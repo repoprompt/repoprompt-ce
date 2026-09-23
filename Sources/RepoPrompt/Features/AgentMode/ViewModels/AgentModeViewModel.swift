@@ -681,7 +681,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
-    private let workspacePathProvider: () -> String?
+    let workspacePathProvider: () -> String?
+    /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
+    /// to the shared polling service; the DEBUG test init can inject a scripted provider so
+    /// picker tests never touch a live ACP process.
+    private let openCodeModelParameterStreamProvider: (String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
     private let acpProviderFactory: ACPProviderFactory
@@ -701,6 +705,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
+    var modelRouterSettingsStore: GlobalSettingsStore = .shared
+    var modelRouterRuntime: AgentTaskRouterRuntime?
+    struct StagedTaskRoutingResult {
+        let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
+        let outcome: AgentTaskRoutingBackendOutcome
+    }
+
+    struct FreshTaskRoutingOwnership {
+        let requestID: UUID
+        let sourceTabID: UUID
+        let destinationTabID: UUID
+        let task: Task<StagedTaskRoutingResult, Never>
+    }
+
+    var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
 
     private var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -722,6 +741,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var pendingAssistantPresentationByTabID: [UUID: AssistantPresentationRequest] = [:]
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
+    /// Latest demand-scoped OpenCode model-parameter observation for the composer's current
+    /// target. Owned by the view model (not the polling actor); accepted deliveries are gated
+    /// on a captured tab/workspace/model target plus a monotonic generation so a stale stream
+    /// can never overwrite a newer target's state.
+    var openCodeModelParameterObservation: OpenCodeACPModelParameterSnapshot?
+    private var openCodeModelParameterObservationTask: Task<Void, Never>?
+    private var openCodeModelParameterObservationTarget: (tabID: UUID, key: OpenCodeACPModelParameterKey)?
+    private var openCodeModelParameterObservationGeneration: UInt64 = 0
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private var antigravityModelsSubscriptionTask: Task<Void, Never>?
@@ -872,6 +899,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
+    /// Memoized normalized search fields, keyed by sidebar row id. Populated only
+    /// while a sidebar search query is active and replaced by the current row set
+    /// on each call, so it stays bounded by the visible sidebar.
+    var sidebarSearchFieldsMemo: [UUID: (source: AgentSessionSearchFieldSource, fields: AgentSessionSearchFields)] = [:]
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var sidebarRuntimeWorkspaceID: UUID? {
         lastKnownWorkspaceSnapshot?.id
@@ -888,6 +919,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
+        /// Counts rows whose normalized search fields were actually materialized.
+        /// Stays at zero while the sidebar search box is empty.
+        var test_sidebarSearchFieldsMaterializationCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         /// Runs on the `@MainActor` inside `agentSessionLinkTranscriptPage(...)`, after the page has
@@ -918,7 +952,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
-    private static let sessionSidebarRestoreBatchSize = 32
+    /// The restore service has already loaded and projected all metadata before
+    /// it begins yielding preferred rows. Publishing those rows in fixed-size
+    /// batches therefore adds no I/O overlap; it only forces the main actor to
+    /// rebuild the complete sidebar once per batch. Yield all preferred rows in
+    /// one bounded batch (at most one per persisted tab), after the separately
+    /// prioritized active-tab result has restored first-paint responsiveness.
+    static func sessionSidebarRestoreBatchSize(forPersistedTabCount count: Int) -> Int {
+        max(count, 1)
+    }
+
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
@@ -1517,19 +1560,59 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedModelRaw = rawModel
     }
 
-    func selectCursorModelParameter(configID: String, valueRaw: String) {
-        guard selectedAgent == .cursor,
+    func selectACPModelParameter(
+        _ target: ACPModelParameterSelection,
+        openCodeDiscoveryKey: OpenCodeACPModelParameterKey? = nil
+    ) {
+        guard let providerID = selectedAgent.acpProviderID,
+              providerID == target.providerID,
               let session = activeSession,
               !session.runState.isActive,
-              !isMCPControlled(tabID: session.tabID),
-              let parameterSet = ACPModelParameterResolver.cursorParameterSet(selectedModelRaw: selectedModelRaw)
+              !isMCPControlled(tabID: session.tabID)
         else { return }
-        guard let definition = parameterSet.definition(configID: configID),
-              let choice = definition.choice(matching: valueRaw)
+
+        // OpenCode selections must carry a live demand-scoped observation: the click is valid
+        // only against the exact (workspace, model) the displayed metadata came from. A missing
+        // or mismatched key rejects (never retargets). Cursor uses its static catalogue and
+        // needs no such authority.
+        let openCodeParameters: OpenCodeACPModelParameterSnapshot?
+        let openCodeAuthorityWorkspace: String?
+        if providerID == .openCode {
+            let observation = openCodeModelParameterObservation
+            guard let openCodeDiscoveryKey,
+                  let currentObservation = observation,
+                  openCodeDiscoveryKey == currentObservation.key,
+                  // The click is valid only against the authority derived by the SAME single
+                  // operation the projection used. A resolution that now fails returns nil and
+                  // rejects; a resolved key (which may legitimately hold workspacePath: nil)
+                  // must match the observation's key exactly.
+                  openCodeDiscoveryKey == openCodeParameterDiscoveryKey(session: session, modelRaw: selectedModelRaw)
+            else { return }
+            openCodeParameters = currentObservation
+            openCodeAuthorityWorkspace = currentObservation.key.workspacePath
+        } else {
+            openCodeParameters = nil
+            openCodeAuthorityWorkspace = nil
+        }
+
+        guard let parameterSet = ACPModelParameterResolver.parameterSet(
+            providerID: providerID,
+            selectedModelRaw: selectedModelRaw,
+            workspacePath: providerID == .openCode
+                ? openCodeAuthorityWorkspace
+                : (try? effectiveWorkspacePath(for: session)) ?? workspacePathProvider(),
+            openCodeParameters: openCodeParameters
+        )
+        else { return }
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(target.baseModelRaw, providerID: providerID)
+            == ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: providerID)
+        else { return }
+        guard let definition = parameterSet.definition(configID: target.configID),
+              let choice = definition.choice(matching: target.valueRaw)
         else { return }
 
         let selection = ACPModelParameterSelection(
-            providerID: .cursor,
+            providerID: providerID,
             baseModelRaw: parameterSet.baseModelRaw,
             kind: definition.kind,
             configID: definition.configID,
@@ -1697,8 +1780,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+    var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
         promptManager?.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
+    }
+
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? .current
     }
 
     var hasAvailableAgentProviders: Bool {
@@ -1823,7 +1910,131 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func stopOpenCodeModelsSubscription() {
         openCodeModelsSubscriptionTask?.cancel()
         openCodeModelsSubscriptionTask = nil
+        cancelOpenCodeModelParameterObservation()
     }
+
+    // MARK: - Demand-scoped OpenCode model-parameter observation
+
+    //
+    // The view model (not the polling actor) owns interest in the composer's displayed target.
+    // Reconcile before publishing committed composer state, including restored bindings and
+    // automatic model adoption. An unchanged tab + canonical discovery key keeps its subscription;
+    // a changed target cancels + clears synchronously before acquisition. Deliveries must still
+    // match the captured target and generation, so stale streams cannot overwrite newer state.
+    //
+    // The workspace key uses the same source that builds that tab's run request
+    // (`effectiveWorkspacePath(for:)` — worktree bindings with the workspace fallback), not the
+    // polling service's preferred workspace.
+    //
+    // Acquisition, the projection, and the setter all derive their authority through ONE
+    // operation (`openCodeParameterDiscoveryKey`), so they can never disagree: a resolution
+    // failure returns no key and every consumer withholds authority identically, while a
+    // resolved key may legitimately carry `workspacePath: nil` (no binding, no fallback)
+    // without being confused with "resolution failed".
+
+    /// The single authority derivation for OpenCode model-parameter acquisition, rendering, and
+    /// selection. Returns `nil` when the session's effective workspace fails to resolve —
+    /// withholding authority rather than discovering from a fallback root — so a failed
+    /// resolution is never collapsed into the (legitimate) nil-workspace key. A non-nil key is a
+    /// successful resolution that may still hold `workspacePath: nil` as a distinct context.
+    /// Internal (not `private`) so the `+ComposerUI` extension can project the same key.
+    func openCodeParameterDiscoveryKey(session: TabSession?, modelRaw: String) -> OpenCodeACPModelParameterKey? {
+        let workspacePath: String?
+        if let session {
+            do {
+                workspacePath = try effectiveWorkspacePath(for: session)
+            } catch {
+                return nil
+            }
+        } else {
+            workspacePath = workspacePathProvider()
+        }
+        return OpenCodeACPModelParameterKey(workspacePath: workspacePath, modelRaw: modelRaw)
+    }
+
+    func reconcileOpenCodeModelParameterObservation() {
+        guard usesProductionAgentDefaultsAndModelPolling, !isRestoringState else { return }
+        // The catalogue subscription owns the polling lifetime. Composer refreshes after a
+        // stop (mode exit, workspace switch, window close) must not restart discovery.
+        guard openCodeModelsSubscriptionTask != nil,
+              selectedAgent == .openCode,
+              let tabID = currentTabID,
+              // Trim to agree with the probe view, which trims before building its key. A
+              // whitespace-only model would otherwise pass here and fail inside discovery,
+              // leaving the control silently absent rather than unavailable.
+              !selectedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let key = openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: selectedModelRaw)
+        else {
+            cancelOpenCodeModelParameterObservation()
+            return
+        }
+        guard openCodeModelParameterObservationTarget?.tabID != tabID
+            || openCodeModelParameterObservationTarget?.key != key
+        else { return }
+
+        cancelOpenCodeModelParameterObservation()
+        openCodeModelParameterObservationTarget = (tabID, key)
+        let generation = openCodeModelParameterObservationGeneration
+        let modelRaw = selectedModelRaw
+        let workspacePath = key.workspacePath
+        let streamProvider = openCodeModelParameterStreamProvider
+        openCodeModelParameterObservationTask = Task { [weak self, workspacePath, modelRaw] in
+            let stream = await streamProvider(workspacePath, modelRaw)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                let matches = await MainActor.run { [weak self] () -> Bool in
+                    guard let self,
+                          openCodeModelParameterObservationGeneration == generation,
+                          currentTabID == tabID,
+                          selectedAgent == .openCode,
+                          openCodeModelParameterObservationTarget?.key == key
+                    else { return false }
+                    // Same construction as acquisition: a resolved key (possibly nil-workspace)
+                    // matches; a resolution that would now fail yields no key and rejects.
+                    guard snapshot.key == key,
+                          key == openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: selectedModelRaw)
+                    else { return false }
+                    openCodeModelParameterObservation = snapshot
+                    return true
+                }
+                // A rejected delivery rejects only this snapshot, never the subscription. The
+                // loop's exit conditions are cancellation and stream termination (checked
+                // above); a stale task exits via `guard !Task.isCancelled` on the next event, so
+                // `continue` leaks nothing. Using `return` here would let one stray or late
+                // foreign snapshot permanently kill an otherwise unchanged subscription.
+                guard matches else { continue }
+                await MainActor.run { [weak self] in
+                    self?.syncComposerUIState()
+                }
+            }
+        }
+    }
+
+    private func cancelOpenCodeModelParameterObservation() {
+        openCodeModelParameterObservationTarget = nil
+        openCodeModelParameterObservationTask?.cancel()
+        openCodeModelParameterObservationTask = nil
+        openCodeModelParameterObservation = nil
+        openCodeModelParameterObservationGeneration &+= 1
+    }
+
+    #if DEBUG
+        /// Test support: install a demand-scoped OpenCode model-parameter observation directly,
+        /// synchronously, bypassing the async subscription stream. Picker/selection tests use
+        /// this to drive `acpModelParameterControls` and the setter without a live ACP process.
+        /// `nil` clears any observation.
+        func test_setOpenCodeModelParameterObservation(_ observation: OpenCodeACPModelParameterSnapshot?) {
+            cancelOpenCodeModelParameterObservation()
+            openCodeModelParameterObservation = observation
+            // Stamp the observation's identity so a later composer publish reconciles to a no-op
+            // instead of cancelling the injection. Without this the seam only survives while
+            // production polling happens to be disabled — an invariant every test using it would
+            // otherwise have to know and preserve.
+            if let observation, let tabID = currentTabID {
+                openCodeModelParameterObservationTarget = (tabID, observation.key)
+            }
+        }
+    #endif
 
     private func updateCursorModelPolling(startPolling: Bool = true) {
         guard selectedAgent == .cursor else {
@@ -2085,7 +2296,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
-        skillCatalog: AgentSkillCatalog? = nil
+        skillCatalog: AgentSkillCatalog? = nil,
+        modelRouterSettingsStore: GlobalSettingsStore = .shared,
+        modelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -2094,6 +2307,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+        self.modelRouterRuntime = modelRouterRuntime
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
@@ -2101,6 +2316,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
             Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
         workspacePathProvider = codexWorkspacePathProvider
+        openCodeModelParameterStreamProvider = { workspacePath, modelRaw in
+            await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
+                workspacePath: workspacePath,
+                modelRaw: modelRaw
+            )
+        }
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
                 return nil
@@ -2261,6 +2482,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restoreLastUsedAgentSelectionIfNeeded()
 
         setupObservers()
+        modelRouterRuntime?.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.handleModelRouterRuntimeChanged() }
+            .store(in: &cancellables)
+        modelRouterSettingsStore.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.syncAllActiveUIState()
+                }
+            }
+            .store(in: &cancellables)
         updateDynamicModelPolling(startCursorPolling: false)
         syncAllActiveUIState()
         scheduleInitialSkillCatalogRefresh()
@@ -2331,7 +2565,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
-            testUsesProductionAgentDefaultsAndModelPolling: Bool = false
+            testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
+            testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2350,6 +2585,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
                 Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
+            openCodeModelParameterStreamProvider = testOpenCodeModelParameterStreamProvider ?? { workspacePath, modelRaw in
+                await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
+                    workspacePath: workspacePath,
+                    modelRaw: modelRaw
+                )
+            }
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
@@ -3113,6 +3354,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.handleAgentProviderAvailabilityChanged()
                 }
                 .store(in: &cancellables)
+            Publishers.CombineLatest(
+                apiSettingsViewModel.$contextBuilderVerifiedCLIProviders,
+                apiSettingsViewModel.$isContextBuilderProviderValidationComplete
+            )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleModelRouterAvailabilityChanged()
+            }
+            .store(in: &cancellables)
         }
 
         // Observe workspace file-system deltas and invalidate the skill catalog
@@ -3449,18 +3699,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func isComposeTabProtectedFromSidebarArchiveSuggestion(_ tabID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return true }
-        if session.runState.isActive { return true }
-        if tabsWithActiveAgentRun.contains(tabID) { return true }
-        if session.mcpControlContext != nil { return true }
-        if session.hasPendingQuestionUI { return true }
-        if session.pendingApproval != nil { return true }
-        if session.hasPendingCodexHookReviewWait { return true }
-        if session.pendingPermissionsRequest != nil { return true }
-        if session.pendingMCPElicitationRequest != nil { return true }
-        if session.pendingApplyEditsReview != nil { return true }
-        if session.pendingUserInputRequest != nil { return true }
-        if session.waitingPrompt != nil { return true }
-        if session.instructionContinuation != nil { return true }
+        if session.runState.isActive {
+            return true
+        }
+        if tabsWithActiveAgentRun.contains(tabID) {
+            return true
+        }
+        if session.mcpControlContext != nil {
+            return true
+        }
+        if session.hasPendingQuestionUI {
+            return true
+        }
+        if session.pendingApproval != nil {
+            return true
+        }
+        if session.hasPendingCodexHookReviewWait {
+            return true
+        }
+        if session.pendingPermissionsRequest != nil {
+            return true
+        }
+        if session.pendingMCPElicitationRequest != nil {
+            return true
+        }
+        if session.pendingApplyEditsReview != nil {
+            return true
+        }
+        if session.pendingUserInputRequest != nil {
+            return true
+        }
+        if session.waitingPrompt != nil {
+            return true
+        }
+        if session.instructionContinuation != nil {
+            return true
+        }
         return false
     }
 
@@ -13888,7 +14162,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let prioritizedBuilder = sidebarPrioritizedIndexBuilder
         let streamBuilder = sidebarIndexStreamBuilder
-        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize
+        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize(forPersistedTabCount: persistedTabs.count)
         sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             #if DEBUG
@@ -15219,10 +15493,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = submitUserTurn(
+                let result = await submitUserTurnAfterFreshTaskRouting(
                     text: text,
-                    tabID: target.tabID,
-                    rawDraftText: claim.attempt.rawDraftSnapshot
+                    claim: claim,
+                    session: preparedSession,
+                    destinationTabID: target.tabID
                 )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
@@ -15286,10 +15561,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = submitUserTurn(
+            let result = await submitUserTurnAfterFreshTaskRouting(
                 text: text,
-                tabID: target.tabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                claim: claim,
+                session: preparedSession,
+                destinationTabID: target.tabID
             )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
@@ -15326,11 +15602,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !Task.isCancelled,
                   composerSubmitClaimIsCurrent(claim)
             else {
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard sessions[target.tabID] === sourceSession else {
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -15340,7 +15616,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ) {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard composerSubmitClaimIsCurrent(claim),
@@ -15348,20 +15624,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard destinationTabID != target.tabID else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             if preparesExecutionLocation {
@@ -15382,7 +15658,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
                 clearPendingUserTurnState(on: destinationSession)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return blocked
             }
             if preparesExecutionLocation {
@@ -15397,7 +15673,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     }
                 } catch {
                     clearPendingUserTurnState(on: destinationSession)
-                    await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                    await discardFreshFirstSendDestinationIfPossible(
+                        destinationTabID,
+                        reactivateSourceTabID: target.tabID
+                    )
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 }
             }
@@ -15409,23 +15688,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return blocked
             }
             destinationSession.pendingInitialStartLocation = .local
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = submitUserTurn(
+            let result = await submitUserTurnAfterFreshTaskRouting(
                 text: text,
-                tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                claim: claim,
+                session: destinationSession,
+                destinationTabID: destinationTabID
             )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(
+                    destinationTabID,
+                    reactivateSourceTabID: target.tabID
+                )
                 return result
             }
             clearPendingUserTurnState(on: sourceSession)
@@ -15505,8 +15791,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func isFreshFirstSendDestination(_ session: TabSession) -> Bool {
+    func isFreshFirstSendDestination(_ session: TabSession) -> Bool {
         !session.runState.isActive
+            && !session.hasSentFirstMessage
             && session.runID == nil
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
@@ -15726,7 +16013,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && !session.pendingHandoff.hasPayload
     }
 
-    private func discardFreshFirstSendDestinationIfPossible(_ tabID: UUID) async {
+    private func discardFreshFirstSendDestinationIfPossible(
+        _ tabID: UUID,
+        reactivateSourceTabID: UUID? = nil
+    ) async {
         guard let session = sessions[tabID], isFreshFirstSendDestination(session) else { return }
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
             await promptManager?.closeComposeTab(tabID)
@@ -15734,6 +16024,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)
             removePendingUIRefresh(for: tabID)
+        }
+        if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
+            await promptManager?.switchComposeTab(reactivateSourceTabID)
         }
     }
 
@@ -18902,6 +19195,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity else {
             let rejection = AgentComposerSubmitClaimRejection.sourceSessionIdentityMismatch
             logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if let routing = freshTaskRoutingByTabID[target.tabID] {
+            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: routing.requestID)
+            logRejectedSubmitTarget(
+                target,
+                session: session,
+                reason: rejection.diagnosticReason,
+                attempt: attempt
+            )
             resyncAfterRejectedSubmitTarget(target)
             return .rejected(rejection)
         }

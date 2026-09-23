@@ -78,7 +78,7 @@ The joined EditFlowPerf request timeline separately freezes `MainActorScheduled 
 
 ### Pinned SDK stdio
 
-`Package.swift` pins `repoprompt/swift-sdk` at `85dec2fc7a27252bc33dc7728be6af6b3bd398c0`. Inspection of that revision's `StdioTransport` found:
+`Package.swift` pins `repoprompt/swift-sdk` at `5716de85a976a8f70dedc9cb000e50aaa0d8cc5b`. Inspection of that revision's `StdioTransport` found:
 
 1. clean EOF finishes the message stream normally;
 2. a read error is logged and then also finishes the stream normally;

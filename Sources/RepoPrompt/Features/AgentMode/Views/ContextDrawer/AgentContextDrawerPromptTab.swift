@@ -4,6 +4,7 @@ struct AgentContextDrawerPromptTab: View {
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
+    let renderSnapshot: AgentContextExportRenderSnapshot
     let isSwitchBlankingSelectedFiles: Bool
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -91,7 +92,7 @@ struct AgentContextDrawerPromptTab: View {
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
             handleSelectionChange(change, isVisible: true)
         }
-        .onChange(of: exportContext.modelRequestIdentity) { _, _ in
+        .onChange(of: renderSnapshot.modelRequestIdentity) { _, _ in
             guard !isSwitchBlankingSelectedFiles else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
             resetOrRefresh(isVisible: true)

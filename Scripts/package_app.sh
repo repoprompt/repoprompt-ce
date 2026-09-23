@@ -108,7 +108,10 @@ IS_RELEASE=0
 if (( IS_RELEASE )); then
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BASE_BUNDLE_ID}"
 else
-    BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
+    # Debug builds belong to the successor RepoPrompt identity even while
+    # version.env is temporarily pinned to the legacy release identity for the
+    # signed P -> T -> S migration rollout.
+    BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-com.repoprompt.ce.debug}}"
 fi
 if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]]; then
     validate_stable_release_context \
@@ -123,10 +126,6 @@ fi
 
 phase "Checking build environment"
 run "$CONTROL_PLANE_SCRIPTS_DIR/doctor.sh" --quiet
-SIGN_IDENTITY_WAS_EXPLICIT=0
-if [[ -n "${SIGN_IDENTITY:-}" ]]; then
-    SIGN_IDENTITY_WAS_EXPLICIT=1
-fi
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 ALLOW_ADHOC_SIGNING="${ALLOW_ADHOC_SIGNING:-0}"
 RELEASE_ALLOW_ADHOC_SIGNING="${RELEASE_ALLOW_ADHOC_SIGNING:-0}"
@@ -150,7 +149,7 @@ warn_adhoc_signing(){
     echo "WARNING: Using explicit ad-hoc signing for a debug package."
     echo "WARNING: RepoPrompt debug runtime will use ephemeral in-memory secure storage instead of macOS Keychain for API keys and secure permission documents."
     echo "WARNING: Keychain consent prompts should be avoided, but secrets and secure permission changes saved in this run will not persist across app launches."
-    echo "WARNING: Use explicit SIGN_IDENTITY=\"Apple Development: ...\" for real local Keychain persistence."
+    echo "WARNING: Use an Apple Development-signed debug build for persistent local Keychain storage."
 }
 warn_release_candidate_signing(){
     echo "WARNING: Using explicit ad-hoc signing for a release-candidate package."
@@ -193,10 +192,6 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
         warn_adhoc_signing
     fi
 else
-    if (( ! IS_RELEASE )) && (( ! SIGN_IDENTITY_WAS_EXPLICIT )) && [[ -z "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then
-        echo "WARNING: Auto-detected debug signing will use ephemeral in-memory secure storage to avoid macOS Keychain prompts."
-        echo "WARNING: Use explicit SIGN_IDENTITY=\"Apple Development: ...\" to opt in to persistent debug Keychain storage."
-    fi
     echo "Using signing identity: $SIGN_IDENTITY"
     if ! security find-identity -v -p codesigning | grep -F -- "$SIGN_IDENTITY" >/dev/null 2>&1; then
         echo "WARNING: SIGN_IDENTITY was not found by exact text in 'security find-identity'; codesign will still attempt to use it."
@@ -224,7 +219,7 @@ elif [[ -n "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then
         keychain|alternate-in-memory) DEBUG_STORAGE_BACKEND_MARKER="$DEBUG_SECURE_STORAGE_BACKEND" ;;
         *) fail "DEBUG_SECURE_STORAGE_BACKEND must be 'keychain' or 'alternate-in-memory', got '$DEBUG_SECURE_STORAGE_BACKEND'." ;;
     esac
-elif (( SIGN_IDENTITY_WAS_EXPLICIT )) && (( ! USE_ADHOC_SIGNING )); then
+elif (( ! USE_ADHOC_SIGNING )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
 elif (( USE_ADHOC_SIGNING )); then
     SIGNING_MODE_MARKER="debug-adhoc"

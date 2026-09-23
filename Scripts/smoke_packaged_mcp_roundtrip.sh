@@ -228,6 +228,107 @@ raise SystemExit(completed.returncode)
 PYTHON
 }
 
+run_external_initialize_request() {
+    python3 - "$MCP_HELPER" "$ISOLATED_HOME" "$ISOLATED_TMP" "$HELPER_REQUEST_TIMEOUT" <<'PYTHON'
+import json
+import os
+import subprocess
+import sys
+
+helper, home, temporary, helper_timeout = sys.argv[1:]
+environment = {
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME": home,
+    "CFFIXED_USER_HOME": home,
+    "TMPDIR": temporary + "/",
+    "USER": os.environ.get("USER", "runner"),
+    "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "runner")),
+    "LANG": "C",
+    "LC_ALL": "C",
+    "MCP_SOCKET_DEBUG": "1",
+}
+frames = [
+    {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+                "experimental": {
+                    "codex/auth-change": {},
+                },
+                "elicitation": {
+                    "form": {},
+                    "url": {},
+                },
+            },
+            "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.154.0",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    },
+]
+payload = "".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames)
+try:
+    completed = subprocess.run(
+        [helper, "--backend", "app"],
+        env=environment,
+        input=payload,
+        text=True,
+        capture_output=True,
+        timeout=int(helper_timeout),
+    )
+except subprocess.TimeoutExpired as error:
+    for value, destination in ((error.stdout, sys.stdout), (error.stderr, sys.stderr)):
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            print(value, end="", file=destination)
+    raise SystemExit(124)
+if completed.stderr:
+    print(completed.stderr, end="", file=sys.stderr)
+if completed.returncode != 0:
+    if completed.stdout:
+        print(completed.stdout, end="")
+    raise SystemExit(completed.returncode)
+
+responses = {}
+for line in completed.stdout.splitlines():
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(message, dict) and message.get("id") in (0, 1):
+        responses[message["id"]] = message
+
+for response_id, label in ((0, "initialize"), (1, "tools/list")):
+    response = responses.get(response_id)
+    if response is None:
+        raise SystemExit(f"missing {label} response in packaged MCP output")
+    if "error" in response:
+        raise SystemExit(f"{label} returned an error: {json.dumps(response['error'], sort_keys=True)}")
+
+tools = responses[1].get("result", {}).get("tools")
+if not isinstance(tools, list) or not tools:
+    raise SystemExit("tools/list returned no tools")
+print(f"OK: object-valued experimental capability initialized and tools/list returned {len(tools)} tools")
+PYTHON
+}
+
 deadline=$(( $(date +%s) + ROUNDTRIP_TIMEOUT ))
 last_status=75
 attempt=0
@@ -271,6 +372,8 @@ while (( $(date +%s) <= deadline )); do
     if (( last_status == 0 )); then
         cat "$attempt_stdout"
         cat "$attempt_stderr" >&2
+        log_phase "$SMOKE_LABEL validating object-valued external initialize capability"
+        run_external_initialize_request
         "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
             fail "$SMOKE_LABEL release MCP socket ownership changed during the helper request"
         printf 'OK: %s completed bootstrap and windows request with exact helper %s against launched pid %s socket %s\n' \

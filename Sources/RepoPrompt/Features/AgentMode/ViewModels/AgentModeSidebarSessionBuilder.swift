@@ -80,8 +80,13 @@ struct AgentModeSidebarSessionBuilder {
         }
         let tabNameByID = sidebarTabNameLookup(for: rowTabs)
         let tabOrder = sidebarTabOrder(for: rowTabs)
+        // `authoritativeSessionIDByTabID` and `rowTabs` can both contain roughly
+        // one entry per persisted chat. Scanning `rowTabs` for every binding made
+        // this O(tabs × bindings) during workspace restore (nearly one million
+        // comparisons in a 969-tab workspace). Build the membership set once.
+        let rowTabIDs = Set(rowTabs.map(\.id))
         let explicitSessionIDByTabID = authoritativeSessionIDByTabID.filter { tabID, _ in
-            rowTabs.contains(where: { $0.id == tabID })
+            rowTabIDs.contains(tabID)
         }
         let explicitTabIDBySessionID = Dictionary(
             explicitSessionIDByTabID.map { ($0.value, $0.key) },
@@ -293,7 +298,7 @@ struct AgentModeSidebarSessionBuilder {
         let canStash = boundLiveSession?.items.isEmpty == false
             || boundLiveSession?.transcript.turns.isEmpty == false
             || entry.map(Self.sessionIndexEntryHasConversationContent) == true
-        let searchFields = Self.searchFields(
+        let searchFieldSource = Self.searchFieldSource(
             title: title,
             entry: entry,
             runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
@@ -318,7 +323,7 @@ struct AgentModeSidebarSessionBuilder {
             isMCPControlled: isMCPControlled,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
-            searchFields: searchFields
+            searchFieldSource: searchFieldSource
         )
     }
 
@@ -442,7 +447,12 @@ struct AgentModeSidebarSessionBuilder {
         }
     }
 
-    static func searchFields(
+    /// Captures the raw inputs a row needs to materialize search fields later.
+    ///
+    /// This is deliberately allocation-free: it only retains values the caller has
+    /// already computed. The expensive normalization lives in
+    /// `searchFields(source:)`, which runs only when a search query is active.
+    nonisolated static func searchFieldSource(
         title: String,
         entry: AgentSessionIndexEntry?,
         runState: AgentSessionRunState?,
@@ -450,22 +460,50 @@ struct AgentModeSidebarSessionBuilder {
         worktree: AgentWorktreeIndicator?,
         mergeAttention: AgentWorktreeMergeAttention?,
         sessionID: UUID?,
-        tabID: UUID
-    ) -> AgentSessionSearchFields {
-        let summaries = entry?.worktreeBindingSummaries ?? []
-        let mergeSummaries = entry?.activeWorktreeMergeSummaries ?? []
-        return AgentSessionSearchFields(
+        tabID: UUID?
+    ) -> AgentSessionSearchFieldSource {
+        AgentSessionSearchFieldSource(
             title: title,
+            runState: runState,
+            isMCPControlled: isMCPControlled,
+            worktree: worktree,
+            mergeAttention: mergeAttention,
+            sessionID: sessionID,
+            tabID: tabID,
+            entryID: entry?.id,
+            entryParentSessionID: entry?.parentSessionID,
+            lastRunStateRaw: entry?.lastRunStateRaw,
+            agentKindRaw: entry?.agentKindRaw,
+            agentModelRaw: entry?.agentModelRaw,
+            agentReasoningEffortRaw: entry?.agentReasoningEffortRaw,
+            autoEditEnabled: entry?.autoEditEnabled == true,
+            hasUnknownConversationContent: entry?.hasUnknownConversationContent == true,
+            worktreeBindingSummaries: entry?.worktreeBindingSummaries ?? [],
+            activeWorktreeMergeSummaries: entry?.activeWorktreeMergeSummaries ?? []
+        )
+    }
+
+    /// Materializes normalized search fields from a captured source.
+    ///
+    /// Field composition, ordering, and kinds are identical to the previous eager
+    /// implementation; only the point at which it runs has moved.
+    nonisolated static func searchFields(source: AgentSessionSearchFieldSource) -> AgentSessionSearchFields {
+        let summaries = source.worktreeBindingSummaries
+        let mergeSummaries = source.activeWorktreeMergeSummaries
+        let worktree = source.worktree
+        let mergeAttention = source.mergeAttention
+        return AgentSessionSearchFields(
+            title: source.title,
             status: [
-                runState?.searchLabel,
-                entry?.lastRunStateRaw,
-                isMCPControlled ? "MCP" : nil,
+                source.runState?.searchLabel,
+                source.lastRunStateRaw,
+                source.isMCPControlled ? "MCP" : nil,
                 mergeAttention == nil ? nil : "merge"
             ],
             model: [
-                entry?.agentKindRaw,
-                entry?.agentModelRaw,
-                entry?.agentReasoningEffortRaw
+                source.agentKindRaw,
+                source.agentModelRaw,
+                source.agentReasoningEffortRaw
             ],
             worktree: [
                 worktree?.label,
@@ -493,10 +531,10 @@ struct AgentModeSidebarSessionBuilder {
                 ]
             },
             secondary: [
-                isMCPControlled ? "MCP controlled" : nil,
-                entry?.autoEditEnabled == true ? "auto edit" : nil,
-                entry?.hasUnknownConversationContent == true ? "unknown content" : nil,
-                entry?.parentSessionID == nil ? nil : "sub-agent"
+                source.isMCPControlled ? "MCP controlled" : nil,
+                source.autoEditEnabled ? "auto edit" : nil,
+                source.hasUnknownConversationContent ? "unknown content" : nil,
+                source.entryParentSessionID == nil ? nil : "sub-agent"
             ],
             path: [
                 worktree?.logicalRootPath,
@@ -508,10 +546,34 @@ struct AgentModeSidebarSessionBuilder {
                 [summary.sourcePath, summary.targetPath]
             },
             identifier: [
-                sessionID?.uuidString,
-                tabID.uuidString,
-                entry?.id.uuidString
+                source.sessionID?.uuidString,
+                source.tabID?.uuidString,
+                source.entryID?.uuidString
             ]
+        )
+    }
+
+    nonisolated static func searchFields(
+        title: String,
+        entry: AgentSessionIndexEntry?,
+        runState: AgentSessionRunState?,
+        isMCPControlled: Bool,
+        worktree: AgentWorktreeIndicator?,
+        mergeAttention: AgentWorktreeMergeAttention?,
+        sessionID: UUID?,
+        tabID: UUID
+    ) -> AgentSessionSearchFields {
+        searchFields(
+            source: searchFieldSource(
+                title: title,
+                entry: entry,
+                runState: runState,
+                isMCPControlled: isMCPControlled,
+                worktree: worktree,
+                mergeAttention: mergeAttention,
+                sessionID: sessionID,
+                tabID: tabID
+            )
         )
     }
 
@@ -751,7 +813,7 @@ struct AgentModeSidebarSessionBuilder {
             isMCPControlled: session.isMCPControlled,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
-            searchFields: session.searchFields
+            searchFieldSource: session.searchFieldSource
         )
     }
 

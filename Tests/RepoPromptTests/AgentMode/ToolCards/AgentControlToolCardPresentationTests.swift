@@ -27,6 +27,30 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.subtitle?.contains("reasoning provider_super") == true, presentation.subtitle ?? "")
     }
 
+    func testOmittedTimeoutRendersWaitDefaultLabel() {
+        let subtitle = ToolCardRouter.callSubtitle(
+            for: "agent_run",
+            argsJSON: #"{"op":"wait","session_id":"11111111-1111-1111-1111-111111111111"}"#
+        )
+        XCTAssertEqual(subtitle, "wait • 11111111-1111-1111-1111-111111111111 • wait (default)", subtitle ?? "")
+    }
+
+    func testExplicitTimeoutRendersBoundedWaitLabel() {
+        let subtitle = ToolCardRouter.callSubtitle(
+            for: "agent_run",
+            argsJSON: #"{"op":"wait","session_id":"11111111-1111-1111-1111-111111111111","timeout":120}"#
+        )
+        XCTAssertEqual(subtitle, "wait • 11111111-1111-1111-1111-111111111111 • wait ≤2m", subtitle ?? "")
+    }
+
+    func testDetachRendersDetachLabel() {
+        let subtitle = ToolCardRouter.callSubtitle(
+            for: "agent_run",
+            argsJSON: #"{"op":"start","detach":true,"message":"probe"}"#
+        )
+        XCTAssertEqual(subtitle, "start • detach")
+    }
+
     func testReasoningEffortFallsBackToArgsWhenResultAgentObjectOmitsIt() throws {
         let args = try runArgs([
             "op": "start",
@@ -62,6 +86,8 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
 
     private func runArgs(_ object: [String: Any]) throws -> ToolArgsDTOs.AgentRunArgs {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-        return try JSONDecoder().decode(ToolArgsDTOs.AgentRunArgs.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ToolArgsDTOs.AgentRunArgs.self, from: data)
     }
 }

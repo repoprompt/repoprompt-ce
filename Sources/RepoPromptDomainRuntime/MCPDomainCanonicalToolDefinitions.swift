@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
 /// Single production schema authority for the complete MCP surface.
 ///
@@ -1220,6 +1221,76 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
+    /// The vendored definitions still carry the retired fixed-wait wording, so canonicalization
+    /// restates omitted-timeout semantics from `MCPTimeoutPolicy`, the single owner of that copy.
+    /// `DirectHeadlessCompositionTests` fails if the vendored phrasing drifts out of these rules.
+    private static func canonicalizeAgentControlWaitSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        typealias Semantics = MCPTimeoutPolicy
+        let phrase = Semantics.configuredSubagentWaitDiscoveryPhrase
+        var description = definition.description
+
+        if definition.name == MCPWindowToolName.agentRun {
+            let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing."
+            if !description.contains(routerDescription) {
+                description += "\n\n\(routerDescription)"
+            }
+            description = description.replacingOccurrences(
+                of: "Waits up to `timeout` seconds (default 120).",
+                with: "Waits up to `timeout` seconds when present. Omitted `timeout` uses the \(phrase)."
+            )
+            description = description.replacingOccurrences(
+                of: "- `wait`: Block until the run finishes or needs input. Default 120s. `timeout: 0` = poll.",
+                with: "- `wait`: Block until the run finishes or needs input. Omit `timeout` for the \(phrase); use shorter waits for closer supervision or longer waits for well-scoped independent work. `timeout: 0` = poll."
+            )
+        }
+
+        if definition.name == MCPWindowToolName.agentExplore {
+            let routerDescription = "When the app-global Model Router is enabled, each new explore child is routed across the configured subagent targets."
+            if !description.contains(routerDescription) {
+                description += "\n\n\(routerDescription)"
+            }
+            description = description.replacingOccurrences(
+                of: "- `wait`: Block until the first referenced explore run finishes or needs input. `timeout=0` behaves like poll.",
+                with: "- `wait`: Block until the first referenced explore run finishes or needs input. Omit `timeout` for the \(phrase); use shorter waits for closer supervision or longer waits for well-scoped independent work. `timeout=0` behaves like poll."
+            )
+        }
+
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else {
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+
+        if case var .object(timeoutProperty)? = properties["timeout"] {
+            timeoutProperty["description"] = .string(Semantics.agentControlTimeoutPropertyDescription)
+            properties["timeout"] = .object(timeoutProperty)
+        }
+
+        if definition.name == MCPWindowToolName.agentRun,
+           case var .object(steerTimeoutProperty)? = properties["timeout_seconds"]
+        {
+            steerTimeoutProperty["description"] = .string(Semantics.agentControlSteerTimeoutPropertyDescription)
+            properties["timeout_seconds"] = .object(steerTimeoutProperty)
+        }
+
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
@@ -1246,13 +1317,18 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
-            return MCPDomainToolDefinition(
-                name: definition.name,
-                description: description,
-                inputSchema: definition.inputSchema,
-                annotations: definition.annotations,
-                isEnabledByDefault: definition.isEnabledByDefault
+            return canonicalizeAgentControlWaitSemantics(
+                MCPDomainToolDefinition(
+                    name: definition.name,
+                    description: description,
+                    inputSchema: definition.inputSchema,
+                    annotations: definition.annotations,
+                    isEnabledByDefault: definition.isEnabledByDefault
+                )
             )
+        }
+        if definition.name == MCPWindowToolName.agentExplore {
+            return canonicalizeAgentControlWaitSemantics(definition)
         }
         if definition.name == MCPGlobalToolName.appSettings,
            case var .object(schema) = definition.inputSchema,
@@ -2390,6 +2466,12 @@ package enum MCPDomainCanonicalToolDefinitions {
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         canonicalizeAgentSessionLink(definition)
+    }
+
+    package static func test_canonicalizeAgentControlWaitSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeAgentControlWaitSemantics(definition)
     }
 
     package static func test_agentSessionLinkLegacyCurrentDefinition() -> MCPDomainToolDefinition {

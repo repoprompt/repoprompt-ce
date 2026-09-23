@@ -114,6 +114,9 @@ extension FileSystemService {
         }
         let id = UUID()
         inFlightMutations[id] = FileSystemInFlightMutation(relativePaths: authorityPaths)
+        // Reserve a newer cache generation before mutation preparation can suspend. Successful
+        // reads already in flight must not publish encoding evidence across this mutation boundary.
+        contentReadCacheRevision &+= 1
         do {
             #if DEBUG
                 let willBegin = mutationIOWillBeginHandler
@@ -212,6 +215,9 @@ extension FileSystemService {
 
     private func finishMutationAuthority(_ id: UUID) {
         guard inFlightMutations.removeValue(forKey: id) != nil else { return }
+        // A read may start after reservation but observe the pre-mutation bytes.
+        // Do not let that read replace encoding evidence installed by reconciliation.
+        contentReadCacheRevision &+= 1
         #if DEBUG
             completedMutationMonitorCountForTesting += 1
         #endif

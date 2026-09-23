@@ -67,6 +67,10 @@ protocol SecKeychainItemAccessProvider {
     func copyAccess(from result: AnyObject) throws -> AnyObject
 }
 
+protocol KeychainAccessRebuilder {
+    func rebuild(_ access: AnyObject) throws -> AnyObject
+}
+
 enum KeychainItemAccessProviderError: Error, LocalizedError, Equatable {
     case invalidItemReference
     case accessCopyFailed(status: OSStatus)
@@ -93,6 +97,126 @@ struct SystemSecKeychainItemAccessProvider: SecKeychainItemAccessProvider {
             throw KeychainItemAccessProviderError.accessCopyFailed(status: status)
         }
         return access
+    }
+}
+
+/// Creates a new classic Keychain access object from an authenticated donor's
+/// decrypt policy. Persisted `SecAccess` objects can carry item-specific state
+/// that causes `SecItemAdd` to reject reuse for a later item. Rebuilding the
+/// trusted applications from their exact code requirements preserves authority
+/// without carrying that persisted object state forward.
+struct FreshClassicKeychainAccessRebuilder: KeychainAccessRebuilder {
+    func rebuild(_ accessObject: AnyObject) throws -> AnyObject {
+        guard CFGetTypeID(accessObject as CFTypeRef) == SecAccessGetTypeID() else {
+            throw KeychainACLValidationError.invalidAccess
+        }
+        let access = unsafeBitCast(accessObject, to: SecAccess.self)
+        guard let aclList = SecAccessCopyMatchingACLList(
+            access,
+            kSecACLAuthorizationDecrypt
+        ) else {
+            throw KeychainACLValidationError.decryptACLListMissing
+        }
+        let aclCount = CFArrayGetCount(aclList)
+        guard aclCount == 1 else {
+            throw KeychainACLValidationError.unexpectedDecryptACLCount(aclCount)
+        }
+        let aclValue = CFArrayGetValueAtIndex(aclList, 0)
+        let aclObject: CFTypeRef = unsafeBitCast(aclValue, to: CFTypeRef.self)
+        guard CFGetTypeID(aclObject) == SecACLGetTypeID() else {
+            throw KeychainACLValidationError.accessACLTypeInvalid
+        }
+        let acl = unsafeBitCast(aclValue, to: SecACL.self)
+        var applications: CFArray?
+        var description: CFString?
+        var promptSelector = SecKeychainPromptSelector(rawValue: 0)
+        let contentsStatus = SecACLCopyContents(
+            acl,
+            &applications,
+            &description,
+            &promptSelector
+        )
+        guard contentsStatus == errSecSuccess else {
+            throw KeychainACLValidationError.accessACLContentsCopyFailed(status: contentsStatus)
+        }
+        guard let applications else {
+            throw KeychainACLValidationError.wildcardPrincipal
+        }
+        guard CFArrayGetCount(applications) > 0 else {
+            throw KeychainACLValidationError.missingPrincipal
+        }
+
+        var freshApplications: [SecTrustedApplication] = []
+        freshApplications.reserveCapacity(CFArrayGetCount(applications))
+        for applicationIndex in 0 ..< CFArrayGetCount(applications) {
+            let applicationValue = CFArrayGetValueAtIndex(applications, applicationIndex)
+            let applicationObject: CFTypeRef = unsafeBitCast(applicationValue, to: CFTypeRef.self)
+            guard CFGetTypeID(applicationObject) == SecTrustedApplicationGetTypeID() else {
+                throw KeychainACLValidationError.malformedPrincipal
+            }
+            let application = unsafeBitCast(applicationValue, to: SecTrustedApplication.self)
+            var requirement: SecRequirement?
+            let requirementStatus = SecTrustedApplicationCopyRequirementSPI(
+                application,
+                &requirement
+            )
+            guard requirementStatus == errSecSuccess else {
+                throw KeychainACLValidationError.trustedApplicationRequirementCopyFailed(
+                    status: requirementStatus
+                )
+            }
+            guard let requirement else {
+                throw KeychainACLValidationError.trustedApplicationRequirementMissing
+            }
+            var freshApplication: SecTrustedApplication?
+            let creationStatus = SecTrustedApplicationCreateFromRequirementSPI(
+                nil,
+                requirement,
+                &freshApplication
+            )
+            guard creationStatus == errSecSuccess, let freshApplication else {
+                throw KeychainItemCreationAttributeError.trustedApplicationCreationFailed(
+                    path: "validated Keychain principal",
+                    status: creationStatus
+                )
+            }
+            freshApplications.append(freshApplication)
+        }
+
+        let accessDescription = description ?? "RepoPrompt CE secure storage" as CFString
+        var freshAccess: SecAccess?
+        let accessStatus = SecAccessCreate(
+            accessDescription,
+            freshApplications as CFArray,
+            &freshAccess
+        )
+        guard accessStatus == errSecSuccess, let freshAccess else {
+            throw KeychainItemCreationAttributeError.accessCreationFailed(status: accessStatus)
+        }
+        guard let freshACLList = SecAccessCopyMatchingACLList(
+            freshAccess,
+            kSecACLAuthorizationDecrypt
+        ),
+            CFArrayGetCount(freshACLList) == 1
+        else {
+            throw KeychainACLValidationError.decryptACLListMissing
+        }
+        let freshACLValue = CFArrayGetValueAtIndex(freshACLList, 0)
+        let freshACLObject: CFTypeRef = unsafeBitCast(freshACLValue, to: CFTypeRef.self)
+        guard CFGetTypeID(freshACLObject) == SecACLGetTypeID() else {
+            throw KeychainACLValidationError.accessACLTypeInvalid
+        }
+        let freshACL = unsafeBitCast(freshACLValue, to: SecACL.self)
+        let setStatus = SecACLSetContents(
+            freshACL,
+            freshApplications as CFArray,
+            accessDescription,
+            promptSelector
+        )
+        guard setStatus == errSecSuccess else {
+            throw KeychainItemCreationAttributeError.accessCreationFailed(status: setStatus)
+        }
+        return freshAccess
     }
 }
 
@@ -380,7 +504,9 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
     func attributesForNewItem() throws -> [String: Any] {
         lock.lock()
         defer { lock.unlock() }
-        if let cachedAttributes { return cachedAttributes }
+        if let cachedAttributes {
+            return cachedAttributes
+        }
 
         var trustedApplications: [SecTrustedApplication] = []
         trustedApplications.reserveCapacity(applications.count)
@@ -435,15 +561,17 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
     }
 }
 
-/// Reuses the ACL from a bridge manifest whose creation was committed by the legacy
-/// preparer. This lets later legacy builds create additional bridge records without
-/// carrying a new successor-signed anchor in every package.
+/// Authenticates the ACL from a committed bridge manifest, then reconstructs a fresh
+/// equivalent access object for each newly added bridge record. This lets later builds
+/// create additional records without either carrying a successor-signed anchor forever
+/// or reusing persisted item-specific `SecAccess` state.
 struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttributeProvider {
     let serviceName: String
     let account: String
     let itemIdentityAttributes: [String: Any]
     let accessValidator: KeychainItemAccessValidator
     let itemAccessProvider: SecKeychainItemAccessProvider
+    let accessRebuilder: KeychainAccessRebuilder
     let secItemClient: SecItemClient
 
     init(
@@ -452,6 +580,7 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
         itemIdentityAttributes: [String: Any] = [:],
         accessValidator: KeychainItemAccessValidator,
         itemAccessProvider: SecKeychainItemAccessProvider = SystemSecKeychainItemAccessProvider(),
+        accessRebuilder: KeychainAccessRebuilder = FreshClassicKeychainAccessRebuilder(),
         secItemClient: SecItemClient = SystemSecItemClient()
     ) {
         self.serviceName = serviceName
@@ -459,6 +588,7 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
         self.itemIdentityAttributes = itemIdentityAttributes
         self.accessValidator = accessValidator
         self.itemAccessProvider = itemAccessProvider
+        self.accessRebuilder = accessRebuilder
         self.secItemClient = secItemClient
     }
 
@@ -482,9 +612,11 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
             throw KeychainItemCreationAttributeError.referenceItemInvalid
         }
 
-        let access = try itemAccessProvider.copyAccess(from: result)
-        try accessValidator.validate(access)
-        return [kSecAttrAccess as String: access]
+        let donorAccess = try itemAccessProvider.copyAccess(from: result)
+        try accessValidator.validate(donorAccess)
+        let freshAccess = try accessRebuilder.rebuild(donorAccess)
+        try accessValidator.validate(freshAccess)
+        return [kSecAttrAccess as String: freshAccess]
     }
 }
 
@@ -495,10 +627,25 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let identityMigrationBridgeServiceNamePrefix = "com.repoprompt.ce.identity-migration.keychain.v1."
     static let identityMigrationLegacyStateServiceName = "com.pvncher.repoprompt.ce.identity-migration.state.v2"
     static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
-    static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
+    static let debugServiceName = "com.repoprompt.ce.debug.keychain"
+    static let appleDevelopmentDebugServiceNamePrefix = "com.repoprompt.ce.debug.apple-development."
 
     static let officialV2Shared = KeychainService(serviceName: officialV2ServiceName)
     static let debugShared = KeychainService(serviceName: debugServiceName)
+
+    static func appleDevelopmentDebugServiceName(teamIdentifier: String) -> String {
+        let normalizedTeamIdentifier = teamIdentifier.lowercased()
+        precondition(
+            !normalizedTeamIdentifier.isEmpty
+                && normalizedTeamIdentifier.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) },
+            "Apple Development team identifier must be non-empty and alphanumeric"
+        )
+        return "\(appleDevelopmentDebugServiceNamePrefix)\(normalizedTeamIdentifier).keychain.v1"
+    }
+
+    static func appleDevelopmentDebug(teamIdentifier: String) -> KeychainService {
+        KeychainService(serviceName: appleDevelopmentDebugServiceName(teamIdentifier: teamIdentifier))
+    }
 
     static func localSelfSignedServiceName(fingerprint: String, generation: Int) -> String {
         let normalizedFingerprint = fingerprint.filter(\.isHexDigit).lowercased()

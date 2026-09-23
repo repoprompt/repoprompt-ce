@@ -2064,7 +2064,7 @@ final class MCPServerViewModel: ObservableObject {
         let parentRunID: UUID
         let childSessionIDs: Set<UUID>
         let startedAt: Date
-        let timeoutSeconds: TimeInterval?
+        let timeoutSeconds: TimeInterval
         let metadata: RequestMetadata
     }
 
@@ -2390,7 +2390,7 @@ final class MCPServerViewModel: ObservableObject {
     private func beginAgentRunWaitScope(
         metadata: RequestMetadata,
         sessionIDs: Set<UUID>,
-        timeoutSeconds: TimeInterval?
+        timeoutSeconds: TimeInterval
     ) async -> AgentRunWaitScopeRegistration? {
         guard !sessionIDs.isEmpty else { return nil }
         purgeStaleAgentRunWaitScopes(source: "begin")
@@ -2403,6 +2403,8 @@ final class MCPServerViewModel: ObservableObject {
             return nil
         }
         let token = UUID()
+        // The caller already froze its resolved wait; stale-scope purging must age against that
+        // same value rather than a preference that can change mid-wait.
         let scope = AgentRunWaitScope(
             token: token,
             parentRunID: parentRunID,
@@ -2415,7 +2417,7 @@ final class MCPServerViewModel: ObservableObject {
         for sessionID in sessionIDs {
             childAgentRunWaitCountsByParentRunID[parentRunID, default: [:]][sessionID, default: 0] += 1
         }
-        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds.map { String($0) } ?? "none") childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
+        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
         return AgentRunWaitScopeRegistration(token: token, parentRunID: parentRunID)
     }
 
@@ -2448,15 +2450,14 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private func purgeStaleAgentRunWaitScopes(now: Date = Date(), source: String) {
         let staleTokens = agentRunWaitScopesByToken.compactMap { token, scope -> UUID? in
-            let timeout = scope.timeoutSeconds ?? AgentRunMCPToolService.defaultWaitTimeoutSeconds
-            let maxAge = timeout + agentRunWaitScopeStaleGraceSeconds
+            let maxAge = scope.timeoutSeconds + agentRunWaitScopeStaleGraceSeconds
             return now.timeIntervalSince(scope.startedAt) > maxAge ? token : nil
         }
         for token in staleTokens {
             guard let scope = agentRunWaitScopesByToken.removeValue(forKey: token) else { continue }
             decrementAgentRunWaitScope(scope)
             let elapsed = now.timeIntervalSince(scope.startedAt)
-            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope stale purge source=\(source) parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) timeout=\(scope.timeoutSeconds.map { String($0) } ?? "default") childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
+            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope stale purge source=\(source) parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) timeout=\(scope.timeoutSeconds) childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
         }
     }
 
@@ -2651,7 +2652,7 @@ final class MCPServerViewModel: ObservableObject {
         func test_beginAgentRunWaitScope(
             metadata: RequestMetadata,
             sessionIDs: Set<UUID>,
-            timeoutSeconds: TimeInterval?
+            timeoutSeconds: TimeInterval
         ) async -> AgentRunWaitScopeRegistration? {
             await beginAgentRunWaitScope(
                 metadata: metadata,
@@ -6150,6 +6151,11 @@ final class MCPServerViewModel: ObservableObject {
         metadata: RequestMetadata,
         lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.ReadFileReply? {
+        guard Self.shouldAttemptSelectedGitArtifactRead(
+            requestedPath: requestedPath,
+            translatedLookupPath: translatedLookupPath
+        ) else { return nil }
+
         guard var resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: MCPWindowToolName.readFile
@@ -6221,6 +6227,33 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("start_line must be positive (1-based) or negative (tail-like behavior)")
         }
     }
+
+    private nonisolated static func shouldAttemptSelectedGitArtifactRead(
+        requestedPath: String,
+        translatedLookupPath: String
+    ) -> Bool {
+        // Advertised aliases retain the `_git_data/` prefix and absolute artifacts retain
+        // the same path component, so ordinary reads never need selected-artifact authorization.
+        [requestedPath, translatedLookupPath]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .contains {
+                $0 == "_git_data"
+                    || $0.hasPrefix("_git_data/")
+                    || $0.contains("/_git_data/")
+            }
+    }
+
+    #if DEBUG
+        nonisolated static func shouldAttemptSelectedGitArtifactReadForTesting(
+            requestedPath: String,
+            translatedLookupPath: String
+        ) -> Bool {
+            shouldAttemptSelectedGitArtifactRead(
+                requestedPath: requestedPath,
+                translatedLookupPath: translatedLookupPath
+            )
+        }
+    #endif
 
     private func isGitDataArtifactRequest(
         _ requestedPath: String,
@@ -6335,14 +6368,10 @@ final class MCPServerViewModel: ObservableObject {
             preparedContent = snapshot.preparedContent
             cacheHit = snapshot.cacheHit
         case let .external(externalFile):
-            do {
-                let full = try await readableService.readAlwaysReadableExternalFile(externalFile)
-                preparedContent = await WorkspaceInteractiveReadProcessor.prepareOffActor(full)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                throw MCPError.invalidParams("Cannot read '\(externalFile.displayPath)': \(error.localizedDescription)")
-            }
+            preparedContent = try await Self.prepareAlwaysReadableExternalFile(
+                externalFile,
+                readableService: readableService
+            )
             cacheHit = false
         }
         try Task.checkCancellation()
@@ -6407,6 +6436,31 @@ final class MCPServerViewModel: ObservableObject {
             file: WorkspaceFileRecord
         ) async throws -> WorkspaceInteractiveReadSnapshot? {
             try await workspaceContentLoad(store: store, file: file)
+        }
+    #endif
+
+    private nonisolated static func prepareAlwaysReadableExternalFile(
+        _ externalFile: WorkspaceExternalReadableFile,
+        readableService: WorkspaceReadableFileService
+    ) async throws -> WorkspaceInteractiveReadPreparedContent {
+        do {
+            let full = try await readableService.readAlwaysReadableExternalFile(externalFile)
+            return await WorkspaceInteractiveReadProcessor.prepareOffActor(full)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as ContentReadSchedulerError {
+            throw error
+        } catch {
+            throw MCPError.invalidParams("Cannot read '\(externalFile.displayPath)': \(error.localizedDescription)")
+        }
+    }
+
+    #if DEBUG
+        nonisolated static func prepareAlwaysReadableExternalFileThroughEnvelopeForTesting(
+            _ externalFile: WorkspaceExternalReadableFile,
+            readableService: WorkspaceReadableFileService
+        ) async throws -> WorkspaceInteractiveReadPreparedContent {
+            try await prepareAlwaysReadableExternalFile(externalFile, readableService: readableService)
         }
     #endif
 

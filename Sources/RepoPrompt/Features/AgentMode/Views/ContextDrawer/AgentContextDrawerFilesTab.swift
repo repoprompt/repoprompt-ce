@@ -57,6 +57,7 @@ struct AgentContextDrawerFilesTab: View {
     @ObservedObject var detailStore: AgentContextDrawerDetailStore
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
+    let renderSnapshot: AgentContextExportRenderSnapshot
     let isSwitchBlankingRows: Bool
 
     @ObservedObject var browseModel: AgentContextFileBrowseModel
@@ -73,7 +74,7 @@ struct AgentContextDrawerFilesTab: View {
     }
 
     private var isSwitchHidingRows: Bool {
-        isSwitchBlankingRows && !modelCoordinator.displayedModelMatches(exportContext.modelRequestIdentity)
+        isSwitchBlankingRows && !modelCoordinator.displayedModelMatches(renderSnapshot.modelRequestIdentity)
     }
 
     private var rows: [AgentContextExportRow] {
@@ -81,7 +82,7 @@ struct AgentContextDrawerFilesTab: View {
     }
 
     private var selectedContextCount: Int? {
-        let authoritativeRowCount = modelCoordinator.displayedModelMatches(exportContext.modelRequestIdentity)
+        let authoritativeRowCount = modelCoordinator.displayedModelMatches(renderSnapshot.modelRequestIdentity)
             ? modelCoordinator.rowSplit.rows.count
             : nil
         return presentedSelectedContextCount(
@@ -128,7 +129,7 @@ struct AgentContextDrawerFilesTab: View {
 
     private var displayedCountReadiness: AgentContextFileCodemapCountReadiness? {
         guard !isSwitchHidingRows else { return nil }
-        return modelCoordinator.displayedFileCodemapCountReadiness(for: exportContext.modelRequestIdentity)
+        return modelCoordinator.displayedFileCodemapCountReadiness(for: renderSnapshot.modelRequestIdentity)
     }
 
     private var fileSubtabCountReadiness: AgentContextCountReadiness {
@@ -233,7 +234,7 @@ struct AgentContextDrawerFilesTab: View {
             browseModel.applySelectionChange(change, exportRows: modelCoordinator.rowSplit.rows)
             handleSelectionChange(change, isVisible: true)
         }
-        .onChange(of: exportContext.modelRequestIdentity) { previousIdentity, currentIdentity in
+        .onChange(of: renderSnapshot.modelRequestIdentity) { previousIdentity, currentIdentity in
             guard !isSwitchBlankingRows else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
             guard agentContextFilesShouldResetModel(

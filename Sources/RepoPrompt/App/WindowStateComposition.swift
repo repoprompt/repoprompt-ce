@@ -11,6 +11,7 @@ struct WindowStateComposition {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -40,8 +41,10 @@ enum WindowStateCompositionFactory {
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) -> WindowStateComposition {
+        let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
@@ -90,6 +93,12 @@ enum WindowStateCompositionFactory {
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy
+        )
+        let routerSettingsViewModel = RouterSettingsViewModel(
+            settingsStore: settingsStore,
+            runtime: modelRouterRuntime,
+            apiSettingsViewModel: apiSettingsViewModel,
+            workspaceManager: workspaceManager
         )
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
             DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
@@ -173,7 +182,9 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore
+            applyEditsApprovalStore: applyEditsApprovalStore,
+            modelRouterSettingsStore: settingsStore,
+            modelRouterRuntime: modelRouterRuntime
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
@@ -224,6 +235,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 agentChatStressHarness: agentChatStressHarness,
@@ -245,6 +257,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 mcpServer: mcpServer,

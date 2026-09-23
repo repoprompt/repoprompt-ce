@@ -727,13 +727,27 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             let truncated = false
         }
 
+        struct TokenUsage: Encodable {
+            let run_id = "run-123"
+            let input_tokens = 120
+            let output_tokens = 30
+        }
+
         struct Turn: Encodable {
             let turn_index = 4
             let started_at = "2026-07-05T06:00:00Z"
             let request_text = "Find unfiled issues"
             let tool_call_summary = "file_search success ×2"
+            let run_ids = ["run-123"]
+            let token_usage = [TokenUsage()]
             let entries = [Entry()]
             let truncated = false
+        }
+
+        struct TokenUsageSummary: Encodable {
+            let provider_input_tokens = 120
+            let provider_output_tokens = 30
+            let attributed_run_count = 1
         }
 
         struct HistoryGetSession: Encodable {
@@ -744,6 +758,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             let returned_turn_start = 3
             let returned_turn_end = 5
             let truncated = true
+            let token_usage_summary = TokenUsageSummary()
             let turns = [Turn()]
         }
 
@@ -756,6 +771,9 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("**Turns**: 3–5 of 12"))
         XCTAssertTrue(text.contains("**Request**: Find unfiled issues"))
         XCTAssertTrue(text.contains("**Tools**: file_search success ×2"))
+        XCTAssertTrue(text.contains("**Provider tokens**: input 120, output 30 • attributed runs: 1"))
+        XCTAssertTrue(text.contains("**Run IDs**: run-123"))
+        XCTAssertTrue(text.contains("**Token usage** (`run-123`): input 120, output 30"))
         XCTAssertTrue(text.contains("**assistant** @ 2026-07-05T06:00:00Z: Candidate issue: missing smoke coverage"))
     }
 

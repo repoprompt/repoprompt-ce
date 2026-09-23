@@ -296,13 +296,15 @@ final class AgentModeRunService {
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
             launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
-            modelParameterSelections: selectedAgent == .cursor
-                ? ACPModelParameterResolver.effectiveSelections(
-                    providerID: .cursor,
+            // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
+            // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
+            modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
+                ACPModelParameterResolver.effectiveSelections(
+                    providerID: providerID,
                     selectedModelRaw: session.selectedModelRaw,
                     persistedSelections: session.acpModelParameterSelections
                 )
-                : []
+            } ?? []
         )
     }
 

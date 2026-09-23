@@ -83,6 +83,28 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         )
     }
 
+    func testConfigurationSequenceStopsAfterOwnershipChangesDuringAwaitedStep() async throws {
+        var isCurrent = true
+        var providerMutations: [String] = []
+
+        let completed = try await ACPIntegratedAgentModeRunner.testPerformConfigurationSequenceIfCurrent(
+            isCurrent: { isCurrent },
+            operations: [
+                {
+                    providerMutations.append("model")
+                    await Task.yield()
+                    isCurrent = false
+                },
+                {
+                    providerMutations.append("parameters")
+                }
+            ]
+        )
+
+        XCTAssertFalse(completed)
+        XCTAssertEqual(providerMutations, ["model"])
+    }
+
     func testModelParameterApplicationAcceptsAppliedAndAlreadyCurrentSelections() throws {
         let selection = ACPModelParameterSelection(
             providerID: .cursor,

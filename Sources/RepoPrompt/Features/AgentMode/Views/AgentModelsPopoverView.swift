@@ -203,6 +203,36 @@ struct AgentModelsPopoverView: View {
     }
 
     private var contextBuilderPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            contextBuilderModelTrigger
+            if let providerID = promptViewModel.contextBuilderAgent.acpProviderID {
+                // Captured target; `setContextBuilderModelParameter` re-checks it against live
+                // state (including the scope) before writing.
+                let expectedModelRaw = promptViewModel.contextBuilderAgentModelRaw
+                let expectedScope = editingScope
+                ACPModelParameterProbeView(
+                    modelRaw: expectedModelRaw,
+                    providerID: providerID,
+                    probeContext: .resolved(promptViewModel.activeWorkspaceRootPath),
+                    pinnedValueRaw: promptViewModel.contextBuilderThinkingParameterValueRaw
+                ) { configID, value in
+                    promptViewModel.setContextBuilderModelParameter(
+                        ACPModelParameterSelection.thinkingPin(
+                            configID: configID,
+                            valueRaw: value,
+                            providerID: providerID,
+                            modelRaw: expectedModelRaw
+                        ),
+                        expectedProviderID: providerID,
+                        expectedModelRaw: expectedModelRaw,
+                        expectedScope: expectedScope
+                    )
+                }
+            }
+        }
+    }
+
+    private var contextBuilderModelTrigger: some View {
         StableMenuButton(
             items: contextBuilderAgentModelMenuItems,
             triggerStyle: .plain
@@ -241,7 +271,8 @@ struct AgentModelsPopoverView: View {
         }
     }
 
-    private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
+    /// Internal so behavioral tests can invoke the same menu actions as the popover.
+    func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
@@ -249,18 +280,9 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: promptViewModel.contextBuilderAgent,
                 selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
             ) { selectedAgent, selectedOption in
-                let identity = currentOperationIdentity
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 promptViewModel.commitContextBuilderSettings()
-                DispatchQueue.main.async {
-                    guard let identity else { return }
-                    RecommendationApplyNotification.post(
-                        sourceWorkspaceID: identity.sourceWorkspaceID,
-                        agentModelsScope: identity.scope,
-                        includesPresetExposure: false
-                    )
-                }
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
@@ -375,6 +397,44 @@ struct AgentModelsPopoverView: View {
                     )
                 }
                 .layoutPriority(1)
+
+                if let providerID = resolution.effective.agent.acpProviderID {
+                    // Capture the write target at render time; the closure re-checks it against
+                    // LIVE host state before writing, so a stale menu (e.g. a scope switch while
+                    // it was open) cannot write to the old scope or a changed model.
+                    let expectedScope = editingScope
+                    let expectedModelRaw = resolution.effective.modelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(promptViewModel.activeWorkspaceRootPath),
+                        pinnedValueRaw: resolution.thinkingParameterValueRaw
+                    ) { configID, value in
+                        guard editingScope == expectedScope,
+                              let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                              live.effective.agent.acpProviderID == providerID,
+                              ACPModelParameterIdentity.canonicalBaseModelRaw(
+                                  live.effective.modelRaw,
+                                  providerID: providerID
+                              ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                                  expectedModelRaw,
+                                  providerID: providerID
+                              )
+                        else { return }
+                        MCPAgentRoleDefaultsService.setModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: live.effective.modelRaw
+                            ),
+                            for: live.role,
+                            displayed: live.effective,
+                            scope: editingScope
+                        )
+                        bumpRoleDefaults()
+                    }
+                }
             }
 
             roleDefaultPinState(for: resolution)
@@ -424,8 +484,7 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true,
-                groupOpenCode: false
+                flattenSingleCodexGroups: true
             ) { selectedAgent, selectedOption in
                 let selection = AgentModelCatalog.NormalizedAgentSelection(
                     agent: selectedAgent,

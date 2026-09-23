@@ -736,14 +736,18 @@ actor ACPAgentSessionController {
         settlePromptTurn(promptTurnID, result: .success(()))
     }
 
-    func setSessionModel(_ rawModel: String) async throws {
+    /// Apply a selected model. `forceRPC` bypasses the same-model no-op skip for providers that
+    /// only advertise model-scoped parameter metadata (e.g. OpenCode `effort`) *after* a model
+    /// set; callers with pending parameter selections pass `true` so the metadata is advertised
+    /// before the selections are applied.
+    func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
-            try await setSessionModelSerialized(rawModel)
+            try await setSessionModelSerialized(rawModel, forceRPC: forceRPC)
         }
     }
 
-    private func setSessionModelSerialized(_ rawModel: String) async throws {
+    private func setSessionModelSerialized(_ rawModel: String, forceRPC: Bool = false) async throws {
         guard let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
@@ -896,32 +900,7 @@ actor ACPAgentSessionController {
             {
                 return
             }
-            guard let sessionModelConfigOptionID else {
-                throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
-            }
-            guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
-                throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
-            }
-            let configValue = try canonicalSessionModelValue(mappedConfigValue)
-            if configValue != model {
-                log("Mapping selected model \(model) to ACP config value \(configValue)")
-            }
-            if discoveredSessionModels?.currentModelRaw == configValue {
-                return
-            }
-            let response = try await sendRequestResponse(
-                method: "session/set_config_option",
-                params: [
-                    "sessionId": sessionID,
-                    "configId": sessionModelConfigOptionID,
-                    "value": configValue
-                ]
-            )
-            try await applyVerifiedConfigOptionsMutationResponse(
-                response,
-                requiredModeValue: nil,
-                requiredModelValue: configValue
-            )
+            try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: forceRPC)
         }
     }
 
@@ -970,6 +949,99 @@ actor ACPAgentSessionController {
         publishDiscoveredSessionModelsIfGloballyAuthoritative(cleared)
     }
 
+    /// Discovers the model-scoped configuration a provider only advertises after a model
+    /// set (OpenCode's `effort` selector), by forcing one verified model-selector mutation
+    /// and returning the refreshed session snapshot.
+    ///
+    /// The forced RPC is the point: OpenCode's bootstrap `session/new` advertises only the
+    /// `model` and `mode` selectors, so skipping a "no-op" model set when the requested model
+    /// is already current would return bootstrap metadata unchanged and hide `effort`
+    /// entirely. The response flows through the same verified mutation path as interactive
+    /// selection — there is no second, unverified writer.
+    func discoverSessionModelParameters(for modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await discoverSessionModelParametersSerialized(modelRaw)
+        }
+    }
+
+    private func discoverSessionModelParametersSerialized(_ modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard state == .sessionOpen else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            throw ControllerError.requestFailed("ACP provider does not advertise a parameterized model picker.")
+        }
+        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            throw ControllerError.requestFailed("Session model parameter discovery requires a non-empty model.")
+        }
+        if let sessionModelFailureReason {
+            throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+        }
+        // Force the selector RPC even when the requested model is already current — see the
+        // doc comment on the public operation.
+        try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: true)
+        guard let snapshot = discoveredSessionModels,
+              let currentModelRaw = snapshot.currentModelRaw
+        else {
+            throw ControllerError.protocolViolation("Session model parameter discovery produced no session snapshot.")
+        }
+        // Never return metadata belonging to a different model than the one requested.
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(currentModelRaw, providerID: provider.providerID)
+            == ACPModelParameterIdentity.canonicalBaseModelRaw(model, providerID: provider.providerID)
+        else {
+            throw ControllerError.protocolViolation(
+                "Session model parameter discovery confirmed a different model than requested '\(model)'."
+            )
+        }
+        return snapshot
+    }
+
+    /// Sends one verified model-selector mutation over `session/set_config_option` using the
+    /// selector ID parsed from `session/new` (`sessionModelConfigOptionID`).
+    ///
+    /// `forceRPC: true` sends the selector RPC even when the requested value already matches
+    /// the session's current model. Interactive selection callers pass `false` to keep the
+    /// no-op fast path; model-parameter discovery passes `true` because providers like
+    /// OpenCode only advertise model-scoped config options (e.g. `effort`) in response to a
+    /// model set, so skipping the RPC would leave discovery blind.
+    private func setSessionModelViaConfigOptionsRPC(
+        _ model: String,
+        sessionID: String,
+        forceRPC: Bool
+    ) async throws {
+        guard let sessionModelConfigOptionID else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
+        }
+        guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
+        }
+        let configValue = try canonicalSessionModelValue(mappedConfigValue)
+        if configValue != model {
+            log("Mapping selected model \(model) to ACP config value \(configValue)")
+        }
+        if !forceRPC, discoveredSessionModels?.currentModelRaw == configValue {
+            return
+        }
+        let response = try await sendRequestResponse(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionID,
+                "configId": sessionModelConfigOptionID,
+                "value": configValue
+            ]
+        )
+        try await applyVerifiedConfigOptionsMutationResponse(
+            response,
+            requiredModeValue: nil,
+            requiredModelValue: configValue
+        )
+    }
+
     func setSessionMode(_ modeID: String) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
@@ -1005,15 +1077,31 @@ actor ACPAgentSessionController {
             }
             return $0.configID < $1.configID
         }
-        var applied: [ACPModelParameterSelection] = []
+        typealias PendingSelection = (
+            selection: ACPModelParameterSelection,
+            currentModelRaw: String,
+            definition: ACPModelParameterDefinition,
+            choice: ACPModelParameterChoice
+        )
+        var pending: [PendingSelection] = []
         var alreadyCurrent: [ACPModelParameterSelection] = []
         var skipped: [ACPModelParameterSelection] = []
+
+        // Resolve the complete batch before sending any parameter mutation. A stale or
+        // unsupported selection makes the run fail closed; applying earlier valid entries first
+        // would leave the provider partially configured even though no prompt is submitted.
         for selection in normalized {
             guard selection.providerID == provider.providerID,
                   let models = discoveredSessionModels,
                   let currentModel = models.currentModelRaw,
                   let parameterSet = models.modelParameterSets.first(where: {
-                      normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+                      ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          $0.baseModelRaw,
+                          providerID: provider.providerID
+                      ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                          currentModel,
+                          providerID: provider.providerID
+                      )
                   }),
                   let definition = parameterSet.definition(kind: selection.kind),
                   selection.identity == ACPModelParameterIdentity(
@@ -1028,31 +1116,40 @@ actor ACPAgentSessionController {
             }
             if definition.currentValueRaw == choice.rawValue {
                 alreadyCurrent.append(selection)
-                continue
+            } else {
+                pending.append((selection, currentModel, definition, choice))
             }
+        }
+
+        guard skipped.isEmpty else {
+            return .init(applied: [], alreadyCurrent: alreadyCurrent, skipped: skipped)
+        }
+
+        var applied: [ACPModelParameterSelection] = []
+        for resolved in pending {
             let response = try await sendRequestResponse(
                 method: "session/set_config_option",
                 params: [
                     "sessionId": sessionID,
-                    "configId": definition.configID,
-                    "value": choice.rawValue
+                    "configId": resolved.definition.configID,
+                    "value": resolved.choice.rawValue
                 ]
             )
             try await applyVerifiedConfigOptionsMutationResponse(
                 response,
                 requiredModeValue: nil,
                 requiredModelValue: nil,
-                requiredParameter: (definition.configID, choice.rawValue)
+                requiredParameter: (resolved.definition.configID, resolved.choice.rawValue)
             )
             applied.append(.init(
-                providerID: selection.providerID,
-                baseModelRaw: currentModel,
-                kind: selection.kind,
-                configID: definition.configID,
-                valueRaw: choice.rawValue
+                providerID: resolved.selection.providerID,
+                baseModelRaw: resolved.currentModelRaw,
+                kind: resolved.selection.kind,
+                configID: resolved.definition.configID,
+                valueRaw: resolved.choice.rawValue
             ))
         }
-        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: skipped)
+        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: [])
     }
 
     private func setSessionModeSerialized(_ modeID: String) async throws {
@@ -2052,15 +2149,27 @@ actor ACPAgentSessionController {
               let models = discoveredSessionModels,
               let currentModel = models.currentModelRaw,
               let parameterSet = models.modelParameterSets.first(where: {
-                  normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      $0.baseModelRaw,
+                      providerID: provider.providerID
+                  ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      currentModel,
+                      providerID: provider.providerID
+                  )
               })
         else {
-            throw ControllerError.requestFailed("Cursor model parameters are unavailable before prompt submission.")
+            throw ControllerError.requestFailed("Model parameters are unavailable before prompt submission.")
         }
         if let requestedModel = normalizedModelString(request.modelString),
-           normalizedCursorModelAlias(requestedModel) != normalizedCursorModelAlias(currentModel)
+           ACPModelParameterIdentity.canonicalBaseModelRaw(
+               requestedModel,
+               providerID: provider.providerID
+           ) != ACPModelParameterIdentity.canonicalBaseModelRaw(
+               currentModel,
+               providerID: provider.providerID
+           )
         {
-            throw ControllerError.requestFailed("Cursor model changed before prompt submission. Retry the requested configuration.")
+            throw ControllerError.requestFailed("Model changed before prompt submission. Retry the requested configuration.")
         }
         for selection in ACPModelParameterSelection.normalized(request.modelParameterSelections) {
             guard selection.identity == ACPModelParameterIdentity(
@@ -2073,7 +2182,7 @@ actor ACPAgentSessionController {
                 definition.currentValueRaw == choice.rawValue
             else {
                 throw ControllerError.requestFailed(
-                    "Cursor \(selection.kind.rawValue) selection is no longer current before prompt submission. Retry the requested configuration."
+                    "\(selection.kind.rawValue.capitalized) selection is no longer current before prompt submission. Retry the requested configuration."
                 )
             }
         }

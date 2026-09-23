@@ -486,6 +486,30 @@ struct AgentModelsSettingsView: View {
                         .cornerRadius(6)
                     }
 
+                    if let providerID = viewModel.selectedContextBuilderAgent.acpProviderID {
+                        let expectedScope = viewModel.editingScope
+                        let expectedModelRaw = viewModel.selectedContextBuilderModelRaw
+                        ACPModelParameterProbeView(
+                            modelRaw: expectedModelRaw,
+                            providerID: providerID,
+                            probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                            pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                            isEnabled: true
+                        ) { configID, value in
+                            viewModel.setContextBuilderModelParameter(
+                                ACPModelParameterSelection.thinkingPin(
+                                    configID: configID,
+                                    valueRaw: value,
+                                    providerID: providerID,
+                                    modelRaw: expectedModelRaw
+                                ),
+                                expectedProviderID: providerID,
+                                expectedModelRaw: expectedModelRaw,
+                                expectedScope: expectedScope
+                            )
+                        }
+                    }
+
                     Spacer(minLength: 0)
 
                     if viewModel.showsRecommendationActions,
@@ -627,6 +651,33 @@ struct AgentModelsSettingsView: View {
                     .cornerRadius(4)
                 }
                 .fixedSize()
+
+                if let providerID = resolution.effective.agent.acpProviderID {
+                    // Capture the write target at render time; the view model re-checks it against
+                    // LIVE state before writing, so a stale menu (a scope switch while it was
+                    // open leaves the discovery key identical) cannot write to the old scope.
+                    let expectedScope = viewModel.editingScope
+                    let expectedModelRaw = resolution.effective.modelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                        pinnedValueRaw: resolution.thinkingParameterValueRaw
+                    ) { configID, value in
+                        viewModel.setRoleModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            for: resolution.role,
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
+                        )
+                    }
+                }
             }
 
             let pinState = resolution.pinState

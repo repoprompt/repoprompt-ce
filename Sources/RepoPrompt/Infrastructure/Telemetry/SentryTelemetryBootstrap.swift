@@ -67,6 +67,14 @@ enum SentryTelemetryBootstrap {
                 }
             }
             started = true
+            // Same consent/DSN/environment gate and existing 20-breadcrumb ring.
+            // Synchronous recording preserves lifecycle order without spawning tasks.
+            MCPLifecycleDiagnostics.shared.setSink { event in
+                let breadcrumb = Breadcrumb(level: .info, category: "mcp.lifecycle")
+                breadcrumb.message = event.phase.rawValue
+                breadcrumb.data = event.data
+                SentrySDK.addBreadcrumb(breadcrumb)
+            }
         #endif
     }
 
@@ -99,6 +107,7 @@ enum SentryTelemetryBootstrap {
     @MainActor
     static func disableAndClose() {
         #if REPOPROMPT_SENTRY_ENABLED
+            MCPLifecycleDiagnostics.shared.setSink(nil)
             performanceTracingEnabled = false
             guard started else { return }
             SentrySDK.close()

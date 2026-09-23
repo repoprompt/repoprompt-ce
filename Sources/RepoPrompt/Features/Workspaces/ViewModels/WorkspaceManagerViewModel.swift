@@ -9249,24 +9249,37 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         guard !initialWorkspace.isEphemeral, let domainWorkspaceAuthorityClient else { return }
         let snapshot: DomainWorkspaceSnapshot?
+        var admissionDiagnostic: DomainWorkspaceTransitionDiagnostic?
         #if DEBUG
             if let agentAdmissionCanonicalSnapshotHandlerForTesting {
                 snapshot = await agentAdmissionCanonicalSnapshotHandlerForTesting(workspaceID)
             } else {
-                snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID)
+                let admission = await domainWorkspaceAuthorityClient.agentAdmissionSnapshot(workspaceID)
+                snapshot = admission.snapshot
+                admissionDiagnostic = admission.diagnostic
             }
         #else
-            snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID)
+            let admission = await domainWorkspaceAuthorityClient.agentAdmissionSnapshot(workspaceID)
+            snapshot = admission.snapshot
+            admissionDiagnostic = admission.diagnostic
         #endif
         try Task.checkCancellation()
         guard let snapshot,
               snapshot.health.acceptsMutations,
               snapshot.revisions.dirtyRevision == nil
         else {
+            let description = admissionDiagnostic?.rejectionDescription
+                ?? (
+                    snapshot == nil ? "Canonical workspace snapshot is unavailable for Agent admission."
+                        : snapshot?.health.acceptsMutations != true
+                        ? "Canonical workspace authority is not mutation-safe for Agent admission."
+                        : "Canonical workspace has unsaved changes; Agent admission remains blocked."
+                )
+            let evidence = admissionDiagnostic.map { " Canonical diagnostic: \($0.encodedEvidence)" } ?? ""
             throw NSError(
                 domain: "RepoPrompt.AgentAdmission",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Canonical workspace state is not ready for Agent admission."]
+                userInfo: [NSLocalizedDescriptionKey: description + evidence]
             )
         }
         let canonicalIdentityEnvelope = try JSONDecoder().decode(
@@ -13786,7 +13799,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURL: URL
     ) throws -> WorkspaceModel {
         _ = fileURL
-        return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+        #if DEBUG
+            return try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
+                try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+            }
+        #else
+            return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+        #endif
     }
 
     nonisolated static func loadWorkspaceFromFileResult(

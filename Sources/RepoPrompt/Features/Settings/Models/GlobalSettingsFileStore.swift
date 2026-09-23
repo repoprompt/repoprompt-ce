@@ -547,6 +547,12 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         var rawScalarPreferences = rawRoot["scalarPreferences"] as? [String: Any] ?? [:]
         if rawScalarPreferences["contextBuilder"] == nil || rawScalarPreferences["contextBuilder"] is NSNull {
             rawScalarPreferences["contextBuilder"] = knownContextBuilder
+        } else if let knownContextBuilder = knownContextBuilder as? [String: Any],
+                  let normalizedAnalysisTokenBudget = knownContextBuilder["analysisTokenBudget"]
+        {
+            var rawContextBuilder = rawScalarPreferences["contextBuilder"] as? [String: Any] ?? [:]
+            rawContextBuilder["analysisTokenBudget"] = normalizedAnalysisTokenBudget
+            rawScalarPreferences["contextBuilder"] = rawContextBuilder
         }
         var rawFileSystem = rawScalarPreferences["fileSystem"] as? [String: Any] ?? [:]
         rawFileSystem["globalIgnoreDefaults"] = knownGlobalIgnoreDefaults

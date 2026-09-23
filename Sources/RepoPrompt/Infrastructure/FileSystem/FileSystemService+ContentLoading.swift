@@ -65,8 +65,11 @@ private struct ContentReadRequest {
     let mode: ContentReadMode
     let workloadClass: ContentReadWorkloadClass
     let schedulerOwnerID: UUID
+    let cacheRevision: UInt64
     #if DEBUG
         let chunkReadHandler: (@Sendable (String) async -> Void)?
+        let cacheCommitHandler: (@Sendable () async -> Void)?
+        let diskReadRecorder: @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void
     #endif
 }
 
@@ -77,15 +80,26 @@ private enum ContentReadTelemetryOutcome: String {
 }
 
 private struct ContentReadResult {
-    let absolutePath: String
     let content: String?
     let detectedEncodingRawValue: UInt?
     let modificationDate: Date?
     let fingerprint: FileContentFingerprint?
+    let encodingCacheFingerprint: FileContentFingerprint?
     let telemetryOutcome: ContentReadTelemetryOutcome
 
     var detectedEncoding: String.Encoding? {
         detectedEncodingRawValue.map(String.Encoding.init(rawValue:))
+    }
+
+    func withEncodingCacheFingerprint(_ fingerprint: FileContentFingerprint?) -> Self {
+        Self(
+            content: content,
+            detectedEncodingRawValue: detectedEncodingRawValue,
+            modificationDate: modificationDate,
+            fingerprint: self.fingerprint,
+            encodingCacheFingerprint: fingerprint,
+            telemetryOutcome: telemetryOutcome
+        )
     }
 }
 
@@ -93,6 +107,78 @@ private struct RawContentReadResult {
     let data: Data
     let modificationDate: Date
     let fingerprint: FileContentFingerprint
+}
+
+/// Bridges cancellation across synchronous filesystem calls that cannot be interrupted.
+/// The lock protects the continuation, producer handle, and first terminal result; no
+/// continuation resume, task cancellation, suspension, or filesystem work occurs while locked.
+private final class CancellablePhysicalReadState<Value: Sendable>: @unchecked Sendable {
+    typealias Continuation = CheckedContinuation<Value, Error>
+
+    private let lock = NSLock()
+    private var continuation: Continuation?
+    private var producer: Task<Void, Never>?
+    private var terminalResult: Result<Value, Error>?
+
+    func install(_ continuation: Continuation) {
+        let resultToResume: Result<Value, Error>?
+        lock.lock()
+        if let terminalResult {
+            resultToResume = terminalResult
+        } else {
+            self.continuation = continuation
+            resultToResume = nil
+        }
+        lock.unlock()
+        resultToResume.map { continuation.resume(with: $0) }
+    }
+
+    func install(_ producer: Task<Void, Never>) {
+        let producerToCancel: Task<Void, Never>?
+        lock.lock()
+        if terminalResult == nil {
+            self.producer = producer
+            producerToCancel = nil
+        } else {
+            producerToCancel = producer
+        }
+        lock.unlock()
+        producerToCancel?.cancel()
+    }
+
+    func finish(_ result: Result<Value, Error>) {
+        let continuationToResume: Continuation?
+        lock.lock()
+        guard terminalResult == nil else {
+            producer = nil
+            lock.unlock()
+            return
+        }
+        terminalResult = result
+        continuationToResume = continuation
+        continuation = nil
+        producer = nil
+        lock.unlock()
+        continuationToResume?.resume(with: result)
+    }
+
+    func cancel() {
+        let continuationToResume: Continuation?
+        let producerToCancel: Task<Void, Never>?
+        lock.lock()
+        guard terminalResult == nil else {
+            lock.unlock()
+            return
+        }
+        terminalResult = .failure(CancellationError())
+        continuationToResume = continuation
+        producerToCancel = producer
+        continuation = nil
+        producer = nil
+        lock.unlock()
+        producerToCancel?.cancel()
+        continuationToResume?.resume(throwing: CancellationError())
+    }
 }
 
 struct FileContentPrefix {
@@ -111,6 +197,17 @@ private struct ValidatedContentFile {
     let fileSize: Int64
     let modificationDate: Date
     let fingerprint: FileContentFingerprint
+}
+
+enum FileSystemCatalogPathState: Equatable {
+    case regularFile
+    case directory
+    case missingOrOther
+}
+
+private struct PhysicalCatalogPathProbe {
+    let pathState: FileSystemCatalogPathState
+    let regularFileEligibility: CatalogRegularFileEligibility
 }
 
 private enum BoundedDataReadResult {
@@ -139,6 +236,8 @@ actor ContentReadAsyncLimiter {
             let activePermitCount: Int
             let queuedWaiterCount: Int
             let ownerLaneCount: Int
+            let activePermitCountsByWorkload: [String: Int]
+            let activePermitCountsByOwner: [UUID: Int]
             let cancellationCount: Int
             let grantCount: Int
             let overloadCount: Int
@@ -198,6 +297,9 @@ actor ContentReadAsyncLimiter {
     private var foregroundActivitiesByTokenID: [UUID: ContentReadForegroundActivityKind] = [:]
     private var waiterStates: [UUID: WaiterState] = [:]
     private var activePermitCountsByOwner: [UUID: Int] = [:]
+    #if DEBUG
+        private var activePermitCountsByWorkload: [String: Int] = [:]
+    #endif
     private var lastGrantOrdinalByOwner: [UUID: UInt64] = [:]
     private var nextEnqueueOrdinal: UInt64 = 0
     private var nextGrantOrdinal: UInt64 = 0
@@ -546,6 +648,16 @@ actor ContentReadAsyncLimiter {
             }
         }
         #if DEBUG
+            let workloadKey = acquisition.workloadClass.rawValue
+            if let activeCount = activePermitCountsByWorkload[workloadKey] {
+                if activeCount <= 1 {
+                    activePermitCountsByWorkload.removeValue(forKey: workloadKey)
+                } else {
+                    activePermitCountsByWorkload[workloadKey] = activeCount - 1
+                }
+            }
+        #endif
+        #if DEBUG
             assert(availablePermits < capacity, "Content read limiter over-release detected")
         #endif
         availablePermits = min(availablePermits + 1, capacity)
@@ -676,6 +788,9 @@ actor ContentReadAsyncLimiter {
             }
         }
         activePermitCountsByOwner[ownerID, default: 0] += 1
+        #if DEBUG
+            activePermitCountsByWorkload[workloadClass.rawValue, default: 0] += 1
+        #endif
         nextGrantOrdinal &+= 1
         lastGrantOrdinalByOwner[ownerID] = nextGrantOrdinal
         grantCount &+= 1
@@ -753,6 +868,8 @@ actor ContentReadAsyncLimiter {
                 activePermitCount: capacity - availablePermits,
                 queuedWaiterCount: waiterStates.count,
                 ownerLaneCount: ownerLaneCount,
+                activePermitCountsByWorkload: activePermitCountsByWorkload,
+                activePermitCountsByOwner: activePermitCountsByOwner,
                 cancellationCount: cancellationCount,
                 grantCount: grantCount,
                 overloadCount: overloadCount,
@@ -837,9 +954,12 @@ extension FileSystemService {
             fileSizeLimit: defaultContentReadFileSizeLimit,
             mode: .automatic,
             workloadClass: workloadClass,
-            schedulerOwnerID: UUID()
+            schedulerOwnerID: UUID(),
+            cacheRevision: 0
         )
-        let result = try await performContentReadOffActor(request)
+        let result = try await performCancellationResponsivePhysicalRead(request) {
+            try await readContentFromDisk(request)
+        }
         try Task.checkCancellation()
         return result.content
     }
@@ -858,7 +978,11 @@ extension FileSystemService {
         }
     #endif
 
-    func contentFingerprint(ofRelativePath relativePath: String) async throws -> FileContentFingerprint {
+    func contentFingerprint(
+        ofRelativePath relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .contentSearch,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> FileContentFingerprint {
         #if DEBUG
             contentFingerprintRequestCountForTesting += 1
         #endif
@@ -867,11 +991,218 @@ extension FileSystemService {
             chunkSize: 1_048_576,
             fileSizeLimit: 10_000_000,
             mode: .automatic,
-            workloadClass: .contentSearch
+            workloadClass: workloadClass,
+            schedulerOwnerID: schedulerOwnerID
         )
-        return try await Task.detached(priority: Task.currentPriority) {
-            try Self.validateContentFileForReading(request).fingerprint
-        }.value
+        #if DEBUG
+            let physicalReadHandler = contentPhysicalReadHandler
+        #endif
+        return try await Self.performCancellationResponsivePhysicalRead(request) {
+            #if DEBUG
+                try physicalReadHandler?()
+            #endif
+            return try Self.validateContentFileForReading(request).fingerprint
+        }
+    }
+
+    /// Exact-file resolution performs the same potentially blocking metadata and
+    /// symlink checks as content loading. Keeping those checks behind the physical
+    /// worker boundary lets a cancelled provider settle without releasing the real
+    /// producer's limiter admission before the filesystem call returns.
+    func cancellationResponsiveRegularFileExistsOnDisk(
+        relativePath: String,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> Bool {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Search.contentFreshnessRootEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(rootToken: diagnosticRootToken.uuidString)
+        )
+        var outcome = "missing"
+        defer {
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.contentFreshnessRootReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(outcome: outcome, rootToken: diagnosticRootToken.uuidString)
+            )
+        }
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: 1,
+            fileSizeLimit: .max,
+            mode: .automatic,
+            workloadClass: .interactiveRead,
+            schedulerOwnerID: schedulerOwnerID
+        )
+        #if DEBUG
+            let physicalReadHandler = contentPhysicalReadHandler
+        #endif
+        do {
+            _ = try await Self.performCancellationResponsivePhysicalRead(request) {
+                #if DEBUG
+                    try physicalReadHandler?()
+                #endif
+                return try Self.validateContentFileForReading(request)
+            }
+            outcome = "current"
+            return true
+        } catch is CancellationError {
+            outcome = "cancelled"
+            throw CancellationError()
+        } catch let error as ContentReadSchedulerError {
+            outcome = "overloaded"
+            throw error
+        } catch {
+            return false
+        }
+    }
+
+    /// Bare relative-path resolution probes every visible root for ambiguity. A slow
+    /// metadata lookup in a root without a catalog record must not pin that root's actor
+    /// or prevent the cancelled provider from settling while the syscall finishes.
+    func cancellationResponsiveCatalogRegularFileEligibility(
+        relativePath: String,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> CatalogRegularFileEligibility {
+        let request: ContentReadRequest
+        do {
+            request = try makeContentReadRequest(
+                cacheKey: relativePath,
+                chunkSize: 1,
+                fileSizeLimit: .max,
+                mode: .automatic,
+                workloadClass: .interactiveRead,
+                schedulerOwnerID: schedulerOwnerID
+            )
+        } catch {
+            return .ineligible(.invalidRelativePath)
+        }
+        #if DEBUG
+            let physicalReadHandler = contentPhysicalReadHandler
+        #endif
+        let physicalEligibility = try await Self.performCancellationResponsivePhysicalRead(request) {
+            #if DEBUG
+                try physicalReadHandler?()
+            #endif
+            return Self.physicalCatalogPathProbe(request).regularFileEligibility
+        }
+        guard physicalEligibility == .eligible else { return physicalEligibility }
+        try Task.checkCancellation()
+
+        let isIgnored: Bool = if enableHierarchicalIgnores {
+            await isIgnoredHierarchical(relativePath: request.relativePath, isDirectory: false)
+                || isIgnoredPrefixCheck(relativePath: request.relativePath)
+        } else {
+            isIgnoredPrefixCheck(relativePath: request.relativePath)
+        }
+        try Task.checkCancellation()
+        return isIgnored ? .ineligible(.ignored) : .eligible
+    }
+
+    func cancellationResponsiveCatalogRegularFileEligibilityWithPolicy(
+        relativePath: String,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> (
+        eligibility: CatalogRegularFileEligibility,
+        policyIdentity: WorkspaceRootCatalogPolicyIdentity,
+        ignoreRulesRevision: UInt64
+    ) {
+        while true {
+            let startingPolicyIdentity = catalogPolicyIdentity
+            let startingIgnoreRulesRevision = ignoreRulesRevision
+            let eligibility = try await cancellationResponsiveCatalogRegularFileEligibility(
+                relativePath: relativePath,
+                schedulerOwnerID: schedulerOwnerID
+            )
+            try Task.checkCancellation()
+            guard startingPolicyIdentity == catalogPolicyIdentity,
+                  startingIgnoreRulesRevision == ignoreRulesRevision
+            else { continue }
+            return (eligibility, startingPolicyIdentity, startingIgnoreRulesRevision)
+        }
+    }
+
+    func cancellationResponsiveCatalogPathState(
+        relativePath: String,
+        schedulerOwnerID: UUID? = nil
+    ) async throws -> FileSystemCatalogPathState {
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: 1,
+            fileSizeLimit: .max,
+            mode: .automatic,
+            workloadClass: .interactiveRead,
+            schedulerOwnerID: schedulerOwnerID
+        )
+        #if DEBUG
+            let physicalReadHandler = contentPhysicalReadHandler
+        #endif
+        return try await Self.performCancellationResponsivePhysicalRead(request) {
+            #if DEBUG
+                try physicalReadHandler?()
+            #endif
+            return Self.physicalCatalogPathProbe(request).pathState
+        }
+    }
+
+    private nonisolated static func physicalCatalogPathProbe(
+        _ request: ContentReadRequest
+    ) -> PhysicalCatalogPathProbe {
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: request.absolutePath, isDirectory: &isDirectory) else {
+            return PhysicalCatalogPathProbe(
+                pathState: .missingOrOther,
+                regularFileEligibility: .ineligible(.missingOrDirectory)
+            )
+        }
+        let url = URL(fileURLWithPath: request.absolutePath)
+        if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+            if values.isSymbolicLink == true {
+                return PhysicalCatalogPathProbe(
+                    pathState: .missingOrOther,
+                    regularFileEligibility: .ineligible(.symbolicLink)
+                )
+            }
+            if !isDirectory.boolValue, values.isRegularFile == false {
+                return PhysicalCatalogPathProbe(
+                    pathState: .missingOrOther,
+                    regularFileEligibility: .ineligible(.nonRegularFile)
+                )
+            }
+        }
+        if request.skipSymlinks,
+           pathContainsSymlinkComponent(
+               request.relativePath,
+               rootURL: URL(fileURLWithPath: request.standardizedRootPath)
+           )
+        {
+            return PhysicalCatalogPathProbe(
+                pathState: .missingOrOther,
+                regularFileEligibility: .ineligible(.symlinkComponent)
+            )
+        }
+
+        let canonicalPath = url.resolvingSymlinksInPath().path
+        let canonicalPrefix = request.canonicalRootPath.hasSuffix("/")
+            ? request.canonicalRootPath
+            : request.canonicalRootPath + "/"
+        guard canonicalPath == request.canonicalRootPath || canonicalPath.hasPrefix(canonicalPrefix) else {
+            return PhysicalCatalogPathProbe(
+                pathState: .missingOrOther,
+                regularFileEligibility: .ineligible(.outsideCanonicalRoot)
+            )
+        }
+        if isDirectory.boolValue {
+            return PhysicalCatalogPathProbe(
+                pathState: .directory,
+                regularFileEligibility: .ineligible(.missingOrDirectory)
+            )
+        }
+        return PhysicalCatalogPathProbe(
+            pathState: .regularFile,
+            regularFileEligibility: .eligible
+        )
     }
 
     func loadValidatedContent(
@@ -900,7 +1231,6 @@ extension FileSystemService {
         else {
             throw FileContentValidationError.fingerprintChanged
         }
-        commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
         return ValidatedFileContentSnapshot(
             content: result.content,
             detectedEncodingRawValue: result.detectedEncodingRawValue,
@@ -1054,7 +1384,6 @@ extension FileSystemService {
             contentLoadOutcome = "cancelled"
             throw error
         }
-        commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
         contentLoadOutcome = result.telemetryOutcome.rawValue
         return result.content
     }
@@ -1181,7 +1510,6 @@ extension FileSystemService {
             contentLoadOutcome = "cancelled"
             throw error
         }
-        commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
         contentLoadOutcome = result.telemetryOutcome.rawValue
         return result.content
     }
@@ -1235,7 +1563,9 @@ extension FileSystemService {
                 mode: mode,
                 workloadClass: workloadClass,
                 schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken,
-                chunkReadHandler: contentReadChunkHandler
+                cacheRevision: contentReadCacheRevision,
+                chunkReadHandler: contentReadChunkHandler,
+                cacheCommitHandler: contentReadCacheCommitHandler
             )
         #else
             return Self.assembleContentReadRequest(
@@ -1249,7 +1579,8 @@ extension FileSystemService {
                 fileSizeLimit: fileSizeLimit,
                 mode: mode,
                 workloadClass: workloadClass,
-                schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken
+                schedulerOwnerID: schedulerOwnerID ?? diagnosticRootToken,
+                cacheRevision: contentReadCacheRevision
             )
         #endif
     }
@@ -1267,7 +1598,11 @@ extension FileSystemService {
             mode: ContentReadMode,
             workloadClass: ContentReadWorkloadClass,
             schedulerOwnerID: UUID,
-            chunkReadHandler: (@Sendable (String) async -> Void)? = nil
+            cacheRevision: UInt64,
+            chunkReadHandler: (@Sendable (String) async -> Void)? = nil,
+            cacheCommitHandler: (@Sendable () async -> Void)? = nil,
+            diskReadRecorder: @escaping @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void = MCPToolWorkCountDiagnostics
+                .readFileDiskReadRecorder()
         ) -> ContentReadRequest {
             ContentReadRequest(
                 cacheKey: cacheKey,
@@ -1281,7 +1616,10 @@ extension FileSystemService {
                 mode: mode,
                 workloadClass: workloadClass,
                 schedulerOwnerID: schedulerOwnerID,
-                chunkReadHandler: chunkReadHandler
+                cacheRevision: cacheRevision,
+                chunkReadHandler: chunkReadHandler,
+                cacheCommitHandler: cacheCommitHandler,
+                diskReadRecorder: diskReadRecorder
             )
         }
     #else
@@ -1296,7 +1634,8 @@ extension FileSystemService {
             fileSizeLimit: Int64,
             mode: ContentReadMode,
             workloadClass: ContentReadWorkloadClass,
-            schedulerOwnerID: UUID
+            schedulerOwnerID: UUID,
+            cacheRevision: UInt64
         ) -> ContentReadRequest {
             ContentReadRequest(
                 cacheKey: cacheKey,
@@ -1309,7 +1648,8 @@ extension FileSystemService {
                 fileSizeLimit: fileSizeLimit,
                 mode: mode,
                 workloadClass: workloadClass,
-                schedulerOwnerID: schedulerOwnerID
+                schedulerOwnerID: schedulerOwnerID,
+                cacheRevision: cacheRevision
             )
         }
     #endif
@@ -1330,11 +1670,16 @@ extension FileSystemService {
             EditFlowPerf.Dimensions(workloadClass: request.workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
         )
         do {
-            let result = try await Self.performContentReadOffActor(
-                request,
-                expectedFingerprint: expectedFingerprint,
-                requirePostReadValidation: requirePostReadValidation
-            )
+            let result = try await Self.performCancellationResponsivePhysicalRead(request) {
+                let result = try await Self.readContentFromDisk(
+                    request,
+                    expectedFingerprint: expectedFingerprint,
+                    requirePostReadValidation: requirePostReadValidation
+                )
+                try Task.checkCancellation()
+                await self.commitContentReadResultIfCurrent(result, request: request)
+                return result
+            }
             EditFlowPerf.end(
                 EditFlowPerf.Stage.FileSystem.contentReadOffActorAwait,
                 offActorState,
@@ -1370,63 +1715,28 @@ extension FileSystemService {
         }
     }
 
-    private func commitContentReadResultIfCurrent(_ result: ContentReadResult, cacheKey: String) {
+    private func commitContentReadResultIfCurrent(
+        _ result: ContentReadResult,
+        request: ContentReadRequest
+    ) {
+        guard !Task.isCancelled else { return }
         guard let detectedEncoding = result.detectedEncoding,
               let fingerprint = result.fingerprint
         else { return }
         let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
 
-        guard (try? FileContentFingerprintReader.fingerprint(atPath: result.absolutePath)) == fingerprint else { return }
-        encodingMap[cacheKey] = detectedEncoding
+        guard result.encodingCacheFingerprint == fingerprint else { return }
+        guard request.cacheRevision == contentReadCacheRevision else { return }
+        encodingMap[request.cacheKey] = detectedEncoding
     }
 
     private nonisolated static func performContentPrefixReadOffActor(
         _ request: ContentReadRequest,
         maximumBytes: Int
     ) async throws -> FileContentPrefix? {
-        let workerPriority = Task.currentPriority
-        return try await contentReadWorkerLimiter.withPermit(
-            workloadClass: request.workloadClass,
-            ownerID: request.schedulerOwnerID
-        ) {
-            try await withThrowingTaskGroup(of: FileContentPrefix?.self) { group in
-                group.addTask(priority: workerPriority) {
-                    try await readContentPrefixFromDisk(request, maximumBytes: maximumBytes)
-                }
-                guard let result = try await group.next() else {
-                    throw CancellationError()
-                }
-                group.cancelAll()
-                return result
-            }
-        }
-    }
-
-    private nonisolated static func performContentReadOffActor(
-        _ request: ContentReadRequest,
-        expectedFingerprint: FileContentFingerprint? = nil,
-        requirePostReadValidation: Bool = false
-    ) async throws -> ContentReadResult {
-        let workerPriority = Task.currentPriority
-        return try await contentReadWorkerLimiter.withPermit(
-            workloadClass: request.workloadClass,
-            ownerID: request.schedulerOwnerID
-        ) {
-            try await withThrowingTaskGroup(of: ContentReadResult.self) { group in
-                group.addTask(priority: workerPriority) {
-                    try await readContentFromDisk(
-                        request,
-                        expectedFingerprint: expectedFingerprint,
-                        requirePostReadValidation: requirePostReadValidation
-                    )
-                }
-                guard let result = try await group.next() else {
-                    throw CancellationError()
-                }
-                group.cancelAll()
-                return result
-            }
+        try await performCancellationResponsivePhysicalRead(request) {
+            try await readContentPrefixFromDisk(request, maximumBytes: maximumBytes)
         }
     }
 
@@ -1434,24 +1744,83 @@ extension FileSystemService {
         _ request: ContentReadRequest,
         expectedFingerprint: FileContentFingerprint?
     ) async throws -> RawContentReadResult {
-        let workerPriority = Task.currentPriority
-        return try await contentReadWorkerLimiter.withPermit(
+        try await performCancellationResponsivePhysicalRead(request) {
+            try await readRawContentFromDisk(
+                request,
+                expectedFingerprint: expectedFingerprint
+            )
+        }
+    }
+
+    private nonisolated static func performCancellationResponsivePhysicalRead<Value: Sendable>(
+        _ request: ContentReadRequest,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await withCancellationResponsivePhysicalReadPermit(
             workloadClass: request.workloadClass,
-            ownerID: request.schedulerOwnerID
-        ) {
-            try await withThrowingTaskGroup(of: RawContentReadResult.self) { group in
-                group.addTask(priority: workerPriority) {
-                    try await readRawContentFromDisk(
-                        request,
-                        expectedFingerprint: expectedFingerprint
-                    )
+            schedulerOwnerID: request.schedulerOwnerID,
+            priority: Task.currentPriority,
+            operation: operation
+        )
+    }
+
+    nonisolated static func withCancellationResponsivePhysicalReadPermit<Value: Sendable>(
+        workloadClass: ContentReadWorkloadClass,
+        schedulerOwnerID: UUID,
+        priority: TaskPriority,
+        beforeProducerInstallForTesting: (@Sendable () -> Void)? = nil,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let state = CancellablePhysicalReadState<Value>()
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+        #endif
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                state.install(continuation)
+                let producer = Task.detached(priority: priority) {
+                    let result: Result<Value, Error>
+                    do {
+                        let admittedOperation: @Sendable () async throws -> Value = {
+                            if workloadClass == .interactiveRead {
+                                return try await contentReadWorkerLimiter.withForegroundActivity(
+                                    kind: .interactiveRead,
+                                    operation
+                                )
+                            }
+                            return try await operation()
+                        }
+                        let value = try await EditFlowPerf.$currentLifecycleCorrelation.withValue(lifecycleCorrelation) {
+                            #if DEBUG
+                                try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag
+                                    .withValue(benchmarkMetricTag) {
+                                        try await contentReadWorkerLimiter.withPermit(
+                                            workloadClass: workloadClass,
+                                            ownerID: schedulerOwnerID
+                                        ) { try await admittedOperation() }
+                                    }
+                            #else
+                                try await contentReadWorkerLimiter.withPermit(
+                                    workloadClass: workloadClass,
+                                    ownerID: schedulerOwnerID
+                                ) { try await admittedOperation() }
+                            #endif
+                        }
+                        result = .success(value)
+                    } catch {
+                        result = .failure(error)
+                    }
+                    state.finish(result)
                 }
-                guard let result = try await group.next() else {
-                    throw CancellationError()
-                }
-                group.cancelAll()
-                return result
+                #if DEBUG
+                    beforeProducerInstallForTesting?()
+                #endif
+                state.install(producer)
             }
+        } onCancel: {
+            state.cancel()
         }
     }
 
@@ -1536,11 +1905,11 @@ extension FileSystemService {
             if hasAlwaysBinaryExtension(request.relativePath), !requirePostReadValidation {
                 workerBodyOutcome = ContentReadTelemetryOutcome.unavailable.rawValue
                 return ContentReadResult(
-                    absolutePath: request.absolutePath,
                     content: nil,
                     detectedEncodingRawValue: nil,
                     modificationDate: nil,
                     fingerprint: nil,
+                    encodingCacheFingerprint: nil,
                     telemetryOutcome: .unavailable
                 )
             }
@@ -1551,7 +1920,8 @@ extension FileSystemService {
                 throw FileContentValidationError.fingerprintChanged
             }
             workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
-            MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+            recordReadFileDiskRead(
+                request,
                 bytes: workerBodyFileBytes ?? 0,
                 decodeMicroseconds: 0
             )
@@ -1569,14 +1939,25 @@ extension FileSystemService {
                     requireStableIdentity: requirePostReadValidation
                 )
             }
+            var postReadFingerprint: FileContentFingerprint?
+            if requirePostReadValidation || result.detectedEncoding != nil {
+                postReadFingerprint = try? FileContentFingerprintReader.fingerprint(atPath: request.absolutePath)
+            }
+            #if DEBUG
+                if result.detectedEncoding != nil,
+                   postReadFingerprint != nil,
+                   let cacheCommitHandler = request.cacheCommitHandler
+                {
+                    await cacheCommitHandler()
+                }
+            #endif
             if requirePostReadValidation {
-                let postReadFingerprint = try FileContentFingerprintReader.fingerprint(atPath: request.absolutePath)
                 guard postReadFingerprint == validated.fingerprint else {
                     throw FileContentValidationError.fingerprintChanged
                 }
             }
             workerBodyOutcome = result.telemetryOutcome.rawValue
-            return result
+            return result.withEncodingCacheFingerprint(postReadFingerprint)
         } catch {
             workerBodyOutcome = error is CancellationError ? "cancelled" : "failed"
             throw error
@@ -1637,6 +2018,21 @@ extension FileSystemService {
         Int(clamping: max(0, fileSize))
     }
 
+    private nonisolated static func recordReadFileDiskRead(
+        _ request: ContentReadRequest,
+        bytes: Int,
+        decodeMicroseconds: Int
+    ) {
+        #if DEBUG
+            request.diskReadRecorder(bytes, decodeMicroseconds)
+        #else
+            MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+                bytes: bytes,
+                decodeMicroseconds: decodeMicroseconds
+            )
+        #endif
+    }
+
     private nonisolated static func readAutomaticContent(
         _ request: ContentReadRequest,
         validated: ValidatedContentFile,
@@ -1681,7 +2077,8 @@ extension FileSystemService {
             let decodeStart = DispatchTime.now().uptimeNanoseconds
             let detected = try decodeSmallFileData(data)
             let decodeEnd = DispatchTime.now().uptimeNanoseconds
-            MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+            recordReadFileDiskRead(
+                request,
                 bytes: 0,
                 decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
             )
@@ -1690,11 +2087,11 @@ extension FileSystemService {
                 handle,
                 validated: validated,
                 result: ContentReadResult(
-                    absolutePath: request.absolutePath,
                     content: detected.string,
                     detectedEncodingRawValue: detected.encoding.rawValue,
                     modificationDate: validated.modificationDate,
                     fingerprint: validated.fingerprint,
+                    encodingCacheFingerprint: nil,
                     telemetryOutcome: .loaded
                 ),
                 required: requireStableIdentity
@@ -1802,7 +2199,8 @@ extension FileSystemService {
         let decodeStart = DispatchTime.now().uptimeNanoseconds
         let decodedContent = String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
         let decodeEnd = DispatchTime.now().uptimeNanoseconds
-        MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+        recordReadFileDiskRead(
+            request,
             bytes: 0,
             decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
         )
@@ -1810,11 +2208,11 @@ extension FileSystemService {
             handle,
             validated: validated,
             result: ContentReadResult(
-                absolutePath: request.absolutePath,
                 content: decodedContent,
                 detectedEncodingRawValue: encoding.rawValue,
                 modificationDate: validated.modificationDate,
                 fingerprint: validated.fingerprint,
+                encodingCacheFingerprint: nil,
                 telemetryOutcome: .loaded
             ),
             required: requireStableIdentity
@@ -1927,11 +2325,11 @@ extension FileSystemService {
         telemetryOutcome: ContentReadTelemetryOutcome = .unavailable
     ) -> ContentReadResult {
         ContentReadResult(
-            absolutePath: request.absolutePath,
             content: content,
             detectedEncodingRawValue: nil,
             modificationDate: validated.modificationDate,
             fingerprint: validated.fingerprint,
+            encodingCacheFingerprint: nil,
             telemetryOutcome: telemetryOutcome
         )
     }
@@ -2313,70 +2711,57 @@ extension FileSystemService {
     }
 
     private nonisolated static func performEncodingDetectionOffActor(_ request: ContentReadRequest) async throws -> String.Encoding {
-        let workerPriority = Task.currentPriority
-        return try await contentReadWorkerLimiter.withPermit(
-            workloadClass: request.workloadClass,
-            ownerID: request.schedulerOwnerID
-        ) {
-            try await withThrowingTaskGroup(of: String.Encoding.self) { group in
-                group.addTask(priority: workerPriority) {
-                    let workerBodyState = EditFlowPerf.begin(
-                        EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
-                        EditFlowPerf.Dimensions(
-                            workloadClass: request.workloadClass.rawValue,
-                            contentSource: "disk"
-                        )
+        try await performCancellationResponsivePhysicalRead(request) {
+            let workerBodyState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+                EditFlowPerf.Dimensions(
+                    workloadClass: request.workloadClass.rawValue,
+                    contentSource: "disk"
+                )
+            )
+            var workerBodyOutcome = "failed"
+            var workerBodyFileBytes: Int?
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+                    workerBodyState,
+                    EditFlowPerf.Dimensions(
+                        outcome: workerBodyOutcome,
+                        fileBytes: workerBodyFileBytes,
+                        workloadClass: request.workloadClass.rawValue,
+                        contentSource: "disk"
                     )
-                    var workerBodyOutcome = "failed"
-                    var workerBodyFileBytes: Int?
-                    defer {
-                        EditFlowPerf.end(
-                            EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
-                            workerBodyState,
-                            EditFlowPerf.Dimensions(
-                                outcome: workerBodyOutcome,
-                                fileBytes: workerBodyFileBytes,
-                                workloadClass: request.workloadClass.rawValue,
-                                contentSource: "disk"
-                            )
-                        )
-                    }
-                    do {
-                        try Task.checkCancellation()
-                        let validated = try validateContentFileForReading(request)
-                        workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
-                        let handle = try openValidatedContentHandle(
-                            request,
-                            validated: validated,
-                            requireStableIdentity: false
-                        )
-                        defer { try? handle.close() }
-                        switch try await readBoundedData(request, handle: handle) {
-                        case let .data(data):
-                            _ = try validateOpenContentHandle(
-                                handle,
-                                validated: validated,
-                                result: noEncodingContentReadResult(request, validated: validated, content: nil),
-                                required: false
-                            )
-                            workerBodyOutcome = "loaded"
-                            return detectFileEncoding(in: data)
-                        case .tooLarge:
-                            workerBodyOutcome = "oversized"
-                            throw FileSystemError.fileTooLarge
-                        }
-                    } catch {
-                        if error is CancellationError {
-                            workerBodyOutcome = "cancelled"
-                        }
-                        throw error
-                    }
+                )
+            }
+            do {
+                try Task.checkCancellation()
+                let validated = try validateContentFileForReading(request)
+                workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
+                let handle = try openValidatedContentHandle(
+                    request,
+                    validated: validated,
+                    requireStableIdentity: false
+                )
+                defer { try? handle.close() }
+                switch try await readBoundedData(request, handle: handle) {
+                case let .data(data):
+                    _ = try validateOpenContentHandle(
+                        handle,
+                        validated: validated,
+                        result: noEncodingContentReadResult(request, validated: validated, content: nil),
+                        required: false
+                    )
+                    workerBodyOutcome = "loaded"
+                    return detectFileEncoding(in: data)
+                case .tooLarge:
+                    workerBodyOutcome = "oversized"
+                    throw FileSystemError.fileTooLarge
                 }
-                guard let encoding = try await group.next() else {
-                    throw CancellationError()
+            } catch {
+                if error is CancellationError {
+                    workerBodyOutcome = "cancelled"
                 }
-                group.cancelAll()
-                return encoding
+                throw error
             }
         }
     }

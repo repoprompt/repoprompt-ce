@@ -32,15 +32,6 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
-    private struct StaleModelParameterSelectionError: LocalizedError {
-        let selections: [ACPModelParameterSelection]
-
-        var errorDescription: String? {
-            let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
-            return "The selected model settings are stale or unsupported for this ACP session: \(values). Refresh the model settings and try again."
-        }
-    }
-
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -628,11 +619,15 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.persistence.scheduleSave(session)
                 hooks.bindingObservation.updateBindings(session)
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try Self.validateModelParameterApplicationReport(parameterReport)
-                await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                guard try await configureControllerForRun(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
+                }
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
                 if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
@@ -709,11 +704,15 @@ final class ACPIntegratedAgentModeRunner {
                     return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
                 }
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
-                try Self.validateModelParameterApplicationReport(parameterReport)
-                await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                guard try await configureControllerForRun(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
+                }
 
                 if let deferredLease {
                     let acquired = await deferredLease.acquire()
@@ -892,10 +891,61 @@ final class ACPIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
     }
 
+    private func configureControllerForRun(
+        session: AgentTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest
+    ) async throws -> Bool {
+        let isCurrent = { [self] in
+            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                && session.acpController === controller
+        }
+        return try await Self.performConfigurationSequenceIfCurrent(
+            isCurrent: isCurrent,
+            operations: [
+                { [self] in
+                    try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                },
+                {
+                    let report = try await controller.applySessionModelParameterSelections(
+                        runRequest.modelParameterSelections
+                    )
+                    try report.validateNoSkippedSelections()
+                },
+                {
+                    await controller.setAutoApproveAllToolPermissions(
+                        runRequest.autoApproveAllToolPermissions
+                    )
+                },
+                { [self] in
+                    try await applyRequestedSessionModeIfNeeded(
+                        runRequest.sessionModeID,
+                        controller: controller
+                    )
+                }
+            ]
+        )
+    }
+
+    /// Configuration calls can suspend on provider RPCs. Re-check ownership before and after
+    /// every step so an attempt superseded during one response cannot continue with later writes.
+    private static func performConfigurationSequenceIfCurrent(
+        isCurrent: () -> Bool,
+        operations: [() async throws -> Void]
+    ) async throws -> Bool {
+        for operation in operations {
+            guard isCurrent() else { return false }
+            try await operation()
+            guard isCurrent() else { return false }
+        }
+        return true
+    }
+
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
-        controller: ACPAgentSessionController,
-        runID: UUID
+        controller: ACPAgentSessionController
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
@@ -914,7 +964,15 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
-        try await controller.setSessionModel(model)
+        // OpenCode advertises model-scoped parameter metadata (`effort`) only after a real model
+        // set. When a pin is inherited, the ordinary same-model no-op skip would leave `effort`
+        // unadvertised, the pin would land in `skipped`, and validation would throw before the
+        // prompt. Force the selector RPC for OpenCode whenever selections are pending; other ACP
+        // providers keep the skip. Covers fresh and continue runs (shared helper).
+        try await controller.setSessionModel(
+            model,
+            forceRPC: runRequest.agentKind == .openCode && !runRequest.modelParameterSelections.isEmpty
+        )
     }
 
     private static func explicitSelectedModel(
@@ -1803,7 +1861,17 @@ final class ACPIntegratedAgentModeRunner {
         static func testValidateModelParameterApplicationReport(
             _ report: ACPModelParameterApplicationReport
         ) throws {
-            try validateModelParameterApplicationReport(report)
+            try report.validateNoSkippedSelections()
+        }
+
+        static func testPerformConfigurationSequenceIfCurrent(
+            isCurrent: () -> Bool,
+            operations: [() async throws -> Void]
+        ) async throws -> Bool {
+            try await performConfigurationSequenceIfCurrent(
+                isCurrent: isCurrent,
+                operations: operations
+            )
         }
 
         static func testExplicitSelectedModel(
@@ -1813,14 +1881,6 @@ final class ACPIntegratedAgentModeRunner {
             try explicitSelectedModel(agentKind: agentKind, modelString: modelString)
         }
     #endif
-
-    private static func validateModelParameterApplicationReport(
-        _ report: ACPModelParameterApplicationReport
-    ) throws {
-        guard report.skipped.isEmpty else {
-            throw StaleModelParameterSelectionError(selections: report.skipped)
-        }
-    }
 
     // MARK: - Provider Stream Tool Event Handling
 

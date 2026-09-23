@@ -275,8 +275,13 @@ struct WorkspaceReadableFileService {
         let chunkSize = Self.externalReadChunkSize
         let workRecorder = MCPToolWorkCountDiagnostics.readFileExternalRecorder()
         let beforeExternalReadOpenHook = beforeExternalReadOpenForTesting
+        let schedulerOwnerID = UUID()
         try Task.checkCancellation()
-        let readTask = Task.detached(priority: .userInitiated) {
+        return try await FileSystemService.withCancellationResponsivePhysicalReadPermit(
+            workloadClass: .interactiveRead,
+            schedulerOwnerID: schedulerOwnerID,
+            priority: .userInitiated
+        ) {
             try Task.checkCancellation()
             let homeDirectoryURL = URL(fileURLWithPath: homeDirectoryPath)
             let normalizedPath = AgentSupportDirectoryCatalog.normalizedPath(for: path)
@@ -356,11 +361,6 @@ struct WorkspaceReadableFileService {
             )
             return decoded
         }
-        return try await withTaskCancellationHandler(operation: {
-            try await readTask.value
-        }, onCancel: {
-            readTask.cancel()
-        })
     }
 
     func resolveAlwaysReadableExternalFile(atAbsolutePath path: String) -> WorkspaceExternalReadableFile? {

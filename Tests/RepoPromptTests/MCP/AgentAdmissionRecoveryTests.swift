@@ -144,6 +144,55 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testCanonicalDirtyAdmissionErrorIncludesEvidenceAndDoesNotMaskLaterFailure() async throws {
+            let fixture = try await makeFixture()
+            await fixture.manager.debugDrainScheduledSaves()
+            var edited = fixture.workspaceA
+            edited.currentPromptText = "diagnostic-private-prompt"
+            let before = await fixture.client.canonicalWorkspaceSnapshot(edited.id)
+            let update = try await fixture.client.replaceWorking(
+                edited, fileURL: fixture.workspaceAURL, expectedWorkspaceRevision: before?.revisions.workingRevision
+            )
+            XCTAssertEqual(update.disposition, .applied)
+            var invoked = false
+            do {
+                _ = try await fixture.manager.withAgentSessionAdmission(
+                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true
+                ) { invoked = true }
+                XCTFail("Dirty canonical state must reject admission")
+            } catch {
+                let error = error as NSError
+                XCTAssertEqual(error.domain, "RepoPrompt.AgentAdmission")
+                XCTAssertEqual(error.code, 2)
+                XCTAssertTrue(error.localizedDescription.contains("unsaved changes"))
+                let json = try XCTUnwrap(error.localizedDescription.components(separatedBy: " Canonical diagnostic: ").last)
+                let evidence = try JSONDecoder().decode(DomainWorkspaceTransitionDiagnostic.self, from: Data(json.utf8))
+                XCTAssertEqual(evidence.revisions, update.after)
+                XCTAssertEqual(evidence.admissionState, .dirtyWithoutLiveSave)
+                XCTAssertEqual(evidence.dirtyOrigin?.operationID, update.operationID)
+                for secret in [edited.name, fixture.workspaceAURL.path, "diagnostic-private-prompt"] {
+                    XCTAssertFalse(error.localizedDescription.contains(secret))
+                }
+            }
+            XCTAssertFalse(invoked)
+            let save = try await fixture.client.save(
+                edited, fileURL: fixture.workspaceAURL, expectedWorkspaceRevision: update.after?.workingRevision,
+                expectedContentDigest: update.resultingDigest
+            )
+            XCTAssertNil(save.after?.dirtyRevision)
+            do {
+                _ = try await fixture.manager.withAgentSessionAdmission(
+                    workspaceID: edited.id, admissionID: UUID(), refreshCanonicalState: true
+                ) { throw NSError(domain: "LaterRoutingBoundary", code: 91) }
+                XCTFail("Expected the distinct later failure")
+            } catch {
+                XCTAssertEqual((error as NSError).domain, "LaterRoutingBoundary")
+                XCTAssertEqual((error as NSError).code, 91)
+            }
+            let trace = await fixture.client.store.transitionDiagnostics(edited.id)
+            XCTAssertEqual(trace.last?.transition, .admissionPassed)
+        }
+
         func testDurableAdmissionDecisionUsesExactCommitBoundary() {
             let authority = AgentSessionLifecycleAuthority()
             let workspaceID = UUID()

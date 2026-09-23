@@ -45,6 +45,9 @@ struct OpenCodeAgentConfig {
     /// Controls best-effort cleanup of legacy persistent RepoPrompt-managed OpenCode entries.
     let cleanupLegacyPersistentConfig: Bool
     let toolProfile: ToolProfile
+    /// Model-parameter selections (e.g. OpenCode thinking level) captured at run admission
+    /// and applied by the headless provider before prompting.
+    let modelParameterSelections: [ACPModelParameterSelection]
 
     var sessionModeID: String {
         toolProfile.sessionModeID
@@ -58,7 +61,8 @@ struct OpenCodeAgentConfig {
         includeRepoPromptMCPServer: Bool = true,
         includeManagedConfigOverlay: Bool = true,
         cleanupLegacyPersistentConfig: Bool = true,
-        toolProfile: ToolProfile = .headless
+        toolProfile: ToolProfile = .headless,
+        modelParameterSelections: [ACPModelParameterSelection] = []
     ) {
         self.commandName = commandName
         self.additionalPathHints = additionalPathHints
@@ -68,5 +72,6 @@ struct OpenCodeAgentConfig {
         self.includeManagedConfigOverlay = includeManagedConfigOverlay
         self.cleanupLegacyPersistentConfig = cleanupLegacyPersistentConfig
         self.toolProfile = toolProfile
+        self.modelParameterSelections = modelParameterSelections
     }
 }

@@ -47,4 +47,33 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"), "GPT-5.1 Codex Max")
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max High"), "GPT-5.1 Codex Max")
     }
+
+    func testClaudeCodePickerExposesOpus55WithSupportedEfforts() throws {
+        let models = AIModel.modelsForProvider(.claudeCode)
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-opus-5-5")))
+        XCTAssertEqual(
+            ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5-5:xhigh"),
+            .claudeCodeModel(specifier: "claude-opus-5-5:xhigh")
+        )
+        XCTAssertNil(ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5-5:ultra"))
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        let group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-5-5" })
+        XCTAssertEqual(group.displayName, "Opus 5.5")
+        XCTAssertEqual(group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), [
+            "claude-opus-5-5:low",
+            "claude-opus-5-5:medium",
+            "claude-opus-5-5:high",
+            "claude-opus-5-5:xhigh",
+            "claude-opus-5-5:max"
+        ])
+
+        XCTAssertEqual(AgentModel(rawValue: "claude-opus-5-5"), .claudeOpus55)
+        XCTAssertEqual(AgentModel.claudeOpus55.contextWindowTokens, 1_000_000)
+        XCTAssertTrue(AgentModel.claudeOpus55.isExtendedContext)
+        XCTAssertEqual(
+            BestPracticeProfiles.claudeCodeOpusRecommendationLabel,
+            "Claude Opus via Claude Code's stable Opus alias (Opus 5.5 on the Anthropic API)"
+        )
+    }
 }

@@ -63,6 +63,10 @@ struct DomainWorkspaceAuthorityClient {
         await store.canonicalWorkspaceSnapshot(workspaceID)
     }
 
+    func agentAdmissionSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceAdmissionSnapshot {
+        await store.agentAdmissionSnapshot(workspaceID)
+    }
+
     /// Awaited read-registration seam for current app state. Unlike create/replace/save, this is
     /// transient and therefore also supports ephemeral and focused-test workspaces.
     func registerForRead(

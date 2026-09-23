@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptShared
 import SwiftUI
 
 enum CodexHookApprovalWorkspaceSetting: CaseIterable, Hashable {
@@ -164,6 +165,8 @@ struct AgentModeGeneralSettingsView: View {
                 tab: .agentModels
             )
 
+            subAgentSupervisionCard
+
             providersLinkRow
 
             providerCleanupActionCard
@@ -215,6 +218,57 @@ struct AgentModeGeneralSettingsView: View {
     }
 
     // MARK: - Provider cleanup
+
+    private var subAgentSupervisionCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Sub-Agent Supervision")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Picker("Default subagent wait", selection: subagentDefaultWaitBinding) {
+                    ForEach(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds, id: \.self) { seconds in
+                        Text(subagentDefaultWaitMenuLabel(for: seconds)).tag(seconds)
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .accessibilityLabel("Default subagent wait")
+
+                Text("Shorter waits allow more frequent progress checks. Longer waits reduce routine model calls. Completion, questions, and your steering can end a wait early.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Agents can choose shorter or longer waits for individual tasks.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private func subagentDefaultWaitMenuLabel(for seconds: Int) -> String {
+        let minutes = seconds / 60
+        if seconds == Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) {
+            return "\(minutes) min (default)"
+        }
+        return "\(minutes) min"
+    }
+
+    private var subagentDefaultWaitBinding: Binding<Int> {
+        Binding(
+            get: { globalSettings.subagentDefaultWaitSeconds() },
+            set: { globalSettings.setSubagentDefaultWaitSeconds($0) }
+        )
+    }
 
     private var providerCleanupActionCard: some View {
         VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {

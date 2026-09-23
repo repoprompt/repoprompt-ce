@@ -93,12 +93,12 @@ Collect results before proceeding:
 \(example(variant,
 	mcp: """
 ```json
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<id_1>","<id_2>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<id_1>","<id_2>"]}}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id_1>","<id_2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id_1>","<id_2>"]'
 ```
 """))
 
@@ -283,7 +283,7 @@ Only parallelize when items have **zero file overlap**. When in doubt, run seque
 - 🚫 Implementing refactorings yourself — you are the coordinator; dispatch agents to do the work
 - 🚫 Dispatching all items at once without verifying each one — refactorings compound; verify before proceeding
 - 🚫 Parallelizing items that share files — sequential is safer for dependent refactorings
-- 🚫 Forgetting to check on dispatched agents — they may block on permission approvals; poll periodically to keep them unblocked
+- 🚫 Forgetting to check on dispatched agents — they may block on permission approvals; use `op=wait` with the configured subagent wait when there is no useful independent work
 - 🚫 Assuming you understand the code structure without \(builderName)'s architectural analysis\(variant == .cli ? "\n- 🚫 **CLI:** Forgetting to pass `-w <window_id>` – CLI invocations are stateless and require explicit window targeting" : "")
 """
 	}

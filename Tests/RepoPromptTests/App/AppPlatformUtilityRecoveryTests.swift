@@ -13,6 +13,53 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertTrue(managerRanOnMainThread)
     }
 
+    func testPassiveAppcastPredicateRunsOnMainActorFromDetachedCaller() async throws {
+        let suiteName = "PassiveAppcastActorTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let now = Date(timeIntervalSince1970: 1234)
+
+        let (callerWasOnMainThread, predicateWasOnMainThread) = await Task.detached {
+            let callerWasOnMainThread = Thread.isMainThread
+            // Leave isolation contextual: an explicit @MainActor closure would mask
+            // a regression that removes the helper parameter's actor annotation.
+            let predicateWasOnMainThread = await SparkleUpdaterManager.performPassiveAppcastCheck(
+                check: { Thread.isMainThread },
+                now: now,
+                defaults: defaults
+            )
+            return (callerWasOnMainThread, predicateWasOnMainThread)
+        }.value
+
+        XCTAssertFalse(callerWasOnMainThread)
+        XCTAssertTrue(predicateWasOnMainThread)
+        XCTAssertEqual(defaults.double(forKey: SparkleUpdaterManager.debugLastCheckKey), now.timeIntervalSince1970)
+    }
+
+    func testPassiveAppcastCheckRecordsTimestampOnlyAfterSuccess() async throws {
+        let suiteName = "PassiveAppcastSettlementTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let key = SparkleUpdaterManager.debugLastCheckKey
+        let previousCheck = 1234.0
+        let now = Date(timeIntervalSince1970: 5678)
+
+        for succeeds in [false, true] {
+            defaults.set(previousCheck, forKey: key)
+            let result = await SparkleUpdaterManager.performPassiveAppcastCheck(
+                check: {
+                    XCTAssertEqual(defaults.double(forKey: key), previousCheck)
+                    return succeeds
+                },
+                now: now,
+                defaults: defaults
+            )
+
+            XCTAssertEqual(result, succeeds)
+            XCTAssertEqual(defaults.double(forKey: key), succeeds ? now.timeIntervalSince1970 : previousCheck)
+        }
+    }
+
     func testSparkleUpdaterStartDecisionKeepsDiscoveryAvailableDuringIdentityMigrationBlock() {
         XCTAssertEqual(
             SparkleUpdaterManager.startDecision(

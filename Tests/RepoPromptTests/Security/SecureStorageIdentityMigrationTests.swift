@@ -426,12 +426,14 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         let migrationAccounts = SecureStorageAccountCatalog.identityMigrationV2Accounts
         let runtimeAccounts = SecureStorageAccountCatalog.allAccounts
         XCTAssertEqual(migrationAccounts.count, 24)
-        XCTAssertEqual(runtimeAccounts.count, 26)
+        XCTAssertFalse(migrationAccounts.contains(.jevRouterAPIKey))
+        XCTAssertTrue(runtimeAccounts.contains(.jevRouterAPIKey))
+        XCTAssertEqual(runtimeAccounts.count, 27)
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionAntigravityDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionAntigravityDocument))
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionDevinDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionDevinDocument))
-        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog())
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog())
 
         let manifest = SecureStorageIdentityMigrationManifest(
             version: SecureStorageIdentityMigrationManifest.currentVersion,
@@ -693,14 +695,26 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertNil(SecureStorageIdentityMigrationBootstrap.configuredPhase(from: 1))
     }
 
-    func testPreparerCatalogGateRejectsDriftFromFrozenMigrationCatalog() {
-        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+    func testPreparerCatalogGateAllowsNewRuntimeAccountsButRejectsMissingOrDuplicateIdentifiers() {
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
             currentAccounts: [.openAIAPI],
             migrationAccounts: [.openAIAPI]
         ))
-        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
             currentAccounts: [.openAIAPI, .anthropicAPI],
             migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.anthropicAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.openAIAPI, .openAIAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.openAIAPI],
+            migrationAccounts: [.openAIAPI, .openAIAPI]
         ))
     }
 

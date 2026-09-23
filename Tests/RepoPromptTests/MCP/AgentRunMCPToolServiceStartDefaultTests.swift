@@ -108,6 +108,29 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         XCTAssertEqual(defaultLabel, .pair)
     }
 
+    func testRouterOwnedStartKeepsRoleSemanticsWithoutResolvingChildModelPin() {
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: nil,
+                defaultTaskLabel: .pair
+            ),
+            .pair
+        )
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "explore",
+                defaultTaskLabel: .pair
+            ),
+            .explore
+        )
+        XCTAssertNil(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "claudeCode:unavailable-stale-model",
+                defaultTaskLabel: .pair
+            )
+        )
+    }
+
     private func makeBindingService(
         defaults: UserDefaults,
         secureStore: AgentPermissionSecureStore? = nil

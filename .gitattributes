@@ -1,2 +1,6 @@
 # Preserve upstream Sparkle distribution bytes, including upstream header whitespace.
 Vendor/Sparkle/** -whitespace
+
+# Preserve exact upstream Codex voice license bytes, including legacy whitespace.
+ThirdPartyLicenses/codex/VOICE-LGPL-2.1.txt -whitespace
+ThirdPartyLicenses/codex/VOICE-proxy-libintl.txt -whitespace

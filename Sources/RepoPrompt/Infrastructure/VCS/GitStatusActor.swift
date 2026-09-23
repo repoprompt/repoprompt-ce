@@ -647,7 +647,7 @@ actor GitStatusActor {
                 scope: scope,
                 selectedAbsolutePaths: selectedAbs,
                 repoURL: repoURL,
-                useCache: !forceRefreshSnapshot
+                allowCachedResult: !forceRefreshSnapshot
             )
             return result.text.isEmpty ? nil : result.text
         } catch {

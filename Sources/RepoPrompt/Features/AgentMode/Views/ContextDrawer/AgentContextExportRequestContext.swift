@@ -6,6 +6,17 @@ struct AgentContextSelectionMutationTarget {
     let expectedSelection: StoredSelection
 }
 
+/// One immutable projection for a selected-files SwiftUI render transaction.
+///
+/// Constructing the export source resolves persistent worktree-binding authority. Keeping the
+/// source and its derived values together lets one body evaluation reuse that resolution without
+/// caching authority across mutations or event-handler transactions.
+struct AgentContextExportRenderSnapshot {
+    let source: AgentContextExportSource
+    let selectionSummary: AgentContextSelectionSummary
+    let modelRequestIdentity: AgentSelectedFilesModelIdentity
+}
+
 @MainActor
 struct AgentContextExportViewContext {
     typealias LookupContextProvider = @MainActor (
@@ -51,9 +62,7 @@ struct AgentContextExportViewContext {
     }
 
     var selectionSummary: AgentContextSelectionSummary {
-        AgentContextExportResolver.selectionSummary(
-            for: makeExportSource(flushPendingUI: false).selection
-        )
+        makeRenderSnapshot().selectionSummary
     }
 
     var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
@@ -62,19 +71,31 @@ struct AgentContextExportViewContext {
     }
 
     var modelRequestIdentity: AgentSelectedFilesModelIdentity {
-        makeModelRequest(flushPendingUI: false).identity
+        makeRenderSnapshot().modelRequestIdentity
     }
 
-    func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
+    func makeRenderSnapshot(flushPendingUI: Bool = false) -> AgentContextExportRenderSnapshot {
         let source = makeExportSource(flushPendingUI: flushPendingUI)
         let cfg = promptManager.resolvePromptContext()
         let filePathDisplay = promptManager.filePathDisplayOption
-        return AgentSelectedFilesModelRequest(
-            identity: AgentSelectedFilesModelIdentity(
+        return AgentContextExportRenderSnapshot(
+            source: source,
+            selectionSummary: AgentContextExportResolver.selectionSummary(for: source.selection),
+            modelRequestIdentity: AgentSelectedFilesModelIdentity(
                 exportContextIdentity: source.exportContextIdentity,
                 filePathDisplay: filePathDisplay,
                 codeMapUsage: cfg.codeMapUsage
-            ),
+            )
+        )
+    }
+
+    func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
+        let renderSnapshot = makeRenderSnapshot(flushPendingUI: flushPendingUI)
+        let source = renderSnapshot.source
+        let cfg = promptManager.resolvePromptContext()
+        let filePathDisplay = promptManager.filePathDisplayOption
+        return AgentSelectedFilesModelRequest(
+            identity: renderSnapshot.modelRequestIdentity,
             source: source,
             store: promptManager.workspaceFileContextStore,
             filePathDisplay: filePathDisplay,

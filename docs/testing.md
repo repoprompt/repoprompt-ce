@@ -53,6 +53,132 @@ make dev-provider-test
 
 A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted root-test workflow discovers one current root XCTest population through `swift test list`, counts methods per suite, assigns every discovered suite to one of four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. Root CI has no contract/integration tier split or contributor-maintained registry; provider-package tests remain a separate lane.
 
+## Workspace projection decode diagnostics
+
+This is a bounded, opt-in diagnostic, not a cache or a CI timing gate. It calls
+the production `WorkspaceManagerViewModel.decodeDomainWorkspaceProjection`
+boundary on MainActor, including JSON decoding and both existing compose-tab
+normalization passes. Default decoding, normalization, and persistence are
+unchanged. The harness owns 1, 5, or 20 value consumers; it does not create
+windows, activate workspaces, save documents, or start the app.
+
+### Protocol fixed before measurement
+
+Protocol version: 1. Normalization instrumentation version: 1 (independent of
+the document's schema version). Fixtures contain only generated data with fixed
+UUIDs, timestamps, field order, and text. Counts are usage hypotheses, not
+verified production percentiles. No padding or transcript sidecars are used.
+
+| Workload | Compose/stashed tabs | Selected paths per tab | Presets | Prompt bytes per tab |
+| --- | ---: | ---: | ---: | ---: |
+| ordinary | 2/0 | 20 | 2 | 2048 |
+| busy | 10/5 | 100 | 10 | 8192 |
+| large | 25/20 | 250 | 20 | 16384 |
+
+Tabs include expanded folders and selection slices; presets include selections.
+The harness reports the exact encoded input sizes. Modern fixtures explicitly
+supply IDs and dates. Legacy missing-field normalization generates IDs/dates and
+is tested separately, not silently made deterministic or changed for this run.
+
+For every workload and N = 1, 5, 20, collect all four scenarios (36 cells):
+
+1. `newRevision`: fresh consumers receive revision 1.
+2. `changedDigest`: establish revision 1 outside measurement, then deliver 2.
+3. `dirtySequence`: establish 1, then deliver distinct revisions 2, 3, 4, 5
+   without writing/changing the shared URL or any disk metadata.
+4. `failureCorrection`: establish 1, deliver malformed JSON, then valid revision
+   2 at that same URL. Failed decode leaves the consumer's previous value intact.
+
+The helper accepts bytes rather than authoritative revisions; reported revisions
+are fixture provenance. Failure is injected at this presentation boundary because
+domain metadata validation can reject malformed JSON before it reaches the UI.
+Each delivery finishes synchronously before the next begins: no sleeps, polling,
+wall-clock deadlines, or random schedules. Consumers are serialized by MainActor,
+as the current presentation bridge serializes this synchronous work.
+
+Five warmups per cell precede 30 retained trials, in three blocks of ten. Rotate
+cell order in each block. Fixture construction, encoding, baseline establishment,
+memory reads, correctness assertions, and output serialization are outside timed
+decode intervals. Keep the hardware, toolchain, build, power state, and competing
+load comparable. Never run another build during collection.
+
+Record raw decode attempts/successes/failures, normalization invocations/mutations,
+total and p50/p95 attempt wall time, normalization time (nested, not additive),
+MainActor occupied wall time, and delivery-loop wall time. Current expected counts
+per trial are N/2N decodes/normalizations for the first two scenarios, 4N/8N for
+dirty values, and 2N attempts/N failures/2N normalizations for correction. These
+are diagnostic expectations of the current implementation, not permanent tests
+requiring duplicate work. No timing threshold is asserted by XCTest.
+
+Report cache entries/bytes as zero (there is no projection decode cache), separately
+from peak/settled consumer value counts and serialized-size-equivalent retained
+bytes. The latter is a documented proxy, **not heap allocation accounting**; Swift
+copy-on-write sharing and allocator retention prevent inferring heap use from JSON
+size. Snapshot process RSS, physical footprint, and CPU before/after each scenario
+and after clearing consumers. Process memory peaks are boundary-sampled lower
+bounds, not allocation high-water marks. Memory observation is outside timing.
+The process CPU interval includes correctness checks and counter reads, so it is
+not decoder-only CPU. Diagnostic retained bytes use sample count times the fixed
+sample stride, excluding Array spare capacity and the recorder's lock/object.
+
+Reports contain only numeric provenance, fixed scenario/workload enums, counters,
+and durations. The recorder has a hard 128-attempt capacity, counts dropped
+attempts, has no global registration, and retains no bytes, paths, errors, names,
+document hashes, or user UUIDs. Task-local scopes expire on return/throw. A trial
+with overflow, missing data, count/output mismatches, or nonfinite timing is invalid;
+fail the diagnostic rather than discarding slow/invalid trials. Retain failure
+status and the conductor log; reruns are separate campaigns.
+
+### Decision gate
+
+Evaluate only after completing the matrix:
+
+- Proportional: equivalent decode counts grow with N, and aggregate decode time
+  divided by N times the one-consumer time is between 0.75 and 1.25 at both 5 and
+  20 consumers for the same workload/scenario.
+- Material: on a justified realistic workload, p95 decode/normalization MainActor
+  occupation reaches 16.7 ms per publication, redundant work beyond one decode
+  contributes at least 8 ms, and decoding accounts for at least 25% of complete
+  presentation projection occupation.
+- Both conditions, optimized measurements, and workload realism evidence are
+  required before designing a cache. Duplicate counts alone are insufficient.
+
+This first-stage helper harness deliberately excludes bridge snapshot acquisition,
+digest/self-echo skips, UI application, task queueing, and full window retention.
+Conductor's current root test lane uses Debug. Consequently its report always
+marks the optimization gate `inconclusive`: it cannot establish optimized cost,
+the fraction of complete presentation time, or production workload prevalence.
+Do not compare these Debug numbers against Release responsiveness thresholds.
+Follow-up optimized integration evidence must include those missing boundaries
+before authorizing a shared bounded cache. If either condition is false, do not
+cache; investigate the measured dominant path instead.
+
+### Entry point and cleanup
+
+Run correctness coverage normally:
+
+```sh
+make dev-test FILTER=RepoPromptTests.WorkspaceProjectionDecodeTests
+```
+
+Opt in to the finite diagnostic through the existing conductor scale-test flag:
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test \
+  --filter RepoPromptTests.WorkspaceProjectionDecodeTests/testMeasurementMatrix \
+  --async --request-key issue-1041-decode-matrix
+./conductor job wait --request-key issue-1041-decode-matrix
+```
+
+The harness emits `WORKSPACE_DECODE_MATRIX` JSON records to the conductor log:
+one record per cell, including all 30 trial summaries, and a final decision record.
+This bounds retained evidence without introducing a production export surface or
+another executable. Keep logs outside the repository or in ignored build artifacts;
+never commit raw test/conductor output. The harness clears values and scoped
+recorders at each trial; it makes no preference changes and creates no files.
+Unrelated test-runner output is not a privacy-safe shareable report: extract only
+the typed matrix records. Ordinary test runs skip the diagnostic unless opted in.
+
 ## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.

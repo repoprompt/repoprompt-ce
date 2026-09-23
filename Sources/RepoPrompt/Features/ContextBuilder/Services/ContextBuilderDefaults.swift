@@ -29,6 +29,13 @@ enum ContextBuilderDefaults {
     /// Default selected-context budget for plan, review, and question runs
     static let analysisTokenBudget: Int = 120_000
 
+    /// Supported persisted/UI range for plan, review, and question token budgets.
+    static let analysisTokenBudgetRange: ClosedRange<Int> = 40000 ... 200_000
+
+    static func normalizedAnalysisTokenBudget(_ value: Int) -> Int {
+        min(max(value, analysisTokenBudgetRange.lowerBound), analysisTokenBudgetRange.upperBound)
+    }
+
     // MARK: - Enhancement Mode
 
     /// Default prompt enhancement mode

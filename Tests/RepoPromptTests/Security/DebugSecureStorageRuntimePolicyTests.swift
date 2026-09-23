@@ -45,7 +45,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             marker: "debug-apple-development",
             debugMarker: "keychain",
             signingInfo: debug,
-            expectedDomain: .appleDevelopmentDebug
+            expectedDomain: .appleDevelopmentDebug,
+            expectedAppleDevelopmentTeamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier
         )
 
         XCTAssertTrue(
@@ -67,8 +68,45 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         )
         XCTAssertTrue(
             SecureKeyValueStorageFactory.selection(
-                for: RuntimeSecureStorageDecision(domain: .appleDevelopmentDebug, rejectionReason: nil)
+                for: RuntimeSecureStorageDecision(
+                    domain: .appleDevelopmentDebug,
+                    rejectionReason: nil,
+                    appleDevelopmentTeamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier
+                )
             ).backend === KeychainService.debugShared
+        )
+    }
+
+    func testPersonalAppleDevelopmentIdentityUsesTeamIsolatedPersistentStorage() {
+        let teamIdentifier = "9S455R5DTM"
+        let signingInfo = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier,
+            teamIdentifier: teamIdentifier,
+            validatedDomains: [.appleDevelopmentDebug]
+        )
+        let decision = RuntimeCodeSigningPolicy.decision(
+            signingModeMarker: "debug-apple-development",
+            debugStorageMarker: "keychain",
+            signingInfo: signingInfo
+        )
+
+        XCTAssertEqual(
+            decision,
+            RuntimeSecureStorageDecision(
+                domain: .appleDevelopmentDebug,
+                rejectionReason: nil,
+                appleDevelopmentTeamIdentifier: teamIdentifier
+            )
+        )
+        let backend = SecureKeyValueStorageFactory.selection(for: decision).backend
+        XCTAssertTrue(backend.persistsValuesAcrossLaunches)
+        XCTAssertEqual(
+            (backend as? KeychainService)?.serviceName,
+            KeychainService.appleDevelopmentDebugServiceName(teamIdentifier: teamIdentifier)
+        )
+        XCTAssertNotEqual(
+            (backend as? KeychainService)?.serviceName,
+            KeychainService.debugServiceName
         )
     }
 
@@ -266,7 +304,7 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
 
     func testCompileTimeTrustAnchorsIncludeExpectedCertificateClasses() {
         XCTAssertEqual(RuntimeCodeSigningPolicy.developerIDBundleIdentifier, "com.pvncher.repoprompt.ce")
-        XCTAssertEqual(RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier, "com.pvncher.repoprompt.ce.debug")
+        XCTAssertEqual(RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier, "com.repoprompt.ce.debug")
         XCTAssertEqual(RuntimeCodeSigningPolicy.signingTeamIdentifier, "648A27MST5")
         XCTAssertEqual(RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier, "com.repoprompt.ce")
         XCTAssertEqual(RuntimeCodeSigningPolicy.successorSigningTeamIdentifier, "69N6K965SF")
@@ -287,7 +325,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         expectedDomain: RuntimeSecureStorageDomain,
         expectedReason: RuntimeSecureStorageRejectionReason? = nil,
         expectedLocalCertificateFingerprint: String? = nil,
-        expectedLocalServiceGeneration: Int? = nil
+        expectedLocalServiceGeneration: Int? = nil,
+        expectedAppleDevelopmentTeamIdentifier: String? = nil
     ) {
         XCTAssertEqual(
             RuntimeCodeSigningPolicy.decision(
@@ -300,7 +339,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 domain: expectedDomain,
                 rejectionReason: expectedReason,
                 localCertificateFingerprint: expectedLocalCertificateFingerprint,
-                localServiceGeneration: expectedLocalServiceGeneration
+                localServiceGeneration: expectedLocalServiceGeneration,
+                appleDevelopmentTeamIdentifier: expectedAppleDevelopmentTeamIdentifier
             )
         )
     }

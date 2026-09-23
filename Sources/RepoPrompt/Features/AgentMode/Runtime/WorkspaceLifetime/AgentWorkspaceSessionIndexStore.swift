@@ -271,10 +271,28 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// rebuilds sort dates. Used by the view model's
     /// `publishSessionIndexReplacement` after checking the refresh token.
     func setSessionIndexAndRebuildSortDates(_ replacement: [UUID: AgentSessionIndexEntry]) {
-        if sessionIndex != replacement {
-            sessionIndex = replacement
+        let indexChanged = sessionIndex != replacement
+        let previousSortDates = sessionListSortDates
+
+        // The index and its derived sort dates are one logical sidebar state.
+        // Publishing their didSet notifications separately exposed an
+        // intermediate index/new + dates/old fingerprint and rebuilt every row
+        // twice per restore batch. Settle both values first, then notify once.
+        do {
+            suppressDelegateNotifications = true
+            defer { suppressDelegateNotifications = false }
+            if indexChanged {
+                sessionIndex = replacement
+            }
+            rebuildSessionSortDatesFromIndex()
         }
-        rebuildSessionSortDatesFromIndex()
+
+        let sortDatesChanged = previousSortDates != sessionListSortDates
+        guard indexChanged || sortDatesChanged else { return }
+        delegate?.sessionIndexStore(
+            self,
+            didChangeStateWithReason: indexChanged ? .sessionIndex : .sortDates
+        )
     }
 
     func applyLocalUpsert(_ entry: AgentSessionIndexEntry) {

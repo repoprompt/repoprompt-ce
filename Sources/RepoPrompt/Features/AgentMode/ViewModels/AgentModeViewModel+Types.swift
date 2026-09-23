@@ -873,7 +873,12 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
-        let searchFields: AgentSessionSearchFields
+        /// Deferred search-field inputs. Rows intentionally store the raw source
+        /// rather than normalized `AgentSessionSearchFields` so ordinary sidebar
+        /// rebuilds never pay ICU folding cost for a search box that is empty.
+        /// Use `makeSearchFields()` (or the view model's memoized accessor) to
+        /// materialize fields when a query is actually active.
+        let searchFieldSource: AgentSessionSearchFieldSource
 
         init(
             id: UUID,
@@ -895,7 +900,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
             threadActivityDate: Date? = nil,
-            searchFields: AgentSessionSearchFields = .empty
+            searchFieldSource: AgentSessionSearchFieldSource = .empty
         ) {
             self.id = id
             self.tabID = tabID
@@ -916,7 +921,16 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
-            self.searchFields = searchFields
+            self.searchFieldSource = searchFieldSource
+        }
+
+        /// Materializes normalized search fields for this row.
+        ///
+        /// Callers on a repeated path should prefer
+        /// `AgentModeViewModel.sidebarSearchFields(for:)`, which memoizes the
+        /// result on the main actor.
+        func makeSearchFields() -> AgentSessionSearchFields {
+            AgentModeSidebarSessionBuilder.searchFields(source: searchFieldSource)
         }
     }
 

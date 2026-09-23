@@ -22,10 +22,17 @@ extension AgentModeViewModel {
         selections: [ACPModelParameterSelection]
     ) throws -> MCPModelParameterSelectionStagingRollback? {
         guard !selections.isEmpty else { return nil }
-        guard agentRaw == AgentProviderKind.cursor.rawValue,
+        // Any ACP provider derived from the resolved agent may carry model parameters (Cursor,
+        // OpenCode). Deriving the agent here, rather than hardcoding Cursor, keeps the same
+        // guard, revision capture, and rollback contract for every ACP provider.
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              agent.acpProviderID != nil,
               let modelRaw
         else {
-            throw MCPError.invalidParams("Cursor model parameters require an explicit Cursor model selection.")
+            throw MCPError.invalidParams(
+                "Model parameters require an explicit ACP model selection."
+            )
         }
         guard let session = session(for: tabID, createIfNeeded: false) else {
             throw MCPError.internalError("Failed to resolve the Agent session for model parameter configuration.")
@@ -33,7 +40,7 @@ extension AgentModeViewModel {
         let previousSelections = session.acpModelParameterSelections
         try mcpStoreModelParameterSelections(
             tabID: tabID,
-            selectedAgent: .cursor,
+            selectedAgent: agent,
             selectedModelRaw: modelRaw,
             selections: selections,
             schedulePersistence: false
@@ -136,21 +143,29 @@ extension AgentModeViewModel {
         selections: [ACPModelParameterSelection]
     ) throws {
         guard !selections.isEmpty else { return }
-        guard selectedAgent == .cursor else {
-            throw MCPError.invalidParams("Cursor model parameters cannot be applied to \(selectedAgent.displayName).")
+        // One concept — which providers may carry model parameters — one answer: ACP providers
+        // (Cursor, OpenCode). Derive the provider from the selected agent and use the
+        // provider-aware canonicalisation rather than a hardcoded Cursor identity. A non-ACP
+        // agent is still rejected, and selections must match the selected provider AND model.
+        guard let providerID = selectedAgent.acpProviderID else {
+            throw MCPError.invalidParams(
+                "Model parameters are supported only for ACP providers; cannot apply them to \(selectedAgent.displayName)."
+            )
         }
         let selectedModelIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
             selectedModelRaw,
-            providerID: .cursor
+            providerID: providerID
         )
         guard selections.allSatisfy({
-            $0.providerID == .cursor
+            $0.providerID == providerID
                 && ACPModelParameterIdentity.canonicalBaseModelRaw(
                     $0.baseModelRaw,
-                    providerID: .cursor
+                    providerID: providerID
                 ) == selectedModelIdentity
         }) else {
-            throw MCPError.invalidParams("Cursor model parameters do not match the configured base model.")
+            throw MCPError.invalidParams(
+                "Model parameters do not match the configured \(selectedAgent.displayName) base model."
+            )
         }
     }
 

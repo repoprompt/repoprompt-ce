@@ -407,7 +407,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     @discardableResult
     nonisolated static func performPassiveAppcastCheck(
-        check: () async -> Bool,
+        check: @MainActor () async -> Bool,
         now: Date = Date(),
         defaults: UserDefaults = .standard
     ) async -> Bool {

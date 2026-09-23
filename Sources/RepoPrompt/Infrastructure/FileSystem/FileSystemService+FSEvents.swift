@@ -296,6 +296,16 @@ extension FileSystemService {
         relativePath rawRelativePath: String
     ) async -> FileSystemExplicitlyManagedRegularFileRegistration {
         let eligibility = await catalogRegularFileEligibility(relativePath: rawRelativePath)
+        return beginExplicitlyManagedRegularFileRegistration(
+            relativePath: rawRelativePath,
+            validatedEligibility: eligibility
+        )
+    }
+
+    private func beginExplicitlyManagedRegularFileRegistration(
+        relativePath rawRelativePath: String,
+        validatedEligibility eligibility: CatalogRegularFileEligibility
+    ) -> FileSystemExplicitlyManagedRegularFileRegistration {
         let relativePath = (rawRelativePath as NSString).standardizingPath
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         switch eligibility {
@@ -352,6 +362,58 @@ extension FileSystemService {
                 eligibility: eligibility,
                 token: nil
             )
+        }
+    }
+
+    func beginExplicitlyManagedRegularFileRegistration(
+        relativePath rawRelativePath: String,
+        validatedEligibility eligibility: CatalogRegularFileEligibility,
+        policyIdentity validatedPolicyIdentity: WorkspaceRootCatalogPolicyIdentity,
+        ignoreRulesRevision validatedIgnoreRulesRevision: UInt64
+    ) async throws -> FileSystemExplicitlyManagedRegularFileRegistration {
+        try Task.checkCancellation()
+        if catalogPolicyIdentity == validatedPolicyIdentity,
+           ignoreRulesRevision == validatedIgnoreRulesRevision
+        {
+            return beginExplicitlyManagedRegularFileRegistration(
+                relativePath: rawRelativePath,
+                validatedEligibility: eligibility
+            )
+        }
+        if catalogPolicyIdentity != validatedPolicyIdentity {
+            let refreshed = try await cancellationResponsiveCatalogRegularFileEligibilityWithPolicy(
+                relativePath: rawRelativePath
+            )
+            return beginExplicitlyManagedRegularFileRegistration(
+                relativePath: rawRelativePath,
+                validatedEligibility: refreshed.eligibility
+            )
+        }
+        switch eligibility {
+        case .eligible, .ineligible(.ignored):
+            let relativePath = (rawRelativePath as NSString).standardizingPath
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            while true {
+                try Task.checkCancellation()
+                let startingPolicyIdentity = catalogPolicyIdentity
+                let startingIgnoreRulesRevision = ignoreRulesRevision
+                let isIgnored = if enableHierarchicalIgnores {
+                    await isIgnoredHierarchical(relativePath: relativePath, isDirectory: false)
+                        || isIgnoredPrefixCheck(relativePath: relativePath)
+                } else {
+                    isIgnoredPrefixCheck(relativePath: relativePath)
+                }
+                try Task.checkCancellation()
+                guard startingPolicyIdentity == catalogPolicyIdentity,
+                      startingIgnoreRulesRevision == ignoreRulesRevision
+                else { continue }
+                return beginExplicitlyManagedRegularFileRegistration(
+                    relativePath: relativePath,
+                    validatedEligibility: isIgnored ? .ineligible(.ignored) : .eligible
+                )
+            }
+        case .ineligible:
+            return FileSystemExplicitlyManagedRegularFileRegistration(eligibility: eligibility, token: nil)
         }
     }
 
@@ -1455,6 +1517,8 @@ extension FileSystemService {
         guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
             return testMode ? [] : nil
         }
+        // Fence encoding evidence before processing accepted events can suspend.
+        contentReadCacheRevision &+= 1
         let events = batch.events
         guard !events.isEmpty || !pendingQuietFolderScanTargets.isEmpty else {
             if let watermark = batch.watcherAcceptedHighWatermark {

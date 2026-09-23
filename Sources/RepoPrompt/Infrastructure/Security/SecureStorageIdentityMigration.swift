@@ -723,11 +723,18 @@ enum SecureStorageIdentityMigrationBootstrap {
         return Phase(rawValue: rawPhase)
     }
 
-    static func preparerCatalogMatchesFrozenCatalog(
+    static func preparerCatalogSupportsFrozenCatalog(
         currentAccounts: [SecureStorageAccount] = SecureStorageAccountCatalog.allAccounts,
         migrationAccounts: [SecureStorageAccount] = SecureStorageAccountCatalog.identityMigrationV2Accounts
     ) -> Bool {
-        currentAccounts.map(\.identifier) == migrationAccounts.map(\.identifier)
+        let currentIdentifiers = currentAccounts.map(\.identifier)
+        let migrationIdentifiers = migrationAccounts.map(\.identifier)
+        guard Set(currentIdentifiers).count == currentIdentifiers.count,
+              Set(migrationIdentifiers).count == migrationIdentifiers.count
+        else {
+            return false
+        }
+        return Set(migrationIdentifiers).isSubset(of: Set(currentIdentifiers))
     }
 
     static func prepareIfConfigured(bundle: Bundle = .main) {
@@ -813,7 +820,7 @@ enum SecureStorageIdentityMigrationBootstrap {
     }
 
     private static func prepareLegacyBridge(bundle: Bundle) {
-        guard preparerCatalogMatchesFrozenCatalog(),
+        guard preparerCatalogSupportsFrozenCatalog(),
               bundle.bundleIdentifier == RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
               let executableURL = bundle.executableURL,
               let resourceURL = bundle.resourceURL,
@@ -835,7 +842,7 @@ enum SecureStorageIdentityMigrationBootstrap {
                 bundle: bundle,
                 domain: .officialDeveloperID
             )
-            blockUpdates("Update installation is paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
+            blockUpdates("Update installation is paused because the secure credential migration package is incomplete, omits a frozen secure-storage account, or has an invalid identity anchor.")
             return
         }
 

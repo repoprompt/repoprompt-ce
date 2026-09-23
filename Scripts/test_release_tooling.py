@@ -20,6 +20,22 @@ POLICY = SCRIPT_DIR / "apple_identity_policy.json"
 PROFILE_TOOL = SCRIPT_DIR / "embedded_provisioning_profile.py"
 
 
+class DebugPackagingIdentityTests(unittest.TestCase):
+    def test_debug_bundle_uses_successor_identity_independent_of_release_rollout(self) -> None:
+        source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-com.repoprompt.ce.debug}}"',
+            source,
+        )
+        self.assertIn(
+            'elif (( ! USE_ADHOC_SIGNING )); then\n    DEBUG_STORAGE_BACKEND_MARKER="keychain"',
+            source,
+        )
+        self.assertNotIn("SIGN_IDENTITY_WAS_EXPLICIT", source)
+        self.assertNotIn("$BASE_BUNDLE_ID.debug", source)
+
+
 class StableTipFloorTests(unittest.TestCase):
     def rollout(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

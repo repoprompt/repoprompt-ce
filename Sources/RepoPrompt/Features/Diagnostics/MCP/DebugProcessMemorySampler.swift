@@ -564,7 +564,8 @@
             }
         }
 
-        private static func captureSnapshot() -> DebugProcessMemorySnapshot? {
+        /// One-shot counters for bounded headless diagnostics; does not start or own a sampler session.
+        static func captureSnapshot() -> DebugProcessMemorySnapshot? {
             let nowMS = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000.0
             guard let residentBytes = captureResidentBytes() else { return nil }
             guard let cpuUsage = captureCPUUsage() else { return nil }

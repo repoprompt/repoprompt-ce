@@ -28,7 +28,7 @@ DEFAULT_MANIFEST = ROOT / "Vendor" / "Codex" / "manifest.json"
 DEFAULT_CACHE_ROOT = ROOT / ".build" / "codex-runtime"
 # Compatibility authority shared with the schema-gate branch that must land first.
 # Pin rotations intentionally update these values and Vendor/Codex/manifest.json together.
-SUPPORTED_VERSION = "0.153.4"
+SUPPORTED_VERSION = "0.156.0"
 SUPPORTED_TAG = f"rust-v{SUPPORTED_VERSION}"
 OFFICIAL_REPOSITORY_URL = "https://github.com/openai/codex"
 OFFICIAL_RELEASE_URL = f"{OFFICIAL_REPOSITORY_URL}/releases/tag/{SUPPORTED_TAG}"
@@ -77,11 +77,17 @@ APPROVED_ENTITLEMENT_KEYS = frozenset(
     {
         "com.apple.security.cs.allow-jit",
         "com.apple.security.cs.allow-unsigned-executable-memory",
+        "com.apple.security.device.audio-input",
     }
 )
-V8_JIT_ENTITLEMENT_PROFILE = {key: True for key in sorted(APPROVED_ENTITLEMENT_KEYS)}
+V8_JIT_ENTITLEMENT_PROFILE = {
+    "com.apple.security.cs.allow-jit": True,
+    "com.apple.security.cs.allow-unsigned-executable-memory": True,
+}
+AUDIO_INPUT_ENTITLEMENT_PROFILE = {"com.apple.security.device.audio-input": True}
 SIGNING_PLAN_PROFILE_LABELS = {
     "v8-jit": V8_JIT_ENTITLEMENT_PROFILE,
+    "audio-input": AUDIO_INPUT_ENTITLEMENT_PROFILE,
     "none": {},
 }
 

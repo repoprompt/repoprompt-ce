@@ -180,6 +180,8 @@ struct ResizableTextField: View {
     @Binding var resetTrigger: Bool
     var onImagePaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
+    /// Revision for intentional programmatic text changes while the editor is focused.
+    var externalUpdateTick: Int? = .none
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -202,6 +204,12 @@ struct ResizableTextField: View {
         guard !scaledPresets.isEmpty else { return preset.scaledMetric(maxHeight) }
         let clampedIndex = min(max(index, 0), scaledPresets.count - 1)
         return scaledPresets[clampedIndex]
+    }
+
+    /// Largest line-fragment count that can still change the chosen height preset.
+    /// Drafts taller than this saturate at the last preset, so measuring further is wasted work.
+    static var maximumVisibleLineFragmentCount: Int {
+        heightPresets.count
     }
 
     static func presetIndex(
@@ -231,6 +239,7 @@ struct ResizableTextField: View {
             onReturn: onReturn,
             onImagePaste: onImagePaste,
             features: features,
+            externalUpdateTick: externalUpdateTick,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -264,6 +273,7 @@ struct CustomTextField: NSViewRepresentable {
     var onReturn: () -> Void
     var onImagePaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
+    var externalUpdateTick: Int? = .none
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -272,6 +282,15 @@ struct CustomTextField: NSViewRepresentable {
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
+    }
+
+    static func shouldApplyTextSynchronization(
+        isFirstResponder: Bool,
+        hasMarkedText: Bool,
+        hasPendingExternalUpdate: Bool
+    ) -> Bool {
+        guard !hasMarkedText else { return false }
+        return !isFirstResponder || hasPendingExternalUpdate
     }
 
     func makeCoordinator() -> Coordinator {
@@ -339,6 +358,7 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
         textView.string = text
+        context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
         context.coordinator.clearUndoHistory()
 
         // Initial height calculation
@@ -377,29 +397,41 @@ struct CustomTextField: NSViewRepresentable {
         )
 
         var appliedProgrammaticTextChange = false
-        // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
+        let isFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
+        let hasPendingExternalUpdate = externalUpdateTick.map {
+            context.coordinator.lastAppliedExternalUpdateTick != $0
+        } ?? false
+        // Avoid replacing active user edits with a stale SwiftUI binding snapshot. Explicit
+        // external updates are allowed through via externalUpdateTick. Callers that do not
+        // opt into revision tracking retain the previous synchronization behavior.
         if textView.string != text {
-            // If an IME composition is active, DO NOT overwrite.
-            if textView.hasMarkedText() { return }
-
-            context.coordinator.internalUpdateInProgress = true
-
-            // Preserve selection when applying programmatic changes.
-            let prevSel = textView.selectedRange()
-            context.coordinator.performExternalReplacement(in: textView) {
-                textView.string = text
+            let hasMarkedText = textView.hasMarkedText()
+            if hasMarkedText {
+                if let externalUpdateTick, hasPendingExternalUpdate {
+                    context.coordinator.pendingExternalTextUpdate = (
+                        text: text,
+                        tick: externalUpdateTick
+                    )
+                }
+                return
             }
-            let nsLen = (text as NSString).length
-            let clampedLoc = min(max(prevSel.location, 0), nsLen)
-            let maxLenFromLoc = max(0, nsLen - clampedLoc)
-            let clampedLen = min(max(prevSel.length, 0), maxLenFromLoc)
-            textView.setSelectedRange(NSRange(location: clampedLoc, length: clampedLen))
+            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate
+            guard Self.shouldApplyTextSynchronization(
+                isFirstResponder: isFirstResponder,
+                hasMarkedText: false,
+                hasPendingExternalUpdate: shouldApplyFocusedBindingUpdate
+            ) else { return }
 
-            context.coordinator.internalUpdateInProgress = false
+            context.coordinator.applyExternalTextReplacement(
+                text,
+                to: textView,
+                externalUpdateTick: externalUpdateTick
+            )
             appliedProgrammaticTextChange = true
-
-            Task { @MainActor in
-                context.coordinator.updateHeightIfNeeded(textView: textView)
+        } else {
+            // Consume an external revision even when the requested text is already installed.
+            if let externalUpdateTick {
+                context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
             }
         }
         if appliedProgrammaticTextChange {
@@ -425,6 +457,8 @@ struct CustomTextField: NSViewRepresentable {
         var parent: CustomTextField
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
+        var lastAppliedExternalUpdateTick: Int?
+        var pendingExternalTextUpdate: (text: String, tick: Int)?
 
         private let textViewUndoManager = UndoManager()
         private let fileTagHelper = FileTagMentionHelper()
@@ -439,7 +473,28 @@ struct CustomTextField: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             if internalUpdateInProgress { return }
             guard isActive, let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
+
+            if textView.hasMarkedText() {
+                // Let the input method finish composing before reflecting text into SwiftUI.
+                // This prevents a stale binding snapshot from being fed back into the editor.
+                updateHeightIfNeeded(textView: textView)
+                return
+            }
+
+            if let pendingExternalTextUpdate {
+                self.pendingExternalTextUpdate = nil
+                if textView.string != pendingExternalTextUpdate.text {
+                    applyExternalTextReplacement(
+                        pendingExternalTextUpdate.text,
+                        to: textView,
+                        externalUpdateTick: pendingExternalTextUpdate.tick
+                    )
+                } else {
+                    lastAppliedExternalUpdateTick = pendingExternalTextUpdate.tick
+                }
+            } else {
+                parent.text = textView.string
+            }
 
             updateHeightIfNeeded(textView: textView)
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)
@@ -504,7 +559,31 @@ struct CustomTextField: NSViewRepresentable {
             textViewUndoManager
         }
 
-        func performExternalReplacement(
+        func applyExternalTextReplacement(
+            _ text: String,
+            to textView: NSTextView,
+            externalUpdateTick: Int?
+        ) {
+            internalUpdateInProgress = true
+
+            let previousSelection = textView.selectedRange()
+            performExternalReplacement(in: textView) {
+                textView.string = text
+            }
+            let nsLength = (text as NSString).length
+            let clampedLocation = min(max(previousSelection.location, 0), nsLength)
+            let maxLengthFromLocation = max(0, nsLength - clampedLocation)
+            let clampedLength = min(max(previousSelection.length, 0), maxLengthFromLocation)
+            textView.setSelectedRange(NSRange(location: clampedLocation, length: clampedLength))
+
+            internalUpdateInProgress = false
+            if let externalUpdateTick {
+                lastAppliedExternalUpdateTick = externalUpdateTick
+            }
+            updateHeightIfNeeded(textView: textView)
+        }
+
+        private func performExternalReplacement(
             in textView: NSTextView,
             mutation: () -> Void
         ) {
@@ -523,17 +602,11 @@ struct CustomTextField: NSViewRepresentable {
             guard let layoutManager = textView.layoutManager,
                   let textContainer = textView.textContainer else { return }
 
-            layoutManager.ensureLayout(for: textContainer)
-            let glyphRange = layoutManager.glyphRange(for: textContainer)
-            var visibleLineFragmentCount = 0
-            layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, _, _ in
-                visibleLineFragmentCount += 1
-            }
-            if layoutManager.extraLineFragmentTextContainer === textContainer,
-               !layoutManager.extraLineFragmentRect.isEmpty
-            {
-                visibleLineFragmentCount += 1
-            }
+            let visibleLineFragmentCount = ComposerLineFragmentCounter.visibleLineFragmentCount(
+                layoutManager: layoutManager,
+                textContainer: textContainer,
+                maximumCountOfInterest: ResizableTextField.maximumVisibleLineFragmentCount
+            )
             let index = ResizableTextField.presetIndex(
                 forVisibleLineFragmentCount: visibleLineFragmentCount,
                 preset: parent.fontPreset
@@ -606,5 +679,97 @@ struct CustomTextField: NSViewRepresentable {
         func dismissSlashSkillOverlay() {
             slashSkillHelper.dismiss()
         }
+    }
+}
+
+/// Counts composer line fragments for height-preset selection.
+///
+/// The composer stops growing at `ResizableTextField.maximumVisibleLineFragmentCount` fragments, so
+/// once that many fragments are proven to exist the exact total cannot change the chosen preset.
+/// Measuring a saturated draft therefore lays out and enumerates only the leading fragments instead
+/// of the whole document on every keystroke. Shorter drafts keep the exact full-container
+/// measurement, so their height behavior is unchanged.
+enum ComposerLineFragmentCounter {
+    static func visibleLineFragmentCount(
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer,
+        maximumCountOfInterest: Int
+    ) -> Int {
+        if maximumCountOfInterest > 0,
+           isSaturated(
+               layoutManager: layoutManager,
+               textContainer: textContainer,
+               maximumCountOfInterest: maximumCountOfInterest
+           )
+        {
+            return maximumCountOfInterest
+        }
+        return exactVisibleLineFragmentCount(
+            layoutManager: layoutManager,
+            textContainer: textContainer
+        )
+    }
+
+    /// Exact measurement over the fully laid out container, including the trailing empty line
+    /// fragment. Only reached for drafts that are shorter than the largest height preset, or when
+    /// the bounded probe could not prove saturation.
+    static func exactVisibleLineFragmentCount(
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer
+    ) -> Int {
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        var count = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, _, _ in
+            count += 1
+        }
+        if layoutManager.extraLineFragmentTextContainer === textContainer,
+           !layoutManager.extraLineFragmentRect.isEmpty
+        {
+            count += 1
+        }
+        return count
+    }
+
+    /// Reports whether at least `maximumCountOfInterest` line fragments exist, laying out only the
+    /// glyphs inside a bounded probe rect rather than the entire document.
+    private static func isSaturated(
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer,
+        maximumCountOfInterest: Int
+    ) -> Bool {
+        let probeRect = probeBoundingRect(
+            layoutManager: layoutManager,
+            textContainer: textContainer,
+            maximumCountOfInterest: maximumCountOfInterest
+        )
+        guard probeRect.width > 0, probeRect.height > 0 else { return false }
+        let probedGlyphRange = layoutManager.glyphRange(forBoundingRect: probeRect, in: textContainer)
+        guard probedGlyphRange.length > 0 else { return false }
+
+        var count = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: probedGlyphRange) { _, _, _, _, stop in
+            count += 1
+            if count >= maximumCountOfInterest {
+                stop.pointee = true
+            }
+        }
+        return count >= maximumCountOfInterest
+    }
+
+    /// Probe rect tall enough to hold the saturating fragment count at twice the default line
+    /// height. When content uses taller fragments the probe simply fails to prove saturation and
+    /// the caller falls back to the exact measurement, so height behavior stays correct.
+    private static func probeBoundingRect(
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer,
+        maximumCountOfInterest: Int
+    ) -> CGRect {
+        let font = textContainer.textView?.font
+            ?? layoutManager.firstTextView?.font
+            ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let lineHeight = max(layoutManager.defaultLineHeight(for: font), 1)
+        let probeHeight = lineHeight * CGFloat(maximumCountOfInterest) * 2
+        return CGRect(x: 0, y: 0, width: textContainer.size.width, height: probeHeight)
     }
 }

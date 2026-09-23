@@ -819,7 +819,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
                 "message": .string("continue after publication recovery")
             ]
         )
-        XCTAssertEqual(continued["status"] as? String, "completed")
+        XCTAssertEqual(continued["status"] as? String, "completed", "Recovered continuation outcome: \(continued)")
         XCTAssertEqual(try fixture.calls().count, 4)
 
         let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
@@ -873,7 +873,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             toolName: "ask_oracle",
             arguments: ["message": .string("terminal commit then throw")]
         )
-        XCTAssertEqual(result["status"] as? String, "completed")
+        XCTAssertEqual(result["status"] as? String, "completed", "Commit-then-throw outcome: \(result)")
         let forcedFailureCount = await store.forcedFailureCount()
         let reconciliationAttemptCount = await store.reconciliationAttemptCount()
         let stagedTerminal = await store.stagedTerminal()
