@@ -32,7 +32,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         ).get()
 
         XCTAssertEqual(runtime.executableURL, armExecutable)
-        XCTAssertEqual(runtime.version, .init(major: 0, minor: 153, patch: 4))
+        XCTAssertEqual(runtime.version, .init(major: 0, minor: 156, patch: 0))
         XCTAssertEqual(runtime.source, .bundled(target: "aarch64-apple-darwin"))
         XCTAssertTrue(runtime.statePaths.codexHome.path.hasPrefix(support.path))
         XCTAssertTrue(runtime.statePaths.sqliteHome.path.hasPrefix(support.path))
@@ -325,7 +325,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let newlyPrepared = try await makeClient().prepareRuntimeForLaunch()
         XCTAssertEqual(first, newlyPrepared)
         XCTAssertEqual(first.executableURL, environment)
-        XCTAssertEqual(first.version, .init(major: 0, minor: 153, patch: 4))
+        XCTAssertEqual(first.version, .init(major: 0, minor: 156, patch: 0))
         XCTAssertNotEqual(first.executableURL, pending)
 
         let preview = try CodexRuntimeAuthority.resolveConfigured(
@@ -514,7 +514,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
 
         XCTAssertEqual(resolution.status, .available)
         XCTAssertEqual(resolution.resolvedCommand, codex.path)
-        XCTAssertEqual(resolution.runtime?.version, .init(major: 0, minor: 153, patch: 4))
+        XCTAssertEqual(resolution.runtime?.version, .init(major: 0, minor: 156, patch: 0))
     }
 
     func testVersionProbeCacheSeparatesCapturedPATHForSameExecutableMetadata() throws {
@@ -544,8 +544,8 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
 
         XCTAssertEqual(first.executableURL.path, codex.path)
         XCTAssertEqual(second.executableURL.path, codex.path)
-        XCTAssertEqual(first.version, .init(major: 0, minor: 153, patch: 4))
-        XCTAssertEqual(second.version, .init(major: 0, minor: 154, patch: 0))
+        XCTAssertEqual(first.version, .init(major: 0, minor: 156, patch: 0))
+        XCTAssertEqual(second.version, .init(major: 0, minor: 157, patch: 0))
         XCTAssertEqual(
             (metadataBefore[.size] as? NSNumber)?.uint64Value,
             (metadataAfter[.size] as? NSNumber)?.uint64Value
@@ -603,7 +603,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         }
 
         XCTAssertEqual(failure(from: resolve(absentEnvironment)), .externalOverrideVersionUnreadable(codex.path))
-        XCTAssertEqual(try resolve(capturedEnvironment).get().version, .init(major: 0, minor: 153, patch: 4))
+        XCTAssertEqual(try resolve(capturedEnvironment).get().version, .init(major: 0, minor: 156, patch: 0))
         XCTAssertEqual(failure(from: resolve(absentEnvironment)), .externalOverrideVersionUnreadable(codex.path))
     }
 
