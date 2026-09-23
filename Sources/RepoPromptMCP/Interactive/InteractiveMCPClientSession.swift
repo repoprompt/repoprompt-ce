@@ -1579,6 +1579,13 @@ actor InteractiveMCPClientSession {
         arguments: [String: Value],
         implicitLifecycleCompatibilityGuard: TimeInterval? = nil
     ) -> TimeInterval? {
+        if toolName == "prompt_experiment" {
+            guard arguments["op"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "wait"
+            else { return nil }
+            return explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
+        }
         switch toolName {
         case "agent_run", "agent_explore":
             agentLifecycleSemanticWaitSeconds(
@@ -1587,12 +1594,6 @@ actor InteractiveMCPClientSession {
                 implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
             )
         case "ask_user", "wait_for_next_user_instruction":
-            explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
-        case "prompt_experiment":
-            guard arguments["op"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased() == "wait"
-            else { return nil }
             explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
         default:
             nil
