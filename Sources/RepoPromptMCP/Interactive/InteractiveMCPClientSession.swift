@@ -1588,15 +1588,15 @@ actor InteractiveMCPClientSession {
         }
         switch toolName {
         case "agent_run", "agent_explore":
-            agentLifecycleSemanticWaitSeconds(
+            return agentLifecycleSemanticWaitSeconds(
                 toolName: toolName,
                 arguments: arguments,
                 implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
             )
         case "ask_user", "wait_for_next_user_instruction":
-            explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
+            return explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
         default:
-            nil
+            return nil
         }
     }
 
