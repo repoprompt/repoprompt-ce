@@ -42,7 +42,7 @@
         }
 
         private var mcpEvaluations: [UUID: MCPEvaluation] = [:]
-        private var mcpEvaluationCounts: [UUID: Int] = [:]
+        private var evaluationAdmissions: [UUID: PromptExperimentEvaluationAdmission] = [:]
         private var mcpModelCallbackReplies: [UUID: [UUID: MCPModelCallbackCompletion]] = [:]
         private var judgeRetries: [UUID: Int] = [:]
         private let gradingRetryGate = PromptExperimentGradingRetryGate()
@@ -326,7 +326,7 @@
                 defer {
                     checkpointSinks.removeValue(forKey: request.attempt.id)
                     mcpEvaluations = mcpEvaluations.filter { $0.value.attemptID != request.attempt.id }
-                    mcpEvaluationCounts.removeValue(forKey: request.attempt.id)
+                    evaluationAdmissions.removeValue(forKey: request.attempt.id)
                     mcpModelCallbackReplies.removeValue(forKey: request.attempt.id)
                     judgeRetries.removeValue(forKey: request.attempt.id)
                 }
@@ -432,7 +432,7 @@
                 progress: progress,
                 observation: observation
             )
-            guard reply.ok, let score = reply.score, ["evaluate", "mcp_grade"].contains(operation) else { return reply }
+            guard let score = Self.checkpointScore(operation: operation, reply: reply) else { return reply }
             do {
                 guard let sink = checkpointSinks[parentRequest.attempt.id], let id = operation == "mcp_grade" ? evaluationID : UUID(uuidString: callbackID),
                       let candidate = evaluation?.candidate ?? payload["candidate"] as? String,
@@ -448,6 +448,39 @@
                 if operation == "mcp_grade", let evaluationID { mcpEvaluations.removeValue(forKey: evaluationID) }
                 return reply
             } catch { return infrastructureReply("Evaluation evidence could not be persisted: \(error.localizedDescription)") }
+        }
+
+        /// Scored evaluation replies become durable evidence, including scored candidate failures
+        /// (for example a sandboxed command reporting `failure_kind: candidate` with `ok: false`).
+        /// Infrastructure failures and unscored replies never checkpoint.
+        nonisolated static func checkpointScore(operation: String, reply: PromptExperimentGEPAHostReply) -> Double? {
+            guard ["evaluate", "mcp_grade"].contains(operation),
+                  let score = reply.score,
+                  reply.failureKind != .infrastructure,
+                  reply.ok || reply.failureKind == .candidate
+            else { return nil }
+            return score
+        }
+
+        /// Admits one sealed target evaluation before any target, judge, or command spend.
+        /// Only a live optimization run may admit; admissions are retained on failure or cancel.
+        private func admitEvaluation(
+            parentRequest: PromptExperimentRunRequest,
+            specification: PromptExperimentOptimizationSpecification,
+            payload: [String: Any]
+        ) throws {
+            let attemptID = parentRequest.attempt.id
+            guard checkpointSinks[attemptID] != nil else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation admission requires a live GEPA run.")
+            }
+            let logicalCallbackID = (payload["_rpce_logical_callback_id"] as? String).flatMap(UUID.init(uuidString:))
+            var admission = evaluationAdmissions[attemptID]
+                ?? PromptExperimentEvaluationAdmission(maxEvaluations: specification.gepa.maxEvaluations)
+            let decision = admission.admit(logicalCallbackID: logicalCallbackID)
+            evaluationAdmissions[attemptID] = admission
+            if case let .failure(rejection) = decision {
+                throw PromptExperimentAuthorityError.runtimeUnavailable(rejection.message)
+            }
         }
 
         private func performGEPAHostRequest(
@@ -539,7 +572,8 @@
                         targets: targets,
                         callbackID: callbackID,
                         progress: progress,
-                        observation: observation
+                        observation: observation,
+                        admissionPayload: payload
                     )
                 default:
                     throw PromptExperimentAuthorityError.runtimeUnavailable("Unsupported GEPA host operation: \(operation)")
@@ -572,11 +606,11 @@
                       let sealed = specification.examples.first(where: { $0.id == exampleID }),
                       example["input"] as? String == sealed.input,
                       example["split"] as? String == sealed.split.rawValue,
-                      specification.admitsPreparationEvaluation(candidate: candidate, exampleID: exampleID),
-                      mcpEvaluationCounts[parentRequest.attempt.id, default: 0] < specification.gepa.maxEvaluations
-                else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP evaluation is outside the sealed dataset, preparation candidates, or evaluation budget.") }
+                      specification.admitsPreparationEvaluation(candidate: candidate, exampleID: exampleID)
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP evaluation is outside the sealed dataset or preparation candidates.") }
+                // The lease is the admitted evaluation; mcp_model and mcp_grade ride it without re-admission.
+                try admitEvaluation(parentRequest: parentRequest, specification: specification, payload: payload)
                 let id = UUID()
-                mcpEvaluationCounts[parentRequest.attempt.id, default: 0] += 1
                 mcpEvaluations[id] = MCPEvaluation(attemptID: parentRequest.attempt.id, candidate: candidate, example: example)
                 return PromptExperimentGEPAHostReply(ok: true, output: id.uuidString, score: nil, feedback: nil, failureKind: nil, error: nil, elapsedSeconds: nil)
             }
@@ -677,6 +711,7 @@
             callbackID: String,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
             observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+            admissionPayload: [String: Any]? = nil,
             mcpAnswer: String? = nil, mcpEvidence: String? = nil, mcpGradingID: UUID? = nil
         ) async throws -> PromptExperimentGEPAHostReply {
             let started = Date()
@@ -689,6 +724,11 @@
             }
             guard specification.admitsPreparationEvaluation(candidate: candidate, exampleID: exampleID) else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("Preparation may evaluate only reviewed candidates on training examples; held-out inputs are not admitted.")
+            }
+            // MCP grading was admitted by its mcp_begin lease; every other evaluation admits here,
+            // before target, judge, or command spend.
+            if mcpGradingID == nil {
+                try admitEvaluation(parentRequest: parentRequest, specification: specification, payload: admissionPayload ?? [:])
             }
             if specification.evaluator.kind == .sandboxedCommand {
                 return try await evaluateSandboxedCommand(
@@ -772,7 +812,7 @@
                     ok: true,
                     output: mcpEvidence ?? output,
                     score: score,
-                    feedback: sealedExample.split == .hiddenTest ? "Held-out score recorded; reference-derived feedback is withheld." : feedback,
+                    feedback: sealedExample.split.proposerFacingFeedback(feedback),
                     failureKind: nil,
                     error: nil,
                     elapsedSeconds: elapsed,
@@ -854,7 +894,7 @@
                     ok: true,
                     output: mcpEvidence ?? output,
                     score: score,
-                    feedback: sealedExample.split == .hiddenTest ? "Held-out score recorded; reference-derived feedback is withheld." : feedback,
+                    feedback: sealedExample.split.proposerFacingFeedback(feedback),
                     failureKind: nil,
                     error: nil,
                     elapsedSeconds: elapsed,
@@ -1052,20 +1092,28 @@
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator exceeded its timeout.")
             }
             guard result.status == 0 else {
+                // Grader stderr can quote reference answers; the error string travels upstream.
+                let detail = example.split == .hiddenTest ? "held-out grader stderr withheld" : stderr
                 throw PromptExperimentAuthorityError.runtimeUnavailable(
-                    "The sealed command evaluator failed with exit \(result.status): \(stderr)"
+                    "The sealed command evaluator failed with exit \(result.status): \(detail)"
                 )
             }
             return try Self.commandEvaluationReply(
                 stdout: stdout,
+                split: example.split,
                 minimumScore: specification.evaluator.minimumScore,
                 maximumScore: specification.evaluator.maximumScore,
                 elapsedSeconds: Date().timeIntervalSince(started)
             )
         }
 
+        /// Hidden-test replies carry only score and classification upstream: grader stdout and
+        /// feedback can embed answer keys, so output is omitted and feedback/error use the fixed
+        /// held-out string. Consequently no raw grader stdout is persisted for hidden-test command
+        /// evaluations, since both partial checkpoints and the upstream result derive from this reply.
         nonisolated static func commandEvaluationReply(
             stdout: String,
+            split: PromptExperimentDatasetSplit,
             minimumScore: Double,
             maximumScore: Double,
             elapsedSeconds: Double
@@ -1085,17 +1133,20 @@
             guard failureRaw == nil || failureKind != nil else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator returned an unknown failure classification.")
             }
+            let hidden = split == .hiddenTest
+            let visibleFeedback = split.proposerFacingFeedback(feedback)
             guard failureKind != .infrastructure else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator reported an infrastructure failure: \(feedback)")
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator reported an infrastructure failure: \(visibleFeedback)")
             }
             let candidateFailure = failureKind == .candidate
             return PromptExperimentGEPAHostReply(
                 ok: !candidateFailure,
-                output: stdout,
+                output: hidden ? nil : stdout,
                 score: score,
-                feedback: feedback,
+                feedback: visibleFeedback,
                 failureKind: failureKind,
-                error: candidateFailure ? feedback : nil,
+                // The worker's ok:false candidate path forwards `error` as GEPA feedback.
+                error: candidateFailure ? visibleFeedback : nil,
                 elapsedSeconds: elapsedSeconds
             )
         }
@@ -1342,6 +1393,47 @@
             guard let windowState else { return }
             windowState.workspaceManager.workspaces.removeAll { $0.id == workspaceID && $0.ephemeralFlag == true }
             await windowState.workspaceFileContextStore.unloadRoot(id: rootID)
+        }
+    }
+
+    /// Host-side ledger for the sealed `maxEvaluations` of one GEPA attempt.
+    ///
+    /// Each target evaluation (non-MCP `evaluate` or MCP `mcp_begin`) is admitted exactly once,
+    /// keyed by the worker's logical callback identity. The worker never retries these
+    /// operations, so a missing or reused identity is a protocol violation, not a retry.
+    /// Admissions are never refunded: a failed or cancelled evaluation may already have spent.
+    struct PromptExperimentEvaluationAdmission: Equatable {
+        enum Rejection: Error, Equatable {
+            case missingLogicalCallbackID
+            case reusedLogicalCallbackID
+            case budgetExhausted(maxEvaluations: Int)
+
+            var message: String {
+                switch self {
+                case .missingLogicalCallbackID:
+                    "GEPA evaluation request omitted its logical callback identity."
+                case .reusedLogicalCallbackID:
+                    "GEPA evaluation request reused an already admitted logical callback identity."
+                case let .budgetExhausted(maxEvaluations):
+                    "GEPA requested an evaluation beyond the sealed budget of \(maxEvaluations)."
+                }
+            }
+        }
+
+        let maxEvaluations: Int
+        private(set) var admittedLogicalCallbackIDs: Set<UUID> = []
+
+        var admittedCount: Int {
+            admittedLogicalCallbackIDs.count
+        }
+
+        /// Returns the admitted evaluation ordinal (1-based) or the rejection; rejections do not consume budget.
+        mutating func admit(logicalCallbackID: UUID?) -> Result<Int, Rejection> {
+            guard let logicalCallbackID else { return .failure(.missingLogicalCallbackID) }
+            guard !admittedLogicalCallbackIDs.contains(logicalCallbackID) else { return .failure(.reusedLogicalCallbackID) }
+            guard admittedCount < maxEvaluations else { return .failure(.budgetExhausted(maxEvaluations: maxEvaluations)) }
+            admittedLogicalCallbackIDs.insert(logicalCallbackID)
+            return .success(admittedCount)
         }
     }
 #endif

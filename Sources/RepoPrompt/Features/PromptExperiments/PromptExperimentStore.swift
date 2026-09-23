@@ -423,7 +423,13 @@
                         lines.append("  - Incrementally saved evaluations: \(partials.count) (trial evidence, not final rankings)")
                         for partial in partials {
                             lines.append("    - \(Self.markdownInline(partial.evaluation.exampleID)): score \(partial.evaluation.score.map(String.init(describing:)) ?? "unavailable"); candidate `../../\(partial.candidateEvidence.relativePath)`")
-                            if let output = partial.evaluation.outputEvidence { lines.append("      - Output: `../../\(output.relativePath)`") }
+                            if let output = partial.evaluation.outputEvidence {
+                                lines.append(
+                                    partial.evaluation.split == .hiddenTest
+                                        ? "      - Output: host-private (hidden test)"
+                                        : "      - Output: `../../\(output.relativePath)`"
+                                )
+                            }
                         }
                     }
                     if let grades = attempt.gradingEvidence {
@@ -454,12 +460,12 @@
                         lines.append("  - GEPA wall time: \(wallTime) seconds")
                         lines.append("  - Proposer usage: \(result.proposerUsage)")
                         if let runDirectory = result.runDirectoryRelativePath {
-                            lines.append("  - Worker artifacts and log: `../../\(runDirectory)`")
+                            lines.append("  - Worker artifacts and log: `../../\(runDirectory)` (diagnostic only; upstream GEPA state is not host-redacted and may include held-out payloads)")
                         } else {
                             lines.append("  - Worker artifacts and log: unavailable")
                         }
-                        if let rawResult = result.rawResultEvidence {
-                            lines.append("  - Raw versioned result: `../../\(rawResult.relativePath)`")
+                        if result.rawResultEvidence != nil {
+                            lines.append("  - Raw versioned result: persisted host-private (embeds hidden-test outputs; referenced from `experiments.json`)")
                         }
                         lines.append("  - Candidates:")
                         for candidate in result.candidates {
@@ -479,7 +485,7 @@
                         for evaluation in result.evaluations {
                             let score = evaluation.score.map { String($0) } ?? "unavailable"
                             let failure = evaluation.failureKind.map { " / \($0.rawValue) failure" } ?? ""
-                            lines.append("    - candidate #\(evaluation.candidateIndex), \(evaluation.exampleID) [\(evaluation.split.rawValue)]: \(score)\(failure) — \(Self.markdownInline(evaluation.feedback))")
+                            lines.append("    - candidate #\(evaluation.candidateIndex), \(evaluation.exampleID) [\(evaluation.split.rawValue)]: \(score)\(failure) — \(Self.markdownInline(evaluation.split.proposerFacingFeedback(evaluation.feedback)))")
                         }
                     }
                     if let diagnostics = attempt.diagnostics {

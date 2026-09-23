@@ -1292,7 +1292,9 @@
                 if let assistant = attempt.assistantOutputEvidence { references.append(assistant) }
                 for partial in attempt.partialEvaluations ?? [] {
                     references.append(partial.candidateEvidence)
-                    if let output = partial.evaluation.outputEvidence { references.append(output) }
+                    if partial.evaluation.split != .hiddenTest, let output = partial.evaluation.outputEvidence {
+                        references.append(output)
+                    }
                 }
                 for grade in attempt.gradingEvidence ?? [] where grade.split != .hiddenTest {
                     references.append(grade.candidateEvidence)
@@ -1300,8 +1302,8 @@
                 }
                 if let result = attempt.optimizationResult {
                     references.append(contentsOf: result.candidates.map(\.candidateEvidence))
-                    references.append(contentsOf: result.evaluations.compactMap(\.outputEvidence))
-                    if let raw = result.rawResultEvidence { references.append(raw) }
+                    references.append(contentsOf: result.evaluations.filter { $0.split != .hiddenTest }.compactMap(\.outputEvidence))
+                    // rawResultEvidence stays host-private: it embeds hidden-test outputs.
                 }
             }
             var textByDigest: [String: String] = [:]

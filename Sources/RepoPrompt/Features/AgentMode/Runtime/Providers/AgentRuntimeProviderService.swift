@@ -253,6 +253,33 @@ final class AgentRuntimeProviderService {
 
     private init() {}
 
+    /// Process configuration for Claude-family headless runs. Ordinary discovery runs keep a
+    /// `nil` working directory (resolved to the temporary directory by `CLIProcessConfiguration`)
+    /// so Context Builder behavior is unchanged; only prompt experiments launch inside their
+    /// isolated experiment directory.
+    static func claudeFamilyProcessConfiguration(
+        config: ClaudeCodeAgentConfig,
+        runType: AgentRunType,
+        workspacePath: String?
+    ) -> CLIProcessConfiguration {
+        let workingDirectory: String? = switch runType {
+        case .discover:
+            nil
+        case .promptExperiment:
+            workspacePath
+        }
+        var processConfig = CLIProcessConfiguration(
+            command: config.commandName,
+            workingDirectory: workingDirectory,
+            enableDebugLogging: enableDebugLogging,
+            captureStdoutTailBytes: 128 * 1024,
+            captureStderrTailBytes: 256 * 1024,
+            logStdinSampleBytes: 0
+        )
+        processConfig.ensureAdditionalPaths(config.additionalPathHints)
+        return processConfig
+    }
+
     /// Create a headless agent provider.
     /// - Parameters:
     ///   - agent: The provider kind to create
@@ -290,15 +317,11 @@ final class AgentRuntimeProviderService {
                     enableDebugLogging: Self.enableDebugLogging
                 )
             }
-            var processConfig = CLIProcessConfiguration(
-                command: config.commandName,
-                workingDirectory: workspacePath,
-                enableDebugLogging: Self.enableDebugLogging,
-                captureStdoutTailBytes: 128 * 1024,
-                captureStderrTailBytes: 256 * 1024,
-                logStdinSampleBytes: 0
+            let processConfig = Self.claudeFamilyProcessConfiguration(
+                config: config,
+                runType: runType,
+                workspacePath: workspacePath
             )
-            processConfig.ensureAdditionalPaths(config.additionalPathHints)
             let runner = CLIProcessRunner(config: processConfig)
             let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config)
             let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)

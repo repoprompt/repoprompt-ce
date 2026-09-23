@@ -71,6 +71,32 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(config.backendConfig?.id.rawValue, "glmZAI")
     }
 
+    func testClaudeFamilyWorkingDirectoryIsTemporaryForDiscoveryAndIsolatedForPromptExperiments() {
+        let workspacePath = "/tmp/repoprompt-prompt-experiment-isolated-workspace"
+        let temporaryDirectory = FileManager.default.temporaryDirectory.path
+
+        let discoveryConfig = AgentRuntimeProviderService.claudeFamilyProcessConfiguration(
+            config: .discovery(modelString: "sonnet", runtimeVariant: .standard, enableDebugLogging: false),
+            runType: .discover,
+            workspacePath: workspacePath
+        )
+        XCTAssertEqual(discoveryConfig.workingDirectory, temporaryDirectory)
+
+        let discoveryWithoutWorkspace = AgentRuntimeProviderService.claudeFamilyProcessConfiguration(
+            config: .discovery(modelString: "sonnet", runtimeVariant: .standard, enableDebugLogging: false),
+            runType: .discover,
+            workspacePath: nil
+        )
+        XCTAssertEqual(discoveryWithoutWorkspace.workingDirectory, temporaryDirectory)
+
+        let experimentConfig = AgentRuntimeProviderService.claudeFamilyProcessConfiguration(
+            config: .promptExperiment(modelString: "sonnet", runtimeVariant: .standard, enableDebugLogging: false),
+            runType: .promptExperiment,
+            workspacePath: workspacePath
+        )
+        XCTAssertEqual(experimentConfig.workingDirectory, workspacePath)
+    }
+
     func testGLMOldDefaultSlotMappingMigratesOnConfigLookup() throws {
         let defaults = try makeIsolatedDefaults()
         let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)

@@ -824,6 +824,184 @@ import XCTest
             XCTAssertTrue(harness.runtime.submitted.isEmpty)
         }
 
+        func testHiddenTestOutputsAreRedactedFromPartialAndFinalMCPProjections() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            var record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            record.phase = .completed
+            var attempt = try PromptExperimentAttempt(trial: XCTUnwrap(plan.trials.first), plan: plan)
+            attempt.status = .completed
+            let candidate = try await harness.store.installArtifact(Data("Candidate prompt".utf8), fileExtension: "txt")
+            let hiddenOutput = try await harness.store.installArtifact(Data("hidden answer".utf8), fileExtension: "txt")
+            let visibleOutput = try await harness.store.installArtifact(Data("visible answer".utf8), fileExtension: "txt")
+            func evaluation(_ split: PromptExperimentDatasetSplit, output: PromptExperimentArtifactReference) -> PromptExperimentEvaluationEvidence {
+                .init(id: UUID(), candidateIndex: 0, exampleID: split.rawValue, split: split, score: 0.5, feedback: "Feedback \(split.rawValue)", failureKind: nil, outputEvidence: output, elapsedSeconds: 1)
+            }
+            let evaluations = [evaluation(.hiddenTest, output: hiddenOutput), evaluation(.validation, output: visibleOutput)]
+            attempt.partialEvaluations = evaluations.map { .init(id: $0.id, candidateEvidence: candidate, evaluation: $0) }
+            attempt.optimizationResult = PromptExperimentOptimizationResult(
+                engine: "gepa", upstreamRevision: "test", baselineScore: 0.5, bestScore: 0.5, bestCandidateIndex: 0,
+                candidates: [.init(id: UUID(), index: 0, parentIndices: [], candidateEvidence: candidate, candidatePreview: "Candidate prompt", aggregateScore: 0.5, isBaseline: true, isBest: true)],
+                evaluations: evaluations, totalEvaluations: 2, wallTimeSeconds: 1, proposerUsage: "unavailable",
+                runDirectoryRelativePath: nil, rawResultEvidence: nil
+            )
+            record.attempts = [attempt]
+
+            let texts = try await harness.service.readableArtifactText(for: record)
+            XCTAssertNil(texts[hiddenOutput.sha256], "Hidden-test output must not be loaded for proposer projections")
+            XCTAssertEqual(texts[visibleOutput.sha256], "visible answer")
+
+            // Even if a caller supplies hidden text, the projection itself must withhold it.
+            var leakedTexts = texts
+            leakedTexts[hiddenOutput.sha256] = "hidden answer"
+            let projected = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: leakedTexts)).objectValue
+            let projectedAttempt = try XCTUnwrap(projected?["attempts"]?.arrayValue?.first?.objectValue)
+
+            let partials = try XCTUnwrap(projectedAttempt["partial_evaluations"]?.arrayValue).compactMap(\.objectValue)
+            let hiddenPartial = try XCTUnwrap(partials.first { $0["split"]?.stringValue == "hidden_test" })
+            XCTAssertEqual(hiddenPartial["output"], .null)
+            XCTAssertEqual(hiddenPartial["output_evidence"], .null)
+            XCTAssertEqual(hiddenPartial["score"], .double(0.5))
+            XCTAssertEqual(hiddenPartial["feedback"]?.stringValue, PromptExperimentDatasetSplit.heldOutFeedback)
+            let visiblePartial = try XCTUnwrap(partials.first { $0["split"]?.stringValue == "validation" })
+            XCTAssertEqual(visiblePartial["feedback"]?.stringValue, "Feedback validation")
+            XCTAssertEqual(visiblePartial["output"]?.stringValue, "visible answer")
+            XCTAssertEqual(visiblePartial["output_evidence"]?.objectValue?["sha256"]?.stringValue, visibleOutput.sha256)
+
+            let result = try XCTUnwrap(projectedAttempt["optimization_result"]?.objectValue)
+            let finals = try XCTUnwrap(result["evaluations"]?.arrayValue).compactMap(\.objectValue)
+            let hiddenFinal = try XCTUnwrap(finals.first { $0["split"]?.stringValue == "hidden_test" })
+            XCTAssertEqual(hiddenFinal["output"], .null)
+            XCTAssertEqual(hiddenFinal["score"], .double(0.5))
+            XCTAssertEqual(hiddenFinal["feedback"]?.stringValue, PromptExperimentDatasetSplit.heldOutFeedback)
+            let visibleFinal = try XCTUnwrap(finals.first { $0["split"]?.stringValue == "validation" })
+            XCTAssertEqual(visibleFinal["output"]?.stringValue, "visible answer")
+            XCTAssertEqual(visibleFinal["feedback"]?.stringValue, "Feedback validation")
+            XCTAssertEqual(result["best_score"], .double(0.5))
+        }
+
+        /// Records persisted before hidden command feedback was withheld upstream may store grader
+        /// feedback (answer keys) verbatim; proposer-facing projections must still replace it.
+        func testHistoricalHiddenTestFeedbackIsReplacedInMCPAndOverview() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            var record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            record.phase = .completed
+            var attempt = try PromptExperimentAttempt(trial: XCTUnwrap(plan.trials.first), plan: plan)
+            attempt.status = .completed
+            let candidate = try await harness.store.installArtifact(Data("Candidate prompt".utf8), fileExtension: "txt")
+            let hiddenPartialMarker = "HIDDEN_PARTIAL_ANSWER_KEY"
+            let hiddenFinalMarker = "HIDDEN_FINAL_ANSWER_KEY"
+            func evaluation(_ split: PromptExperimentDatasetSplit, feedback: String) -> PromptExperimentEvaluationEvidence {
+                .init(id: UUID(), candidateIndex: 0, exampleID: split.rawValue, split: split, score: 0.5, feedback: feedback, failureKind: .candidate, outputEvidence: nil, elapsedSeconds: 1)
+            }
+            attempt.partialEvaluations = [
+                evaluation(.hiddenTest, feedback: "expected \(hiddenPartialMarker)"),
+                evaluation(.validation, feedback: "VALIDATION_PARTIAL_FEEDBACK")
+            ].map { .init(id: $0.id, candidateEvidence: candidate, evaluation: $0) }
+            attempt.optimizationResult = PromptExperimentOptimizationResult(
+                engine: "gepa", upstreamRevision: "test", baselineScore: 0.5, bestScore: 0.5, bestCandidateIndex: 0,
+                candidates: [.init(id: UUID(), index: 0, parentIndices: [], candidateEvidence: candidate, candidatePreview: "Candidate prompt", aggregateScore: 0.5, isBaseline: true, isBest: true)],
+                evaluations: [
+                    evaluation(.hiddenTest, feedback: "expected \(hiddenFinalMarker)"),
+                    evaluation(.validation, feedback: "VALIDATION_FINAL_FEEDBACK")
+                ],
+                totalEvaluations: 2, wallTimeSeconds: 1, proposerUsage: "unavailable",
+                runDirectoryRelativePath: nil, rawResultEvidence: nil
+            )
+            record.attempts = [attempt]
+
+            let texts = try await harness.service.readableArtifactText(for: record)
+            let projection = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: texts))
+            let serialized = try String(decoding: JSONEncoder().encode(projection), as: UTF8.self)
+            XCTAssertFalse(serialized.contains(hiddenPartialMarker))
+            XCTAssertFalse(serialized.contains(hiddenFinalMarker))
+            XCTAssertTrue(serialized.contains(PromptExperimentDatasetSplit.heldOutFeedback))
+            XCTAssertTrue(serialized.contains("VALIDATION_PARTIAL_FEEDBACK"))
+            XCTAssertTrue(serialized.contains("VALIDATION_FINAL_FEEDBACK"))
+
+            _ = try await harness.store.saveRecords([record])
+            let directory = try await harness.store.recordDirectoryURL(experimentID: id)
+            let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
+            XCTAssertFalse(overview.contains(hiddenPartialMarker))
+            XCTAssertFalse(overview.contains(hiddenFinalMarker))
+            XCTAssertTrue(overview.contains(PromptExperimentDatasetSplit.heldOutFeedback))
+            XCTAssertTrue(overview.contains("VALIDATION_FINAL_FEEDBACK"))
+        }
+
+        func testRawGEPAResultAndHiddenOutputPathsAreNotAdvertisedInMCPOrOverview() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            var record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            record.phase = .completed
+            var attempt = try PromptExperimentAttempt(trial: XCTUnwrap(plan.trials.first), plan: plan)
+            attempt.status = .completed
+            let candidate = try await harness.store.installArtifact(Data("Candidate prompt".utf8), fileExtension: "txt")
+            let hiddenOutput = try await harness.store.installArtifact(Data("HIDDEN_TEST_ANSWER".utf8), fileExtension: "txt")
+            let visibleOutput = try await harness.store.installArtifact(Data("VALIDATION_ANSWER".utf8), fileExtension: "txt")
+            let rawJSON = Data(#"{"evaluations":[{"split":"hidden_test","output":"HIDDEN_TEST_ANSWER"}]}"#.utf8)
+            let rawResult = try await harness.store.installArtifact(rawJSON, fileExtension: "json")
+            func evaluation(_ split: PromptExperimentDatasetSplit, output: PromptExperimentArtifactReference) -> PromptExperimentEvaluationEvidence {
+                .init(id: UUID(), candidateIndex: 0, exampleID: split.rawValue, split: split, score: 0.5, feedback: "Feedback \(split.rawValue)", failureKind: nil, outputEvidence: output, elapsedSeconds: 1)
+            }
+            let evaluations = [evaluation(.hiddenTest, output: hiddenOutput), evaluation(.validation, output: visibleOutput)]
+            attempt.partialEvaluations = evaluations.map { .init(id: $0.id, candidateEvidence: candidate, evaluation: $0) }
+            attempt.optimizationResult = PromptExperimentOptimizationResult(
+                engine: "gepa", upstreamRevision: "test", baselineScore: 0.5, bestScore: 0.5, bestCandidateIndex: 0,
+                candidates: [.init(id: UUID(), index: 0, parentIndices: [], candidateEvidence: candidate, candidatePreview: "Candidate prompt", aggregateScore: 0.5, isBaseline: true, isBest: true)],
+                evaluations: evaluations, totalEvaluations: 2, wallTimeSeconds: 1, proposerUsage: "unavailable",
+                runDirectoryRelativePath: "worker-runs/attempt", rawResultEvidence: rawResult
+            )
+            record.attempts = [attempt]
+            let hiddenMarkers = [hiddenOutput.sha256, hiddenOutput.relativePath, rawResult.sha256, rawResult.relativePath, "HIDDEN_TEST_ANSWER"]
+
+            let texts = try await harness.service.readableArtifactText(for: record)
+            XCTAssertNil(texts[rawResult.sha256], "The raw GEPA result embeds hidden outputs and must not be read for proposer projections")
+            XCTAssertFalse(texts.values.contains { $0.contains("HIDDEN_TEST_ANSWER") })
+            XCTAssertEqual(texts[visibleOutput.sha256], "VALIDATION_ANSWER")
+
+            let projection = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: texts))
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            let serialized = try String(decoding: encoder.encode(projection), as: UTF8.self)
+            for marker in hiddenMarkers {
+                XCTAssertFalse(serialized.contains(marker), "MCP projection advertises hidden payload: \(marker)")
+            }
+            XCTAssertTrue(serialized.contains("VALIDATION_ANSWER"))
+            XCTAssertTrue(serialized.contains(visibleOutput.sha256))
+            let result = try XCTUnwrap(projection.objectValue?["attempts"]?.arrayValue?.first?.objectValue?["optimization_result"]?.objectValue)
+            XCTAssertNil(result["raw_result_evidence"])
+            XCTAssertEqual(result["raw_result_persisted"], .bool(true))
+            XCTAssertEqual(result["run_directory_relative_path"]?.stringValue, "worker-runs/attempt")
+            XCTAssertNotNil(result["run_directory_policy"]?.stringValue)
+
+            _ = try await harness.store.saveRecords([record])
+            let directory = try await harness.store.recordDirectoryURL(experimentID: id)
+            let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
+            for marker in hiddenMarkers {
+                XCTAssertFalse(overview.contains(marker), "overview.md advertises hidden payload: \(marker)")
+            }
+            XCTAssertTrue(overview.contains("Output: host-private (hidden test)"))
+            XCTAssertTrue(overview.contains("../../\(visibleOutput.relativePath)"))
+            XCTAssertTrue(overview.contains("Raw versioned result: persisted host-private"))
+            XCTAssertTrue(overview.contains("worker-runs/attempt"))
+
+            // Durable evidence stays stored and inspectable through explicit file access.
+            let reloaded = try await harness.store.loadRecords()
+            let persisted = try XCTUnwrap(reloaded.first { $0.id == id }?.attempts.first?.optimizationResult)
+            XCTAssertEqual(persisted.rawResultEvidence, rawResult)
+            let storedRaw = try await harness.store.readArtifact(rawResult)
+            let storedHidden = try await harness.store.readArtifact(hiddenOutput)
+            XCTAssertEqual(storedRaw, rawJSON)
+            XCTAssertEqual(storedHidden, Data("HIDDEN_TEST_ANSWER".utf8))
+        }
+
         func testStartingPointChoiceIsValidatedAndDigestBoundWithoutChangingLegacyEncoding() throws {
             let date = Date(timeIntervalSince1970: 100)
             var draft = PromptExperimentDraft(revision: 1, title: "Seed choice", optimization: Self.validOptimization(), createdAt: date, updatedAt: date)
@@ -3205,6 +3383,7 @@ import XCTest
         func testCommandEvaluatorDistinguishesCandidateAndInfrastructureFailures() throws {
             let candidate = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
                 stdout: #"{"score":0.25,"feedback":"candidate output was invalid","failure_kind":"candidate"}"#,
+                split: .training,
                 minimumScore: 0,
                 maximumScore: 1,
                 elapsedSeconds: 0.1
@@ -3212,15 +3391,113 @@ import XCTest
             XCTAssertFalse(candidate.ok)
             XCTAssertEqual(candidate.failureKind, .candidate)
             XCTAssertEqual(candidate.score, 0.25)
+            XCTAssertEqual(candidate.feedback, "candidate output was invalid")
+            XCTAssertEqual(candidate.error, "candidate output was invalid")
 
             XCTAssertThrowsError(try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
                 stdout: #"{"score":0,"feedback":"sandbox bootstrap failed","failure_kind":"infrastructure"}"#,
+                split: .training,
                 minimumScore: 0,
                 maximumScore: 1,
                 elapsedSeconds: 0.1
             )) { error in
                 XCTAssertTrue(error.localizedDescription.contains("infrastructure failure"))
+                XCTAssertTrue(error.localizedDescription.contains("sandbox bootstrap failed"))
             }
+        }
+
+        func testHiddenTestCommandReplyWithholdsGraderStdoutFeedbackAndError() throws {
+            let marker = "HIDDEN_ANSWER_KEY_42"
+            let stdoutWith = { (kind: String?) in
+                let failure = kind.map { #","failure_kind":"\#($0)""# } ?? ""
+                return #"{"score":0.25,"feedback":"expected \#(marker)"\#(failure)}"#
+            }
+            let heldOut = PromptExperimentDatasetSplit.heldOutFeedback
+
+            let passing = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: stdoutWith(nil), split: .hiddenTest, minimumScore: 0, maximumScore: 1, elapsedSeconds: 0.1
+            )
+            XCTAssertTrue(passing.ok)
+            XCTAssertNil(passing.failureKind)
+            XCTAssertEqual(passing.score, 0.25)
+            XCTAssertNil(passing.output)
+            XCTAssertEqual(passing.feedback, heldOut)
+            XCTAssertNil(passing.error)
+
+            // The worker's ok:false candidate path turns `error` into GEPA feedback.
+            let candidate = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: stdoutWith("candidate"), split: .hiddenTest, minimumScore: 0, maximumScore: 1, elapsedSeconds: 0.1
+            )
+            XCTAssertFalse(candidate.ok)
+            XCTAssertEqual(candidate.failureKind, .candidate)
+            XCTAssertEqual(candidate.score, 0.25)
+            XCTAssertEqual(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: candidate), 0.25)
+            XCTAssertNil(candidate.output)
+            XCTAssertEqual(candidate.feedback, heldOut)
+            XCTAssertEqual(candidate.error, heldOut)
+
+            for reply in [passing, candidate] {
+                let wire = try String(decoding: JSONSerialization.data(withJSONObject: reply.jsonObject), as: UTF8.self)
+                XCTAssertFalse(wire.contains(marker), "Hidden grader payload reached the GEPA wire: \(wire)")
+            }
+
+            XCTAssertThrowsError(try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: stdoutWith("infrastructure"), split: .hiddenTest, minimumScore: 0, maximumScore: 1, elapsedSeconds: 0.1
+            )) { error in
+                XCTAssertTrue(error.localizedDescription.contains("infrastructure failure"))
+                XCTAssertFalse(error.localizedDescription.contains(marker))
+            }
+
+            // Non-hidden command feedback and output still reach GEPA.
+            let validation = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: stdoutWith(nil), split: .validation, minimumScore: 0, maximumScore: 1, elapsedSeconds: 0.1
+            )
+            XCTAssertEqual(validation.feedback, "expected \(marker)")
+            XCTAssertEqual(validation.output, stdoutWith(nil))
+        }
+
+        func testScoredCommandCandidateFailureCheckpointsButInfrastructureDoesNot() throws {
+            let candidate = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: #"{"score":0.25,"feedback":"candidate output was invalid","failure_kind":"candidate"}"#,
+                split: .training,
+                minimumScore: 0,
+                maximumScore: 1,
+                elapsedSeconds: 0.1
+            )
+            XCTAssertEqual(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: candidate), 0.25)
+
+            let passing = PromptExperimentGEPAHostReply(ok: true, output: "out", score: 1, feedback: "ok", failureKind: nil, error: nil, elapsedSeconds: 0.1)
+            XCTAssertEqual(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: passing), 1)
+            XCTAssertEqual(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "mcp_grade", reply: passing), 1)
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "reflect", reply: passing))
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "mcp_begin", reply: passing))
+
+            let scoredInfrastructure = PromptExperimentGEPAHostReply(ok: false, output: nil, score: 0, feedback: nil, failureKind: .infrastructure, error: "boom", elapsedSeconds: nil)
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: scoredInfrastructure))
+            let okInfrastructure = PromptExperimentGEPAHostReply(ok: true, output: nil, score: 0, feedback: nil, failureKind: .infrastructure, error: nil, elapsedSeconds: nil)
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: okInfrastructure))
+            let unclassifiedFailure = PromptExperimentGEPAHostReply(ok: false, output: nil, score: 0.5, feedback: nil, failureKind: nil, error: "boom", elapsedSeconds: nil)
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: unclassifiedFailure))
+            let unscoredCandidate = PromptExperimentGEPAHostReply(ok: false, output: nil, score: nil, feedback: nil, failureKind: .candidate, error: "bad", elapsedSeconds: nil)
+            XCTAssertNil(NativePromptExperimentContextBuilderRuntime.checkpointScore(operation: "evaluate", reply: unscoredCandidate))
+        }
+
+        func testEvaluationAdmissionEnforcesSealedBudgetAndLogicalIdentity() {
+            var admission = PromptExperimentEvaluationAdmission(maxEvaluations: 2)
+            let first = UUID()
+            let second = UUID()
+
+            XCTAssertEqual(admission.admit(logicalCallbackID: nil), .failure(.missingLogicalCallbackID))
+            XCTAssertEqual(admission.admittedCount, 0, "Rejections must not consume budget.")
+
+            XCTAssertEqual(admission.admit(logicalCallbackID: first), .success(1))
+            XCTAssertEqual(admission.admit(logicalCallbackID: first), .failure(.reusedLogicalCallbackID))
+            XCTAssertEqual(admission.admittedCount, 1)
+
+            XCTAssertEqual(admission.admit(logicalCallbackID: second), .success(2))
+            XCTAssertEqual(admission.admit(logicalCallbackID: UUID()), .failure(.budgetExhausted(maxEvaluations: 2)))
+            XCTAssertEqual(admission.admit(logicalCallbackID: second), .failure(.reusedLogicalCallbackID))
+            XCTAssertEqual(admission.admittedCount, 2, "Admissions are retained; failed or cancelled evaluations are never refunded.")
         }
 
         func testPromptOnlyClaudeProfileDisablesNativeAndWebTools() {

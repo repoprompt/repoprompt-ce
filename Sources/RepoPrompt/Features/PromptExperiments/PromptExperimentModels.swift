@@ -103,6 +103,16 @@
         case training
         case validation
         case hiddenTest = "hidden_test"
+
+        /// Fixed feedback sent upstream and shown to proposers for held-out evaluations; grader
+        /// feedback can embed reference answers and never leaves the native host for this split.
+        static let heldOutFeedback = "Held-out score recorded; reference-derived feedback is withheld."
+
+        /// Proposer-facing feedback. Hidden-test feedback is always replaced, including for
+        /// historical records persisted before hidden command feedback was withheld upstream.
+        func proposerFacingFeedback(_ feedback: String) -> String {
+            self == .hiddenTest ? Self.heldOutFeedback : feedback
+        }
     }
 
     struct PromptExperimentExample: Codable, Equatable, Identifiable {

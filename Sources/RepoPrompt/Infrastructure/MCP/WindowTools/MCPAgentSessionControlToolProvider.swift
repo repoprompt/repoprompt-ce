@@ -720,15 +720,17 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             }) } ?? .null
             value["partial_evaluations"] = attempt.partialEvaluations.map { evaluations in .array(evaluations.map { partial in
                 let evaluation = partial.evaluation
+                let visibleOutput = evaluation.split != .hiddenTest ? evaluation.outputEvidence : nil
                 return .object([
                     "id": .string(partial.id.uuidString),
                     "candidate_evidence": artifactValue(partial.candidateEvidence),
                     "candidate": artifactTextBySHA256[partial.candidateEvidence.sha256].map(Value.string) ?? .null,
                     "example_id": .string(evaluation.exampleID), "split": .string(evaluation.split.rawValue),
-                    "score": evaluation.score.map(Value.double) ?? .null, "feedback": .string(evaluation.feedback),
+                    "score": evaluation.score.map(Value.double) ?? .null,
+                    "feedback": .string(evaluation.split.proposerFacingFeedback(evaluation.feedback)),
                     "failure_kind": evaluation.failureKind.map { .string($0.rawValue) } ?? .null,
-                    "output_evidence": evaluation.outputEvidence.map(artifactValue) ?? .null,
-                    "output": evaluation.outputEvidence.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
+                    "output_evidence": visibleOutput.map(artifactValue) ?? .null,
+                    "output": visibleOutput.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
                     "elapsed_seconds": evaluation.elapsedSeconds.map(Value.double) ?? .null
                 ])
             }) } ?? .null
@@ -814,7 +816,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "wall_time_seconds": result.wallTimeSeconds.map(Value.double) ?? .null,
                 "proposer_usage": .string(result.proposerUsage),
                 "run_directory_relative_path": result.runDirectoryRelativePath.map(Value.string) ?? .null,
-                "raw_result_evidence": result.rawResultEvidence.map(artifactValue) ?? .null,
+                "run_directory_policy": .string("Diagnostic worker directory for user/auditor inspection. Upstream GEPA state inside it is not host-redacted and may include held-out evaluation payloads; it is not proposer evidence."),
+                // The raw versioned result embeds every evaluation output, including hidden-test
+                // outputs. Content-addressed paths derive from the digest, so neither is projected.
+                "raw_result_persisted": .bool(result.rawResultEvidence != nil),
                 "candidates": .array(result.candidates.map { candidate in
                     .object([
                         "index": .int(candidate.index),
@@ -831,14 +836,15 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     ])
                 }),
                 "evaluations": .array(result.evaluations.map { evaluation in
-                    .object([
+                    let visibleOutput = evaluation.split != .hiddenTest ? evaluation.outputEvidence : nil
+                    return .object([
                         "candidate_index": .int(evaluation.candidateIndex),
                         "example_id": .string(evaluation.exampleID),
                         "split": .string(evaluation.split.rawValue),
                         "score": evaluation.score.map(Value.double) ?? .null,
-                        "feedback": .string(evaluation.feedback),
+                        "feedback": .string(evaluation.split.proposerFacingFeedback(evaluation.feedback)),
                         "failure_kind": evaluation.failureKind.map { .string($0.rawValue) } ?? .null,
-                        "output": evaluation.outputEvidence.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
+                        "output": visibleOutput.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
                         "elapsed_seconds": evaluation.elapsedSeconds.map(Value.double) ?? .null
                     ])
                 })
