@@ -490,6 +490,7 @@ extension AgentModeViewModel {
             normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
             activeAgentSessionID: tab.activeAgentSessionID,
             isPinned: tab.isPinned,
+            pinnedOrder: tab.pinnedOrder,
             lastModified: tab.lastModified
         )
     }
@@ -661,6 +662,9 @@ extension AgentModeViewModel {
                     changed = true
                 }
                 if previousTab.isPinned != currentTab.isPinned { categories.insert("tabMetadata.isPinned")
+                    changed = true
+                }
+                if previousTab.pinnedOrder != currentTab.pinnedOrder { categories.insert("tabMetadata.pinnedOrder")
                     changed = true
                 }
                 if previousTab.lastModified != currentTab.lastModified {

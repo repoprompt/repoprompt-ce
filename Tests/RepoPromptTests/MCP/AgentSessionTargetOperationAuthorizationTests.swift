@@ -400,6 +400,69 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertTrue(allIDs.contains(sibling.uuidString))
     }
 
+    func testAdministrativePinAndReorderDoesNotResumeIndexOnlySessions() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let firstTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let firstSession = window.agentModeViewModel.session(for: firstTabID)
+        let firstID = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(firstSession))
+        let createdSecondTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank, name: "Second")
+        let secondTab = try XCTUnwrap(createdSecondTab)
+        let secondSession = window.agentModeViewModel.session(for: secondTab.id)
+        let secondID = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(secondSession))
+        firstSession.hasLoadedPersistedState = false
+        secondSession.hasLoadedPersistedState = false
+
+        let admin = makeManageService(window: window, callerSessionID: nil, runPurpose: nil)
+        for sessionID in [firstID, secondID] {
+            _ = try await admin.execute(args: [
+                "op": .string("set_session_pin"),
+                "session_id": .string(sessionID.uuidString),
+                "pinned": .bool(true)
+            ])
+        }
+        let beforeValue = try await admin.execute(args: ["op": .string("list_pinned_sessions")])
+        let before = try pinnedSessionIDs(in: beforeValue)
+        XCTAssertEqual(Set(before), Set([firstID, secondID]))
+        let desired = Array(before.reversed())
+        _ = try await admin.execute(args: [
+            "op": .string("reorder_pinned_sessions"),
+            "expected_session_ids": .array(before.map { .string($0.uuidString) }),
+            "session_ids": .array(desired.map { .string($0.uuidString) })
+        ])
+        let afterValue = try await admin.execute(args: ["op": .string("list_pinned_sessions")])
+        XCTAssertEqual(try pinnedSessionIDs(in: afterValue), desired)
+        XCTAssertFalse(firstSession.hasLoadedPersistedState)
+        XCTAssertFalse(secondSession.hasLoadedPersistedState)
+
+        do {
+            _ = try await admin.execute(args: [
+                "op": .string("reorder_pinned_sessions"),
+                "expected_session_ids": .array(before.map { .string($0.uuidString) }),
+                "session_ids": .array(before.map { .string($0.uuidString) })
+            ])
+            XCTFail("Expected a stale-order rejection")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Pinned session order changed"))
+        }
+
+        let agent = makeManageService(window: window, callerSessionID: firstID)
+        do {
+            _ = try await agent.execute(args: ["op": .string("list_pinned_sessions")])
+            XCTFail("Agent-origin caller must not enumerate workspace-wide pins")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("external administrative MCP connection"))
+        }
+    }
+
+    private func pinnedSessionIDs(in value: Value) throws -> [UUID] {
+        let sessions = try XCTUnwrap(value.objectValue?["sessions"]?.arrayValue)
+        return try sessions.map { item in
+            let raw = try XCTUnwrap(item.objectValue?["session_id"]?.stringValue)
+            return try XCTUnwrap(UUID(uuidString: raw))
+        }
+    }
+
     // MARK: - Helpers
 
     private final class DeletionRecorder {

@@ -19,6 +19,7 @@ struct AgentModeSidebarSessionBuilder {
         let tabByID: [UUID: ComposeTabState]
         let tabNameByID: [UUID: String]
         let tabOrder: [UUID: Int]
+        let pinnedOrderByTabID: [UUID: Int]
         let sortDateByTabID: [UUID: Date]
         let resolvedSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
@@ -115,6 +116,9 @@ struct AgentModeSidebarSessionBuilder {
             tabByID: tabByID,
             tabNameByID: tabNameByID,
             tabOrder: tabOrder,
+            pinnedOrderByTabID: Dictionary(uniqueKeysWithValues: rowTabs.compactMap { tab in
+                tab.pinnedOrder.map { (tab.id, $0) }
+            }),
             sortDateByTabID: sortDateByTabID,
             resolvedSessionIDByTabID: resolvedSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
@@ -429,6 +433,9 @@ struct AgentModeSidebarSessionBuilder {
         context: BuildContext
     ) -> [SidebarSession] {
         rows.sorted { lhs, rhs in
+            if let manualOrder = manualPinnedOrderComparison(lhs, rhs, pinnedOrderByTabID: context.pinnedOrderByTabID) {
+                return manualOrder
+            }
             if context.useFrozenRestoreOrder {
                 let lhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[lhs.tabID]
                 let rhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[rhs.tabID]
@@ -443,7 +450,7 @@ struct AgentModeSidebarSessionBuilder {
                     break
                 }
             }
-            return sidebarRowPrecedes(lhs, rhs, tabOrder: context.tabOrder)
+            return sidebarRowPrecedes(lhs, rhs, tabOrder: context.tabOrder, pinnedOrderByTabID: context.pinnedOrderByTabID)
         }
     }
 
@@ -577,11 +584,33 @@ struct AgentModeSidebarSessionBuilder {
         )
     }
 
+    private func manualPinnedOrderComparison(
+        _ lhs: SidebarSession,
+        _ rhs: SidebarSession,
+        pinnedOrderByTabID: [UUID: Int]
+    ) -> Bool? {
+        guard lhs.isPinned, rhs.isPinned else { return nil }
+        switch (pinnedOrderByTabID[lhs.tabID], pinnedOrderByTabID[rhs.tabID]) {
+        case let (.some(lhsOrder), .some(rhsOrder)) where lhsOrder != rhsOrder:
+            return lhsOrder < rhsOrder
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            return nil
+        }
+    }
+
     private func sidebarRowPrecedes(
         _ lhs: SidebarSession,
         _ rhs: SidebarSession,
-        tabOrder: [UUID: Int]
+        tabOrder: [UUID: Int],
+        pinnedOrderByTabID: [UUID: Int]
     ) -> Bool {
+        if let manualOrder = manualPinnedOrderComparison(lhs, rhs, pinnedOrderByTabID: pinnedOrderByTabID) {
+            return manualOrder
+        }
         if lhs.activityDate != rhs.activityDate {
             return lhs.activityDate > rhs.activityDate
         }
@@ -618,7 +647,8 @@ struct AgentModeSidebarSessionBuilder {
         if baseSortedSessions.contains(where: { $0.parentSessionID != nil }) {
             return threadedSidebarSessions(
                 from: baseSortedSessions,
-                tabOrder: context.tabOrder
+                tabOrder: context.tabOrder,
+                pinnedOrderByTabID: context.pinnedOrderByTabID
             )
         }
         return sidebarSessionsPreservingFlatOrder(
@@ -679,7 +709,8 @@ struct AgentModeSidebarSessionBuilder {
     /// Cycles and missing parents degrade children to root level.
     private func threadedSidebarSessions(
         from flat: [SidebarSession],
-        tabOrder: [UUID: Int]
+        tabOrder: [UUID: Int],
+        pinnedOrderByTabID: [UUID: Int]
     ) -> [SidebarSession] {
         // Build lookup: sessionID -> index in flat list
         var sessionIDToIndex: [UUID: Int] = [:]
@@ -771,7 +802,7 @@ struct AgentModeSidebarSessionBuilder {
                     if lhsContainsPinned != rhsContainsPinned {
                         return lhsContainsPinned && !rhsContainsPinned
                     }
-                    return sidebarRowPrecedes(flat[lhs], flat[rhs], tabOrder: tabOrder)
+                    return sidebarRowPrecedes(flat[lhs], flat[rhs], tabOrder: tabOrder, pinnedOrderByTabID: pinnedOrderByTabID)
                 }
                 for childIndex in orderedChildren {
                     emit(childIndex, depth: depth + 1)
