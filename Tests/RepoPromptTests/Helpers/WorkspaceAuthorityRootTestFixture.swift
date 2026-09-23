@@ -411,7 +411,6 @@ import XCTest
             let savedBefore = await runtime.workspaceStore.savedStateForTesting(workspace.id)
             let savedState = try XCTUnwrap(savedBefore)
             let model = try XCTUnwrap(manager.workspace(withID: workspace.id))
-            let stateVersion = manager.debugStateVersionForWorkspace(workspace.id)
             let shells = files.visibleRootShellProjections
             let ticket = manager.currentRootReconciliationTicketForTesting
             let selection = files.snapshotSelection()
@@ -425,19 +424,28 @@ import XCTest
             let savedAfter = await runtime.workspaceStore.savedStateForTesting(workspace.id)
             let canonicalAfter = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
             let after = await runtime.workspaceStore.snapshot()
-            guard model == manager.workspace(withID: workspace.id),
-                  stateVersion == manager.debugStateVersionForWorkspace(workspace.id),
-                  shells == files.visibleRootShellProjections,
-                  ticket == manager.currentRootReconciliationTicketForTesting,
-                  selection == files.snapshotSelection(), notifications == rootNotificationCount,
-                  roots == rootsAfter,
-                  readinessObservation == observationAfter,
-                  savedState == savedAfter,
-                  before.publicationSequence == after.publicationSequence,
-                  canonical == canonicalAfter, try diskBytes == Data(contentsOf: workspaceURL)
-            else { throw CheckpointFailure.authorityChangedDuringCapture }
+            let diskAfter = try Data(contentsOf: workspaceURL)
+            var changed: [String] = []
+            if model != manager.workspace(withID: workspace.id) { changed.append("manager model") }
+            // Debounced in-memory observers can advance the dirty-tracking version while
+            // this cross-actor read is suspended, without changing the model or authority.
+            // No-op actions bracket their own version on the main actor instead.
+            if shells != files.visibleRootShellProjections { changed.append("visible shells") }
+            if ticket != manager.currentRootReconciliationTicketForTesting { changed.append("reconciliation ticket") }
+            if selection != files.snapshotSelection() { changed.append("selection") }
+            if notifications != rootNotificationCount { changed.append("root notifications") }
+            if roots != rootsAfter { changed.append("primary roots") }
+            if readinessObservation != observationAfter { changed.append("root readiness") }
+            if savedState != savedAfter { changed.append("saved state") }
+            if before.publicationSequence != after.publicationSequence { changed.append("publication sequence") }
+            if canonical != canonicalAfter { changed.append("canonical workspace") }
+            if diskBytes != diskAfter { changed.append("disk bytes") }
+            guard changed.isEmpty else {
+                throw CheckpointFailure.authorityChangedDuringCapture(changed.joined(separator: ", "))
+            }
             guard savedState.revision == canonical.revisions.savedRevision,
                   DomainContentDigest.sha256(diskBytes) == savedState.digest else { throw CheckpointFailure.savedBytesUnverified }
+            let stateVersion = manager.debugStateVersionForWorkspace(workspace.id)
             return try Capture(
                 model: model, canonical: canonical, savedState: savedState,
                 disk: JSONDecoder().decode(WorkspaceModel.self, from: diskBytes), diskBytes: diskBytes,
@@ -528,7 +536,8 @@ import XCTest
         }
 
         enum CheckpointFailure: Error, Equatable {
-            case projectionTimedOut, authorityChangedDuringCapture, savedBytesUnverified
+            case projectionTimedOut, savedBytesUnverified
+            case authorityChangedDuringCapture(String)
             case operationTimedOut(String)
         }
     }
