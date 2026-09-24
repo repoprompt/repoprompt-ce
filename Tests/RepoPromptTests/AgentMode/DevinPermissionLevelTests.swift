@@ -664,6 +664,67 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertFalse(ACPAIModelCatalog.devinModelsFromStore().contains(.devinCustom(name: "default")))
     }
 
+    func testOraclePickerExpandsAdvertisedDevinThinkingChoices() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
+        addTeardownBlock { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        let base = "gpt-6-astra-medium"
+        let choices = ["low", "medium", "high", "xhigh", "max"].map {
+            ACPModelParameterChoice(rawValue: $0, displayName: $0.capitalized)
+        }
+        AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: base,
+                        displayName: "GPT-6 Astra Medium Thinking",
+                        description: nil,
+                        isDefault: true
+                    ),
+                    AgentModelOption(rawValue: "swe-1-7-medium", displayName: "SWE-1.7", description: nil, isDefault: false)
+                ],
+                currentModelRaw: base,
+                modelParameterSets: [
+                    ACPModelParameterSet(
+                        baseModelRaw: base,
+                        parameters: [ACPModelParameterDefinition(
+                            kind: .thinking,
+                            configID: "thought_level",
+                            displayName: "Thought level",
+                            choices: choices,
+                            currentValueRaw: "medium"
+                        )]
+                    ),
+                    ACPModelParameterSet(
+                        baseModelRaw: "swe-1-7-medium",
+                        parameters: [ACPModelParameterDefinition(
+                            kind: .thinking,
+                            configID: "thought_level",
+                            displayName: "Thought level",
+                            choices: [
+                                ACPModelParameterChoice(rawValue: "medium", displayName: "Medium"),
+                                ACPModelParameterChoice(rawValue: "max", displayName: "Max")
+                            ],
+                            currentValueRaw: "medium"
+                        )]
+                    )
+                ]
+            ),
+            for: .devin
+        )
+
+        let pickerModels = ACPAIModelCatalog.devinModelsFromStore()
+        XCTAssertEqual(
+            Set(pickerModels.map(\.modelName)),
+            Set(choices.map { "gpt-6-astra-\($0.rawValue)" } + ["swe-1-7-medium"])
+        )
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-astra-high").displayName, "GPT-6 Astra High Thinking")
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-astra-xhigh").modelName, "gpt-6-astra-xhigh")
+        XCTAssertEqual(AgentModelCatalog.options(
+            for: .devin,
+            availability: .init(devinAvailable: true)
+        ).map(\.rawValue), [base, "swe-1-7-medium"])
+    }
+
     func testHeadlessAndOracleDoNotInheritAgentModePermission() {
         let message = AgentMessage(systemPrompt: "system", userMessage: "prompt")
         let headless = DevinACPHeadlessAgentProvider.makeRunRequest(
