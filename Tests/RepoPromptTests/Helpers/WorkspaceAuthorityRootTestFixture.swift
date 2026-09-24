@@ -50,6 +50,7 @@ import XCTest
         final class RecordingManager: WorkspaceManagerViewModel {
             var dirtyMarkDidFinish: (() -> Void)?
             var selectionObservationDidFinish: (([FileViewModel]) -> Void)?
+            var selectionMirrorWillApply: (() async -> Void)?
             /// Negative control only: omit production request triggers after real setup.
             var omitRootReconciliationRequests = false
 
@@ -66,6 +67,11 @@ import XCTest
             override func checkIfActivePresetIsDirty(with newSelection: [FileViewModel]) {
                 super.checkIfActivePresetIsDirty(with: newSelection)
                 selectionObservationDidFinish?(newSelection)
+            }
+
+            override func applySelectionMirrorAttempt(_ selection: StoredSelection, forTabID tabID: UUID, workspaceID: UUID) async {
+                await selectionMirrorWillApply?()
+                await super.applySelectionMirrorAttempt(selection, forTabID: tabID, workspaceID: workspaceID)
             }
         }
 

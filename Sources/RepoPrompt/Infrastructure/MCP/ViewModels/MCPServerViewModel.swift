@@ -2232,8 +2232,10 @@ final class MCPServerViewModel: ObservableObject {
             }
             return .converged
         }
-        guard let workspaceManager else { return .invalidated }
-        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+        guard let workspaceManager, let workspaceID = key.workspaceID else { return .invalidated }
+        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(
+            for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
+        )
     }
 
     /// Presentation snapshot cache. Domain routing remains the only routing authority.

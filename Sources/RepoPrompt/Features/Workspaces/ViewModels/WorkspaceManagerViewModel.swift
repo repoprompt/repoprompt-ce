@@ -7950,31 +7950,42 @@ class WorkspaceManagerViewModel: ObservableObject {
         promptViewModel.tokenCountingViewModel.markDirty(.selection)
     }
 
-    /// Applies the newest stored selection after deferred `read_file` auto-selection.
+    /// Publishes canonical selection for the exact tab; only the active tab updates the file UI.
     @MainActor
     func applyStoredSelectionMirrorForReadFileAutoSelection(
-        tabID: UUID
+        for identity: WorkspaceSelectionIdentity
     ) async -> WorkspaceSelectionCoordinator.SelectionMirrorOutcome {
+        guard !Task.isCancelled else { return .cancelled }
         guard let active = activeWorkspace,
-              active.activeComposeTabID == tabID,
-              let tab = composeTab(with: tabID)
+              active.id == identity.workspaceID,
+              let tab = composeTab(for: identity)
         else { return .invalidated }
+        if active.activeComposeTabID != identity.tabID {
+            updateComposeTabSelectionPresentation(tab.selection, for: identity)
+            return .converged
+        }
+
+        let outcome: WorkspaceSelectionCoordinator.SelectionMirrorOutcome
         if let selectionCoordinator {
-            return await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
+            outcome = await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: identity.tabID)
         } else {
             await applySelectionMirrorAttempt(
                 tab.selection,
-                forTabID: tabID,
-                workspaceID: active.id
+                forTabID: identity.tabID,
+                workspaceID: identity.workspaceID
             )
-            guard !Task.isCancelled else { return .cancelled }
-            guard let current = activeWorkspace,
-                  current.id == active.id,
-                  current.activeComposeTabID == tabID,
-                  composeTab(with: tabID)?.selection == tab.selection
-            else { return .invalidated }
+            outcome = composeTab(for: identity)?.selection == tab.selection ? .converged : .invalidated
+        }
+        guard !Task.isCancelled, outcome != .cancelled else { return .cancelled }
+        guard let current = activeWorkspace,
+              current.id == identity.workspaceID,
+              let currentTab = composeTab(for: identity)
+        else { return .invalidated }
+        if current.activeComposeTabID != identity.tabID {
+            updateComposeTabSelectionPresentation(currentTab.selection, for: identity)
             return .converged
         }
+        return outcome
     }
 
     func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
