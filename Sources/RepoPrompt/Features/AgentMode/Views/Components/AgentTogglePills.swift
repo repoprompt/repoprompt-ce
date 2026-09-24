@@ -170,7 +170,7 @@ struct AgentAutoEffortPill: View {
         if !props.isOn { return "Auto effort off. Click to let Jev choose effort before eligible user turns." }
         if props.isJudging { return "Jev is choosing effort for this user turn." }
         let availability = props.isAvailable ? "" : " Jev is unavailable; turns use manual effort."
-        guard let feedback else { return "Auto effort on. No Jev choice has been submitted for this model yet.\(availability)" }
+        guard let feedback else { return "Auto effort on. No Jev choice has been submitted for this model yet. Effort does not change between tool calls inside an active turn.\(availability)" }
         let change = switch feedback.direction {
         case .up: "up from the previous Jev choice or initial selected effort"
         case .down: "down from the previous Jev choice or initial selected effort"
@@ -226,7 +226,7 @@ struct AgentAutoEffortPill: View {
             Button("Enable Auto effort", action: onToggle)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("For eligible user turns, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, effort choices, and any built-in workflow category. This includes settled MCP follow-ups. Masking may miss sensitive information. Workflow templates, files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. See Model Router Settings for the privacy policy.")
+            Text("For eligible user turns, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, effort choices, and any built-in workflow category. This includes first MCP starts and settled follow-ups, except starts already routed by Model Router. Masking may miss sensitive information. Workflow templates, files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. See Model Router Settings for the privacy policy.")
         }
     }
 }

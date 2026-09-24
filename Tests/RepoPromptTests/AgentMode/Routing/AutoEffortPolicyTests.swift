@@ -2,14 +2,14 @@
 import XCTest
 
 final class AutoEffortPolicyTests: XCTestCase {
-    func testMCPAdmissionAllowsSettledFollowUpsButPreservesFirstStartAndActiveSteering() {
+    func testMCPAdmissionAllowsFirstStartsAndSettledFollowUpsButPreservesRoutedInitialEffort() {
         XCTAssertTrue(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
             isEnabled: true,
             startsNewRun: true,
             hasPriorUserTurn: true,
             isNativePreparedTurn: false
         ))
-        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+        XCTAssertTrue(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
             isEnabled: true,
             startsNewRun: true,
             hasPriorUserTurn: false,
@@ -19,7 +19,8 @@ final class AutoEffortPolicyTests: XCTestCase {
             isEnabled: true,
             startsNewRun: true,
             hasPriorUserTurn: false,
-            isNativePreparedTurn: false
+            isNativePreparedTurn: false,
+            preserveRoutedInitialEffort: true
         ))
         XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
             isEnabled: true,

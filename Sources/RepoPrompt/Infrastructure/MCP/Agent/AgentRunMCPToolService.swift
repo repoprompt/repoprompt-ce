@@ -272,7 +272,8 @@ struct AgentRunMCPToolService {
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ workflow: AgentWorkflowDefinition?,
         _ expectedParentSessionID: UUID?,
-        _ oracleReviewSource: AgentRunOracleReviewSource?
+        _ oracleReviewSource: AgentRunOracleReviewSource?,
+        _ preserveRoutedInitialEffort: Bool
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome
     typealias ResolveOracleReviewLaunchSource = @MainActor (
         _ metadata: RequestMetadata,
@@ -340,6 +341,18 @@ struct AgentRunMCPToolService {
         let normalized = requestedModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return defaultTaskLabel }
         return AgentModelCatalog.taskLabels.first(where: { $0.label == normalized })?.kind
+    }
+
+    static func shouldRouteModelForStart(
+        requestedModelID: String?,
+        hasExplicitModelParameters: Bool
+    ) -> Bool {
+        guard !hasExplicitModelParameters else { return false }
+        guard let requestedModelID,
+              !requestedModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return true }
+        let normalized = requestedModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return AgentModelCatalog.taskLabels.contains { $0.label == normalized }
     }
 
     let toolName: String
@@ -514,9 +527,8 @@ struct AgentRunMCPToolService {
         // for agent_run.start resolves through the effective workspace Pair role default.
         let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
 
-        // Router mode owns the child target before any caller-supplied model is resolved. This lets
-        // it replace stale or currently unavailable child pins instead of failing on a selection it
-        // will not use. With Router disabled, preserve the existing strict model_id validation.
+        // An explicit compound model ID or model parameters are caller authority, even when
+        // Router is on. Default and role-label starts remain eligible for model routing.
         let requestedModelID = normalizedString(args["model_id"])
         let routedTaskLabelKind = Self.taskLabelKindForRouterOwnedStart(
             requestedModelID: requestedModelID,
@@ -526,7 +538,10 @@ struct AgentRunMCPToolService {
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
         do {
-            if let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
+            if Self.shouldRouteModelForStart(
+                requestedModelID: requestedModelID,
+                hasExplicitModelParameters: args["model_parameters"] != nil
+            ), let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
                 surface: .general
             ) {
@@ -544,7 +559,7 @@ struct AgentRunMCPToolService {
                         "provider": routed.agentRaw,
                         "model": routed.modelRaw,
                         "effort": routed.reasoningEffortRaw ?? "provider-default",
-                        "overrodeRequestedModel": String(requestedModelID != nil || args["model_parameters"] != nil)
+                        "overrodeRequestedModel": "false"
                     ])
                 #endif
             } else {
@@ -888,7 +903,8 @@ struct AgentRunMCPToolService {
                 selection.taskLabelKind,
                 workflow,
                 spawnParentSessionID,
-                oracleLaunchSource.source
+                oracleLaunchSource.source,
+                routerSelectedTarget
             )
             agentModeVM.mcpAcceptSessionTarget(target)
             agentModeVM.recordAgentSessionProviderLifecycle(

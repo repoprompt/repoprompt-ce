@@ -677,9 +677,11 @@ final actor ClaudeNativeProcessSessionController {
         let requestedModel = modelSpecifier != nil
             ? model
             : config.modelString
-        let effectiveEffortLevel = modelSpecifier?.explicitEffortLevel
-            ?? suppliedEffortLevel
-            ?? config.effortLevel
+        let effectiveEffortLevel = Self.resolvedEffortLevel(
+            model: model,
+            suppliedEffortLevel: suppliedEffortLevel,
+            fallbackEffortLevel: config.effortLevel
+        )
         let launchEnvironment = try await environmentResolver.resolve(
             variant: config.runtimeVariant,
             requestedModel: requestedModel
@@ -692,6 +694,18 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: requestEffortLevel
         )
         return (launchEnvironment, request)
+    }
+
+    /// A turn-scoped effort override must win over the picker's encoded baseline. Otherwise
+    /// `claude-opus-5-5:high` silently defeats an Auto effort choice of low or medium.
+    private nonisolated static func resolvedEffortLevel(
+        model: String?,
+        suppliedEffortLevel: ClaudeCodeEffortLevel?,
+        fallbackEffortLevel: ClaudeCodeEffortLevel?
+    ) -> ClaudeCodeEffortLevel? {
+        suppliedEffortLevel
+            ?? ClaudeModelSpecifier(raw: model).explicitEffortLevel
+            ?? fallbackEffortLevel
     }
 
     private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {

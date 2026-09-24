@@ -69,9 +69,11 @@ enum AutoEffortModelPolicy {
         isEnabled: Bool,
         startsNewRun: Bool,
         hasPriorUserTurn: Bool,
-        isNativePreparedTurn: Bool
+        isNativePreparedTurn: Bool,
+        preserveRoutedInitialEffort: Bool = false
     ) -> Bool {
-        isEnabled && startsNewRun && hasPriorUserTurn && !isNativePreparedTurn
+        isEnabled && startsNewRun && !isNativePreparedTurn
+            && (hasPriorUserTurn || !preserveRoutedInitialEffort)
     }
 
     static func codexEfforts(modelRaw: String, advertised: [CodexReasoningEffort]) -> [String] {

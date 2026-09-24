@@ -1824,13 +1824,38 @@ final class ClaudeAgentModeCoordinator {
     }
 
     func currentClaudeEffortLevel(for session: AgentTabSession) -> ClaudeCodeEffortLevel {
-        providerBindingService?.claudeEffortLevel(
+        let stored = providerBindingService?.claudeEffortLevel(
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
         ) ?? ClaudeAgentToolPreferences.effortLevel(
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
         )
+        return Self.resolvedMCPPinnedEffort(
+            modelRaw: session.selectedModelRaw,
+            agentKind: session.selectedAgent,
+            pinnedEffortRaw: session.selectedReasoningEffortRaw,
+            isMCPOriginated: session.isMCPOriginated,
+            stored: stored
+        )
+    }
+
+    static func resolvedMCPPinnedEffort(
+        modelRaw: String,
+        agentKind: AgentProviderKind,
+        pinnedEffortRaw: String?,
+        isMCPOriginated: Bool,
+        stored: ClaudeCodeEffortLevel
+    ) -> ClaudeCodeEffortLevel {
+        guard isMCPOriginated,
+              let pinnedEffortRaw,
+              let pinned = ClaudeCodeEffortLevel.parse(pinnedEffortRaw),
+              AgentModelCatalog.supportedClaudeEfforts(
+                  forSelectedModelRaw: modelRaw,
+                  agentKind: agentKind
+              ).contains(pinned)
+        else { return stored }
+        return pinned
     }
 
     private func agentModeInstructionInjection(for session: AgentTabSession) -> String {

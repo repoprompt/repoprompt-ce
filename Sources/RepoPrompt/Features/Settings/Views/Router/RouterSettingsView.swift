@@ -76,7 +76,7 @@ struct RouterSettingsView: View {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
                     Label("Auto effort", systemImage: "brain.head.profile").font(.headline)
-                    Text("Let Jev choose reasoning effort for the model you already selected, before an eligible user turn. Includes settled MCP follow-ups; first MCP starts and active steering keep their requested effort. Model Router does not need to be on.")
+                    Text("Let Jev choose reasoning effort for the model you already selected, before an eligible user turn. Includes first MCP starts and settled follow-ups; starts already routed by Model Router and active steering keep their chosen effort. Model Router does not need to be on.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

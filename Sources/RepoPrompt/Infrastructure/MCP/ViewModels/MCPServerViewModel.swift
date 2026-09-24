@@ -905,7 +905,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource, preserveRoutedInitialEffort in
                 try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                     target: target,
                     message: message,
@@ -918,6 +918,7 @@ final class MCPServerViewModel: ObservableObject {
                     workflow: workflow,
                     expectedParentSessionID: expectedParentSessionID,
                     oracleReviewSource: oracleReviewSource,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
                     dispatchInstruction: {
                         #if DEBUG
                             self.agentRunDispatchOverrideForTesting
@@ -1160,7 +1161,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _, preserveRoutedInitialEffort in
                 try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                     target: target,
                     message: message,
@@ -1173,7 +1174,8 @@ final class MCPServerViewModel: ObservableObject {
                     modelRaw: modelRaw,
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
-                    workflow: workflow
+                    workflow: workflow,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
                 )
             }
         )

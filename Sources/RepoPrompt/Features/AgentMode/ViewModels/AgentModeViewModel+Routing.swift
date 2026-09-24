@@ -4,6 +4,7 @@ extension AgentModeViewModel {
     enum GlobalModelRoutingError: LocalizedError {
         case unavailable
         case noTargets
+        case taskTooLong
         case failed
         case cancelled
         case stale
@@ -12,6 +13,7 @@ extension AgentModeViewModel {
             switch self {
             case .unavailable: "Model Router is enabled but its routing service is unavailable."
             case .noTargets: "Model Router has no available targets for this session type."
+            case .taskTooLong: "This task exceeds RepoPrompt's privacy limit for Model Router. Choose an explicit model_id, shorten the task, or turn off Router. The task was not sent to Jev."
             case .failed: "Model Router could not choose a target."
             case .cancelled: "Model routing was cancelled."
             case .stale: "The Model Router policy changed while the request was in progress."
@@ -218,6 +220,8 @@ extension AgentModeViewModel {
                 scheduleSave(for: session.tabID)
             }
             return result
+        case .failed where Self.routingTaskExceedsLocalLimit(text):
+            return .blocked(message: "This task exceeds RepoPrompt's privacy limit for Model Router. Shorten it or turn off Router to use your current selection. The task was not sent to Jev.")
         case .abstained, .failed:
             return .blocked(message: "The Router could not choose a target. Retry, or turn off Router to use your current selection.")
         case .cancelled:
@@ -389,9 +393,17 @@ extension AgentModeViewModel {
             return selected.target
         case .cancelled:
             throw GlobalModelRoutingError.cancelled
+        case .failed where Self.routingTaskExceedsLocalLimit(task):
+            throw GlobalModelRoutingError.taskTooLong
         case .abstained, .failed:
             throw GlobalModelRoutingError.failed
         }
+    }
+
+    private static func routingTaskExceedsLocalLimit(_ text: String) -> Bool {
+        let task = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return task.count > AgentTaskRoutingEnvelopeBuilder.maximumCharacters
+            || task.utf8.count > AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes
     }
 
     private func routeModelThenEffort(

@@ -350,6 +350,7 @@ struct AgentExploreMCPToolService {
         )
         var selection = context.selection
         var routedReasoningEffortRaw: String?
+        var routerSelectedTarget = false
         do {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
@@ -362,6 +363,7 @@ struct AgentExploreMCPToolService {
                     modelParameterSelections: routed.modelParameters
                 )
                 routedReasoningEffortRaw = routed.reasoningEffortRaw
+                routerSelectedTarget = true
                 #if DEBUG
                     AgentModePerfDiagnostics.event("modelRouter.subagent.selected", fields: [
                         "entryPoint": "agent_explore.start",
@@ -396,7 +398,8 @@ struct AgentExploreMCPToolService {
             .explore,
             nil,
             nil,
-            nil
+            nil,
+            routerSelectedTarget
         )
         context.agentModeVM.mcpAcceptSessionTarget(target)
         return outcome

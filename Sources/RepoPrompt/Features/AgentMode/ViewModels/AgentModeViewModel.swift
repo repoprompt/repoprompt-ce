@@ -10504,7 +10504,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         text: String,
         allowStartingRun: Bool,
         workflow: AgentWorkflowDefinition? = nil,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil
+        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
+        preserveRoutedInitialEffort: Bool = false
     ) async throws -> MCPInstructionDispatch {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
@@ -10525,14 +10526,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
-        // Preserve the effort chosen by the MCP caller or Model Router for a first start.
-        // Only a settled follow-up can be rejudged; active steering keeps its effort.
+        // Preserve Model Router's effort on a router-owned first start. Auto effort may
+        // judge other first starts and settled follow-ups; active steering keeps its effort.
         let judgesUserTurn = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
             isEnabled: modelRouterSettingsStore.autoEffortEnabled(),
             startsNewRun: allowStartingRun && !session.runState.isActive
                 && !(session.runState == .waitingForUser && session.instructionContinuation != nil),
             hasPriorUserTurn: session.hasSentFirstMessage,
-            isNativePreparedTurn: nativePreparedTurn != nil
+            isNativePreparedTurn: nativePreparedTurn != nil,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort
         )
         let autoEffortSelection = judgesUserTurn
             ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow)

@@ -131,6 +131,33 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         )
     }
 
+    func testExplicitModelAndParameterPinsBypassModelRouter() {
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "codexExec:gpt-6-sol-xhigh",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "devin:swe-2",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: true
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: true
+        ))
+    }
+
     private func makeBindingService(
         defaults: UserDefaults,
         secureStore: AgentPermissionSecureStore? = nil
