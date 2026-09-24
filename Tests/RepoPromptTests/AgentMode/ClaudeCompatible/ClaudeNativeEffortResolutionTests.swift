@@ -58,5 +58,12 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             isMCPOriginated: false,
             stored: .high
         ), .high)
+        XCTAssertEqual(ClaudeAgentModeCoordinator.resolvedMCPPinnedEffort(
+            modelRaw: "claude-opus-5-5",
+            agentKind: .claudeCode,
+            pinnedEffortRaw: nil,
+            isMCPOriginated: true,
+            stored: .high
+        ), .high)
     }
 }

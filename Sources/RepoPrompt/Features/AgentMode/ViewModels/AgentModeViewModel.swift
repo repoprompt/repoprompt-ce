@@ -9036,7 +9036,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.selectedAgent = normalized.agent
         session.selectedModelRaw = normalized.modelRaw
-        if let reasoningEffortRaw {
+        if normalized.agent == .claudeCode {
+            // A reused MCP tab must not turn an earlier selection into an implicit
+            // Claude pin when this request did not specify an effort.
+            session.selectedReasoningEffortRaw = reasoningEffortRaw
+        } else if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         }
         try mcpApplyModelParameterSelections(tabID: tabID, selections: modelParameterSelections)
