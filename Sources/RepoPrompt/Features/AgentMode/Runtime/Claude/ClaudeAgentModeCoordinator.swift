@@ -1847,6 +1847,20 @@ final class ClaudeAgentModeCoordinator {
         isMCPOriginated: Bool,
         stored: ClaudeCodeEffortLevel
     ) -> ClaudeCodeEffortLevel {
+        validatedMCPPinnedEffort(
+            modelRaw: modelRaw,
+            agentKind: agentKind,
+            pinnedEffortRaw: pinnedEffortRaw,
+            isMCPOriginated: isMCPOriginated
+        ) ?? stored
+    }
+
+    static func validatedMCPPinnedEffort(
+        modelRaw: String,
+        agentKind: AgentProviderKind,
+        pinnedEffortRaw: String?,
+        isMCPOriginated: Bool
+    ) -> ClaudeCodeEffortLevel? {
         guard isMCPOriginated,
               let pinnedEffortRaw,
               let pinned = ClaudeCodeEffortLevel.parse(pinnedEffortRaw),
@@ -1854,7 +1868,7 @@ final class ClaudeAgentModeCoordinator {
                   forSelectedModelRaw: modelRaw,
                   agentKind: agentKind
               ).contains(pinned)
-        else { return stored }
+        else { return nil }
         return pinned
     }
 

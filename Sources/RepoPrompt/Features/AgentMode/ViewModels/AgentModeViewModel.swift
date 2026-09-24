@@ -5659,7 +5659,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.autoEditEnabled = agentSession.autoEditEnabled
         restoreAgentSessionLinkState(from: agentSession, to: session)
-        codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
+        if session.selectedAgent == .claudeCode,
+           let pinned = ClaudeAgentModeCoordinator.validatedMCPPinnedEffort(
+               modelRaw: session.selectedModelRaw,
+               agentKind: session.selectedAgent,
+               pinnedEffortRaw: agentSession.agentReasoningEffort
+                   ?? ClaudeModelSpecifier(raw: session.selectedModelRaw).explicitEffortLevel?.rawValue,
+               isMCPOriginated: session.isMCPOriginated
+           )
+        {
+            session.selectedReasoningEffortRaw = pinned.rawValue
+        } else {
+            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
+        }
 
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
@@ -9048,10 +9060,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // tri-state policy's per-provider override never goes stale on an already-active
         // MCP-controlled session (sub-agent or top-level).
         _ = refreshMCPPermissionProfileIfNeeded(for: session)
-        codexCoordinator.normalizeCodexSelectionForSession(
-            session,
-            preservingExplicitEffort: reasoningEffortRaw != nil
-        )
+        // Codex normalization clears reasoning effort for every non-Codex provider.
+        // Claude MCP effort is a separate session pin and must survive configuration.
+        if session.selectedAgent != .claudeCode {
+            codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: reasoningEffortRaw != nil
+            )
+        }
         // Record last-used effort for the MCP path so the in-memory fallback
         // used by `normalizeCodexSelectionForSession` stays current.  The UI path
         // records this via the `@Published selectedReasoningEffortRaw` didSet, but

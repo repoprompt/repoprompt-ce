@@ -65,5 +65,63 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             isMCPOriginated: true,
             stored: .high
         ), .high)
+        XCTAssertEqual(ClaudeAgentModeCoordinator.validatedMCPPinnedEffort(
+            modelRaw: "claude-opus-5-5:low",
+            agentKind: .claudeCode,
+            pinnedEffortRaw: "low",
+            isMCPOriginated: true
+        ), .low)
+        XCTAssertNil(ClaudeAgentModeCoordinator.validatedMCPPinnedEffort(
+            modelRaw: "claude-opus-5-5",
+            agentKind: .claudeCode,
+            pinnedEffortRaw: "low",
+            isMCPOriginated: false
+        ))
+    }
+
+    @MainActor
+    func testMCPConfigurationPreservesClaudePinAndClearsItForUnpinnedModel() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rpce-claude-effort-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        defer {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Claude MCP effort pin",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "claudeEffortPinTests")
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+        let viewModel = window.agentModeViewModel
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.isMCPOriginated = true
+
+        try await viewModel.mcpConfigureSession(
+            tabID: tabID,
+            agentRaw: AgentProviderKind.claudeCode.rawValue,
+            modelRaw: "claude-opus-5-5:low",
+            reasoningEffortRaw: "low"
+        )
+        XCTAssertEqual(session.selectedReasoningEffortRaw, "low")
+        XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: session), .low)
+
+        try await viewModel.mcpConfigureSession(
+            tabID: tabID,
+            agentRaw: AgentProviderKind.claudeCode.rawValue,
+            modelRaw: "claude-opus-5-5",
+            reasoningEffortRaw: nil
+        )
+        XCTAssertNil(session.selectedReasoningEffortRaw)
     }
 }
