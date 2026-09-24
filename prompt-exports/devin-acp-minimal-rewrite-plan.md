@@ -7,9 +7,6 @@ merge-base 4232fc4ba6 touched the files below. Replaces `fix/devin-acp-permissio
 Supporting artifacts (this PR):
 - `prompt-exports/devin-acp-probe-evidence.md` — raw live-probe results
 - `prompt-exports/devin-acp-probe.py` — rerunnable raw JSON-RPC probe for `devin acp`
-- `prompt-exports/oracle-plan-2026-09-23-141626-…-c1f6.md` — Context Builder plan (gpt-6-astra; built from the discarded tree)
-- `prompt-exports/oracle-plan-2026-09-23-142405-…-6269.md` — revised plan grounded on main (gpt-6-astra)
-- `prompt-exports/oracle-plan-2026-09-23-144805-…-29d9.md` — Fable lane retry (claude-fable-5.1 xhigh) + gpt-6-astra
 
 ## 1. Ground truth (live probes, Devin CLI 3000.11.1, enterprise macOS + no-policy Linux Docker)
 
