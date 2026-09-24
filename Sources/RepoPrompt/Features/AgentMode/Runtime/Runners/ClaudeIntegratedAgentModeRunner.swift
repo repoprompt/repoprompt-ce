@@ -55,7 +55,8 @@ final class ClaudeIntegratedAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID) -> MCPBootstrapLease,
+        autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async {
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
@@ -132,7 +133,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         intent: .runAttempt(ownership: ownership, runID: runID),
                         // No event stream is owned until this send succeeds and the runner subscribes
                         // below, so replacing a route-stale controller is safe at this boundary.
-                        allowsCatalogRouteControllerRecovery: true
+                        allowsCatalogRouteControllerRecovery: true,
+                        autoEffortSelection: autoEffortSelection
                     )
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:

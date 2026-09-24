@@ -203,10 +203,14 @@ final class ClaudeAgentModeCoordinator {
     private let hasActiveMCPTools: MCPActiveToolQuery
     private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
+    private let autoEffortEnabledProvider: @MainActor () -> Bool
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
     private var toolHandlerByTabID: [UUID: ClaudeAgentToolTrackingHandler] = [:]
+    /// Tracks only a temporary Auto effort applied to this exact live controller.
+    /// The next ordinary turn restores the user's manual effort before dispatch.
+    private var appliedAutoEffortByTabID: [UUID: (controllerID: ObjectIdentifier, effort: ClaudeCodeEffortLevel)] = [:]
     private var controllerLaunchSettingsByTabID: [UUID: ControllerLaunchSettings] = [:]
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
@@ -228,7 +232,8 @@ final class ClaudeAgentModeCoordinator {
         toolEndedCount: @escaping MCPToolEndedCountProvider = { _ in 0 },
         hasActiveMCPTools: @escaping MCPActiveToolQuery = { _ in false },
         hasActiveChildAgentRunWaits: @escaping ActiveAgentRunWaitQuery = { _ in false },
-        steeringInterruptSafePointTimeoutSeconds: TimeInterval = 2.0
+        steeringInterruptSafePointTimeoutSeconds: TimeInterval = 2.0,
+        autoEffortEnabledProvider: @escaping @MainActor () -> Bool = { GlobalSettingsStore.shared.autoEffortEnabled() }
     ) {
         self.windowID = windowID
         self.workspacePathProvider = workspacePathProvider
@@ -238,6 +243,7 @@ final class ClaudeAgentModeCoordinator {
         self.hasActiveMCPTools = hasActiveMCPTools
         self.hasActiveChildAgentRunWaits = hasActiveChildAgentRunWaits
         self.steeringInterruptSafePointTimeoutSeconds = steeringInterruptSafePointTimeoutSeconds
+        self.autoEffortEnabledProvider = autoEffortEnabledProvider
     }
 
     private static func makeDefaultController(
@@ -366,6 +372,9 @@ final class ClaudeAgentModeCoordinator {
         let effortLevel = currentClaudeEffortLevel(for: session)
         do {
             try await controller.applyModelAndEffort(model: model, effortLevel: effortLevel)
+            if session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller) {
+                appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+            }
             Self.flagSettingsLogger.debug(
                 "Applied Claude flag settings for tab=\(session.tabID.uuidString, privacy: .public) reason=\(reason, privacy: .public) model=\(model ?? "default", privacy: .public) effort=\(effortLevel.rawValue, privacy: .public)"
             )
@@ -627,6 +636,7 @@ final class ClaudeAgentModeCoordinator {
     ) {
         session.claudeController = nil
         controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
+        appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
     }
 
     private func stopToolTracking(
@@ -672,6 +682,7 @@ final class ClaudeAgentModeCoordinator {
         func test_discardRuntimeState(for session: AgentTabSession) {
             session.claudeController = nil
             controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
+            appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
             controllerRetirementGenerationByTabID.removeValue(forKey: session.tabID)
             pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)?.cancel()
             pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
@@ -987,7 +998,8 @@ final class ClaudeAgentModeCoordinator {
         text: String,
         attachments _: [AgentImageAttachment],
         intent: NativeSessionIntent,
-        allowsCatalogRouteControllerRecovery: Bool
+        allowsCatalogRouteControllerRecovery: Bool,
+        autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         var handler = toolHandler(for: session)
@@ -1138,9 +1150,8 @@ final class ClaudeAgentModeCoordinator {
                 )
             }
 
-            // This is the final launch-settings validation before dispatch. There is
-            // intentionally no suspension between this check and sendUserMessage, so a
-            // Safe Managed tightening cannot enqueue a turn on the stale controller.
+            // Validate launch settings before optional effort application below. That
+            // application can suspend, so its result is fenced again before dispatch.
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
                 await recycleClaudeControllerForLaunchSettingsChange(
                     session: session,
@@ -1174,6 +1185,89 @@ final class ClaudeAgentModeCoordinator {
                     session: session,
                     intent: intent
                 )
+            }
+
+            let controllerID = ObjectIdentifier(controller)
+            if appliedAutoEffortByTabID[session.tabID]?.controllerID != controllerID {
+                appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+            }
+            let manualEffort = currentClaudeEffortLevel(for: session)
+            let autoEffort: ClaudeCodeEffortLevel? = {
+                guard let autoEffortSelection,
+                      autoEffortSelection.isCurrent(
+                          provider: session.selectedAgent,
+                          selectedModelRaw: session.selectedModelRaw,
+                          manualEffortRaw: manualEffort.rawValue,
+                          enabled: autoEffortEnabledProvider()
+                      ),
+                      AutoEffortModelPolicy.claudeEfforts(
+                          modelRaw: session.selectedModelRaw,
+                          advertised: AgentModelCatalog.supportedClaudeEfforts(
+                              forSelectedModelRaw: session.selectedModelRaw,
+                              agentKind: session.selectedAgent
+                          )
+                      ).contains(autoEffortSelection.effortRaw)
+                else { return nil }
+                return ClaudeCodeEffortLevel.parse(autoEffortSelection.effortRaw)
+            }()
+            if let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort) {
+                do {
+                    try await controller.applyModelAndEffort(
+                        model: effectiveClaudeModel(for: session),
+                        effortLevel: desiredEffort
+                    )
+                    if autoEffort != nil {
+                        appliedAutoEffortByTabID[session.tabID] = (controllerID, desiredEffort)
+                    } else {
+                        appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+                    }
+                } catch {
+                    // An optional Jev choice must not leave the controller at a prior override.
+                    do {
+                        try await controller.applyModelAndEffort(
+                            model: effectiveClaudeModel(for: session),
+                            effortLevel: manualEffort
+                        )
+                        appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+                    } catch {
+                        return recordSendFailure(
+                            "Claude could not restore manual effort before sending: \(error.localizedDescription)",
+                            session: session,
+                            intent: intent
+                        )
+                    }
+                }
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else { return .superseded }
+                // Applying flags suspends. Do not dispatch on a controller whose model,
+                // manual effort, or route changed while the setting was being applied.
+                guard currentClaudeEffortLevel(for: session) == manualEffort,
+                      (autoEffort == nil || autoEffortSelection?.isCurrent(
+                          provider: session.selectedAgent,
+                          selectedModelRaw: session.selectedModelRaw,
+                          manualEffortRaw: manualEffort.rawValue,
+                          enabled: autoEffortEnabledProvider()
+                      ) == true)
+                else {
+                    return recordSendFailure(
+                        "Claude effort changed before sending. Retry the turn.",
+                        session: session,
+                        intent: intent
+                    )
+                }
+                if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
+                    continue
+                }
+                if requiresFinalRouteFence,
+                   !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+                {
+                    return recordSendFailure(
+                        routeVerificationFailure("effort-fence"),
+                        session: session,
+                        intent: intent
+                    )
+                }
             }
 
             do {
@@ -1729,7 +1823,7 @@ final class ClaudeAgentModeCoordinator {
         return selectedRaw
     }
 
-    private func currentClaudeEffortLevel(for session: AgentTabSession) -> ClaudeCodeEffortLevel {
+    func currentClaudeEffortLevel(for session: AgentTabSession) -> ClaudeCodeEffortLevel {
         providerBindingService?.claudeEffortLevel(
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent

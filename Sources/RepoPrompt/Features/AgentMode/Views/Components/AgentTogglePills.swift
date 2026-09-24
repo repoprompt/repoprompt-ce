@@ -152,3 +152,81 @@ struct AgentModelRouterPill: View {
         .accessibilityValue(props.isOn ? "On" : "Off")
     }
 }
+
+// MARK: - Auto Effort Pill
+
+struct AgentAutoEffortPill: View {
+    let props: AgentAutoEffortPillProps
+    let onToggle: () -> Void
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var showingEnableConfirmation = false
+
+    private var feedback: AutoEffortTurnFeedback? {
+        props.isOn ? props.feedback : nil
+    }
+
+    private var tooltip: String {
+        if !props.isOn { return "Auto effort off. Click to let Jev choose effort before eligible user turns." }
+        if props.isJudging { return "Jev is choosing effort for this user turn." }
+        let availability = props.isAvailable ? "" : " Jev is unavailable; turns use manual effort."
+        guard let feedback else { return "Auto effort on. No Jev choice has been submitted for this model yet.\(availability)" }
+        let change = switch feedback.direction {
+        case .up: "up from the previous Jev choice or initial selected effort"
+        case .down: "down from the previous Jev choice or initial selected effort"
+        case .unchanged: "unchanged from the previous Jev choice"
+        case .unknown: "no comparable previous effort"
+        }
+        return "Auto effort on. Last Jev choice: \(feedback.effortRaw), \(change). The arrow compares Jev choices, not intervening manual turns.\(availability)"
+    }
+
+    var body: some View {
+        let cornerRadius = AgentPillMetrics.cornerRadius()
+        let size = AgentPillMetrics.height()
+        Button {
+            if props.isOn {
+                onToggle()
+            } else {
+                showingEnableConfirmation = true
+            }
+        } label: {
+            HStack(spacing: 5) {
+                if props.isJudging, props.isOn {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "brain.head.profile")
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 14, weight: .semibold))
+                }
+                if let feedback {
+                    Text(feedback.effortRaw.uppercased())
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    if feedback.direction == .up || feedback.direction == .down {
+                        Image(systemName: feedback.direction == .up ? "arrow.up" : "arrow.down")
+                            .font(fontScale.preset.swiftUIFont(sizeAtNormal: 10, weight: .bold))
+                    }
+                }
+            }
+            .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
+            .frame(minWidth: size, minHeight: size)
+            .padding(.horizontal, feedback == nil ? 0 : 7)
+            .background(props.isOn ? Color.accentColor.opacity(0.12) : Color.clear)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(props.isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: props.isOn ? 0.8 : 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!props.isOn && !props.isAvailable)
+        .hoverTooltip(tooltip, .top)
+        .accessibilityLabel("Auto effort")
+        .accessibilityValue(tooltip)
+        .confirmationDialog("Enable Auto effort?", isPresented: $showingEnableConfirmation) {
+            Button("Enable Auto effort", action: onToggle)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("For eligible user turns, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, effort choices, and any built-in workflow category. This includes settled MCP follow-ups. Masking may miss sensitive information. Workflow templates, files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. See Model Router Settings for the privacy policy.")
+        }
+    }
+}

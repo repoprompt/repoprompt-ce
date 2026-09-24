@@ -86,6 +86,10 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+        runtime.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         apiSettingsViewModel.$agentAvailability
             .removeDuplicates()
             .receive(on: RunLoop.main)
@@ -114,6 +118,14 @@ final class RouterSettingsViewModel: ObservableObject {
 
     var canEnable: Bool {
         readiness.isReady && policyCanBuildCandidates
+    }
+
+    var autoEffortEnabled: Bool {
+        settingsStore.autoEffortEnabled()
+    }
+
+    var canEnableAutoEffort: Bool {
+        runtime.isBackendReady(.jev)
     }
 
     var availableProviders: Set<AgentProviderKind> {
@@ -187,6 +199,12 @@ final class RouterSettingsViewModel: ObservableObject {
         settingsStore.setModelRouterEnabled(enabled)
         synchronizeConfiguration()
         scheduleRefresh()
+    }
+
+    func setAutoEffortEnabled(_ enabled: Bool) {
+        guard !enabled || canEnableAutoEffort else { return }
+        settingsStore.setAutoEffortEnabled(enabled)
+        objectWillChange.send()
     }
 
     @discardableResult

@@ -28,12 +28,16 @@ final class AgentTaskRouterRuntime: ObservableObject {
         let credentials = JevRouterCredentialService(secureKeys: secureKeys, client: jevClient)
         let configuration = GlobalSettingsStore.shared.modelRouterConfiguration()
         do {
-            try self.init(registrations: [
-                AgentTaskRouterBackendRegistration(
-                    backend: JevTaskRouterBackend(credentialService: credentials),
-                    settings: JevTaskRouterBackend.settingsRegistration(controller: credentials)
-                )
-            ], bootstrapBackendID: configuration.enabled ? configuration.selectedBackendID : nil)
+            try self.init(
+                registrations: [
+                    AgentTaskRouterBackendRegistration(
+                        backend: JevTaskRouterBackend(credentialService: credentials),
+                        settings: JevTaskRouterBackend.settingsRegistration(controller: credentials)
+                    )
+                ],
+                bootstrapBackendID: GlobalSettingsStore.shared.autoEffortEnabled() ? .jev
+                    : (configuration.enabled ? configuration.selectedBackendID : nil)
+            )
         } catch {
             preconditionFailure("Invalid bundled model-router registry: \(error)")
         }
@@ -47,6 +51,23 @@ final class AgentTaskRouterRuntime: ObservableObject {
         readinessLock.lock()
         defer { readinessLock.unlock() }
         return readinessByBackendID[id]
+    }
+
+    func chooseAutoEffort(
+        maskedTaskExcerpt: String,
+        selectedModelID: String,
+        builtInWorkflow: AgentWorkflow?,
+        efforts: [String]
+    ) async -> String? {
+        guard isBackendReady(.jev),
+              let backend = await registry.registration(for: .jev)?.backend as? JevTaskRouterBackend
+        else { return nil }
+        return await backend.chooseAutoEffort(
+            maskedTaskExcerpt: maskedTaskExcerpt,
+            selectedModelID: selectedModelID,
+            builtInWorkflow: builtInWorkflow,
+            efforts: efforts
+        )
     }
 
     func cancelAll() {

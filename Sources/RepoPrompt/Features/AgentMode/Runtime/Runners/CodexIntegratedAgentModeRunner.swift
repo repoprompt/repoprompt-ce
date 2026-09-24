@@ -21,7 +21,8 @@ final class CodexIntegratedAgentModeRunner {
         session: AgentTabSession,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?
+        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
+        autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
@@ -58,7 +59,8 @@ final class CodexIntegratedAgentModeRunner {
                     attachments: attachments,
                     fallbackContext: fallbackContext,
                     attachmentReservationID: attachmentReservationID,
-                    terminalizeRejectedSend: createdOwnership
+                    terminalizeRejectedSend: createdOwnership,
+                    autoEffortSelection: autoEffortSelection
                 )
                 // Explicit cancellation can terminalize the original run before its
                 // suspended send observes CancellationError. Preserve the caller-level

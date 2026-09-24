@@ -13,6 +13,7 @@ struct RouterSettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 statusCard
+                autoEffortCard
                 backendCard
                 routingPolicyCard
                 candidatesCard
@@ -67,6 +68,44 @@ struct RouterSettingsView: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var autoEffortCard: some View {
+        card {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Auto effort", systemImage: "brain.head.profile").font(.headline)
+                    Text("Let Jev choose reasoning effort for the model you already selected, before an eligible user turn. Includes settled MCP follow-ups; first MCP starts and active steering keep their requested effort. Model Router does not need to be on.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Toggle("Auto effort", isOn: Binding(
+                    get: { viewModel.autoEffortEnabled },
+                    set: viewModel.setAutoEffortEnabled
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .disabled(!viewModel.canEnableAutoEffort && !viewModel.autoEffortEnabled)
+                .accessibilityLabel("Auto effort")
+            }
+            if viewModel.autoEffortEnabled, !viewModel.canEnableAutoEffort {
+                Text("Paused until the Jev key is validated. Turns use your manual effort in the meantime.")
+                    .foregroundStyle(.orange)
+            }
+            Text("Only explicitly selected supported models with multiple advertised effort levels are eligible. Default and alias selections keep manual effort.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+            Text("For each eligible composer or MCP user turn, TypeSafe Jev receives a short, best-effort masked excerpt of the message, the selected model ID, available effort choices, and the category of any selected built-in workflow. Workflow templates, attached files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. Masking can miss secrets or sensitive prose; turn this off for private tasks.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("If Jev is unavailable, your manual effort is used. Effort changes may affect provider caching; savings are not guaranteed.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+            Link("TypeSafe privacy policy", destination: URL(string: "https://typesafe.ai/legal/privacy-policy")!)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
         }
     }
 

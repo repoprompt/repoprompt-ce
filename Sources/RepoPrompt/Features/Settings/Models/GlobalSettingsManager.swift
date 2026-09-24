@@ -1421,6 +1421,18 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    /// Independent of Model Router. Missing settings retain the manual-effort path.
+    func autoEffortEnabled() -> Bool {
+        scalarPreferences.agentMode?.autoEffortEnabled == true
+    }
+
+    func setAutoEffortEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.autoEffortEnabled = enabled ? true : nil
+        }
+    }
+
     func codexMemoriesEnabled() -> Bool {
         CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
     }

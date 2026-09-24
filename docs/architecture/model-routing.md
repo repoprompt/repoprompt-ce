@@ -1,6 +1,14 @@
 # Model Routing Architecture
 
-Current as of 2026-09-23.
+Current as of 2026-09-24.
+
+## Auto effort (independent opt-in)
+
+`Auto effort` is a separate persisted setting under `scalarPreferences.agentMode`, default off. It does not enable Model Router or change its policy. Before an eligible user turn from either the composer or MCP `agent_run`, Jev chooses only the effort for the already-selected exact Codex or Claude model. MCP follow-ups can use it after the previous run settles. First MCP starts preserve caller-selected or role-default effort, including explicit pins; Model Router retains its fresh-session model-and-effort decision when both settings are enabled. Subsequent eligible turns may use Auto effort. Active-turn steering, slash controls, and unsupported models retain their existing effort behavior. A failed or unavailable Jev judgment falls back to the current manual effort.
+
+The Auto effort request contains only a short, locally best-effort-masked excerpt of the current composer or MCP user message, the selected model ID, the effort choices, and the fixed category of a selected built-in workflow. It does not attach workflow templates, files, tool results, or earlier conversation. Custom workflows keep manual effort rather than disclosing user-authored templates or judging an incomplete task. Masking is not a promise of anonymization: sensitive prose can remain. Settings disclose the TypeSafe transfer and privacy policy; enabling through the pill first displays a disclosure confirmation. After the asynchronous judgment, RPCE rejects a choice if the workflow selection changed; the provider send also rechecks the model, manual effort, and setting. The choice is ephemeral and does not update saved model or effort preferences. The selected runtime applies effort before the user turn, not within an autonomous tool loop. A pill beside Router shows a pending judgment and the last Jev choice submitted for the current model, with an up/down change relative to the preceding Jev choice (or initial selected effort). Intervening manual turns are not reflected in the arrow. This is not an acknowledgement that a provider turn completed or reused its prompt cache.
+
+Cache preservation is **not guaranteed** by this feature. The Codex app-server and Claude Code controls used by RPCE are distinct from their providers' direct API mechanisms; actual request-level behavior and savings require separate measurement.
 
 ## Status
 
@@ -61,7 +69,7 @@ The bundled adapter uses TypeSafe's documented HTTP surface directly; there is n
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 
-Startup readiness observation is noninteractive. For an explicitly selected, enabled backend, the runtime reads the stored credential noninteractively and validates it through the Jev model-list endpoint; inactive and disabled backends are not contacted. A transient or definitive readiness failure does not erase the persisted enablement intent. Selecting a backend while routing remains disabled also does not validate it—validation is an explicit Settings action.
+Startup readiness observation is noninteractive. For an explicitly selected, enabled routing backend—or Jev when Auto effort alone is enabled—the runtime reads the stored credential noninteractively and validates it through the Jev model-list endpoint; inactive and disabled backends are not contacted. A transient or definitive readiness failure does not erase the persisted enablement intent. Selecting a backend while both features remain disabled does not validate it—validation is an explicit Settings action.
 
 ## Adding a bundled backend
 

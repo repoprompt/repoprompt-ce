@@ -6763,7 +6763,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         attachmentReservationID: UUID? = nil,
         policyAlreadyInstalled: Bool = false,
-        terminalizeRejectedSend: Bool = true
+        terminalizeRejectedSend: Bool = true,
+        autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let wasRunAlreadyActive = session.runState.isActive
@@ -6825,7 +6826,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
-        let selection = effectiveCodexSelection(for: session)
+        func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?) {
+            var manual = effectiveCodexSelection(for: session)
+            guard !wasRunAlreadyActive,
+                  let autoEffortSelection,
+                  autoEffortSelection.isCurrent(
+                      provider: session.selectedAgent,
+                      selectedModelRaw: session.selectedModelRaw,
+                      manualEffortRaw: manual.reasoningEffort,
+                      enabled: viewModel?.modelRouterSettingsStore.autoEffortEnabled()
+                          ?? GlobalSettingsStore.shared.autoEffortEnabled()
+                  ),
+                  let baseModel = CodexModelSpecifier(raw: session.selectedModelRaw).baseModel,
+                  let advertisedModel = modelOptions(for: .codexExec).first(where: {
+                      CodexModelSpecifier(raw: $0.rawValue).baseModel?.caseInsensitiveCompare(baseModel) == .orderedSame
+                  }),
+                  AutoEffortModelPolicy.codexEfforts(
+                      modelRaw: session.selectedModelRaw,
+                      advertised: advertisedModel.supportedReasoningEfforts
+                  ).contains(autoEffortSelection.effortRaw)
+            else { return manual }
+            manual.reasoningEffort = autoEffortSelection.effortRaw
+            return manual
+        }
+        let selection = turnSelection()
         session.codexPendingAuthRetryTurn = .init(
             text: text,
             images: attachments,
@@ -7170,12 +7194,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         controller: controller,
                         session: session
                     ) {
-                        try await controller.startUserTurn(
+                        let physicalSelection = autoEffortSelection == nil ? selection : turnSelection()
+                        if var pendingTurn = session.codexPendingAuthRetryTurn {
+                            pendingTurn.model = physicalSelection.model
+                            pendingTurn.reasoningEffort = physicalSelection.reasoningEffort
+                            pendingTurn.serviceTier = physicalSelection.serviceTier
+                            session.codexPendingAuthRetryTurn = pendingTurn
+                        }
+                        return try await controller.startUserTurn(
                             text: dispatchText,
                             images: attachments,
-                            model: selection.model,
-                            reasoningEffort: selection.reasoningEffort,
-                            serviceTier: selection.serviceTier
+                            model: physicalSelection.model,
+                            reasoningEffort: physicalSelection.reasoningEffort,
+                            serviceTier: physicalSelection.serviceTier
                         )
                     }
                     dispatched = true

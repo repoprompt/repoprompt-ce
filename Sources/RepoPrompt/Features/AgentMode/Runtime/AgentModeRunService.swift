@@ -108,6 +108,7 @@ final class AgentModeRunService {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
@@ -131,7 +132,8 @@ final class AgentModeRunService {
                 session: session,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
-                fallbackContext: codexFallbackContext
+                fallbackContext: codexFallbackContext,
+                autoEffortSelection: autoEffortSelection
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -175,7 +177,8 @@ final class AgentModeRunService {
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
-                makeLease: makeLease
+                makeLease: makeLease,
+                autoEffortSelection: autoEffortSelection
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
