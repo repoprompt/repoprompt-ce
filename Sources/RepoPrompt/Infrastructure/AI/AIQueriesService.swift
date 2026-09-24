@@ -268,6 +268,23 @@ public class AIQueriesService {
     ) async -> ProviderConversationCleanupOutcome
 
     private let taskManager = TaskManager()
+
+    #if DEBUG
+        /// Cancellation-connected replacement transport. Registration is acknowledged before
+        /// returning to sendMessage, including cancellation that raced registration.
+        func registerControlledStreamForTesting(
+            id: ChatStreamID,
+            continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation,
+            producer: Task<Void, Never>
+        ) async {
+            await taskManager.storeContinuation(continuation, for: id)
+            await taskManager.addTask(producer, for: id)
+        }
+
+        func removeControlledStreamForTesting(id: ChatStreamID) async {
+            await taskManager.removeTask(for: id)
+        }
+    #endif
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool
