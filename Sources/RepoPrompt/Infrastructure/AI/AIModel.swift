@@ -1484,6 +1484,20 @@ public enum AIModel: Equatable, Hashable {
             return metadata
         }
 
+        // Precompute claudeCode sort keys once per model so that baseSortRank's
+        // O(M) linear scan through modelDefinitions is not repeated on every
+        // comparison inside the sort closure (which would be O(N log N × M) on
+        // the main actor).
+        var claudeCodeSortKeyCache: [AIModel: ClaudeCodeAIModelCatalog.SortKey] = [:]
+        func claudeCodeSortKey(for model: AIModel) -> ClaudeCodeAIModelCatalog.SortKey {
+            if let cached = claudeCodeSortKeyCache[model] {
+                return cached
+            }
+            let key = ClaudeCodeAIModelCatalog.sortKey(for: model)
+            claudeCodeSortKeyCache[model] = key
+            return key
+        }
+
         return models.sorted { lhs, rhs in
             if lhs.providerType != rhs.providerType {
                 return ModelPickerStringOrdering.precedes(
@@ -1492,7 +1506,10 @@ public enum AIModel: Equatable, Hashable {
                 )
             }
             if lhs.providerType == .claudeCode {
-                return ClaudeCodeAIModelCatalog.modelPrecedes(lhs, rhs)
+                return ClaudeCodeAIModelCatalog.precedes(
+                    lhsKey: claudeCodeSortKey(for: lhs), lhs: lhs,
+                    rhsKey: claudeCodeSortKey(for: rhs), rhs: rhs
+                )
             }
             return semanticMetadataPrecedes(metadata(for: lhs), metadata(for: rhs))
         }

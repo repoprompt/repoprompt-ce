@@ -253,31 +253,50 @@ enum ClaudeCodeAIModelCatalog {
         return AIModel.ClaudeCodePickerMenu(defaultOption: nil, groups: groups + compatibleGroups)
     }
 
-    static func modelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
-        let lhsCompatible = compatibleBackendDescriptor(for: lhs)
-        let rhsCompatible = compatibleBackendDescriptor(for: rhs)
-        if lhsCompatible != nil || rhsCompatible != nil {
-            if lhsCompatible == nil { return true }
-            if rhsCompatible == nil { return false }
+    struct SortKey {
+        let isCompatibleBackend: Bool
+        let baseRank: Int
+        let effortRank: Int
+        let displayName: String
+        let rawValue: String
+    }
+
+    /// Precomputes all values used for sorting so that `baseSortRank`'s linear
+    /// scan through `modelDefinitions` is paid once per model rather than once
+    /// per comparison inside a sort closure.
+    static func sortKey(for model: AIModel) -> SortKey {
+        SortKey(
+            isCompatibleBackend: compatibleBackendDescriptor(for: model) != nil,
+            baseRank: baseSortRank(baseModelRaw(for: model)),
+            effortRank: effortSortRank(explicitEffort(for: model)),
+            displayName: model.displayName,
+            rawValue: model.rawValue
+        )
+    }
+
+    static func precedes(lhsKey: SortKey, lhs: AIModel, rhsKey: SortKey, rhs: AIModel) -> Bool {
+        let lhsCompatible = lhsKey.isCompatibleBackend
+        let rhsCompatible = rhsKey.isCompatibleBackend
+        if lhsCompatible || rhsCompatible {
+            if !lhsCompatible { return true }
+            if !rhsCompatible { return false }
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
-        let leftBaseRank = baseSortRank(baseModelRaw(for: lhs))
-        let rightBaseRank = baseSortRank(baseModelRaw(for: rhs))
-        if leftBaseRank != rightBaseRank {
-            return leftBaseRank < rightBaseRank
+        if lhsKey.baseRank != rhsKey.baseRank {
+            return lhsKey.baseRank < rhsKey.baseRank
         }
-
-        let leftEffortRank = effortSortRank(explicitEffort(for: lhs))
-        let rightEffortRank = effortSortRank(explicitEffort(for: rhs))
-        if leftEffortRank != rightEffortRank {
-            return leftEffortRank < rightEffortRank
+        if lhsKey.effortRank != rhsKey.effortRank {
+            return lhsKey.effortRank < rhsKey.effortRank
         }
-
-        let displayComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+        let displayComparison = lhsKey.displayName.localizedCaseInsensitiveCompare(rhsKey.displayName)
         if displayComparison != .orderedSame {
             return displayComparison == .orderedAscending
         }
-        return lhs.rawValue.localizedCaseInsensitiveCompare(rhs.rawValue) == .orderedAscending
+        return lhsKey.rawValue.localizedCaseInsensitiveCompare(rhsKey.rawValue) == .orderedAscending
+    }
+
+    static func modelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
+        precedes(lhsKey: sortKey(for: lhs), lhs: lhs, rhsKey: sortKey(for: rhs), rhs: rhs)
     }
 
     private static func definition(forBaseModelRaw raw: String?) -> ModelDefinition? {
