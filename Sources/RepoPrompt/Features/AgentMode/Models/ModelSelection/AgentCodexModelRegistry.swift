@@ -6,8 +6,21 @@ final class AgentCodexModelRegistry {
     private let lock = NSLock()
     private var liveModels: [CodexAppServerClient.RemoteModel] = []
     private var liveModelSignature: [CodexDynamicModelRecord] = []
+    private enum DynamicOptionsInput: Equatable {
+        case remote([CodexAppServerClient.RemoteModel])
+        case stored([CodexDynamicModelRecord])
+    }
 
-    private init() {}
+    private struct DynamicOptionsCacheEntry {
+        let input: DynamicOptionsInput
+        let options: [AgentModelOption]
+    }
+
+    /// Preferred, live, and persisted model lists can differ. Keep a few exact
+    /// input snapshots rather than treating the most recent sort as universal.
+    private var cachedDynamicOptions: [DynamicOptionsCacheEntry] = []
+
+    init() {}
 
     @discardableResult
     func updateLiveModels(_ models: [CodexAppServerClient.RemoteModel]) -> Bool {
@@ -44,10 +57,10 @@ final class AgentCodexModelRegistry {
                     staticOptions: staticOptions
                 )
             }
-            let cachedOptions = CodexDynamicModelStore.modelOptions()
-            if !cachedOptions.isEmpty {
+            let cachedRecords = CodexDynamicModelStore.load()
+            if !cachedRecords.isEmpty {
                 return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: cachedOptions),
+                    dynamicOptions: codexDynamicOptions(from: cachedRecords),
                     staticOptions: staticOptions
                 )
             }
@@ -62,10 +75,10 @@ final class AgentCodexModelRegistry {
             )
         }
 
-        let cachedOptions = CodexDynamicModelStore.modelOptions()
-        if !cachedOptions.isEmpty {
+        let cachedRecords = CodexDynamicModelStore.load()
+        if !cachedRecords.isEmpty {
             return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: cachedOptions),
+                dynamicOptions: codexDynamicOptions(from: cachedRecords),
                 staticOptions: staticOptions
             )
         }
@@ -137,7 +150,45 @@ final class AgentCodexModelRegistry {
     private func codexDynamicOptions(
         from models: [CodexAppServerClient.RemoteModel]
     ) -> [AgentModelOption] {
-        codexDynamicOptions(from: CodexDynamicModelMapper.options(from: models))
+        cachedOptions(for: .remote(models)) {
+            CodexDynamicModelMapper.options(from: models)
+        }
+    }
+
+    private func codexDynamicOptions(
+        from records: [CodexDynamicModelRecord]
+    ) -> [AgentModelOption] {
+        cachedOptions(for: .stored(records)) {
+            CodexDynamicModelMapper.options(from: records)
+        }
+    }
+
+    private func cachedOptions(
+        for input: DynamicOptionsInput,
+        makeDynamicOptions: () -> [CodexDynamicModelOption]
+    ) -> [AgentModelOption] {
+        lock.lock()
+        if let cached = cachedDynamicOptions.first(where: { $0.input == input }) {
+            lock.unlock()
+            return cached.options
+        }
+        lock.unlock()
+
+        // Sorting may be expensive; do it outside the registry lock. A concurrent
+        // miss can duplicate work, but an older result cannot overwrite a newer
+        // catalog because each entry retains the input that produced it.
+        let result = codexDynamicOptions(from: makeDynamicOptions())
+
+        lock.lock()
+        if !cachedDynamicOptions.contains(where: { $0.input == input }) {
+            cachedDynamicOptions.insert(DynamicOptionsCacheEntry(input: input, options: result), at: 0)
+            if cachedDynamicOptions.count > 3 {
+                cachedDynamicOptions.removeLast()
+            }
+        }
+        lock.unlock()
+
+        return result
     }
 
     private func codexDynamicOptions(
