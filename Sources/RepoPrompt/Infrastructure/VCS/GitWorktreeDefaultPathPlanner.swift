@@ -95,7 +95,7 @@ enum GitWorktreeDefaultPathPlanner {
             knownWorktreeRoots: existingRoots,
             copyWorktreeIncludeFiles: copyWorktreeIncludeFiles,
             copyWorktreeIncludeUntrackedFiles: request.copyWorktreeIncludeUntrackedFiles,
-            cloneTrackedCheckout: copyWorktreeIncludeFiles && request.cloneTrackedCheckout
+            cloneTrackedCheckout: request.cloneTrackedCheckout
         )
         return Plan(path: path, branch: branch, appManagedContainer: container, createRequest: createRequest)
     }

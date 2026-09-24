@@ -93,6 +93,32 @@ final class GitWorktreeTrackedCheckoutCloneTests: XCTestCase {
 
     // MARK: - Materializer safety
 
+    func testCopySymbolicLinkAcceptsEmptyTarget() throws {
+        let source = fixture.sandbox.appendingPathComponent("empty-link-source", isDirectory: true)
+        let destination = fixture.sandbox.appendingPathComponent("empty-link-destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        XCTAssertEqual(symlink("", source.appendingPathComponent("link").path), 0)
+
+        let sourceDescriptor = open(source.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(sourceDescriptor, 0)
+        defer { close(sourceDescriptor) }
+        let destinationDescriptor = open(destination.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(destinationDescriptor, 0)
+        defer { close(destinationDescriptor) }
+
+        XCTAssertEqual(
+            GitWorktreeFileCloner.copySymbolicLink(
+                sourceDirectory: sourceDescriptor,
+                name: "link",
+                destinationDirectory: destinationDescriptor
+            ),
+            .symbolicLinkCreated
+        )
+        var target = [CChar](repeating: 0, count: 1)
+        XCTAssertEqual(readlinkat(destinationDescriptor, "link", &target, target.count), 0)
+    }
+
     func testMaterializerRefusesDestinationSymlinkParentWithoutWritingThroughIt() throws {
         let source = fixture.sandbox.appendingPathComponent("materialize-source", isDirectory: true)
         let destination = fixture.sandbox.appendingPathComponent("materialize-destination", isDirectory: true)
@@ -439,10 +465,10 @@ final class GitWorktreeTrackedCheckoutCloneTests: XCTestCase {
             allowExternalPath: true,
             purpose: .standaloneCreate(now: Date())
         ))
-        XCTAssertFalse(plan.createRequest.cloneTrackedCheckout)
+        XCTAssertTrue(plan.createRequest.cloneTrackedCheckout)
         let result = try await GitService().createWorktreeWithResult(request: plan.createRequest, at: source)
         XCTAssertEqual(result.checkoutReport?.strategy, .ordinary)
-        XCTAssertEqual(result.checkoutReport?.ineligibilityReason, "not-requested")
+        XCTAssertEqual(result.checkoutReport?.ineligibilityReason, "destination-not-app-managed")
     }
 
     #if DEBUG

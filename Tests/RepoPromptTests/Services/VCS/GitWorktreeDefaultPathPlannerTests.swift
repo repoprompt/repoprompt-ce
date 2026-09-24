@@ -108,6 +108,16 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         ))
         XCTAssertEqual(allowed.path, externalPath.standardizedFileURL)
         XCTAssertFalse(allowed.createRequest.copyWorktreeIncludeFiles)
+        XCTAssertTrue(allowed.createRequest.cloneTrackedCheckout)
+
+        let optedOut = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: mainRoot,
+            explicitPath: externalPath,
+            allowExternalPath: true,
+            cloneTrackedCheckout: false,
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        ))
+        XCTAssertFalse(optedOut.createRequest.cloneTrackedCheckout)
     }
 
     func testRejectsRelativeExplicitPathAndExpandsHomePath() throws {
