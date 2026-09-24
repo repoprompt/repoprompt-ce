@@ -357,7 +357,9 @@ actor GitService {
         private var worktreeMutationLockAcquiredHandlerForTesting: (@Sendable (UUID?) async -> Void)?
         private var targetEvidenceDidSealBeforeCommandHandlerForTesting: (@Sendable () async throws -> Void)?
         private var drainCreationFailureForTesting: (any Error)?
+        private var trackedCheckoutCloneSyscallForTesting: GitWorktreeFileCloner.CloneSyscall?
     #endif
+    private static let worktreeCloneLogger = Logger(subsystem: "com.repoprompt.git", category: "worktree-clone")
 
     /// Spawns one git child. Injectable for deterministic launch-failure and
     /// launch-blocking tests; production always uses `ProcessLauncher`.
@@ -408,6 +410,11 @@ actor GitService {
             _ handler: (@Sendable (UUID?) async -> Void)?
         ) {
             worktreeMutationLockAcquiredHandlerForTesting = handler
+        }
+
+        /// Replaces `fclonefileat` for tracked-checkout materialization in tests.
+        func setTrackedCheckoutCloneSyscallForTesting(_ clone: GitWorktreeFileCloner.CloneSyscall?) {
+            trackedCheckoutCloneSyscallForTesting = clone
         }
 
         func setTargetEvidenceDidSealBeforeCommandHandlerForTesting(
@@ -902,7 +909,18 @@ actor GitService {
                     nil
                 }
                 do {
+                    #if DEBUG
+                        let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
+                    #endif
+                    let eligibilityClock = ContinuousClock()
+                    let eligibilityStarted = eligibilityClock.now
+                    let trackedCloneDecision = try await trackedCheckoutCloneDecision(
+                        request: mutationRequest,
+                        sourceLayout: sourceLayout
+                    )
+                    let eligibilityMilliseconds = Self.milliseconds(eligibilityClock.now - eligibilityStarted)
                     var args = ["worktree", "add"]
+                    if case .eligible = trackedCloneDecision { args.append("--no-checkout") }
                     if mutationRequest.force { args.append("--force") }
                     if mutationRequest.detach { args.append("--detach") }
                     if let lockReason = mutationRequest.lockReason {
@@ -919,13 +937,28 @@ actor GitService {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    #if DEBUG
-                        let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
-                    #endif
                     let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
+                    let checkoutReport: GitWorktreeCheckoutReport
+                    switch trackedCloneDecision {
+                    case let .ineligible(reason):
+                        checkoutReport = GitWorktreeCheckoutReport(
+                            strategy: .ordinary,
+                            ineligibilityReason: reason.rawValue,
+                            eligibilityMilliseconds: eligibilityMilliseconds
+                        )
+                    case let .eligible(plan):
+                        await clearLayoutCache()
+                        checkoutReport = try await completeTrackedCheckoutClone(
+                            plan: plan,
+                            destinationURL: mutationRequest.path.standardizedFileURL
+                        ).withEligibilityMilliseconds(eligibilityMilliseconds)
+                    }
+                    Self.worktreeCloneLogger.debug(
+                        "worktree checkout strategy=\(checkoutReport.strategy.rawValue, privacy: .public) ineligible=\(checkoutReport.ineligibilityReason ?? "-", privacy: .public) files=\(checkoutReport.clonedFileCount, privacy: .public) links=\(checkoutReport.symbolicLinkCount, privacy: .public) bytes=\(checkoutReport.clonedByteCount, privacy: .public) fallback=\(checkoutReport.fallbackReason ?? "-", privacy: .private)"
+                    )
                     #if DEBUG
                         let benchmarkMutationFinished = DispatchTime.now().uptimeNanoseconds
                         let benchmarkPostMutationStarted = benchmarkMutationFinished
@@ -1040,11 +1073,14 @@ actor GitService {
                     let includeCopyHadFailures = includeCopyResult.map {
                         !$0.skippedSummaries.isEmpty || !$0.errorSummaries.isEmpty
                     } ?? false
+                    // Opt-in untracked copies are not part of the parent snapshot's ignored-file
+                    // model, so they conservatively disable receipt reuse.
                     var includeCopyWasComplete = reusableReceiptDestinationIsEligible
                         && !includeCopyHadFailures
                         && (includeCopyResult.map {
                             $0.copiedCount == $0.matchedCount
                                 && $0.copiedRelativePaths.count == $0.copiedCount
+                                && $0.copiedUntrackedCount == 0
                         } ?? true)
                     #if DEBUG
                         if consumeReceiptCreationFailureForTesting(
@@ -1169,6 +1205,7 @@ actor GitService {
                     return GitWorktreeCreateResult(
                         descriptor: created,
                         includeCopyResult: includeCopyResult,
+                        checkoutReport: checkoutReport,
                         initializationReceipt: receipt,
                         initializationFallbackReason: initializationFallbackReason
                     )
@@ -1602,17 +1639,14 @@ actor GitService {
         else { return nil }
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
-        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
-        if MCPDomainMutationCommitContext.controller != nil, physicalMutationCapability == nil {
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        if MCPDomainMutationCommitContext.controller != nil, physicalMutationGuard == nil {
             return GitWorktreeIncludeCopyResult(
                 copiedCount: 0,
                 matchedCount: 0,
-                errorSummaries: [
-                    "protected .worktreeinclude copying is unsupported without a descriptor-backed capability"
-                ]
+                errorSummaries: ["protected .worktreeinclude copying has no admitted path fence"]
             )
         }
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         do {
             let (stdout, stderr, exitCode) = try await runGit(
@@ -1626,10 +1660,26 @@ actor GitService {
                     errorSummaries: ["could not list Git-ignored files: \(stderr)"]
                 )
             }
+            var untrackedStdout = ""
+            if request.copyWorktreeIncludeUntrackedFiles {
+                let (untracked, untrackedStderr, untrackedExitCode) = try await runGit(
+                    ["ls-files", "--others", "--exclude-standard", "-z"],
+                    at: sourceRepoURL
+                )
+                guard untrackedExitCode == 0 else {
+                    return GitWorktreeIncludeCopyResult(
+                        copiedCount: 0,
+                        matchedCount: 0,
+                        errorSummaries: ["could not list untracked files: \(untrackedStderr)"]
+                    )
+                }
+                untrackedStdout = untracked
+            }
             return try GitWorktreeIncludeCopier.copyIncludedFiles(
                 from: sourceRepoURL,
                 to: destinationURL,
                 ignoredFilesNULOutput: stdout,
+                untrackedFilesNULOutput: untrackedStdout,
                 appManagedContainer: appManagedContainer,
                 physicalMutationGuard: physicalMutationGuard
             )
@@ -1640,6 +1690,391 @@ actor GitService {
                 copiedCount: 0,
                 matchedCount: 0,
                 errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
+            )
+        }
+    }
+
+    // MARK: - Tracked checkout APFS clone fast path
+
+    struct TrackedCheckoutClonePlan {
+        let sourceRoot: URL
+        let commonDirectory: URL
+        let treeOID: String
+        let entries: [GitWorktreeTrackedTreeEntry]
+        /// Paths whose raw bytes must equal their blob (see `assessCheckoutAttributes`).
+        let rawByteVerificationPaths: [String]
+        let rawByteVerificationObjectIDs: [String]
+        let physicalMutationGuard: GitWorktreePhysicalMutationGuardBox
+    }
+
+    enum TrackedCheckoutCloneDecision {
+        case eligible(TrackedCheckoutClonePlan)
+        case ineligible(GitWorktreeTrackedCloneIneligibility)
+    }
+
+    /// Decides, before `git worktree add`, whether tracked files can be APFS clones of the
+    /// source checkout. Every check is read-only and conservative: anything that could make a
+    /// fresh checkout differ from the clean source bytes leaves the work to an ordinary Git
+    /// checkout. Git failures while probing also choose the ordinary path.
+    private func trackedCheckoutCloneDecision(
+        request: GitWorktreeCreateRequest,
+        sourceLayout: GitRepositoryLayout?
+    ) async throws -> TrackedCheckoutCloneDecision {
+        guard request.cloneTrackedCheckout else { return .ineligible(.notRequested) }
+        guard !request.force else { return .ineligible(.forceRequested) }
+        guard !request.allowExternalPath,
+              let appManagedContainer = request.appManagedContainer,
+              Self.isPath(request.path, equalToOrInside: appManagedContainer)
+        else { return .ineligible(.destinationNotAppManaged) }
+        guard let sourceLayout else { return .ineligible(.sourceLayoutUnavailable) }
+
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        if MCPDomainMutationCommitContext.controller != nil, physicalMutationGuard == nil {
+            return .ineligible(.protectedMutationWithoutCapability)
+        }
+        try physicalMutationGuard?.revalidate()
+
+        do {
+            return try await evaluateTrackedCheckoutClone(
+                request: request,
+                sourceLayout: sourceLayout,
+                physicalMutationGuard: GitWorktreePhysicalMutationGuardBox(value: physicalMutationGuard)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DomainMutationPathFenceError {
+            throw error
+        } catch {
+            return .ineligible(.gitCommandFailed)
+        }
+    }
+
+    private func evaluateTrackedCheckoutClone(
+        request: GitWorktreeCreateRequest,
+        sourceLayout: GitRepositoryLayout,
+        physicalMutationGuard: GitWorktreePhysicalMutationGuardBox
+    ) async throws -> TrackedCheckoutCloneDecision {
+        let sourceRoot = sourceLayout.workTreeRoot.standardizedFileURL
+        let volume: GitWorktreeTrackedCheckoutClone.VolumeProbe
+        switch GitWorktreeTrackedCheckoutClone.probeVolumes(sourceRoot: sourceRoot, destination: request.path) {
+        case let .success(probe): volume = probe
+        case let .failure(reason): return .ineligible(reason)
+        }
+
+        let environment = GitWorktreeTrackedCheckoutClone.gitEnvironment
+        func git(_ args: [String], stdin: Data? = nil) async throws -> (String, String, Int32) {
+            try await runGit(args, at: sourceRoot, env: environment, stdin: stdin)
+        }
+        func trimmed(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let (config, _, configExitCode) = try await git(["config", "--list", "-z"])
+        guard configExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let configAssessment = GitWorktreeTrackedCheckoutClone.assessConfig(config)
+        if let reason = configAssessment.ineligibility { return .ineligible(reason) }
+
+        let (sourceTree, _, sourceTreeExitCode) = try await git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+        let sourceTreeOID = trimmed(sourceTree)
+        guard sourceTreeExitCode == 0, !sourceTreeOID.isEmpty else { return .ineligible(.sourceHeadUnavailable) }
+        let targetRef = request.baseRef.flatMap { $0.isEmpty ? nil : $0 } ?? "HEAD"
+        let (targetTree, _, targetTreeExitCode) = try await git(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", "\(targetRef)^{tree}"]
+        )
+        guard targetTreeExitCode == 0 else { return .ineligible(.baseTreeUnavailable) }
+        guard trimmed(targetTree) == sourceTreeOID else { return .ineligible(.baseTreeMismatch) }
+
+        // `worktree add --no-checkout` does not run `post-checkout`, so any hook (file-based or
+        // configured) keeps the ordinary checkout that runs it.
+        let (_, _, hookListExitCode) = try await git(["hook", "list", "post-checkout"])
+        if hookListExitCode == 0 { return .ineligible(.postCheckoutHook) }
+        let (hookPath, _, hookPathExitCode) = try await git(["rev-parse", "--git-path", "hooks/post-checkout"])
+        guard hookPathExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let hookPathValue = trimmed(hookPath)
+        let hookURL = hookPathValue.hasPrefix("/")
+            ? URL(fileURLWithPath: hookPathValue)
+            : sourceRoot.appendingPathComponent(hookPathValue)
+        if FileManager.default.fileExists(atPath: hookURL.path) { return .ineligible(.postCheckoutHook) }
+
+        let (status, _, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=no", "--ignore-submodules=none"]
+        )
+        guard statusExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        guard status.isEmpty else { return .ineligible(.sourceHasTrackedChanges) }
+
+        let (indexTags, _, indexTagsExitCode) = try await git(["ls-files", "-v", "-z"])
+        guard indexTagsExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        if GitWorktreeTrackedCheckoutClone.hasHiddenIndexState(indexTags) { return .ineligible(.hiddenIndexState) }
+
+        // No `-l`: sizes would force Git to read every blob header.
+        let (treeListing, _, treeListingExitCode) = try await git(
+            ["ls-tree", "-r", "-z", "--full-tree", sourceTreeOID]
+        )
+        guard treeListingExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let entries: [GitWorktreeTrackedTreeEntry]
+        switch GitWorktreeTrackedCheckoutClone.parseTree(treeListing, caseSensitiveVolume: volume.caseSensitive) {
+        case let .success(parsed): entries = parsed
+        case let .failure(reason): return .ineligible(reason)
+        }
+
+        let fileManager = FileManager.default
+        let xdgConfigHome = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".config").path
+        let attributeSourcesPresent = entries.contains { $0.pathComponents.last == ".gitattributes" }
+            || configAssessment.attributesFileConfigured
+            || fileManager.fileExists(atPath: sourceLayout.commonDir.appendingPathComponent("info/attributes").path)
+            || fileManager.fileExists(atPath: sourceLayout.gitDir.appendingPathComponent("info/attributes").path)
+            || fileManager.fileExists(atPath: URL(fileURLWithPath: xdgConfigHome).appendingPathComponent("git/attributes").path)
+        var rawByteVerificationPaths: [String] = []
+        var rawByteVerificationObjectIDs: [String] = []
+        if attributeSourcesPresent {
+            let paths = entries.map(\.relativePath).joined(separator: "\0") + "\0"
+            let (attributes, _, attributesExitCode) = try await git(
+                ["check-attr", "-z", "--stdin"] + GitWorktreeTrackedCheckoutClone.checkedAttributes,
+                stdin: Data(paths.utf8)
+            )
+            guard attributesExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+            let assessment = GitWorktreeTrackedCheckoutClone.assessCheckoutAttributes(attributes)
+            if assessment.blocksClone { return .ineligible(.checkoutAttributes) }
+            let entriesByPath = Dictionary(
+                entries.map { ($0.relativePath, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            for path in assessment.rawByteVerificationPaths {
+                // `--stdin-paths` is line based; symlinks carry no line-ending conversion.
+                guard !path.contains("\n") else { return .ineligible(.checkoutAttributes) }
+                guard let entry = entriesByPath[path], entry.kind != .symbolicLink else { continue }
+                rawByteVerificationPaths.append(path)
+                rawByteVerificationObjectIDs.append(entry.objectID)
+            }
+            // A clean source can still hold CRLF bytes that normalize to an LF blob; an
+            // ordinary checkout would write the blob bytes, so require raw equality up front.
+            if !rawByteVerificationPaths.isEmpty {
+                let (hashes, _, hashesExitCode) = try await git(
+                    ["hash-object", "--no-filters", "--stdin-paths"],
+                    stdin: Data((rawByteVerificationPaths.joined(separator: "\n") + "\n").utf8)
+                )
+                guard hashesExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+                guard hashes.split(separator: "\n").map(String.init) == rawByteVerificationObjectIDs else {
+                    return .ineligible(.lineEndingConversion)
+                }
+            }
+        }
+
+        return .eligible(TrackedCheckoutClonePlan(
+            sourceRoot: sourceRoot.resolvingSymlinksInPath().standardizedFileURL,
+            commonDirectory: sourceLayout.commonDir,
+            treeOID: sourceTreeOID,
+            entries: entries,
+            rawByteVerificationPaths: rawByteVerificationPaths,
+            rawByteVerificationObjectIDs: rawByteVerificationObjectIDs,
+            physicalMutationGuard: physicalMutationGuard
+        ))
+    }
+
+    /// The freshly created worktree, pinned by directory identity and by its own Git metadata
+    /// so verification and fallback commands can never be redirected to another checkout.
+    struct TrackedCheckoutCloneTarget {
+        let url: URL
+        let layout: GitRepositoryLayout
+        let identity: GitWorktreeTrackedCheckoutClone.DirectoryIdentity
+        let admittedDirectories: DomainMutationWorktreeDirectories?
+    }
+
+    /// Materializes and verifies a `--no-checkout` worktree. Once Git has published the
+    /// worktree it is finished (clone or ordinary fallback) even if the caller is cancelled,
+    /// so it is never left without an index.
+    private func completeTrackedCheckoutClone(
+        plan: TrackedCheckoutClonePlan,
+        destinationURL: URL
+    ) async throws -> GitWorktreeCheckoutReport {
+        #if DEBUG
+            let clone = trackedCheckoutCloneSyscallForTesting ?? GitWorktreeFileCloner.systemClone
+        #else
+            let clone = GitWorktreeFileCloner.systemClone
+        #endif
+        // Fail closed unless the destination is a real directory whose gitfile points into this
+        // repository's linked-worktree metadata.
+        let worktreesDirectory = plan.commonDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("worktrees", isDirectory: true)
+        guard let identity = GitWorktreeTrackedCheckoutClone.directoryIdentity(destinationURL),
+              let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: destinationURL),
+              layout.isLinkedWorktree,
+              layout.commonDir.resolvingSymlinksInPath().standardizedFileURL.path
+              == plan.commonDirectory.resolvingSymlinksInPath().standardizedFileURL.path,
+              Self.isPath(layout.gitDir.resolvingSymlinksInPath(), equalToOrInside: worktreesDirectory)
+        else {
+            throw GitError(
+                message: "created worktree at \(destinationURL.path) could not be verified before cloning; it was left without a checkout"
+            )
+        }
+        let admittedDirectories = try plan.physicalMutationGuard.value?.openCreatedWorktreeDirectories(
+            sourcePath: plan.sourceRoot.path,
+            destinationPath: destinationURL.path,
+            destinationDevice: UInt64(identity.device),
+            destinationInode: UInt64(identity.inode)
+        )
+        let target = TrackedCheckoutCloneTarget(
+            url: destinationURL,
+            layout: layout,
+            identity: identity,
+            admittedDirectories: admittedDirectories
+        )
+        return try await Task.detached(priority: .userInitiated) { [self] in
+            try await finishTrackedCheckoutClone(plan: plan, target: target, clone: clone)
+        }.value
+    }
+
+    private nonisolated static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
+    }
+
+    private nonisolated static func ensureTrackedCloneTargetIdentity(_ target: TrackedCheckoutCloneTarget) throws {
+        guard GitWorktreeTrackedCheckoutClone.directoryIdentity(target.url) == target.identity else {
+            throw GitError(
+                message: "worktree at \(target.url.path) changed identity during tracked clone; refusing to run Git there"
+            )
+        }
+    }
+
+    private nonisolated func finishTrackedCheckoutClone(
+        plan: TrackedCheckoutClonePlan,
+        target: TrackedCheckoutCloneTarget,
+        clone: @escaping GitWorktreeFileCloner.CloneSyscall
+    ) async throws -> GitWorktreeCheckoutReport {
+        let clock = ContinuousClock()
+        let materializationStarted = clock.now
+        var verificationStarted: ContinuousClock.Instant?
+        let failureReason: String
+        do {
+            let summary = try GitWorktreeTrackedCheckoutClone.materialize(
+                entries: plan.entries,
+                sourceRoot: plan.sourceRoot,
+                destinationRoot: target.url,
+                destinationRootIdentity: target.identity,
+                admittedDirectories: target.admittedDirectories,
+                revalidate: {
+                    if let admittedDirectories = target.admittedDirectories {
+                        try admittedDirectories.revalidate()
+                    } else {
+                        try plan.physicalMutationGuard.value?.revalidate()
+                    }
+                },
+                clone: clone
+            )
+            let verificationStart = clock.now
+            verificationStarted = verificationStart
+            if let mismatch = try await verifyClonedCheckout(target: target, plan: plan) {
+                failureReason = mismatch
+            } else {
+                return GitWorktreeCheckoutReport(
+                    strategy: .cloned,
+                    clonedFileCount: summary.regularFileCount,
+                    symbolicLinkCount: summary.symbolicLinkCount,
+                    clonedByteCount: summary.byteCount,
+                    materializationMilliseconds: Self.milliseconds(verificationStart - materializationStarted),
+                    verificationMilliseconds: Self.milliseconds(clock.now - verificationStart)
+                )
+            }
+        } catch let error as DomainMutationPathFenceError {
+            // The authorized roots changed; writing a fallback checkout would be unsafe too.
+            throw error
+        } catch {
+            failureReason = String(describing: error)
+        }
+        let fallbackStart = verificationStarted ?? clock.now
+        try await resetFailedTrackedCheckoutClone(target: target, plan: plan, reason: failureReason)
+        return GitWorktreeCheckoutReport(
+            strategy: .checkoutFallback,
+            fallbackReason: failureReason,
+            materializationMilliseconds: Self.milliseconds(fallbackStart - materializationStarted),
+            verificationMilliseconds: Self.milliseconds(clock.now - fallbackStart)
+        )
+    }
+
+    /// Builds the index from `HEAD` and proves the cloned files match it. `read-tree` leaves
+    /// zeroed stat data, so `update-index --refresh` re-hashes every file and exits non-zero on
+    /// any content, executable-bit, or symlink mismatch (`-q` would mask that exit status).
+    private nonisolated func verifyClonedCheckout(
+        target: TrackedCheckoutCloneTarget,
+        plan: TrackedCheckoutClonePlan
+    ) async throws -> String? {
+        try Self.ensureTrackedCloneTargetIdentity(target)
+        func git(_ args: [String], stdin: Data? = nil) async throws -> (String, String, Int32) {
+            try await runGit(
+                args,
+                at: target.url,
+                env: GitWorktreeTrackedCheckoutClone.gitEnvironment,
+                stdin: stdin,
+                repositoryBinding: .exactWorktree(target.layout)
+            )
+        }
+        if !plan.rawByteVerificationPaths.isEmpty {
+            let (hashes, _, hashesExitCode) = try await git(
+                ["hash-object", "--no-filters", "--stdin-paths"],
+                stdin: Data((plan.rawByteVerificationPaths.joined(separator: "\n") + "\n").utf8)
+            )
+            guard hashesExitCode == 0,
+                  hashes.split(separator: "\n").map(String.init) == plan.rawByteVerificationObjectIDs
+            else { return "cloned bytes differ from checkout bytes for line-ending-normalized files" }
+        }
+        let (headTree, _, headTreeExitCode) = try await git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+        guard headTreeExitCode == 0,
+              headTree.trimmingCharacters(in: .whitespacesAndNewlines) == plan.treeOID
+        else { return "target HEAD does not resolve to the cloned tree" }
+        let (_, readTreeError, readTreeExitCode) = try await git(["read-tree", "HEAD"])
+        guard readTreeExitCode == 0 else { return "read-tree failed: \(readTreeError)" }
+        let (_, _, refreshExitCode) = try await git(["update-index", "--refresh"])
+        guard refreshExitCode == 0 else { return "index refresh found files that differ from the target tree" }
+        let (status, _, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
+        )
+        guard statusExitCode == 0, status.isEmpty else { return "cloned worktree status is not clean" }
+        return nil
+    }
+
+    /// Replaces a failed clone with Git's own checkout inside the new worktree only. The
+    /// source worktree, branches, and other worktrees are never touched; a fallback that
+    /// cannot be verified clean fails loudly and leaves the worktree in place for inspection.
+    private nonisolated func resetFailedTrackedCheckoutClone(
+        target: TrackedCheckoutCloneTarget,
+        plan: TrackedCheckoutClonePlan,
+        reason: String
+    ) async throws {
+        if let admittedDirectories = target.admittedDirectories {
+            try admittedDirectories.revalidate()
+        } else {
+            try plan.physicalMutationGuard.value?.revalidate()
+        }
+        try Self.ensureTrackedCloneTargetIdentity(target)
+        func git(_ args: [String]) async throws -> (String, String, Int32) {
+            try await runGit(
+                args,
+                at: target.url,
+                env: GitWorktreeTrackedCheckoutClone.gitEnvironment,
+                repositoryBinding: .exactWorktree(target.layout)
+            )
+        }
+        let destinationPath = target.url.path
+        // Empty the new worktree's index first: refreshed stat data could otherwise make
+        // `reset --hard` keep a cloned file whose raw bytes differ from Git's checkout.
+        var (_, resetError, resetExitCode) = try await git(["read-tree", "--empty"])
+        if resetExitCode == 0 {
+            (_, resetError, resetExitCode) = try await git(["reset", "--quiet", "--hard", "HEAD"])
+        }
+        guard resetExitCode == 0 else {
+            throw GitError(
+                message: "worktree checkout fallback failed at \(destinationPath): git reset --hard failed (\(resetError.trimmingCharacters(in: .whitespacesAndNewlines))) after tracked clone failure: \(reason)"
+            )
+        }
+        let (status, statusError, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
+        )
+        guard statusExitCode == 0, status.isEmpty else {
+            let statusSummary = status.split(separator: "\0").prefix(5).joined(separator: "; ")
+            throw GitError(
+                message: "worktree checkout fallback left \(destinationPath) unclean after tracked clone failure (\(reason)): \(statusSummary)\(statusError)"
             )
         }
     }
@@ -1672,7 +2107,9 @@ actor GitService {
             appManagedContainer: URL(fileURLWithPath: canonicalContainer, isDirectory: true),
             mainWorktreeRoot: request.mainWorktreeRoot,
             knownWorktreeRoots: request.knownWorktreeRoots,
-            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles
+            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles,
+            copyWorktreeIncludeUntrackedFiles: request.copyWorktreeIncludeUntrackedFiles,
+            cloneTrackedCheckout: request.cloneTrackedCheckout
         )
     }
 

@@ -1,33 +1,80 @@
+import Darwin
 import Foundation
 import RepoPromptDomainRuntime
 
 enum GitWorktreeIncludeCopier {
     private static let includeFileName = ".worktreeinclude"
 
+    /// Copies Git-ignored files (and, only when `untrackedFilesNULOutput` is supplied by an
+    /// explicit opt-in, untracked non-ignored files) whose final `.worktreeinclude` match is
+    /// positive. Regular files are APFS-cloned through parent directory descriptors opened
+    /// with `O_NOFOLLOW`; volumes that cannot clone fall back to an exclusive byte copy.
     static func copyIncludedFiles(
         from sourceRoot: URL,
         to destinationRoot: URL,
         ignoredFilesNULOutput: String,
+        untrackedFilesNULOutput: String = "",
         appManagedContainer: URL? = nil,
         fileManager: FileManager = .default,
-        physicalMutationGuard: DomainMutationPhysicalCommitGuard? = nil
+        physicalMutationGuard: DomainMutationPhysicalCommitGuard? = nil,
+        clone: GitWorktreeFileCloner.CloneSyscall = GitWorktreeFileCloner.systemClone
     ) throws -> GitWorktreeIncludeCopyResult? {
+        let admittedDirectories: DomainMutationWorktreeDirectories?
+        if let physicalMutationGuard {
+            guard let destinationIdentity = GitWorktreeTrackedCheckoutClone.directoryIdentity(destinationRoot) else {
+                throw DomainMutationPathFenceError.pathResolutionChanged(destinationRoot.path)
+            }
+            admittedDirectories = try physicalMutationGuard.openCreatedWorktreeDirectories(
+                sourcePath: sourceRoot.path,
+                destinationPath: destinationRoot.path,
+                destinationDevice: UInt64(destinationIdentity.device),
+                destinationInode: UInt64(destinationIdentity.inode)
+            )
+        } else {
+            admittedDirectories = nil
+        }
         let includeURL = sourceRoot.appendingPathComponent(includeFileName, isDirectory: false)
-        guard fileManager.fileExists(atPath: includeURL.path) else { return nil }
+        if admittedDirectories == nil {
+            guard fileManager.fileExists(atPath: includeURL.path) else { return nil }
+        }
 
         let content: String
         do {
-            content = try String(contentsOf: includeURL, encoding: .utf8)
+            if let admittedDirectories {
+                let descriptor = openat(
+                    admittedDirectories.sourceFD,
+                    includeFileName,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+                )
+                if descriptor < 0, errno == ENOENT { return nil }
+                guard descriptor >= 0 else {
+                    throw GitWorktreeFileClonerError(operation: "open-worktreeinclude", code: errno)
+                }
+                let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                var status = stat()
+                guard fstat(descriptor, &status) == 0, status.st_mode & S_IFMT == S_IFREG else {
+                    throw GitWorktreeFileClonerError(operation: "stat-worktreeinclude", code: EFTYPE)
+                }
+                let data = try handle.readToEnd() ?? Data()
+                guard let decoded = String(data: data, encoding: .utf8) else {
+                    throw CocoaError(.fileReadInapplicableStringEncoding)
+                }
+                content = decoded
+            } else {
+                content = try String(contentsOf: includeURL, encoding: .utf8)
+            }
         } catch {
             return GitWorktreeIncludeCopyResult(
                 copiedCount: 0,
                 matchedCount: 0,
-                errorSummaries: ["could not read .worktreeinclude: \(error.localizedDescription)"]
+                errorSummaries: ["could not read .worktreeinclude: \(error)"]
             )
         }
 
         let rules = GitignoreCompiler.compile(content: content, directoryPath: "")
         var copiedCount = 0
+        var clonedCount = 0
+        var copiedUntrackedCount = 0
         var matchedCount = 0
         var copiedRelativePaths: [String] = []
         var skippedSummaries: [String] = []
@@ -35,10 +82,20 @@ enum GitWorktreeIncludeCopier {
         let appManagedContainerComponents = appManagedContainer.flatMap {
             relativePathComponentsIfInside(child: $0, root: sourceRoot)
         }
+        var sourceCursor: GitWorktreeFileCloner.DirectoryCursor?
+        var destinationCursor: GitWorktreeFileCloner.DirectoryCursor?
 
-        for relativePathSlice in ignoredFilesNULOutput.split(separator: "\0", omittingEmptySubsequences: false) {
-            guard !relativePathSlice.isEmpty else { continue }
-            let relativePath = String(relativePathSlice)
+        var candidates: [(relativePath: String, isUntracked: Bool)] = []
+        var seenCandidates = Set<String>()
+        for (output, isUntracked) in [(ignoredFilesNULOutput, false), (untrackedFilesNULOutput, true)] {
+            for slice in output.split(separator: "\0", omittingEmptySubsequences: true) {
+                let relativePath = String(slice)
+                guard seenCandidates.insert(relativePath).inserted else { continue }
+                candidates.append((relativePath, isUntracked))
+            }
+        }
+
+        for (relativePath, isUntracked) in candidates {
             guard let pathComponents = safePathComponents(relativePath) else {
                 skippedSummaries.append("skipped unsafe path \(relativePath)")
                 continue
@@ -94,24 +151,79 @@ enum GitWorktreeIncludeCopier {
                 continue
             }
 
-            try physicalMutationGuard?.revalidate()
+            try admittedDirectories?.revalidate()
+            let parentComponents = pathComponents.dropLast()
+            let sourceDirectory: Int32
+            let destinationDirectory: Int32
             do {
-                try fileManager.createDirectory(
-                    at: destinationURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
+                // The source root may legitimately be opened through a symlinked path, so it is
+                // resolved once; the new worktree root must not be a symlink at all.
+                let sourceWalker = try sourceCursor ?? {
+                    if let admittedDirectories {
+                        return try GitWorktreeFileCloner.DirectoryCursor(
+                            rootDescriptor: admittedDirectories.sourceFD,
+                            createMissing: false
+                        )
+                    }
+                    return try GitWorktreeFileCloner.DirectoryCursor(
+                        rootPath: sourceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+                        createMissing: false,
+                        noFollowRoot: true
+                    )
+                }()
+                sourceCursor = sourceWalker
+                let destinationWalker = try destinationCursor ?? {
+                    if let admittedDirectories {
+                        return try GitWorktreeFileCloner.DirectoryCursor(
+                            rootDescriptor: admittedDirectories.destinationFD,
+                            createMissing: true
+                        )
+                    }
+                    return try GitWorktreeFileCloner.DirectoryCursor(
+                        rootPath: destinationRoot.standardizedFileURL.path,
+                        createMissing: true,
+                        noFollowRoot: true
+                    )
+                }()
+                destinationCursor = destinationWalker
+                sourceDirectory = try sourceWalker.directory(for: parentComponents)
+                destinationDirectory = try destinationWalker.directory(for: parentComponents)
             } catch {
-                errorSummaries.append("failed to prepare \(relativePath): \(error.localizedDescription)")
+                errorSummaries.append("failed to prepare \(relativePath): \(error)")
                 continue
             }
 
-            try physicalMutationGuard?.revalidate()
-            do {
-                try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            try admittedDirectories?.revalidate()
+            let outcome = GitWorktreeFileCloner.cloneRegularFile(
+                sourceDirectory: sourceDirectory,
+                name: pathComponents[pathComponents.count - 1],
+                destinationDirectory: destinationDirectory,
+                metadata: .preserveSource,
+                allowCopyFallback: true,
+                clone: clone
+            )
+            switch outcome {
+            case .cloned, .copied:
                 copiedCount += 1
+                if outcome == .cloned { clonedCount += 1 }
+                if isUntracked { copiedUntrackedCount += 1 }
                 copiedRelativePaths.append(pathComponents.joined(separator: "/"))
-            } catch {
-                errorSummaries.append("failed to copy \(relativePath): \(error.localizedDescription)")
+            case .destinationExists:
+                skippedSummaries.append("destination already exists for \(relativePath)")
+            case .sourceTypeMismatch:
+                skippedSummaries.append("source is not a regular file for \(relativePath)")
+            case .sourceMissing:
+                errorSummaries.append("failed to copy \(relativePath): source file disappeared")
+            case let .failed(operation, code):
+                errorSummaries.append(
+                    "failed to copy \(relativePath): \(GitWorktreeFileClonerError(operation: operation, code: code))"
+                )
+            case let .cloneUnsupported(code):
+                errorSummaries.append(
+                    "failed to copy \(relativePath): \(GitWorktreeFileClonerError(operation: "clone", code: code))"
+                )
+            case .symbolicLinkCreated:
+                errorSummaries.append("failed to copy \(relativePath): unexpected link result")
             }
         }
 
@@ -123,7 +235,9 @@ enum GitWorktreeIncludeCopier {
             matchedCount: matchedCount,
             copiedRelativePaths: copiedRelativePaths.sorted(),
             skippedSummaries: skippedSummaries,
-            errorSummaries: errorSummaries
+            errorSummaries: errorSummaries,
+            clonedCount: clonedCount,
+            copiedUntrackedCount: copiedUntrackedCount
         )
     }
 
