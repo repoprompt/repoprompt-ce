@@ -2095,8 +2095,12 @@ final class ContentReadCancellationTests: XCTestCase {
         let fingerprint = try await service.contentFingerprint(ofRelativePath: "Target.swift")
         let cacheCommitReached = AsyncSignal()
         let releaseCacheCommit = AsyncSignal()
+        let cacheCommitOrReadCompletion = XCTestExpectation(description: "Validated read reaches cache commit or completes")
+        let readCompleted = XCTestExpectation(description: "Validated read result observed")
+        let readResult = TaskResultRecorder<ValidatedFileContentSnapshot, Error>()
         await service.setContentReadCacheCommitHandlerForTesting {
             await cacheCommitReached.signal()
+            cacheCommitOrReadCompletion.fulfill()
             await releaseCacheCommit.wait()
         }
         addTeardownBlock {
@@ -2111,23 +2115,39 @@ final class ContentReadCancellationTests: XCTestCase {
                 workloadClass: .interactiveRead
             )
         }
+        let readObservation = Task {
+            await readResult.record(readTask.result)
+            // An error before the hook must wake the test with its actual result. Once the
+            // hook is reached, it alone fulfills the first-progress expectation.
+            if await !(cacheCommitReached.isSignaledSnapshot()) {
+                cacheCommitOrReadCompletion.fulfill()
+            }
+            readCompleted.fulfill()
+        }
         addTeardownBlock {
             await releaseCacheCommit.signal()
             readTask.cancel()
-            let readResult = await self.waitForTaskResult(readTask)
-            XCTAssertNotNil(readResult, "Validated read did not settle during teardown")
+            await readObservation.value
         }
-        guard await waitUntil({ await cacheCommitReached.isSignaledSnapshot() }) else {
-            return XCTFail("Validated read did not reach the cache-only commit boundary")
+        // The event establishes ordering; the timeout only bounds a broken fixture/read.
+        guard await XCTWaiter.fulfillment(of: [cacheCommitOrReadCompletion], timeout: 5) == .completed else {
+            return XCTFail("Validated read neither reached cache commit nor returned a result")
+        }
+        guard await cacheCommitReached.isSignaledSnapshot() else {
+            let earlyResult = await readResult.snapshot()
+            _ = try XCTUnwrap(earlyResult).get()
+            return XCTFail("Validated read completed without reaching the cache-only commit boundary")
         }
         let beforeCommitSnapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
         XCTAssertEqual(beforeCommitSnapshot.activePermitCount, 1)
 
         await releaseCacheCommit.signal()
-        guard let observedReadResult = await waitForTaskResult(readTask) else {
+        guard await XCTWaiter.fulfillment(of: [readCompleted], timeout: 5) == .completed else {
             return XCTFail("Validated read did not settle after cache commit")
         }
-        let snapshot = try observedReadResult.get()
+        await readObservation.value
+        let observedReadResult = await readResult.snapshot()
+        let snapshot = try XCTUnwrap(observedReadResult).get()
         XCTAssertEqual(snapshot.content, contents)
         let afterReadSnapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
         XCTAssertEqual(afterReadSnapshot.grantCount, beforeCommitSnapshot.grantCount)

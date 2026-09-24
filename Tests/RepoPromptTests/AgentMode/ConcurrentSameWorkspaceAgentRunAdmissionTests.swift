@@ -612,12 +612,50 @@ import XCTest
         }
 
         func testCanonicalAdmissionRefreshRejectsDuplicateTabIDWithoutMutationOrDispatch() async throws {
-            let fixture = try await DurableAgentAdmissionFixture.make()
-            trackCleanup { await fixture.cleanup() }
-            let manager = fixture.window.workspaceManager
-            let workspaceBefore = try XCTUnwrap(manager.workspace(withID: fixture.workspaceID))
-            let canonicalValue = await fixture.runtime.workspaceStore
-                .canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let container = try makeTemporaryDirectory(named: "MalformedCanonicalIdentity")
+            let authorityRoot = container.appendingPathComponent("state", isDirectory: true)
+            try FileManager.default.createDirectory(at: authorityRoot, withIntermediateDirectories: true)
+            let storageOverride = AdmissionWorkspaceStorageOverride(authorityRoot: authorityRoot)
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "malformed-canonical-admission",
+                storageDirectory: authorityRoot,
+                eventDirectory: authorityRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: authorityRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -882)
+            let fixture = makeManagerFixture(
+                coordinator: WorkspaceAgentAdmissionCoordinator(),
+                domainWorkspaceAuthorityClient: authority
+            )
+            let manager = fixture.manager
+            trackCleanup {
+                manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting(nil)
+                manager.prepareForWindowClose()
+                _ = await runtime.shutdown()
+                storageOverride.restore()
+            }
+            try await runtime.start()
+
+            // Exercise canonical admission with a manager-only fixture. A full WindowState
+            // starts an independent Oracle task that can replace activeChatSessionID across
+            // this test's awaits, making whole-workspace equality depend on its schedule.
+            var tab = ComposeTabState(name: "Admission")
+            tab.activeChatSessionID = UUID()
+            let workspace = WorkspaceModel(
+                name: "Malformed canonical admission",
+                repoPaths: [],
+                composeTabs: [tab],
+                activeComposeTabID: tab.id
+            )
+            let creation = try await authority.create(workspace, fileURL: manager.workspaceFileURL(for: workspace))
+            guard creation.disposition == .applied else {
+                throw AdmissionTestError.fixtureSetup("canonical admission workspace did not commit")
+            }
+            manager.workspaces = [workspace]
+            let workspaceBefore = try XCTUnwrap(manager.workspace(withID: workspace.id))
+            let canonicalValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
             let canonicalSnapshot = try XCTUnwrap(canonicalValue)
             var malformed = try JSONDecoder().decode(
                 WorkspaceModel.self,
@@ -635,7 +673,7 @@ import XCTest
 
             do {
                 try await manager.withAgentSessionAdmission(
-                    workspaceID: fixture.workspaceID,
+                    workspaceID: workspace.id,
                     admissionID: UUID(),
                     refreshCanonicalState: true
                 ) {
@@ -647,7 +685,7 @@ import XCTest
             }
 
             XCTAssertFalse(operationRan)
-            XCTAssertEqual(manager.workspace(withID: fixture.workspaceID), workspaceBefore)
+            XCTAssertEqual(manager.workspace(withID: workspace.id), workspaceBefore)
         }
 
         func testRetainedRecoveryKeepsPeerProvisionalFenceUntilRecoveryTerminates() async throws {
@@ -1818,7 +1856,8 @@ import XCTest
         }
 
         private func makeManagerFixture(
-            coordinator: WorkspaceAgentAdmissionCoordinator
+            coordinator: WorkspaceAgentAdmissionCoordinator,
+            domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil
         ) -> (
             manager: WorkspaceManagerViewModel,
             prompt: PromptViewModel
@@ -1843,6 +1882,7 @@ import XCTest
             let manager = WorkspaceManagerViewModel(
                 fileManager: fileManager,
                 promptViewModel: prompt,
+                domainWorkspaceAuthorityClient: domainWorkspaceAuthorityClient,
                 workspaceAgentAdmissionCoordinator: coordinator,
                 performInitialWorkspaceActivation: false
             )
