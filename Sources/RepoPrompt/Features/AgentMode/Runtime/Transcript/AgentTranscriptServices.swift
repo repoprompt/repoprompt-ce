@@ -1302,9 +1302,18 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     private var toolExecutionByItemID: [UUID: AgentTranscriptToolExecution] = [:]
     private var missingToolExecutionItemIDs: Set<UUID> = []
     private var bashMetadataByRaw: [String: BashToolResultParser.Metadata] = [:]
+    /// When false, item-ID-keyed execution lookups always miss and stores are dropped.
+    /// Content-addressed caches (JSON parses, bash metadata) are unaffected. Used by
+    /// passes that must not let one activity's execution be reused for another activity
+    /// that happens to share its item ID.
+    private let cachesToolExecutions: Bool
     #if DEBUG || EDIT_FLOW_PERF
         private var metrics: AgentToolResultProcessingMetrics = .zero
     #endif
+
+    init(cachesToolExecutions: Bool = true) {
+        self.cachesToolExecutions = cachesToolExecutions
+    }
 
     func jsonObject(from raw: String?) -> [String: Any]? {
         guard let normalizedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1363,6 +1372,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func lookupToolExecution(for itemID: UUID) -> ToolExecutionLookup {
+        guard cachesToolExecutions else { return .miss }
         lock.lock()
         if let cached = toolExecutionByItemID[itemID] {
             #if DEBUG || EDIT_FLOW_PERF
@@ -1386,6 +1396,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func storeToolExecution(_ execution: AgentTranscriptToolExecution, for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         toolExecutionByItemID[itemID] = execution
         missingToolExecutionItemIDs.remove(itemID)
@@ -1393,6 +1404,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func markMissingToolExecution(for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         missingToolExecutionItemIDs.insert(itemID)
         toolExecutionByItemID.removeValue(forKey: itemID)
@@ -5766,16 +5778,34 @@ enum AgentTranscriptProjectionBuilder {
         let transcriptTurnIDs = Set(transcript.turns.map(\.id))
         let protectedTurnID = protection.protectedTurnID
         var updatedTurnCaches = existingTurnCaches.filter { transcriptTurnIDs.contains($0.key) }
+        // Group the whole-projection collections once; per-turn filters would make this O(turns × blocks).
+        let workingBlocksByTurn = Dictionary(grouping: projection.workingBlocks, by: \.turnID)
+        let archivedBlocksByTurn = Dictionary(grouping: projection.archivedBlocks, by: \.turnID)
+        var rowAnchorsByTurn: [UUID: [UUID: AgentTranscriptAnchor]] = [:]
+        for (rowID, anchor) in projection.rowAnchorIndex {
+            rowAnchorsByTurn[turnID(for: anchor), default: [:]][rowID] = anchor
+        }
+        var anchorBlocksByTurn: [UUID: [AgentTranscriptAnchor: String]] = [:]
+        for (anchor, blockID) in projection.anchorBlockIndex {
+            anchorBlocksByTurn[turnID(for: anchor), default: [:]][anchor] = blockID
+        }
         for turn in transcript.turns {
             guard turn.isCompleted else {
                 updatedTurnCaches.removeValue(forKey: turn.id)
                 continue
             }
             guard turn.id != protectedTurnID else { continue }
+            let turnWorkingBlocks = workingBlocksByTurn[turn.id] ?? []
+            let turnArchivedBlocks = archivedBlocksByTurn[turn.id] ?? []
             updatedTurnCaches[turn.id] = projectionCache(
                 for: turn,
                 token: validationToken(for: turn),
-                projection: projection
+                workingBlocks: turnWorkingBlocks,
+                archivedBlocks: turnArchivedBlocks,
+                workingRows: projectionRows(for: turnWorkingBlocks),
+                archivedRows: projectionRows(for: turnArchivedBlocks),
+                rowAnchorIndex: rowAnchorsByTurn[turn.id] ?? [:],
+                anchorBlockIndex: anchorBlocksByTurn[turn.id] ?? [:]
             )
         }
         return updatedTurnCaches
@@ -6141,25 +6171,6 @@ enum AgentTranscriptProjectionBuilder {
             archivedRows: archivedRows,
             rowAnchorIndex: rowAnchorIndex.filter { turnID(for: $0.value) == turn.id },
             anchorBlockIndex: anchorBlockIndex.filter { turnID(for: $0.key) == turn.id }
-        )
-    }
-
-    private static func projectionCache(
-        for turn: AgentTranscriptTurn,
-        token: AgentTranscriptTurnProjectionCache.ValidationToken,
-        projection: AgentTranscriptProjection
-    ) -> AgentTranscriptTurnProjectionCache {
-        let workingBlocks = projection.workingBlocks.filter { $0.turnID == turn.id }
-        let archivedBlocks = projection.archivedBlocks.filter { $0.turnID == turn.id }
-        return projectionCache(
-            for: turn,
-            token: token,
-            workingBlocks: workingBlocks,
-            archivedBlocks: archivedBlocks,
-            workingRows: projectionRows(for: workingBlocks),
-            archivedRows: projectionRows(for: archivedBlocks),
-            rowAnchorIndex: projection.rowAnchorIndex,
-            anchorBlockIndex: projection.anchorBlockIndex
         )
     }
 
