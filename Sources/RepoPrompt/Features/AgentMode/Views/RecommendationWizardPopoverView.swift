@@ -742,7 +742,7 @@ private struct RecommendationProviderFilterPopover: View {
 
 // MARK: - Role Defaults Summary Helper
 
-/// Produces a compact summary string for role defaults: "Explore → Codex GPT-5.6 Sol Low · ..."
+/// Produces a compact summary string for role defaults: "Explore → Codex GPT-6 Luna Low · ..."
 private func roleDefaultsSummary(_ defaults: [MCPAgentRoleDefault]) -> String {
     defaults.map { "\($0.roleLabel.capitalized) → \($0.modelDisplayName)" }.joined(separator: " · ")
 }

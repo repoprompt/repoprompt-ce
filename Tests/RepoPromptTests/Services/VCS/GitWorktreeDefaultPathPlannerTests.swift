@@ -44,6 +44,21 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         XCTAssertEqual(plan.createRequest.appManagedContainer, expectedContainer)
         XCTAssertFalse(plan.createRequest.allowExternalPath)
         XCTAssertTrue(plan.createRequest.copyWorktreeIncludeFiles)
+        XCTAssertTrue(plan.createRequest.cloneTrackedCheckout)
+        XCTAssertFalse(plan.createRequest.copyWorktreeIncludeUntrackedFiles)
+    }
+
+    func testExplicitCloneOptOutAndUntrackedOptInPassThrough() throws {
+        let mainRoot = tempRoot.appendingPathComponent("repo", isDirectory: true)
+        let plan = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: mainRoot,
+            cloneTrackedCheckout: false,
+            copyWorktreeIncludeUntrackedFiles: true,
+            purpose: .standaloneCreate(now: Date())
+        ))
+
+        XCTAssertFalse(plan.createRequest.cloneTrackedCheckout)
+        XCTAssertTrue(plan.createRequest.copyWorktreeIncludeUntrackedFiles)
     }
 
     func testAgentStartDefaultsToAgentBranchAndReadablePathPrefix() throws {
@@ -57,6 +72,7 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
 
         XCTAssertEqual(plan.branch, "rp/agent/abcdef12-feature-long-branch-name")
         XCTAssertTrue(plan.path.lastPathComponent.hasPrefix("rp-agent-abcdef12-feature-long-branch-name"))
+        XCTAssertTrue(plan.createRequest.cloneTrackedCheckout)
     }
 
     func testSuppliedBranchIsPreservedAndIncludedInDefaultLeaf() throws {
@@ -92,6 +108,16 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         ))
         XCTAssertEqual(allowed.path, externalPath.standardizedFileURL)
         XCTAssertFalse(allowed.createRequest.copyWorktreeIncludeFiles)
+        XCTAssertTrue(allowed.createRequest.cloneTrackedCheckout)
+
+        let optedOut = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: mainRoot,
+            explicitPath: externalPath,
+            allowExternalPath: true,
+            cloneTrackedCheckout: false,
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        ))
+        XCTAssertFalse(optedOut.createRequest.cloneTrackedCheckout)
     }
 
     func testRejectsRelativeExplicitPathAndExpandsHomePath() throws {

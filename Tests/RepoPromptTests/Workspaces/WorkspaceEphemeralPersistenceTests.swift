@@ -420,7 +420,9 @@ import XCTest
             let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-creation-timeout")
             defer { Task { _ = await runtime.shutdown() } }
 
-            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            // The gate makes the first deletion time out regardless of machine load.
+            // The same coordinator must then have enough time for a real confirmed retry.
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .seconds(2))
             let manager = makeManager(
                 windowID: -764,
                 domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
@@ -450,7 +452,7 @@ import XCTest
                     closeOpenWorkspaces: true
                 )
             }
-            await fulfillment(of: [deletionFinished], timeout: 2)
+            await fulfillment(of: [deletionFinished], timeout: 4)
             await gate.open()
             let deletion = await deletionTask.value
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
@@ -470,7 +472,7 @@ import XCTest
                 workspaceIDs: [created.id],
                 closeOpenWorkspaces: true
             )
-            XCTAssertEqual(retry.deletedWorkspaceIDs, [created.id], "The timed-out claim must permit a confirmed retry")
+            XCTAssertEqual(retry.deletedWorkspaceIDs, [created.id], "The timed-out claim must permit a confirmed retry: \(retry)")
         }
 
         func testConfirmedDeleteTimeoutCannotCloseAWorkspaceAfterLateSessionCancellation() async throws {

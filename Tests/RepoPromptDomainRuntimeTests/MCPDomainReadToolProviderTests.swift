@@ -143,6 +143,44 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         XCTAssertEqual(resolutionCount, 0, "argument validation must precede unrelated routing")
     }
 
+    func testResolveFailureReturnsTypedValueWithoutExecutingBackend() async throws {
+        enum ResolutionFailure: Error {
+            case unavailable
+        }
+
+        let identity = makeIdentity()
+        let backendInvocations = InvocationRecorder()
+        let provider = MCPDomainReadToolProvider(
+            resolveContext: { _, _ in
+                throw ResolutionFailure.unavailable
+            },
+            resolveFailure: { toolName, arguments, error in
+                guard toolName == "read_file",
+                      arguments["path"]?.stringValue == "file.swift",
+                      error is ResolutionFailure
+                else { return nil }
+                return .object([
+                    "error_code": .string("workspace_authority_unavailable"),
+                    "retryable": .bool(true)
+                ])
+            },
+            backend: MCPDomainReadToolBackend { name, context, arguments, _ in
+                await backendInvocations.record(name: name, context: context, arguments: arguments)
+                return .string("unexpected")
+            },
+            sideEffects: DomainReadSideEffectCoordinator(identity: identity)
+        )
+
+        let value = try await XCTUnwrap(provider.binding(named: "read_file"))([
+            "path": .string("file.swift")
+        ])
+
+        XCTAssertEqual(value.objectValue?["error_code"]?.stringValue, "workspace_authority_unavailable")
+        XCTAssertEqual(value.objectValue?["retryable"]?.boolValue, true)
+        let invocations = await backendInvocations.snapshot()
+        XCTAssertTrue(invocations.isEmpty)
+    }
+
     private func makeIdentity() -> DomainRuntimeIdentity {
         DomainRuntimeIdentity(
             runtimeID: UUID(),

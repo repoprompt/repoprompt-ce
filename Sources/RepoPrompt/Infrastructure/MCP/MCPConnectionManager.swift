@@ -1526,6 +1526,7 @@ actor ServerNetworkManager {
 
     // 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:]
+    private var windowBindingTransactions: [UUID: (mutex: AsyncMutex, users: Int)] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
 
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
@@ -2528,26 +2529,87 @@ actor ServerNetworkManager {
     // MARK: Window-selection helpers (called from WindowRoutingService)
 
     /// ------------------------------------------------------------------
+    /// Serializes tab replacement and affinity publication per connection. A failed replacement
+    /// never publishes provisional affinity, and a later bind cannot overtake an earlier commit.
+    func withValidatedWindowBinding(
+        windowID: Int?,
+        connectionID: UUID,
+        operation: @escaping @MainActor @Sendable () async throws -> Bool
+    ) async throws -> Bool {
+        guard Self.currentConnectionID == connectionID else {
+            throw MCPError.internalError("No matching active connection context")
+        }
+        let mutex = windowBindingTransactions[connectionID]?.mutex ?? AsyncMutex()
+        windowBindingTransactions[connectionID] = (
+            mutex, (windowBindingTransactions[connectionID]?.users ?? 0) + 1
+        )
+        defer {
+            if let entry = windowBindingTransactions[connectionID], entry.users > 1 {
+                windowBindingTransactions[connectionID] = (mutex, entry.users - 1)
+            } else {
+                windowBindingTransactions.removeValue(forKey: connectionID)
+            }
+        }
+        return try await mutex.withLock { [self] in
+            try await commitValidatedWindowBinding(
+                windowID: windowID, connectionID: connectionID, operation: operation
+            )
+        }
+    }
+
+    private func commitValidatedWindowBinding(
+        windowID: Int?,
+        connectionID: UUID,
+        operation: @MainActor @Sendable () async throws -> Bool
+    ) async throws -> Bool {
+        try Task.checkCancellation()
+        guard !connectionsBeingRemoved.contains(connectionID) else {
+            throw ToolDispatchAdmissionError.connectionTerminal
+        }
+        let changed = try await operation()
+        // No failure or suspension is allowed between successful replacement and publication.
+        if let windowID {
+            setConnectionWindowMapping(connectionID, windowID: windowID, schedulePersistence: false)
+            if let clientID = clientIdentifier(forConnection: connectionID) {
+                // Persistence belongs to the same FIFO, including explicit selection and clear.
+                await updateRoutingRecordForConnection(connectionID, clientID: clientID)
+            }
+        } else {
+            clearConnectionWindowMapping(connectionID)
+            clearPersistedWindowAffinity(for: connectionID)
+        }
+        return changed
+    }
+
+    #if DEBUG
+        func debugWindowBindingMutexForTesting(connectionID: UUID) -> AsyncMutex? {
+            windowBindingTransactions[connectionID]?.mutex
+        }
+    #endif
+
     func setActiveWindowForCurrentConnection(_ windowID: Int) async throws {
         guard let connID = Self.currentConnectionID else {
             throw MCPError.internalError("No active connection context")
         }
-        setConnectionWindowMapping(connID, windowID: windowID)
+        _ = try await withValidatedWindowBinding(windowID: windowID, connectionID: connID) { false }
     }
 
     func clearActiveWindowForCurrentConnection() async throws {
         guard let connID = Self.currentConnectionID else {
             throw MCPError.internalError("No active connection context")
         }
-        clearConnectionWindowMapping(connID)
-        clearPersistedWindowAffinity(for: connID)
+        _ = try await withValidatedWindowBinding(windowID: nil, connectionID: connID) { false }
     }
 
     func selectedWindow(for connectionID: UUID) -> Int? {
         presentationWindowByConnection[connectionID]
     }
 
-    private func setConnectionWindowMapping(_ connectionID: UUID, windowID: Int) {
+    private func setConnectionWindowMapping(
+        _ connectionID: UUID,
+        windowID: Int,
+        schedulePersistence: Bool = true
+    ) {
         presentationWindowByConnection[connectionID] = windowID
         resolvedPresentationWindowByConnection[connectionID] = windowID
 
@@ -2561,8 +2623,10 @@ actor ServerNetworkManager {
             lastWindowByClientSession[storageKey, default: [:]][sessionKey] = windowID
         }
 
-        Task { [weak self] in
-            await self?.updateRoutingRecordForConnection(connectionID, clientID: clientID)
+        if schedulePersistence {
+            Task { [weak self] in
+                await self?.updateRoutingRecordForConnection(connectionID, clientID: clientID)
+            }
         }
     }
 

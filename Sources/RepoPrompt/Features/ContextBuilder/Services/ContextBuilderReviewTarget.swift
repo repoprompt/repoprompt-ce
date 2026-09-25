@@ -834,7 +834,7 @@ struct ContextBuilderReviewTargetResolver {
         let isSessionWorktreeRoot: Bool = switch lookupContext.rootScope {
         case let .sessionBoundWorkspace(_, physicalRootPaths):
             physicalRootPaths.contains(physicalRoot.standardizedFullPath)
-        case let .validatedSessionBoundWorkspace(_, physicalRoots):
+        case let .validatedSessionBoundWorkspace(_, physicalRoots, _):
             physicalRoots.contains(where: {
                 $0.id == physicalRoot.id
                     && $0.standardizedFullPath == physicalRoot.standardizedFullPath

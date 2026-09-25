@@ -3,19 +3,31 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 @MainActor
 final class MCPFileToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .files
 
     private let runtime: MCPAppToolBinder
-    private typealias Dependencies = (
+    typealias Dependencies = (
         context: MCPAppPhysicalCapabilityAdapters.Context,
         selection: MCPAppPhysicalCapabilityAdapters.Selection,
         files: MCPAppPhysicalCapabilityAdapters.Files
     )
 
     private let dependencies: Dependencies
+
+    private struct ReadAuthority {
+        let metadata: MCPServerViewModel.RequestMetadata
+        let frozen: MCPServerViewModel.FrozenFileToolAuthority
+        let dependencies: Dependencies
+        let isRunlessOneShotHint: Bool
+
+        var lookupContext: WorkspaceLookupContext {
+            frozen.lookupContext
+        }
+    }
 
     init(runtime: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
@@ -33,40 +45,149 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         args: [String: Value],
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
-        switch toolName {
-        case MCPWindowToolName.getCodeStructure:
-            try await executeGetCodeStructure(args: args, appContext: appContext)
-        case MCPWindowToolName.getFileTree:
-            try await executeGetFileTree(args: args, appContext: appContext)
-        case MCPWindowToolName.readFile:
-            try await executeReadFile(args: args, appContext: appContext, sideEffects: sideEffects)
-        case MCPWindowToolName.search:
-            try await executeFileSearchToolValue(args: args, appContext: appContext, sideEffects: sideEffects)
-        default:
-            throw MCPError.invalidParams("Unsupported file read tool: \(toolName)")
+        do {
+            let authority = try await readAuthority(appContext)
+            return switch toolName {
+            case MCPWindowToolName.getCodeStructure:
+                try await executeGetCodeStructure(args: args, authority: authority)
+            case MCPWindowToolName.getFileTree:
+                try await executeGetFileTree(args: args, authority: authority)
+            case MCPWindowToolName.readFile:
+                try await executeReadFile(args: args, authority: authority, sideEffects: sideEffects)
+            case MCPWindowToolName.search:
+                try await executeFileSearchToolValue(args: args, authority: authority, sideEffects: sideEffects)
+            default:
+                throw MCPError.invalidParams("Unsupported file read tool: \(toolName)")
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
+            return try Self.authorityFailureValue(toolName: toolName, args: args, failure: failure)
         }
     }
 
     private func readAuthority(
         _ appContext: MCPServerViewModel.DomainReadAppExecutionContext?
-    ) async -> (
-        metadata: MCPServerViewModel.RequestMetadata,
-        lookupContext: WorkspaceLookupContext
-    ) {
+    ) async throws -> ReadAuthority {
         if let appContext {
-            return (appContext.metadata, appContext.lookupContext)
+            guard let frozen = appContext.frozenFileToolAuthority else {
+                throw MCPServerViewModel.FileToolAuthorityFailure.unavailable
+            }
+            let authority = ReadAuthority(
+                metadata: appContext.metadata,
+                frozen: frozen,
+                dependencies: appContext.fileToolDependencies,
+                isRunlessOneShotHint: appContext.resolvedTabContext.isRunlessOneShotHint
+            )
+            try await validate(authority)
+            return authority
         }
         let metadata = await dependencies.context.captureRequestMetadata()
-        return await (metadata, dependencies.selection.resolveFileToolLookupContext(metadata))
+        let route = try await dependencies.context.resolveTabContextSnapshot(
+            metadata,
+            "file_tool_lookup_scope"
+        )
+        let frozen = try await dependencies.selection.requiredFileToolLookupContext(metadata)
+        return ReadAuthority(
+            metadata: metadata,
+            frozen: frozen,
+            dependencies: dependencies,
+            isRunlessOneShotHint: route.isRunlessOneShotHint
+        )
+    }
+
+    private func validate(_ authority: ReadAuthority) async throws {
+        guard let workspaceManager = authority.dependencies.context.workspaceManager else {
+            throw MCPServerViewModel.FileToolAuthorityFailure.unavailable
+        }
+        try await authority.frozen.validate(
+            workspaceManager: workspaceManager,
+            store: authority.dependencies.context.promptVM.workspaceFileContextStore
+        )
+    }
+
+    nonisolated static func authorityFailureValue(
+        toolName: String,
+        args: [String: Value],
+        failure: MCPServerViewModel.FileToolAuthorityFailure
+    ) throws -> Value {
+        let message = failure.localizedDescription
+        let retryAfter = MCPServerViewModel.FileToolAuthorityFailure.retryAfterMilliseconds
+        switch toolName {
+        case MCPWindowToolName.search:
+            return try Value(ToolResultDTOs.SearchResultDTO(
+                totalMatches: 0,
+                totalFiles: 0,
+                contentMatches: 0,
+                pathMatches: 0,
+                limitHit: false,
+                perFileCounts: [],
+                pathMatchLines: [],
+                contentMatchGroups: [],
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter,
+                suggestion: "Retry after workspace restoration settles or bind the intended context again."
+            ))
+        case MCPWindowToolName.readFile:
+            let path = args["path"]?.stringValue ?? ""
+            return try Value(ToolResultDTOs.ReadFileReply(
+                content: "",
+                totalLines: 0,
+                firstLine: 0,
+                lastLine: 0,
+                message: message,
+                displayPath: path,
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter
+            ))
+        case MCPWindowToolName.getFileTree:
+            return try Value(ToolResultDTOs.FileTreeDTO(
+                rootsCount: 0,
+                usesLegend: false,
+                tree: message,
+                note: "Workspace authority unavailable",
+                wasTruncated: false,
+                errorMessage: message,
+                errorCode: failure.errorCode,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter
+            ))
+        case MCPWindowToolName.getCodeStructure:
+            let size = args["size"]?.stringValue.flatMap(WorkspaceCodemapGraphOutputSize.init(rawValue:)) ?? .medium
+            let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
+                code: failure.errorCode,
+                phase: "workspace_authority",
+                path: nil,
+                retryable: failure.retryable,
+                retryAfterMilliseconds: retryAfter,
+                attempted: nil,
+                limit: nil,
+                message: message
+            )
+            return try Value(ToolResultDTOs.CodeStructureReplyDTO(
+                status: .unavailable,
+                size: size,
+                roots: [],
+                files: [],
+                summary: .init(seeds: 0, nodes: 0, edges: 0, files: 0, tokens: 0),
+                issues: [issue],
+                retry: .init(retryable: failure.retryable, retryAfterMilliseconds: retryAfter),
+                worktreeScope: nil
+            ))
+        default:
+            throw failure
+        }
     }
 
     private func withActiveWorktreeStartupBenchmarkTag<T>(
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        lookupContext: WorkspaceLookupContext,
         _ operation: () async throws -> T
     ) async rethrows -> T {
         #if DEBUG
-            let authority = await readAuthority(appContext)
-            let lookupContext = authority.lookupContext
             let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
                 WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
                     agentSessionID: $0
@@ -162,9 +283,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func executeGetCodeStructure(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+        authority: ReadAuthority
     ) async throws -> Value {
-        try await withActiveWorktreeStartupBenchmarkTag(appContext: appContext) {
+        let dependencies = authority.dependencies
+        return try await withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
             try await MCPToolWorkCountDiagnostics.withGitInvocation(
                 operation: MCPWindowToolName.getCodeStructure
             ) {
@@ -236,7 +358,6 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 )
 
                 await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
-                let authority = await readAuthority(appContext)
                 let metadata = authority.metadata
                 try Task.checkCancellation()
                 let lookupContext = authority.lookupContext
@@ -276,11 +397,13 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                         MCPServerViewModel.codeStructureSeedLimit(for: request)
                     )
                 } else {
-                    guard try await dependencies.files.drainReadFileAutoSelection(
-                        metadata,
-                        .canonicalSelection
-                    ) == .completed else {
-                        throw CancellationError()
+                    if !authority.isRunlessOneShotHint {
+                        guard try await dependencies.files.drainReadFileAutoSelection(
+                            metadata,
+                            .canonicalSelection
+                        ) == .completed else {
+                            throw CancellationError()
+                        }
                     }
                     files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
                         metadata,
@@ -297,6 +420,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     lookupContext
                 )
                 try Task.checkCancellation()
+                try await validate(authority)
                 return try Value(reply)
             }
         }
@@ -304,15 +428,16 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func executeGetFileTree(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+        authority: ReadAuthority
     ) async throws -> Value {
+        let dependencies = authority.dependencies
         await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution)
-        return try await withActiveWorktreeStartupBenchmarkTag(appContext: appContext) {
+        return try await withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
             let type = args["type"]?.stringValue ?? "files"
             switch type {
             case "roots":
                 let filePathDisplay = await MainActor.run { dependencies.context.promptVM.filePathDisplayOption }
-                let lookupContext = await readAuthority(appContext).lookupContext
+                let lookupContext = authority.lookupContext
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution, transition: .completed)
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait)
                 _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
@@ -325,15 +450,26 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     request: WorkspaceFileTreeSnapshotRequest(mode: .full, filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false, showCodeMapMarkers: false, rootScope: lookupContext.rootScope),
                     profile: .mcpRead
                 )
+                try await validate(authority)
                 if snapshot.roots.isEmpty {
-                    let msg = await dependencies.files.workspaceContextMessage(MCPWindowToolName.getFileTree, nil)
+                    guard authority.frozen.rootCatalogSnapshot.isGenuinelyRootless else {
+                        throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
+                    }
                     await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
-                    return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: 0, usesLegend: false, tree: msg, note: "No workspace loaded", wasTruncated: false, worktreeScope: worktreeScope))
+                    return try Value(ToolResultDTOs.FileTreeDTO(
+                        rootsCount: 0,
+                        usesLegend: false,
+                        tree: "The resolved workspace has no configured roots.",
+                        note: "No roots configured",
+                        wasTruncated: false,
+                        worktreeScope: worktreeScope
+                    ))
                 }
                 let rootLines = snapshot.roots.map { root in
                     lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: root.fullPath, display: .full) ?? root.fullPath
                 }
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
+                try await validate(authority)
                 return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
             case "files":
                 let mode = args["mode"]?.stringValue ?? "auto"
@@ -344,7 +480,6 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 } else {
                     maxDepth = nil
                 }
-                let authority = await readAuthority(appContext)
                 let metadata = authority.metadata
                 let lookupContext = authority.lookupContext
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeRequestResolution, transition: .completed)
@@ -354,13 +489,21 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeIngressWait, transition: .completed)
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction)
                 if mode.lowercased() == "selected" {
-                    guard try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                        throw CancellationError()
+                    if !authority.isRunlessOneShotHint {
+                        guard try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
+                            throw CancellationError()
+                        }
                     }
                 }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
                 let resultAndRootCount = try await dependencies.files.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
+                try await validate(authority)
+                if resultAndRootCount.emptyReason == .rootProjectionEmpty,
+                   !authority.frozen.rootCatalogSnapshot.isGenuinelyRootless
+                {
+                    throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
+                }
                 return try Value(ToolResultDTOs.FileTreeDTO(
                     rootsCount: resultAndRootCount.rootCount,
                     usesLegend: resultAndRootCount.result.usesLegend,
@@ -377,17 +520,18 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func executeReadFile(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        authority: ReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
-        try await executeReadFileBody(args: args, appContext: appContext, sideEffects: sideEffects)
+        try await executeReadFileBody(args: args, authority: authority, sideEffects: sideEffects)
     }
 
     private func executeReadFileBody(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        authority: ReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
+        let dependencies = authority.dependencies
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.readFileRequestResolution)
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
@@ -403,9 +547,6 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             let startLine1Based = startLineFromInteger ?? offsetFromInteger ?? startLineFromString ?? offsetFromString
             let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
             return (path, startLine1Based, limit)
-        }
-        let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
-            await readAuthority(appContext)
         }
         let metadata = authority.metadata
         try Task.checkCancellation()
@@ -475,22 +616,28 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
         try Task.checkCancellation()
         let autoSelectOutcome = switch readResult {
-        case .workspace: "attempted"
+        case .workspace where !authority.isRunlessOneShotHint: "attempted"
+        case .workspace: "skipped"
         case .nonSelecting: "skipped"
         }
+        try await validate(authority)
         await MCPToolExecutionHandlerPhaseContext.report(.readFileAutoSelection)
         try await EditFlowPerf.measure(
             EditFlowPerf.Stage.ReadFile.providerAutoSelect,
             EditFlowPerf.Dimensions(outcome: autoSelectOutcome)
         ) {
-            if case let .workspace(reply, absolutePhysicalPath) = readResult {
+            if case let .workspace(reply, absolutePhysicalPath) = readResult,
+               !authority.isRunlessOneShotHint
+            {
                 try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [weak self] in
                     guard let self else { throw CancellationError() }
-                    try await applyReadFileSideEffect(
+                    _ = try await applyReadFileSideEffect(
                         reply: reply,
                         requestedPath: path,
                         absolutePhysicalPath: absolutePhysicalPath,
-                        metadata: metadata
+                        metadata: metadata,
+                        authority: authority.frozen,
+                        files: dependencies.files
                     )
                 }
             }
@@ -500,6 +647,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         let projectedReply = switch readResult {
         case let .workspace(reply, _), let .nonSelecting(reply): reply
         }
+        try await validate(authority)
         let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try await MCPProviderProjectionWorker.encode(
                 projectedReply,
@@ -531,7 +679,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func executeFileSearchToolValue(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        authority: ReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
@@ -539,11 +687,12 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
         let reply = try await executeFileSearch(
             args: args,
-            appContext: appContext,
+            authority: authority,
             sideEffects: sideEffects
         )
 
         try Task.checkCancellation()
+        try await validate(authority)
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
             try Value(reply)
         }
@@ -553,9 +702,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func executeFileSearch(
         args: [String: Value],
-        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
+        authority: ReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.SearchResultDTO {
+        let dependencies = authority.dependencies
         try Task.checkCancellation()
         let rawPattern = args["pattern"]?.stringValue ?? ""
         let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -585,9 +735,6 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
-            await readAuthority(appContext)
-        }
         let metadata = authority.metadata
         try Task.checkCancellation()
         let lookupContext = EditFlowPerf.measure(
@@ -901,19 +1048,24 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             )
         )
         try Task.checkCancellation()
+        try await validate(authority)
         try await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
-            try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [weak self] in
-                guard let self else { throw CancellationError() }
-                try await applyFileSearchSideEffect(
-                    mode: mode,
-                    contextLines: contextLines,
-                    reply: reply,
-                    resolvedPhysicalPaths: autoSelectionResolvedPhysicalPaths,
-                    metadata: metadata
-                )
+            if !authority.isRunlessOneShotHint {
+                try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    _ = try await applyFileSearchSideEffect(
+                        mode: mode,
+                        contextLines: contextLines,
+                        reply: reply,
+                        resolvedPhysicalPaths: autoSelectionResolvedPhysicalPaths,
+                        metadata: metadata,
+                        authority: authority.frozen,
+                        files: dependencies.files
+                    )
+                }
             }
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
@@ -924,17 +1076,17 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
         absolutePhysicalPath: String,
-        metadata: MCPServerViewModel.RequestMetadata
-    ) async throws {
-        try await dependencies.files.enqueueReadFileAutoSelection(
+        metadata: MCPServerViewModel.RequestMetadata,
+        authority: MCPServerViewModel.FrozenFileToolAuthority,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    ) async throws -> Bool {
+        try await files.enqueueReadFileAutoSelection(
             reply,
             requestedPath,
             absolutePhysicalPath,
-            metadata
+            metadata,
+            authority
         )
-        // Historical read_file completion guaranteed queue admission, not completion of the
-        // deferred presentation mirror. Legacy consumers can now drain immediately after reply.
-        try Task.checkCancellation()
     }
 
     private func applyFileSearchSideEffect(
@@ -942,18 +1094,18 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         contextLines: Int,
         reply: ToolResultDTOs.SearchResultDTO,
         resolvedPhysicalPaths: [String],
-        metadata: MCPServerViewModel.RequestMetadata
-    ) async throws {
-        try await dependencies.files.enqueueFileSearchAutoSelection(
+        metadata: MCPServerViewModel.RequestMetadata,
+        authority: MCPServerViewModel.FrozenFileToolAuthority,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    ) async throws -> Bool {
+        try await files.enqueueFileSearchAutoSelection(
             mode,
             contextLines,
             reply,
             resolvedPhysicalPaths,
-            metadata
+            metadata,
+            authority
         )
-        // Match read_file: publish admission before reply without serializing the response on UI
-        // mirroring/metrics work.
-        try Task.checkCancellation()
     }
 
     static func searchRetryableFailureDTO(

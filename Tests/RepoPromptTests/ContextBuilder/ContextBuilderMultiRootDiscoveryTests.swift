@@ -51,7 +51,7 @@ import XCTest
                 let original = try XCTUnwrap(context.primaryRootSnapshot).roots
                 driver.streamBody = { runID in
                     let connection = try await driver.connectChild(runID: runID)
-                    try await driver.discover(using: connection)
+                    try await driver.discover(using: connection, loadUnrelatedRoot: false)
                     let before = try driver.promotedSnapshot(for: connection)
                     XCTAssertEqual(before.frozenLookupContext?.rootScope, context.lookupContext.rootScope)
                     await driver.files.unloadRootFolderPath(driver.fixture.rootPaths[1])
@@ -61,12 +61,16 @@ import XCTest
                     try await driver.files.loadFolder(at: URL(fileURLWithPath: driver.fixture.rootPaths[1]), for: driver.fixture.workspace)
                     let replacement = await driver.files.workspaceFileContextStore.primaryRootReadinessObservation(orderedPaths: Array(driver.fixture.rootPaths.prefix(2)))
                     XCTAssertNotEqual(replacement.requestedRoots[1].id, original[1].id)
-                    let read = try await connection.client.callTool(name: "read_file", arguments: ["path": .string(driver.fixture.rootPaths[1] + "/README.md")])
-                    XCTAssertEqual(read.isError, true)
+                    let read = try await connection.client.callTool(name: "read_file", arguments: [
+                        "path": .string(driver.fixture.rootPaths[1] + "/README.md"), "_rawJSON": .bool(true)
+                    ])
+                    let value = try XCTUnwrap(ContextBuilderMultiRootDiscoveryDriver.text(read).data(using: .utf8))
+                    let result = try JSONDecoder().decode(ToolResultDTOs.ReadFileReply.self, from: value)
+                    XCTAssertEqual(result.errorCode, "workspace_authority_superseded")
                     XCTAssertFalse(ContextBuilderMultiRootDiscoveryDriver.text(read).contains("REPLACEMENT_SENTINEL_MUST_NOT_LEAK"))
                     let after = try driver.promotedSnapshot(for: connection)
                     XCTAssertEqual(after.runID, runID)
-                    XCTAssertEqual(after.frozenLookupContext?.rootScope, before.frozenLookupContext?.rootScope)
+                    XCTAssertNil(after.frozenLookupContext, "Root replacement must revoke the stale file lookup scope")
                     XCTAssertEqual(context.primaryRootSnapshot?.roots, original)
                 }
                 let completion = try await driver.fixture.perform("post-stream replacement ordinary commit") {

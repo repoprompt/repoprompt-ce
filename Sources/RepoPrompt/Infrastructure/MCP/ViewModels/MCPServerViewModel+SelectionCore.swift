@@ -107,8 +107,18 @@ extension MCPServerViewModel {
 
     @MainActor
     func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
-        if let frozenLookupContext = context.frozenLookupContext {
-            return frozenLookupContext
+        if let authority = context.frozenFileToolAuthority,
+           let workspaceManager
+        {
+            do {
+                try await authority.validate(
+                    workspaceManager: workspaceManager,
+                    store: promptVM.workspaceFileContextStore
+                )
+                return authority.lookupContext
+            } catch {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
         }
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(

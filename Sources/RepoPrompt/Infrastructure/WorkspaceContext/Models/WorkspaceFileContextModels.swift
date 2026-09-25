@@ -9,7 +9,8 @@ enum WorkspaceLookupRootScope: Hashable {
     case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
     case validatedSessionBoundWorkspace(
         canonicalRoots: Set<WorkspaceRootRef>,
-        physicalRoots: Set<WorkspaceRootRef>
+        physicalRoots: Set<WorkspaceRootRef>,
+        includesGitData: Bool = false
     )
 }
 
@@ -159,6 +160,88 @@ enum WorkspaceSearchReadinessState: Equatable {
             true
         case .idle, .activating, .loadingCatalog, .buildingIndexes:
             false
+        }
+    }
+
+    /// Root-catalog completion, which happens one state earlier than search readiness:
+    /// `.buildingIndexes` already carries the catalog generation and the load failures, so
+    /// every configured root is either registered or recorded as failed by then. A consumer
+    /// that only needs root identities must not wait for search-index construction it never
+    /// reads.
+    var isRootCatalogAdmissible: Bool {
+        switch self {
+        case .buildingIndexes, .ready:
+            true
+        case let .degraded(_, _, catalogGeneration, _, _, _):
+            catalogGeneration != nil
+        case .idle, .activating, .loadingCatalog:
+            false
+        }
+    }
+}
+
+/// Which completion a readiness waiter is gated on. Two consumers wait on the same state
+/// machine for different things, so the admission rule travels with the waiter rather than
+/// being baked into the state.
+enum WorkspaceReadinessAdmission: Equatable {
+    case searchIndex
+    case rootCatalog
+
+    func admits(_ state: WorkspaceSearchReadinessState) -> Bool {
+        switch self {
+        case .searchIndex:
+            state.isSearchAdmissible
+        case .rootCatalog:
+            state.isRootCatalogAdmissible
+        }
+    }
+}
+
+/// Evidence that one workspace's configured roots are all loaded under one hydration
+/// generation.
+///
+/// Deliberately carries no `Codable`/serialization conformance: the ticket and the root
+/// identities are process-lifetime values, so a persisted copy would outlive the generation
+/// that makes it true and would reassert loaded roots that no longer exist.
+struct WorkspaceRootCatalogSnapshot: Equatable {
+    let ticket: WorkspaceSearchReadinessTicket
+    let workspaceID: UUID
+    /// Canonical, de-duplicated, workspace-declaration order.
+    let configuredRootPaths: [String]
+    /// Loaded primary roots, ordered to match `configuredRootPaths`.
+    let primaryRoots: [WorkspaceRootRef]
+
+    /// A workspace that declares no roots at all. Distinct from a workspace whose roots
+    /// have not been hydrated yet, which never produces a snapshot.
+    var isGenuinelyRootless: Bool {
+        configuredRootPaths.isEmpty && primaryRoots.isEmpty
+    }
+}
+
+/// Messages stay free of absolute root paths so a failure can be surfaced to an MCP client
+/// without leaking filesystem layout.
+enum WorkspaceRootCatalogSnapshotError: LocalizedError, Equatable {
+    case missingWorkspaceIdentity
+    case workspaceNotActive
+    case readinessUnavailable
+    case readinessTimedOut
+    case readinessSuperseded
+    case inconsistentRootProjection
+
+    var errorDescription: String? {
+        switch self {
+        case .missingWorkspaceIdentity:
+            "Workspace readiness did not identify a workspace."
+        case .workspaceNotActive:
+            "The requested workspace is not the active workspace."
+        case .readinessUnavailable:
+            "Workspace readiness is not being tracked."
+        case .readinessTimedOut:
+            "The workspace root catalog did not finish loading in time."
+        case .readinessSuperseded:
+            "Workspace hydration advanced before the root catalog could be read."
+        case .inconsistentRootProjection:
+            "The workspace's configured roots and loaded roots do not agree."
         }
     }
 }

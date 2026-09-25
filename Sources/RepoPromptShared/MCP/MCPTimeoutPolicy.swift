@@ -85,6 +85,23 @@ public enum MCPTimeoutPolicy {
     public static let workspaceReadinessWaitTimeoutSeconds = 30
     public static let workspaceReadinessWaitTimeout: Duration = .seconds(workspaceReadinessWaitTimeoutSeconds)
 
+    /// Root-catalog authority fence for a single MCP file-tool call. Shorter than
+    /// `workspaceReadinessWaitTimeout` because catalog admissibility excludes search-index
+    /// construction: this window covers only the filesystem crawl. It stays well inside
+    /// `boundedToolExecutionDeadline` so a crawl that overruns surfaces as an explicit
+    /// retryable readiness error rather than racing the tool watchdog.
+    public static let fileToolAuthorityReadinessWaitTimeoutSeconds = 5
+    public static let fileToolAuthorityReadinessWaitTimeout: Duration = .seconds(
+        fileToolAuthorityReadinessWaitTimeoutSeconds
+    )
+
+    /// Context Builder freezes roots once for an entire discovery run, so paying a longer
+    /// wait once is cheaper than failing a run that would have resolved.
+    public static let contextBuilderAuthorityReadinessWaitTimeoutSeconds = 10
+    public static let contextBuilderAuthorityReadinessWaitTimeout: Duration = .seconds(
+        contextBuilderAuthorityReadinessWaitTimeoutSeconds
+    )
+
     public static let workspaceSwitchToolExecutionDeadlineSeconds = 120
     public static let workspaceSwitchToolExecutionDeadline: Duration = .seconds(
         workspaceSwitchToolExecutionDeadlineSeconds

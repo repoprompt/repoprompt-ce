@@ -6,6 +6,62 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPReadAutoSelectionRecoveryIntegrationTests: XCTestCase {
+        func testBackgroundReadSelectionDoesNotBlockLaterDrainsOrChangeForegroundSelection() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let context = fixture.contextA
+                let server = context.window.mcpServer
+                let manager = context.window.workspaceManager
+                var endpoint: PersistentMCPTestEndpoint?
+                do {
+                    try await fixture.registerDomainWorkspace(context)
+                    try await Self.activateWorkspace(context)
+                    let caller = try await Self.makeBoundEndpoint(label: "background-reader", fixture: fixture)
+                    endpoint = caller
+                    _ = try await caller.callTool(name: MCPWindowToolName.manageSelection, arguments: ["op": "clear"])
+                    let created = await context.window.promptManager.createBackgroundComposeTab(strategy: .blank, name: "Foreground")
+                    let foreground = try XCTUnwrap(created)
+                    await context.window.promptManager.switchComposeTab(foreground.id)
+                    let foregroundSelection = Set(context.window.workspaceFilesViewModel.selectedFiles.map(\.fullPath))
+                    XCTAssertFalse(foregroundSelection.contains(context.fileURL.path))
+
+                    let read = try await caller.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": context.fileURL.path]
+                    )
+                    XCTAssertFalse(read.rawJSON.contains("\"isError\":true"), read.rawJSON)
+                    let metadata = MCPServerViewModel.RequestMetadata(
+                        connectionID: caller.connectionID, clientName: nil, windowID: context.window.windowID
+                    )
+                    let firstDrain = try await server.drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics)
+                    XCTAssertEqual(firstDrain, .completed)
+                    let identity = WorkspaceSelectionIdentity(workspaceID: context.workspaceID, tabID: context.tabID)
+                    XCTAssertTrue(try XCTUnwrap(manager.composeTab(for: identity)).selection.selectedPaths.contains(context.fileURL.path))
+                    let add = try await caller.callTool(
+                        name: MCPWindowToolName.manageSelection,
+                        arguments: ["op": "add", "paths": [context.fileURL.path]]
+                    )
+                    XCTAssertFalse(add.rawJSON.contains("\"isError\":true"), add.rawJSON)
+                    XCTAssertEqual(manager.activeWorkspace?.activeComposeTabID, foreground.id)
+                    XCTAssertEqual(Set(context.window.workspaceFilesViewModel.selectedFiles.map(\.fullPath)), foregroundSelection)
+
+                    await context.window.promptManager.switchComposeTab(context.tabID)
+                    XCTAssertTrue(context.window.workspaceFilesViewModel.selectedFiles.contains { $0.fullPath == context.fileURL.path })
+                    await Self.cleanupEndpoint(caller, manager: fixture.networkManager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if let endpoint { await Self.cleanupEndpoint(endpoint, manager: fixture.networkManager) }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testParkedMirrorConnectionRemovalPreservesSameWindowOwnerAndSelectionMutations() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(

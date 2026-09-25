@@ -627,8 +627,13 @@ struct MCPOracleToolService {
     }
 
     private func oraclePackagingLookupContext(for context: TabContextSnapshot) async throws -> WorkspaceLookupContext {
-        if let frozenLookupContext = context.frozenLookupContext {
-            return frozenLookupContext
+        if let authority = context.frozenFileToolAuthority {
+            let targetWindow = try requireTargetWindow()
+            try await authority.validate(
+                workspaceManager: targetWindow.workspaceManager,
+                store: targetWindow.promptManager.workspaceFileContextStore
+            )
+            return authority.lookupContext
         }
         return try await requiredOracleLookupContext(
             source: AgentWorkspaceLookupContextSource(

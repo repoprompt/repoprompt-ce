@@ -17,6 +17,8 @@ enum GitWorktreeDefaultPathPlanner {
         var force: Bool
         var lockReason: String?
         var allowExternalPath: Bool
+        var cloneTrackedCheckout: Bool
+        var copyWorktreeIncludeUntrackedFiles: Bool
         var purpose: Purpose
 
         init(
@@ -29,6 +31,8 @@ enum GitWorktreeDefaultPathPlanner {
             force: Bool = false,
             lockReason: String? = nil,
             allowExternalPath: Bool = false,
+            cloneTrackedCheckout: Bool = true,
+            copyWorktreeIncludeUntrackedFiles: Bool = false,
             purpose: Purpose
         ) {
             self.mainWorktreeRoot = mainWorktreeRoot
@@ -40,6 +44,8 @@ enum GitWorktreeDefaultPathPlanner {
             self.force = force
             self.lockReason = lockReason
             self.allowExternalPath = allowExternalPath
+            self.cloneTrackedCheckout = cloneTrackedCheckout
+            self.copyWorktreeIncludeUntrackedFiles = copyWorktreeIncludeUntrackedFiles
             self.purpose = purpose
         }
     }
@@ -87,7 +93,9 @@ enum GitWorktreeDefaultPathPlanner {
             appManagedContainer: container,
             mainWorktreeRoot: mainRoot,
             knownWorktreeRoots: existingRoots,
-            copyWorktreeIncludeFiles: copyWorktreeIncludeFiles
+            copyWorktreeIncludeFiles: copyWorktreeIncludeFiles,
+            copyWorktreeIncludeUntrackedFiles: request.copyWorktreeIncludeUntrackedFiles,
+            cloneTrackedCheckout: request.cloneTrackedCheckout
         )
         return Plan(path: path, branch: branch, appManagedContainer: container, createRequest: createRequest)
     }

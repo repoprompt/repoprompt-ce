@@ -122,9 +122,9 @@
             let restoredAToolsEnabled = await restoredA.mcpServer.setWindowToolsEnabled(true)
             XCTAssertTrue(restoredAToolsEnabled)
 
-            // A is restored under a different numeric ID; the same real tools/call now
-            // reaches the stable target rather than falling back to B. Roots lookup is
-            // window-scoped and needs no explicit context hint that could override affinity.
+            // A is restored under a different numeric ID; the same real tool call now
+            // reaches that window rather than falling back to B. File tools still require
+            // a bound tab context, which this routing-only fixture does not create.
             WindowStatesManager.shared.allWindows = [restoredA]
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
@@ -137,7 +137,8 @@
                 name: "get_file_tree",
                 arguments: ["type": .string("roots"), "_rawJSON": .bool(true)]
             )
-            XCTAssertNotEqual(restored.isError, true, toolText(restored))
+            XCTAssertEqual(restored.isError, true)
+            XCTAssertTrue(toolText(restored).contains("No tab context is bound for file_tool_lookup_scope"))
             let selectedAfterRestore = await manager.selectedWindow(for: connection.connectionID)
             XCTAssertEqual(selectedAfterRestore, restoredA.windowID)
             let recordsAfterRestore = await manager.debugRoutingRecordsForTesting(clientName: clientName)

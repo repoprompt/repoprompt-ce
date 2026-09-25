@@ -72,6 +72,133 @@ package struct DomainMutationPhysicalCommitGuard {
     package func revalidate() throws {
         try DomainMutationPathFence.revalidateBlocking(snapshot)
     }
+
+    /// The Git subprocess creates the admitted destination after the original fence was
+    /// recorded. Pin both directory trees by descriptor instead of revalidating the
+    /// now-intentionally-changed destination path through a pathname.
+    package func openCreatedWorktreeDirectories(
+        sourcePath: String,
+        destinationPath: String,
+        destinationDevice: UInt64,
+        destinationInode: UInt64
+    ) throws -> DomainMutationWorktreeDirectories {
+        let source = try admittedEntry(for: sourcePath)
+        let destination = try admittedEntry(for: destinationPath)
+        guard source.existingAnchor.originalPath == source.requestedPath,
+              destination.existingAnchor.originalPath != destination.requestedPath
+        else {
+            throw DomainMutationPathFenceError.pathResolutionChanged(destinationPath)
+        }
+        let sourceFD = try Self.openDirectory(for: source)
+        do {
+            let destinationFD = try Self.openDirectory(for: destination)
+            do {
+                let directories = try DomainMutationWorktreeDirectories(
+                    sourceFD: sourceFD,
+                    destinationFD: destinationFD,
+                    source: source.existingAnchor,
+                    destinationDevice: destinationDevice,
+                    destinationInode: destinationInode
+                )
+                return directories
+            } catch {
+                close(destinationFD)
+                throw error
+            }
+        } catch {
+            close(sourceFD)
+            throw error
+        }
+    }
+
+    private func admittedEntry(for path: String) throws -> DomainMutationPathFenceEntry {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard let entry = snapshot.entries.first(where: { $0.requestedPath == standardized }) else {
+            throw DomainMutationPathFenceError.pathOutsideAuthorizedRoots(path)
+        }
+        return entry
+    }
+
+    private static func openDirectory(for entry: DomainMutationPathFenceEntry) throws -> Int32 {
+        let root = entry.authorizedRoot
+        let rootFD = open(root.originalPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard rootFD >= 0 else { throw DomainMutationPathFenceError.rootUnavailable(root.originalPath) }
+        var rootStatus = stat()
+        guard fstat(rootFD, &rootStatus) == 0,
+              UInt64(rootStatus.st_dev) == root.device,
+              UInt64(rootStatus.st_ino) == root.inode
+        else {
+            close(rootFD)
+            throw DomainMutationPathFenceError.rootIdentityChanged(root.originalPath)
+        }
+        let prefix = root.resolvedPath == "/" ? "/" : root.resolvedPath + "/"
+        guard entry.resolvedPath == root.resolvedPath || entry.resolvedPath.hasPrefix(prefix) else {
+            close(rootFD)
+            throw DomainMutationPathFenceError.pathOutsideAuthorizedRoots(entry.requestedPath)
+        }
+        let relative = entry.resolvedPath == root.resolvedPath
+            ? "" : String(entry.resolvedPath.dropFirst(prefix.count))
+        var currentFD = rootFD
+        for component in relative.split(separator: "/") {
+            guard component != ".", component != ".." else {
+                close(currentFD)
+                throw DomainMutationPathFenceError.pathResolutionChanged(entry.requestedPath)
+            }
+            let nextFD = openat(currentFD, String(component), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            close(currentFD)
+            guard nextFD >= 0 else {
+                throw DomainMutationPathFenceError.pathResolutionChanged(entry.requestedPath)
+            }
+            currentFD = nextFD
+        }
+        return currentFD
+    }
+}
+
+/// Descriptor ownership is shared with a detached checkout task. All mutation below these
+/// roots uses no-follow relative traversal; a later pathname swap cannot redirect it.
+package final class DomainMutationWorktreeDirectories: @unchecked Sendable {
+    package let sourceFD: Int32
+    package let destinationFD: Int32
+    private let sourceDevice: UInt64
+    private let sourceInode: UInt64
+    private let destinationDevice: UInt64
+    private let destinationInode: UInt64
+
+    fileprivate init(
+        sourceFD: Int32,
+        destinationFD: Int32,
+        source: DomainMutationPathIdentity,
+        destinationDevice: UInt64,
+        destinationInode: UInt64
+    ) throws {
+        self.sourceFD = sourceFD
+        self.destinationFD = destinationFD
+        sourceDevice = source.device
+        sourceInode = source.inode
+        self.destinationDevice = destinationDevice
+        self.destinationInode = destinationInode
+        try revalidate()
+    }
+
+    deinit {
+        close(sourceFD)
+        close(destinationFD)
+    }
+
+    package func revalidate() throws {
+        var source = stat()
+        var destination = stat()
+        guard fstat(sourceFD, &source) == 0,
+              fstat(destinationFD, &destination) == 0,
+              UInt64(source.st_dev) == sourceDevice,
+              UInt64(source.st_ino) == sourceInode,
+              UInt64(destination.st_dev) == destinationDevice,
+              UInt64(destination.st_ino) == destinationInode
+        else {
+            throw DomainMutationPathFenceError.scopeUnavailable
+        }
+    }
 }
 
 package enum DomainMutationPathFence {

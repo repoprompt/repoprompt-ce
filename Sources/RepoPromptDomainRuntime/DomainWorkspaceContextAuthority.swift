@@ -1217,6 +1217,14 @@ actor DomainWorkspaceContextAuthority {
                 externalDocument.metadata.consolidatedIntoWorkspaceID
                 == localDocument.metadata.consolidatedIntoWorkspaceID
             else { return .recoveryPending }
+            // A stale process must not replay its whole workspace over Agent tabs (or pinned
+            // tabs) that appeared in the newer saved document. Fail closed rather than silently
+            // orphaning those sessions.
+            guard Self.protectedAgentIdentityConflict(
+                local: externalDocument,
+                external: localDocument,
+                callerClaims: []
+            ) == nil else { return .recoveryPending }
             let before = record.revisions
             let restoresCapturedDocument = record.document.contentDigest != localDocument.contentDigest
             let revisions: DomainRevisionState
@@ -1346,6 +1354,11 @@ actor DomainWorkspaceContextAuthority {
         guard record.document.contentDigest != localDocument.contentDigest else {
             return .applied
         }
+        guard Self.protectedAgentIdentityConflict(
+            local: record.document,
+            external: localDocument,
+            callerClaims: []
+        ) == nil else { return .recoveryPending }
 
         let before = record.revisions
         let nextWorking = before.workingRevision &+ 1
@@ -1455,6 +1468,11 @@ actor DomainWorkspaceContextAuthority {
                     fileMetadata: fileMetadata
                 )
             }
+            guard Self.protectedAgentIdentityConflict(
+                local: record.document,
+                external: externalDocument,
+                callerClaims: []
+            ) == nil else { return .recoveryPending }
 
             let before = record.revisions
             let next = before.workingRevision &+ 1
@@ -1998,6 +2016,19 @@ actor DomainWorkspaceContextAuthority {
                expected != record.revisions.workingRevision
             {
                 return conflictOutcome(envelope, record: record, diagnostic: "workspace_revision_mismatch")
+            }
+            if isDurableReplay,
+               let identityConflict = Self.protectedAgentIdentityConflict(
+                   local: record.document,
+                   external: document,
+                   callerClaims: []
+               )
+            {
+                return conflictOutcome(
+                    envelope,
+                    record: record,
+                    diagnostic: "durable_replay_\(identityConflict)"
+                )
             }
             let changedContextIDs = Self.changedContextIDs(from: record.document, to: document)
             if let expectedContext = envelope.expectedContextRevision {

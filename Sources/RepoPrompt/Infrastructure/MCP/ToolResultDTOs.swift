@@ -255,6 +255,10 @@ enum ToolResultDTOs {
         let note: String?
         let wasTruncated: Bool?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             rootsCount: Int,
@@ -262,7 +266,11 @@ enum ToolResultDTOs {
             tree: String,
             note: String? = nil,
             wasTruncated: Bool? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.rootsCount = rootsCount
             self.usesLegend = usesLegend
@@ -270,6 +278,10 @@ enum ToolResultDTOs {
             self.note = note
             self.wasTruncated = wasTruncated
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -279,6 +291,10 @@ enum ToolResultDTOs {
             case note
             case wasTruncated = "was_truncated"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 

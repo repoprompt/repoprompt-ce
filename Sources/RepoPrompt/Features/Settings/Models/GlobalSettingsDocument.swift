@@ -930,6 +930,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
+        var autoEffortEnabled: Bool?
         var codexMemoriesEnabled: Bool?
         var codexAppsEnabled: Bool?
         var codexPluginsEnabled: Bool?
@@ -952,6 +953,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
+            autoEffortEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
             codexAppsEnabled: Bool? = nil,
             codexPluginsEnabled: Bool? = nil,
@@ -973,6 +975,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.autoEffortEnabled = autoEffortEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
             self.codexAppsEnabled = codexAppsEnabled
             self.codexPluginsEnabled = codexPluginsEnabled

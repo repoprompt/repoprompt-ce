@@ -112,6 +112,9 @@ extension AgentModeViewModel {
                 forModelRaw: activeSession.selectedModelRaw,
                 agentKind: activeSession.selectedAgent
             )
+            if activeSession.isMCPOriginated {
+                activeSession.selectedReasoningEffortRaw = level.rawValue
+            }
         } else {
             providerBindingService.setClaudeEffortLevel(level)
         }

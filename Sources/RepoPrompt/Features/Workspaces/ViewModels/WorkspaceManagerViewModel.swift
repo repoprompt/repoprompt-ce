@@ -2476,6 +2476,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private struct WorkspaceSearchReadinessWaiter {
         let ticket: WorkspaceSearchReadinessTicket
+        let admission: WorkspaceReadinessAdmission
         let continuation: CheckedContinuation<WorkspaceSearchReadinessTicket, any Error>
         let timeoutTask: Task<Void, Never>
     }
@@ -2488,6 +2489,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceSwitchReadinessDidInvalidateHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceHydrationGenerationDidAdvanceHandlerForTesting: (@MainActor () -> Void)?
+        private var workspaceRootHydrationWillSpawnHandlerForTesting: (@MainActor (UUID) async -> Void)?
+        private var workspaceRootCatalogDidCaptureRootsHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting: (@MainActor (UUID) async -> Void)?
         private var workspaceSwitchDidFinishHandlerForTesting: (@MainActor (UUID) -> Void)?
     #endif
@@ -5046,17 +5049,47 @@ class WorkspaceManagerViewModel: ObservableObject {
         ) {
             workspaceHydrationGenerationDidAdvanceHandlerForTesting = handler
         }
+
+        /// Fires after `activeWorkspaceID` is published and before root hydration is spawned,
+        /// which is the only point where the workspace is "current" while its root catalog is
+        /// still empty. Awaitable so a test can hold that window open.
+        func setWorkspaceRootHydrationWillSpawnHandlerForTesting(
+            _ handler: (@MainActor (UUID) async -> Void)?
+        ) {
+            workspaceRootHydrationWillSpawnHandlerForTesting = handler
+        }
+
+        func setWorkspaceRootCatalogDidCaptureRootsHandlerForTesting(
+            _ handler: (@MainActor () async -> Void)?
+        ) {
+            workspaceRootCatalogDidCaptureRootsHandlerForTesting = handler
+        }
+
+        func republishReadyRootCatalogWithNextGenerationForTesting() {
+            guard case let .ready(workspaceID, _, catalogGeneration, indexedGeneration, diagnostics) = workspaceSearchReadinessState else {
+                preconditionFailure("Expected ready workspace state before advancing its test generation")
+            }
+            let generation = advanceWorkspaceHydrationGeneration()
+            workspaceSearchReadinessState = .ready(
+                workspaceID: workspaceID,
+                generation: generation,
+                catalogGeneration: catalogGeneration,
+                indexedGeneration: indexedGeneration,
+                diagnostics: diagnostics
+            )
+        }
     #endif
 
     func awaitWorkspaceSearchReadiness(
-        timeout: Duration
+        timeout: Duration,
+        admission: WorkspaceReadinessAdmission = .searchIndex
     ) async throws -> WorkspaceSearchReadinessTicket {
         try Task.checkCancellation()
         guard let ticket = workspaceSearchReadinessState.ticket else {
             throw WorkspaceSearchReadinessWaitError.unavailable
         }
-        if workspaceSearchReadinessState.isSearchAdmissible {
-            try validateWorkspaceSearchReadiness(ticket)
+        if admission.admits(workspaceSearchReadinessState) {
+            try validateWorkspaceSearchReadiness(ticket, admission: admission)
             return ticket
         }
 
@@ -5072,9 +5105,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                     continuation.resume(throwing: WorkspaceSearchReadinessWaitError.superseded)
                     return
                 }
-                if workspaceSearchReadinessState.isSearchAdmissible {
+                if admission.admits(workspaceSearchReadinessState) {
                     do {
-                        try validateWorkspaceSearchReadiness(ticket)
+                        try validateWorkspaceSearchReadiness(ticket, admission: admission)
                         continuation.resume(returning: ticket)
                     } catch {
                         continuation.resume(throwing: error)
@@ -5096,6 +5129,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
                 workspaceSearchReadinessWaiters[waiterID] = WorkspaceSearchReadinessWaiter(
                     ticket: ticket,
+                    admission: admission,
                     continuation: continuation,
                     timeoutTask: timeoutTask
                 )
@@ -5110,6 +5144,108 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    func awaitWorkspaceRootCatalogSnapshot(
+        workspaceID: UUID,
+        timeout: Duration
+    ) async throws -> WorkspaceRootCatalogSnapshot {
+        try Task.checkCancellation()
+        guard activeWorkspaceID == workspaceID,
+              activeWorkspace?.id == workspaceID
+        else {
+            throw WorkspaceRootCatalogSnapshotError.workspaceNotActive
+        }
+
+        let ticket: WorkspaceSearchReadinessTicket
+        do {
+            ticket = try await awaitWorkspaceSearchReadiness(
+                timeout: timeout,
+                admission: .rootCatalog
+            )
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            switch error {
+            case .unavailable:
+                throw WorkspaceRootCatalogSnapshotError.readinessUnavailable
+            case .timedOut:
+                throw WorkspaceRootCatalogSnapshotError.readinessTimedOut
+            case .superseded:
+                throw WorkspaceRootCatalogSnapshotError.readinessSuperseded
+            }
+        }
+        try Task.checkCancellation()
+
+        guard ticket.workspaceID == workspaceID else {
+            throw WorkspaceRootCatalogSnapshotError.missingWorkspaceIdentity
+        }
+        try validateWorkspaceRootCatalogReadiness(ticket)
+        guard let workspace = activeWorkspace,
+              workspace.id == workspaceID
+        else {
+            throw WorkspaceRootCatalogSnapshotError.workspaceNotActive
+        }
+        let configuredRootPaths = uniqueWorkspaceRootLoadRequests(
+            for: Self.loadableRepoPaths(for: workspace)
+        ).map(\.canonicalPath)
+        let primaryRootRecords = await fileManager.workspaceFileContextStore.roots()
+            .filter { $0.kind == .primaryWorkspace }
+        try Task.checkCancellation()
+        #if DEBUG
+            await workspaceRootCatalogDidCaptureRootsHandlerForTesting?()
+        #endif
+        try Task.checkCancellation()
+
+        try validateWorkspaceRootCatalogReadiness(ticket)
+        guard activeWorkspaceID == workspaceID,
+              let currentWorkspace = activeWorkspace,
+              currentWorkspace.id == workspaceID
+        else {
+            throw WorkspaceRootCatalogSnapshotError.workspaceNotActive
+        }
+        let currentConfiguredRootPaths = uniqueWorkspaceRootLoadRequests(
+            for: Self.loadableRepoPaths(for: currentWorkspace)
+        ).map(\.canonicalPath)
+        guard currentConfiguredRootPaths == configuredRootPaths else {
+            throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
+        }
+
+        var rootsByPath: [String: WorkspaceRootRecord] = [:]
+        for root in primaryRootRecords {
+            guard rootsByPath.updateValue(root, forKey: root.standardizedFullPath) == nil else {
+                throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
+            }
+        }
+        guard rootsByPath.count == configuredRootPaths.count,
+              Set(rootsByPath.keys) == Set(configuredRootPaths)
+        else {
+            throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
+        }
+
+        let orderedRoots = configuredRootPaths.compactMap { path -> WorkspaceRootRef? in
+            guard let root = rootsByPath[path] else { return nil }
+            return WorkspaceRootRef(id: root.id, name: root.name, fullPath: root.standardizedFullPath)
+        }
+        guard orderedRoots.count == configuredRootPaths.count else {
+            throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
+        }
+        try Task.checkCancellation()
+
+        return WorkspaceRootCatalogSnapshot(
+            ticket: ticket,
+            workspaceID: workspaceID,
+            configuredRootPaths: configuredRootPaths,
+            primaryRoots: orderedRoots
+        )
+    }
+
+    private func validateWorkspaceRootCatalogReadiness(
+        _ ticket: WorkspaceSearchReadinessTicket
+    ) throws {
+        do {
+            try validateWorkspaceSearchReadiness(ticket, admission: .rootCatalog)
+        } catch is WorkspaceSearchReadinessWaitError {
+            throw WorkspaceRootCatalogSnapshotError.readinessSuperseded
+        }
+    }
+
     nonisolated func validateWorkspaceSearchReadinessSnapshot(
         _ ticket: WorkspaceSearchReadinessTicket
     ) throws {
@@ -5119,9 +5255,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func validateWorkspaceSearchReadiness(
-        _ ticket: WorkspaceSearchReadinessTicket
+        _ ticket: WorkspaceSearchReadinessTicket,
+        admission: WorkspaceReadinessAdmission = .searchIndex
     ) throws {
-        guard workspaceSearchReadinessState.isSearchAdmissible,
+        guard admission.admits(workspaceSearchReadinessState),
               workspaceSearchReadinessState.ticket == ticket,
               workspaceHydrationGeneration == ticket.generation,
               activeWorkspaceID == ticket.workspaceID
@@ -5140,9 +5277,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
                 continue
             }
-            guard workspaceSearchReadinessState.isSearchAdmissible else { continue }
+            guard waiter.admission.admits(workspaceSearchReadinessState) else { continue }
             do {
-                try validateWorkspaceSearchReadiness(waiter.ticket)
+                try validateWorkspaceSearchReadiness(waiter.ticket, admission: waiter.admission)
                 succeedWorkspaceSearchReadinessWaiter(waiterID, ticket: waiter.ticket)
             } catch {
                 failWorkspaceSearchReadinessWaiter(waiterID, throwing: error)
@@ -5615,6 +5752,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         if shouldOverlapRootHydration {
             folderLoadStart = Date()
             logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
+            #if DEBUG
+                await workspaceRootHydrationWillSpawnHandlerForTesting?(activeWS.id)
+            #endif
             folderLoadTask = Task { @MainActor in
                 await loadTargetWorkspaceFolders()
             }
@@ -7810,31 +7950,42 @@ class WorkspaceManagerViewModel: ObservableObject {
         promptViewModel.tokenCountingViewModel.markDirty(.selection)
     }
 
-    /// Applies the newest stored selection after deferred `read_file` auto-selection.
+    /// Publishes canonical selection for the exact tab; only the active tab updates the file UI.
     @MainActor
     func applyStoredSelectionMirrorForReadFileAutoSelection(
-        tabID: UUID
+        for identity: WorkspaceSelectionIdentity
     ) async -> WorkspaceSelectionCoordinator.SelectionMirrorOutcome {
+        guard !Task.isCancelled else { return .cancelled }
         guard let active = activeWorkspace,
-              active.activeComposeTabID == tabID,
-              let tab = composeTab(with: tabID)
+              active.id == identity.workspaceID,
+              let tab = composeTab(for: identity)
         else { return .invalidated }
+        if active.activeComposeTabID != identity.tabID {
+            updateComposeTabSelectionPresentation(tab.selection, for: identity)
+            return .converged
+        }
+
+        let outcome: WorkspaceSelectionCoordinator.SelectionMirrorOutcome
         if let selectionCoordinator {
-            return await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
+            outcome = await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: identity.tabID)
         } else {
             await applySelectionMirrorAttempt(
                 tab.selection,
-                forTabID: tabID,
-                workspaceID: active.id
+                forTabID: identity.tabID,
+                workspaceID: identity.workspaceID
             )
-            guard !Task.isCancelled else { return .cancelled }
-            guard let current = activeWorkspace,
-                  current.id == active.id,
-                  current.activeComposeTabID == tabID,
-                  composeTab(with: tabID)?.selection == tab.selection
-            else { return .invalidated }
+            outcome = composeTab(for: identity)?.selection == tab.selection ? .converged : .invalidated
+        }
+        guard !Task.isCancelled, outcome != .cancelled else { return .cancelled }
+        guard let current = activeWorkspace,
+              current.id == identity.workspaceID,
+              let currentTab = composeTab(for: identity)
+        else { return .invalidated }
+        if current.activeComposeTabID != identity.tabID {
+            updateComposeTabSelectionPresentation(currentTab.selection, for: identity)
             return .converged
         }
+        return outcome
     }
 
     func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {

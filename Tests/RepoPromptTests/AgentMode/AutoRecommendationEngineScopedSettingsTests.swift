@@ -31,7 +31,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
     func testRecommendationSatisfactionUsesTargetEditingScope() throws {
         let fixture = try makeFixture()
         let workspaceID = UUID()
-        let recommended = AIModel.gpt54Pro.rawValue
+        let recommended = try recommendedOpenAIModelRaw(from: fixture.engine)
         let nonRecommended = AIModel.claude4Sonnet.rawValue
 
         fixture.store.setGlobalAgentModelsProfile(
@@ -91,14 +91,15 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID)),
             enabledProviders: [.openAI]
         )
+        let recommended = try XCTUnwrap(recommendations.chatModel?.openAIOption?.modelString)
         fixture.engine.applyModelRecommendations(
             recommendations,
             identity: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID))
         )
 
         let workspaceProfile = try XCTUnwrap(fixture.store.workspaceAgentModelsProfile(for: workspaceID))
-        XCTAssertEqual(workspaceProfile.planningModelRaw, AIModel.gpt54Pro.rawValue)
-        XCTAssertEqual(workspaceProfile.preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(workspaceProfile.planningModelRaw, recommended)
+        XCTAssertEqual(workspaceProfile.preferredComposeModelRaw, recommended)
         XCTAssertEqual(fixture.store.globalAgentModelsProfile(), globalProfile)
     }
 
@@ -291,6 +292,14 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             fixture.store.hasUserSetGlobalContextBuilderAgentDefaults,
             "Automatic seeding must not demote an established user-owned selection."
         )
+    }
+
+    private func recommendedOpenAIModelRaw(from engine: AutoRecommendationEngine) throws -> String {
+        let recommendations = engine.computeRecommendations(
+            for: AgentModelsOperationIdentity(sourceWorkspaceID: UUID(), scope: .global),
+            enabledProviders: [.openAI]
+        )
+        return try XCTUnwrap(recommendations.chatModel?.openAIOption?.modelString)
     }
 
     private func makeFixture() throws -> (

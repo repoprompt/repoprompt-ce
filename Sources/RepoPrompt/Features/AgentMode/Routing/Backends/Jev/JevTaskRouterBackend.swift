@@ -15,7 +15,7 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
         AgentTaskRouterBackendSettingsRegistration(
             presentation: .init(
                 title: "Jev by TypeSafe",
-                configurationDetail: "Verify a TypeSafe API key, then enable Model Router above. Key verification checks your account without sending a task. Routing chooses a model and then its effort in separate Jev decisions, each with a five-second deadline and no automatic retry.",
+                configurationDetail: "Verify a TypeSafe API key, then enable Model Router or Auto effort. Key verification checks your account without sending a task. Model Router chooses a model and then its effort; Auto effort chooses only effort for an eligible user turn. Jev decisions have a five-second deadline and no automatic retry.",
                 secretFieldLabel: "TypeSafe API key",
                 links: [
                     .init(title: "TypeSafe API documentation", url: URL(string: "https://docs.typesafe.ai/api")!),
@@ -23,6 +23,20 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
                 ]
             ),
             controller: controller
+        )
+    }
+
+    func chooseAutoEffort(
+        maskedTaskExcerpt: String,
+        selectedModelID: String,
+        builtInWorkflow: AgentWorkflow?,
+        efforts: [String]
+    ) async -> String? {
+        await JevAutoEffortJudge(credentials: credentialService).chooseEffort(
+            maskedTaskExcerpt: maskedTaskExcerpt,
+            selectedModelID: selectedModelID,
+            builtInWorkflow: builtInWorkflow,
+            efforts: efforts
         )
     }
 

@@ -1143,12 +1143,13 @@ import XCTest
                 }
                 do {
                     let clientName = "real-manage-selection-watchdog-\(UUID().uuidString)"
+                    let runID = UUID()
                     await manager.installClientConnectionPolicy(
                         for: clientName,
                         windowID: fixture.contextA.window.windowID,
                         restrictedTools: [],
                         tabID: fixture.contextA.tabID,
-                        runID: UUID(),
+                        runID: runID,
                         additionalTools: [],
                         purpose: .agentModeRun
                     )
@@ -1162,6 +1163,49 @@ import XCTest
                         ]
                     )
                     endpoint = createdEndpoint
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
+                    try await Self.activateWorkspace(for: fixture.contextA)
+                    let bindResponse = try await createdEndpoint.callTool(
+                        name: "bind_context",
+                        arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
+                    )
+                    XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
+                    let authority = try XCTUnwrap(
+                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
+                    )
+                    try server.bindTabForConnection(
+                        connectionID: createdEndpoint.connectionID,
+                        clientName: clientName,
+                        tabID: fixture.contextA.tabID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        windowID: fixture.contextA.window.windowID,
+                        runID: runID,
+                        frozenFileToolAuthority: authority
+                    )
+                    await manager.setRunPurpose(.agentModeRun, for: createdEndpoint.connectionID)
+                    await manager.debugSeedConnectionRunRouting(
+                        connectionID: createdEndpoint.connectionID,
+                        runID: runID,
+                        purpose: .agentModeRun,
+                        windowID: fixture.contextA.window.windowID
+                    )
+                    let registration = try await AppDomainRuntimeComposition.shared.runtime
+                        .routingCoordinator.currentRegistration(connectionID: createdEndpoint.connectionID)
+                    let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                        connection: registration,
+                        binding: .runScoped(
+                            runID: runID,
+                            context: .init(
+                                workspaceID: fixture.contextA.workspaceID,
+                                contextID: fixture.contextA.tabID
+                            )
+                        ),
+                        operationID: UUID()
+                    )
+                    XCTAssertTrue(
+                        routingOutcome.disposition == .applied || routingOutcome.disposition == .unchanged,
+                        routingOutcome.diagnostic ?? "Domain run routing was not established"
+                    )
                     let readTask = Task {
                         try await createdEndpoint.callTool(
                             name: MCPWindowToolName.readFile,

@@ -58,6 +58,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
             - `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.
             - `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.
+            - App-managed creation automatically attempts APFS CoW cloning for a clean, same-tree tracked checkout. `clone_tracked_checkout=false` opts out when checkout speed matters more than disk space.
+            - `copy_worktree_include_untracked_files=true` also admits non-ignored untracked matches from `.worktreeinclude`. Ignored matches remain enabled by default.
 
             **Merge safety**:
             - `preview` is non-mutating and publishes bounded artifacts by default.
@@ -91,6 +93,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     "detach": .boolean(description: "Create: create a detached worktree."),
                     "force": .boolean(description: "Create: pass --force to git worktree add."),
                     "allow_external_path": .boolean(description: "Create: allow explicit paths outside RepoPrompt's app-managed worktree container."),
+                    "clone_tracked_checkout": .boolean(description: "Create: attempt APFS CoW tracked checkout when safe. Default true for app-managed destinations; false opts out for faster Git checkout."),
+                    "copy_worktree_include_untracked_files": .boolean(description: "Create: also copy non-ignored untracked files selected by .worktreeinclude; default false."),
                     "bind": .boolean(description: "Create: bind the created worktree to a target Agent session."),
                     "label": .string(description: "Create/bind: visual label to persist for this worktree."),
                     "color": .string(description: "Create/bind: visual color as #RRGGBB."),
@@ -241,6 +245,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 detach: parseBool(args["detach"]) ?? false,
                 force: parseBool(args["force"]) ?? false,
                 allowExternalPath: parseBool(args["allow_external_path"]) ?? false,
+                cloneTrackedCheckout: parseBool(args["clone_tracked_checkout"]) ?? true,
+                copyWorktreeIncludeUntrackedFiles: parseBool(args["copy_worktree_include_untracked_files"]) ?? false,
                 purpose: .standaloneCreate(now: Date())
             )
         )
@@ -875,7 +881,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         case .show:
             ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "include_status", "include_graph", "graph_limit", "persist_visuals"]
         case .create:
-            ["op", "operation_id", "repo_root", "repo_key", "session_id", "include_status", "branch", "base_ref", "path", "detach", "force", "allow_external_path", "bind", "label", "color", "icon_name", "marker_style"]
+            ["op", "operation_id", "repo_root", "repo_key", "session_id", "include_status", "branch", "base_ref", "path", "detach", "force", "allow_external_path", "clone_tracked_checkout", "copy_worktree_include_untracked_files", "bind", "label", "color", "icon_name", "marker_style"]
         case .bind, .select:
             ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
         case .unbind:

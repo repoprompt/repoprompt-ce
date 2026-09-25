@@ -113,6 +113,8 @@ struct CodexModelSpecifier: Equatable {
         // unavailable or omits capabilities previously supported by those families.
         let supported: Set<ReasoningEffort>
         switch supportBase {
+        case "gpt-6-sol", "gpt-6-luna":
+            supported = [.max]
         case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
             supported = [.max, .ultra]
         case "gpt-5.6-luna":

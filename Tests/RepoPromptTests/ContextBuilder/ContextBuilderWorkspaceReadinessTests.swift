@@ -391,7 +391,7 @@ import XCTest
                 XCTAssertEqual(context.worktreeBindings, [binding])
                 XCTAssertEqual(context.providerWorkspacePath, fixture.rootPaths[2])
                 XCTAssertEqual(context.lookupContext.bindingProjection?.sessionID, context.parentAgentSessionID)
-                guard case let .validatedSessionBoundWorkspace(_, physicalRoots) = context.lookupContext.rootScope else {
+                guard case let .validatedSessionBoundWorkspace(_, physicalRoots, _) = context.lookupContext.rootScope else {
                     return XCTFail("Bound projection lost validated scope")
                 }
                 XCTAssertEqual(physicalRoots.map(\.standardizedFullPath), [fixture.rootPaths[2]])
@@ -709,7 +709,7 @@ import XCTest
                 let context = try await fixture.admit()
                 XCTAssertEqual(context.primaryRootSnapshot?.roots, capture.readinessObservation.requestedRoots)
                 XCTAssertEqual(context.reviewGitContext.displayContext.roots.map(\.logicalRootPath), fixture.rootPaths)
-                guard case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots) = context.lookupContext.rootScope else {
+                guard case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, _) = context.lookupContext.rootScope else {
                     return XCTFail("Admission must freeze validated root IDs, not only paths")
                 }
                 XCTAssertEqual(canonicalRoots, Set(capture.readinessObservation.requestedRoots))

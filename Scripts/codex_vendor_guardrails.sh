@@ -14,6 +14,44 @@ fail() {
 
 python3 Scripts/codex_runtime_artifact.py validate-manifest
 
+# The release artifact, runtime resolver, schema gate, and CI installer must rotate together.
+# External-runtime compatibility fixtures intentionally remain independent of this exact pin.
+python3 - <<'PYTHON' || fail "Codex bundle version pins disagree"
+import json
+import re
+import sys
+from pathlib import Path
+
+version = json.loads(Path("Vendor/Codex/manifest.json").read_text(encoding="utf-8"))["version"]
+
+def one_match(path: str, pattern: str) -> str:
+    matches = re.findall(pattern, Path(path).read_text(encoding="utf-8"))
+    if len(matches) != 1:
+        sys.exit(f"{path}: expected one exact Codex version pin, found {len(matches)}")
+    match = matches[0]
+    return ".".join(match) if isinstance(match, tuple) else match
+
+pins = {
+    "CodexRuntimeAuthority.bundledVersion": one_match(
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexRuntimeAuthority.swift",
+        r"static let bundledVersion\s*=\s*Version\(major:\s*(\d+),\s*minor:\s*(\d+),\s*patch:\s*(\d+)\)",
+    ),
+    "Scripts/codex_runtime_artifact.py": one_match(
+        "Scripts/codex_runtime_artifact.py", r'(?m)^SUPPORTED_VERSION\s*=\s*"(\d+\.\d+\.\d+)"$',
+    ),
+    "Scripts/Fixtures/codex-app-server-contract.json": json.loads(
+        Path("Scripts/Fixtures/codex-app-server-contract.json").read_text(encoding="utf-8")
+    )["minimumCodexVersion"],
+    ".github/workflows/ci.yml": one_match(
+        ".github/workflows/ci.yml", r"@openai/codex@(\d+\.\d+\.\d+)",
+    ),
+}
+for label, pinned in pins.items():
+    if pinned != version:
+        sys.exit(f"{label}: pinned {pinned}, but Codex manifest requires {version}")
+print(f"OK: Codex runtime, artifact, schema, and CI pins agree at {version}.")
+PYTHON
+
 python3 Scripts/validate_codex_update_workflow.py
 grep -F 'python3 Scripts/test_codex_update_candidate.py' Makefile >/dev/null ||
     fail "release-selftest must cover guarded Codex update candidates"
@@ -50,7 +88,8 @@ grep -F "codex-resources/zsh/bin/zsh" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled Zsh notice"
 grep -F "codex-resources/voice/" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled voice-runtime notice"
-grep -F "rust-v0.156.0" docs/releasing.md >/dev/null ||
+codex_manifest_version="$(python3 Scripts/codex_runtime_artifact.py manifest-version)"
+grep -F "rust-v${codex_manifest_version}" docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the pinned Codex release"
 grep -F 'Contents/Resources/BundledRuntimes/Codex/<target>/' docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the target-specific bundled Codex layout"

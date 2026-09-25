@@ -274,7 +274,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             description: """
             List agents, manage sessions, and browse workflows.
 
-            **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | create_session | resume_session | stop_session | cleanup_sessions | list_workflows
+            **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | create_session | resume_session | stop_session | cleanup_sessions | list_pinned_sessions | set_session_pin | reorder_pinned_sessions | list_workflows
 
             - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets. Cursor model entries also include release-catalog `model_parameters` and exact choices; `current_value` describes the catalog default, not a live session value. The catalog does not synthesize model variants. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
             - `list_sessions`: Browse sessions. Returns `session_id` for each session. Filter by MCP-facing `state` (e.g. `running`, `waiting_for_input`, `completed`, `failed`). When called from agent mode, automatically scopes to sessions spawned by the current agent session.
@@ -283,6 +283,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             - `create_session` / `resume_session`: Create or resume a session with a specific `model_id`. Cursor models may also pass exact `model_parameters` advertised by `list_agents`.
             - `stop_session`: Stop a live session.
             - `cleanup_sessions`: Delete up to 256 specific MCP-originated sessions by ID. The entire array must contain unique valid UUID strings; any non-string, invalid UUID, or duplicate rejects the request before lookup or mutation. Only sessions started via MCP are eligible; user-created sessions are never deleted. Skips active sessions. Cancellation before mutation returns the current and remaining IDs as unprocessed/retry IDs. Cancellation after mutation starts but before durable deletion reports the current ID as retryable `mutation_cancelled`, returns only later IDs as unprocessed/retry, and stops the batch. Cancellation after durable deletion keeps the current ID in `deleted_sessions` with `durable=true`, leaves it out of retry IDs, returns only later IDs as unprocessed/retry, and stops the batch. Per-ID lookup and persisted-session load failures are `resolution_failed`. Durable deletion failures preserve live UI/session state and are `delete_failed`; open-tab failures include `durable=false` and `local_cleanup_completed=false`. Missing or previously deleted IDs are `already_absent` and do not make an otherwise successful response partial. Use `list_sessions` first to find session IDs, then pass them here.
+            - `list_pinned_sessions`: Return pinned Agent-session rows in current sidebar order without resuming sessions. External administrative MCP connections only.
+            - `set_session_pin`: Pin or unpin one open or index-only Agent session by UUID without running it. External administrative MCP connections only.
+            - `reorder_pinned_sessions`: Replace the complete pinned Agent-session order. Supply the exact current `expected_session_ids` from `list_pinned_sessions` and a permutation as `session_ids`; a concurrent change rejects the request. External administrative MCP connections only.
             - `list_workflows`: Discover workflows usable with `agent_run` operations, including `orchestrate` for planning, decomposition, and sub-agent dispatch.
             """,
             annotations: .repoPromptLocalEphemeralState,
@@ -299,11 +302,14 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 **resume_session**: session_id (required), model_id?, model_parameters?
                 **stop_session**: session_id (required)
                 **cleanup_sessions**: session_ids (required, array of 1...256 session UUIDs)
+                **list_pinned_sessions**: no additional fields
+                **set_session_pin**: session_id (required), pinned (required boolean)
+                **reorder_pinned_sessions**: expected_session_ids (required, exact current order), session_ids (required, complete desired order)
 
                 Default extraction behavior: `extract_handoff` (or alias `handoff`) returns `handoff_xml` inline when `output_path` is omitted. When `output_path` is provided, XML is written to disk and omitted from the response unless `inline=true`. `output_path` must be absolute (or `~/...`); CLI shorthand resolves relative paths before calling MCP.
                 """,
                 properties: [
-                    "op": .string(description: "Operation.", enum: ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"]),
+                    "op": .string(description: "Operation.", enum: ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_pinned_sessions", "set_session_pin", "reorder_pinned_sessions", "list_workflows"]),
                     "model_id": .string(description: "[create_session, resume_session] Role label from list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from list_agents agents[].models[].model_id."),
                     "model_parameters": modelParametersSchema(operations: "create_session, resume_session"),
                     "session_id": .string(description: "[get_log, extract_handoff, resume_session, stop_session] Session UUID."),
@@ -318,7 +324,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "max_tool_args_characters": .integer(description: "[extract_handoff] Tool argument character budget; clamped to 0...20000. Default 2000."),
                     "state": .string(description: "[list_sessions] Session state filter. Use MCP-facing values such as running, waiting_for_input, completed, failed."),
                     "offset": .integer(description: "[get_log] Turn offset."),
-                    "session_ids": .array(description: "[cleanup_sessions] Array of 1...256 unique valid session UUID strings. Any non-string, invalid UUID, or duplicate rejects the entire request before lookup or mutation.", items: .string()),
+                    "session_ids": .array(description: "[cleanup_sessions, reorder_pinned_sessions] Session UUIDs. Reorder requires the complete desired pinned order.", items: .string()),
+                    "expected_session_ids": .array(description: "[reorder_pinned_sessions] Exact current pinned order returned by list_pinned_sessions.", items: .string()),
+                    "pinned": .boolean(description: "[set_session_pin] True to pin; false to unpin."),
                     "roles_only": .boolean(description: "[list_agents] When true, return only the authoritative role-label mapping (task_labels) and omit the explicit per-agent target catalog. Default false.")
                 ],
                 required: ["op"]

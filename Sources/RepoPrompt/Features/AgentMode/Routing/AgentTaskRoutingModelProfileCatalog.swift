@@ -8,7 +8,7 @@ import Foundation
 /// aliases, published evaluations, or prices change.
 enum AgentTaskRoutingModelProfileCatalog {
     static let evidenceVersion = "rpce.model-routing-evidence.2026-09-23"
-    static let rubricVersion = "rpce.automatic-utility-frontier.v1-evidence-2026-09-23"
+    static let rubricVersion = "rpce.automatic-utility-frontier.v2-evidence-2026-09-23"
 
     static func description(for target: AgentRoutingExecutableTarget) -> String {
         let modelIdentity = normalizedModelIdentity(for: target)
@@ -24,12 +24,16 @@ enum AgentTaskRoutingModelProfileCatalog {
 
     private static func profile(for modelIdentity: String) -> String {
         switch modelIdentity {
+        case "gpt-6-luna":
+            "GPT-6 Luna is OpenAI's efficient, high-volume GPT-6 tier with a 1.05M-token context window and 128K-token maximum output. API list price: $0.10 input / $0.50 output per 1M tokens."
         case "gpt-5.6-luna":
-            "GPT-5.6 Luna is the nano-tier, fastest GPT-5.6 option for cost-sensitive, high-volume work; OpenAI reports 74.6 on Artificial Analysis Coding Agent Index v1.1 and 84.7% on Terminal-Bench 2.1. API list price: $0.20 input / $1.20 output per 1M tokens."
+            "GPT-5.6 Luna is the prior nano-tier, fastest GPT-5.6 option for cost-sensitive, high-volume work; OpenAI reports 74.6 on Artificial Analysis Coding Agent Index v1.1 and 84.7% on Terminal-Bench 2.1. API list price: $0.20 input / $1.20 output per 1M tokens."
         case "gpt-5.6-terra":
             "GPT-5.6 Terra is the balanced intelligence-and-cost tier for everyday agentic work; OpenAI reports 77.4 on Artificial Analysis Coding Agent Index v1.1 and 87.4% on Terminal-Bench 2.1. API list price: $2 input / $12 output per 1M tokens."
+        case "gpt-6-sol":
+            "GPT-6 Sol is OpenAI's flagship GPT-6 tier for complex coding and agentic work, with a 1.05M-token context window and 128K-token maximum output. API list price: $2 input / $10 output per 1M tokens."
         case "gpt-5.6-sol", "gpt-5.6":
-            "GPT-5.6 Sol is the flagship tier for complex professional work; OpenAI reports 80.0 on Artificial Analysis Coding Agent Index v1.1 and 88.8% on Terminal-Bench 2.1. API list price: $4 input / $20 output per 1M tokens."
+            "GPT-5.6 Sol is the prior flagship tier for complex professional work; OpenAI reports 80.0 on Artificial Analysis Coding Agent Index v1.1 and 88.8% on Terminal-Bench 2.1. API list price: $4 input / $20 output per 1M tokens."
         case "gpt-6-astra":
             "GPT-6 Astra is OpenAI's most capable tier for the hardest end-to-end reasoning, coding, research, and computer-use work. API list price: $10 input / $50 output per 1M tokens. No directly comparable coding score is included in this snapshot."
         case "haiku", "claude-haiku-4-5", "claude-haiku-4-5-20251001":

@@ -207,8 +207,14 @@ struct AgentManageMCPToolService {
             return try await executeStopSession(args: args)
         case "cleanup_sessions":
             return try await executeCleanupSessions(args: args)
+        case "list_pinned_sessions":
+            return try await executeListPinnedSessions()
+        case "set_session_pin":
+            return try await executeSetSessionPin(args: args)
+        case "reorder_pinned_sessions":
+            return try await executeReorderPinnedSessions(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
+            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, list_pinned_sessions, set_session_pin, reorder_pinned_sessions, or list_workflows.")
         }
     }
 
@@ -448,6 +454,145 @@ struct AgentManageMCPToolService {
         return .object([
             "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
         ])
+    }
+
+    /// Sidebar pin state is workspace-wide UI state, not a child-session control capability.
+    /// A model-run connection cannot mutate or enumerate another user's pinned rows.
+    private func requireAdministrativePinCaller(targetWindow: WindowState) async throws {
+        let metadata = await captureRequestMetadata()
+        guard await operationCaller(metadata: metadata, targetWindow: targetWindow) == .administrativePrincipal else {
+            throw MCPError.invalidParams("Session pin management requires an external administrative MCP connection.")
+        }
+    }
+
+    private func pinnedSessionRows(
+        targetWindow: WindowState,
+        workspace: WorkspaceModel
+    ) -> [AgentModeViewModel.SidebarSession] {
+        targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+            .filter { $0.isPinned && $0.sessionID != nil }
+    }
+
+    private func executeListPinnedSessions() async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.list_pinned_sessions.")
+        }
+        let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(rows.compactMap { $0.sessionID.map { .string($0.uuidString) } }),
+            "sessions": .array(rows.compactMap { row in
+                guard let sessionID = row.sessionID else { return nil }
+                return .object([
+                    "session_id": .string(sessionID.uuidString),
+                    "tab_id": .string(row.tabID.uuidString),
+                    "name": .string(row.title),
+                    "pinned_order": tabsByID[row.tabID]?.pinnedOrder.map(Value.int) ?? .null
+                ])
+            })
+        ])
+    }
+
+    private func executeSetSessionPin(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let reference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        guard let sessionID = UUID(uuidString: reference),
+              let workspace = targetWindow.workspaceManager.activeWorkspace,
+              let row = targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+              .first(where: { $0.sessionID == sessionID })
+        else {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        guard let requested = args["pinned"] else {
+            throw MCPError.invalidParams("pinned is required.")
+        }
+        let pinned = try parseBool(requested, name: "pinned", defaultValue: false)
+        let report = targetWindow.promptManager.setComposeTabsPinned(
+            pinned,
+            for: [row.tabID],
+            isMutationContextCurrent: { targetWindow.workspaceManager.activeWorkspaceID == workspace.id }
+        )
+        guard !report.contextRejected else {
+            throw MCPError.invalidParams("The active workspace or session changed before pinning.")
+        }
+        return .object([
+            "session_id": .string(sessionID.uuidString),
+            "pinned": .bool(pinned),
+            "changed": .bool(!report.updatedTabIDs.isEmpty)
+        ])
+    }
+
+    /// Full-list compare-and-swap prevents a second MCP writer from silently displacing pins.
+    /// All validation and the workspace mutation run on the MainActor without suspension.
+    private func executeReorderPinnedSessions(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let expectedIDs = try parseSessionIDs(args["expected_session_ids"], name: "expected_session_ids")
+        let desiredIDs = try parseSessionIDs(args["session_ids"], name: "session_ids")
+        guard Set(expectedIDs) == Set(desiredIDs) else {
+            throw MCPError.invalidParams("session_ids must contain exactly the expected pinned sessions.")
+        }
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.reorder_pinned_sessions.")
+        }
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        let currentIDs = rows.compactMap(\.sessionID)
+        guard currentIDs == expectedIDs else {
+            throw MCPError.invalidParams("Pinned session order changed; call list_pinned_sessions and retry with its current order.")
+        }
+        let tabIDBySessionID = Dictionary(rows.compactMap { row in
+            row.sessionID.map { ($0, row.tabID) }
+        }, uniquingKeysWith: { first, _ in first })
+        guard tabIDBySessionID.count == rows.count else {
+            throw MCPError.invalidParams("Pinned sessions contain duplicate identities.")
+        }
+        let orderedTabIDs = desiredIDs.compactMap { tabIDBySessionID[$0] }
+        guard orderedTabIDs.count == desiredIDs.count else {
+            throw MCPError.invalidParams("The pinned session set changed before reordering.")
+        }
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let previewTabs = workspace.composeTabs.map { tab -> ComposeTabState in
+            var preview = tab
+            if let rank = rankByTabID[tab.id] {
+                preview.pinnedOrder = rank
+            }
+            return preview
+        }
+        let projectedIDs = targetWindow.agentModeViewModel.sidebarSessions(for: previewTabs)
+            .filter(\.isPinned)
+            .compactMap(\.sessionID)
+        guard projectedIDs == desiredIDs else {
+            throw MCPError.invalidParams("Thread grouping prevents the requested pinned order from being displayed.")
+        }
+        guard targetWindow.promptManager.setPinnedComposeTabOrder(orderedTabIDs, workspaceID: workspace.id) else {
+            throw MCPError.invalidParams("The active workspace or pinned sessions changed before reordering.")
+        }
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(desiredIDs.map { .string($0.uuidString) })
+        ])
+    }
+
+    private func parseSessionIDs(_ value: Value?, name: String) throws -> [UUID] {
+        guard let values = value?.arrayValue else {
+            throw MCPError.invalidParams("\(name) must be an array of session UUIDs.")
+        }
+        var ids: [UUID] = []
+        var seen = Set<UUID>()
+        for item in values {
+            guard let raw = item.stringValue,
+                  let id = UUID(uuidString: raw),
+                  seen.insert(id).inserted
+            else {
+                throw MCPError.invalidParams("\(name) must contain unique session UUIDs.")
+            }
+            ids.append(id)
+        }
+        return ids
     }
 
     private func executeGetLog(args: [String: Value]) async throws -> Value {

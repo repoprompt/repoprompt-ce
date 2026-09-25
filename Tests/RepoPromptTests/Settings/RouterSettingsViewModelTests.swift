@@ -67,6 +67,40 @@ final class RouterSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.backendOperationFeedback, .failed("Authentication failed."))
     }
 
+    func testSuccessfulStoredSecretRemovalDisablesRouter() async throws {
+        let controller = SettingsTestController(result: .succeeded("Stored key removed."))
+        let fixture = try makeFixture(settingsController: controller)
+        fixture.store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+            providers: [.claudeCode, .codexExec]
+        )
+        await fixture.viewModel.refresh()
+
+        let succeeded = await fixture.viewModel.performBackendAction(.removeStoredSecret)
+
+        XCTAssertTrue(succeeded)
+        XCTAssertFalse(fixture.store.modelRouterConfiguration().enabled)
+        XCTAssertFalse(fixture.viewModel.configuration.enabled)
+    }
+
+    func testFailedStoredSecretRemovalPreservesRouterEnablementIntent() async throws {
+        let controller = SettingsTestController(result: .failed("Removal failed."))
+        let fixture = try makeFixture(settingsController: controller)
+        fixture.store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+            providers: [.claudeCode, .codexExec]
+        )
+        await fixture.viewModel.refresh()
+
+        let succeeded = await fixture.viewModel.performBackendAction(.removeStoredSecret)
+
+        XCTAssertFalse(succeeded)
+        XCTAssertTrue(fixture.store.modelRouterConfiguration().enabled)
+        XCTAssertTrue(fixture.viewModel.configuration.enabled)
+    }
+
     func testUnavailableSettingsControllerClearsBackendOperationProgress() async throws {
         let fixture = try makeFixture()
         await fixture.viewModel.refresh()
@@ -93,7 +127,7 @@ final class RouterSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.providerLimit(for: .subagent), .claudeCode)
     }
 
-    func testCompletedProviderValidationWithNoAuthenticatedTargetsDisablesRouter() async throws {
+    func testCompletedProviderValidationWithNoAuthenticatedTargetsPreservesEnablementIntent() async throws {
         let fixture = try makeFixture(
             availability: .none,
             verifiedProviders: []
@@ -106,8 +140,8 @@ final class RouterSettingsViewModelTests: XCTestCase {
 
         await fixture.viewModel.refresh()
 
-        XCTAssertFalse(fixture.store.modelRouterConfiguration().enabled)
-        XCTAssertFalse(fixture.viewModel.configuration.enabled)
+        XCTAssertTrue(fixture.store.modelRouterConfiguration().enabled)
+        XCTAssertTrue(fixture.viewModel.configuration.enabled)
         XCTAssertFalse(fixture.viewModel.canEnable)
     }
 

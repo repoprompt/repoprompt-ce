@@ -8280,7 +8280,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 return visibleRootFolders.contains(where: { $0.id == root.id })
                     && canonicalRootPaths.contains(root.standardizedFullPath)
             }
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, includesGitData):
             guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
                 canonicalRoots: canonicalRoots,
                 physicalRoots: physicalRoots
@@ -8288,6 +8288,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             return rootFolders.filter { root in
                 selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
                     || selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || (
+                        includesGitData && !canonicalRoots.isEmpty && physicalRoots.isEmpty
+                            && gitDataRootFolders().contains { $0.id == root.id }
+                    )
             }
         }
     }

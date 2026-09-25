@@ -86,6 +86,10 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+        runtime.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         apiSettingsViewModel.$agentAvailability
             .removeDuplicates()
             .receive(on: RunLoop.main)
@@ -114,6 +118,14 @@ final class RouterSettingsViewModel: ObservableObject {
 
     var canEnable: Bool {
         readiness.isReady && policyCanBuildCandidates
+    }
+
+    var autoEffortEnabled: Bool {
+        settingsStore.autoEffortEnabled()
+    }
+
+    var canEnableAutoEffort: Bool {
+        runtime.isBackendReady(.jev)
     }
 
     var availableProviders: Set<AgentProviderKind> {
@@ -189,6 +201,12 @@ final class RouterSettingsViewModel: ObservableObject {
         scheduleRefresh()
     }
 
+    func setAutoEffortEnabled(_ enabled: Bool) {
+        guard !enabled || canEnableAutoEffort else { return }
+        settingsStore.setAutoEffortEnabled(enabled)
+        objectWillChange.send()
+    }
+
     @discardableResult
     func performBackendAction(_ action: AgentTaskRouterBackendSettingsAction) async -> Bool {
         guard !isPerformingBackendOperation,
@@ -215,7 +233,13 @@ final class RouterSettingsViewModel: ObservableObject {
         case let .missingSecret(message), let .superseded(message), let .failed(message): .failed(message)
         }
         await refresh()
-        if case .succeeded = result { return true }
+        if case .succeeded = result {
+            if case .removeStoredSecret = action {
+                settingsStore.setModelRouterEnabled(false)
+                synchronizeConfiguration()
+            }
+            return true
+        }
         return false
     }
 
@@ -295,13 +319,6 @@ final class RouterSettingsViewModel: ObservableObject {
                     guard self?.observedBackendID == registration.id,
                           self?.settingsStore.modelRouterConfiguration().selectedBackendID == registration.id else { return }
                     self?.readiness = snapshot
-                    if case let .needsConfiguration(generation, _) = snapshot,
-                       generation > 0,
-                       self?.settingsStore.modelRouterConfiguration().enabled == true
-                    {
-                        self?.settingsStore.setModelRouterEnabled(false)
-                        self?.synchronizeConfiguration()
-                    }
                 }
             }
         }
@@ -341,14 +358,6 @@ final class RouterSettingsViewModel: ObservableObject {
             )
         }
         policyCanBuildCandidates = !targetPreviews.isEmpty
-        if configuration.enabled,
-           apiSettingsViewModel.isContextBuilderProviderValidationComplete,
-           readiness.isReady,
-           !policyCanBuildCandidates
-        {
-            settingsStore.setModelRouterEnabled(false)
-            configuration = settingsStore.modelRouterConfiguration()
-        }
     }
 
     static func effectiveRoles(

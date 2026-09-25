@@ -128,6 +128,52 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
     }
 
+    func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
+        let task = "Investigate the parser. password=openingSecret "
+            + String(repeating: "irrelevant middle ", count: 300)
+            + " Finally, verify the fix. token=endingSecret"
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertEqual(excerpt, AgentTaskRoutingTaskExcerpt.make(from: task))
+        XCTAssertTrue(excerpt.contains("Investigate the parser"))
+        XCTAssertTrue(excerpt.contains("verify the fix"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertFalse(excerpt.contains("openingSecret"))
+        XCTAssertFalse(excerpt.contains("endingSecret"))
+        XCTAssertLessThanOrEqual(excerpt.count, AgentTaskRoutingEnvelopeBuilder.maximumCharacters)
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+    }
+
+    func testLongRoutingExcerptOmitsUnsafeCutSegmentsButStillProvidesJevInput() {
+        let task = "```\nprivate text\n" + String(repeating: "secret", count: 1000)
+            + "\n```\nPlease inspect the result."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertFalse(excerpt.contains("private text"))
+        XCTAssertFalse(excerpt.contains("secret"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: excerpt, candidates: [descriptor("a"), descriptor("b")]
+        ))
+    }
+
+    func testShortRoutingTaskRemainsExact() {
+        XCTAssertEqual(AgentTaskRoutingTaskExcerpt.make(from: "  Implement a parser  "), "Implement a parser")
+    }
+
+    func testLongRoutingExcerptRespectsUTF8Limit() {
+        let task = "Review Unicode handling. " + String(repeating: "✈️ ", count: 3000)
+            + " Finally, add tests."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertTrue(excerpt.contains("add tests"))
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+    }
+
     func testExecutableIdentityIncludesEffortAndNormalizedACPParameters() {
         let low = AgentRoutingExecutableTarget(
             agentRaw: "grokBuild", modelRaw: "grok", reasoningEffortRaw: "low", modelParameters: []
@@ -562,6 +608,42 @@ private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
 
 @MainActor
 final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
+    private static let advertisedCodexOptions = [
+        modelOption("gpt-5.6-luna-low", "GPT-5.6 Luna Low"),
+        modelOption("gpt-5.6-terra-medium", "GPT-5.6 Terra Medium"),
+        modelOption("gpt-5.6-sol-high", "GPT-5.6 Sol High"),
+        modelOption("gpt-6-luna-low", "GPT-6 Luna Low"),
+        modelOption("gpt-6-sol-medium", "GPT-6 Sol Medium"),
+        modelOption("gpt-6-sol-high", "GPT-6 Sol High")
+    ]
+
+    private static let advertisedClaudeOptions = [
+        modelOption("claude-haiku-4-5", "Claude Haiku 4.5"),
+        modelOption("claude-sonnet-5", "Claude Sonnet 5"),
+        modelOption("opus", "Claude Opus"),
+        modelOption("claude-opus-5-5", "Claude Opus 5.5"),
+        modelOption("claude-fable-5-1", "Claude Fable 5.1")
+    ]
+
+    private static func modelOption(_ raw: String, _ name: String) -> AgentModelOption {
+        AgentModelOption(rawValue: raw, displayName: name, description: nil, isDefault: false)
+    }
+
+    private func candidateBuilder(
+        codexOptions: [AgentModelOption]? = nil,
+        claudeOptions: [AgentModelOption]? = nil
+    ) -> AgentTaskRoutingCandidateBuilder {
+        let codexOptions = codexOptions ?? Self.advertisedCodexOptions
+        let claudeOptions = claudeOptions ?? Self.advertisedClaudeOptions
+        return AgentTaskRoutingCandidateBuilder { provider, _ in
+            switch provider {
+            case .codexExec: codexOptions
+            case .claudeCode: claudeOptions
+            default: []
+            }
+        }
+    }
+
     func testModelCandidatesIncludeAuditedCapabilityAndPricingWithoutPreselectedEffort() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
@@ -569,20 +651,20 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             openCodeAvailable: false
         )
 
-        let candidates = try AgentTaskRoutingCandidateBuilder(opaqueKey: { UUID().uuidString }).build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability
         )
 
         let lunaCandidate = try XCTUnwrap(candidates.first(where: {
-            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == "gpt-5.6-luna"
+            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == "gpt-6-luna"
         }))
-        XCTAssertEqual(lunaCandidate.utilityTier, "gpt-5.6-luna")
-        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("nano-tier"))
-        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.20 input / $1.20 output"))
+        XCTAssertEqual(lunaCandidate.utilityTier, "gpt-6-luna")
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("efficient, high-volume"))
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.10 input / $0.50 output"))
         XCTAssertNil(lunaCandidate.target.reasoningEffortRaw)
         XCTAssertFalse(lunaCandidate.descriptor.targetDescription.contains("Effort:"))
-        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, "rpce.automatic-utility-frontier.v1-evidence-2026-09-23")
+        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, AgentTaskRoutingModelProfileCatalog.rubricVersion)
 
         let fableCandidate = try XCTUnwrap(candidates.first(where: {
             ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
@@ -600,6 +682,41 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("$4 input / $20 output"))
     }
 
+    func testClaudeOpusAliasIsFallbackWhenPinned55IsUnavailable() throws {
+        let claudeOptions = Self.advertisedClaudeOptions.filter {
+            $0.rawValue != AgentModel.claudeOpus55.rawValue
+        }
+        let candidates = try candidateBuilder(claudeOptions: claudeOptions).build(
+            allowedProviders: [.claudeCode],
+            availability: .init(claudeCodeAvailable: true, codexAvailable: false, openCodeAvailable: false)
+        )
+
+        let opusCandidate = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-opus" })
+        XCTAssertEqual(opusCandidate.target.modelRaw, "opus")
+    }
+
+    func testGPT6EffortAndAgentModelResolution() {
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-6-sol-max").reasoningEffort, .max)
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-6-sol-xhigh").reasoningEffort, .xhigh)
+        XCTAssertNil(CodexModelSpecifier(raw: "gpt-6-sol-ultra").reasoningEffort)
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-sol-max", agentKind: .codexExec), .gpt6SolMax)
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-luna-low", agentKind: .codexExec), .gpt6LunaLow)
+    }
+
+    func testApprovedCodexFamilySelectionTracksNewestAdvertisedVersionOnly() throws {
+        let options = [
+            AgentModelOption(rawValue: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol High", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "gpt-6-sol-high", displayName: "GPT-6 Sol High", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "gpt-7-sol-high", displayName: "GPT-7 Sol High", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "gpt-99-nova-high", displayName: "GPT-99 Nova High", description: nil, isDefault: false)
+        ]
+
+        let selected = try XCTUnwrap(AgentModelCatalog.preferredCodexFamilyOption("sol", from: options))
+
+        XCTAssertEqual(CodexModelSpecifier(raw: selected.rawValue).baseModel, "gpt-7-sol")
+        XCTAssertNil(AgentModelCatalog.preferredCodexFamilyOption("nova", from: Array(options.prefix(3))))
+    }
+
     func testAutomaticModelCandidatesCoverAvailableBaseModelsWithoutTierDefaults() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
@@ -607,13 +724,13 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             openCodeAvailable: false
         )
 
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability
         )
 
         XCTAssertTrue(Set(candidates.map(\.utilityTier)).isSuperset(of: [
-            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"
+            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol"
         ]))
         XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [
             AgentProviderKind.claudeCode.rawValue,
@@ -630,11 +747,11 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let builder = AgentTaskRoutingCandidateBuilder()
+        let builder = candidateBuilder()
         let model = try XCTUnwrap(builder.build(
             allowedProviders: [.codexExec],
             availability: availability
-        ).first(where: { $0.target.modelRaw == "gpt-5.6-sol" }))
+        ).first(where: { $0.target.modelRaw == "gpt-6-sol" }))
 
         let efforts = try builder.buildEfforts(for: model, availability: availability)
 
@@ -651,24 +768,39 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability,
             roleDefaults: [
                 .init(
                     roleLabel: "Engineer",
                     provider: .codexExec,
-                    modelRaw: "gpt-5.6-sol-high",
+                    modelRaw: "gpt-6-sol-high",
                     isUserOverride: true
                 )
             ]
         )
 
         XCTAssertGreaterThan(candidates.count, 1)
-        let sol = try XCTUnwrap(candidates.first(where: { $0.target.modelRaw == "gpt-5.6-sol" }))
+        let sol = try XCTUnwrap(candidates.first(where: { $0.target.modelRaw == "gpt-6-sol" }))
         XCTAssertTrue(sol.descriptor.targetDescription.contains("Engineer (user-set)"))
         XCTAssertTrue(sol.descriptor.targetDescription.contains("not constraints or automatic choices"))
         XCTAssertTrue(candidates.contains { $0.target.modelRaw == "gpt-5.6-terra" })
+    }
+
+    func testCodexCandidatesFallBackToGPT56BeforeDiscovery() throws {
+        let codexOptions = Self.advertisedCodexOptions.filter {
+            !$0.rawValue.hasPrefix("gpt-6-")
+        }
+        let candidates = try candidateBuilder(codexOptions: codexOptions).build(
+            allowedProviders: [.codexExec],
+            availability: .init(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
+        )
+
+        XCTAssertEqual(Set(candidates.map(\.target.modelRaw)), [
+            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"
+        ])
+        XCTAssertFalse(candidates.contains { $0.target.modelRaw.hasPrefix("gpt-6-") })
     }
 
     func testUnknownModelEvidenceMakesCapabilityAndCostUncertaintyExplicit() {
@@ -691,7 +823,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode],
             availability: availability
         )

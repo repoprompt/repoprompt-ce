@@ -21,9 +21,9 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.156.0**.
-- Local validation accepts 0.156.0 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.156.0`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.156.1**.
+- Local validation accepts 0.156.1 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.156.1`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
 This schema baseline and exact CI pin are distinct from
@@ -65,7 +65,7 @@ hook-key → `{trusted_hash}` object shape cannot be expressed by the current ch
 After a trust write, the post-write `hooks/list` result is the semantic success authority;
 `config/batchWrite.status` alone is not.
 
-The hardened 0.156.0 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
+The hardened 0.156.1 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -86,7 +86,7 @@ differences:
    eligibility, but resume config does not reconcile an existing stored thread's persisted mode. RPCE
    therefore calls experimental `thread/memoryMode/set` with `enabled` or `disabled` before
    `thread/resume` so resumed startup observes the requested mode. It does not issue a redundant
-   post-start request. The 0.156.0 runtime floor and `experimentalApi` initialization capability make
+   post-start request. The 0.156.1 schema floor and `experimentalApi` initialization capability make
    resume reconciliation a required contract rather than an optional compatibility fallback.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
@@ -182,6 +182,19 @@ Upstream `LICENSE` and `NOTICE` remain byte-identical to the previous copies. Th
 runtime ships its own notice, source provenance, and licences for GStreamer, GLib, Opus,
 PCRE2/SLJIT, libffi, proxy-libintl, and zlib; exact copies are included in the flat Codex
 legal inventory and covered by its `SHA256SUMS`.
+
+## 0.156.1 patch rotation findings (2026-09-23)
+
+The official `rust-v0.156.1` macOS packages preserve the 52-entry layout, 30-Mach-O
+inventory, signing identities, and closed-world entitlement profile of 0.156.0.
+The bounded experimental app-server projection remains unchanged at 45 methods,
+193 parameter paths, and 93 response paths. The exact schema/CI pin advances to
+0.156.1; the separately proven external-runtime compatibility floor remains 0.149.0.
+
+Upstream `LICENSE` and `NOTICE` and the packaged voice notice, source manifest, and
+licences are byte-identical to 0.156.0. The patch release adds GPT-6 Sol and Luna to
+Codex's model catalog; model availability remains runtime-discovered rather than
+hard-coded by RepoPrompt.
 
 ## Files and tests
 

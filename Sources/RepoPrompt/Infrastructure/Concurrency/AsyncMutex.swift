@@ -47,6 +47,9 @@ actor AsyncMutex {
                     return
                 }
                 waiters.append((id: waiterID, continuation: continuation))
+                #if DEBUG
+                    didEnqueueWaiterForTesting?()
+                #endif
             }
         } onCancel: { [weak self] in
             Task { await self?.removeCancelledWaiter(waiterID) }
@@ -72,6 +75,12 @@ actor AsyncMutex {
     }
 
     #if DEBUG
+        private var didEnqueueWaiterForTesting: (@Sendable () -> Void)?
+
+        func setDidEnqueueWaiterForTesting(_ action: (@Sendable () -> Void)?) {
+            didEnqueueWaiterForTesting = action
+        }
+
         private var willResumeNextWaiterForTesting: (@Sendable () -> Void)?
 
         var queuedWaiterCountForTesting: Int {

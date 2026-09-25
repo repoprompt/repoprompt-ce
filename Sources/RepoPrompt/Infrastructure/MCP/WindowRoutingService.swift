@@ -206,6 +206,10 @@ public struct BindContextResponse: Codable, Sendable {
     public let createdWorkspace: Bool?
     public let normalizedWorkingDirs: [String]?
     public let note: String?
+    public let error: String?
+    public let errorCode: String?
+    public let retryable: Bool?
+    public let retryAfterMilliseconds: Int?
 
     private enum CodingKeys: String, CodingKey {
         case windows
@@ -217,6 +221,10 @@ public struct BindContextResponse: Codable, Sendable {
         case createdWorkspace = "created_workspace"
         case normalizedWorkingDirs = "normalized_working_dirs"
         case note
+        case error
+        case errorCode = "error_code"
+        case retryable
+        case retryAfterMilliseconds = "retry_after_ms"
     }
 
     public init(
@@ -228,7 +236,11 @@ public struct BindContextResponse: Codable, Sendable {
         createdTab: Bool? = nil,
         createdWorkspace: Bool? = nil,
         normalizedWorkingDirs: [String]? = nil,
-        note: String? = nil
+        note: String? = nil,
+        error: String? = nil,
+        errorCode: String? = nil,
+        retryable: Bool? = nil,
+        retryAfterMilliseconds: Int? = nil
     ) {
         self.windows = windows
         self.binding = binding
@@ -239,6 +251,10 @@ public struct BindContextResponse: Codable, Sendable {
         self.createdWorkspace = createdWorkspace
         self.normalizedWorkingDirs = normalizedWorkingDirs
         self.note = note
+        self.error = error
+        self.errorCode = errorCode
+        self.retryable = retryable
+        self.retryAfterMilliseconds = retryAfterMilliseconds
     }
 }
 
@@ -325,6 +341,7 @@ final class WindowRoutingService: Service {
     // ---------------------------------------------------------------------
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
+    private let setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)?
 
     /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
     /// filtering and window selection are applied from live state outside this cache.
@@ -337,10 +354,12 @@ final class WindowRoutingService: Service {
     /// ---------------------------------------------------------------------
     init(
         windowStates: WindowStatesManager,
-        networkMgr: ServerNetworkManager
+        networkMgr: ServerNetworkManager,
+        setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)? = nil
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
+        self.setActiveWindowForCurrentConnection = setActiveWindowForCurrentConnection
     }
 
     /// Materializes the static M1 routing definitions without publishing them.
@@ -720,6 +739,11 @@ final class WindowRoutingService: Service {
         let matchedBy: String
         let createdTab: Bool
         let normalizedWorkingDirs: [String]?
+    }
+
+    private enum BindTargetCurrentness {
+        case exactContext
+        case activeTab
     }
 
     private struct WorkingDirsBindResolution {
@@ -1868,37 +1892,68 @@ final class WindowRoutingService: Service {
         _ target: ResolvedBindTarget,
         connectionID: UUID,
         clientName: String?,
-        expectedWorkingDirsResolution: MCPServerViewModel.ProspectiveFileToolLookupResolution? = nil,
-        bindingAlreadyMatches: Bool = false
-    ) async throws {
+        expectedFileAuthority: MCPServerViewModel.FrozenFileToolAuthority? = nil,
+        currentness: BindTargetCurrentness = .activeTab
+    ) async throws -> Bool {
         guard let targetWindow = windowStates.allWindows.first(where: { $0.windowID == target.windowID }) else {
             throw MCPError.invalidParams("Window \(target.windowID) not found")
         }
-        if let expectedWorkingDirsResolution {
-            let currentTarget = try? resolveActiveTabBindTarget(
-                windowID: target.windowID,
-                expectedWorkspaceID: target.workspaceID,
-                matchedBy: target.matchedBy,
-                normalizedWorkingDirs: target.normalizedWorkingDirs
-            )
-            guard currentTarget?.tabID == target.tabID else {
-                throw staleWorkingDirsTargetError()
-            }
-            let didBind = try await targetWindow.mcpServer.performIfProspectiveFileToolLookupResolutionIsCurrent(
-                expectedWorkingDirsResolution,
-                tabID: target.tabID,
-                workspaceID: target.workspaceID
-            ) {
-                let commitTarget = try? resolveActiveTabBindTarget(
-                    windowID: target.windowID,
-                    expectedWorkspaceID: target.workspaceID,
-                    matchedBy: target.matchedBy,
-                    normalizedWorkingDirs: target.normalizedWorkingDirs
-                )
-                guard commitTarget?.tabID == target.tabID else {
-                    throw staleWorkingDirsTargetError()
+        // Failure injection runs before either owner changes. Production affinity is published
+        // by the network owner only after the serialized, validated tab replacement succeeds.
+        try await setActiveWindowForCurrentConnection?(target.windowID)
+        return try await networkMgr.withValidatedWindowBinding(
+            windowID: target.windowID,
+            connectionID: connectionID
+        ) { [self] in
+            var bindingChanged = false
+            if let expectedFileAuthority {
+                guard bindTargetIsCurrent(target, currentness: currentness) else {
+                    throw staleBindTargetError()
                 }
-                guard !bindingAlreadyMatches else { return }
+                let didBind = try await targetWindow.mcpServer.performIfFileToolAuthorityIsCurrent(
+                    expectedFileAuthority,
+                    tabID: target.tabID,
+                    workspaceID: target.workspaceID
+                ) {
+                    guard bindTargetIsCurrent(target, currentness: currentness) else {
+                        throw staleBindTargetError()
+                    }
+                    let existingBinding = targetWindow.mcpServer.connectionBindingSnapshot(
+                        forConnection: connectionID
+                    )
+                    guard !connectionBindingMatchesTarget(existingBinding, target: target) else {
+                        targetWindow.mcpServer.updateBoundFileToolAuthority(
+                            connectionID: connectionID,
+                            tabID: target.tabID,
+                            workspaceID: target.workspaceID,
+                            authority: expectedFileAuthority
+                        )
+                        return
+                    }
+                    try targetWindow.mcpServer.bindTabForConnection(
+                        connectionID: connectionID,
+                        clientName: clientName,
+                        tabID: target.tabID,
+                        workspaceID: target.workspaceID,
+                        windowID: target.windowID,
+                        frozenFileToolAuthority: expectedFileAuthority
+                    )
+                    clearNonRunScopedBindingsAcrossWindows(
+                        for: connectionID,
+                        excludingWindowID: target.windowID
+                    )
+                    bindingChanged = true
+                }
+                guard didBind else {
+                    throw staleBindTargetError()
+                }
+            } else {
+                let existingBinding = targetWindow.mcpServer.connectionBindingSnapshot(
+                    forConnection: connectionID
+                )
+                guard !connectionBindingMatchesTarget(existingBinding, target: target) else {
+                    return false
+                }
                 try targetWindow.mcpServer.bindTabForConnection(
                     connectionID: connectionID,
                     clientName: clientName,
@@ -1910,30 +1965,92 @@ final class WindowRoutingService: Service {
                     for: connectionID,
                     excludingWindowID: target.windowID
                 )
+                bindingChanged = true
             }
-            guard didBind else {
-                throw staleWorkingDirsTargetError()
-            }
-        } else if !bindingAlreadyMatches {
-            try targetWindow.mcpServer.bindTabForConnection(
-                connectionID: connectionID,
-                clientName: clientName,
-                tabID: target.tabID,
-                workspaceID: target.workspaceID,
-                windowID: target.windowID
-            )
-            clearNonRunScopedBindingsAcrossWindows(
-                for: connectionID,
-                excludingWindowID: target.windowID
-            )
+            return bindingChanged
         }
-        try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
     }
 
-    private func staleWorkingDirsTargetError() -> MCPError {
+    private func bindAuthorityFailureResponse(
+        _ failure: MCPServerViewModel.FileToolAuthorityFailure,
+        connectionID: UUID
+    ) async -> BindContextResponse {
+        await BindContextResponse(
+            binding: currentBindingSummary(for: connectionID),
+            changed: false,
+            error: failure.localizedDescription,
+            errorCode: failure.errorCode,
+            retryable: failure.retryable,
+            retryAfterMilliseconds: MCPServerViewModel.FileToolAuthorityFailure.retryAfterMilliseconds
+        )
+    }
+
+    private func connectionBindingMatchesTarget(
+        _ binding: MCPServerViewModel.ConnectionBindingSnapshot,
+        target: ResolvedBindTarget
+    ) -> Bool {
+        binding.windowID == target.windowID
+            && binding.workspaceID == target.workspaceID
+            && binding.tabID == target.tabID
+            && binding.explicitlyBound
+            && binding.runID == nil
+    }
+
+    private func bindTargetIsCurrent(
+        _ target: ResolvedBindTarget,
+        currentness: BindTargetCurrentness
+    ) -> Bool {
+        switch currentness {
+        case .exactContext:
+            guard let window = windowStates.allWindows.first(where: { $0.windowID == target.windowID }),
+                  let candidate = window.workspaceManager.storedBindingCandidate(forContextID: target.tabID),
+                  candidate.workspaceID == target.workspaceID
+            else { return false }
+            return WorkspaceRootSetKey(paths: candidate.repoPaths) == WorkspaceRootSetKey(paths: target.repoPaths)
+        case .activeTab:
+            let currentTarget = try? resolveActiveTabBindTarget(
+                windowID: target.windowID,
+                expectedWorkspaceID: target.workspaceID,
+                matchedBy: target.matchedBy,
+                normalizedWorkingDirs: target.normalizedWorkingDirs
+            )
+            return currentTarget?.tabID == target.tabID
+        }
+    }
+
+    #if DEBUG
+        func test_bindTarget(
+            windowID: Int,
+            workspaceID: UUID,
+            tabID: UUID,
+            repoPaths: [String],
+            connectionID: UUID,
+            authority: MCPServerViewModel.FrozenFileToolAuthority
+        ) async throws -> Bool {
+            try await bindTarget(
+                ResolvedBindTarget(
+                    windowID: windowID,
+                    workspaceID: workspaceID,
+                    workspaceName: "Test Workspace",
+                    tabID: tabID,
+                    tabName: "Test Context",
+                    repoPaths: repoPaths,
+                    matchedBy: "context_id",
+                    createdTab: false,
+                    normalizedWorkingDirs: nil
+                ),
+                connectionID: connectionID,
+                clientName: "BindContextFileAuthorityTests",
+                expectedFileAuthority: authority,
+                currentness: .exactContext
+            )
+        }
+    #endif
+
+    private func staleBindTargetError() -> MCPError {
         MCPError.invalidRequest(
-            "The working_dirs target changed while its root projection was being resolved. " +
-                "The existing MCP binding was not changed. Bind again with the same working_dirs."
+            "The requested bind target changed while its root authority was being resolved. " +
+                "The existing MCP binding was not changed. Bind the intended context again."
         )
     }
 
@@ -1978,9 +2095,9 @@ final class WindowRoutingService: Service {
     private func ensureWorkingDirsRootProjectionIsLoaded(
         _ target: ResolvedBindTarget,
         requestedRoots: [String]
-    ) async throws -> MCPServerViewModel.ProspectiveFileToolLookupResolution {
+    ) async throws -> MCPServerViewModel.FrozenFileToolAuthority {
         let window = try resolveWindowForBinding(windowID: target.windowID)
-        let resolution = try await window.mcpServer.resolveProspectiveFileToolLookupContext(
+        let resolution = try await window.mcpServer.resolveFileToolAuthority(
             tabID: target.tabID,
             workspaceID: target.workspaceID
         )
@@ -2001,6 +2118,16 @@ final class WindowRoutingService: Service {
             )
         }
         return resolution
+    }
+
+    private func ensureBindTargetFileAuthority(
+        _ target: ResolvedBindTarget
+    ) async throws -> MCPServerViewModel.FrozenFileToolAuthority {
+        let window = try resolveWindowForBinding(windowID: target.windowID)
+        return try await window.mcpServer.resolveFileToolAuthority(
+            tabID: target.tabID,
+            workspaceID: target.workspaceID
+        )
     }
 
     private func listBindContextWindows(
@@ -2134,112 +2261,102 @@ final class WindowRoutingService: Service {
                     guard let connectionID else {
                         throw MCPError.internalError("No active connection context")
                     }
-                    let previousBinding = await currentBindingSummary(for: connectionID)
                     let clientName = await networkMgr.currentClientIdentifier()
-                    switch request.matchKind {
-                    case .contextID:
-                        let connectionPreferredWindow = await networkMgr.selectedWindow(for: connectionID)
-                        let target = try await MainActor.run {
-                            try self.resolveContextIDBindTarget(contextID: request.contextID!, windowID: request.windowID, connectionPreferredWindowID: connectionPreferredWindow)
-                        }
-                        let unchanged = previousBinding.bindingKind == "tab_context"
-                            && previousBinding.windowID == target.windowID
-                            && previousBinding.contextID == target.tabID
-                            && previousBinding.explicit
-                            && !previousBinding.runScoped
+                    do {
+                        switch request.matchKind {
+                        case .contextID:
+                            let connectionPreferredWindow = await networkMgr.selectedWindow(for: connectionID)
+                            let target = try await MainActor.run {
+                                try self.resolveContextIDBindTarget(contextID: request.contextID!, windowID: request.windowID, connectionPreferredWindowID: connectionPreferredWindow)
+                            }
+                            let authority = try await ensureBindTargetFileAuthority(target)
+                            let changed = try await bindTarget(
+                                target,
+                                connectionID: connectionID,
+                                clientName: clientName,
+                                expectedFileAuthority: authority,
+                                currentness: .exactContext
+                            )
 
-                        if !unchanged {
-                            try await bindTarget(target, connectionID: connectionID, clientName: clientName)
-                        } else {
-                            try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
-                        }
-
-                        let binding = await currentBindingSummary(for: connectionID)
-                        let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
-                        return BindContextResponse(
-                            binding: binding,
-                            changed: !unchanged,
-                            matchedBy: target.matchedBy,
-                            createdTab: target.createdTab,
-                            normalizedWorkingDirs: target.normalizedWorkingDirs,
-                            note: note
-                        )
-                    case .workingDirs:
-                        let target = try await resolveWorkingDirsBindTarget(
-                            workingDirs: request.workingDirs,
-                            windowID: request.windowID,
-                            createIfMissing: request.createIfMissing,
-                            tabName: request.tabName,
-                            connectionID: connectionID
-                        )
-
-                        let tabTarget = try await MainActor.run {
-                            try self.resolveActiveTabBindTarget(
-                                windowID: target.windowID,
-                                expectedWorkspaceID: target.workspaceID,
+                            let binding = await currentBindingSummary(for: connectionID)
+                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                            return BindContextResponse(
+                                binding: binding,
+                                changed: changed,
                                 matchedBy: target.matchedBy,
-                                normalizedWorkingDirs: target.normalizedWorkingDirs
+                                createdTab: target.createdTab,
+                                normalizedWorkingDirs: target.normalizedWorkingDirs,
+                                note: note
                             )
-                        }
-                        let prospectiveLookupResolution = try await ensureWorkingDirsRootProjectionIsLoaded(
-                            tabTarget,
-                            requestedRoots: target.normalizedWorkingDirs
-                        )
-                        let unchanged = previousBinding.bindingKind == "tab_context"
-                            && previousBinding.windowID == tabTarget.windowID
-                            && previousBinding.contextID == tabTarget.tabID
-                            && previousBinding.explicit
-                            && !previousBinding.runScoped
-                        try await bindTarget(
-                            tabTarget,
-                            connectionID: connectionID,
-                            clientName: clientName,
-                            expectedWorkingDirsResolution: prospectiveLookupResolution,
-                            bindingAlreadyMatches: unchanged
-                        )
-
-                        let binding = await currentBindingSummary(for: connectionID)
-                        let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
-                        return BindContextResponse(
-                            binding: binding,
-                            changed: binding != previousBinding,
-                            matchedBy: target.matchedBy,
-                            createdTab: false,
-                            createdWorkspace: target.createdWorkspace,
-                            normalizedWorkingDirs: target.normalizedWorkingDirs,
-                            note: note
-                        )
-                    case .windowID:
-                        let windowID = request.windowID!
-                        let target = try await MainActor.run {
-                            try self.resolveActiveTabBindTarget(
-                                windowID: windowID,
-                                matchedBy: BindContextRequest.MatchKind.windowID.rawValue
+                        case .workingDirs:
+                            let target = try await resolveWorkingDirsBindTarget(
+                                workingDirs: request.workingDirs,
+                                windowID: request.windowID,
+                                createIfMissing: request.createIfMissing,
+                                tabName: request.tabName,
+                                connectionID: connectionID
                             )
-                        }
-                        let unchanged = previousBinding.bindingKind == "tab_context"
-                            && previousBinding.windowID == target.windowID
-                            && previousBinding.contextID == target.tabID
-                            && previousBinding.explicit
-                            && !previousBinding.runScoped
 
-                        if !unchanged {
-                            try await bindTarget(target, connectionID: connectionID, clientName: clientName)
-                        } else {
-                            try await networkMgr.setActiveWindowForCurrentConnection(windowID)
-                        }
+                            let tabTarget = try await MainActor.run {
+                                try self.resolveActiveTabBindTarget(
+                                    windowID: target.windowID,
+                                    expectedWorkspaceID: target.workspaceID,
+                                    matchedBy: target.matchedBy,
+                                    normalizedWorkingDirs: target.normalizedWorkingDirs
+                                )
+                            }
+                            let prospectiveLookupResolution = try await ensureWorkingDirsRootProjectionIsLoaded(
+                                tabTarget,
+                                requestedRoots: target.normalizedWorkingDirs
+                            )
+                            let changed = try await bindTarget(
+                                tabTarget,
+                                connectionID: connectionID,
+                                clientName: clientName,
+                                expectedFileAuthority: prospectiveLookupResolution
+                            )
 
-                        let binding = await currentBindingSummary(for: connectionID)
-                        let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
-                        return BindContextResponse(
-                            binding: binding,
-                            changed: !unchanged,
-                            matchedBy: BindContextRequest.MatchKind.windowID.rawValue,
-                            createdTab: false,
-                            note: note
-                        )
-                    case .none:
-                        throw MCPError.invalidParams("bind_context op='bind' requires context_id, working_dirs, or window_id.")
+                            let binding = await currentBindingSummary(for: connectionID)
+                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                            return BindContextResponse(
+                                binding: binding,
+                                changed: changed,
+                                matchedBy: target.matchedBy,
+                                createdTab: false,
+                                createdWorkspace: target.createdWorkspace,
+                                normalizedWorkingDirs: target.normalizedWorkingDirs,
+                                note: note
+                            )
+                        case .windowID:
+                            let windowID = request.windowID!
+                            let target = try await MainActor.run {
+                                try self.resolveActiveTabBindTarget(
+                                    windowID: windowID,
+                                    matchedBy: BindContextRequest.MatchKind.windowID.rawValue
+                                )
+                            }
+                            let authority = try await ensureBindTargetFileAuthority(target)
+                            let changed = try await bindTarget(
+                                target,
+                                connectionID: connectionID,
+                                clientName: clientName,
+                                expectedFileAuthority: authority
+                            )
+
+                            let binding = await currentBindingSummary(for: connectionID)
+                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                            return BindContextResponse(
+                                binding: binding,
+                                changed: changed,
+                                matchedBy: BindContextRequest.MatchKind.windowID.rawValue,
+                                createdTab: false,
+                                note: note
+                            )
+                        case .none:
+                            throw MCPError.invalidParams("bind_context op='bind' requires context_id, working_dirs, or window_id.")
+                        }
+                    } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
+                        return await bindAuthorityFailureResponse(failure, connectionID: connectionID)
                     }
                 }
             }

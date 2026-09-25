@@ -117,6 +117,12 @@ extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
 @MainActor
 final class WorkspaceSelectionCoordinator {
+    typealias CommitAuthorization = @MainActor (_ commit: () -> Void) -> Bool
+
+    #if DEBUG
+        var beforeAuthorizedCommitForTesting: (@MainActor () async -> Void)?
+    #endif
+
     private enum SelectionPersistenceResult {
         case committed(StoredSelection)
         case conflict(current: StoredSelection)
@@ -416,7 +422,8 @@ final class WorkspaceSelectionCoordinator {
         mirrorToUIIfActive: Bool = true,
         expectedCurrentSelection: StoredSelection? = nil,
         peerSourceRevision: UInt64? = nil,
-        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil,
+        commitAuthorization: CommitAuthorization? = nil
     ) async -> StoredSelection {
         switch await persistSelectionResult(
             selection,
@@ -425,7 +432,8 @@ final class WorkspaceSelectionCoordinator {
             mirrorToUIIfActive: mirrorToUIIfActive,
             expectedCurrentSelection: expectedCurrentSelection,
             peerSourceRevision: peerSourceRevision,
-            peerMutationFence: peerMutationFence
+            peerMutationFence: peerMutationFence,
+            commitAuthorization: commitAuthorization
         ) {
         case let .committed(committed):
             committed
@@ -443,14 +451,23 @@ final class WorkspaceSelectionCoordinator {
         mirrorToUIIfActive: Bool = true,
         expectedCurrentSelection: StoredSelection? = nil,
         peerSourceRevision: UInt64? = nil,
-        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil,
+        commitAuthorization: CommitAuthorization? = nil
     ) async -> SelectionPersistenceResult {
+        #if DEBUG
+            if commitAuthorization != nil, let beforeAuthorizedCommitForTesting {
+                await beforeAuthorizedCommitForTesting()
+            }
+        #endif
         guard let workspaceManager,
               let currentSelection = workspaceManager.composeTab(for: identity)?.selection
         else { return .targetUnavailable }
         if let expectedCurrentSelection,
            currentSelection != expectedCurrentSelection
         {
+            return .conflict(current: currentSelection)
+        }
+        if let commitAuthorization, !commitAuthorization({}) {
             return .conflict(current: currentSelection)
         }
         if source == .mcpPeerContext {
@@ -504,11 +521,20 @@ final class WorkspaceSelectionCoordinator {
         }
 
         let requiredPeerMutationFence = source == .mcpPeerContext ? peerMutationFence : nil
-        guard let revision = persist(
-            selection,
-            for: identity,
-            peerMutationFence: requiredPeerMutationFence
-        ) else { return .targetUnavailable }
+        var committedRevision: UInt64?
+        let commit = {
+            committedRevision = self.persist(
+                selection,
+                for: identity,
+                peerMutationFence: requiredPeerMutationFence
+            )
+        }
+        if let commitAuthorization {
+            guard commitAuthorization(commit) else { return .conflict(current: currentSelection) }
+        } else {
+            commit()
+        }
+        guard let revision = committedRevision else { return .targetUnavailable }
         guard canCommitPeerMutation(
             peerMutationFence,
             source: source,

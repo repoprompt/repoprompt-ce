@@ -24,13 +24,17 @@ enum AgentExternalMCPRunStarter {
     }
 
     /// Extracts a reasoning effort suffix from a model string if present.
-    /// Supports formats like "gpt-5.4-high", "o3_low", "gpt-5.4-fast-high".
+    /// Supports Codex variants such as "gpt-5.4-high" and Claude variants such as
+    /// "claude-opus-5-5:low" without changing the model selection.
     /// The model string is passed through unchanged (preserving service tier and other modifiers);
     /// only the effort is extracted separately.
     static func extractReasoningEffort(from modelRaw: String?) -> (model: String?, effort: String?) {
         guard let modelRaw, !modelRaw.isEmpty else { return (modelRaw, nil) }
         let specifier = CodexModelSpecifier(raw: modelRaw)
         if let effort = specifier.reasoningEffort {
+            return (modelRaw, effort.rawValue)
+        }
+        if let effort = ClaudeModelSpecifier(raw: modelRaw).explicitEffortLevel {
             return (modelRaw, effort.rawValue)
         }
         return (modelRaw, nil)
@@ -48,6 +52,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition? = nil,
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
@@ -63,6 +68,7 @@ enum AgentExternalMCPRunStarter {
             workflow: workflow,
             expectedParentSessionID: expectedParentSessionID,
             oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
             dispatchInstruction: dispatchInstruction
         )
     }
@@ -80,6 +86,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition? = nil,
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
@@ -95,6 +102,7 @@ enum AgentExternalMCPRunStarter {
             workflow: workflow,
             expectedParentSessionID: expectedParentSessionID,
             oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
             dispatchInstruction: dispatchInstruction
         )
     }
@@ -112,6 +120,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition?,
         expectedParentSessionID: UUID?,
         oracleReviewSource: AgentRunOracleReviewSource?,
+        preserveRoutedInitialEffort: Bool,
         dispatchInstruction: DispatchInstruction?
     ) async throws -> StartOutcome {
         let resolvedModel: String?
@@ -195,7 +204,8 @@ enum AgentExternalMCPRunStarter {
                     sessionID: sessionID,
                     text: message,
                     allowStartingRun: true,
-                    workflow: workflow
+                    workflow: workflow,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
                 )
             }
 

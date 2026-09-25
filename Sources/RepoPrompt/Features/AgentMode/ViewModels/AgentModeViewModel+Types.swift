@@ -266,6 +266,7 @@ extension AgentModeViewModel {
         let normalizedName: String
         let activeAgentSessionID: UUID?
         let isPinned: Bool
+        let pinnedOrder: Int?
         let lastModified: Date
     }
 

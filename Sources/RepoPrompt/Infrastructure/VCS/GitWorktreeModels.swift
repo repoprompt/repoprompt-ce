@@ -220,6 +220,12 @@ public struct GitWorktreeCreateRequest: Sendable, Equatable {
     public let mainWorktreeRoot: URL?
     public let knownWorktreeRoots: [URL]
     public let copyWorktreeIncludeFiles: Bool
+    /// Also copy untracked, non-ignored files selected by `.worktreeinclude`. Off by default;
+    /// ignored files remain the only files copied unless a caller explicitly opts in.
+    public let copyWorktreeIncludeUntrackedFiles: Bool
+    /// Materialize tracked files as APFS clones of a clean, same-tree source checkout when
+    /// every safety check passes; otherwise Git performs an ordinary checkout.
+    public let cloneTrackedCheckout: Bool
 
     public init(
         path: URL,
@@ -232,7 +238,9 @@ public struct GitWorktreeCreateRequest: Sendable, Equatable {
         appManagedContainer: URL? = nil,
         mainWorktreeRoot: URL? = nil,
         knownWorktreeRoots: [URL] = [],
-        copyWorktreeIncludeFiles: Bool = false
+        copyWorktreeIncludeFiles: Bool = false,
+        copyWorktreeIncludeUntrackedFiles: Bool = false,
+        cloneTrackedCheckout: Bool = false
     ) {
         self.path = path
         self.branch = branch
@@ -245,21 +253,89 @@ public struct GitWorktreeCreateRequest: Sendable, Equatable {
         self.mainWorktreeRoot = mainWorktreeRoot
         self.knownWorktreeRoots = knownWorktreeRoots
         self.copyWorktreeIncludeFiles = copyWorktreeIncludeFiles
+        self.copyWorktreeIncludeUntrackedFiles = copyWorktreeIncludeUntrackedFiles
+        self.cloneTrackedCheckout = cloneTrackedCheckout
+    }
+}
+
+/// How the tracked files of a newly created worktree were materialized.
+public struct GitWorktreeCheckoutReport: Sendable, Equatable {
+    public enum Strategy: String, Sendable, Equatable {
+        /// `git worktree add` performed its normal checkout.
+        case ordinary
+        /// Tracked files are APFS clones of the source checkout, verified by an index refresh.
+        case cloned
+        /// Cloning failed after `git worktree add --no-checkout`; `git reset --hard` in the new
+        /// worktree produced an ordinary, verified-clean checkout instead.
+        case checkoutFallback
+    }
+
+    public let strategy: Strategy
+    /// Stable, path-free reason the clone fast path was not attempted (`ordinary` only).
+    public let ineligibilityReason: String?
+    /// Diagnostic reason the attempted clone was abandoned (`checkoutFallback` only).
+    public let fallbackReason: String?
+    public let clonedFileCount: Int
+    public let symbolicLinkCount: Int
+    public let clonedByteCount: Int64
+    /// Diagnostic phase durations: read-only eligibility probing, descriptor-based cloning,
+    /// and Git index build plus verification (or the checkout fallback).
+    public let eligibilityMilliseconds: Double?
+    public let materializationMilliseconds: Double?
+    public let verificationMilliseconds: Double?
+
+    public init(
+        strategy: Strategy,
+        ineligibilityReason: String? = nil,
+        fallbackReason: String? = nil,
+        clonedFileCount: Int = 0,
+        symbolicLinkCount: Int = 0,
+        clonedByteCount: Int64 = 0,
+        eligibilityMilliseconds: Double? = nil,
+        materializationMilliseconds: Double? = nil,
+        verificationMilliseconds: Double? = nil
+    ) {
+        self.strategy = strategy
+        self.ineligibilityReason = ineligibilityReason
+        self.fallbackReason = fallbackReason
+        self.clonedFileCount = clonedFileCount
+        self.symbolicLinkCount = symbolicLinkCount
+        self.clonedByteCount = clonedByteCount
+        self.eligibilityMilliseconds = eligibilityMilliseconds
+        self.materializationMilliseconds = materializationMilliseconds
+        self.verificationMilliseconds = verificationMilliseconds
+    }
+
+    func withEligibilityMilliseconds(_ milliseconds: Double) -> GitWorktreeCheckoutReport {
+        GitWorktreeCheckoutReport(
+            strategy: strategy,
+            ineligibilityReason: ineligibilityReason,
+            fallbackReason: fallbackReason,
+            clonedFileCount: clonedFileCount,
+            symbolicLinkCount: symbolicLinkCount,
+            clonedByteCount: clonedByteCount,
+            eligibilityMilliseconds: milliseconds,
+            materializationMilliseconds: materializationMilliseconds,
+            verificationMilliseconds: verificationMilliseconds
+        )
     }
 }
 
 public struct GitWorktreeCreateResult: Sendable, Equatable {
     public let descriptor: GitWorktreeDescriptor
     public let includeCopyResult: GitWorktreeIncludeCopyResult?
+    public let checkoutReport: GitWorktreeCheckoutReport?
     let initializationReceipt: GitWorktreeCreationReceipt?
     let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
 
     public init(
         descriptor: GitWorktreeDescriptor,
-        includeCopyResult: GitWorktreeIncludeCopyResult? = nil
+        includeCopyResult: GitWorktreeIncludeCopyResult? = nil,
+        checkoutReport: GitWorktreeCheckoutReport? = nil
     ) {
         self.descriptor = descriptor
         self.includeCopyResult = includeCopyResult
+        self.checkoutReport = checkoutReport
         initializationReceipt = nil
         initializationFallbackReason = nil
     }
@@ -267,11 +343,13 @@ public struct GitWorktreeCreateResult: Sendable, Equatable {
     init(
         descriptor: GitWorktreeDescriptor,
         includeCopyResult: GitWorktreeIncludeCopyResult?,
+        checkoutReport: GitWorktreeCheckoutReport? = nil,
         initializationReceipt: GitWorktreeCreationReceipt?,
         initializationFallbackReason: WorkspaceRootSeedFallbackReason? = nil
     ) {
         self.descriptor = descriptor
         self.includeCopyResult = includeCopyResult
+        self.checkoutReport = checkoutReport
         self.initializationReceipt = initializationReceipt
         self.initializationFallbackReason = initializationFallbackReason
     }
@@ -283,19 +361,27 @@ public struct GitWorktreeIncludeCopyResult: Sendable, Equatable {
     public let copiedRelativePaths: [String]
     public let skippedSummaries: [String]
     public let errorSummaries: [String]
+    /// Copied files that were APFS clones (the rest used a byte-copy fallback).
+    public let clonedCount: Int
+    /// Copied files that were untracked but not ignored (explicit opt-in only).
+    public let copiedUntrackedCount: Int
 
     public init(
         copiedCount: Int,
         matchedCount: Int,
         copiedRelativePaths: [String] = [],
         skippedSummaries: [String] = [],
-        errorSummaries: [String] = []
+        errorSummaries: [String] = [],
+        clonedCount: Int = 0,
+        copiedUntrackedCount: Int = 0
     ) {
         self.copiedCount = copiedCount
         self.matchedCount = matchedCount
         self.copiedRelativePaths = copiedRelativePaths
         self.skippedSummaries = skippedSummaries
         self.errorSummaries = errorSummaries
+        self.clonedCount = clonedCount
+        self.copiedUntrackedCount = copiedUntrackedCount
     }
 
     public var warningText: String? {
