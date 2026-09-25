@@ -49,6 +49,25 @@ final class ClaudeIntegratedAgentModeRunner {
         self.terminalCommitBarrier = terminalCommitBarrier
     }
 
+    /// Whether cancelling an attempt on `runID` must keep that run's committed MCP route.
+    ///
+    /// True only while the session still owns this exact reused process run: its Claude controller is
+    /// attached and its process run identity is still `runID`. That is the case for an attempt that
+    /// ended before its provider call — for example a retracted Auto-wake — whose provider process and
+    /// MCP connection outlive it. User Stop and provider identity resets detach the controller and
+    /// clear the run identity first (`prepareClaudeCancelSync`), so their cancellation keeps revoking.
+    static func cancellationPreservesRunRoute(session: AgentTabSession, runID: UUID) -> Bool {
+        session.claudeController != nil
+            && AgentModeProcessRunIdentity.existingProcessRunID(for: session) == runID
+    }
+
+    /// Cancels one attempt's bootstrap lease. Every cancellation in this runner goes through here so
+    /// the run-ownership decision is made in exactly one place, at cleanup time.
+    static func cancelAttemptLease(_ lease: MCPBootstrapLease, session: AgentTabSession?, runID: UUID) async {
+        let preservesRoute = session.map { cancellationPreservesRunRoute(session: $0, runID: runID) } ?? false
+        await lease.cancelAndCleanup(preservingCommittedRoute: preservesRoute)
+    }
+
     func startRun(
         tabID: UUID,
         session: AgentTabSession,
@@ -75,13 +94,13 @@ final class ClaudeIntegratedAgentModeRunner {
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
         let ownership = session.beginRunAttempt(source: "claudeNative")
-        session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
+        session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
                 switch terminalState {
                 case .failed:
                     await lease.failAndRelease()
                 case .cancelled:
-                    await lease.cancelAndCleanup()
+                    await Self.cancelAttemptLease(lease, session: session, runID: runID)
                 default:
                     break
                 }
@@ -207,10 +226,10 @@ final class ClaudeIntegratedAgentModeRunner {
                             notifyTurnComplete: false
                         )
                         if revision == nil {
-                            await lease.cancelAndCleanup()
+                            await Self.cancelAttemptLease(lease, session: session, runID: runID)
                         }
                     } else {
-                        await lease.cancelAndCleanup()
+                        await Self.cancelAttemptLease(lease, session: session, runID: runID)
                     }
                 case let .terminal(outcome):
                     let terminalState: AgentSessionRunState = switch outcome.kind {
