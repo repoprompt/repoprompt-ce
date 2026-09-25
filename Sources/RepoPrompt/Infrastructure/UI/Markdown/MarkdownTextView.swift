@@ -226,13 +226,22 @@ enum MarkdownStreamingFreezeBoundaryResolver {
         let candidates = blankLineBoundaryOffsets(in: text)
         guard !candidates.isEmpty else { return nil }
 
-        let boundaries = candidates.compactMap { makeBoundary(in: text, utf16Offset: $0, totalLineCount: totalLineCount) }
-        if let preferred = boundaries.reversed().first(where: {
-            $0.tailCharacterCount >= preferredTailCharacterCount || $0.tailLineCount >= preferredTailLineCount
-        }) {
-            return preferred
+        // Search backwards and stop at the first preferred boundary. This returns the same
+        // result as evaluating every candidate and scanning the results in reverse
+        // (latest preferred, else latest valid) while skipping work that cannot affect it.
+        var fallback: MarkdownStreamingFreezeBoundary?
+        for offset in candidates.reversed() {
+            guard let boundary = makeBoundary(in: text, utf16Offset: offset, totalLineCount: totalLineCount) else {
+                continue
+            }
+            if fallback == nil {
+                fallback = boundary
+            }
+            if boundary.tailCharacterCount >= preferredTailCharacterCount || boundary.tailLineCount >= preferredTailLineCount {
+                return boundary
+            }
         }
-        return boundaries.last
+        return fallback
     }
 
     static func split(text: String, atUTF16Offset utf16Offset: Int) -> (prefix: String, tail: String)? {
