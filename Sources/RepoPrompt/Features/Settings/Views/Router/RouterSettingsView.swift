@@ -67,6 +67,10 @@ struct RouterSettingsView: View {
                 Text("When enabled, Router chooses the target for every new primary session and RepoPrompt-managed subagent. Existing sessions keep their established target.")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
+                Text("TypeSafe Jev receives task text to choose a model and effort. For long tasks, RepoPrompt sends only a short, best-effort masked excerpt from the beginning and end; the full task goes only to the selected agent. Masking can miss sensitive prose. If routing is unavailable or returns no valid choice, the task continues with the current selection or role default.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

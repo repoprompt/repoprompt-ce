@@ -128,6 +128,52 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
     }
 
+    func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
+        let task = "Investigate the parser. password=openingSecret "
+            + String(repeating: "irrelevant middle ", count: 300)
+            + " Finally, verify the fix. token=endingSecret"
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertEqual(excerpt, AgentTaskRoutingTaskExcerpt.make(from: task))
+        XCTAssertTrue(excerpt.contains("Investigate the parser"))
+        XCTAssertTrue(excerpt.contains("verify the fix"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertFalse(excerpt.contains("openingSecret"))
+        XCTAssertFalse(excerpt.contains("endingSecret"))
+        XCTAssertLessThanOrEqual(excerpt.count, AgentTaskRoutingEnvelopeBuilder.maximumCharacters)
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+    }
+
+    func testLongRoutingExcerptOmitsUnsafeCutSegmentsButStillProvidesJevInput() {
+        let task = "```\nprivate text\n" + String(repeating: "secret", count: 1000)
+            + "\n```\nPlease inspect the result."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertFalse(excerpt.contains("private text"))
+        XCTAssertFalse(excerpt.contains("secret"))
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: excerpt, candidates: [descriptor("a"), descriptor("b")]
+        ))
+    }
+
+    func testShortRoutingTaskRemainsExact() {
+        XCTAssertEqual(AgentTaskRoutingTaskExcerpt.make(from: "  Implement a parser  "), "Implement a parser")
+    }
+
+    func testLongRoutingExcerptRespectsUTF8Limit() {
+        let task = "Review Unicode handling. " + String(repeating: "✈️ ", count: 3000)
+            + " Finally, add tests."
+
+        let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
+
+        XCTAssertTrue(excerpt.contains("middle omitted"))
+        XCTAssertTrue(excerpt.contains("add tests"))
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+    }
+
     func testExecutableIdentityIncludesEffortAndNormalizedACPParameters() {
         let low = AgentRoutingExecutableTarget(
             agentRaw: "grokBuild", modelRaw: "grok", reasoningEffortRaw: "low", modelParameters: []

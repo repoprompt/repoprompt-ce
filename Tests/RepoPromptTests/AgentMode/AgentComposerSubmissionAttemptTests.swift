@@ -225,7 +225,7 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertNotNil(viewModel.modelRouterPillProps().disabledReason)
     }
 
-    func testMissingRouterCredentialBlocksPrimarySubmitWithoutClearingIntent() async throws {
+    func testMissingRouterCredentialUsesCurrentSelectionWithoutClearingIntent() async throws {
         let backend = ComposerRoutingBackend(
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
@@ -243,25 +243,19 @@ extension AgentComposerSubmissionAttemptTests {
             destinationTabID: tabID
         )
 
-        XCTAssertEqual(result, .blocked(message: "Model Router is unavailable. Turn it off to send with the current selection."))
+        XCTAssertEqual(result, .submitted)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
-        XCTAssertTrue(session.items.isEmpty)
-        XCTAssertTrue(session.transcript.turns.isEmpty)
     }
 
-    func testMissingRouterCredentialBlocksSubagentRoutingWithoutClearingIntent() async throws {
+    func testMissingRouterCredentialLeavesSubagentRoleDefaultInControl() async throws {
         let backend = ComposerRoutingBackend(
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
         let (viewModel, store) = try makeRoutingViewModel(backend: backend)
 
-        do {
-            _ = try await viewModel.routeSubagentTargetIfEnabled(task: "Explore the parser", surface: .general)
-            XCTFail("An enabled but paused Router must fail closed")
-        } catch AgentModeViewModel.GlobalModelRoutingError.unavailable {
-            // Expected.
-        }
+        let routed = try await viewModel.routeSubagentTargetIfEnabled(task: "Explore the parser", surface: .general)
+        XCTAssertNil(routed)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
     }
 
@@ -299,7 +293,7 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
     }
 
-    func testFakeRouterAbstentionBlocksWithoutChangingSelectionOrSending() async throws {
+    func testFakeRouterAbstentionSubmitsWithCurrentSelection() async throws {
         let backend = ComposerRoutingBackend(outcome: .abstain)
         let (viewModel, _) = try makeRoutingViewModel(backend: backend)
         let tabID = UUID()
@@ -317,13 +311,78 @@ extension AgentComposerSubmissionAttemptTests {
             destinationTabID: tabID
         )
 
-        guard case .blocked = result else { return XCTFail("Abstention must block") }
+        XCTAssertEqual(result, .submitted)
         XCTAssertEqual(session.selectedAgent, baseline.0)
         XCTAssertEqual(session.selectedModelRaw, baseline.1)
         XCTAssertEqual(session.selectedReasoningEffortRaw, baseline.2)
         XCTAssertEqual(session.acpModelParameterSelections, baseline.3)
-        XCTAssertTrue(session.items.isEmpty)
-        XCTAssertTrue(session.transcript.turns.isEmpty)
+    }
+
+    func testLongComposerTaskStillRoutesOnMaskedExcerpt() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        let text = "Implement a parser. password=private123 "
+            + String(repeating: "background detail ", count: 300)
+            + " Finally, add regression tests. token=lastsecret"
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: text)
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: text, claim: claim, session: session, destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        let requests = await backend.requests
+        XCTAssertEqual(requests.map(\.decisionStage), [.model, .effort])
+        XCTAssertEqual(requests.first?.task, requests.last?.task)
+        XCTAssertTrue(requests.allSatisfy { $0.task.contains("Implement a parser") })
+        XCTAssertTrue(requests.allSatisfy { $0.task.contains("add regression tests") })
+        XCTAssertTrue(requests.allSatisfy { !$0.task.contains("private123") && !$0.task.contains("lastsecret") })
+        XCTAssertTrue(requests.allSatisfy { $0.task.count <= AgentTaskRoutingEnvelopeBuilder.maximumCharacters })
+        XCTAssertEqual(session.transcript.turns.first?.request?.text, text)
+    }
+
+    func testLongSubagentTaskStillRoutesOnBoundedExcerpt() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let task = "Investigate a concurrency bug. "
+            + String(repeating: "background context ", count: 300)
+            + " Finally, review the cancellation path."
+
+        let selected = try await viewModel.routeSubagentTargetIfEnabled(task: task, surface: .general)
+
+        XCTAssertNotNil(selected)
+        let requests = await backend.requests
+        XCTAssertEqual(requests.map(\.decisionStage), [.model, .effort])
+        XCTAssertTrue(requests.allSatisfy { $0.scope == .subagent })
+        XCTAssertTrue(requests.allSatisfy { $0.task.contains("concurrency bug") })
+        XCTAssertTrue(requests.allSatisfy { $0.task.contains("cancellation path") })
+        XCTAssertTrue(requests.allSatisfy { $0.task != task })
+    }
+
+    func testEffortAbstentionKeepsJevSelectedModelWithProviderDefaultEffort() async throws {
+        let backend = ComposerRoutingBackend(outcome: .abstainEffort)
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+
+        let selected = try await viewModel.routeSubagentTargetIfEnabled(
+            task: "Implement parser and tests", surface: .general
+        )
+
+        XCTAssertNotNil(selected)
+        XCTAssertNil(selected?.reasoningEffortRaw)
+        let requests = await backend.requests
+        XCTAssertEqual(requests.map(\.decisionStage), [.model, .effort])
+    }
+
+    func testModelAbstentionLeavesSubagentRoleDefaultInControl() async throws {
+        let backend = ComposerRoutingBackend(outcome: .abstain)
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let selected = try await viewModel.routeSubagentTargetIfEnabled(
+            task: "Implement parser and tests", surface: .general
+        )
+        XCTAssertNil(selected)
     }
 
     func testGlobalRouterRoutesSubagentRequestWithScopeGuidanceAndTargetIdentity() async throws {
@@ -476,7 +535,7 @@ extension AgentComposerSubmissionAttemptTests {
 }
 
 private actor ComposerRoutingBackend: AgentTaskRouterBackend {
-    enum Outcome { case selectLast, abstain }
+    enum Outcome { case selectLast, abstain, abstainEffort }
     nonisolated let id = AgentTaskRouterBackendID(rawValue: "composer-fake")
     nonisolated let displayName = "Composer fake"
     let outcome: Outcome
@@ -504,6 +563,10 @@ private actor ComposerRoutingBackend: AgentTaskRouterBackend {
             .selected(opaqueKey: request.candidates[request.candidates.count - 1].opaqueKey, evidence: nil)
         case .abstain:
             .abstained(reason: "ambiguous", evidence: nil)
+        case .abstainEffort:
+            request.decisionStage == .effort
+                ? .abstained(reason: "ambiguous effort", evidence: nil)
+                : .selected(opaqueKey: request.candidates[request.candidates.count - 1].opaqueKey, evidence: nil)
         }
     }
 }
