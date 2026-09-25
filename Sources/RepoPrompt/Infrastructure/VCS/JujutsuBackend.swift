@@ -8,6 +8,11 @@ import Foundation
 /// - Staged/unstaged compare specs are degraded to uncommitted with warnings (jj has no staging area).
 /// - Unified diffs use `jj diff --git`.
 /// - Fingerprint statusHash is prefixed with "jj:" to prevent collisions with git fingerprints.
+/// - Every command states a `JJWorkingCopyPolicy`. Status polling snapshots the working copy
+///   once per refresh (`jj diff --summary`), or three times in a workspace colocated with git,
+///   where the bookmark lists snapshot too; reads a snapshot cannot change use `.recorded`.
+/// - Bookmark reads need jj 0.22 or later, which introduced `jj bookmark`; on older jj they
+///   return nothing.
 public actor JujutsuBackend: VCSBackendWithWarnings {
     // MARK: - Configuration
 
@@ -120,7 +125,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
     public func findRepoRoot(from url: URL) async throws -> URL? {
         // jj: `jj root` returns the workspace root directory (repo root for our purposes).
-        let (stdout, _, exitCode) = try await runner.run(["root", "--color=never"], at: url)
+        let (stdout, _, exitCode) = try await runner.run(["root", "--color=never"], at: url, workingCopy: .snapshot)
         guard exitCode == 0 else { return nil }
         let s = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
@@ -133,13 +138,14 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         // Head ID in jj context: the working copy commit id for "@"
         if let id = try await templateSingleValue(
             args: ["log", "-r", "@", "--no-graph", "--color=never", "-T", "commit_id ++ \"\\n\""],
-            at: repoURL
+            at: repoURL,
+            workingCopy: .snapshot
         ) {
             return id
         }
 
         // Fallback: parse `jj log -r @ --no-graph`
-        let text = try await runner.runOrThrow(["log", "-r", "@", "--no-graph", "--color=never"], at: repoURL)
+        let text = try await runner.runOrThrow(["log", "-r", "@", "--no-graph", "--color=never"], at: repoURL, workingCopy: .snapshot)
         if let firstHex = firstHexLikeToken(in: text) {
             return firstHex
         }
@@ -152,12 +158,13 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
         if let id = try await templateSingleValue(
             args: ["log", "-r", trimmed, "--no-graph", "--color=never", "-T", "commit_id ++ \"\\n\""],
-            at: repoURL
+            at: repoURL,
+            workingCopy: .snapshot
         ) {
             return id
         }
 
-        let text = try await runner.runOrThrow(["log", "-r", trimmed, "--no-graph", "--color=never"], at: repoURL)
+        let text = try await runner.runOrThrow(["log", "-r", trimmed, "--no-graph", "--color=never"], at: repoURL, workingCopy: .snapshot)
         if let firstHex = firstHexLikeToken(in: text) {
             return firstHex
         }
@@ -225,7 +232,13 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         // jj has no staging area and no untracked concept in the same way as git.
         // Provide a best-effort \"modified\" list from `jj diff --summary`.
         let refs = try resolveDiffRefs(for: .uncommitted(base: "HEAD"), repoURL: repoURL)
-        let summaryText = try await jjDiffSummary(from: refs.from, to: refs.to, repoURL: repoURL, paths: nil)
+        let summaryText = try await jjDiffSummary(
+            from: refs.from,
+            to: refs.to,
+            repoURL: repoURL,
+            paths: nil,
+            workingCopy: .snapshot
+        )
         let files = parseJjDiffSummary(summaryText).map(\.path)
 
         return VCSWorkingStatus(
@@ -252,7 +265,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
     public func fetch(at repoURL: URL) async throws {
         // jj uses git remotes via `jj git fetch`
         try await withBookmarkCachesBypassed(for: repoURL) {
-            _ = try await runner.runOrThrow(["git", "fetch", "--color=never"], at: repoURL)
+            _ = try await runner.runOrThrow(["git", "fetch", "--color=never"], at: repoURL, workingCopy: .snapshot)
         }
     }
 
@@ -265,7 +278,13 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         let headID = try await getHeadID(at: repoURL)
 
         // Stable-ish status material: summary diff between base and @
-        let summaryText = try await jjDiffSummary(from: normalizedBase, to: "@", repoURL: repoURL, paths: nil)
+        let summaryText = try await jjDiffSummary(
+            from: normalizedBase,
+            to: "@",
+            repoURL: repoURL,
+            paths: nil,
+            workingCopy: .snapshot
+        )
         var data = Data(summaryText.utf8)
         data.append(Data(normalizedBase.utf8))
 
@@ -295,12 +314,26 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         let normalized = normalizeCompareSpecWithWarning(compare).spec
         let refs = try resolveDiffRefs(for: normalized, repoURL: repoURL)
 
-        // 1) Summary for statuses (M/A/D/R/C etc)
-        let summaryText = try await jjDiffSummary(from: refs.from, to: refs.to, repoURL: repoURL, paths: paths)
+        // 1) Summary for statuses (M/A/D/R/C etc). This call snapshots the working copy; the
+        //    reads below rely on it having run first, so they reuse its snapshot instead of
+        //    scanning again. Keep this order.
+        let summaryText = try await jjDiffSummary(
+            from: refs.from,
+            to: refs.to,
+            repoURL: repoURL,
+            paths: paths,
+            workingCopy: .snapshot
+        )
         var entries = parseJjDiffSummary(summaryText)
 
         // 2) Stat for insertions/deletions (best-effort parse)
-        let statText = try await jjDiffStat(from: refs.from, to: refs.to, repoURL: repoURL, paths: paths)
+        let statText = try await jjDiffStat(
+            from: refs.from,
+            to: refs.to,
+            repoURL: repoURL,
+            paths: paths,
+            workingCopy: .recorded
+        )
         let statMap = parseJjDiffStat(statText)
 
         // Merge
@@ -318,7 +351,14 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
         // If stat parsing failed entirely, fall back to scanning a git-format diff for accurate counts.
         if !entries.isEmpty, statMap.isEmpty {
-            let diffText = try await jjDiffGit(from: refs.from, to: refs.to, repoURL: repoURL, contextLines: 0, paths: paths)
+            let diffText = try await jjDiffGit(
+                from: refs.from,
+                to: refs.to,
+                repoURL: repoURL,
+                contextLines: 0,
+                paths: paths,
+                workingCopy: .recorded
+            )
             let counts = computeAddDelByFileFromUnifiedDiff(diffText)
             for i in entries.indices {
                 let path = entries[i].path
@@ -346,7 +386,14 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         // jj doesn't expose a git-style -M; ignore detectRenames.
         let normalized = normalizeCompareSpecWithWarning(compare).spec
         let refs = try resolveDiffRefs(for: normalized, repoURL: repoURL)
-        return try await jjDiffGit(from: refs.from, to: refs.to, repoURL: repoURL, contextLines: contextLines, paths: paths)
+        return try await jjDiffGit(
+            from: refs.from,
+            to: refs.to,
+            repoURL: repoURL,
+            contextLines: contextLines,
+            paths: paths,
+            workingCopy: .snapshot
+        )
     }
 
     public func getUntrackedDiff(
@@ -363,7 +410,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
     public func getCommitGraph(maxLines: Int, at repoURL: URL) async throws -> String {
         // Default jj log includes a graph; keep it.
         let lim = max(1, maxLines)
-        let out = try await runner.runOrThrow(["log", "--color=never", "--limit", "\(lim)"], at: repoURL)
+        let out = try await runner.runOrThrow(["log", "--color=never", "--limit", "\(lim)"], at: repoURL, workingCopy: .snapshot)
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -395,13 +442,17 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             args.append(path)
         }
 
-        let (stdout, _, exit) = try await runner.run(args, at: repoURL)
+        let (stdout, _, exit) = try await runner.run(args, at: repoURL, workingCopy: .snapshot)
         let lines: [String]
         if exit == 0 {
             lines = stdout.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         } else {
             // Fallback to non-templated log; best-effort parse commit ids and messages.
-            let fallback = try await runner.runOrThrow(["log", "--no-graph", "--color=never", "--limit", "\(lim)"], at: repoURL)
+            let fallback = try await runner.runOrThrow(
+                ["log", "--no-graph", "--color=never", "--limit", "\(lim)"],
+                at: repoURL,
+                workingCopy: .snapshot
+            )
             lines = fallback.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         }
 
@@ -474,7 +525,8 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
         let (stdout, _, exit) = try await runner.run(
             ["log", "-r", trimmed, "--no-graph", "--color=never", "-T", template],
-            at: repoURL
+            at: repoURL,
+            workingCopy: .snapshot
         )
 
         if exit == 0 {
@@ -491,7 +543,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         }
 
         // Fallback: `jj show --no-patch` and best-effort parsing.
-        let showText = try await runner.runOrThrow(["show", "--color=never", "--no-patch", trimmed], at: repoURL)
+        let showText = try await runner.runOrThrow(["show", "--color=never", "--no-patch", trimmed], at: repoURL, workingCopy: .snapshot)
         let id = firstHexLikeToken(in: showText) ?? trimmed
         let shortID = String(id.prefix(12))
         let message = extractFirstNonEmptyLine(afterAnyOf: ["description:", "message:"], in: showText) ?? ""
@@ -515,7 +567,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         guard !trimmed.isEmpty else { throw VCSError.parseError(message: "Empty path") }
 
         // jj: `jj file annotate <path>`
-        let text = try await runner.runOrThrow(["file", "annotate", "--color=never", "--", trimmed], at: repoURL)
+        let text = try await runner.runOrThrow(["file", "annotate", "--color=never", "--", trimmed], at: repoURL, workingCopy: .snapshot)
         let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
         var results: [VCSBlameLine] = []
@@ -616,19 +668,38 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
     // MARK: - Helpers: jj commands
 
-    private func jjDiffSummary(from: String, to: String, repoURL: URL, paths: [String]?) async throws -> String {
+    private func jjDiffSummary(
+        from: String,
+        to: String,
+        repoURL: URL,
+        paths: [String]?,
+        workingCopy: JJWorkingCopyPolicy
+    ) async throws -> String {
         var args = ["diff", "--summary", "--color=never", "--from", from, "--to", to]
         appendPaths(&args, paths: paths)
-        return try await runner.runOrThrow(args, at: repoURL)
+        return try await runner.runOrThrow(args, at: repoURL, workingCopy: workingCopy)
     }
 
-    private func jjDiffStat(from: String, to: String, repoURL: URL, paths: [String]?) async throws -> String {
+    private func jjDiffStat(
+        from: String,
+        to: String,
+        repoURL: URL,
+        paths: [String]?,
+        workingCopy: JJWorkingCopyPolicy
+    ) async throws -> String {
         var args = ["diff", "--stat", "--color=never", "--from", from, "--to", to]
         appendPaths(&args, paths: paths)
-        return try await runner.runOrThrow(args, at: repoURL)
+        return try await runner.runOrThrow(args, at: repoURL, workingCopy: workingCopy)
     }
 
-    private func jjDiffGit(from: String, to: String, repoURL: URL, contextLines: Int, paths: [String]?) async throws -> String {
+    private func jjDiffGit(
+        from: String,
+        to: String,
+        repoURL: URL,
+        contextLines: Int,
+        paths: [String]?,
+        workingCopy: JJWorkingCopyPolicy
+    ) async throws -> String {
         var args: [String] = [
             "diff",
             "--git",
@@ -640,7 +711,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             args.append(contentsOf: ["--context", "\(contextLines)"])
         }
         appendPaths(&args, paths: paths)
-        return try await runner.runOrThrow(args, at: repoURL)
+        return try await runner.runOrThrow(args, at: repoURL, workingCopy: workingCopy)
     }
 
     private func appendPaths(_ args: inout [String], paths: [String]?) {
@@ -696,6 +767,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             return try await task.value.names
         }
 
+        // Bookmark names are snapshot-invariant: a snapshot rewrites @ and moves the bookmarks
+        // on it along. A colocated workspace is the exception: there a snapshotting command also
+        // imports refs and HEAD moved by plain `git`, and moves @ onto a new git HEAD. Only a
+        // snapshot does that safely (`jj git import` under --ignore-working-copy resets git HEAD
+        // instead), so colocated workspaces keep snapshotting here, as before.
+        let workingCopy: JJWorkingCopyPolicy = Self.isColocatedWorkspace(repoURL) ? .snapshot : .recorded
         let task = Task { [runner] in
             var args = ["bookmark", "list", "--color=never"]
             switch mode {
@@ -704,7 +781,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
             case .tracked:
                 args.append("--tracked")
             }
-            let (stdout, _, exit) = try await runner.run(args, at: repoURL)
+            let (stdout, _, exit) = try await runner.run(args, at: repoURL, workingCopy: workingCopy)
             guard exit == 0 else {
                 // Treat as non-fatal: older jj may not support some flags.
                 return BookmarkListResult(names: [], isCacheable: false)
@@ -744,6 +821,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         return Array(Set(results)).sorted()
     }
 
+    /// Whether the workspace is colocated with git (`.git` beside `.jj`). jj imports changes made
+    /// with plain `git` only in such a workspace, and only while snapshotting.
+    private nonisolated static func isColocatedWorkspace(_ repoURL: URL) -> Bool {
+        FileManager.default.fileExists(atPath: repoURL.appendingPathComponent(".git").path)
+    }
+
     private func bookmarkSnapshot(repoURL: URL) async throws -> BookmarkSnapshot {
         let key = standardizedRepoPath(repoURL)
         let cacheGeneration = bookmarkCacheGenerations[key] ?? 0
@@ -757,7 +840,7 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         let task = Task { [weak self] in
             guard let self else { throw CancellationError() }
             let bookmarks = try await listBookmarks(repoURL: repoURL, mode: .all)
-            let current = try await currentBookmarksPointingAtAt(repoURL: repoURL, bookmarks: bookmarks)
+            let current = try await localBookmarksAtWorkingCopy(repoURL: repoURL, bookmarks: bookmarks)
             return BookmarkSnapshot(all: bookmarks, current: current)
         }
         bookmarkSnapshotTasks[key] = task
@@ -773,26 +856,36 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         return snapshot
     }
 
-    private func currentBookmarksPointingAtAt(repoURL: URL, bookmarks: [String]) async throws -> [String] {
-        // Best-effort approach:
-        // - Filter all bookmarks to those whose target commit_id equals @'s commit_id.
-        // This is potentially expensive; keep it lightweight by limiting to first N bookmarks.
+    /// Names of the local bookmarks pointing at the working-copy commit, sorted.
+    ///
+    /// Asks jj directly in one process rather than resolving each bookmark and comparing
+    /// commit ids, which cost one working-copy snapshot per bookmark.
+    private func localBookmarksAtWorkingCopy(repoURL: URL, bookmarks: [String]) async throws -> [String] {
+        // No bookmarks at all means none can point at @.
         guard !bookmarks.isEmpty else { return [] }
-        let atID = try await getHeadID(at: repoURL)
+        // Recorded state is sufficient: `listBookmarks` has just run, and in a colocated
+        // workspace it snapshotted, which imported any refs and HEAD moved by plain `git`.
+        let (stdout, _, exit) = try await runner.run(
+            ["log", "-r", "@", "--no-graph", "--color=never", "-T", Self.localBookmarkNamesTemplate],
+            at: repoURL,
+            workingCopy: .recorded
+        )
+        // Best-effort, like `listBookmarks`: failure means "unknown", not an error.
+        guard exit == 0 else { return [] }
+        return Self.parseLocalBookmarkNames(stdout)
+    }
 
-        // Avoid unbounded calls; check up to 50 bookmarks.
-        let cap = min(50, bookmarks.count)
-        var matches: [String] = []
-        matches.reserveCapacity(4)
+    /// Conflicted bookmarks print as empty lines: they have no single target, so jj cannot
+    /// resolve them as a revision, and they were never reported as current before.
+    private static let localBookmarkNamesTemplate =
+        #"local_bookmarks.map(|b| if(b.conflict(), "", b.name())).join("\n")"#
 
-        for name in bookmarks.prefix(cap) {
-            if Task.isCancelled { break }
-            let id = try? await getRefID(ref: name, at: repoURL)
-            if id == atID {
-                matches.append(name)
-            }
-        }
-        return matches
+    private nonisolated static func parseLocalBookmarkNames(_ output: String) -> [String] {
+        let names = output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return Array(Set(names)).sorted()
     }
 
     private func invalidateBookmarkCaches(for repoURL: URL) {
@@ -1028,7 +1121,11 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
     private func showStatsForCommit(id: String, repoURL: URL) async throws -> (filesChanged: Int, insertions: Int, deletions: Int) {
         // Prefer `jj show --stat` and parse its output.
-        let (stdout, _, exit) = try await runner.run(["show", "--color=never", "--stat", "--no-patch", id], at: repoURL)
+        let (stdout, _, exit) = try await runner.run(
+            ["show", "--color=never", "--stat", "--no-patch", id],
+            at: repoURL,
+            workingCopy: .snapshot
+        )
         if exit == 0 {
             if let summary = parseShowStat(stdout) {
                 return summary
@@ -1039,7 +1136,14 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         // Use explicit parents() revset syntax instead of "id-" shorthand to avoid
         // parsing ambiguities with arbitrary commit IDs.
         let parentRef = parentRevsetExpr(for: id)
-        let diff = try await jjDiffGit(from: parentRef, to: id, repoURL: repoURL, contextLines: 0, paths: nil)
+        let diff = try await jjDiffGit(
+            from: parentRef,
+            to: id,
+            repoURL: repoURL,
+            contextLines: 0,
+            paths: nil,
+            workingCopy: .snapshot
+        )
         let byFile = computeAddDelByFileFromUnifiedDiff(diff)
         var insertions = 0
         var deletions = 0
@@ -1075,8 +1179,12 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
 
     // MARK: - Helpers: template-safe single value
 
-    private func templateSingleValue(args: [String], at repoURL: URL) async throws -> String? {
-        let (stdout, _, exit) = try await runner.run(args, at: repoURL)
+    private func templateSingleValue(
+        args: [String],
+        at repoURL: URL,
+        workingCopy: JJWorkingCopyPolicy
+    ) async throws -> String? {
+        let (stdout, _, exit) = try await runner.run(args, at: repoURL, workingCopy: workingCopy)
         guard exit == 0 else { return nil }
         let s = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return s.isEmpty ? nil : s

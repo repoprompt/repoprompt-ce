@@ -1,6 +1,24 @@
 import CryptoKit
 import Foundation
 
+// MARK: - Working-Copy Policy
+
+/// Whether a jj command may snapshot the working copy before it runs.
+///
+/// jj snapshots by default: every command scans all tracked files and rewrites
+/// `.jj/working_copy` state before doing its work. That is required when output must
+/// reflect edits nothing has snapshotted yet, and pure overhead otherwise. Callers choose
+/// explicitly so that no command silently inherits the expensive default.
+public enum JJWorkingCopyPolicy: Sendable, Equatable {
+    /// Snapshot the working copy first (jj's default behaviour).
+    case snapshot
+    /// Read the last recorded snapshot via `--ignore-working-copy`, without scanning or
+    /// writing. Only valid for output a snapshot cannot change, or for a read that follows
+    /// a snapshot taken earlier in the same operation. Never use it for a command that writes:
+    /// jj then neither updates the working copy nor follows a moved git HEAD.
+    case recorded
+}
+
 // MARK: - JJ Command Runner
 
 /// Actor for executing Jujutsu (jj) commands safely.
@@ -19,7 +37,17 @@ public actor JJCommandRunner {
         }
     }
 
+    /// Executes a fully assembled jj argument list in place of spawning jj.
+    typealias CommandExecutor = @Sendable (
+        _ arguments: [String],
+        _ workingDirectory: URL,
+        _ stdin: Data?
+    ) async throws -> (stdout: String, stderr: String, exitCode: Int32)
+
     // MARK: - Properties
+
+    /// Test seam; `nil` in production, where commands spawn the real jj executable.
+    private let commandExecutor: CommandExecutor?
 
     /// Resolved path to the jj executable (cached after first resolution).
     private var resolvedExecutablePath: String?
@@ -29,13 +57,22 @@ public actor JJCommandRunner {
 
     // MARK: - Initialization
 
-    public init() {}
+    public init() {
+        commandExecutor = nil
+    }
+
+    /// Routes every command through `commandExecutor` instead of spawning jj, so jj-backed
+    /// behaviour can be tested without a jj installation.
+    init(commandExecutor: @escaping CommandExecutor) {
+        self.commandExecutor = commandExecutor
+    }
 
     // MARK: - Public API
 
     /// Check if jj is available on this system.
     /// - Returns: True if jj executable is found.
     public func isAvailable() async -> Bool {
+        if commandExecutor != nil { return true }
         do {
             _ = try await resolveExecutable()
             return true
@@ -54,19 +91,26 @@ public actor JJCommandRunner {
     /// - Parameters:
     ///   - args: The arguments to pass to jj (not including the jj command itself).
     ///   - at: The working directory for the command.
+    ///   - workingCopy: Whether jj may snapshot the working copy first.
     ///   - stdin: Optional stdin data to send to the process.
     /// - Returns: Tuple of (stdout, stderr, exitCode).
     public func run(
         _ args: [String],
         at repoURL: URL,
+        workingCopy: JJWorkingCopyPolicy,
         stdin: Data? = nil
     ) async throws -> (stdout: String, stderr: String, exitCode: Int32) {
+        let arguments = Self.commandArguments(args, workingCopy: workingCopy)
+        if let commandExecutor {
+            return try await commandExecutor(arguments, repoURL, stdin)
+        }
+
         let executable = try await resolveExecutable()
         let environment = try await getEnvironment()
 
         return try await runProcess(
             executable: executable,
-            args: args,
+            args: arguments,
             at: repoURL,
             environment: environment,
             stdin: stdin
@@ -77,14 +121,16 @@ public actor JJCommandRunner {
     /// - Parameters:
     ///   - args: The arguments to pass to jj.
     ///   - at: The working directory for the command.
+    ///   - workingCopy: Whether jj may snapshot the working copy first.
     /// - Returns: The stdout output.
     public func runOrThrow(
         _ args: [String],
-        at repoURL: URL
+        at repoURL: URL,
+        workingCopy: JJWorkingCopyPolicy
     ) async throws -> String {
-        let (stdout, stderr, exitCode) = try await run(args, at: repoURL)
+        let (stdout, stderr, exitCode) = try await run(args, at: repoURL, workingCopy: workingCopy)
         guard exitCode == 0 else {
-            let command = "jj " + args.joined(separator: " ")
+            let command = "jj " + Self.commandArguments(args, workingCopy: workingCopy).joined(separator: " ")
             throw JJError("Command '\(command)' failed with exit code \(exitCode): \(stderr)")
         }
         return stdout
@@ -94,6 +140,19 @@ public actor JJCommandRunner {
     public func sha256Hex(_ data: Data) -> String {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The argument list jj actually receives for `args` under `workingCopy`.
+    ///
+    /// `--ignore-working-copy` is a global flag, so it goes before the subcommand. Appended
+    /// after a trailing `-- <paths>` it would be read as a path and silently change the result.
+    static func commandArguments(_ args: [String], workingCopy: JJWorkingCopyPolicy) -> [String] {
+        switch workingCopy {
+        case .snapshot:
+            args
+        case .recorded:
+            ["--ignore-working-copy"] + args
+        }
     }
 
     // MARK: - Private Implementation
