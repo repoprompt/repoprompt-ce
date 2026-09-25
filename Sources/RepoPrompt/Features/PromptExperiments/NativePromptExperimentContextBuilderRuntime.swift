@@ -209,7 +209,8 @@
                     isSystemWorkspace: baseConfiguration.isSystemWorkspace,
                     codexRunConstraints: agent == .codexExec
                         ? .promptExperiment(workingDirectory: rootURL.path)
-                        : nil
+                        : nil,
+                    experimentInstructions: plan.instructions(for: request.attempt.condition)
                 )
                 let authority = ContextBuilderResolvedRunAuthority(
                     configuration: configuration,

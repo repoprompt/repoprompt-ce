@@ -219,6 +219,8 @@ struct ContextBuilderMCPRunConfiguration {
     let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
     let isSystemWorkspace: Bool
     let codexRunConstraints: CodexExecRunConstraints?
+    /// Sealed experiment instructions expected in the final provider request.
+    let experimentInstructions: String?
 
     init(
         identity: WorkspaceSelectionIdentity,
@@ -228,7 +230,8 @@ struct ContextBuilderMCPRunConfiguration {
         responseType: String?,
         generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority,
         isSystemWorkspace: Bool,
-        codexRunConstraints: CodexExecRunConstraints? = nil
+        codexRunConstraints: CodexExecRunConstraints? = nil,
+        experimentInstructions: String? = nil
     ) {
         self.identity = identity
         self.nestedTabContext = nestedTabContext
@@ -238,10 +241,47 @@ struct ContextBuilderMCPRunConfiguration {
         self.generatedResponseAuthority = generatedResponseAuthority
         self.isSystemWorkspace = isSystemWorkspace
         self.codexRunConstraints = codexRunConstraints
+        self.experimentInstructions = experimentInstructions
     }
 
     var effectiveTokenBudget: Int {
         runBehavior.tokenBudget
+    }
+}
+
+enum ContextBuilderExperimentPromptInsertionError: LocalizedError, Equatable {
+    case emptyInstructions
+    case missingInstructions
+    case duplicateInstructions
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyInstructions:
+            "The sealed experiment instructions are empty."
+        case .missingInstructions:
+            "The sealed experiment instructions are absent from the final Context Builder user message. No provider call was made."
+        case .duplicateInstructions:
+            "The sealed experiment instructions occur more than once in the final Context Builder user message. No provider call was made."
+        }
+    }
+}
+
+enum ContextBuilderExperimentPromptInsertion {
+    static func validate(_ message: AgentMessage, instructions: String) throws {
+        guard !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ContextBuilderExperimentPromptInsertionError.emptyInstructions
+        }
+        // Check the production insertion block, not arbitrary occurrences in the task or context.
+        let expectedBlock = "<discover_instructions>\n\(instructions)\n</discover_instructions>"
+        let count = message.userMessage.components(separatedBy: expectedBlock).count - 1
+        switch count {
+        case 1:
+            return
+        case 0:
+            throw ContextBuilderExperimentPromptInsertionError.missingInstructions
+        default:
+            throw ContextBuilderExperimentPromptInsertionError.duplicateInstructions
+        }
     }
 }
 

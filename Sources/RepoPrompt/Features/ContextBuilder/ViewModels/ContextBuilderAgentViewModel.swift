@@ -2898,6 +2898,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     await lease.failAndCleanup()
                     return .cancelled
                 }
+                if let instructions = record.mcpConfiguration?.experimentInstructions {
+                    try ContextBuilderExperimentPromptInsertion.validate(message, instructions: instructions)
+                }
                 #if DEBUG
                     observeStartupBoundary(.streamStart, record: record)
                 #endif
