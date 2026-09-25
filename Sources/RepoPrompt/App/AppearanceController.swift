@@ -26,6 +26,7 @@ final class AppearanceController: ObservableObject {
         if !isAppearanceApplied(desiredAppearance) {
             NSApplication.shared.appearance = desiredAppearance
         }
+        AppIconController.shared.applyFromGlobalSettings()
     }
 
     private func appearance(for mode: AppearanceMode) -> NSAppearance? {
