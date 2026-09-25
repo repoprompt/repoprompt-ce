@@ -360,6 +360,24 @@ extension OracleViewModel {
         } else {
             throw ChatToolError.internalError("Resolved Oracle execution is required for a new group.")
         }
+        if let images = tabContext?.transientImages, !images.isEmpty {
+            for (laneIndex, laneModel) in roster.orderedModels.enumerated() {
+                let resolution = PromptViewModel.mcpOraclePlanningModelResolution(
+                    rawValue: laneModel.modelID,
+                    isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
+                )
+                guard case let .configured(resolvedModel) = resolution else {
+                    throw ChatToolError.invalidParams(
+                        "Image attachments require every Oracle lane model to be configured; Oracle \(laneIndex + 1) is unavailable."
+                    )
+                }
+                guard OracleImageRouteAdmission.supports(resolvedModel) else {
+                    throw ChatToolError.invalidParams(
+                        "Image attachments are not supported by Oracle \(laneIndex + 1)'s model '\(resolvedModel.displayName)' on provider '\(resolvedModel.providerType.displayName)'."
+                    )
+                }
+            }
+        }
         let input = try frozenInput ?? OracleInput(mode: mode, userMessage: message)
         guard input.mode == mode, input.userMessage == message else {
             throw ChatToolError.invalidParams("Frozen Oracle input does not match the requested mode and message.")
@@ -767,7 +785,8 @@ extension OracleViewModel {
             agentModeSessionID: context.agentModeSessionID,
             agentModeRunID: context.agentModeRunID,
             activationPolicy: .background,
-            packaging: context.packaging
+            packaging: context.packaging,
+            transientImages: context.transientImages
         )
     }
 

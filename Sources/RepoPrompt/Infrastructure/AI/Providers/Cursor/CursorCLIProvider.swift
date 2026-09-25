@@ -20,6 +20,10 @@ final class CursorCLIProvider: AIProvider {
         static func test_makeHeadlessConfig(modelName: String?) -> CursorAgentConfig {
             makeHeadlessConfig(modelName: modelName)
         }
+
+        static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
+            CursorCLIProvider().makeAgentMessage(from: aiMessage)
+        }
     #endif
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -133,6 +137,7 @@ final class CursorCLIProvider: AIProvider {
         return AgentMessage(
             systemPrompt: systemPrompt.isEmpty ? systemPrompt : systemPrompt + Self.noToolsSuffix,
             userMessage: buildPrompt(from: aiMessage),
+            transientImages: aiMessage.transientImages,
             resumeSessionID: nil
         )
     }
