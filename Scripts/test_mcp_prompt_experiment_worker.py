@@ -13,6 +13,7 @@ import select
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -31,11 +32,42 @@ from mcp_evaluation import (
 )
 
 
+def read_worker_line(stream, pending: bytearray, timeout: float, timeout_message: str) -> str:
+    """Read NDJSON without mixing TextIOWrapper prefetch with fd-level select."""
+    deadline = time.monotonic() + timeout
+    while True:
+        newline = pending.find(b'\n')
+        if newline >= 0:
+            line = bytes(pending[:newline + 1])
+            del pending[:newline + 1]
+            return line.decode('utf-8')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([stream.fileno()], [], [], remaining)[0]:
+            raise AssertionError(timeout_message)
+        chunk = os.read(stream.fileno(), 65536)
+        if not chunk:
+            raise AssertionError('Worker protocol closed before the next message')
+        pending.extend(chunk)
+
+
 class InfrastructureFailure(BaseException):
     pass
 
 
 class MCPExperimentTests(unittest.TestCase):
+    def test_worker_line_reader_drains_prefetched_messages_without_fd_readability(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b'{"type":"one"}\n{"type":"two"}\n')
+            with os.fdopen(read_fd, 'rb', buffering=0) as stream:
+                pending = bytearray()
+                self.assertEqual(read_worker_line(stream, pending, 1, 'timeout'), '{"type":"one"}\n')
+                self.assertTrue(pending, 'The second line should already be in the reader buffer')
+                self.assertFalse(select.select([stream.fileno()], [], [], 0)[0])
+                self.assertEqual(read_worker_line(stream, pending, 1, 'timeout'), '{"type":"two"}\n')
+        finally:
+            os.close(write_fd)
+
     def setup_trial(self, directory):
         root = Path(directory)
         project = root / 'reviewed-project'; project.mkdir()
@@ -347,9 +379,9 @@ class MCPExperimentTests(unittest.TestCase):
                     env={'HOME':directory,'TMPDIR':directory,'PATH':'/usr/bin:/bin'})
                 try:
                     process.stdin.write(json.dumps({'protocol_version':1,'type':'run','request':body})+'\n');process.stdin.flush()
+                    pending = bytearray()
                     for _ in range(200):
-                        self.assertTrue(select.select([process.stdout],[],[],20)[0], 'Worker protocol stalled')
-                        line=process.stdout.readline();self.assertTrue(line)
+                        line = read_worker_line(process.stdout, pending, 20, 'Worker protocol stalled')
                         event=json.loads(line);events.append(event)
                         self.assertNotEqual(event['type'],'failed',event)
                         if event['type']=='completed':
@@ -434,9 +466,9 @@ class MCPExperimentTests(unittest.TestCase):
             pid=None
             try:
                 process.stdin.write(json.dumps({'protocol_version':1,'type':'run','request':body})+'\n');process.stdin.flush()
+                pending = bytearray()
                 while True:
-                    self.assertTrue(select.select([process.stdout],[],[],20)[0], 'Worker failed to reach the model callback')
-                    line=process.stdout.readline();self.assertTrue(line)
+                    line = read_worker_line(process.stdout, pending, 20, 'Worker failed to reach the model callback')
                     event=json.loads(line)
                     self.assertNotEqual(event['type'],'failed',event)
                     if event['type']=='mcp_process' and event['state']=='started':pid=event['pid']
