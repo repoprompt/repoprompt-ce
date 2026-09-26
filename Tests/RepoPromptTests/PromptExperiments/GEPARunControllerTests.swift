@@ -556,7 +556,11 @@ import XCTest
             XCTAssertEqual(request.candidateSelectionStrategy, "current_best")
             XCTAssertFalse(request.useMerge)
             XCTAssertNil(request.heldOutBaseline)
+            XCTAssertEqual(request.promptCharacterCeilingRatio, 1.0, "proposals may not grow the prompt by default")
+            XCTAssertNil(request.maxPromptCharacters)
+            XCTAssertTrue(request.objective.contains("shorter wins"))
             let wire = try String(decoding: JSONEncoder().encode(request), as: UTF8.self)
+            XCTAssertTrue(wire.contains("\"prompt_character_ceiling_ratio\":1"))
             XCTAssertFalse(wire.contains("SECRET"))
             XCTAssertFalse(wire.contains("\"good\""))
             XCTAssertFalse(wire.contains("hidden input"), "held-out inputs never cross to the worker")
@@ -669,6 +673,10 @@ import XCTest
             guard case let .evaluated(first) = replies.values.first else { return XCTFail("Expected a scored reply") }
             XCTAssertEqual(first.promptTokens, 3)
             XCTAssertEqual(first.completionTokens, 2)
+            XCTAssertEqual(first.outputCharacters, 4)
+            guard case let .evaluated(replayed) = replies.values.last else { return XCTFail("Expected a replayed reply") }
+            XCTAssertTrue(replayed.replayed)
+            XCTAssertEqual(replayed.outputCharacters, 4, "replays carry the recorded answer length for brevity")
             let usage = try XCTUnwrap(result.optimization?.candidateUsage.first ?? nil)
             XCTAssertEqual(usage.promptCharacters, "seed prompt".count)
             XCTAssertEqual(usage.evaluations, 2)

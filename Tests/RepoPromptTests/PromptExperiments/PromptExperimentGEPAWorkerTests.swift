@@ -210,6 +210,14 @@ import XCTest
             XCTAssertEqual(evaluated["status"] as? String, "ok")
             XCTAssertEqual(evaluated["replayed"] as? Bool, true)
             XCTAssertEqual(evaluated["protocol_version"] as? Int, 2)
+            XCTAssertNil(evaluated["output_characters"], "absent usage is omitted, never zero")
+            let measured = GEPAWorkerProtocol.HostReply.evaluated(.init(
+                evaluationID: "e", score: 1, feedback: "f", outputExcerpt: nil, replayed: false,
+                promptTokens: 5, completionTokens: 7, searchRemaining: 3, outputCharacters: 42
+            )).jsonObject(id: "r1")
+            XCTAssertEqual(measured["search_remaining"] as? Int, 3)
+            XCTAssertEqual(measured["output_characters"] as? Int, 42)
+            XCTAssertEqual(measured["completion_tokens"] as? Int, 7)
         }
 
         func testGEPAWorkerEnvironmentDoesNotInheritProviderCredentials() {

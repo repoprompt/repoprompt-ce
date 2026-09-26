@@ -97,6 +97,11 @@
         var skipPerfectScore = true
         /// GEPA parent selection; `current_best` always refines the incumbent.
         var candidateSelectionStrategy = "current_best"
+        /// Hard ceiling for a proposed prompt, as a multiple of the prompt being edited
+        /// (1.0: a proposal may never grow the prompt).
+        var promptCharacterCeilingRatio = 1.0
+        /// Optional absolute ceiling, applied together with the ratio.
+        var maxPromptCharacters: Int?
         var randomSeed = 0
         var stopAtScore: Double?
         /// Additional invocations per logical provider call for classified transient failures.
@@ -498,10 +503,10 @@
         }
     }
 
-    /// Canonical store document. Schema 8 adds the baseline-calibration line and usage
-    /// evidence; earlier lab documents are discarded, never migrated.
+    /// Canonical store document. Schema 9 adds the baseline-calibration line, usage
+    /// evidence, and prompt-length ceilings; earlier lab documents are discarded, never migrated.
     struct PromptExperimentDocument: Codable {
-        static let schemaVersion = 8
+        static let schemaVersion = 9
         let schemaVersion: Int
         var experiments: [PromptExperiment]
 

@@ -43,6 +43,9 @@
             let maxMergeInvocations: Int
             let skipPerfectScore: Bool
             let candidateSelectionStrategy: String
+            /// Proposal ceiling as a multiple of the prompt being edited, plus an optional absolute cap.
+            let promptCharacterCeilingRatio: Double
+            var maxPromptCharacters: Int?
             let perfectScore: Double
             let stopAtScore: Double?
             let randomSeed: Int
@@ -64,6 +67,8 @@
                 case maxMergeInvocations = "max_merge_invocations"
                 case skipPerfectScore = "skip_perfect_score"
                 case candidateSelectionStrategy = "candidate_selection_strategy"
+                case promptCharacterCeilingRatio = "prompt_character_ceiling_ratio"
+                case maxPromptCharacters = "max_prompt_characters"
                 case perfectScore = "perfect_score"
                 case stopAtScore = "stop_at_score"
                 case randomSeed = "random_seed"
@@ -101,6 +106,8 @@
             var completionTokens: Int?
             /// Search-pool admissions left after this evaluation (host ledger authority).
             var searchRemaining: Int?
+            /// Answer length, for the worker's brevity objective (replays included).
+            var outputCharacters: Int?
         }
 
         enum HostReply: Equatable {
@@ -128,6 +135,7 @@
                     if let promptTokens = reply.promptTokens { value["prompt_tokens"] = promptTokens }
                     if let completionTokens = reply.completionTokens { value["completion_tokens"] = completionTokens }
                     if let searchRemaining = reply.searchRemaining { value["search_remaining"] = searchRemaining }
+                    if let outputCharacters = reply.outputCharacters { value["output_characters"] = outputCharacters }
                 case .budgetExhausted:
                     value["status"] = "budget_exhausted"
                 case let .failed(code, message):

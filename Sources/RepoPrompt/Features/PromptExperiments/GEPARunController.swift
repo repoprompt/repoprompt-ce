@@ -203,7 +203,7 @@
             let settings = execution.settings
             return GEPAWorkerProtocol.RunRequest(
                 runName: "rpce-\(execution.experimentID.uuidString.lowercased())",
-                objective: "Improve RepoPrompt's built-in '\(execution.promptID.rawValue)' system prompt so the target model's answers score higher on suite '\(execution.suite.suiteID)'.",
+                objective: "Improve RepoPrompt's built-in '\(execution.promptID.rawValue)' system prompt so the target model's answers pass more of the checks in suite '\(execution.suite.suiteID)', with the prompt no longer than it needs to be and answers no longer than each request needs. Quality comes first; at equal quality, shorter wins.",
                 background: "The candidate is the complete prompt body. RepoPrompt appends fixed response-format instructions to it and sends each case as a production Oracle user message (frozen file map and file contents, then the case input in <user_instructions>) to a model with no tools. Preserve the prompt's role and output contract; do not memorize individual cases.",
                 seedCandidate: execution.baseline,
                 examples: execution.suite.cases.filter { $0.split != .hiddenTest }.map(wire),
@@ -223,6 +223,8 @@
                 maxMergeInvocations: settings.maxMergeInvocations,
                 skipPerfectScore: settings.skipPerfectScore,
                 candidateSelectionStrategy: settings.candidateSelectionStrategy,
+                promptCharacterCeilingRatio: settings.promptCharacterCeilingRatio,
+                maxPromptCharacters: settings.maxPromptCharacters,
                 perfectScore: execution.suite.grader.scoreRange.max,
                 stopAtScore: settings.stopAtScore,
                 randomSeed: settings.randomSeed,
@@ -448,7 +450,8 @@
                     replayed: replayed,
                     promptTokens: outcome.usage?.promptTokens,
                     completionTokens: outcome.usage?.completionTokens,
-                    searchRemaining: run.ledger.remaining(in: .search)
+                    searchRemaining: run.ledger.remaining(in: .search),
+                    outputCharacters: split == .hiddenTest ? nil : outcome.usage?.outputCharacters
                 ))
             }
         }
@@ -613,6 +616,8 @@
                     break
                 case "missing_envelope", "empty_candidate":
                     await run.progress("A reflection reply had no usable candidate (\(reflection.contract)); GEPA skipped that proposal.")
+                case "over_ceiling":
+                    await run.progress("A proposal stayed over the prompt-length ceiling after one compression repair; it was skipped without spending evaluations.")
                 default:
                     await run.progress("The reflection reply ignored the candidate envelope; its \(reflection.contract) text was used whole.")
                 }

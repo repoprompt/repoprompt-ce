@@ -2029,6 +2029,10 @@
             "description" : "create_or_update: total evaluation cap the user approves.",
             "type" : "integer"
           },
+          "max_prompt_characters" : {
+            "description" : "create_or_update: optional absolute prompt-length ceiling in characters, 200-200000.",
+            "type" : "integer"
+          },
           "max_provider_retries" : {
             "description" : "create_or_update: retries per provider call for transient failures, 0-3.",
             "type" : "integer"
@@ -2044,6 +2048,10 @@
               "propose_patch"
             ],
             "type" : "string"
+          },
+          "prompt_character_ceiling_ratio" : {
+            "description" : "create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt).",
+            "type" : "number"
           },
           "prompt_id" : {
             "description" : "create_or_update: built-in prompt ID from targets.",

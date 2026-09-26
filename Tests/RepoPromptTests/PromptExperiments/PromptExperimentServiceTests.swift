@@ -329,6 +329,27 @@ import XCTest
             }
         }
 
+        func testPromptLengthCeilingIsValidatedAndPartOfTheAuthority() async throws {
+            let harness = try makeHarness()
+            let defaults = try await create(harness.service)
+            XCTAssertEqual(defaults.authority.settings.promptCharacterCeilingRatio, 1.0)
+            XCTAssertNil(defaults.authority.settings.maxPromptCharacters)
+            let custom = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
+                promptID: "oracle-plan", maxEvaluations: 4, promptCharacterCeilingRatio: 0.8, maxPromptCharacters: 5000
+            ))
+            XCTAssertEqual(custom.authority.settings.promptCharacterCeilingRatio, 0.8)
+            XCTAssertEqual(custom.authority.settings.maxPromptCharacters, 5000)
+            XCTAssertNotEqual(custom.authorityDigest, defaults.authorityDigest, "the ceiling is approved authority")
+            do {
+                _ = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
+                    promptID: "oracle-plan", maxEvaluations: 4, promptCharacterCeilingRatio: 9, maxPromptCharacters: 10
+                ))
+                XCTFail("Out-of-range ceilings must be rejected")
+            } catch let PromptExperimentAuthorityError.validation(fields) {
+                XCTAssertEqual(Set(fields.map(\.field)), ["prompt_character_ceiling_ratio", "max_prompt_characters"])
+            }
+        }
+
         func testChangingApprovedAuthorityCreatesANewExperiment() async throws {
             let harness = try makeHarness()
             let original = try await create(harness.service)

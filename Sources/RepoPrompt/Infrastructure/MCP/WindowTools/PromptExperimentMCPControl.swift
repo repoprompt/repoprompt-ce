@@ -86,7 +86,7 @@
         private static let createArguments: Set<String> = [
             "experiment_id", "title", "prompt_id", "suite_id", "execution_target", "reflection_target",
             "judge_target", "max_evaluations", "reflection_minibatch_size", "max_provider_retries",
-            "random_seed"
+            "random_seed", "prompt_character_ceiling_ratio", "max_prompt_characters"
         ]
         static let acceptedArguments: [PromptExperimentOperation: Set<String>] = [
             .targets: [],
@@ -187,6 +187,16 @@
                     return nil
                 }
             }
+            func number(_ key: String) -> Double? {
+                guard let value = args[key], value != .null else { return nil }
+                switch value {
+                case let .int(number): return Double(number)
+                case let .double(number): return number
+                default:
+                    errors.append(.init(field: key, message: "Must be a number."))
+                    return nil
+                }
+            }
             func uuid(_ key: String, required: Bool) -> UUID? {
                 guard let text = string(key) else {
                     if required, args[key] == nil || args[key] == .null {
@@ -217,7 +227,9 @@
                     maxEvaluations: integer("max_evaluations"),
                     reflectionMinibatchSize: integer("reflection_minibatch_size"),
                     maxProviderRetries: integer("max_provider_retries"),
-                    randomSeed: integer("random_seed")
+                    randomSeed: integer("random_seed"),
+                    promptCharacterCeilingRatio: number("prompt_character_ceiling_ratio"),
+                    maxPromptCharacters: integer("max_prompt_characters")
                 ))
             case .requestApproval:
                 let id = uuid("experiment_id", required: true)
@@ -411,6 +423,8 @@
                     "calibration_evaluations": .int(authority.calibrationEvaluations),
                     "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
                     "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
+                    "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
+                    "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
                     "max_provider_retries": .int(settings.maxProviderRetries),
                     "random_seed": .int(settings.randomSeed),
                     "gepa_revision": .string(authority.gepaRevision)

@@ -31,6 +31,8 @@
         var reflectionMinibatchSize: Int?
         var maxProviderRetries: Int?
         var randomSeed: Int?
+        var promptCharacterCeilingRatio: Double?
+        var maxPromptCharacters: Int?
     }
 
     struct PromptExperimentTargetDefaults: Equatable {
@@ -306,6 +308,14 @@
             bounded("reflection_minibatch_size", request.reflectionMinibatchSize, 1 ... 100) { settings.reflectionMinibatchSize = $0 }
             bounded("max_provider_retries", request.maxProviderRetries, 0 ... 3) { settings.maxProviderRetries = $0 }
             bounded("random_seed", request.randomSeed, 0 ... Int(Int32.max)) { settings.randomSeed = $0 }
+            bounded("max_prompt_characters", request.maxPromptCharacters, 200 ... 200_000) { settings.maxPromptCharacters = $0 }
+            if let ratio = request.promptCharacterCeilingRatio {
+                if ratio.isFinite, (0.25 ... 4.0).contains(ratio) {
+                    settings.promptCharacterCeilingRatio = ratio
+                } else {
+                    errors.append(.init(field: "prompt_character_ceiling_ratio", message: "Must be between 0.25 and 4.0."))
+                }
+            }
 
             let maxEvaluations = request.maxEvaluations ?? base?.authority.maxEvaluations
             if let maxEvaluations {

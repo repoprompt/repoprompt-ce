@@ -17,6 +17,7 @@
                 field("Evaluation cap", "\(authority.maxEvaluations) total · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
                 field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
                 field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
+                field("Objectives", "quality first, then brevity (prompt and answer length) · proposals ≤ \(String(format: "%.2f", settings.promptCharacterCeilingRatio))× the edited prompt\(settings.maxPromptCharacters.map { " and ≤ \($0) chars" } ?? "")")
                 field("Authority digest", String(experiment.authorityDigest.prefix(24)))
             }
         }

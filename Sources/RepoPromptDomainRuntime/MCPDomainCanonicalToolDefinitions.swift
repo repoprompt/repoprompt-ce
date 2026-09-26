@@ -1155,6 +1155,11 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "reflection_minibatch_size": integer("create_or_update: GEPA reflection minibatch size, 1-100."),
                         "max_provider_retries": integer("create_or_update: retries per provider call for transient failures, 0-3."),
                         "random_seed": integer("create_or_update: GEPA random seed."),
+                        "prompt_character_ceiling_ratio": .object([
+                            "type": .string("number"),
+                            "description": .string("create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt).")
+                        ]),
+                        "max_prompt_characters": integer("create_or_update: optional absolute prompt-length ceiling in characters, 200-200000."),
                         "run_id": string("propose_patch: completed run UUID."),
                         "candidate_index": integer("propose_patch: retained GEPA candidate index."),
                         "timeout_seconds": .object([

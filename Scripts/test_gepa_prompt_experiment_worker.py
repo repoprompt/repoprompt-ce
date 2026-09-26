@@ -29,11 +29,14 @@ sys.path.insert(0, str(WORKER.parent))
 from gepa_worker import (  # noqa: E402
     REFLECTION_BEGIN,
     REFLECTION_END,
+    QualityThenBrevityAcceptance,
+    brevity_score,
     build_reflection_prompt,
     delimit_for_gepa,
     extract_reflection_candidate,
     fenced,
     full_iteration_cost,
+    preferred_best_index,
 )
 
 FENCE_HEAVY = """Instructions:
@@ -76,8 +79,10 @@ class FakeHost:
         feedback: Callable[[str], str] | None = None,
         output_excerpt: Callable[[str], str] | None = None,
         report_remaining: bool = True,
+        output_characters: Callable[[str], int] | None = None,
     ) -> None:
         self.report_remaining = report_remaining
+        self.output_characters_fn = output_characters
         self.reflect_prompts: list[str] = []
         self.reflect_fn = reflect
         self.score_fn = score
@@ -134,6 +139,8 @@ class FakeHost:
         }
         if self.output_excerpt_fn:
             response["output_excerpt"] = self.output_excerpt_fn(candidate)
+        if self.output_characters_fn:
+            response["output_characters"] = self.output_characters_fn(candidate)
         self.memo[key] = response
         return self.with_remaining(dict(response), payload)
 
@@ -193,6 +200,9 @@ def run_worker(
                 "random_seed": 0,
                 "run_dir": str(root / "gepa-run"),
                 "output_dir": str(root / "gepa-output"),
+                # Most scenarios propose texts longer than their short seed; the ceiling
+                # itself is exercised by dedicated tests.
+                "prompt_character_ceiling_ratio": 100.0,
                 **(extra or {}),
             },
         }) + "\n")
@@ -297,6 +307,49 @@ class ReflectionPromptTests(unittest.TestCase):
         self.assertNotIn("_budget", prompt)
         self.assertIn(f"({len(FENCE_HEAVY)} characters)", prompt)
         self.assertIn("````\n" + FENCE_HEAVY + "\n````", prompt, "the candidate is fenced safely")
+
+    def test_task_asks_for_root_causes_then_an_edit_under_the_ceiling(self) -> None:
+        prompt = build_reflection_prompt(objective="o", background="", current="x" * 40, records=[], character_ceiling=30)
+        self.assertIn("Root causes first", prompt)
+        self.assertIn("Edit, do not append", prompt)
+        self.assertIn("at most 30 characters (the current prompt has 40)", prompt)
+        self.assertLess(prompt.index("Root causes first"), prompt.index(REFLECTION_BEGIN))
+
+    def test_brevity_is_higher_for_shorter_prompts_and_answers(self) -> None:
+        same = brevity_score(prompt_characters=100, seed_prompt_characters=100, output_characters=50, reference_output_characters=50)
+        shorter = brevity_score(prompt_characters=50, seed_prompt_characters=100, output_characters=25, reference_output_characters=50)
+        longer = brevity_score(prompt_characters=200, seed_prompt_characters=100, output_characters=100, reference_output_characters=50)
+        self.assertEqual(same, 0.5)
+        self.assertEqual(shorter, 1.0)
+        self.assertEqual(longer, 0.25)
+        self.assertEqual(
+            brevity_score(prompt_characters=100, seed_prompt_characters=100, output_characters=0, reference_output_characters=50),
+            0.25, "an empty answer earns no brevity credit",
+        )
+
+    def test_acceptance_is_quality_first_and_only_shorter_on_ties(self) -> None:
+        class Evaluation:
+            def __init__(self, length: int) -> None:
+                self.trajectories = [{"_prompt_characters": length}]
+
+        class Proposal:
+            def __init__(self, before: list[float], after: list[float], child: str, parent_length: int) -> None:
+                self.subsample_scores_before = before
+                self.subsample_scores_after = after
+                self.candidate = {"current_candidate": child}
+                self.eval_before = Evaluation(parent_length)
+
+        accept = QualityThenBrevityAcceptance().should_accept
+        self.assertTrue(accept(Proposal([0.5, 0.5], [0.6, 0.5], "x" * 50, 10), None), "better quality wins even if longer")
+        self.assertFalse(accept(Proposal([0.5, 0.5], [0.4, 0.5], "x", 10), None))
+        self.assertTrue(accept(Proposal([0.5, 0.5], [0.5, 0.5], "x" * 9, 10), None), "a tie accepts a shorter prompt")
+        self.assertFalse(accept(Proposal([0.5, 0.5], [0.5, 0.5], "x" * 10, 10), None), "a tie never accepts equal length")
+        self.assertFalse(accept(Proposal([0.5, 0.5], [0.5, 0.5], "x" * 11, 10), None), "a tie never accepts longer")
+
+    def test_best_prefers_the_shortest_among_validation_ties(self) -> None:
+        self.assertEqual(preferred_best_index(["long seed", "mid", "s"], [0.5, 0.8, 0.8], 1), 2)
+        self.assertEqual(preferred_best_index(["a", "bb"], [0.9, 0.8], 0), 0)
+        self.assertEqual(preferred_best_index(["a"], [None], 0), 0)
 
     def test_full_iteration_cost(self) -> None:
         self.assertEqual(full_iteration_cost(minibatch=2, training=6, validation=3), 7)
@@ -438,6 +491,50 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertIn("score 0.000", prompt)
         self.assertNotIn("_budget", prompt)
         self.assertIn("Produce the exact words improved candidate.", prompt, "objective survives the custom proposer")
+
+    def test_over_ceiling_proposal_gets_one_repair_then_is_skipped(self) -> None:
+        def reflect(prompt: str, count: int) -> str:
+            if "over the hard limit" in prompt:
+                return envelope("still far too long a candidate" if count == 2 else "tiny")
+            return envelope("a candidate that is far too long")
+
+        host = FakeHost(reflect=reflect, score=exact("tiny"))
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, extra={"prompt_character_ceiling_ratio": 1.0},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        usage = dict(item.split("=") for item in result["proposer_usage"].split(","))
+        self.assertEqual(int(usage["skipped_over_ceiling"]), 1)
+        self.assertGreaterEqual(int(usage["ceiling_repairs"]), 2)
+        self.assertIn("over_ceiling", [m["contract"] for m in messages if m["type"] == "reflection"])
+        evaluated = {payload["candidate"] for payload in host.evaluate_payloads}
+        self.assertNotIn("still far too long a candidate", evaluated, "an over-ceiling text is never evaluated")
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], "tiny")
+        self.assertTrue(all(len(p["candidate"]) <= len("bad candidate") for p in host.evaluate_payloads))
+
+    def test_equal_quality_shorter_prompt_is_accepted_and_reported_best(self) -> None:
+        host = FakeHost(reflect=always("short"), score=lambda candidate, payload: 0.5, search_cap=6)
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, stop_at_score=None, skip_perfect_score=False,
+            search_max_evaluations=6, extra={"prompt_character_ceiling_ratio": 1.0},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        texts = self.registered(messages)
+        self.assertIn("short", texts.values(), "a tie at a shorter length is accepted into the pool")
+        self.assertEqual(texts[result["best_candidate_index"]], "short", "the shortest tied candidate is best")
+
+    def test_scores_carry_quality_and_brevity_for_the_frontier(self) -> None:
+        host = FakeHost(
+            reflect=always("improved candidate"), score=exact("improved candidate"),
+            output_characters=lambda candidate: 100 if candidate == "bad candidate" else 50,
+        )
+        terminal, messages, code, stderr = run_worker(self.root, host)
+        self.assert_completed(terminal, code, stderr)
+        prompt = host.reflect_prompts[0]
+        # GEPA renames side_info "scores" to its objective field; the proposer renders it.
+        self.assertIn("Objective scores (higher is better): brevity 0.500, quality 0.000", prompt)
+        self.assertIn("answer length 100 characters", prompt)
+        self.assertNotIn("_prompt_characters", prompt)
 
     def test_identical_proposal_is_skipped_without_spending_a_child_pass(self) -> None:
         def reflect(prompt: str, count: int) -> str:

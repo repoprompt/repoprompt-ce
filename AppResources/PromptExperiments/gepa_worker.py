@@ -27,7 +27,14 @@ Budget contract (pinned GEPA 0.1.4 / 0632cdb5):
 Reflection: the worker owns the reflection prompt through GEPA's
 `custom_candidate_proposer`, so the reflection model sees the objective, the case
 request, the score, the grader feedback, and a head+tail output excerpt per case, and
-never GEPA's internal `_budget` bookkeeping.
+never GEPA's internal `_budget` bookkeeping. The proposer first clusters the
+minibatch failures into root causes, then returns an edited prompt under a hard
+character ceiling (default: the current prompt's length).
+
+Objectives: the scalar score is quality; side_info `scores` = {quality, brevity}
+(higher is better) feeds GEPA's hybrid frontier. Acceptance is quality first, and on
+an exact quality tie only a strictly shorter prompt is accepted; the reported best is
+the shortest candidate among validation-score ties.
 """
 
 from __future__ import annotations
@@ -67,7 +74,77 @@ SIDE_INFO_REQUEST = "request"
 SIDE_INFO_SCORE = "score"
 SIDE_INFO_FEEDBACK = "feedback"
 SIDE_INFO_OUTPUT = "output"
+SIDE_INFO_OUTPUT_CHARACTERS = "output_characters"
 SIDE_INFO_OBJECTIVES = "Scores (Higher is Better)"
+# Hidden ("_"-prefixed) so reflection never sees it; the acceptance criterion reads it.
+SIDE_INFO_PROMPT_CHARACTERS = "_prompt_characters"
+SCORE_EPSILON = 1e-9
+
+
+def length_ratio_score(reference: int | None, actual: int) -> float:
+    """Higher-is-better length score in [0, 1]: 0.5 at the reference length, 1.0 at half
+    of it or less, 0.25 at double. Neutral 0.5 without a reference."""
+    if reference is None or reference <= 0:
+        return 0.5
+    if actual <= 0:
+        return 1.0
+    return max(0.0, min(1.0, 0.5 * reference / actual))
+
+
+def brevity_score(
+    *,
+    prompt_characters: int,
+    seed_prompt_characters: int | None,
+    output_characters: int | None,
+    reference_output_characters: int | None,
+) -> float:
+    """Equal blend of prompt brevity (vs. the seed prompt) and answer brevity (vs. the
+    seed's answer on the same case). An empty answer earns no brevity credit."""
+    prompt_part = length_ratio_score(seed_prompt_characters, prompt_characters)
+    if output_characters is None:
+        output_part = 0.5
+    elif output_characters <= 0:
+        output_part = 0.0
+    else:
+        output_part = length_ratio_score(reference_output_characters, output_characters)
+    return round(0.5 * (prompt_part + output_part), 6)
+
+
+def prompt_characters_of(evaluation: Any) -> int | None:
+    for info in getattr(evaluation, "trajectories", None) or []:
+        value = info.get(SIDE_INFO_PROMPT_CHARACTERS) if isinstance(info, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+class QualityThenBrevityAcceptance:
+    """GEPA acceptance criterion: a strictly higher minibatch quality sum is accepted; on
+    an exact tie only a strictly shorter prompt is (so ties never favour longer prompts)."""
+
+    def should_accept(self, proposal: Any, state: Any) -> bool:
+        before = sum(proposal.subsample_scores_before or [])
+        after = sum(proposal.subsample_scores_after or [])
+        if after > before + SCORE_EPSILON:
+            return True
+        if after < before - SCORE_EPSILON:
+            return False
+        parent_length = prompt_characters_of(proposal.eval_before)
+        return parent_length is not None and len(candidate_text(proposal.candidate)) < parent_length
+
+    def reject_reason(self, proposal: Any, state: Any) -> str:
+        return "not better on quality, and not a shorter prompt at equal quality"
+
+
+def preferred_best_index(texts: list[str], scores: list[float | None], gepa_best: int | None) -> int | None:
+    """GEPA's best, except that among candidates tied on the validation aggregate the
+    shortest prompt wins (then the earliest index)."""
+    finite = [(index, score) for index, score in enumerate(scores) if score is not None]
+    if not finite:
+        return gepa_best
+    top = max(score for _, score in finite)
+    tied = [index for index, score in finite if score >= top - SCORE_EPSILON]
+    return min(tied, key=lambda index: (len(texts[index]), index))
 
 
 def fenced(text: str, info: str = "") -> str:
@@ -85,7 +162,11 @@ def format_score(value: Any) -> str:
 
 
 def render_case(position: int, record: dict[str, Any]) -> str:
-    parts = [f"### Case {position} — score {format_score(record.get(SIDE_INFO_SCORE))}"]
+    header = f"### Case {position} — score {format_score(record.get(SIDE_INFO_SCORE))}"
+    output_characters = record.get(SIDE_INFO_OUTPUT_CHARACTERS)
+    if isinstance(output_characters, int) and not isinstance(output_characters, bool):
+        header += f", answer length {output_characters} characters"
+    parts = [header]
     objectives = record.get(SIDE_INFO_OBJECTIVES)
     if isinstance(objectives, dict) and objectives:
         rendered = ", ".join(f"{name} {format_score(value)}" for name, value in sorted(objectives.items()))
@@ -99,7 +180,10 @@ def render_case(position: int, record: dict[str, Any]) -> str:
     output = record.get(SIDE_INFO_OUTPUT)
     if isinstance(output, str) and output:
         parts.append("Target output (head and tail excerpt):\n" + fenced(output))
-    known = {SIDE_INFO_REQUEST, SIDE_INFO_SCORE, SIDE_INFO_FEEDBACK, SIDE_INFO_OUTPUT, SIDE_INFO_OBJECTIVES}
+    known = {
+        SIDE_INFO_REQUEST, SIDE_INFO_SCORE, SIDE_INFO_FEEDBACK, SIDE_INFO_OUTPUT,
+        SIDE_INFO_OUTPUT_CHARACTERS, SIDE_INFO_OBJECTIVES,
+    }
     for key in sorted(k for k in record if isinstance(k, str) and k not in known and not k.startswith("_")):
         value = record[key]
         text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
@@ -113,9 +197,13 @@ def build_reflection_prompt(
     background: str,
     current: str,
     records: list[dict[str, Any]],
+    character_ceiling: int | None = None,
 ) -> str:
     """The complete reflection request for one component. `records` are GEPA's reflective
-    dataset entries (the evaluator's side_info per minibatch case)."""
+    dataset entries (the evaluator's side_info per minibatch case). The task asks for an
+    ESPO-style root-cause diagnosis across all cases first, then an edited (not appended)
+    prompt within `character_ceiling`."""
+    ceiling = character_ceiling if character_ceiling is not None else len(current)
     sections = [
         "You are improving a system prompt. Analyze the evaluation evidence and propose a revised prompt.",
         "## Optimization goal\n\n" + objective,
@@ -130,14 +218,29 @@ def build_reflection_prompt(
     )
     sections.append(
         "## Your task\n\n"
-        "1. Diagnose: explain each low score by what the prompt says, omits, or over-emphasizes. "
-        "Look for root causes shared across cases rather than one-off noise.\n"
-        "2. Preserve: keep the instructions the high-scoring behavior relied on.\n"
-        "3. Revise: edit the current prompt to remove those root causes. Prefer rewriting or "
-        "tightening existing text over appending new rules, and never add case-specific content.\n"
-        "4. Keep the prompt's role and output contract."
+        "1. Root causes first. Before writing any prompt text, list at most three root causes that "
+        "together explain the failures across ALL cases above. Cluster failures that share a cause and "
+        "ignore one-off noise. For each root cause give: the cause, the cases and failed checks it "
+        "explains, and the current prompt text responsible (quote it, or name what is missing).\n"
+        "2. Edit, do not append. Produce an edited version of the current prompt that removes those "
+        "root causes by rewriting, merging, tightening, or deleting existing text. Do not add a list of "
+        "new rules or any case-specific content; when you add a sentence, compress or remove another.\n"
+        "3. Preserve what the high-scoring cases relied on, and keep the prompt's role and output contract.\n"
+        f"4. Hard length limit: the new prompt must be at most {ceiling} characters (the current prompt "
+        f"has {len(current)}). At equal quality, shorter prompts and shorter answers win.\n\n"
+        "Write the root-cause list first, then the complete edited prompt inside the envelope."
     )
     return "\n\n".join(sections) + REFLECTION_OUTPUT_CONTRACT
+
+
+def ceiling_repair_prompt(prompt: str, text: str, ceiling: int) -> str:
+    return (
+        prompt
+        + f"\n\nYour previous revision below has {len(text)} characters, over the hard limit of {ceiling}. "
+        "Return a shorter edited version of it that keeps its fixes: compress or delete, do not append. "
+        "Use the same envelope.\n\n"
+        + fenced(text)
+    )
 
 
 class WorkerCancelled(BaseException):
@@ -334,6 +437,11 @@ class RunState:
         self.reflection_limit_reached = False
         self.skipped_identical_proposals = 0
         self.skipped_repeated_proposals = 0
+        self.ceiling_repairs = 0
+        self.skipped_over_ceiling = 0
+        # Brevity references: the seed prompt and its answer length per case.
+        self.seed_text: str | None = None
+        self.seed_output_characters: dict[str, int] = {}
         # Texts already proposed in this process: re-proposing one would only replay free
         # ledger outcomes, so it can never drain the budget the stopper watches.
         self.proposed_sha256: set[str] = set()
@@ -482,6 +590,24 @@ def main() -> int:
         )
         objective = str(body["objective"])
         background = str(body.get("background") or "")
+        seed_candidate = body.get("seed_candidate")
+        if isinstance(seed_candidate, str):
+            state.seed_text = seed_candidate
+        ceiling_ratio = body.get("prompt_character_ceiling_ratio")
+        ceiling_ratio = float(ceiling_ratio) if isinstance(ceiling_ratio, (int, float)) and ceiling_ratio > 0 else 1.0
+        max_prompt_characters = body.get("max_prompt_characters")
+        max_prompt_characters = (
+            int(max_prompt_characters)
+            if isinstance(max_prompt_characters, int) and not isinstance(max_prompt_characters, bool)
+            and max_prompt_characters > 0
+            else None
+        )
+
+        def character_ceiling(current: str) -> int:
+            ceiling = math.floor(len(current) * ceiling_ratio)
+            if max_prompt_characters is not None:
+                ceiling = min(ceiling, max_prompt_characters)
+            return max(1, ceiling)
 
         def reflect_candidate(prompt: str) -> str:
             """One host reflection call; returns the enveloped candidate or raises
@@ -524,9 +650,26 @@ def main() -> int:
             for component in components_to_update:
                 current = str(candidate.get(component, ""))
                 records = [dict(record) for record in (reflective_dataset.get(component) or [])]
-                text = reflect_candidate(build_reflection_prompt(
+                ceiling = character_ceiling(current)
+                prompt = build_reflection_prompt(
                     objective=objective, background=background, current=current, records=records,
-                ))
+                    character_ceiling=ceiling,
+                )
+                text = reflect_candidate(prompt)
+                if len(text) > ceiling:
+                    # One compression repair; a second overrun skips the proposal (no retry
+                    # storm: an empty proposal is not an exception GEPA re-runs).
+                    state.ceiling_repairs += 1
+                    text = reflect_candidate(ceiling_repair_prompt(prompt, text, ceiling))
+                    if len(text) > ceiling:
+                        state.skipped_over_ceiling += 1
+                        emit({
+                            "type": "reflection",
+                            "event_id": f"reflection:{state.reflection_calls}:over_ceiling",
+                            "contract": "over_ceiling",
+                            "candidate_sha256": sha256_text(text),
+                        })
+                        continue
                 if text == current:
                     # An unchanged proposal would spend a child minibatch pass for nothing.
                     state.skipped_identical_proposals += 1
@@ -562,6 +705,18 @@ def main() -> int:
             example_value = example if isinstance(example, dict) else {"id": "single", "split": "training"}
             response = host_evaluate(text, example_value)
             score = finite_score(response.get("score"))
+            if state.seed_text is None:
+                state.seed_text = text  # seedless: the generated seed is the reference
+            output_characters = response.get("output_characters")
+            if not isinstance(output_characters, int) or isinstance(output_characters, bool) or output_characters < 0:
+                output_characters = None
+            example_id = str(example_value["id"])
+            if text == state.seed_text and output_characters is not None:
+                state.seed_output_characters.setdefault(example_id, output_characters)
+            reference_output = state.seed_output_characters.get(example_id)
+            if reference_output is None and state.seed_output_characters:
+                known = sorted(state.seed_output_characters.values())
+                reference_output = known[len(known) // 2]
             emit({
                 "type": "evaluation",
                 "event_id": str(response.get("evaluation_id") or "unavailable"),
@@ -580,6 +735,18 @@ def main() -> int:
             excerpt = response.get("output_excerpt")
             if isinstance(excerpt, str) and excerpt:
                 side_info[SIDE_INFO_OUTPUT] = excerpt
+            if output_characters is not None:
+                side_info[SIDE_INFO_OUTPUT_CHARACTERS] = output_characters
+            side_info[SIDE_INFO_PROMPT_CHARACTERS] = len(text)
+            side_info["scores"] = {
+                "quality": score,
+                "brevity": brevity_score(
+                    prompt_characters=len(text),
+                    seed_prompt_characters=len(state.seed_text) if state.seed_text else None,
+                    output_characters=output_characters,
+                    reference_output_characters=reference_output,
+                ),
+            }
             return score, side_info
 
         def examples(key: str, *, with_input: bool) -> list[dict[str, Any]]:
@@ -640,6 +807,9 @@ def main() -> int:
                     "write_agent_state": True,
                     "raise_on_exception": True,
                     "candidate_selection_strategy": str(body.get("candidate_selection_strategy") or "current_best"),
+                    # Pareto fronts over per-case scores and the {quality, brevity} objectives.
+                    "frontier_type": "hybrid",
+                    "acceptance_criterion": QualityThenBrevityAcceptance(),
                 },
                 "stop_callbacks": [LedgerBudgetStopper(state, iteration_cost, max_reflections=search_max_evaluations)],
                 "callbacks": build_callbacks(state),
@@ -688,7 +858,8 @@ def main() -> int:
                     "parent_indices": parents[index],
                     "aggregate_score": scores[index],
                 })
-            best_index = int(result.best_idx) if result.best_idx is not None else None
+            gepa_best = int(result.best_idx) if result.best_idx is not None else None
+            best_index = preferred_best_index(texts, scores, gepa_best)
             best_score = scores[best_index] if best_index is not None else None
             baseline_score = scores[0] if scores else None
 
@@ -748,7 +919,9 @@ def main() -> int:
                     f"completion_tokens={state.completion_tokens},reported_callbacks={state.usage_reported},"
                     f"unavailable_callbacks={state.usage_unavailable},"
                     f"skipped_identical_proposals={state.skipped_identical_proposals},"
-                    f"skipped_repeated_proposals={state.skipped_repeated_proposals}"
+                    f"skipped_repeated_proposals={state.skipped_repeated_proposals},"
+                    f"ceiling_repairs={state.ceiling_repairs},"
+                    f"skipped_over_ceiling={state.skipped_over_ceiling}"
                 ),
             },
         })
