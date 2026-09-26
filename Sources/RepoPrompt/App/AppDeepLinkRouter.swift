@@ -58,9 +58,21 @@ final class AppDeepLinkRouter {
         }
     }
 
+    /// Notification click routing. Unlike in-app `route(agentSession:)`, a click that arrives before any
+    /// window is live (cold launch from the notification, or MCP background mode) queues the route URL;
+    /// `WindowStatesManager.registerWindowState` drains it once a window registers.
     func route(notificationRoute route: AgentSessionDeepLinkRoute?) async {
         guard let route else {
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp?.activate(ignoringOtherApps: true)
+            return
+        }
+        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        guard !liveWindows.isEmpty else {
+            windowStatesManager.pendingURLs.append(route.url)
+            NSApp?.activate(ignoringOtherApps: true)
+            if MCPBackgroundModeCoordinator.shared.isBackgrounded {
+                MCPBackgroundModeCoordinator.shared.restore()
+            }
             return
         }
         _ = await self.route(agentSession: route)

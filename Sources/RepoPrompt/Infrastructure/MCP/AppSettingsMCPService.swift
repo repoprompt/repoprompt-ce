@@ -50,7 +50,7 @@ final class AppSettingsMCPService: Service {
 
                 **Selectors**: `get` accepts exactly one of `key`, `keys`, or `group`. `set` and `options` take one `key`.
 
-                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode`
+                **Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode` · `notifications`
 
                 **Examples**:
                 - `{"op":"list","group":"ui"}`
@@ -66,7 +66,7 @@ final class AppSettingsMCPService: Service {
                 inputSchema: .object(
                     properties: [
                         "op": .string(description: "Operation.", enum: ["list", "get", "set", "options"]),
-                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]),
+                        "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]),
                         "key": .string(description: "Allowlisted setting key (required for set/options)."),
                         "keys": .array(description: "Multiple keys (get only).", items: .string()),
                         "value": .anyOf([
@@ -605,7 +605,7 @@ private struct AppSettingDefinition: @unchecked Sendable {
 }
 
 private enum AppSettingsMCPRegistry {
-    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]
+    static let groups = ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode", "notifications"]
 
     private static let appearanceModes = ["System", "Light", "Dark"]
     private static let filePathDisplayOptions = ["Full", "Relative"]
@@ -964,7 +964,23 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setShowEmptyFolders(requiredBool(from: $1)) },
             afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.show_empty_folders")
         )
-    ] + debugDefinitions
+    ] + notificationDefinitions + debugDefinitions
+
+    /// Notification preferences. Keys, labels, and descriptions are single-sourced in
+    /// `NotificationSettingDescriptor` so the Settings pane and this surface cannot drift.
+    private static let notificationDefinitions: [AppSettingDefinition] = NotificationSettingDescriptor.all.map { descriptor in
+        boolSetting(
+            key: descriptor.appSettingsKey,
+            group: "notifications",
+            label: descriptor.label,
+            description: descriptor.description,
+            read: { .bool($0.notificationSetting(descriptor)) },
+            write: { store, value in
+                let enabled = try requiredBool(from: value)
+                store.setNotificationSetting(descriptor, enabled)
+            }
+        )
+    }
 
     #if DEBUG
         private static let debugDefinitions: [AppSettingDefinition] = [

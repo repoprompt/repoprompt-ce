@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import JSONSchema
 import MCP
@@ -213,7 +214,12 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             // For non-MCP-controlled sessions, surface the tab so the user can
             // see and answer the question. MCP-controlled runs handle interactions
             // programmatically via `respond`, so pulling focus would be disruptive.
-            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID) {
+            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID),
+               !Self.prefersNotificationOverActivation(
+                   isAppActive: NSApp?.isActive == true,
+                   preferences: GlobalSettingsStore.shared.notificationPreferences()
+               )
+            {
                 _ = await targetWindow.revealPendingInteraction(
                     tabID: tabID,
                     surface: .agentQuestion
@@ -293,6 +299,19 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         } onCancel: {
             Task { await coordinator.cancel(requestID: requestID) }
         }
+    }
+
+    /// Opt-in (`notifications.mcp_ask_user_notify_instead_of_activate`): while RepoPrompt is in the
+    /// background, let the attention-notification reconciler surface the question instead of pulling
+    /// the app to the front. Default behavior (reveal the tab) is unchanged.
+    nonisolated static func prefersNotificationOverActivation(
+        isAppActive: Bool,
+        preferences: NotificationPreferences
+    ) -> Bool {
+        !isAppActive
+            && preferences.enabled
+            && preferences.agentInteractions
+            && preferences.mcpAskUserNotifyInsteadOfActivate
     }
 
     nonisolated static func resolvedInteractionTimeoutSeconds(

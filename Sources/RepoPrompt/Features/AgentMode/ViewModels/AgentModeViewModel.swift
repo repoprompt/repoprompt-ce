@@ -478,6 +478,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // One eager revocation hook covering every live-session removal path (tab close, stash,
             // delete, MCP control teardown) instead of five separate call sites that could drift.
             notifyAgentSessionLinkBindingsChanged(previous: oldValue)
+            syncAttentionNotificationObservers()
         }
     }
 
@@ -913,7 +914,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var tabDraftText: [UUID: String] = [:]
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
-    private var isAgentModeActive = false
+    private(set) var isAgentModeActive = false
+    /// Observation state feeding `AgentNotificationCoordinator` (see `+AttentionNotifications`).
+    let notificationAttention = AgentModeNotificationAttentionTracker()
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
@@ -3069,6 +3072,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 notifyAgentTurnComplete: { [weak self] session in
                     self?.notifyAgentTurnComplete(for: session)
+                },
+                notifyAgentTurnFailed: { [weak self] session, errorText in
+                    self?.notifyAgentTurnFailed(for: session, errorText: errorText)
                 }
             ),
             bindingObservation: .init(
@@ -4069,6 +4075,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let workspaceIDForLog = workspaceManager?.activeWorkspace?.id
         #endif
         isAgentModeActive = isActive
+        NotificationService.shared.agentNotifications.visibilityMayHaveChanged()
         guard isActive else {
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
@@ -13548,7 +13555,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return lowered == "request_user_input" || lowered == "requestuserinput" || lowered.hasSuffix(".requestuserinput")
     }
 
-    private func resolvedSessionDisplayName(for tabID: UUID) -> String {
+    func resolvedSessionDisplayName(for tabID: UUID) -> String {
         normalizedSessionTitle(workspaceManager?.composeTabName(with: tabID))
     }
 
@@ -19663,7 +19670,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let inlineItem = AgentChatItem.assistantInline(waitMessage, sequenceIndex: session.nextSequenceIndex)
         session.appendItem(inlineItem)
         updateBindingsFromSession(session)
-        notifyAgentWaitingForUser(for: tabID, prompt: waitMessage)
+        // The instruction wait surfaces through the attention-notification reconciler once the
+        // continuation below is installed (see `AgentPendingInteractionDescriptor.make`).
 
         return try await withCheckedThrowingContinuation { continuation in
             session.instructionContinuation = continuation
@@ -20343,47 +20351,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func notifyAgentTurnComplete(for session: TabSession) {
-        let preview = latestAssistantPreviewText(in: session)
-        NotificationService.shared.notifyAgentTurnComplete(
-            sessionName: resolvedSessionDisplayName(for: session.tabID),
-            previewText: preview,
-            route: agentNotificationRoute(for: session),
-            fallbackToDockBounce: true
+        guard let state = attentionNotificationState(for: session, includeInteraction: false) else { return }
+        NotificationService.shared.agentNotifications.postTurnOutcome(
+            .completed(preview: latestAssistantPreviewText(in: session)),
+            for: state
         )
     }
 
-    func notifyAgentWaitingForUser(for tabID: UUID, prompt: String) {
-        NotificationService.shared.notifyAgentWaitingForUser(
-            sessionName: resolvedSessionDisplayName(for: tabID),
-            promptText: prompt,
-            route: agentNotificationRoute(forTabID: tabID),
-            fallbackToDockBounce: true
-        )
-    }
-
-    private func agentNotificationRoute(for session: TabSession) -> AgentSessionDeepLinkRoute? {
-        agentNotificationRoute(forTabID: session.tabID, sessionID: session.activeAgentSessionID)
-    }
-
-    private func agentNotificationRoute(forTabID tabID: UUID, sessionID explicitSessionID: UUID? = nil) -> AgentSessionDeepLinkRoute? {
-        guard let workspace = workspaceManager?.activeWorkspace else {
-            return nil
-        }
-        let tabIsInWorkspace = workspace.composeTabs.contains(where: { $0.id == tabID })
-            || workspace.stashedTabs.contains(where: { $0.tab.id == tabID })
-        guard tabIsInWorkspace else {
-            return nil
-        }
-
-        let resolvedSessionID = explicitSessionID
-            ?? sessions[tabID]?.activeAgentSessionID
-            ?? workspaceManager?.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspace.id)
-        return AgentSessionDeepLinkRoute(
-            windowID: windowID,
-            workspaceID: workspace.id,
-            tabID: tabID,
-            sessionID: resolvedSessionID
-        )
+    func notifyAgentTurnFailed(for session: TabSession, errorText: String?) {
+        guard let state = attentionNotificationState(for: session, includeInteraction: false) else { return }
+        NotificationService.shared.agentNotifications.postTurnOutcome(.failed(message: errorText), for: state)
     }
 
     private func latestAssistantPreviewText(in session: TabSession) -> String? {

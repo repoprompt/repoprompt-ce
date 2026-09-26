@@ -28,6 +28,8 @@ struct AgentRunTerminalSessionBinding {
         ) -> AgentRunTerminalPublicationEnvelope?
         let updateBindings: @MainActor () -> Void
         let notifyAgentTurnComplete: @MainActor () -> Void
+        /// Defaulted so bindings built by test doubles that predate failure notifications compile.
+        var notifyAgentTurnFailed: @MainActor (_ errorText: String?) -> Void = { _ in }
         let scheduleSave: @MainActor () -> Void
         let publishTerminalCommit: @MainActor (
             AgentRunTerminalCommitRevision,

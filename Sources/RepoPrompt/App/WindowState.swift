@@ -885,6 +885,7 @@ class WindowState: ObservableObject {
         guard !shouldSuppressObservationSideEffects else { return }
         guard isCurrentlyFocused != focused else { return }
         isCurrentlyFocused = focused
+        NotificationService.shared.agentNotifications.visibilityMayHaveChanged()
         workspaceFilesViewModel.setWindowFocused(focused)
         scheduleFocusSideEffects(focused)
     }
@@ -1693,7 +1694,16 @@ class WindowState: ObservableObject {
         } else {
             focusWindowIfPossible()
         }
+        if route.interactionID != nil {
+            agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
+        }
         return .routed
+    }
+
+    /// Whether the given agent session is the transcript the user is looking at in this window.
+    func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
+        guard !isClosing, isCurrentlyFocused else { return false }
+        return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
     }
 
     @MainActor
