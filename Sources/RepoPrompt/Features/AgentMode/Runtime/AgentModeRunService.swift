@@ -298,7 +298,6 @@ final class AgentModeRunService {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
             // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
             // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
             modelParameterSelections: selectedAgent.acpProviderID.map { providerID in

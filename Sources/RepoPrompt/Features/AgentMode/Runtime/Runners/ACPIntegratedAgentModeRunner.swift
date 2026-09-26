@@ -922,6 +922,7 @@ final class ACPIntegratedAgentModeRunner {
                 { [self] in
                     try await applyRequestedSessionModeIfNeeded(
                         runRequest.sessionModeID,
+                        agentKind: runRequest.agentKind,
                         controller: controller
                     )
                 }
@@ -945,10 +946,13 @@ final class ACPIntegratedAgentModeRunner {
 
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
+        agentKind: AgentProviderKind,
         controller: ACPAgentSessionController
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
+        } else if agentKind == .devin {
+            try await controller.restoreOpenedSessionMode()
         }
     }
 
@@ -979,7 +983,7 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         modelString: String?
     ) throws -> String? {
-        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity || agentKind == .devin else { return nil }
         guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame

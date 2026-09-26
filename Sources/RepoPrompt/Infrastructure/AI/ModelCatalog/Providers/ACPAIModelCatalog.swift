@@ -382,7 +382,7 @@ enum ACPAIModelCatalog {
     }
 
     static func devinModelsFromStore() -> [AIModel] {
-        devinModelOptionsFromStore().map { .devinCustom(name: $0.rawValue) }
+        devinPickerOptionsFromStore().map { .devinCustom(name: $0.rawValue) }
     }
 
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
@@ -406,8 +406,45 @@ enum ACPAIModelCatalog {
     static func devinModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
-        return devinModelOptionsFromStore()
+        return devinPickerOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    private static func devinPickerOptionsFromStore() -> [AgentModelOption] {
+        guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin) else { return [] }
+        var options = snapshot.options
+        var seen = Set(options.map { $0.rawValue.lowercased() })
+        for option in snapshot.options {
+            // Fusion and SWE thought settings do not map one-to-one to Devin CLI model IDs.
+            guard !option.rawValue.hasPrefix("fusion-"), !option.rawValue.hasPrefix("swe-") else { continue }
+            guard let parameterSet = snapshot.modelParameterSets.first(where: {
+                $0.baseModelRaw.caseInsensitiveCompare(option.rawValue) == .orderedSame
+            }), let thinking = parameterSet.definition(kind: .thinking),
+            let encoded = thinking.choices.first(where: { option.rawValue.hasSuffix("-\($0.rawValue)") })
+            else { continue }
+            let suffix = "-\(encoded.rawValue)"
+            let stem = option.rawValue.dropLast(suffix.count)
+            for choice in thinking.choices {
+                guard choice.rawValue != encoded.rawValue,
+                      choice.rawValue.range(of: "^[a-z]+$", options: .regularExpression) != nil
+                else { continue }
+                let raw = "\(stem)-\(choice.rawValue)"
+                guard seen.insert(raw.lowercased()).inserted else { continue }
+                var name = option.displayName
+                if let range = name.range(of: encoded.displayName, options: [.caseInsensitive, .backwards]) {
+                    name.replaceSubrange(range, with: choice.displayName)
+                } else {
+                    name += " · \(choice.displayName)"
+                }
+                options.append(AgentModelOption(
+                    rawValue: raw,
+                    displayName: name,
+                    description: option.description,
+                    isDefault: false
+                ))
+            }
+        }
+        return options
     }
 
     static func normalizedCursorModelAlias(_ value: String) -> String {

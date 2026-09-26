@@ -156,11 +156,8 @@ final class AgentProviderPreferenceSnapshotStore {
             )
         case .devin:
             let level = effectiveDevinPermissionLevel(profile: profile)
-            // Devin's level becomes a launch-time `--permission-mode` argument. RepoPrompt
-            // does not auto-select Devin permission options, so the auto-approval flags stay
-            // false for every mode.
             return AgentProviderRuntimePermissionBinding(
-                acpLaunchPermissionMode: level.cliPermissionMode
+                acpSessionModeID: level.sessionModeID
             )
         }
     }
