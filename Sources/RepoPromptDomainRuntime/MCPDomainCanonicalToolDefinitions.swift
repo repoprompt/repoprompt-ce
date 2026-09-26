@@ -1160,6 +1160,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                             "description": .string("create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt).")
                         ]),
                         "max_prompt_characters": integer("create_or_update: optional absolute prompt-length ceiling in characters, 200-200000."),
+                        "noise_floor_replicates": integer("create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments."),
                         "run_id": string("propose_patch: completed run UUID."),
                         "candidate_index": integer("propose_patch: retained GEPA candidate index."),
                         "timeout_seconds": .object([

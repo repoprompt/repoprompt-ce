@@ -163,6 +163,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "random_seed": .integer(description: "create_or_update: GEPA random seed. Default 0."),
                         "prompt_character_ceiling_ratio": .number(description: "create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt)."),
                         "max_prompt_characters": .integer(description: "create_or_update: optional absolute prompt-length ceiling in characters, 200-200000."),
+                        "noise_floor_replicates": .integer(description: "create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments."),
                         "timeout_seconds": .number(description: "status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60."),
                         "run_id": .string(description: "propose_patch: completed run UUID."),
                         "candidate_index": .integer(description: "propose_patch: retained GEPA candidate index.")

@@ -2037,6 +2037,10 @@
             "description" : "create_or_update: retries per provider call for transient failures, 0-3.",
             "type" : "integer"
           },
+          "noise_floor_replicates" : {
+            "description" : "create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments.",
+            "type" : "integer"
+          },
           "op" : {
             "enum" : [
               "targets",

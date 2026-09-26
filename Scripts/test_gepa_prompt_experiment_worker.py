@@ -536,6 +536,22 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertIn("answer length 100 characters", prompt)
         self.assertNotIn("_prompt_characters", prompt)
 
+    def test_completion_reports_paired_per_case_validation_scores(self) -> None:
+        host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"))
+        terminal, messages, code, stderr = run_worker(
+            self.root, host,
+            examples=[
+                {"id": "t1", "split": "training", "input": "one"},
+                {"id": "v1", "split": "validation", "input": "two"},
+                {"id": "v2", "split": "validation", "input": "three"},
+            ],
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["validation_scores"], {
+            "baseline": {"v1": 0.0, "v2": 0.0},
+            "best": {"v1": 1.0, "v2": 1.0},
+        }, "keyed by suite case ID, for the seed (replicate 0) and the reported best")
+
     def test_identical_proposal_is_skipped_without_spending_a_child_pass(self) -> None:
         def reflect(prompt: str, count: int) -> str:
             return envelope("bad candidate" if count == 1 else "improved candidate")

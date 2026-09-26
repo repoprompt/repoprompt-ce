@@ -86,7 +86,7 @@
         private static let createArguments: Set<String> = [
             "experiment_id", "title", "prompt_id", "suite_id", "execution_target", "reflection_target",
             "judge_target", "max_evaluations", "reflection_minibatch_size", "max_provider_retries",
-            "random_seed", "prompt_character_ceiling_ratio", "max_prompt_characters"
+            "random_seed", "prompt_character_ceiling_ratio", "max_prompt_characters", "noise_floor_replicates"
         ]
         static let acceptedArguments: [PromptExperimentOperation: Set<String>] = [
             .targets: [],
@@ -229,7 +229,8 @@
                     maxProviderRetries: integer("max_provider_retries"),
                     randomSeed: integer("random_seed"),
                     promptCharacterCeilingRatio: number("prompt_character_ceiling_ratio"),
-                    maxPromptCharacters: integer("max_prompt_characters")
+                    maxPromptCharacters: integer("max_prompt_characters"),
+                    noiseFloorReplicates: integer("noise_floor_replicates")
                 ))
             case .requestApproval:
                 let id = uuid("experiment_id", required: true)
@@ -346,11 +347,40 @@
                 "accepted_proposal_cost": .int(shape.iterationCost),
                 "rejected_proposal_cost": .int(shape.iterationCost - shape.validationPass),
                 "held_out_reserve": .int(PromptExperimentBudgetLedger.heldOutReserve(for: cases)),
-                "calibration_evaluations": .int(PromptExperimentBudgetLedger.calibrationEvaluations(cases: cases)),
+                "calibration_evaluations": .int(PromptExperimentBudgetLedger.calibrationEvaluations(
+                    cases: cases, replicates: PromptExperimentGEPASettings().noiseFloorReplicates
+                )),
                 "expected_proposals_at_25": .int(PromptExperimentBudgetLedger.expectedProposals(
                     cap: 25, cases: cases, reflectionMinibatchSize: minibatch
                 )),
                 "note": .string("Calibration is a separate approved line, spent only when the cross-experiment baseline cache misses. The worker never starts an iteration the remaining cap cannot finish.")
+            ])
+        }
+
+        static func noiseFloorValue(_ noise: PromptExperimentNoiseFloor) -> Value {
+            func comparison(_ value: PromptExperimentNoiseFloor.CaseComparison) -> Value {
+                .object([
+                    "example_id": .string(value.exampleID),
+                    "split": .string(value.split.rawValue),
+                    "baseline_samples": .array(value.baselineSamples.map(Value.double)),
+                    "baseline_mean": .double(value.baselineMean),
+                    "best": value.best.map(Value.double) ?? .null,
+                    "delta": value.delta.map(Value.double) ?? .null,
+                    "spread": .double(value.spread),
+                    "improved_beyond_noise": .bool(value.improvedBeyondNoise),
+                    "regressed_beyond_noise": .bool(value.regressedBeyondNoise)
+                ])
+            }
+            return .object([
+                "summary": .string(noise.summary),
+                "measured": .bool(noise.measured),
+                "within_noise": .bool(noise.withinNoise),
+                "samples_per_case": .int(noise.samplesPerCase),
+                "mean_spread": .double(noise.meanSpread),
+                "mean_delta": noise.meanDelta.map(Value.double) ?? .null,
+                "held_out_mean_delta": noise.heldOutMeanDelta.map(Value.double) ?? .null,
+                "validation": .array(noise.validation.map(comparison)),
+                "held_out": .array(noise.heldOut.map(comparison))
             ])
         }
 
@@ -425,6 +455,7 @@
                     "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
                     "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
                     "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
+                    "noise_floor_replicates": .int(settings.noiseFloorReplicates),
                     "max_provider_retries": .int(settings.maxProviderRetries),
                     "random_seed": .int(settings.randomSeed),
                     "gepa_revision": .string(authority.gepaRevision)
@@ -484,26 +515,35 @@
                         "baseline_source": summary.baselineSource.map { .string($0.rawValue) } ?? .null
                     ])
                 }
+                let candidates: [Value] = result.candidates.map { candidate in
+                    let usage: Value = candidate.usage.map(usageValue) ?? .null
+                    let score: Value = candidate.aggregateScore.map(Value.double) ?? .null
+                    return .object([
+                        "index": .int(candidate.index),
+                        "parent_indices": .array(candidate.parentIndices.map(Value.int)),
+                        "aggregate_score": score,
+                        "is_baseline": .bool(candidate.isBaseline),
+                        "is_best": .bool(candidate.isBest),
+                        "sha256": .string(candidate.candidateEvidence.sha256),
+                        "preview": .string(candidate.candidatePreview),
+                        "usage": usage
+                    ])
+                }
+                let noise: Value = result.noiseFloor.map(noiseFloorValue) ?? .null
+                let stopReason: Value = result.stopReason.map(Value.string) ?? .null
+                let baselineScore: Value = result.baselineScore.map(Value.double) ?? .null
+                let bestScore: Value = result.bestScore.map(Value.double) ?? .null
+                let bestIndex: Value = result.bestCandidateIndex.map(Value.int) ?? .null
                 value["result"] = .object([
-                    "stop_reason": result.stopReason.map(Value.string) ?? .null,
+                    "stop_reason": stopReason,
                     "assessment": .string(result.assessment),
-                    "baseline_score": result.baselineScore.map(Value.double) ?? .null,
-                    "best_score": result.bestScore.map(Value.double) ?? .null,
-                    "best_candidate_index": result.bestCandidateIndex.map(Value.int) ?? .null,
+                    "baseline_score": baselineScore,
+                    "best_score": bestScore,
+                    "best_candidate_index": bestIndex,
                     "held_out": heldOut,
+                    "noise_floor": noise,
                     "evaluations": .int(result.totalEvaluations),
-                    "candidates": .array(result.candidates.map { candidate in
-                        .object([
-                            "index": .int(candidate.index),
-                            "parent_indices": .array(candidate.parentIndices.map(Value.int)),
-                            "aggregate_score": candidate.aggregateScore.map(Value.double) ?? .null,
-                            "is_baseline": .bool(candidate.isBaseline),
-                            "is_best": .bool(candidate.isBest),
-                            "sha256": .string(candidate.candidateEvidence.sha256),
-                            "preview": .string(candidate.candidatePreview),
-                            "usage": candidate.usage.map(usageValue) ?? .null
-                        ])
-                    })
+                    "candidates": .array(candidates)
                 ])
             }
             return .object(value)

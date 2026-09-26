@@ -83,6 +83,7 @@ import XCTest
             registry: BuiltInPromptRegistry,
             maxEvaluations: Int = 4,
             maxProviderRetries: Int = 0,
+            noiseFloorReplicates: Int = 0,
             title: String = "Experiment",
             approved: Bool = true
         ) throws -> PromptExperiment {
@@ -90,6 +91,8 @@ import XCTest
             let suite = try PromptSuiteLoader.load(promptID: .oraclePlan, registry: registry)
             var settings = PromptExperimentGEPASettings()
             settings.maxProviderRetries = maxProviderRetries
+            // Most runtime tests script exact spend; noise-floor tests opt in.
+            settings.noiseFloorReplicates = noiseFloorReplicates
             let authority = PromptExperimentAuthority(
                 promptID: .oraclePlan,
                 promptResourceSHA256: resource.sha256,
@@ -99,7 +102,9 @@ import XCTest
                 targets: PromptExperimentTargets(execution: execution, reflection: reflection, judge: nil),
                 settings: settings,
                 maxEvaluations: maxEvaluations,
-                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases),
+                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(
+                    cases: suite.cases, replicates: noiseFloorReplicates
+                ),
                 pythonSealValue: "bundle://PromptExperimentPython/test/python/bin/python3.11",
                 gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
             )
@@ -334,6 +339,8 @@ import XCTest
             let defaults = try await create(harness.service)
             XCTAssertEqual(defaults.authority.settings.promptCharacterCeilingRatio, 1.0)
             XCTAssertNil(defaults.authority.settings.maxPromptCharacters)
+            XCTAssertEqual(defaults.authority.settings.noiseFloorReplicates, 2)
+            XCTAssertEqual(defaults.authority.calibrationEvaluations, 2, "two noise-floor passes over the one validation case")
             let custom = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
                 promptID: "oracle-plan", maxEvaluations: 4, promptCharacterCeilingRatio: 0.8, maxPromptCharacters: 5000
             ))
@@ -342,12 +349,17 @@ import XCTest
             XCTAssertNotEqual(custom.authorityDigest, defaults.authorityDigest, "the ceiling is approved authority")
             do {
                 _ = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
-                    promptID: "oracle-plan", maxEvaluations: 4, promptCharacterCeilingRatio: 9, maxPromptCharacters: 10
+                    promptID: "oracle-plan", maxEvaluations: 4, promptCharacterCeilingRatio: 9, maxPromptCharacters: 10,
+                    noiseFloorReplicates: 9
                 ))
-                XCTFail("Out-of-range ceilings must be rejected")
+                XCTFail("Out-of-range ceilings and replicate counts must be rejected")
             } catch let PromptExperimentAuthorityError.validation(fields) {
-                XCTAssertEqual(Set(fields.map(\.field)), ["prompt_character_ceiling_ratio", "max_prompt_characters"])
+                XCTAssertEqual(Set(fields.map(\.field)), ["prompt_character_ceiling_ratio", "max_prompt_characters", "noise_floor_replicates"])
             }
+            let noNoise = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
+                promptID: "oracle-plan", maxEvaluations: 4, noiseFloorReplicates: 0
+            ))
+            XCTAssertEqual(noNoise.authority.calibrationEvaluations, 0)
         }
 
         func testChangingApprovedAuthorityCreatesANewExperiment() async throws {

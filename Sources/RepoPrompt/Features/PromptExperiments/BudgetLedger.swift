@@ -306,10 +306,20 @@
             cases.count(where: { $0.split == .hiddenTest })
         }
 
-        /// The separately approved baseline-calibration line: the seed's held-out pass when
-        /// the cross-experiment cache misses. Zero spend on a cache hit.
-        nonisolated static func calibrationEvaluations(cases: [PromptSuiteCase]) -> Int {
-            cases.count(where: { $0.split == .hiddenTest })
+        /// The separately approved baseline-calibration line: the seed's held-out pass plus
+        /// `replicates` extra seed passes over the validation cases (the noise floor), spent
+        /// only for what the cross-experiment cache lacks.
+        nonisolated static func calibrationEvaluations(cases: [PromptSuiteCase], replicates: Int) -> Int {
+            cases.count(where: { $0.split == .hiddenTest }) + max(0, replicates) * validationPassCases(cases).count
+        }
+
+        /// The cases GEPA scores in its validation pass, mirroring the worker: the validation
+        /// split when training cases exist; otherwise the (promoted) development cases.
+        nonisolated static func validationPassCases(_ cases: [PromptSuiteCase]) -> [PromptSuiteCase] {
+            let training = cases.filter { $0.split == .training }
+            let validation = cases.filter { $0.split == .validation }
+            if !training.isEmpty, !validation.isEmpty { return validation }
+            return training.isEmpty ? validation : training
         }
 
         /// Validation-pass size and the worst-case cost of one full reflective iteration

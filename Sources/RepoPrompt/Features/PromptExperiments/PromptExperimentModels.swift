@@ -102,6 +102,9 @@
         var promptCharacterCeilingRatio = 1.0
         /// Optional absolute ceiling, applied together with the ratio.
         var maxPromptCharacters: Int?
+        /// Extra seed passes over the validation cases before search (the noise floor);
+        /// with GEPA's own pass that is `k + 1` samples per case.
+        var noiseFloorReplicates = 2
         var randomSeed = 0
         var stopAtScore: Double?
         /// Additional invocations per logical provider call for classified transient failures.
@@ -303,6 +306,8 @@
         var heldOut: PromptExperimentHeldOutSummary?
         /// True when the ledger-aware stopper declined to start an iteration it could not finish.
         var stoppedBeforeUnfinishableIteration: Bool?
+        /// Paired per-case deltas of the best against the seed's replicate spread.
+        var noiseFloor: PromptExperimentNoiseFloor?
 
         var assessment: String {
             let budgetNote: String = if stopReason == "budget_exhausted" {
@@ -313,10 +318,11 @@
                 ""
             }
             let heldOutNote = heldOut.map { " " + $0.summary } ?? ""
+            let noiseNote = noiseFloor.map { " " + $0.summary } ?? ""
             if candidates.count == 1 {
-                return "Only the starting candidate was retained after \(totalEvaluations) evaluations; improvement was not demonstrated." + budgetNote + heldOutNote
+                return "Only the starting candidate was retained after \(totalEvaluations) evaluations; improvement was not demonstrated." + budgetNote + heldOutNote + noiseNote
             }
-            return "GEPA retained \(candidates.count) candidates over \(totalEvaluations) evaluations. Compare per-example evidence before claiming improvement." + budgetNote + heldOutNote
+            return "GEPA retained \(candidates.count) candidates over \(totalEvaluations) evaluations." + noiseNote + budgetNote + heldOutNote
         }
     }
 
@@ -503,10 +509,11 @@
         }
     }
 
-    /// Canonical store document. Schema 9 adds the baseline-calibration line, usage
-    /// evidence, and prompt-length ceilings; earlier lab documents are discarded, never migrated.
+    /// Canonical store document. Schema 10 adds the baseline-calibration line, usage
+    /// evidence, prompt-length ceilings, and the noise floor; earlier lab documents are
+    /// discarded, never migrated.
     struct PromptExperimentDocument: Codable {
-        static let schemaVersion = 9
+        static let schemaVersion = 10
         let schemaVersion: Int
         var experiments: [PromptExperiment]
 
@@ -550,6 +557,7 @@
         var stoppedBeforeUnfinishableIteration: Bool?
         /// Index-aligned with `candidates`, from every completed ledger evaluation of that text.
         var candidateUsage: [PromptExperimentCandidateUsage?] = []
+        var noiseFloor: PromptExperimentNoiseFloor?
     }
 
     enum PromptExperimentCheckpoint: Equatable {

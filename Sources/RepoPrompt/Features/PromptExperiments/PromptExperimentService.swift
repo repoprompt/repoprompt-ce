@@ -33,6 +33,7 @@
         var randomSeed: Int?
         var promptCharacterCeilingRatio: Double?
         var maxPromptCharacters: Int?
+        var noiseFloorReplicates: Int?
     }
 
     struct PromptExperimentTargetDefaults: Equatable {
@@ -309,6 +310,7 @@
             bounded("max_provider_retries", request.maxProviderRetries, 0 ... 3) { settings.maxProviderRetries = $0 }
             bounded("random_seed", request.randomSeed, 0 ... Int(Int32.max)) { settings.randomSeed = $0 }
             bounded("max_prompt_characters", request.maxPromptCharacters, 200 ... 200_000) { settings.maxPromptCharacters = $0 }
+            bounded("noise_floor_replicates", request.noiseFloorReplicates, 0 ... 5) { settings.noiseFloorReplicates = $0 }
             if let ratio = request.promptCharacterCeilingRatio {
                 if ratio.isFinite, (0.25 ... 4.0).contains(ratio) {
                     settings.promptCharacterCeilingRatio = ratio
@@ -355,7 +357,9 @@
                 targets: PromptExperimentTargets(execution: execution, reflection: reflection, judge: judge),
                 settings: settings,
                 maxEvaluations: maxEvaluations,
-                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases),
+                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(
+                    cases: suite.cases, replicates: settings.noiseFloorReplicates
+                ),
                 pythonSealValue: pythonSealValue(),
                 gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
             )
@@ -704,7 +708,8 @@
                 rawResultEvidence: rawResultEvidence,
                 stopReason: runtime.stopReason,
                 heldOut: runtime.heldOut,
-                stoppedBeforeUnfinishableIteration: runtime.stoppedBeforeUnfinishableIteration
+                stoppedBeforeUnfinishableIteration: runtime.stoppedBeforeUnfinishableIteration,
+                noiseFloor: runtime.noiseFloor
             )
         }
 

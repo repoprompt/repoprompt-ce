@@ -47,6 +47,10 @@
                             Text("\(heldOut.summary) (best = GEPA candidate #\(run.result?.bestCandidateIndex.map(String.init) ?? "—"))")
                                 .font(.caption.bold())
                         }
+                        if let noise = run.result?.noiseFloor {
+                            // The paired, replicate-calibrated check: is the gain larger than the judge/target noise?
+                            PromptExperimentNoiseVerdict(noise: noise)
+                        }
                         if let result = run.result {
                             let usage = { (index: Int?) in result.candidates.first { $0.index == index }?.usage?.summary ?? "—" }
                             Text("Size: baseline \(usage(0)) → proposed \(usage(proposal.candidateIndex))")

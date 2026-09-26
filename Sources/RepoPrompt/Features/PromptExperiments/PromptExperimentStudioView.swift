@@ -174,6 +174,9 @@
                                     }
                                 }
                                 if let result = run.result {
+                                    if let noise = result.noiseFloor, !noise.bestIsBaseline {
+                                        PromptExperimentNoiseVerdict(noise: noise)
+                                    }
                                     Text(result.assessment).font(.caption)
                                     ForEach(result.candidates) { candidate in
                                         VStack(alignment: .leading, spacing: 3) {

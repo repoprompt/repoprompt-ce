@@ -73,6 +73,8 @@
 
         private struct CalibrationResult {
             let heldOutScores: [String: Double]?
+            /// Complete noise-floor replicates 1...k of the seed's validation pass.
+            var validationReplicates: [[String: Double]] = []
             let source: PromptExperimentCalibrationSource?
         }
 
@@ -165,7 +167,9 @@
             guard authority.maxEvaluations >= minimum else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The approved cap of \(authority.maxEvaluations) evaluations is below the minimum of \(minimum) for one mutation-and-validation cycle.")
             }
-            guard authority.calibrationEvaluations == PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases) else {
+            guard authority.calibrationEvaluations == PromptExperimentBudgetLedger.calibrationEvaluations(
+                cases: suite.cases, replicates: authority.settings.noiseFloorReplicates
+            ) else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The approved baseline-calibration line no longer matches the suite. Create a new experiment.")
             }
             if let targetError = PromptExperimentConnectedModelRunner.targetErrors(authority.targets).first {
@@ -532,59 +536,93 @@
         /// of failing the search; ledger failures and cancellation still end the run.
         private func calibrate(_ run: ActiveRun) async throws -> CalibrationResult {
             let execution = run.execution
-            let hidden = execution.suite.cases.filter { $0.split == .hiddenTest }
-            guard !hidden.isEmpty else { return CalibrationResult(heldOutScores: nil, source: nil) }
+            let cases = execution.suite.cases
+            let hidden = cases.filter { $0.split == .hiddenTest }
+            let replicatesWanted = max(0, execution.settings.noiseFloorReplicates)
+            guard !hidden.isEmpty || replicatesWanted > 0 else {
+                return CalibrationResult(heldOutScores: nil, source: nil)
+            }
             let key = execution.calibrationKey
-            if let cached = PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key),
-               cached.isComplete(for: execution.suite.cases),
-               let scores = cached.heldOutScores
-            {
-                await run.progress("Reusing the cached seed held-out baseline for this seed, suite, rubric, and target set; no calibration evaluations spent.")
-                return CalibrationResult(heldOutScores: scores, source: .cache)
-            }
-            await run.progress("Calibrating the seed baseline: scoring \(hidden.count) held-out case(s) once on the separately approved calibration line.")
             let seedSHA256 = execution.baselineSHA256
-            var scores: [String: Double] = [:]
-            for example in hidden {
-                let result: LedgerEvaluation
+            let cached = PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key)
+            var heldOut = cached.flatMap { $0.hasHeldOutBaseline(for: cases) ? $0.heldOutScores : nil }
+            var replicates = Array((cached?.completeReplicates(for: cases) ?? []).prefix(replicatesWanted))
+            let missingHeldOut = !hidden.isEmpty && heldOut == nil
+            let missingReplicates = replicatesWanted - replicates.count
+            guard missingHeldOut || missingReplicates > 0 else {
+                await run.progress("Reusing the cached seed baseline (held-out scores and \(replicates.count) noise-floor replicate(s)) for this seed, suite, rubric, and target set; no calibration evaluations spent.")
+                return CalibrationResult(heldOutScores: heldOut, validationReplicates: replicates, source: .cache)
+            }
+            let validation = PromptExperimentBudgetLedger.validationPassCases(cases)
+            await run.progress("Calibrating the seed baseline on the separately approved line: \(missingHeldOut ? hidden.count : 0) held-out case(s) and \(max(0, missingReplicates)) extra validation pass(es) for the noise floor.")
+
+            /// One seed pass over `examples`; nil when a provider/judge failure or the spent
+            /// line leaves it incomplete (report-only evidence never fails the search).
+            func seedPass(_ examples: [PromptSuiteCase], replicate: Int, label: String) async throws -> [String: Double]? {
+                var scores: [String: Double] = [:]
+                for example in examples {
+                    let result: LedgerEvaluation
+                    do {
+                        result = try await admitAndEvaluate(
+                            run,
+                            candidate: execution.baseline,
+                            candidateSHA256: seedSHA256,
+                            example: example,
+                            replicate: replicate,
+                            pool: .calibration
+                        )
+                    } catch let failure as PromptExperimentProviderFailure {
+                        await run.progress("Seed \(label) calibration failed (\(failure.code.rawValue)); it is reported as unavailable.")
+                        return nil
+                    } catch is PromptExperimentGrading.Failure {
+                        await run.progress("Seed \(label) calibration could not be graded; it is reported as unavailable.")
+                        return nil
+                    }
+                    switch result {
+                    case .exhausted:
+                        await run.progress("The calibration line is used up; the seed \(label) is reported as unavailable.")
+                        return nil
+                    case let .recorded(_, outcome), let .spent(_, outcome):
+                        scores[example.id] = outcome.score
+                    }
+                }
+                return scores
+            }
+
+            if missingHeldOut {
+                heldOut = try await seedPass(hidden, replicate: 0, label: "held-out baseline")
+            }
+            while replicates.count < replicatesWanted {
+                guard let pass = try await seedPass(validation, replicate: replicates.count + 1, label: "noise-floor replicate") else { break }
+                replicates.append(pass)
+            }
+            var merged = cached ?? PromptExperimentBaselineCalibration(
+                schemaVersion: PromptExperimentBaselineCalibration.schemaVersion,
+                key: key,
+                seedSHA256: seedSHA256,
+                heldOutScores: nil,
+                validationReplicates: nil,
+                createdAt: environment.now()
+            )
+            // Only completed measurements are cached; a failed pass never writes a record.
+            var changed = false
+            if missingHeldOut, let heldOut {
+                merged.heldOutScores = heldOut
+                changed = true
+            }
+            if replicates.count > merged.completeReplicates(for: cases).count {
+                merged.validationReplicates = replicates
+                changed = true
+            }
+            if changed {
                 do {
-                    result = try await admitAndEvaluate(
-                        run,
-                        candidate: execution.baseline,
-                        candidateSHA256: seedSHA256,
-                        example: example,
-                        pool: .calibration
-                    )
-                } catch let failure as PromptExperimentProviderFailure {
-                    await run.progress("Seed held-out calibration failed (\(failure.code.rawValue)); the held-out baseline is reported as unavailable.")
-                    return CalibrationResult(heldOutScores: nil, source: nil)
-                } catch is PromptExperimentGrading.Failure {
-                    await run.progress("Seed held-out calibration could not be graded; the held-out baseline is reported as unavailable.")
-                    return CalibrationResult(heldOutScores: nil, source: nil)
-                }
-                switch result {
-                case .exhausted:
-                    await run.progress("The calibration line is used up; the held-out baseline is reported as unavailable.")
-                    return CalibrationResult(heldOutScores: nil, source: nil)
-                case let .recorded(_, outcome), let .spent(_, outcome):
-                    scores[example.id] = outcome.score
+                    try PromptExperimentCalibrationCache.save(merged, storeRoot: environment.storeRoot)
+                } catch {
+                    await run.progress("The calibration cache could not be saved (\(error.localizedDescription)); later experiments will calibrate again.")
                 }
             }
-            do {
-                try PromptExperimentCalibrationCache.save(
-                    PromptExperimentBaselineCalibration(
-                        schemaVersion: PromptExperimentBaselineCalibration.schemaVersion,
-                        key: key,
-                        seedSHA256: seedSHA256,
-                        heldOutScores: scores,
-                        createdAt: environment.now()
-                    ),
-                    storeRoot: environment.storeRoot
-                )
-            } catch {
-                await run.progress("The calibration cache could not be saved (\(error.localizedDescription)); later experiments will calibrate again.")
-            }
-            return CalibrationResult(heldOutScores: scores, source: .calibrated)
+            // `source` describes the held-out baseline the summary reports.
+            return CalibrationResult(heldOutScores: heldOut, validationReplicates: replicates, source: missingHeldOut ? .calibrated : .cache)
         }
 
         private func handleEvent(_ run: ActiveRun, _ event: GEPAWorkerProtocol.Event) async throws {
@@ -690,7 +728,55 @@
                 stoppedBeforeUnfinishableIteration: terminal.stoppedBeforeUnfinishableIteration
             )
             optimization.candidateUsage = texts.map { Self.candidateUsage(text: $0, ledger: run.ledger) }
+            optimization.noiseFloor = Self.noiseFloor(
+                cases: run.execution.suite.cases,
+                texts: texts,
+                best: best,
+                terminal: terminal,
+                replicates: run.calibration.validationReplicates,
+                seedHeldOut: run.calibration.heldOutScores ?? terminal.heldOut?.baseline?.scores,
+                ledger: run.ledger
+            )
             return runtimeResult(run, terminal.stopReason == "budget_exhausted" ? .stoppedBudget : .completed, optimization: optimization)
+        }
+
+        /// Paired per-case comparison of the reported best against the seed's samples: GEPA's
+        /// own seed validation pass (replicate 0) plus the calibrated replicates. Per-case scores
+        /// come from the worker's summary, else from the ledger's replicate-0 entries.
+        static func noiseFloor(
+            cases: [PromptSuiteCase],
+            texts: [String],
+            best: Int,
+            terminal: GEPAWorkerProtocol.Terminal,
+            replicates: [[String: Double]],
+            seedHeldOut: [String: Double]?,
+            ledger: PromptExperimentBudgetLedger
+        ) -> PromptExperimentNoiseFloor? {
+            guard let seed = texts.first, texts.indices.contains(best) else { return nil }
+            func ledgerScores(_ text: String) -> [String: Double] {
+                let sha256 = PromptExperimentDigest.sha256(Data(text.utf8))
+                var scores: [String: Double] = [:]
+                for entry in ledger.document.entries
+                    where entry.candidateSHA256 == sha256 && entry.replicate == 0 && entry.state == .completed && entry.split != .hiddenTest
+                {
+                    if let score = entry.outcome?.score { scores[entry.exampleID] = score }
+                }
+                return scores
+            }
+            let validation = PromptExperimentBudgetLedger.validationPassCases(cases)
+            let seedPass = terminal.validationScores?.baseline ?? ledgerScores(seed)
+            var samples: [String: [Double]] = [:]
+            for example in validation {
+                samples[example.id] = ([seedPass[example.id]] + replicates.map { $0[example.id] }).compactMap(\.self)
+            }
+            return PromptExperimentNoiseFloor.compute(
+                validationCases: validation,
+                seedSamples: samples,
+                bestValidation: terminal.validationScores?.best ?? ledgerScores(texts[best]),
+                seedHeldOut: seedHeldOut,
+                bestHeldOut: terminal.heldOut?.best?.scores,
+                bestIsBaseline: texts[best] == seed
+            )
         }
 
         /// Averages over every completed evaluation of this exact text on visible splits

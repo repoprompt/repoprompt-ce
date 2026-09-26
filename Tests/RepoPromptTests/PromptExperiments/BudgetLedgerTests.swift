@@ -191,7 +191,11 @@ import XCTest
             // (the seed's held-out baseline is calibration, not reserve).
             let validationOnly = [example("v1", .validation), example("v2", .validation), example("h1", .hiddenTest)]
             XCTAssertEqual(PromptExperimentBudgetLedger.minimumApprovableEvaluations(cases: validationOnly, reflectionMinibatchSize: 3), 9)
-            XCTAssertEqual(PromptExperimentBudgetLedger.calibrationEvaluations(cases: validationOnly), 1)
+            XCTAssertEqual(PromptExperimentBudgetLedger.calibrationEvaluations(cases: validationOnly, replicates: 0), 1)
+            XCTAssertEqual(
+                PromptExperimentBudgetLedger.calibrationEvaluations(cases: validationOnly, replicates: 2), 5,
+                "the held-out case plus two noise-floor passes over the two (promoted) validation cases"
+            )
         }
 
         /// oracle-plan-v1's shape (6 training, 3 validation, 3 held out) at the default minibatch 2:
@@ -206,6 +210,10 @@ import XCTest
                 + (1 ... 3).map { example("h\($0)", .hiddenTest) }
             XCTAssertEqual(PromptExperimentBudgetLedger.minimumApprovableEvaluations(cases: cases, reflectionMinibatchSize: 2), 13)
             XCTAssertEqual(PromptExperimentBudgetLedger.searchShape(cases: cases, reflectionMinibatchSize: 2).iterationCost, 7)
+            XCTAssertEqual(
+                PromptExperimentBudgetLedger.calibrationEvaluations(cases: cases, replicates: 2), 9,
+                "separate line: 3 held-out + 2 x 3 validation replicates, spent once per configuration"
+            )
             XCTAssertEqual(PromptExperimentBudgetLedger.expectedProposals(cap: 25, cases: cases, reflectionMinibatchSize: 2), 4)
             XCTAssertEqual(PromptExperimentBudgetLedger.expectedProposals(cap: 25, cases: cases, reflectionMinibatchSize: 2, acceptedProposals: 1), 3)
             XCTAssertEqual(PromptExperimentBudgetLedger.expectedProposals(cap: 25, cases: cases, reflectionMinibatchSize: 3), 2, "the old minibatch 3 affords only two")

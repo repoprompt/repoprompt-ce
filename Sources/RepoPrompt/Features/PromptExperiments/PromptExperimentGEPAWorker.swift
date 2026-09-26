@@ -228,6 +228,12 @@
             let best: HeldOutScores?
         }
 
+        /// GEPA's per-case validation scores for the seed (replicate 0) and the reported best.
+        struct ValidationScores: Codable, Equatable {
+            let baseline: [String: Double]
+            let best: [String: Double]
+        }
+
         struct Terminal: Codable, Equatable {
             let engine: String
             let upstreamRevision: String
@@ -246,6 +252,7 @@
             var searchRemaining: Int?
             var iterationCost: Int?
             var stoppedBeforeUnfinishableIteration: Bool?
+            var validationScores: ValidationScores?
 
             enum CodingKeys: String, CodingKey {
                 case engine
@@ -263,6 +270,7 @@
                 case searchRemaining = "search_remaining"
                 case iterationCost = "iteration_cost"
                 case stoppedBeforeUnfinishableIteration = "stopped_before_unfinishable_iteration"
+                case validationScores = "validation_scores"
             }
         }
 

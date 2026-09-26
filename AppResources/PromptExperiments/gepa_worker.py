@@ -540,6 +540,22 @@ def full_iteration_cost(*, minibatch: int, training: int, validation: int) -> in
     return 2 * effective_minibatch + (validation if validation > 0 else training)
 
 
+def per_case_scores(subscores: Any, examples: list[dict[str, Any]]) -> dict[str, float]:
+    """GEPA's per-validation-case scores for one candidate, keyed by suite case ID. GEPA
+    keys a list valset by position; string keys are passed through."""
+    scores: dict[str, float] = {}
+    if not isinstance(subscores, dict):
+        return scores
+    for key, value in subscores.items():
+        if isinstance(key, int) and not isinstance(key, bool) and 0 <= key < len(examples):
+            case_id = str(examples[key]["id"])
+        else:
+            case_id = str(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            scores[case_id] = float(value)
+    return scores
+
+
 def held_out_baseline_from(value: Any, held_out_ids: list[str]) -> dict[str, Any] | None:
     """A host-supplied seed held-out baseline (calibration cache or pre-search pass),
     accepted only when it scores exactly the held-out cases with finite values."""
@@ -840,6 +856,7 @@ def main() -> int:
         best_score = None
         baseline_score = None
         held_out_result = None
+        validation_scores = None
         if has_incumbent:
             texts = [candidate_text(value) for value in result.candidates]
             scores = [
@@ -862,6 +879,15 @@ def main() -> int:
             best_index = preferred_best_index(texts, scores, gepa_best)
             best_score = scores[best_index] if best_index is not None else None
             baseline_score = scores[0] if scores else None
+            # Paired per-case evidence for the host's noise-floor comparison: GEPA's own
+            # validation pass (the seed's replicate 0) and the reported best's pass.
+            subscores = list(getattr(result, "val_subscores", None) or [])
+            validation_examples = valset or dataset
+            if subscores and best_index is not None and best_index < len(subscores):
+                validation_scores = {
+                    "baseline": per_case_scores(subscores[0], validation_examples),
+                    "best": per_case_scores(subscores[best_index], validation_examples),
+                }
 
             def score_held_out(text: str) -> dict[str, Any] | None:
                 """Held-out scores are report-only: an exhausted reserve or a provider/judge
@@ -910,6 +936,7 @@ def main() -> int:
                 "total_metric_calls": result.total_metric_calls if isinstance(result.total_metric_calls, int) else None,
                 "wall_time_seconds": time.monotonic() - started,
                 "held_out": held_out_result,
+                "validation_scores": validation_scores,
                 "search_remaining": state.search_remaining,
                 "iteration_cost": iteration_cost,
                 "stopped_before_unfinishable_iteration": state.stopped_before_unfinishable_iteration,

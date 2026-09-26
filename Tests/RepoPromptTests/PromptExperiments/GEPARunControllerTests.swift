@@ -629,6 +629,106 @@ import XCTest
             XCTAssertNil(PromptExperimentCalibrationCache.load(storeRoot: root, key: key), "a failed calibration is never cached")
         }
 
+        // MARK: Noise floor
+
+        private static let noiseCases: [PromptSuiteCase] = [
+            PromptSuiteCase(id: "t1", split: .training, input: "t", expectedOutput: nil),
+            PromptSuiteCase(id: "v1", split: .validation, input: "a", expectedOutput: nil),
+            PromptSuiteCase(id: "v2", split: .validation, input: "b", expectedOutput: nil)
+        ]
+
+        func testNoiseFloorFlagsImprovementsNoLargerThanTheSeedSpread() throws {
+            let noisy = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
+                validationCases: PromptExperimentBudgetLedger.validationPassCases(Self.noiseCases),
+                seedSamples: ["v1": [0.5, 0.7, 0.6], "v2": [0.4, 0.5, 0.6]],
+                bestValidation: ["v1": 0.75, "v2": 0.6],
+                seedHeldOut: ["h1": 0.5],
+                bestHeldOut: ["h1": 0.6],
+                bestIsBaseline: false
+            ))
+            XCTAssertEqual(noisy.samplesPerCase, 3)
+            XCTAssertEqual(noisy.meanSpread, 0.2, accuracy: 1e-9)
+            XCTAssertEqual(try XCTUnwrap(noisy.meanDelta), 0.125, accuracy: 1e-9)
+            XCTAssertTrue(noisy.withinNoise, "+0.125 does not exceed the 0.2 seed spread")
+            XCTAssertEqual(noisy.improvedBeyondNoise, 0)
+            XCTAssertEqual(noisy.heldOut.map(\.exampleID), ["h1"])
+            XCTAssertTrue(noisy.summary.contains("within noise: not a demonstrated improvement"), noisy.summary)
+            XCTAssertTrue(noisy.summary.contains("Held-out \u{0394} +0.100 (0 of 1 case beyond the spread)"), noisy.summary)
+
+            let clear = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
+                validationCases: PromptExperimentBudgetLedger.validationPassCases(Self.noiseCases),
+                seedSamples: ["v1": [0.5, 0.5, 0.6], "v2": [0.4, 0.4, 0.4]],
+                bestValidation: ["v1": 0.9, "v2": 0.8],
+                seedHeldOut: nil,
+                bestHeldOut: nil,
+                bestIsBaseline: false
+            ))
+            XCTAssertFalse(clear.withinNoise)
+            XCTAssertEqual(clear.improvedBeyondNoise, 2)
+            XCTAssertTrue(clear.summary.hasSuffix("beyond noise."), clear.summary)
+
+            let unmeasured = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
+                validationCases: PromptExperimentBudgetLedger.validationPassCases(Self.noiseCases),
+                seedSamples: ["v1": [0.5], "v2": [0.4]],
+                bestValidation: ["v1": 0.9, "v2": 0.8],
+                seedHeldOut: nil, bestHeldOut: nil, bestIsBaseline: false
+            ))
+            XCTAssertFalse(unmeasured.measured)
+            XCTAssertTrue(unmeasured.withinNoise, "an unmeasured gain is never reported as beyond noise")
+            XCTAssertTrue(unmeasured.summary.hasPrefix("Noise floor not measured"))
+
+            let seedBest = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
+                validationCases: PromptExperimentBudgetLedger.validationPassCases(Self.noiseCases),
+                seedSamples: ["v1": [0.5, 0.6]], bestValidation: ["v1": 0.5],
+                seedHeldOut: ["h1": 1], bestHeldOut: ["h1": 1], bestIsBaseline: true
+            ))
+            XCTAssertTrue(seedBest.heldOut.isEmpty)
+            XCTAssertTrue(seedBest.summary.contains("the seed stayed best"))
+            XCTAssertNil(PromptExperimentNoiseFloor.compute(
+                validationCases: [], seedSamples: [:], bestValidation: nil, seedHeldOut: nil, bestHeldOut: nil, bestIsBaseline: false
+            ))
+        }
+
+        func testNoiseFloorReplicatesAreCalibratedCachedAndJudgedPairwise() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: makeRoot())
+            let first = try PromptExperimentTestFixtures.makeExperiment(registry: registry, maxEvaluations: 6, noiseFloorReplicates: 2)
+            let second = try PromptExperimentTestFixtures.makeExperiment(registry: registry, maxEvaluations: 6, noiseFloorReplicates: 2)
+            XCTAssertEqual(first.authority.calibrationEvaluations, 2, "two replicates of the one validation case")
+            let completer = FakeCompleter()
+            var seedValidationCalls = 0
+            completer.handler = { _, _, user in
+                guard user.contains("validation input") else { return "good" }
+                seedValidationCalls += 1
+                return seedValidationCalls == 2 ? "bad" : "good" // replicate 2 disagrees: spread 1.0
+            }
+            func worker() -> FakeWorker {
+                FakeWorker { host, event in
+                    try await Self.register(event, 0, "seed prompt", score: 1)
+                    _ = await host(Self.evaluate("seed prompt", "v1", .validation))
+                    try await Self.register(event, 1, "better prompt", parents: [0], score: 1)
+                    var terminal = Self.terminal([("seed prompt", [], 1), ("better prompt", [0], 1)], best: 1)
+                    terminal.validationScores = .init(baseline: ["v1": 1], best: ["v1": 1])
+                    return terminal
+                }
+            }
+            let workers = [worker(), worker()]
+            let controller = makeController(root: root, registry: registry, completer: completer, workers: workers)
+
+            let calibrated = try await controller.wait(for: submit(controller, experiment: first))
+            XCTAssertEqual(calibrated.calibrationAdmissionsAfter, 2)
+            XCTAssertEqual(try ledger(root: root, experiment: first).entries.map(\.replicate), [1, 2, 0], "replicates first, then GEPA's own pass")
+            let noise = try XCTUnwrap(calibrated.optimization?.noiseFloor)
+            XCTAssertEqual(noise.validation.first?.baselineSamples, [1, 1, 0], "GEPA's pass, then replicates 1 and 2")
+            XCTAssertEqual(noise.meanSpread, 1)
+            XCTAssertTrue(noise.withinNoise)
+
+            let reused = try await controller.wait(for: submit(controller, experiment: second))
+            XCTAssertEqual(reused.calibrationAdmissionsAfter, 0, "cached replicates are not paid for again")
+            XCTAssertEqual(reused.optimization?.noiseFloor?.validation.first?.baselineSamples, [1, 1, 0])
+            XCTAssertEqual(seedValidationCalls, 4, "2 replicates + 2 GEPA seed passes (one per experiment ledger)")
+        }
+
         func testCalibrationKeyChangesWithEveryMeasuredInput() {
             let targets = PromptExperimentTargets(
                 execution: PromptExperimentTestFixtures.execution,

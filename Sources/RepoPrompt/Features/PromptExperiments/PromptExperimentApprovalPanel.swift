@@ -15,7 +15,7 @@
                 field("Reflection model", authority.targets.reflection.displayName)
                 field("Judge", authority.targets.judge?.displayName ?? "Exact match (no judge model)")
                 field("Evaluation cap", "\(authority.maxEvaluations) total · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
-                field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
+                field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline (held-out + \(settings.noiseFloorReplicates) noise-floor pass\(settings.noiseFloorReplicates == 1 ? "" : "es")) · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
                 field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
                 field("Objectives", "quality first, then brevity (prompt and answer length) · proposals ≤ \(String(format: "%.2f", settings.promptCharacterCeilingRatio))× the edited prompt\(settings.maxPromptCharacters.map { " and ≤ \($0) chars" } ?? "")")
                 field("Authority digest", String(experiment.authorityDigest.prefix(24)))
@@ -27,6 +27,26 @@
                 Text(label).font(.caption.bold()).foregroundStyle(.secondary).frame(width: 120, alignment: .leading)
                 Text(value).font(.caption).textSelection(.enabled)
             }
+        }
+    }
+
+    /// Whether the best candidate's paired improvement exceeds the seed's replicate spread.
+    struct PromptExperimentNoiseVerdict: View {
+        let noise: PromptExperimentNoiseFloor
+
+        var body: some View {
+            let (title, symbol, color): (String, String, Color) = if noise.bestIsBaseline {
+                ("Seed stayed best", "equal.circle", .secondary)
+            } else if !noise.measured {
+                ("Noise not measured", "questionmark.circle", .secondary)
+            } else if noise.withinNoise {
+                ("Within noise — not a demonstrated improvement", "exclamationmark.triangle", .orange)
+            } else {
+                ("Beyond noise", "checkmark.seal", .green)
+            }
+            Label(title, systemImage: symbol)
+                .font(.caption.bold())
+                .foregroundStyle(color)
         }
     }
 
