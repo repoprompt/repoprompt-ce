@@ -46,7 +46,7 @@ extension AgentWorkflow {
             "Describe what you want planned — the agent will ask how involved you want to be, then research and write a polished plan."
         #if DEBUG
             case .promptExperiment:
-                "Shape a reviewed GEPA optimization here, then approve and run the exact digest from its native in-session card."
+                "Pick a built-in prompt and its suite, then approve the evaluation cap on the native card to run GEPA."
         #endif
         }
     }

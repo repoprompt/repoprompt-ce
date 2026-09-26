@@ -361,6 +361,11 @@ if [[ -d AppResources ]]; then
     else
         run rsync -a --exclude='__pycache__/' --exclude='*.py[co]' AppResources/ "$APP_BUNDLE/Contents/Resources/"
     fi
+    # Built-in prompt bodies are production inputs (BuiltInPromptRegistry); the bundle must carry the exact checked-in bytes.
+    if [[ -d AppResources/Prompts ]]; then
+        diff -r AppResources/Prompts "$APP_BUNDLE/Contents/Resources/Prompts" >/dev/null \
+            || fail "Bundled built-in prompt resources differ from AppResources/Prompts"
+    fi
 fi
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done

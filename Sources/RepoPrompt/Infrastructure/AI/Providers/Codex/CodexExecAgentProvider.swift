@@ -52,8 +52,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         selectedModelString: String?,
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         brokenServers: Set<String>,
-        fullAccess: Bool = false,
-        runConstraints: CodexExecRunConstraints? = nil
+        fullAccess: Bool = false
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
         let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
@@ -67,7 +66,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         let toolPolicy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
-            webSearchRequestEnabled: runConstraints?.disableWebSearch == true ? false : nil,
+            webSearchRequestEnabled: nil,
             multiAgentEnabled: false,
             modelReasoningSummary: nil
         )
@@ -86,7 +85,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         args.append(contentsOf: toolOverrideArgs)
         args.append(contentsOf: serverOverrideArgs)
         args.append(contentsOf: ["--json", "--skip-git-repo-check"])
-        if fullAccess, runConstraints == nil {
+        if fullAccess {
             args.append("--dangerously-bypass-approvals-and-sandbox")
         } else {
             args.append(contentsOf: ["--sandbox", "workspace-write"])
@@ -95,18 +94,12 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         return (args, modelSpecifier)
     }
 
-    static func allowsModelFallback(runConstraints: CodexExecRunConstraints?) -> Bool {
-        runConstraints?.requireExactModel != true
-    }
-
     static func processConfiguration(
         for resolution: CodexProviderHelpers.CodexExecutableResolution,
-        enableDebugLogging: Bool,
-        workingDirectory: String? = nil
+        enableDebugLogging: Bool
     ) -> CLIProcessConfiguration {
         CLIProcessConfiguration(
             command: resolution.resolvedCommand,
-            workingDirectory: workingDirectory,
             environment: resolution.environmentOverrides,
             enableDebugLogging: enableDebugLogging,
             captureStdoutTailBytes: 128 * 1024,
@@ -146,8 +139,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         var processConfig = Self.processConfiguration(
             for: resolution,
-            enableDebugLogging: enableDebugLogging,
-            workingDirectory: config.runConstraints?.workingDirectory
+            enableDebugLogging: enableDebugLogging
         )
         processConfig.ensureAdditionalPaths(config.additionalPathHints)
         runner = CLIProcessRunner(config: processConfig)
@@ -241,8 +233,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
-                                    fullAccess: config.fullAccess,
-                                    runConstraints: config.runConstraints
+                                    fullAccess: config.fullAccess
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier
@@ -562,13 +553,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         didRetryModelFallback: Bool,
         didRetryBrokenServer: Bool
     ) -> StreamRetryAction {
-        // Exact-model experiment runs fail closed instead of silently changing the sealed target.
-        let mayFallbackModel = Self.allowsModelFallback(runConstraints: config.runConstraints)
-
         // Check stdout first for model-not-found fallback; otherwise preserve stdout as the primary error.
         if let stdoutMessage {
-            if mayFallbackModel,
-               !didRetryModelFallback,
+            if !didRetryModelFallback,
                let fallbackModel = CodexProviderHelpers.codexFallbackModelIfNeeded(
                    attemptedModel: attemptedModel,
                    errorDetail: stdoutMessage
@@ -580,8 +567,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
 
         // Fall back to stderr checks.
-        if mayFallbackModel,
-           !didRetryModelFallback,
+        if !didRetryModelFallback,
            let fallbackModel = CodexProviderHelpers.codexFallbackModelIfNeeded(
                attemptedModel: attemptedModel,
                errorDetail: stderrString

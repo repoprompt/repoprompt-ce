@@ -202,6 +202,18 @@ struct AIMessage {
         return parts.joined(separator: "\n\n")
     }
 
+    /// Prepends the auto-generated tail (file map, file contents, …) to the final user turn.
+    static func prependingTail(_ tail: String, to content: String) -> String {
+        tail.isEmpty ? content : tail + "\n" + content
+    }
+
+    /// The final user turn with the packaged tail, as a chat-style provider receives it
+    /// (the same composition `openAIChatMessages` uses). Nil without a user entry.
+    var packagedFinalUserMessage: String? {
+        guard let last = conversationMessages.last(where: { $0.role == .user }) else { return nil }
+        return Self.prependingTail(buildTail(embedSystemPrompt: false), to: last.content)
+    }
+
     /// Generates the full array of `ChatCompletionParameters.Message` objects
     /// that an OpenAI‑style chat endpoint expects.
     ///
@@ -220,8 +232,8 @@ struct AIMessage {
 
         for (idx, entry) in conversationMessages.enumerated() {
             let baseText = entry.content
-            let text = (entry.role == .user && idx == lastUserIndex && !tail.isEmpty)
-                ? tail + "\n" + baseText
+            let text = (entry.role == .user && idx == lastUserIndex)
+                ? Self.prependingTail(tail, to: baseText)
                 : baseText
 
             let role: ChatCompletionParameters.Message.Role = (entry.role == .user)

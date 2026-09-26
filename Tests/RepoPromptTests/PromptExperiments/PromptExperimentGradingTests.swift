@@ -5,6 +5,14 @@ import XCTest
 #if DEBUG
     @MainActor
     final class PromptExperimentGradingTests: XCTestCase {
+        func testHeldOutFeedbackIsRedactedAtProposerBoundary() {
+            let privateFeedback = "Expected secret answer: SECRET_EXPECTED"
+            XCTAssertEqual(PromptSuiteSplit.training.proposerFacingFeedback(privateFeedback), privateFeedback)
+            XCTAssertEqual(PromptSuiteSplit.validation.proposerFacingFeedback(privateFeedback), privateFeedback)
+            XCTAssertEqual(PromptSuiteSplit.hiddenTest.proposerFacingFeedback(privateFeedback), PromptSuiteSplit.heldOutFeedback)
+            XCTAssertFalse(PromptSuiteSplit.hiddenTest.proposerFacingFeedback(privateFeedback).contains("SECRET_EXPECTED"))
+        }
+
         func testInvalidJSONRepairsOnlyJudgeOnceAndCheckpointsBeforeEachInvocation() async throws {
             var events: [String] = []
             var calls = 0
@@ -97,146 +105,89 @@ import XCTest
             }
         }
 
-        func testExplicitRetryPausesWithoutAnotherJudgeCallAndReusesOriginalCallback() async throws {
-            for providerFailed in [false, true] {
-                let gate = PromptExperimentGradingRetryGate()
-                let attemptID = UUID(), gradingID = UUID()
-                let paused = expectation(description: "failed judge is awaiting decision")
-                var calls = 0
-                var states: [PromptExperimentGradingState] = []
-                let task = Task { @MainActor in
-                    try await PromptExperimentGrading.run(minimum: 0, maximum: 1, canRepair: true) { _, state, _ in
-                        states.append(state)
-                    } requestRetry: { failure in
-                        XCTAssertEqual(failure, providerFailed ? .providerFailed : .invalidResponse)
-                        try await gate.wait(attemptID: attemptID, gradingID: gradingID) { paused.fulfill() }
-                    } invoke: { _ in
-                        calls += 1
-                        if calls == 1 {
-                            if providerFailed { throw NSError(domain: "provider", code: 1) }
-                            return "invalid"
-                        }
-                        return #"{"score":0.75,"feedback":"Grounded"}"#
-                    }
-                }
-                await fulfillment(of: [paused], timeout: 2)
-                XCTAssertEqual(calls, 1, "No spending until the explicit decision")
-                XCTAssertThrowsError(try gate.retry(attemptID: UUID(), gradingID: gradingID))
-                try gate.retry(attemptID: attemptID, gradingID: gradingID)
-                XCTAssertThrowsError(try gate.retry(attemptID: attemptID, gradingID: gradingID), "Double click must not authorize another call")
-                let result = try await task.value
-                XCTAssertEqual(result.score, 0.75)
-                XCTAssertEqual(calls, 2)
-                XCTAssertEqual(states, [.pending, providerFailed ? .providerFailed : .invalidResponse, .pending, .completed])
-                XCTAssertThrowsError(try gate.retry(attemptID: attemptID, gradingID: gradingID), "A settled callback cannot resume")
-            }
-        }
-
-        func testCancellationWhilePausedReleasesCallbackWithoutSpending() async {
-            let gate = PromptExperimentGradingRetryGate()
-            let attemptID = UUID(), gradingID = UUID()
-            let paused = expectation(description: "paused")
-            var calls = 0
-            var states: [PromptExperimentGradingState] = []
-            let task = Task { @MainActor in
-                try await PromptExperimentGrading.run(minimum: 0, maximum: 1, canRepair: true) { _, state, _ in
-                    states.append(state)
-                } requestRetry: { _ in
-                    try await gate.wait(attemptID: attemptID, gradingID: gradingID) { paused.fulfill() }
-                } invoke: { _ in calls += 1
-                    return "invalid"
-                }
-            }
-            await fulfillment(of: [paused], timeout: 2)
-            task.cancel()
-            do { _ = try await task.value
-                XCTFail("Cancelled callback must not produce a grade")
-            } catch { XCTAssertTrue(error is CancellationError) }
-            XCTAssertEqual(calls, 1)
-            XCTAssertEqual(states.last, .cancelled)
-            XCTAssertThrowsError(try gate.retry(attemptID: attemptID, gradingID: gradingID))
-        }
-
-        func testRetryDecisionDuringPublicationIsNotLostAndFailureDoesNotPauseWithoutBudget() async throws {
-            let gate = PromptExperimentGradingRetryGate()
-            let attemptID = UUID(), gradingID = UUID()
-            try await gate.wait(attemptID: attemptID, gradingID: gradingID) {
-                try gate.retry(attemptID: attemptID, gradingID: gradingID)
-            }
-            var offers = 0, calls = 0
-            do {
-                _ = try await PromptExperimentGrading.run(minimum: 0, maximum: 1, canRepair: false) { _, _, _ in }
-                    requestRetry: { _ in offers += 1 } invoke: { _ in calls += 1
-                        return "invalid"
-                    }
-                XCTFail("Budget exhaustion must settle")
-            } catch { XCTAssertEqual(error as? PromptExperimentGrading.Failure, .invalidResponse) }
-            XCTAssertEqual(offers, 0)
-            XCTAssertEqual(calls, 1)
-        }
-
-        func testCancellationAtRetryCheckpointPreventsSecondInvocation() async {
-            let task = Task { @MainActor in
-                var calls = 0
-                var states: [PromptExperimentGradingState] = []
-                do {
-                    _ = try await PromptExperimentGrading.run(minimum: 0, maximum: 1, canRepair: true) { ordinal, state, _ in
-                        states.append(state)
-                        if ordinal == 2, state == .pending { withUnsafeCurrentTask { $0?.cancel() } }
-                    } requestRetry: { _ in } invoke: { _ in calls += 1
-                        return "invalid"
-                    }
-                    XCTFail("Cancellation must prevent the second call")
-                } catch { XCTAssertTrue(error is CancellationError) }
-                XCTAssertEqual(calls, 1)
-                XCTAssertEqual(states.last, .cancelled)
-            }
-            await task.value
-        }
-
-        func testCancelledGateRejectsDecisionBeforeWaiterUnwinds() async {
-            let gate = PromptExperimentGradingRetryGate()
-            let id = UUID(), attemptID = UUID()
-            let ready = expectation(description: "gate registered")
-            let task = Task { @MainActor in
-                try await gate.wait(attemptID: attemptID, gradingID: id) { ready.fulfill() }
-            }
-            await fulfillment(of: [ready], timeout: 2)
-            gate.cancel(gradingID: id)
-            XCTAssertThrowsError(try gate.retry(attemptID: attemptID, gradingID: id))
-            do { try await task.value
-                XCTFail("Cancelled gate must throw")
-            } catch { XCTAssertTrue(error is CancellationError) }
-        }
-
-        func testCancellationDuringPublicationDoesNotLoseWaiter() async {
-            let gate = PromptExperimentGradingRetryGate()
-            let id = UUID()
-            do {
-                try await gate.wait(attemptID: UUID(), gradingID: id) { gate.cancel(gradingID: id) }
-                XCTFail("Cancelled publication must not install a lost continuation")
-            } catch { XCTAssertTrue(error is CancellationError) }
-        }
-
-        func testCallbackClockExcludesOnlyExplicitPauseTime() {
-            var clock = PromptExperimentCallbackClock(startedAt: 10)
-            XCTAssertEqual(clock.activeSeconds(at: 20), 10)
-            clock.setPaused(true, now: 20)
-            clock.setPaused(true, now: 30) // duplicate observation cannot reset pause
-            XCTAssertEqual(clock.activeSeconds(at: 10000), 10)
-            clock.setPaused(false, now: 10000)
-            XCTAssertEqual(clock.activeSeconds(at: 10005), 15)
-            clock.setPaused(false, now: 10006)
-            clock.setPaused(true, now: 10010)
-            clock.setPaused(false, now: 20000)
-            XCTAssertEqual(clock.activeSeconds(at: 20005), 25)
-        }
-
-        func testStrictGradeDecodingRejectsBooleanOutOfRangeAndProse() {
-            for output in [#"{"score":true,"feedback":"bad"}"#, #"{"score":2,"feedback":"bad"}"#, #"{"score":0.2}"#, #"Here is {"score":1,"feedback":"bad"}"#, #"{"score":1e400,"feedback":"bad"}"#] {
-                XCTAssertNil(PromptExperimentGrading.decode(output, minimum: 0, maximum: 1))
+        func testStrictGradeDecodingRejectsBooleanOutOfRangeAndMissingFields() {
+            for output in [
+                #"{"score":true,"feedback":"bad"}"#, #"{"score":2,"feedback":"bad"}"#, #"{"score":0.2}"#,
+                #"{"score":"0.5","feedback":"bad"}"#, #"{"score":1e400,"feedback":"bad"}"#,
+                #"Here is my verdict: {"score":2,"feedback":"out of range"}"#, "No JSON at all.", "{unbalanced"
+            ] {
+                XCTAssertNil(PromptExperimentGrading.decode(output, minimum: 0, maximum: 1), output)
             }
             XCTAssertEqual(PromptExperimentGrading.decode("```json\n{\"score\":0.5,\"feedback\":\"ok\"}\n```", minimum: 0, maximum: 1)?.score, 0.5)
+        }
+
+        func testGradeDecodingToleratesPreambleAndExtractsTheEvaluatorObject() {
+            let preamble = PromptExperimentGrading.decode(
+                #"Here is my evaluation: {"score":0.75,"feedback":"Grounded {with braces} and \"quotes\""} Thanks."#,
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(preamble?.score, 0.75)
+            XCTAssertEqual(preamble?.feedback, #"Grounded {with braces} and "quotes""#)
+
+            let prosePlaceholder = PromptExperimentGrading.decode(
+                #"I will answer in the {score, feedback} shape. {"score":0.25,"feedback":"thin"}"#,
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(prosePlaceholder?.score, 0.25, "non-JSON brace spans are skipped")
+
+            let fenced = PromptExperimentGrading.decode(
+                "Draft:\n```json\n{\"score\":0.1,\"feedback\":\"draft\"}\n```\nFinal:\n```json\n{\"score\":0.9,\"feedback\":\"final\"}\n```\n",
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(fenced?.score, 0.9, "the last fenced JSON block wins")
+        }
+
+        func testJudgeRepairIsAvailableForEveryEvaluationNotRunWide() async throws {
+            let completer = ScriptedJudge()
+            let invoker = PromptExperimentModelInvoker(
+                completer: completer,
+                policy: PromptExperimentProviderRetryPolicy(maxRetries: 0),
+                checkpoint: { _ in },
+                callbackRootBase: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("grading-\(UUID().uuidString)", isDirectory: true)
+            )
+            let grader = PromptExperimentGrader(
+                grader: PromptSuiteGrader(
+                    kind: .modelJudge,
+                    scoreRange: .init(min: 0, max: 1),
+                    rubric: PromptSuiteRubric(fileName: "rubric.md", text: "Score it.", sha256: "x")
+                ),
+                judgeTarget: PromptExperimentTestFixtures.execution
+            )
+            // Every evaluation's first judge reply is malformed; each must still get its own repair.
+            for index in 0 ..< 4 {
+                let grade = try await grader.grade(
+                    example: PromptSuiteCase(id: "t\(index)", split: .training, input: "input", expectedOutput: nil),
+                    candidate: "candidate",
+                    output: "output",
+                    gradingID: UUID(),
+                    invoker: invoker,
+                    checkpoint: { _ in },
+                    progress: { _ in }
+                )
+                XCTAssertEqual(grade.score, 0.5)
+            }
+            XCTAssertEqual(completer.calls, 8)
+        }
+    }
+
+    @MainActor
+    private final class ScriptedJudge: PromptExperimentModelCompleting {
+        private(set) var calls = 0
+
+        func complete(
+            target _: PromptExperimentResolvedTarget,
+            systemPrompt _: String,
+            userPrompt: String,
+            callbackRoot _: URL
+        ) async throws -> PromptExperimentConnectedModelCompletion {
+            calls += 1
+            let repair = userPrompt.contains("did not satisfy the evaluator JSON contract")
+            return PromptExperimentConnectedModelCompletion(
+                output: repair ? #"{"score":0.5,"feedback":"ok"}"# : "I cannot decide yet.",
+                promptTokens: nil,
+                completionTokens: nil
+            )
         }
     }
 #endif

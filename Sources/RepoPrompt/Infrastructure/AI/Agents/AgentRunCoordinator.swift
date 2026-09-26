@@ -102,15 +102,13 @@ final class AgentRunCoordinator {
         agentKind: AgentProviderKind,
         modelString: String?,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil,
-        codexRunConstraints: CodexExecRunConstraints? = nil
+        workspacePath: String? = nil
     ) -> HeadlessAgentProvider {
         AgentRuntimeProviderService.shared.makeProvider(
             for: agentKind,
             modelString: modelString,
             runType: runType,
-            workspacePath: workspacePath,
-            codexRunConstraints: codexRunConstraints
+            workspacePath: workspacePath
         )
     }
 

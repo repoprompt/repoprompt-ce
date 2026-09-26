@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "suite_id": "oracle-plan-v1",
+  "prompt_id": "oracle-plan",
+  "prompt_variant": "built_in",
+  "grader": {
+    "kind": "model_judge",
+    "score_range": { "min": 0, "max": 1 },
+    "rubric": "rubric.md"
+  },
+  "cases": [
+    {
+      "id": "registry-archive-validation",
+      "split": "training",
+      "input": "Plan recognition of archived built-in defaults so unedited stored copies upgrade after a reviewed prompt change. Specify archive validation, precedence against user edits, and tests.",
+      "file_tree": "repoprompt-ce\n├── AppResources/Prompts/oracle-plan\n│   └── prompt.md\n└── Sources/RepoPrompt\n    ├── Features/Prompt/ViewModels\n    │   └── PromptViewModel.swift *\n    └── Infrastructure/AI/Prompts\n        └── BuiltInPromptRegistry.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Infrastructure/AI/Prompts/BuiltInPromptRegistry.swift",
+          "content": "func resource(_ id: BuiltInPromptID) throws -> BuiltInPromptResource {\n    let data = try Data(contentsOf: fileURL(for: id))\n    let sha256 = Self.sha256Hex(data) // raw bytes\n    guard var text = String(data: data, encoding: .utf8) else { throw BuiltInPromptRegistryError.invalidUTF8(id) }\n    if text.hasSuffix(LF) { text.removeLast() }\n    return BuiltInPromptResource(id: id, text: text, sha256: sha256)\n}"
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift",
+          "content": "private func insertDefaultPromptsIfNeeded() {\n    // Preserves user-edited StoredPrompt records.\n    if previousVariants.contains(where: { $0.title == prompt.title && $0.content == prompt.content }) {\n        upgradeToCanonical(prompt)\n    }\n}"
+        }
+      ]
+    },
+    {
+      "id": "experiment-cap-conflict",
+      "split": "training",
+      "input": "Plan a localized evaluation-cap check. Address interrupted callbacks, duplicate evaluation IDs and persistence order without redesigning the lab.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── BudgetLedger.swift *\n    ├── PromptExperimentModels.swift *\n    └── PromptExperimentService.swift",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentModels.swift",
+          "content": "var remainingEvaluations: Int {\n    max(0, authority.maxEvaluations - admissionsUsed)\n}"
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/BudgetLedger.swift",
+          "content": "/// Admissions persist before spend and are never refunded.\nfunc admit(candidateSHA256: String, exampleID: String, split: PromptExperimentDatasetSplit) throws -> Admission {\n    guard admittedCount(in: pool) < cap else { return .exhausted(pool) }\n    // ...\n}"
+        }
+      ]
+    },
+    {
+      "id": "suite-loader-unknown-fields",
+      "split": "training",
+      "input": "Plan test-first rejection of unknown suite case fields before any model spend. Name the exact loader and test touch points and the failure behavior.",
+      "file_tree": "repoprompt-ce\n├── AppResources/Prompts/oracle-plan\n│   └── suite.json\n├── Sources/RepoPrompt/Features/PromptExperiments\n│   └── PromptSuite.swift *\n└── Tests/RepoPromptTests/PromptExperiments\n    └── PromptSuiteLoaderTests.swift",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptSuite.swift",
+          "content": "static func load(promptID: BuiltInPromptID, registry: BuiltInPromptRegistry = .shared) throws -> PromptSuite {\n    let directory = try registry.directory(for: promptID)\n    let data = try Data(contentsOf: directory.appendingPathComponent(PromptSuite.fileName))\n    return try decode(data, promptID: promptID, directory: directory)\n}\n\n// decode validates prompt ID, grader and cases.\ncase unknownFields(path: String, fields: [String])"
+        }
+      ]
+    },
+    {
+      "id": "mcp-proposal-contract",
+      "split": "training",
+      "input": "Plan an additive MCP candidate-selection argument that grants no apply authority. Specify validation, the response shape, snapshot updates and tests.",
+      "file_tree": "repoprompt-ce\n└── Sources\n    ├── RepoPrompt/Infrastructure/MCP/WindowTools\n    │   ├── MCPAgentSessionControlToolProvider.swift\n    │   └── PromptExperimentMCPControl.swift *\n    └── RepoPromptDomainRuntime\n        ├── MCPDomainCanonicalToolDefinitions.swift\n        └── MCPDomainToolCatalog.swift",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/PromptExperimentMCPControl.swift",
+          "content": "let accepted = acceptedArguments[operation, default: []].union(commonArguments)\nfor key in args.keys.sorted() where !accepted.contains(key) {\n    errors.append(.init(field: key, message: unacceptedMessage(operation)))\n}\n// MCPDomainToolCatalog and the canonical definition publish operation/schema snapshots."
+        }
+      ]
+    },
+    {
+      "id": "source-patch-race",
+      "split": "training",
+      "input": "Plan reviewed winner application to the checked-in AppResources/Prompts/oracle-plan/prompt.md, never Contents/Resources/Prompts. Resolve the checkout, reject symlink/path escape, archive the old canonical bytes, recheck the SHA before the atomic write and explain conflicts.",
+      "file_tree": "repoprompt-ce\n├── AppResources/Prompts/oracle-plan\n│   └── prompt.md\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── PromptExperimentModels.swift *\n    └── PromptExperimentStore.swift",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentModels.swift",
+          "content": "struct PromptExperimentProposal: Codable, Equatable, Identifiable {\n    let baselineResourceSHA256: String\n    let candidateEvidence: PromptExperimentArtifactReference\n    let diffEvidence: PromptExperimentArtifactReference?\n}\n// Store.installArtifact is content-addressed."
+        }
+      ]
+    },
+    {
+      "id": "run-evidence-ui",
+      "split": "training",
+      "input": "Plan a small native proposal review sheet. Cover the full diff, a score summary, native-only apply/reject, conflict display and published state refresh.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── PromptExperimentModels.swift *\n    ├── PromptExperimentService.swift\n    └── PromptExperimentStudioView.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentStudioView.swift",
+          "content": "ForEach(result.candidates) { candidate in\n    CandidateRow(index: candidate.index, score: candidate.aggregateScore)\n}\n// readArtifactText(_:) verifies artifact size and digest before returning text."
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentModels.swift",
+          "content": "enum PromptExperimentProposalState: String, Codable { case proposed, applied, rejected }"
+        }
+      ]
+    },
+    {
+      "id": "worker-retry-accounting",
+      "split": "validation",
+      "input": "Plan provider retry accounting. Explain invocation ID ownership, checkpoint ordering, backoff cancellation and tests; do not move retries into Python.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── BudgetLedger.swift\n    ├── ConnectedModelHarness.swift\n    └── PromptExperimentModelInvoker.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentModelInvoker.swift",
+          "content": "try await checkpoint(.modelCall(.init(id: invocationID, target: target, role: role, state: .started)))\n// ... on failure:\nguard failure.code.isRetryable, retries < policy.maxRetries else { throw failure }\nretries += 1\nlet delay = policy.delaySeconds(beforeRetry: retries, jitter: jitter())\ntry await backoffSleep(delay)\n// The ledger admits one logical evaluation; the harness has no tools."
+        }
+      ]
+    },
+    {
+      "id": "prompt-user-override",
+      "split": "validation",
+      "input": "Plan a built-in Oracle Plan prompt update that preserves user customizations. State precedence and tests, including a user edit with similar wording.",
+      "file_tree": "repoprompt-ce\n├── AppResources/Prompts/oracle-plan\n│   └── prompt.md\n└── Sources/RepoPrompt/Features/Prompt/ViewModels\n    └── PromptViewModel.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift",
+          "content": "StoredPromptRecord(id: architectID, title: architectTitle, content: BuiltInPromptRegistry.shared.text(.oraclePlan))\n\nif isKnownPreviousCanonical(planningPromptCandidate) {\n    customPlanningPrompt = architectPrompt.content\n}\n// insertDefaultPromptsIfNeeded preserves a user-edited StoredPrompt."
+        }
+      ]
+    },
+    {
+      "id": "gepa-resume-checkpoint",
+      "split": "validation",
+      "input": "Plan an explicit-resume integrity check. Explain ambiguous replay rejection, evidence retention and why there is no automatic rerun.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── BudgetLedger.swift *\n    ├── GEPARunController.swift *\n    └── PromptExperimentService.swift",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/GEPARunController.swift",
+          "content": "/// gepa-runs/{experiment UUID}/{authority digest prefix 32}\nstatic func runDirectoryRelativePath(experimentID: UUID, authorityDigest: String) -> String\n// The controller preflights the worker before submission."
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/BudgetLedger.swift",
+          "content": "/// Stores admissions and outcomes. Unsettled admissions from an interrupted run are\n/// settled as spent on open; their remote settlement may be uncertain.\nprivate(set) var interruptedSettledOnOpen = 0"
+        }
+      ]
+    },
+    {
+      "id": "hidden-feedback-boundary",
+      "split": "hidden_test",
+      "input": "Plan held-out feedback isolation. Identify the projection boundary, the tests, and the native reviewer evidence that stays host-side.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── GEPARunController.swift\n    ├── Grader.swift *\n    └── PromptExperimentModels.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentModels.swift",
+          "content": "enum PromptSuiteSplit: String { case training, validation, hiddenTest = hidden_test }\n\nfunc proposerFacingFeedback(_ feedback: String) -> String {\n    self == .hiddenTest ? Self.heldOutFeedback : feedback\n}"
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/Grader.swift",
+          "content": "struct PromptExperimentGrade {\n    let score: Double\n    let proposerFeedback: String // may reach GEPA reflection\n    let hostFeedback: String     // host-side only\n}\n// GEPARunController forwards worker callbacks to the harness."
+        }
+      ]
+    },
+    {
+      "id": "artifact-digest-failure",
+      "split": "hidden_test",
+      "input": "Plan bounded handling of a corrupt candidate artifact during proposal creation: no diff and no source write on validation failure. Describe the error, the durable record and the test.",
+      "file_tree": "repoprompt-ce\n└── Sources/RepoPrompt/Features/PromptExperiments\n    ├── PromptExperimentModels.swift\n    ├── PromptExperimentService.swift *\n    └── PromptExperimentStore.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentStore.swift",
+          "content": "func readArtifact(_ reference: PromptExperimentArtifactReference) throws -> Data {\n    let data = try Data(contentsOf: url(for: reference))\n    guard data.count == reference.byteCount, PromptExperimentDigest.sha256(data) == reference.sha256 else {\n        throw StoreError.artifactMismatch\n    }\n    return data\n}"
+        },
+        {
+          "path": "Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentService.swift",
+          "content": "// The service is the single writer. A proposal selects one retained candidate of a\n// completed run: let candidateEvidence: PromptExperimentArtifactReference"
+        }
+      ]
+    },
+    {
+      "id": "catalog-snapshot-drift",
+      "split": "hidden_test",
+      "input": "Plan adding one debug prompt_experiment MCP operation without schema drift. State the update order, operation-list and parser tests and the snapshot refresh; grant no MCP approval or apply authority.",
+      "file_tree": "repoprompt-ce\n└── Sources\n    ├── RepoPrompt/Infrastructure/MCP/WindowTools\n    │   ├── MCPAgentSessionControlToolProvider.swift *\n    │   └── PromptExperimentMCPControl.swift\n    └── RepoPromptDomainRuntime\n        ├── MCPDomainCanonicalToolDefinitions.swift\n        └── MCPDomainToolCatalog.swift *",
+      "files": [
+        {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentSessionControlToolProvider.swift",
+          "content": "let operations = MCPDomainToolCatalog.promptExperimentOperations\n// ...\nreturn try await PromptExperimentMCPControl.handle(args: args, service: .shared)\n// The catalog owns operations, the canonical definition owns the schema, and this\n// window provider serves the live tool."
+        }
+      ]
+    }
+  ]
+}

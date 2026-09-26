@@ -4048,18 +4048,15 @@ final class MCPServerViewModel: ObservableObject {
         intent: AgentSessionLifecycleAuthority.Intent
     ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
         // 1) Explicit _tabID override (hidden param), validated against real tabs.
-        // Prompt Experiment authority is intentionally bound-context-only; an agent cannot spoof an owner tab.
         let explicitRaw = rawExplicitTabID(args: args)
         let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
         let availableTabIDs = workspaceTabIDs.isEmpty
             ? Set(promptVM.currentComposeTabs.map(\.id))
             : workspaceTabIDs
-        if intent != .promptExperiment,
-           let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
-               rawTabID: explicitRaw,
-               availableTabIDs: availableTabIDs
-           )
-        {
+        if let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
+            rawTabID: explicitRaw,
+            availableTabIDs: availableTabIDs
+        ) {
             let expectedSessionID = workspaceManager?.composeTab(with: explicitUUID)?.activeAgentSessionID
             return try requireTargetWindow().agentModeViewModel
                 .resolveAgentSessionLifecycleMutationTarget(
@@ -4076,7 +4073,7 @@ final class MCPServerViewModel: ObservableObject {
             await service.currentRequestConnectionID()
         }
         let requiresBoundAgentSessionContext = switch intent {
-        case .setStatus, .shareThoughts, .waitForInstruction, .askUser, .promptExperiment:
+        case .setStatus, .shareThoughts, .waitForInstruction, .askUser:
             true
         case .createOrContinue, .applyProjection, .providerStart:
             false

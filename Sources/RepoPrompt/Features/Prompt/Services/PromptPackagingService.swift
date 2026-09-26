@@ -397,6 +397,11 @@ enum PromptPackagingService {
         return entry.file.fullPath
     }
 
+    /// One whole selected file exactly as production packages it into `<file_contents>`.
+    static func fullFileBlock(path: String, content: String) -> String {
+        renderFullFileBlock(selectedPath: path, startFence: codeFenceStart(for: path), content: content)
+    }
+
     private static func renderFullFileBlock(selectedPath: String, startFence: String, content: String) -> String {
         let endFence = "```"
         return """

@@ -110,14 +110,7 @@ import XCTest
 
         func testPromptExperimentContractsAreOperationSensitive() {
             let toolName = MCPWindowToolName.promptExperiment
-            XCTAssertEqual(
-                MCPToolExecutionContractCatalog.contract(
-                    for: toolName,
-                    arguments: ["op": .string("  RuN\n")]
-                ),
-                .interactiveCancellable
-            )
-            for operation in ["wait", "cancel"] {
+            for operation in ["  Status_Or_Wait\n", "cancel"] {
                 XCTAssertEqual(
                     MCPToolExecutionContractCatalog.contract(
                         for: toolName,
@@ -127,7 +120,7 @@ import XCTest
                     operation
                 )
             }
-            for operation in ["capabilities", "setup", "status", "read"] {
+            for operation in ["targets", "create_or_update", "request_approval", "run"] {
                 XCTAssertEqual(
                     MCPToolExecutionContractCatalog.contract(
                         for: toolName,
@@ -1267,12 +1260,12 @@ import XCTest
                 toolName: "prompt_experiment",
                 arguments: ["op": .string("run")]
             )
-            XCTAssertNil(runTimeout, "Native approval must remain pending until user action or caller cancellation")
+            XCTAssertEqual(runTimeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds, "approval is native and non-blocking; run returns once started")
 
             let explicitWaitTimeout = await session.test_resolvedToolCallTimeout(
                 toolName: "prompt_experiment",
                 arguments: [
-                    "op": .string("wait"),
+                    "op": .string("status_or_wait"),
                     "timeout_seconds": .int(3600)
                 ]
             )
@@ -1282,7 +1275,7 @@ import XCTest
             )
             let defaultWaitTimeout = await session.test_resolvedToolCallTimeout(
                 toolName: "prompt_experiment",
-                arguments: ["op": .string("wait")]
+                arguments: ["op": .string("status_or_wait")]
             )
             XCTAssertEqual(defaultWaitTimeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
             let cancelTimeout = await session.test_resolvedToolCallTimeout(
@@ -1296,13 +1289,6 @@ import XCTest
                 arguments: ["op": .string("run")]
             )
             XCTAssertEqual(explicitRunTimeout, 45)
-
-            let deadline = await session.test_resolvedToolCallDeadline(
-                toolName: "prompt_experiment",
-                arguments: ["op": .string("run")]
-            )
-            XCTAssertNil(deadline.wireEnvelope)
-            XCTAssertFalse(deadline.isSharedOrdinaryExportEnvelope)
         }
 
         func testPromptContextExportAliasesResolveToCanonicalDeadlineEnvelopeAndSettlementPath() async {

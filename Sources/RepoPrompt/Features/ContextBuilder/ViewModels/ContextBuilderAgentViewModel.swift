@@ -122,7 +122,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         _ agent: AgentProviderKind,
         _ modelString: String?,
         _ workspacePath: String?,
-        _ codexRunConstraints: CodexExecRunConstraints?,
         _ modelParameterSelections: [ACPModelParameterSelection]
     ) -> HeadlessAgentProvider
 
@@ -1072,12 +1071,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
-        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, codexRunConstraints, modelParameterSelections in
+        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
                 modelString: modelString,
                 workspacePath: workspacePath,
-                codexRunConstraints: codexRunConstraints,
                 modelParameterSelections: modelParameterSelections
             )
         }
@@ -2861,7 +2859,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 record.agentKind,
                 modelString,
                 providerWorkspacePath,
-                record.mcpConfiguration?.codexRunConstraints,
                 record.modelParameterSelections
             )
             guard record.installProvider(provider) else {
@@ -2897,9 +2894,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 guard acceptsEvents(from: record) else {
                     await lease.failAndCleanup()
                     return .cancelled
-                }
-                if let instructions = record.mcpConfiguration?.experimentInstructions {
-                    try ContextBuilderExperimentPromptInsertion.validate(message, instructions: instructions)
                 }
                 #if DEBUG
                     observeStartupBoundary(.streamStart, record: record)

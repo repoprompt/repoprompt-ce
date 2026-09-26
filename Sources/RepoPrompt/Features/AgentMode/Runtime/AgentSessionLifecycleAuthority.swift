@@ -141,7 +141,6 @@ final class AgentSessionLifecycleAuthority {
         case shareThoughts = "share_thoughts"
         case waitForInstruction = "wait_for_instruction"
         case askUser = "ask_user"
-        case promptExperiment = "prompt_experiment"
         case providerStart = "provider_start"
     }
 

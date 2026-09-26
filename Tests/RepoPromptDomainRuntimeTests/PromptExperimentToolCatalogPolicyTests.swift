@@ -15,14 +15,14 @@ import XCTest
             let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
             let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue))
             XCTAssertEqual(operations, [
-                "capabilities", "list", "setup", "create_draft", "update_draft", "propose_seal",
-                "status", "run", "wait", "cancel", "retry_grading", "read", "clone", "clone_draft", "rerun",
-                "propose_run_again", "continue", "propose_next_revision"
+                "targets", "create_or_update", "request_approval", "run", "status_or_wait", "cancel", "propose_patch"
             ])
-            XCTAssertEqual(properties["specification_json"]?.objectValue?["type"]?.stringValue, "string")
-            XCTAssertEqual(properties["grading_id"]?.objectValue?["type"]?.stringValue, "string")
-            XCTAssertEqual(properties["candidate_index"]?.objectValue?["type"]?.stringValue, "integer")
+            XCTAssertEqual(properties["prompt_id"]?.objectValue?["type"]?.stringValue, "string")
+            XCTAssertEqual(properties["max_evaluations"]?.objectValue?["type"]?.stringValue, "integer")
             XCTAssertEqual(properties["timeout_seconds"]?.objectValue?["type"]?.stringValue, "number")
+            for removed in ["specification_json", "approval_mode", "workspace_id", "grading_id"] {
+                XCTAssertNil(properties[removed], removed)
+            }
             for operation in operations {
                 XCTAssertEqual(
                     MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)).normalizedOperation,

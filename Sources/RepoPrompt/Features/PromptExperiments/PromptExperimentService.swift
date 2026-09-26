@@ -2,9 +2,10 @@
     import Combine
     import Foundation
 
+    /// The execution seam the service drives. `GEPARunController` is the live implementation.
     @MainActor
     protocol PromptExperimentRuntime: AnyObject {
-        func preflightOptimization(_ plan: PromptExperimentPlan) async throws
+        func preflight(_ experiment: PromptExperiment) async throws
         func submit(
             _ request: PromptExperimentRunRequest,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
@@ -12,129 +13,110 @@
             checkpoint: @escaping PromptExperimentCheckpointSink
         ) async throws -> PromptExperimentRuntimeHandle
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult
-        func retryGrading(_ handle: PromptExperimentRuntimeHandle, gradingID: UUID) throws
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation
+        func runDirectoryURL(for experiment: PromptExperiment) -> URL
     }
 
-    extension PromptExperimentRuntime {
-        func retryGrading(_: PromptExperimentRuntimeHandle, gradingID _: UUID) throws {
-            throw PromptExperimentAuthorityError.runtimeUnavailable("This runtime has no live grading retry.")
-        }
-
-        func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
-            guard plan.optimization == nil else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable("The configured runtime does not support upstream GEPA optimization.")
-            }
-        }
+    /// Typed create/update input. Nil fields keep the updated experiment's value, or use the
+    /// server default for a new experiment.
+    struct PromptExperimentCreateRequest: Equatable {
+        var experimentID: UUID?
+        var title: String?
+        var promptID: String?
+        var suiteID: String?
+        var executionTarget: String?
+        var reflectionTarget: String?
+        var judgeTarget: String?
+        var maxEvaluations: Int?
+        var reflectionMinibatchSize: Int?
+        var maxProviderRetries: Int?
+        var randomSeed: Int?
     }
 
-    /// Publishes late service creation to cards restored before the lab is opened.
-    /// This holder does not create/rebind runtimes or grant any execution authority.
-    @MainActor
-    final class PromptExperimentServiceAvailability: ObservableObject {
-        @Published private(set) var service: PromptExperimentService?
-
-        func install(_ service: PromptExperimentService) {
-            self.service = service
-        }
+    struct PromptExperimentTargetDefaults: Equatable {
+        let execution: PromptExperimentResolvedTarget?
+        let reflection: PromptExperimentResolvedTarget?
+        let judge: PromptExperimentResolvedTarget?
     }
 
+    /// Owns experiments, approval, runs, and persistence for the whole app (not a window).
+    ///
+    /// It is the store's single writer. Approvals, run admissions, and scored evidence are
+    /// durable commits before they take effect; worker diagnostics and progress are batched
+    /// into throttled saves. Only native UI calls `approve`; there is no MCP approval path.
     @MainActor
     final class PromptExperimentService: ObservableObject {
-        static let liveAvailability = PromptExperimentServiceAvailability()
-        static var currentLiveInstance: PromptExperimentService? {
-            liveAvailability.service
-        }
+        static let defaultExecutionRole = "engineer"
+        static let defaultReflectionRole = "design"
+        static let defaultJudgeRole = "pair"
 
-        static func live(windowState: WindowState) throws -> PromptExperimentService {
-            let bindingIdentity = ObjectIdentifier(windowState)
-            if let liveInstance = currentLiveInstance {
-                guard liveInstance.bindRuntimeIfIdle(
-                    NativePromptExperimentContextBuilderRuntime(windowState: windowState),
-                    bindingIdentity: bindingIdentity
-                ) else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable(
-                        "Another window owns the pending or running Prompt Experiment runtime. Wait for it to settle before using this window."
-                    )
-                }
-                return liveInstance
-            }
+        private static var sharedInstance: PromptExperimentService?
+
+        static var shared: PromptExperimentService {
+            if let sharedInstance { return sharedInstance }
             let service = PromptExperimentService(
                 store: PromptExperimentStore(rootURL: PromptExperimentStore.liveRootURL()),
-                runtime: NativePromptExperimentContextBuilderRuntime(windowState: windowState)
+                runtime: GEPARunController.live()
             )
-            service.runtimeBindingIdentity = bindingIdentity
-            liveAvailability.install(service)
+            sharedInstance = service
             return service
         }
 
-        @Published private(set) var records: [PromptExperimentRecord] = []
+        @Published private(set) var experiments: [PromptExperiment] = []
         @Published private(set) var loadError: String?
+        @Published private(set) var persistenceError: String?
         @Published private(set) var projectionError: String?
         @Published private(set) var isLoaded = false
+        @Published private(set) var discardedLegacyLabData = false
 
         private let store: PromptExperimentStore
-        private var runtime: PromptExperimentRuntime
-        private let resolveTarget: @MainActor (String) throws -> PromptExperimentResolvedTarget?
-        private let listAvailableTargets: @MainActor () -> [PromptExperimentResolvedTarget]
+        private let runtime: PromptExperimentRuntime
+        private let patchProposer: PromptPatchProposer
+        private let registry: BuiltInPromptRegistry
+        private let resolveTarget: @MainActor (String) throws -> PromptExperimentResolvedTarget
+        private let listTargets: @MainActor () -> [PromptExperimentResolvedTarget]
+        private let pythonSealValue: @MainActor () -> String
         private let now: @MainActor () -> Date
-        private static let pendingApprovalStatus = "Run requested by this Agent session. Review the exact sealed digest below; Approve & Run starts automatically."
-        private static let restoredAwaitingApprovalStatus = "Sealed plan is awaiting a new owning-session run request; no native approval is pending."
+        private let diagnosticsSaveInterval: Duration
 
-        private struct PendingRunApproval {
-            let planDigest: String
-            let controllerSessionID: UUID
-            let continuation: CheckedContinuation<PromptExperimentRecord, Error>
+        private struct ActiveRun {
+            let experimentID: UUID
+            let runID: UUID
+            let suite: PromptSuite
+            var handle: PromptExperimentRuntimeHandle?
         }
 
-        private struct ExecutionWaiter {
-            let continuation: CheckedContinuation<Void, Never>
-            let timeoutTask: Task<Void, Never>
-        }
-
-        private var executionTasks: [UUID: Task<Void, Never>] = [:]
-        private var failedCheckpointAttempts: Set<UUID> = []
-        private var checkpointInFlight: Set<UUID> = []
-        private var persistenceBusy = false
-        private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
-        private var admittedExperimentIDs: Set<UUID> = []
-        private var activeHandles: [UUID: PromptExperimentRuntimeHandle] = [:]
-        private var pendingRunApprovals: [UUID: PendingRunApproval] = [:]
-        private var mcpApprovalRequests: [UUID: UUID] = [:]
-        private var mcpApprovalWaiters: [UUID: (requestID: UUID, continuation: CheckedContinuation<Bool, Error>)] = [:]
-        private var pendingRunApprovalObservers: [UUID: [CheckedContinuation<Void, Never>]] = [:]
-        private var executionWaiters: [UUID: [UUID: ExecutionWaiter]] = [:]
         private var loadTask: Task<Void, Never>?
-        private var runtimeBindingIdentity: ObjectIdentifier?
+        private var activeRun: ActiveRun?
+        private var executionTasks: [UUID: Task<Void, Never>] = [:]
+        private var isSaving = false
+        private var saveWaiters: [CheckedContinuation<Void, Never>] = []
+        private var pendingDiagnosticsSave: Task<Void, Never>?
+        private var changeWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
 
         init(
             store: PromptExperimentStore,
             runtime: PromptExperimentRuntime,
-            resolveTarget: @escaping @MainActor (String) throws -> PromptExperimentResolvedTarget? = PromptExperimentService.liveTarget,
-            availableTargets: @escaping @MainActor () -> [PromptExperimentResolvedTarget] = PromptExperimentService.liveTargets,
-            now: @escaping @MainActor () -> Date = Date.init
+            registry: BuiltInPromptRegistry = .shared,
+            patchProposer: PromptPatchProposer = PromptPatchProposer(),
+            resolveTarget: @escaping @MainActor (String) throws -> PromptExperimentResolvedTarget = { try PromptExperimentTargetCatalog.resolve($0) },
+            availableTargets: @escaping @MainActor () -> [PromptExperimentResolvedTarget] = { PromptExperimentTargetCatalog.availableTargets() },
+            pythonSealValue: @escaping @MainActor () -> String = { PromptExperimentGEPAWorker.configuredPythonSealValue() },
+            now: @escaping @MainActor () -> Date = Date.init,
+            diagnosticsSaveInterval: Duration = .seconds(2)
         ) {
             self.store = store
             self.runtime = runtime
+            self.registry = registry
+            self.patchProposer = patchProposer
             self.resolveTarget = resolveTarget
-            listAvailableTargets = availableTargets
+            listTargets = availableTargets
+            self.pythonSealValue = pythonSealValue
             self.now = now
+            self.diagnosticsSaveInterval = diagnosticsSaveInterval
         }
 
-        /// A process-global service may serve multiple windows, but an approval request pins the
-        /// originating runtime until it either starts or settles. Same-window lookups preserve the
-        /// pinned instance; a different window fails closed instead of executing against it.
-        @discardableResult
-        func bindRuntimeIfIdle(
-            _ replacement: PromptExperimentRuntime,
-            bindingIdentity: ObjectIdentifier
-        ) -> Bool {
-            if runtimeBindingIdentity == bindingIdentity { return true }
-            guard admittedExperimentIDs.isEmpty, pendingRunApprovals.isEmpty, mcpApprovalRequests.isEmpty else { return false }
-            runtime = replacement
-            runtimeBindingIdentity = bindingIdentity
-            return true
-        }
+        // MARK: - Loading
 
         func load() async {
             if let loadTask {
@@ -151,1406 +133,483 @@
 
         private func performInitialLoad() async {
             do {
-                var loaded = try await store.loadRecords()
-                let recoveryDate = now()
+                let loaded = try await store.load()
+                discardedLegacyLabData = loaded.discardedLegacyLabData
+                var experiments = loaded.experiments
                 var changed = false
-                for index in loaded.indices {
-                    if loaded[index].migrateLegacyAttemptLineage() {
-                        changed = true
-                    }
-                    if loaded[index].phase == .awaitingApproval,
-                       loaded[index].statusMessage == Self.pendingApprovalStatus
+                let recoveredAt = now()
+                for experimentIndex in experiments.indices {
+                    for runIndex in experiments[experimentIndex].runs.indices
+                        where experiments[experimentIndex].runs[runIndex].state.isActive
                     {
+                        // The worker and provider calls died with the previous process. Their
+                        // admissions stay spent; an explicit run settles them and resumes.
                         changed = true
-                        loaded[index].updatedAt = recoveryDate
-                        loaded[index].statusMessage = Self.restoredAwaitingApprovalStatus
-                    }
-                    guard loaded[index].phase == .running || loaded[index].phase == .cancelling else { continue }
-                    changed = true
-                    for attemptIndex in loaded[index].attempts.indices {
-                        loaded[index].attempts[attemptIndex].gradingEvidence = loaded[index].attempts[attemptIndex].gradingEvidence?.map { $0.settlingInterruption() }
-                        if var diagnostics = loaded[index].attempts[attemptIndex].diagnostics,
-                           [.preparing, .runningObserved].contains(diagnostics.processObservation)
-                        {
+                        experiments[experimentIndex].runs[runIndex].state = .failed
+                        experiments[experimentIndex].runs[runIndex].uncertainRemoteSettlement = true
+                        experiments[experimentIndex].runs[runIndex].settledAt = recoveredAt
+                        experiments[experimentIndex].runs[runIndex].statusText = "Interrupted by an app restart; provider settlement is unknown. Its checkpoint is retained; run again to resume within the remaining budget."
+                        experiments[experimentIndex].runs[runIndex].gradings = experiments[experimentIndex].runs[runIndex].gradings.map { $0.settlingCancellation() }
+                        if var diagnostics = experiments[experimentIndex].runs[runIndex].diagnostics {
                             diagnostics.processObservation = .unknownAfterRestart
                             diagnostics.activeCallbackID = nil
                             diagnostics.activeCallbackOperation = nil
-                            diagnostics.append(PromptExperimentDiagnosticEvent(
-                                observedAt: recoveryDate,
-                                channel: "service",
-                                event: "service_restarted",
-                                detail: "Persisted worker identity is historical only; current liveness is unknown."
-                            ))
-                            loaded[index].attempts[attemptIndex].diagnostics = diagnostics
+                            diagnostics.append(.init(observedAt: recoveredAt, channel: "service", event: "service_restarted", detail: nil))
+                            experiments[experimentIndex].runs[runIndex].diagnostics = diagnostics
                         }
-                        switch loaded[index].attempts[attemptIndex].status {
-                        case .submitting, .running:
-                            loaded[index].attempts[attemptIndex].status = .submissionUncertain
-                            loaded[index].attempts[attemptIndex].statusText = "App restarted before provider settlement; acceptance is uncertain and this attempt will not be retried."
-                        case .cancellationRequested:
-                            loaded[index].attempts[attemptIndex].status = .cancelledRemoteUnknown
-                            loaded[index].attempts[attemptIndex].statusText = "Cancellation was requested before restart; remote settlement is unknown."
-                        default:
-                            break
-                        }
+                        experiments[experimentIndex].updatedAt = recoveredAt
                     }
-                    loaded[index].phase = loaded[index].cancellationRequestedAt == nil ? .inconclusive : .cancelled
-                    loaded[index].updatedAt = recoveryDate
-                    loaded[index].statusMessage = loaded[index].cancellationRequestedAt == nil
-                        ? "Reopened with uncertain provider submission; automatic retry is disabled."
-                        : "Reopened after cancellation with remote settlement unknown."
                 }
-                records = loaded.sorted { $0.updatedAt > $1.updatedAt }
-                loadError = nil
+                self.experiments = experiments
                 isLoaded = true
                 if changed {
-                    try await persist()
-                } else {
-                    projectionError = await store.rebuildReadableViews(records).message
+                    try await persist(projecting: Set(experiments.map(\.id)))
                 }
             } catch {
-                records = []
-                isLoaded = false
                 loadError = error.localizedDescription
+                isLoaded = true
             }
         }
 
         private func requireLoaded() async throws {
             await load()
-            guard isLoaded, loadError == nil else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable(
-                    loadError ?? "Prompt Experiment storage has not finished loading."
-                )
-            }
+            if let loadError { throw PromptExperimentAuthorityError.runtimeUnavailable(loadError) }
         }
 
-        @discardableResult
-        func createExperiment(controllerSessionID: UUID, sourceTabID: UUID) async throws -> UUID {
-            try await requireLoaded()
-            let date = now()
-            let experimentID = UUID()
-            let draft = PromptExperimentDraft(
-                revision: 1,
-                title: "Prompt comparison",
-                createdAt: date,
-                updatedAt: date
-            )
-            records.insert(PromptExperimentRecord(
-                id: experimentID,
-                controllerSessionID: controllerSessionID,
-                sourceTabID: sourceTabID,
-                createdAt: date,
-                updatedAt: date,
-                phase: .drafting,
-                draft: draft,
-                plans: [],
-                approvals: [],
-                attempts: [],
-                cancellationRequestedAt: nil,
-                statusMessage: "Draft — edit and seal a fixed synthetic-fixture comparison."
-            ), at: 0)
-            do {
-                try await persist()
-            } catch {
-                records.removeAll { $0.id == experimentID }
-                throw error
-            }
-            return experimentID
+        func experiment(id: UUID) -> PromptExperiment? {
+            experiments.first { $0.id == id }
         }
 
-        @discardableResult
-        func createOptimizationExperiment(controllerSessionID: UUID, sourceTabID: UUID) async throws -> UUID {
-            try await requireLoaded()
-            let date = now()
-            let experimentID = UUID()
-            let draft = makeOptimizationDraft(at: date)
-            records.insert(PromptExperimentRecord(
-                id: experimentID,
-                controllerSessionID: controllerSessionID,
-                sourceTabID: sourceTabID,
-                createdAt: date,
-                updatedAt: date,
-                phase: .drafting,
-                draft: draft,
-                plans: [],
-                approvals: [],
-                attempts: [],
-                cancellationRequestedAt: nil,
-                statusMessage: "Draft — the linked Agent session can propose a reviewed dataset, evaluator, targets, and GEPA budget."
-            ), at: 0)
-            do {
-                try await persist()
-            } catch {
-                records.removeAll { $0.id == experimentID }
-                throw error
+        private func index(of id: UUID) throws -> Int {
+            guard let index = experiments.firstIndex(where: { $0.id == id }) else {
+                throw PromptExperimentAuthorityError.experimentNotFound
             }
-            return experimentID
+            return index
         }
 
-        func makeOptimizationDraftForAuthoring() async throws -> PromptExperimentDraft {
-            try await requireLoaded()
-            return makeOptimizationDraft(at: now())
-        }
-
-        private func makeOptimizationDraft(at date: Date) -> PromptExperimentDraft {
-            let python = PromptExperimentGEPAWorker.configuredPythonSealValue()
-            return PromptExperimentDraft(
-                revision: 1,
-                title: "GEPA optimization",
-                targetRole: "",
-                optimization: PromptExperimentOptimizationSpecification(
-                    startingPoint: .choose,
-                    seedCandidate: nil,
-                    objective: "",
-                    background: "",
-                    examples: [],
-                    evaluator: PromptExperimentEvaluatorSpecification(
-                        kind: .exactMatch,
-                        rubric: "",
-                        judgeTargetSelector: nil,
-                        command: nil,
-                        candidateFileName: nil,
-                        minimumScore: 0,
-                        maximumScore: 1
-                    ),
-                    execution: PromptExperimentExecutionSpecification(
-                        adapter: .connectedModel,
-                        targetSelector: nil,
-                        instructions: "Use the candidate as the governing instructions for this task."
-                    ),
-                    gepa: PromptExperimentGEPAConfiguration(
-                        engine: "gepa",
-                        pythonExecutablePath: python,
-                        reflectionTargetSelector: "",
-                        maxEvaluations: 40,
-                        stopAtScore: 1,
-                        randomSeed: 0,
-                        maxProviderRetries: 1,
-                        maxJudgeRetries: 3,
-                        pauseOnGradingFailure: true
-                    )
-                ),
-                createdAt: date,
-                updatedAt: date
-            )
-        }
-
-        @discardableResult
-        func updateDraft(
-            experimentID: UUID,
-            expectedDraftID: UUID,
-            expectedDraftVersion: Int,
-            expectedDraftDigest: String,
-            draft: PromptExperimentDraft,
-            expectedControllerSessionID: UUID? = nil
-        ) async throws -> PromptExperimentDraft {
-            try await requireLoaded()
-            let index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].phase == .drafting, let current = records[index].draft else {
-                throw PromptExperimentAuthorityError.illegalPhase("Only the active drafting phase can be updated.")
-            }
-            guard current.id == expectedDraftID,
-                  draft.id == current.id,
-                  draft.revision == current.revision,
-                  draft.parentPlanID == current.parentPlanID,
-                  draft.createdAt == current.createdAt,
-                  current.optimisticVersion == expectedDraftVersion
-            else {
-                throw PromptExperimentAuthorityError.staleDraft
-            }
-            guard try current.contentDigest() == expectedDraftDigest else {
-                throw PromptExperimentAuthorityError.draftDigestMismatch
-            }
-            var updated = try draft.validatedBounds()
-            updated.version = current.optimisticVersion + 1
-            updated.updatedAt = now()
-            let previousRecord = records[index]
-            records[index].draft = updated
-            records[index].updatedAt = updated.updatedAt
-            records[index].statusMessage = "Draft version \(updated.optimisticVersion) saved; seal again before approval."
-            do {
-                try await persist()
-            } catch {
-                restoreRecord(previousRecord)
-                throw error
-            }
-            return updated
-        }
-
-        @discardableResult
-        func seal(
-            experimentID: UUID,
-            expectedDraftID: UUID,
-            expectedDraftVersion: Int,
-            expectedDraftDigest: String,
-            expectedControllerSessionID: UUID? = nil,
-            authorizedSourceRoots: [String] = []
-        ) async throws -> PromptExperimentPlan {
-            try await requireLoaded()
-            let originalIndex = try index(of: experimentID)
-            try requireOwner(records[originalIndex], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[originalIndex].phase == .drafting,
-                  let draft = records[originalIndex].draft
-            else { throw PromptExperimentAuthorityError.noDraft }
-            guard draft.id == expectedDraftID,
-                  draft.optimisticVersion == expectedDraftVersion
-            else { throw PromptExperimentAuthorityError.staleDraft }
-            guard try draft.contentDigest() == expectedDraftDigest else {
-                throw PromptExperimentAuthorityError.draftDigestMismatch
-            }
-            var validated = try draft.validated()
-            if validated.optimization?.execution.adapter == .mcpAdapter {
-                let resolvedMCP = try validated.optimization?.execution.mcp?.resolved()
-                validated.optimization?.execution.mcp = resolvedMCP
-            }
-            let optimizationTargets: PromptExperimentOptimizationTargets?
-            let target: PromptExperimentResolvedTarget
-            if let optimization = validated.optimization {
-                guard let reflection = try resolveTarget(optimization.gepa.reflectionTargetSelector) else {
-                    throw PromptExperimentAuthorityError.targetUnavailable(
-                        "No available catalog target resolves the reflection selector ‘\(optimization.gepa.reflectionTargetSelector)’."
-                    )
-                }
-                let execution: PromptExperimentResolvedTarget? = if let selector = optimization.execution.targetSelector {
-                    try resolveTarget(selector)
-                } else {
-                    nil
-                }
-                if optimization.execution.adapter != .sandboxedCommand, execution == nil {
-                    throw PromptExperimentAuthorityError.targetUnavailable(
-                        "The \(optimization.execution.adapter.rawValue) execution target is unavailable."
-                    )
-                }
-                let judge: PromptExperimentResolvedTarget? = if let selector = optimization.evaluator.judgeTargetSelector {
-                    try resolveTarget(selector)
-                } else {
-                    nil
-                }
-                if optimization.evaluator.kind == .connectedModelJudge, judge == nil {
-                    throw PromptExperimentAuthorityError.targetUnavailable("The connected-model judge target is unavailable.")
-                }
-                let resolvedTargets = PromptExperimentOptimizationTargets(
-                    reflection: reflection,
-                    execution: execution,
-                    judge: judge
-                )
-                try PromptExperimentConnectedModelRunner.validateSealingTargets(
-                    specification: optimization,
-                    targets: resolvedTargets
-                )
-                optimizationTargets = resolvedTargets
-                target = execution ?? reflection
-            } else {
-                guard let legacyTarget = try resolveTarget(validated.targetRole) else {
-                    throw PromptExperimentAuthorityError.targetUnavailable(
-                        "No currently available catalog target resolves for selector ‘\(validated.targetRole)’."
-                    )
-                }
-                optimizationTargets = nil
-                target = legacyTarget
-            }
-            let date = now()
-            let materialized: (rootURL: URL, files: [PromptExperimentFixtureFile], digest: String)
-            if let optimization = validated.optimization {
-                let value = try await store.materializeOptimizationEnvironment(
-                    experimentID: experimentID,
-                    planRevision: validated.revision,
-                    project: optimization.projectSnapshot,
-                    authorizedSourceRoots: authorizedSourceRoots
-                )
-                materialized = (value.rootURL, value.files, value.digest)
-            } else {
-                let value = try await store.materializeSyntheticEnvironment(
-                    experimentID: experimentID,
-                    planRevision: validated.revision,
-                    fixtureText: validated.syntheticFixture
-                )
-                materialized = (value.rootURL, [value.fixture], value.digest)
-            }
-            let currentIndex = try index(of: experimentID)
-            try requireOwner(records[currentIndex], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[currentIndex].phase == .drafting,
-                  records[currentIndex].draft == draft
-            else { throw PromptExperimentAuthorityError.staleDraft }
-            let environment = PromptExperimentEnvironment(
-                workspaceID: PromptExperimentDigest.deterministicUUID(
-                    namespace: "environment-workspace",
-                    value: "\(experimentID.uuidString):\(validated.revision):\(materialized.digest)"
-                ),
-                sourceTabID: records[currentIndex].sourceTabID,
-                capturedAt: date,
-                isolatedRootPath: materialized.rootURL.standardizedFileURL.path,
-                selection: StoredSelection(selectedPaths: materialized.files.map(\.path)),
-                fixtureFiles: materialized.files,
-                fixtureDigest: materialized.digest,
-                captureLimitations: validated.optimization == nil ? [
-                    "Only the reviewed synthetic fixture is available to trial tools.",
-                    "The user’s loaded workspace, worktrees, session bindings, and hidden grading data are not attached."
-                ] : [
-                    "Only explicitly reviewed regular project files were copied into this immutable app-owned snapshot.",
-                    "Expected outputs, reviewer notes, and held-out grading data are host-private and are not present in the runtime root.",
-                    "Commands receive the copied project read-only and a separate writable scratch directory; the source workspace is never an execution cwd."
-                ]
-            )
-            let plan = try PromptExperimentPlan.seal(
-                draft: validated,
-                target: target,
-                optimizationTargets: optimizationTargets,
-                environment: environment,
-                at: date
-            )
-            let previousRecord = records[currentIndex]
-            records[currentIndex].plans.append(plan)
-            records[currentIndex].draft = nil
-            records[currentIndex].cancellationRequestedAt = nil
-            records[currentIndex].phase = .awaitingApproval
-            records[currentIndex].updatedAt = date
-            records[currentIndex].statusMessage = "Sealed revision \(plan.revision). Review digest \(plan.digest.prefix(12))… and approve in this native view."
-            try await persist(restoring: previousRecord)
-            return plan
-        }
-
-        func approve(
-            experimentID: UUID,
-            displayedDigest: String,
-            source: PromptExperimentApprovalActor = .nativeUI,
-            expectedControllerSessionID: UUID? = nil,
-            expectedMCPRequestID: UUID? = nil,
-            validateAuthority: @MainActor () throws -> Void = {}
-        ) async throws {
-            try await requireLoaded()
-            let index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].phase == .awaitingApproval else {
-                throw PromptExperimentAuthorityError.illegalPhase("Only a newly sealed plan awaiting approval can be approved.")
-            }
-            guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
-            guard records[index].approval(for: plan) == nil else {
-                throw PromptExperimentAuthorityError.illegalPhase("This exact plan is already approved.")
-            }
-            guard source == .nativeUI || source == .mcpElicitation else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
-            if source == .mcpElicitation {
-                guard let expectedMCPRequestID, mcpApprovalRequests[experimentID] == expectedMCPRequestID else {
-                    throw CancellationError()
-                }
-            }
-            try Task.checkCancellation()
-            try validateAuthority()
-            guard displayedDigest == plan.digest, plan.verifiesIntegrity() else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            let previousRecord = records[index]
-            let date = now()
-            records[index].approvals.append(PromptExperimentApproval(
-                id: UUID(),
-                planID: plan.id,
-                planDigest: plan.digest,
-                source: source,
-                approvedAt: date,
-                statement: "I reviewed and approve exactly plan digest \(plan.digest)."
-            ))
-            records[index].phase = .approved
-            records[index].updatedAt = date
-            records[index].statusMessage = "Approved locally; starting the exact sealed run."
-            try await persist(restoring: previousRecord)
-        }
-
-        func requestRun(
-            experimentID: UUID,
-            expectedPlanDigest: String,
-            expectedControllerSessionID: UUID
-        ) async throws -> PromptExperimentRecord {
-            try await requireLoaded()
-            let index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
-            guard plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-
-            switch records[index].phase {
-            case .approved:
-                try await run(
-                    experimentID: experimentID,
-                    expectedPlanDigest: expectedPlanDigest,
-                    expectedControllerSessionID: expectedControllerSessionID
-                )
-                return try records[self.index(of: experimentID)]
-            case .running, .cancelling, .completed, .inconclusive, .cancelled:
-                return records[index]
-            case .awaitingApproval:
-                guard pendingRunApprovals[experimentID] == nil, mcpApprovalRequests[experimentID] == nil else {
-                    throw PromptExperimentAuthorityError.experimentAlreadyRunning
-                }
-                return try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { continuation in
-                        if Task.isCancelled {
-                            continuation.resume(throwing: CancellationError())
-                            return
-                        }
-                        guard let currentIndex = records.firstIndex(where: { $0.id == experimentID }),
-                              records[currentIndex].phase == .awaitingApproval,
-                              records[currentIndex].currentPlan?.digest == expectedPlanDigest
-                        else {
-                            continuation.resume(throwing: PromptExperimentAuthorityError.digestMismatch)
-                            return
-                        }
-                        pendingRunApprovals[experimentID] = PendingRunApproval(
-                            planDigest: expectedPlanDigest,
-                            controllerSessionID: expectedControllerSessionID,
-                            continuation: continuation
-                        )
-                        records[currentIndex].statusMessage = Self.pendingApprovalStatus
-                        records[currentIndex].updatedAt = now()
-                        resumePendingRunApprovalObservers(experimentID: experimentID)
-                        Task { @MainActor [weak self] in
-                            do {
-                                try await self?.persist()
-                            } catch {
-                                guard let self,
-                                      pendingRunApprovals[experimentID]?.planDigest == expectedPlanDigest
-                                else { return }
-                                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
-                            }
-                        }
-                    }
-                } onCancel: {
-                    Task { @MainActor [weak self] in
-                        await self?.cancelPendingRunRequest(
-                            experimentID: experimentID,
-                            expectedPlanDigest: expectedPlanDigest,
-                            statusMessage: "Run approval request was cancelled; the sealed plan remains unapproved."
-                        )
-                    }
-                }
-            case .drafting:
-                throw PromptExperimentAuthorityError.illegalPhase("Seal the reviewed draft before requesting a run.")
-            }
-        }
-
-        /// Approval arrives from the negotiated MCP transport, never from a tool argument.
-        /// Pin the runtime while awaiting the user, and fence late responses against cancellation
-        /// and replacement requests for the same digest. Existing run/wait/evidence authority is reused.
-        func requestRunUsingMCPApproval(
-            experimentID: UUID,
-            expectedPlanDigest: String,
-            owner: PromptExperimentAgentOwner,
-            validateAuthority: @MainActor () throws -> Void = {},
-            authorize: @escaping @MainActor (PromptExperimentPlan) async throws -> Bool
-        ) async throws -> PromptExperimentRecord {
-            let record = try await ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
-            guard let plan = record.currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
-            guard plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            guard record.phase == .awaitingApproval else {
-                return try await requestRun(
-                    experimentID: experimentID, expectedPlanDigest: expectedPlanDigest,
-                    expectedControllerSessionID: owner.controllerSessionID
-                )
-            }
-            guard pendingRunApprovals[experimentID] == nil, mcpApprovalRequests[experimentID] == nil else {
-                throw PromptExperimentAuthorityError.experimentAlreadyRunning
-            }
-            let requestID = UUID()
-            mcpApprovalRequests[experimentID] = requestID
-            defer {
-                if mcpApprovalRequests[experimentID] == requestID {
-                    mcpApprovalRequests.removeValue(forKey: experimentID)
-                }
-            }
-            let pendingIndex = try index(of: experimentID)
-            records[pendingIndex].statusMessage = "Awaiting MCP user approval for exact plan digest " + plan.digest
-            records[pendingIndex].updatedAt = now()
-            try await persist()
-            try Task.checkCancellation()
-            guard mcpApprovalRequests[experimentID] == requestID else { throw CancellationError() }
-            let accepted: Bool
-            do {
-                accepted = try await awaitMCPApproval(experimentID: experimentID, requestID: requestID) {
-                    try await authorize(plan)
-                }
-            } catch {
-                if mcpApprovalRequests[experimentID] == requestID {
-                    let index = try index(of: experimentID)
-                    records[index].statusMessage = "MCP approval did not complete; the plan remains unapproved. Inspect the client connection and request again."
-                    records[index].updatedAt = now()
-                    try await persist()
-                }
-                throw error
-            }
-            try Task.checkCancellation()
-            guard mcpApprovalRequests[experimentID] == requestID else { throw CancellationError() }
-            if accepted {
-                try await approve(
-                    experimentID: experimentID, displayedDigest: expectedPlanDigest,
-                    source: .mcpElicitation, expectedControllerSessionID: owner.controllerSessionID,
-                    expectedMCPRequestID: requestID, validateAuthority: validateAuthority
-                )
-                try await run(
-                    experimentID: experimentID, expectedPlanDigest: expectedPlanDigest,
-                    expectedControllerSessionID: owner.controllerSessionID
-                )
-            }
-            if !accepted {
-                let index = try index(of: experimentID)
-                records[index].statusMessage = "MCP approval declined. The plan remains unapproved; revise it or request approval again."
-                records[index].updatedAt = now()
-                try await persist()
-            }
-            return try await ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
-        }
-
-        /// The SDK's elicitation request can outlive task cancellation. Release the lab caller
-        /// immediately; a late transport response is harmless because this exact waiter is gone.
-        private func awaitMCPApproval(
-            experimentID: UUID,
-            requestID: UUID,
-            authorize: @escaping @MainActor () async throws -> Bool
-        ) async throws -> Bool {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    guard !Task.isCancelled, mcpApprovalRequests[experimentID] == requestID else {
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    mcpApprovalWaiters[experimentID] = (requestID, continuation)
-                    Task { @MainActor [weak self] in
-                        let result: Result<Bool, Error>
-                        do { result = try await .success(authorize()) }
-                        catch { result = .failure(error) }
-                        self?.finishMCPApproval(experimentID: experimentID, requestID: requestID, result: result)
-                    }
-                }
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    self?.finishMCPApproval(experimentID: experimentID, requestID: requestID, result: .failure(CancellationError()))
-                }
-            }
-        }
-
-        private func finishMCPApproval(experimentID: UUID, requestID: UUID, result: Result<Bool, Error>) {
-            guard let waiter = mcpApprovalWaiters[experimentID], waiter.requestID == requestID else { return }
-            mcpApprovalWaiters.removeValue(forKey: experimentID)
-            waiter.continuation.resume(with: result)
-        }
-
-        func approveAndRun(
-            experimentID: UUID,
-            displayedDigest: String,
-            source: PromptExperimentApprovalActor = .nativeUI
-        ) async throws {
-            guard let pending = pendingRunApprovals[experimentID] else {
-                throw PromptExperimentAuthorityError.illegalPhase("The owning Agent session must request this exact run before native approval.")
-            }
-            guard pending.planDigest == displayedDigest else {
-                let error = PromptExperimentAuthorityError.digestMismatch
-                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
-                throw error
-            }
-            let expectedOwner = pending.controllerSessionID
-            do {
-                try await approve(
-                    experimentID: experimentID,
-                    displayedDigest: displayedDigest,
-                    source: source,
-                    expectedControllerSessionID: expectedOwner
-                )
-                try await run(
-                    experimentID: experimentID,
-                    expectedPlanDigest: displayedDigest,
-                    expectedControllerSessionID: expectedOwner
-                )
-                try resumePendingRunApproval(
-                    experimentID: experimentID,
-                    result: .success(records[index(of: experimentID)])
-                )
-            } catch {
-                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
-                throw error
-            }
-        }
-
-        func declineRunAndRevise(
-            experimentID: UUID,
-            displayedDigest: String,
-            source: PromptExperimentApprovalActor = .nativeUI,
-            feedback: String = ""
-        ) async throws {
-            guard feedback.count <= 8000 else {
-                throw PromptExperimentAuthorityError.invalidDraft("Revision feedback is limited to 8,000 characters.")
-            }
-            try await requireLoaded()
-            let originalIndex = try index(of: experimentID)
-            guard source == .nativeUI else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
-            guard let pending = pendingRunApprovals[experimentID], pending.planDigest == displayedDigest else {
-                throw PromptExperimentAuthorityError.illegalPhase("The owning Agent session must request this exact run before changes can be returned.")
-            }
-            try requireOwner(records[originalIndex], expectedControllerSessionID: pending.controllerSessionID)
-            guard records[originalIndex].phase == .awaitingApproval,
-                  let plan = records[originalIndex].currentPlan,
-                  plan.digest == displayedDigest,
-                  plan.verifiesIntegrity()
-            else { throw PromptExperimentAuthorityError.digestMismatch }
-            let fixture = if plan.optimization == nil {
-                try await store.readSyntheticFixture(environment: plan.environment)
-            } else {
-                ""
-            }
-            let index = try index(of: experimentID)
-            guard records[index].phase == .awaitingApproval,
-                  records[index].currentPlan == plan
-            else { throw PromptExperimentAuthorityError.staleDraft }
-            let previousRecord = records[index]
-            let date = now()
-            records[index].draft = PromptExperimentDraft(
-                revision: plan.revision + 1,
-                parentPlanID: plan.id,
-                title: plan.title,
-                taskInput: plan.taskInput,
-                syntheticFixture: fixture,
-                originalInstructions: plan.originalInstructions,
-                candidateInstructions: plan.candidateInstructions,
-                targetRole: plan.resolvedTarget.selector,
-                repetitions: plan.repetitions,
-                optimization: {
-                    var optimization = plan.optimization
-                    optimization?.gepa.maxWallClockSeconds = nil
-                    return optimization
-                }(),
-                createdAt: date,
-                updatedAt: date
-            )
-            records[index].phase = .drafting
-            records[index].updatedAt = date
-            records[index].statusMessage = "The user requested changes to revision \(plan.revision). Continue this conversation to revise the new versioned draft."
-                + (feedback.isEmpty ? "" : "\nUser feedback: \(feedback)")
-            try await persist(restoring: previousRecord)
-            try resumePendingRunApproval(
-                experimentID: experimentID,
-                result: .success(records[self.index(of: experimentID)])
-            )
-        }
-
-        func hasPendingRunApproval(experimentID: UUID, planDigest: String) -> Bool {
-            pendingRunApprovals[experimentID]?.planDigest == planDigest
-        }
-
-        func waitForPendingRunApprovalForTesting(experimentID: UUID) async {
-            if pendingRunApprovals[experimentID] != nil { return }
-            await withCheckedContinuation { continuation in
-                if pendingRunApprovals[experimentID] != nil {
-                    continuation.resume()
-                } else {
-                    pendingRunApprovalObservers[experimentID, default: []].append(continuation)
-                }
-            }
-        }
-
-        private func resumePendingRunApprovalObservers(experimentID: UUID) {
-            let observers = pendingRunApprovalObservers.removeValue(forKey: experimentID) ?? []
-            observers.forEach { $0.resume() }
-        }
-
-        private func cancelPendingRunRequest(
-            experimentID: UUID,
-            expectedPlanDigest: String,
-            statusMessage: String
-        ) async {
-            guard let pending = pendingRunApprovals[experimentID],
-                  pending.planDigest == expectedPlanDigest
-            else { return }
-            pendingRunApprovals[experimentID] = nil
-            if let index = records.firstIndex(where: { $0.id == experimentID }),
-               records[index].phase == .awaitingApproval,
-               records[index].currentPlan?.digest == expectedPlanDigest
-            {
-                records[index].statusMessage = statusMessage
-                records[index].updatedAt = now()
-                try? await persist()
-            }
-            pending.continuation.resume(throwing: CancellationError())
-        }
-
-        private func resumePendingRunApproval(
-            experimentID: UUID,
-            result: Result<PromptExperimentRecord, Error>
-        ) {
-            guard let pending = pendingRunApprovals.removeValue(forKey: experimentID) else { return }
-            pending.continuation.resume(with: result)
-        }
-
-        func run(
-            experimentID: UUID,
-            expectedPlanDigest: String? = nil,
-            expectedControllerSessionID: UUID? = nil
-        ) async throws {
-            try await requireLoaded()
-            var index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard !admittedExperimentIDs.contains(experimentID) else {
-                throw PromptExperimentAuthorityError.experimentAlreadyRunning
-            }
-            guard records[index].phase == .approved else {
-                throw PromptExperimentAuthorityError.illegalPhase("Only an approved, not-yet-run plan can start trials.")
-            }
-            guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
-            if let expectedPlanDigest, expectedPlanDigest != plan.digest {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            guard records[index].approval(for: plan) != nil, plan.verifiesIntegrity() else {
-                throw PromptExperimentAuthorityError.planNotApproved
-            }
-            if plan.optimization != nil {
-                guard plan.schemaVersion == PromptExperimentPlan.optimizationSchemaVersion else {
-                    throw PromptExperimentAuthorityError.illegalPhase("Earlier optimization schemas are preserved read-only. Clone the result into a current reviewed draft before execution.")
-                }
-                do {
-                    try await runtime.preflightOptimization(plan)
-                } catch {
-                    index = try self.index(of: experimentID)
-                    if records[index].phase == .approved,
-                       records[index].currentPlan?.digest == plan.digest,
-                       records[index].cancellationRequestedAt == nil
-                    {
-                        records[index].updatedAt = now()
-                        records[index].statusMessage = "Execution preflight blocked before any attempt: \(error.localizedDescription)"
-                        try? await persist()
-                    }
-                    throw error
-                }
-            }
-            // Preflight suspends. Re-resolve the record (persist sorts the array), and never
-            // overwrite a cancellation or a new revision with the stale approved snapshot.
-            try Task.checkCancellation()
-            index = try self.index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].phase == .approved, records[index].currentPlan?.digest == plan.digest,
-                  records[index].cancellationRequestedAt == nil
-            else { throw PromptExperimentAuthorityError.illegalPhase("Run was cancelled or superseded during preflight.") }
-            guard records[index].attempts(for: plan).isEmpty else {
-                throw PromptExperimentAuthorityError.illegalPhase("This immutable plan already has an execution history and cannot be run again.")
-            }
-            guard admittedExperimentIDs.insert(experimentID).inserted else {
-                throw PromptExperimentAuthorityError.experimentAlreadyRunning
-            }
-            let previousRecord = records[index]
-            records[index].attempts.append(contentsOf: plan.trials.map { PromptExperimentAttempt(trial: $0, plan: plan) })
-            records[index].phase = .running
-            records[index].updatedAt = now()
-            records[index].statusMessage = plan.optimization == nil
-                ? "Running fixed serial comparison (0/\(plan.trials.count))."
-                : "Starting \(plan.optimization?.isPreparation == true ? "reviewed preparation batch" : "pinned upstream GEPA search") (0/\(plan.optimization?.gepa.maxEvaluations ?? 0) evaluations)."
-            do {
-                try await persist()
-            } catch {
-                admittedExperimentIDs.remove(experimentID)
-                restoreRecord(previousRecord)
-                throw error
-            }
-            executionTasks[experimentID] = Task { @MainActor [weak self] in
-                await self?.executeSerially(experimentID: experimentID, plan: plan)
-            }
-        }
-
-        func cancel(
-            experimentID: UUID,
-            expectedPlanDigest: String? = nil,
-            expectedControllerSessionID: UUID? = nil
-        ) async throws {
-            try await requireLoaded()
-            let index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            if let expectedPlanDigest, records[index].currentPlan?.digest != expectedPlanDigest {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            if records[index].phase == .awaitingApproval, let expectedPlanDigest {
-                if let requestID = mcpApprovalRequests.removeValue(forKey: experimentID) {
-                    finishMCPApproval(experimentID: experimentID, requestID: requestID, result: .failure(CancellationError()))
-                    records[index].statusMessage = "MCP approval request cancelled; any late response is invalid. The sealed plan remains unapproved."
-                    records[index].updatedAt = now()
-                    try await persist()
-                    return
-                }
-                await cancelPendingRunRequest(
-                    experimentID: experimentID,
-                    expectedPlanDigest: expectedPlanDigest,
-                    statusMessage: "Run approval request cancelled by its owning Agent session; the sealed plan remains unapproved."
-                )
-                return
-            }
-            if records[index].phase == .approved {
-                mcpApprovalRequests.removeValue(forKey: experimentID)
-                records[index].phase = .cancelled
-                records[index].cancellationRequestedAt = now()
-                records[index].updatedAt = now()
-                records[index].statusMessage = "Cancelled before provider admission; no evaluation was started."
-                try await persist()
-                resumeExecutionWaiters(experimentID: experimentID)
-                return
-            }
-            guard records[index].phase == .running || records[index].phase == .cancelling else { return }
-            let date = now()
-            records[index].phase = .cancelling
-            records[index].cancellationRequestedAt = date
-            records[index].updatedAt = date
-            records[index].statusMessage = "Cancellation requested; waiting for provider settlement."
-            var handle: PromptExperimentRuntimeHandle?
-            let currentPlanID = records[index].currentPlan?.id
-            for attemptIndex in records[index].attempts.indices where records[index].attempts[attemptIndex].planID == currentPlanID {
-                if records[index].attempts[attemptIndex].status == .running || records[index].attempts[attemptIndex].status == .submitting {
-                    records[index].attempts[attemptIndex].status = .cancellationRequested
-                    records[index].attempts[attemptIndex].statusText = "Cancellation requested; settlement pending."
-                    records[index].attempts[attemptIndex].cancellationRequestedAt = date
-                    handle = activeHandles[records[index].attempts[attemptIndex].id]
-                }
-            }
-            try await persist()
-            guard let handle else { return }
-            let observation = await runtime.cancel(handle)
-            if case let .remoteStateUnknown(message) = observation {
-                try await mutate(experimentID: experimentID) { record in
-                    if let attemptIndex = record.attempts.firstIndex(where: { $0.id == handle.id }) {
-                        record.attempts[attemptIndex].statusText = "Cancellation requested; remote settlement unknown: \(message)"
-                    }
-                }
-            }
-        }
-
-        private func isAwaitingGradingRetry(_ record: PromptExperimentRecord) -> Bool {
-            guard let plan = record.currentPlan else { return false }
-            return record.attempts(for: plan).last?.gradingEvidence?.contains(where: { $0.awaitingRetry == true }) == true
-        }
-
-        func waitForExecution(
-            experimentID: UUID,
-            expectedPlanDigest: String,
-            expectedControllerSessionID: UUID,
-            timeoutSeconds: TimeInterval
-        ) async throws -> PromptExperimentRecord {
-            try await requireLoaded()
-            guard timeoutSeconds.isFinite, timeoutSeconds >= 0, timeoutSeconds <= 3600 else {
-                throw PromptExperimentAuthorityError.invalidDraft("timeout_seconds must be between 0 and 3600.")
-            }
-            var index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].currentPlan?.digest == expectedPlanDigest else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            guard records[index].phase == .running || records[index].phase == .cancelling,
-                  executionTasks[experimentID] != nil,
-                  timeoutSeconds > 0,
-                  !isAwaitingGradingRetry(records[index])
-            else { return records[index] }
-
-            let waiterID = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    if Task.isCancelled {
-                        continuation.resume()
-                        return
-                    }
-                    guard let currentIndex = records.firstIndex(where: { $0.id == experimentID }),
-                          records[currentIndex].phase == .running || records[currentIndex].phase == .cancelling,
-                          executionTasks[experimentID] != nil,
-                          !isAwaitingGradingRetry(records[currentIndex])
-                    else {
-                        continuation.resume()
-                        return
-                    }
-                    let timeoutTask = Task { @MainActor [weak self] in
-                        do {
-                            try await Task.sleep(for: .seconds(timeoutSeconds))
-                        } catch {
-                            return
-                        }
-                        self?.resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
-                    }
-                    executionWaiters[experimentID, default: [:]][waiterID] = ExecutionWaiter(
-                        continuation: continuation,
-                        timeoutTask: timeoutTask
-                    )
-                }
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    self?.resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
-                }
-            }
-            index = try self.index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].currentPlan?.digest == expectedPlanDigest else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            return records[index]
-        }
-
-        private func resumeExecutionWaiter(experimentID: UUID, waiterID: UUID) {
-            guard let waiter = executionWaiters[experimentID]?.removeValue(forKey: waiterID) else { return }
-            waiter.timeoutTask.cancel()
-            waiter.continuation.resume()
-            if executionWaiters[experimentID]?.isEmpty == true {
-                executionWaiters[experimentID] = nil
-            }
-        }
-
-        private func resumeExecutionWaiters(experimentID: UUID) {
-            guard let waiters = executionWaiters[experimentID] else { return }
-            for waiterID in Array(waiters.keys) {
-                resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
-            }
-        }
-
-        func startNextRevision(
-            experimentID: UUID,
-            expectedPlanDigest: String? = nil,
-            expectedControllerSessionID: UUID? = nil,
-            revisionMode: PromptExperimentRevisionMode = .continueBest
-        ) async throws {
-            try await requireLoaded()
-            let originalIndex = try index(of: experimentID)
-            try requireOwner(records[originalIndex], expectedControllerSessionID: expectedControllerSessionID)
-            guard [.completed, .inconclusive, .cancelled].contains(records[originalIndex].phase) else {
-                throw PromptExperimentAuthorityError.illegalPhase("A next revision can only follow a settled experiment run.")
-            }
-            guard records[originalIndex].draft == nil,
-                  let plan = records[originalIndex].currentPlan
-            else { throw PromptExperimentAuthorityError.noSealedPlan }
-            if let expectedPlanDigest, expectedPlanDigest != plan.digest {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            let recordSnapshot = records[originalIndex]
-            let originalPhase = recordSnapshot.phase
-            let chosenCandidateReference: PromptExperimentArtifactReference? = try {
-                guard plan.optimization != nil else { return nil }
-                switch revisionMode {
-                case .repeatCurrentSeed:
-                    return nil
-                case .continueBest, .continueCandidate:
-                    guard let result = recordSnapshot.attempts(for: plan).last?.optimizationResult else {
-                        throw PromptExperimentAuthorityError.invalidDraft("No settled GEPA candidate evidence is available to continue.")
-                    }
-                    let desired: Int? = switch revisionMode {
-                    case .continueBest: result.bestCandidateIndex
-                    case let .continueCandidate(index): index
-                    case .repeatCurrentSeed: nil
-                    }
-                    guard let desired,
-                          let reference = result.candidates.first(where: { $0.index == desired })?.candidateEvidence
-                    else {
-                        throw PromptExperimentAuthorityError.invalidDraft("The selected GEPA candidate is unavailable; no silent seed fallback was applied.")
-                    }
-                    return reference
-                }
-            }()
-            let fixture = if plan.optimization == nil {
-                try await store.readSyntheticFixture(environment: plan.environment)
-            } else {
-                ""
-            }
-            let chosenCandidate: String? = if let chosenCandidateReference {
-                try await String(data: store.readArtifact(chosenCandidateReference), encoding: .utf8)
-            } else {
-                nil
-            }
-            let index = try index(of: experimentID)
-            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
-            guard records[index].phase == originalPhase,
-                  records[index].draft == nil,
-                  records[index].currentPlan == plan
-            else { throw PromptExperimentAuthorityError.staleDraft }
-            let date = now()
-            var nextOptimization = plan.optimization
-            nextOptimization?.gepa.maxWallClockSeconds = nil
-            if let chosenCandidate {
-                nextOptimization?.seedCandidate = chosenCandidate
-                nextOptimization?.startingPoint = .supplied
-                // Continuing a development round must not silently promote it to search.
-                // Keep only the selected text; the agent chooses focused cases and revisions.
-                nextOptimization?.stage = plan.optimization?.isPreparation == true ? .preparation : .search
-                nextOptimization?.preparationCandidates = plan.optimization?.isPreparation == true ? [chosenCandidate] : nil
-            }
-            records[index].draft = PromptExperimentDraft(
-                revision: plan.revision + 1,
-                parentPlanID: plan.id,
-                title: plan.title,
-                taskInput: plan.taskInput,
-                syntheticFixture: fixture,
-                originalInstructions: plan.originalInstructions,
-                candidateInstructions: plan.candidateInstructions,
-                targetRole: plan.resolvedTarget.role,
-                repetitions: plan.repetitions,
-                optimization: nextOptimization,
-                createdAt: date,
-                updatedAt: date
-            )
-            records[index].phase = .drafting
-            records[index].updatedAt = date
-            records[index].statusMessage = "Revision \(plan.revision + 1) draft created; prior plans and evidence remain immutable."
-            try await persist(restoring: recordSnapshot)
-        }
-
-        @discardableResult
-        func cloneExperiment(
-            experimentID: UUID,
-            expectedControllerSessionID: UUID? = nil
-        ) async throws -> UUID {
-            try await requireLoaded()
-            let sourceIndex = try index(of: experimentID)
-            let source = records[sourceIndex]
-            try requireOwner(source, expectedControllerSessionID: expectedControllerSessionID)
-            guard [.approved, .completed, .inconclusive, .cancelled].contains(source.phase),
-                  let plan = source.currentPlan
-            else {
-                throw PromptExperimentAuthorityError.illegalPhase("Only a sealed or settled experiment can be cloned into a new draft.")
-            }
-            let date = now()
-            let cloneID = UUID()
-            let draft = try await PromptExperimentDraft(
-                revision: 1,
-                title: "\(plan.title) copy",
-                taskInput: plan.taskInput,
-                syntheticFixture: plan.optimization == nil ? store.readSyntheticFixture(environment: plan.environment) : "",
-                originalInstructions: plan.originalInstructions,
-                candidateInstructions: plan.candidateInstructions,
-                targetRole: plan.resolvedTarget.selector,
-                repetitions: plan.repetitions,
-                optimization: {
-                    var optimization = plan.optimization
-                    optimization?.gepa.maxWallClockSeconds = nil
-                    return optimization
-                }(),
-                createdAt: date,
-                updatedAt: date
-            )
-            records.insert(PromptExperimentRecord(
-                id: cloneID,
-                controllerSessionID: source.controllerSessionID,
-                sourceTabID: source.sourceTabID,
-                createdAt: date,
-                updatedAt: date,
-                phase: .drafting,
-                draft: draft,
-                plans: [],
-                approvals: [],
-                attempts: [],
-                cancellationRequestedAt: nil,
-                statusMessage: "Cloned as an unsealed draft. Review and seal a new digest before approval or execution."
-            ), at: 0)
-            do {
-                try await persist()
-            } catch {
-                records.removeAll { $0.id == cloneID }
-                throw error
-            }
-            return cloneID
-        }
-
-        func record(id: UUID) -> PromptExperimentRecord? {
-            records.first { $0.id == id }
-        }
-
-        func retryGrading(
-            experimentID: UUID, expectedPlanDigest: String, gradingID: UUID,
-            expectedControllerSessionID: UUID? = nil
-        ) async throws {
-            try await requireLoaded()
-            let record = try records[index(of: experimentID)]
-            try requireOwner(record, expectedControllerSessionID: expectedControllerSessionID)
-            guard let plan = record.currentPlan, plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
-                throw PromptExperimentAuthorityError.digestMismatch
-            }
-            guard record.phase == .running, record.cancellationRequestedAt == nil,
-                  plan.optimization?.gepa.pauseOnGradingFailure == true,
-                  let attempt = record.attempts(for: plan).last,
-                  attempt.gradingEvidence?.contains(where: { $0.id == gradingID && $0.awaitingRetry == true && $0.ordinal == 1 }) == true,
-                  let handle = activeHandles[attempt.id]
-            else { throw PromptExperimentAuthorityError.runtimeUnavailable("No matching live grading recovery is pending. Inspect status; exited workers cannot resume.") }
-            try runtime.retryGrading(handle, gradingID: gradingID)
-        }
+        // MARK: - Targets
 
         func availableTargets() -> [PromptExperimentResolvedTarget] {
-            listAvailableTargets()
+            listTargets()
         }
 
-        func ownedRecords(controllerSessionID: UUID) async throws -> [PromptExperimentRecord] {
+        func targetDefaults() -> PromptExperimentTargetDefaults {
+            PromptExperimentTargetDefaults(
+                execution: defaultTarget(role: Self.defaultExecutionRole),
+                reflection: defaultTarget(role: Self.defaultReflectionRole),
+                judge: defaultTarget(role: Self.defaultJudgeRole)
+            )
+        }
+
+        private func defaultTarget(role: String) -> PromptExperimentResolvedTarget? {
+            if let resolved = try? resolveTarget(role), PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks(resolved) {
+                return resolved
+            }
+            return listTargets().first(where: PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks)
+        }
+
+        // MARK: - Create / update
+
+        /// Validates every field and reports all problems together. An unapproved experiment is
+        /// updated in place; changing an approved experiment's authority creates a new
+        /// experiment (superseding it) that needs its own approval.
+        func createOrUpdate(_ request: PromptExperimentCreateRequest) async throws -> PromptExperiment {
             try await requireLoaded()
-            return records.filter { $0.controllerSessionID == controllerSessionID }
-        }
+            let base = try request.experimentID.map { try experiments[index(of: $0)] }
+            var errors: [PromptExperimentFieldError] = []
 
-        func ownedRecord(id: UUID, controllerSessionID: UUID) async throws -> PromptExperimentRecord {
-            try await requireLoaded()
-            let record = try records[index(of: id)]
-            try requireOwner(record, expectedControllerSessionID: controllerSessionID)
-            return record
-        }
+            var promptID = base?.authority.promptID
+            if let raw = request.promptID?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                promptID = BuiltInPromptID(rawValue: raw)
+                if promptID == nil {
+                    errors.append(.init(field: "prompt_id", message: "Unknown built-in prompt '\(raw)'. Choose one of: \(BuiltInPromptID.allCases.map(\.rawValue).joined(separator: ", "))."))
+                }
+            } else if promptID == nil {
+                errors.append(.init(field: "prompt_id", message: "Required: the built-in prompt to optimize."))
+            }
 
-        func readableArtifactText(for record: PromptExperimentRecord) async throws -> [String: String] {
-            var references: [PromptExperimentArtifactReference] = []
-            for attempt in record.attempts {
-                if let prompt = attempt.committedHandoff?.promptEvidence { references.append(prompt) }
-                if let assistant = attempt.assistantOutputEvidence { references.append(assistant) }
-                for partial in attempt.partialEvaluations ?? [] {
-                    references.append(partial.candidateEvidence)
-                    if partial.evaluation.split != .hiddenTest, let output = partial.evaluation.outputEvidence {
-                        references.append(output)
+            var resource: BuiltInPromptResource?
+            var suite: PromptSuite?
+            if let promptID {
+                do { resource = try registry.resource(promptID) } catch {
+                    errors.append(.init(field: "prompt_id", message: error.localizedDescription))
+                }
+                do {
+                    let loaded = try PromptSuiteLoader.load(promptID: promptID, registry: registry)
+                    let requestedSuite = request.suiteID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let requestedSuite, requestedSuite != loaded.suiteID {
+                        errors.append(.init(field: "suite_id", message: "Unknown suite '\(requestedSuite)' for '\(promptID.rawValue)'; the checked-in suite is '\(loaded.suiteID)'."))
+                    } else {
+                        suite = loaded
+                    }
+                } catch {
+                    errors.append(.init(field: "suite_id", message: "The checked-in suite for '\(promptID.rawValue)' is unavailable: \(error.localizedDescription)"))
+                }
+            }
+
+            let defaults = targetDefaults()
+            func target(_ field: String, _ selector: String?, current: PromptExperimentResolvedTarget?, fallback: PromptExperimentResolvedTarget?) -> PromptExperimentResolvedTarget? {
+                if let selector = selector?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    do { return try resolveTarget(selector) } catch {
+                        errors.append(.init(field: field, message: error.localizedDescription))
+                        return nil
                     }
                 }
-                for grade in attempt.gradingEvidence ?? [] where grade.split != .hiddenTest {
-                    references.append(grade.candidateEvidence)
-                    references.append(grade.outputEvidence)
+                if let current { return current }
+                if fallback == nil {
+                    errors.append(.init(field: field, message: "No available prompt-only target; choose one from targets."))
                 }
-                if let result = attempt.optimizationResult {
-                    references.append(contentsOf: result.candidates.map(\.candidateEvidence))
-                    references.append(contentsOf: result.evaluations.filter { $0.split != .hiddenTest }.compactMap(\.outputEvidence))
-                    // rawResultEvidence stays host-private: it embeds hidden-test outputs.
+                return fallback
+            }
+            let execution = target("execution_target", request.executionTarget, current: base?.authority.targets.execution, fallback: defaults.execution)
+            let reflection = target("reflection_target", request.reflectionTarget, current: base?.authority.targets.reflection, fallback: defaults.reflection)
+            var judge: PromptExperimentResolvedTarget?
+            if let suite {
+                if suite.grader.kind == .modelJudge {
+                    judge = target("judge_target", request.judgeTarget, current: base?.authority.targets.judge, fallback: defaults.judge)
+                } else if request.judgeTarget != nil {
+                    errors.append(.init(field: "judge_target", message: "Suite '\(suite.suiteID)' is graded by exact match; omit judge_target."))
                 }
             }
-            var textByDigest: [String: String] = [:]
-            for reference in references where textByDigest[reference.sha256] == nil {
-                let data = try await store.readArtifact(reference)
-                guard let text = String(data: data, encoding: .utf8) else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable(
-                        "Experiment artifact \(reference.sha256) is not valid UTF-8."
+
+            var settings = base?.authority.settings ?? PromptExperimentGEPASettings()
+            func bounded(_ field: String, _ value: Int?, _ range: ClosedRange<Int>, _ apply: (Int) -> Void) {
+                guard let value else { return }
+                guard range.contains(value) else {
+                    errors.append(.init(field: field, message: "Must be between \(range.lowerBound) and \(range.upperBound)."))
+                    return
+                }
+                apply(value)
+            }
+            bounded("reflection_minibatch_size", request.reflectionMinibatchSize, 1 ... 100) { settings.reflectionMinibatchSize = $0 }
+            bounded("max_provider_retries", request.maxProviderRetries, 0 ... 3) { settings.maxProviderRetries = $0 }
+            bounded("random_seed", request.randomSeed, 0 ... Int(Int32.max)) { settings.randomSeed = $0 }
+
+            let maxEvaluations = request.maxEvaluations ?? base?.authority.maxEvaluations
+            if let maxEvaluations {
+                if !(1 ... 10000).contains(maxEvaluations) {
+                    errors.append(.init(field: "max_evaluations", message: "Must be between 1 and 10000."))
+                } else if let suite {
+                    let minimum = PromptExperimentBudgetLedger.minimumApprovableEvaluations(
+                        cases: suite.cases, reflectionMinibatchSize: settings.reflectionMinibatchSize
                     )
+                    if maxEvaluations < minimum {
+                        errors.append(.init(field: "max_evaluations", message: "Must be at least \(minimum) for suite '\(suite.suiteID)': the seed's validation pass, one mutation-and-validation cycle, and the held-out reserve."))
+                    }
                 }
-                textByDigest[reference.sha256] = text
+            } else {
+                errors.append(.init(field: "max_evaluations", message: "Required: the total evaluation cap the user will approve."))
             }
-            return textByDigest
+
+            if let execution, let reflection {
+                errors += PromptExperimentConnectedModelRunner.targetErrors(
+                    PromptExperimentTargets(execution: execution, reflection: reflection, judge: judge)
+                ).map { PromptExperimentFieldError(field: "\($0.field)_target", message: $0.message) }
+            }
+            let title = request.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? base?.title
+            if let title, title.isEmpty || title.count > 200 {
+                errors.append(.init(field: "title", message: "Must be 1-200 characters."))
+            }
+
+            guard errors.isEmpty, let promptID, let resource, let suite, let execution, let reflection, let maxEvaluations else {
+                throw PromptExperimentAuthorityError.validation(errors)
+            }
+            let authority = PromptExperimentAuthority(
+                promptID: promptID,
+                promptResourceSHA256: resource.sha256,
+                suiteID: suite.suiteID,
+                suiteSHA256: suite.suiteSHA256,
+                rubricSHA256: suite.grader.rubric?.sha256,
+                targets: PromptExperimentTargets(execution: execution, reflection: reflection, judge: judge),
+                settings: settings,
+                maxEvaluations: maxEvaluations,
+                pythonSealValue: pythonSealValue(),
+                gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
+            )
+            let digest = try authority.digest()
+            let date = now()
+            let resolvedTitle = title ?? "Optimize \(promptID.rawValue)"
+
+            if let base, base.isApproved || !base.runs.isEmpty {
+                if digest == base.authorityDigest {
+                    guard resolvedTitle != base.title else { return base }
+                    let position = try index(of: base.id)
+                    experiments[position].title = resolvedTitle
+                    experiments[position].updatedAt = date
+                    try await persist(projecting: [base.id])
+                    return experiments[position]
+                }
+                let successor = PromptExperiment(
+                    id: UUID(), title: resolvedTitle, createdAt: date, updatedAt: date,
+                    authority: authority, authorityDigest: digest, supersedes: base.id,
+                    approvalRequest: nil, approval: nil, runs: [], proposals: []
+                )
+                experiments.append(successor)
+                try await persist(projecting: [successor.id])
+                return successor
+            }
+            if let base {
+                let position = try index(of: base.id)
+                experiments[position].title = resolvedTitle
+                if experiments[position].authorityDigest != digest {
+                    experiments[position].authority = authority
+                    experiments[position].authorityDigest = digest
+                    experiments[position].approvalRequest = nil
+                }
+                experiments[position].updatedAt = date
+                try await persist(projecting: [base.id])
+                notifyChange(base.id)
+                return experiments[position]
+            }
+            let created = PromptExperiment(
+                id: UUID(), title: resolvedTitle, createdAt: date, updatedAt: date,
+                authority: authority, authorityDigest: digest, supersedes: nil,
+                approvalRequest: nil, approval: nil, runs: [], proposals: []
+            )
+            experiments.append(created)
+            try await persist(projecting: [created.id])
+            return created
         }
 
-        func rebuildReadableViews() async throws {
+        // MARK: - Approval
+
+        /// Surfaces the native approval card. It never approves; only `approve` (native UI) can.
+        func requestApproval(experimentID: UUID, expectedAuthorityDigest: String?) async throws -> PromptExperiment {
             try await requireLoaded()
-            let report = await store.rebuildReadableViews(records)
-            projectionError = report.message
-        }
-
-        func recordDirectoryURL(experimentID: UUID) async throws -> URL {
-            try await store.recordDirectoryURL(experimentID: experimentID)
-        }
-
-        func waitForExecutionForTesting(experimentID: UUID) async {
-            let task = executionTasks[experimentID]
-            await task?.value
-        }
-
-        private func executeSerially(experimentID: UUID, plan: PromptExperimentPlan) async {
-            defer {
-                executionTasks[experimentID] = nil
-                admittedExperimentIDs.remove(experimentID)
+            let position = try index(of: experimentID)
+            let experiment = experiments[position]
+            guard !experiment.isApproved else { throw PromptExperimentAuthorityError.alreadyApproved }
+            if let expectedAuthorityDigest, expectedAuthorityDigest != experiment.authorityDigest {
+                throw PromptExperimentAuthorityError.authorityChanged
             }
-            for trial in plan.trials {
-                guard let recordIndex = records.firstIndex(where: { $0.id == experimentID }),
-                      records[recordIndex].cancellationRequestedAt == nil,
-                      let attemptIndex = records[recordIndex].attempts.firstIndex(where: { $0.trialID == trial.id })
-                else { break }
+            _ = try GEPARunController.resolveExecution(experiment, registry: registry)
+            experiments[position].approvalRequest = PromptExperimentApprovalRequest(
+                authorityDigest: experiment.authorityDigest,
+                requestedAt: now()
+            )
+            experiments[position].updatedAt = now()
+            try await persist(projecting: [experimentID])
+            notifyChange(experimentID)
+            return experiments[position]
+        }
 
-                let attemptID = records[recordIndex].attempts[attemptIndex].id
-                records[recordIndex].attempts[attemptIndex].status = .submitting
-                records[recordIndex].attempts[attemptIndex].statusText = "Persisted as submitting; awaiting runtime acceptance."
-                let submittedAt = now()
-                records[recordIndex].attempts[attemptIndex].submittedAt = submittedAt
-                records[recordIndex].attempts[attemptIndex].diagnostics = .initial(
-                    workerExpected: plan.optimization != nil,
-                    at: submittedAt
+        /// Native-only approval of the exact authority shown, then the first run starts.
+        func approve(experimentID: UUID, authorityDigest: String) async throws {
+            try await requireLoaded()
+            let position = try index(of: experimentID)
+            let experiment = experiments[position]
+            guard !experiment.isApproved else { throw PromptExperimentAuthorityError.alreadyApproved }
+            guard let request = experiment.approvalRequest else { throw PromptExperimentAuthorityError.approvalNotRequested }
+            guard request.authorityDigest == authorityDigest, experiment.authorityDigest == authorityDigest else {
+                throw PromptExperimentAuthorityError.authorityChanged
+            }
+            experiments[position].approval = PromptExperimentApproval(authorityDigest: authorityDigest, approvedAt: now())
+            experiments[position].approvalRequest = nil
+            experiments[position].updatedAt = now()
+            try await persist(projecting: [experimentID])
+            notifyChange(experimentID)
+            _ = try await run(experimentID: experimentID)
+        }
+
+        func decline(experimentID: UUID) async throws {
+            try await requireLoaded()
+            let position = try index(of: experimentID)
+            guard experiments[position].approvalRequest != nil else { throw PromptExperimentAuthorityError.approvalNotRequested }
+            experiments[position].approvalRequest = nil
+            experiments[position].updatedAt = now()
+            try await persist(projecting: [experimentID])
+            notifyChange(experimentID)
+        }
+
+        // MARK: - Runs
+
+        /// Starts (or resumes) an approved experiment within its remaining approved budget.
+        func run(experimentID: UUID) async throws -> PromptExperiment {
+            try await requireLoaded()
+            var position = try index(of: experimentID)
+            let experiment = experiments[position]
+            guard experiment.isApproved else { throw PromptExperimentAuthorityError.notApproved }
+            guard activeRun == nil else { throw PromptExperimentAuthorityError.runActive }
+            let used = max(
+                experiment.admissionsUsed,
+                PromptExperimentBudgetLedger.peekTotalAdmitted(directory: runtime.runDirectoryURL(for: experiment))
+            )
+            guard used < experiment.authority.maxEvaluations else { throw PromptExperimentAuthorityError.budgetExhausted }
+            let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
+            do {
+                try await runtime.preflight(experiment)
+            } catch {
+                throw PromptExperimentAuthorityError.runtimeUnavailable(error.localizedDescription)
+            }
+            guard activeRun == nil else { throw PromptExperimentAuthorityError.runActive }
+            position = try index(of: experimentID)
+            let runID = UUID()
+            let date = now()
+            let runRecord = PromptExperimentRun(
+                id: runID,
+                ordinal: experiments[position].runs.count + 1,
+                runDirectoryRelativePath: GEPARunController.runDirectoryRelativePath(
+                    experimentID: experimentID, authorityDigest: experiment.authorityDigest
+                ),
+                createdAt: date,
+                state: .queued,
+                statusText: "Queued; starting the pinned GEPA worker.",
+                admissionsBefore: used,
+                interruptedAdmissionsSettled: 0,
+                uncertainRemoteSettlement: false,
+                diagnostics: .initial(at: date),
+                modelCalls: [],
+                evaluations: [],
+                gradings: [],
+                result: nil
+            )
+            experiments[position].runs.append(runRecord)
+            experiments[position].updatedAt = date
+            activeRun = ActiveRun(experimentID: experimentID, runID: runID, suite: execution.suite)
+            do {
+                try await persist(projecting: [experimentID])
+            } catch {
+                activeRun = nil
+                throw error
+            }
+
+            let handle: PromptExperimentRuntimeHandle
+            do {
+                handle = try await runtime.submit(
+                    PromptExperimentRunRequest(experiment: experiments[index(of: experimentID)], runID: runID),
+                    progress: { [weak self] message in self?.recordProgress(experimentID: experimentID, runID: runID, message: message) },
+                    observation: { [weak self] value in self?.recordObservation(experimentID: experimentID, runID: runID, value) },
+                    checkpoint: { [weak self] value in
+                        guard let self else { throw PromptExperimentAuthorityError.runtimeUnavailable("The experiment service is unavailable.") }
+                        try await persistCheckpoint(experimentID: experimentID, runID: runID, value: value)
+                    }
                 )
-                records[recordIndex].updatedAt = submittedAt
-                let request = PromptExperimentRunRequest(
-                    experimentID: experimentID,
-                    controllerSessionID: records[recordIndex].controllerSessionID,
-                    plan: plan,
-                    attempt: records[recordIndex].attempts[attemptIndex]
-                )
-                do {
-                    try await persist()
-                } catch {
-                    markLocalPersistenceFailure(experimentID: experimentID, attemptID: attemptID, message: "Trial was not submitted because its submitting state could not be persisted: \(error.localizedDescription)")
-                    break
+            } catch {
+                activeRun = nil
+                try? mutateRun(experimentID: experimentID, runID: runID) { run in
+                    run.state = .failed
+                    run.settledAt = now()
+                    run.error = error.localizedDescription
+                    run.statusText = "The run was rejected before any evaluation: \(error.localizedDescription)"
                 }
-
-                let handle: PromptExperimentRuntimeHandle
-                do {
-                    handle = try await runtime.submit(
-                        request,
-                        progress: { [weak self] message in
-                            guard let self else { return }
-                            await updateProgress(experimentID: experimentID, attemptID: attemptID, message: message)
-                        },
-                        observation: { [weak self] observation in
-                            guard let self else { return }
-                            await updateRuntimeObservation(
-                                experimentID: experimentID,
-                                attemptID: attemptID,
-                                observation: observation
-                            )
-                        },
-                        checkpoint: { [weak self] value in
-                            guard let self else { throw PromptExperimentAuthorityError.runtimeUnavailable("Experiment store is unavailable.") }
-                            try await persistCheckpoint(experimentID: experimentID, attemptID: attemptID, value: value)
-                        }
-                    )
-                } catch let error as PromptExperimentSubmissionError {
-                    await settleSubmissionFailure(experimentID: experimentID, attemptID: attemptID, error: error)
-                    if case .acceptanceUnknown = error { break }
-                    continue
-                } catch {
-                    await settleSubmissionFailure(
-                        experimentID: experimentID,
-                        attemptID: attemptID,
-                        error: .rejected(error.localizedDescription)
-                    )
-                    continue
-                }
-
-                activeHandles[attemptID] = handle
-                guard let currentRecordIndex = records.firstIndex(where: { $0.id == experimentID }),
-                      let currentAttemptIndex = records[currentRecordIndex].attempts.firstIndex(where: { $0.id == attemptID })
-                else {
-                    _ = await runtime.cancel(handle)
-                    _ = await runtime.wait(for: handle)
-                    activeHandles.removeValue(forKey: attemptID)
-                    break
-                }
-                let cancellationAlreadyRequested = records[currentRecordIndex].cancellationRequestedAt != nil
-                records[currentRecordIndex].attempts[currentAttemptIndex].status = cancellationAlreadyRequested
-                    ? .cancellationRequested
-                    : .running
-                records[currentRecordIndex].attempts[currentAttemptIndex].statusText = cancellationAlreadyRequested
-                    ? "Accepted after cancellation was requested; forwarding cancellation and awaiting settlement."
-                    : "Accepted by existing Context Builder runtime."
-                if cancellationAlreadyRequested,
-                   records[currentRecordIndex].attempts[currentAttemptIndex].cancellationRequestedAt == nil
-                {
-                    records[currentRecordIndex].attempts[currentAttemptIndex].cancellationRequestedAt = records[currentRecordIndex].cancellationRequestedAt
-                }
-                let primaryRuntimeTarget = plan.optimizationTargets?.reflection ?? plan.resolvedTarget
-                let acceptedRuntimeLink = PromptExperimentRuntimeLink(
-                    adapter: plan.executionAdapter,
-                    tabID: handle.tabID,
-                    runID: handle.runID,
-                    provider: primaryRuntimeTarget.agentRaw,
-                    model: primaryRuntimeTarget.modelRaw
-                )
-                records[currentRecordIndex].attempts[currentAttemptIndex].runtimeLink = acceptedRuntimeLink
-                if var diagnostics = records[currentRecordIndex].attempts[currentAttemptIndex].diagnostics {
-                    diagnostics.append(PromptExperimentDiagnosticEvent(
-                        observedAt: now(),
-                        channel: "service",
-                        event: "runtime_accepted",
-                        detail: "adapter=\(acceptedRuntimeLink.adapter) run_id=\(acceptedRuntimeLink.runID?.uuidString ?? "unavailable")"
-                    ))
-                    records[currentRecordIndex].attempts[currentAttemptIndex].diagnostics = diagnostics
-                }
-                do {
-                    try await persist()
-                } catch {
-                    _ = await runtime.cancel(handle)
-                    _ = await runtime.wait(for: handle)
-                    activeHandles.removeValue(forKey: attemptID)
-                    markLocalPersistenceFailure(
-                        experimentID: experimentID,
-                        attemptID: attemptID,
-                        message: "Runtime accepted the trial, but local acceptance persistence failed. Cancellation was requested and terminal settlement was drained: \(error.localizedDescription)"
-                    )
-                    break
-                }
-                if cancellationAlreadyRequested {
-                    _ = await runtime.cancel(handle)
-                }
-
+                try? await persist(projecting: [experimentID])
+                notifyChange(experimentID)
+                throw PromptExperimentAuthorityError.runtimeUnavailable(error.localizedDescription)
+            }
+            activeRun?.handle = handle
+            try? mutateRun(experimentID: experimentID, runID: runID) { run in
+                run.state = .running
+                run.startedAt = now()
+                if run.statusText.hasPrefix("Queued") { run.statusText = "Running pinned upstream GEPA." }
+            }
+            if activeRun?.runID == runID, self.experiment(id: experimentID)?.runs.last?.cancellationRequestedAt != nil {
+                _ = await runtime.cancel(handle)
+            }
+            try await persist(projecting: [experimentID])
+            notifyChange(experimentID)
+            executionTasks[runID] = Task { @MainActor [weak self] in
+                guard let self else { return }
                 let result = await runtime.wait(for: handle)
-                activeHandles.removeValue(forKey: attemptID)
-                do {
-                    try await settle(experimentID: experimentID, attemptID: attemptID, result: result)
-                } catch {
-                    markLocalPersistenceFailure(
-                        experimentID: experimentID,
-                        attemptID: attemptID,
-                        message: "Runtime settled, but evidence or settlement persistence failed: \(error.localizedDescription)"
-                    )
-                    break
+                await settle(experimentID: experimentID, runID: runID, result: result)
+            }
+            return try experiments[index(of: experimentID)]
+        }
+
+        func cancel(experimentID: UUID) async throws -> PromptExperiment {
+            try await requireLoaded()
+            let position = try index(of: experimentID)
+            guard let active = activeRun, active.experimentID == experimentID else {
+                return experiments[position]
+            }
+            try mutateRun(experimentID: experimentID, runID: active.runID) { run in
+                if run.cancellationRequestedAt == nil { run.cancellationRequestedAt = now() }
+                run.statusText = "Cancellation requested; waiting for this run's provider calls to settle."
+            }
+            try await persist(projecting: [experimentID])
+            if let handle = active.handle { _ = await runtime.cancel(handle) }
+            notifyChange(experimentID)
+            return try experiments[index(of: experimentID)]
+        }
+
+        /// Returns immediately for a zero timeout; otherwise waits until the experiment's
+        /// approval or run state changes, or the timeout elapses.
+        func statusOrWait(experimentID: UUID, timeoutSeconds: TimeInterval) async throws -> PromptExperiment {
+            try await requireLoaded()
+            _ = try index(of: experimentID)
+            if timeoutSeconds > 0 {
+                let waiterID = UUID()
+                let timeout = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    self?.resumeWaiter(experimentID: experimentID, waiterID: waiterID)
                 }
-            }
-            await finishExperiment(experimentID: experimentID)
-        }
-
-        private func markLocalPersistenceFailure(experimentID: UUID, attemptID: UUID, message: String) {
-            loadError = message
-            guard let recordIndex = records.firstIndex(where: { $0.id == experimentID }),
-                  let attemptIndex = records[recordIndex].attempts.firstIndex(where: { $0.id == attemptID })
-            else { return }
-            records[recordIndex].attempts[attemptIndex].status = .localPersistenceFailed
-            records[recordIndex].attempts[attemptIndex].statusText = message
-            records[recordIndex].attempts[attemptIndex].error = message
-            records[recordIndex].phase = .inconclusive
-            records[recordIndex].statusMessage = message
-            records[recordIndex].updatedAt = now()
-        }
-
-        private func settle(experimentID: UUID, attemptID: UUID, result: PromptExperimentRuntimeResult) async throws {
-            let committedHandoff: PromptExperimentCommittedHandoff? = if let handoff = result.committedHandoff {
-                try await PromptExperimentCommittedHandoff(
-                    promptEvidence: store.installArtifact(Data(handoff.prompt.utf8)),
-                    promptPreview: String(handoff.prompt.prefix(400)),
-                    selection: handoff.selection,
-                    selectionRevision: handoff.selectionRevision,
-                    usedAgentOutputAsPrompt: handoff.usedAgentOutputAsPrompt
-                )
-            } else {
-                nil
-            }
-            let assistantOutputEvidence: PromptExperimentArtifactReference? = if let assistantOutput = result.assistantOutput {
-                try await store.installArtifact(Data(assistantOutput.utf8))
-            } else {
-                nil
-            }
-            let optimizationResult = try await installOptimizationResult(result.optimizationResult)
-            try await mutate(experimentID: experimentID) { record in
-                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
-                let cancelled = record.attempts[index].cancellationRequestedAt != nil || record.cancellationRequestedAt != nil
-                record.attempts[index].runtimeLink = result.runtimeLink
-                record.attempts[index].fixtureDigestBefore = result.fixtureDigestBefore
-                record.attempts[index].fixtureDigestAfter = result.fixtureDigestAfter
-                record.attempts[index].committedHandoff = committedHandoff
-                record.attempts[index].assistantOutputEvidence = assistantOutputEvidence
-                record.attempts[index].assistantOutputPreview = result.assistantOutput.map { String($0.prefix(400)) }
-                record.attempts[index].handoffUnavailableReason = result.handoffUnavailableReason
-                record.attempts[index].optimizationResult = optimizationResult
-                record.attempts[index].settledAt = now()
-                record.attempts[index].lateResultAfterCancellation = cancelled
-                if cancelled {
-                    record.attempts[index].status = .cancelledSettled
-                    record.attempts[index].statusText = "Provider settled after cancellation was requested; committed handoff and assistant output are retained when available, but not scored."
-                } else if result.fixtureDigestBefore != record.plan(for: record.attempts[index])?.environment.fixtureDigest
-                    || result.fixtureDigestAfter != result.fixtureDigestBefore
-                {
-                    record.attempts[index].status = .failed
-                    record.attempts[index].statusText = "Synthetic fixture digest was not sealed or changed during the run; attempt disqualified."
-                    record.attempts[index].error = "Fixture digest mismatch"
-                } else {
-                    switch result.disposition {
-                    case .completed where committedHandoff == nil && optimizationResult == nil:
-                        let message = result.handoffUnavailableReason ?? "Context Builder completion did not include an immutable committed handoff."
-                        record.attempts[index].status = .failed
-                        record.attempts[index].statusText = "Committed handoff unavailable; attempt is inconclusive: \(message)"
-                        record.attempts[index].error = message
-                    case .completed:
-                        record.attempts[index].status = .completed
-                        record.attempts[index].statusText = "Completed with immutable committed prompt and final selection evidence."
-                    case let .failed(message):
-                        record.attempts[index].status = .failed
-                        record.attempts[index].statusText = "Runtime failed: \(message)"
-                        record.attempts[index].error = message
-                    case .cancelled:
-                        record.attempts[index].status = .cancelledSettled
-                        record.attempts[index].statusText = "Provider confirmed cancellation."
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        changeWaiters[experimentID, default: [:]][waiterID] = continuation
                     }
+                } onCancel: {
+                    Task { @MainActor [weak self] in self?.resumeWaiter(experimentID: experimentID, waiterID: waiterID) }
                 }
-                if record.attempts[index].status == .cancelledSettled {
-                    // A worker cancellation can settle before its callback unwinds. Do not
-                    // leave an admitted but ungraded output pretending grading is still active.
-                    record.attempts[index].gradingEvidence = record.attempts[index].gradingEvidence?.map { $0.settlingCancellation() }
+                timeout.cancel()
+            }
+            return try experiments[index(of: experimentID)]
+        }
+
+        func waitForSettlementForTesting(experimentID: UUID) async {
+            for (runID, task) in executionTasks where experiment(id: experimentID)?.runs.contains(where: { $0.id == runID }) == true {
+                await task.value
+            }
+        }
+
+        private func resumeWaiter(experimentID: UUID, waiterID: UUID) {
+            changeWaiters[experimentID]?.removeValue(forKey: waiterID)?.resume()
+        }
+
+        private func notifyChange(_ experimentID: UUID) {
+            let waiters = changeWaiters.removeValue(forKey: experimentID) ?? [:]
+            for continuation in waiters.values {
+                continuation.resume()
+            }
+        }
+
+        private func settle(experimentID: UUID, runID: UUID, result: PromptExperimentRuntimeResult) async {
+            defer {
+                executionTasks.removeValue(forKey: runID)
+                if activeRun?.runID == runID { activeRun = nil }
+                notifyChange(experimentID)
+            }
+            let installed: PromptExperimentOptimizationResult?
+            do {
+                installed = try await installOptimizationResult(result.optimization)
+            } catch {
+                installed = nil
+                persistenceError = "Run evidence could not be installed: \(error.localizedDescription)"
+            }
+            try? mutateRun(experimentID: experimentID, runID: runID) { run in
+                run.settledAt = now()
+                run.admissionsAfter = result.admissionsAfter
+                run.interruptedAdmissionsSettled = result.interruptedAdmissionsSettled
+                run.result = installed
+                switch result.disposition {
+                case .completed:
+                    run.state = .completed
+                    run.statusText = installed?.assessment ?? "Completed."
+                case .stoppedBudget:
+                    run.state = .stoppedBudget
+                    run.statusText = installed?.assessment ?? "Stopped at the approved evaluation budget."
+                case let .failed(message):
+                    run.state = .failed
+                    run.error = message
+                    run.statusText = "Failed: \(message)"
+                case .cancelled:
+                    run.state = .cancelled
+                    run.statusText = "Cancelled; this run's provider calls were cancelled."
+                    run.gradings = run.gradings.map { $0.settlingCancellation() }
                 }
+            }
+            do {
+                try await persist(projecting: [experimentID])
+            } catch {
+                persistenceError = error.localizedDescription
             }
         }
 
@@ -1570,16 +629,11 @@
                     candidatePreview: String(candidate.prefix(600)),
                     aggregateScore: index < runtime.aggregateScores.count ? runtime.aggregateScores[index] : nil,
                     isBaseline: index == 0,
-                    isBest: index == runtime.bestCandidateIndex,
-                    isParetoEfficient: runtime.paretoFrontierIndices?.contains(index),
-                    promptSurface: runtime.candidatePromptSurfaces.flatMap {
-                        index < $0.count ? $0[index] : nil
-                    }
+                    isBest: index == runtime.bestCandidateIndex
                 ))
             }
             var evaluations: [PromptExperimentEvaluationEvidence] = []
             for (index, evaluation) in runtime.evaluations.enumerated() {
-                let scoreIdentity = evaluation.score.map { String($0) } ?? "unavailable"
                 let outputEvidence: PromptExperimentArtifactReference? = if let output = evaluation.output {
                     try await store.installArtifact(Data(output.utf8), fileExtension: "txt")
                 } else {
@@ -1587,8 +641,8 @@
                 }
                 evaluations.append(PromptExperimentEvaluationEvidence(
                     id: PromptExperimentDigest.deterministicUUID(
-                        namespace: "gepa-evaluation",
-                        value: "\(evaluation.candidateIndex):\(evaluation.exampleID):\(index):\(scoreIdentity)"
+                        namespace: "gepa-result-evaluation",
+                        value: "\(evaluation.candidateIndex):\(evaluation.exampleID):\(index)"
                     ),
                     candidateIndex: evaluation.candidateIndex,
                     exampleID: evaluation.exampleID,
@@ -1606,304 +660,122 @@
                 baselineScore: runtime.baselineScore,
                 bestScore: runtime.bestScore,
                 bestCandidateIndex: runtime.bestCandidateIndex,
-                paretoFrontierIndices: runtime.paretoFrontierIndices,
                 candidates: candidates,
                 evaluations: evaluations,
                 totalEvaluations: runtime.totalEvaluations,
                 wallTimeSeconds: runtime.wallTimeSeconds,
                 proposerUsage: runtime.proposerUsage,
-                runDirectoryRelativePath: runtime.runDirectoryRelativePath,
-                rawResultEvidence: rawResultEvidence
+                rawResultEvidence: rawResultEvidence,
+                stopReason: runtime.stopReason,
+                heldOut: runtime.heldOut
             )
         }
 
-        private func settleSubmissionFailure(
-            experimentID: UUID,
-            attemptID: UUID,
-            error: PromptExperimentSubmissionError
-        ) async {
-            try? await mutate(experimentID: experimentID) { record in
-                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
-                record.attempts[index].settledAt = now()
-                record.attempts[index].error = error.localizedDescription
-                switch error {
-                case let .rejected(message):
-                    record.attempts[index].status = .failed
-                    record.attempts[index].statusText = "Submission rejected before acceptance: \(message)"
-                case let .acceptanceUnknown(message):
-                    record.attempts[index].status = .submissionUncertain
-                    record.attempts[index].statusText = "Submission acceptance uncertain; automatic retry disabled: \(message)"
-                }
-            }
-        }
+        // MARK: - Evidence (durable)
 
-        private func finishExperiment(experimentID: UUID) async {
-            defer { resumeExecutionWaiters(experimentID: experimentID) }
-            guard loadError == nil else { return }
-            try? await mutate(experimentID: experimentID) { record in
-                guard let plan = record.currentPlan else { return }
-                for index in record.attempts.indices where record.attempts[index].planDigest == plan.digest {
-                    record.attempts[index].gradingEvidence = record.attempts[index].gradingEvidence?.map { $0.settlingInterruption() }
-                }
-                let currentAttempts = record.attempts(for: plan)
-                if record.cancellationRequestedAt != nil {
-                    record.phase = .cancelled
-                    record.statusMessage = "Cancelled. Requested and settled/unknown states remain visible per attempt."
-                } else if !currentAttempts.isEmpty, currentAttempts.allSatisfy({ $0.status == .completed }) {
-                    record.phase = .completed
-                    if let result = currentAttempts.last?.optimizationResult {
-                        record.statusMessage = result.assessment + " Applying a candidate requires separate approval."
-                    } else {
-                        record.statusMessage = "Fixed serial comparison complete. Review outputs; no automatic winner or promotion is computed."
-                    }
-                } else {
-                    record.phase = .inconclusive
-                    record.statusMessage = "Comparison inconclusive. Failures and uncertain submissions were not retried."
-                }
-            }
-        }
-
-        private func persistCheckpoint(experimentID: UUID, attemptID: UUID, value: PromptExperimentCheckpoint) async throws {
-            guard !failedCheckpointAttempts.contains(attemptID), checkpointInFlight.insert(attemptID).inserted else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint storage is failed or already busy for this attempt.")
-            }
-            defer { checkpointInFlight.remove(attemptID) }
-            do {
-                try await commitCheckpoint(experimentID: experimentID, attemptID: attemptID, value: value)
-            } catch {
-                // An unsuccessful checkpoint is never published or acknowledged on replay.
-                failedCheckpointAttempts.insert(attemptID)
-                throw error
-            }
-        }
-
-        private func commitCheckpoint(experimentID: UUID, attemptID: UUID, value: PromptExperimentCheckpoint) async throws {
-            let record = try records[index(of: experimentID)]
-            guard let attempt = record.attempts.first(where: { $0.id == attemptID }),
-                  attempt.planID == record.currentPlan?.id,
-                  [.submitting, .running, .cancellationRequested].contains(attempt.status),
-                  let plan = record.currentPlan, let spec = plan.optimization
-            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint no longer belongs to an active sealed attempt.") }
+        private func persistCheckpoint(experimentID: UUID, runID: UUID, value: PromptExperimentCheckpoint) async throws {
+            guard let active = activeRun, active.experimentID == experimentID, active.runID == runID,
+                  let experiment = experiment(id: experimentID),
+                  let run = experiment.runs.first(where: { $0.id == runID }), run.state.isActive
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint no longer belongs to an active run.") }
             switch value {
             case let .modelCall(call):
+                let targets = experiment.authority.targets
                 let expected: PromptExperimentResolvedTarget? = switch call.role {
-                case "execution": plan.optimizationTargets?.execution
-                case "reflection": spec.isPreparation ? nil : plan.optimizationTargets?.reflection
-                case "judge": spec.evaluator.kind == .connectedModelJudge ? plan.optimizationTargets?.judge : nil
+                case "execution": targets.execution
+                case "reflection": targets.reflection
+                case "judge": targets.judge
                 default: nil
                 }
                 guard call.target == expected,
-                      call.state != .started || attempt.status != .cancellationRequested,
                       call.state == .completed || (call.promptTokens == nil && call.completionTokens == nil),
-                      call.promptTokens.map({ $0 >= 0 }) != false,
-                      call.completionTokens.map({ $0 >= 0 }) != false
-                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid model usage checkpoint.") }
-                if let old = attempt.modelCalls?.first(where: { $0.id == call.id }) {
-                    if old == call { return }
-                    guard old.state == .started, call.state != .started, old.target == call.target, old.role == call.role else {
-                        throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting model usage checkpoint.")
+                      call.state != .started || run.cancellationRequestedAt == nil
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid model-call checkpoint.") }
+                if let old = run.modelCalls.first(where: { $0.id == call.id }) {
+                    guard old.state == .started, call.state != .started else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting model-call checkpoint.")
                     }
                 } else if call.state != .started {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable("Model completion has no admitted invocation.")
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("Model completion has no recorded invocation.")
                 }
-                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
-                    guard call.state != .started || attempt.status != .cancellationRequested else {
-                        throw PromptExperimentAuthorityError.runtimeUnavailable("Cancellation prevents a new model invocation.")
-                    }
-                    var calls = attempt.modelCalls ?? []
-                    if let i = calls.firstIndex(where: { $0.id == call.id }) { calls[i] = call } else { calls.append(call) }
-                    attempt.modelCalls = calls
+                try mutateRun(experimentID: experimentID, runID: runID) { run in
+                    if let i = run.modelCalls.firstIndex(where: { $0.id == call.id }) { run.modelCalls[i] = call } else { run.modelCalls.append(call) }
+                }
+            case let .evaluation(id, candidate, evaluation):
+                guard active.suite.cases.contains(where: { $0.id == evaluation.exampleID && $0.split == evaluation.split }),
+                      !candidate.isEmpty,
+                      evaluation.score.map({ $0.isFinite && $0 >= active.suite.grader.scoreRange.min && $0 <= active.suite.grader.scoreRange.max }) == true,
+                      evaluation.failureKind != .infrastructure
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint is outside the suite.") }
+                guard !run.evaluations.contains(where: { $0.id == id }) else { return }
+                let candidateRef = try await store.installArtifact(Data(candidate.utf8))
+                let outputRef: PromptExperimentArtifactReference? = if let output = evaluation.output {
+                    try await store.installArtifact(Data(output.utf8))
+                } else { nil }
+                try mutateRun(experimentID: experimentID, runID: runID) { run in
+                    run.evaluations.append(PromptExperimentScoredEvaluation(id: id, candidateEvidence: candidateRef, evaluation: .init(
+                        id: id, candidateIndex: evaluation.candidateIndex, exampleID: evaluation.exampleID,
+                        split: evaluation.split, score: evaluation.score, feedback: evaluation.feedback,
+                        failureKind: evaluation.failureKind, outputEvidence: outputRef, elapsedSeconds: evaluation.elapsedSeconds
+                    )))
                 }
             case let .grading(value):
-                guard let example = spec.examples.first(where: { $0.id == value.exampleID }),
-                      example.split == value.split, !value.candidate.isEmpty,
-                      spec.evaluator.kind == .connectedModelJudge,
-                      spec.admitsPreparationEvaluation(candidate: value.candidate, exampleID: value.exampleID),
-                      (1 ... 2).contains(value.ordinal),
-                      [.completed, .invalidResponse].contains(value.state) ? value.response != nil : value.response == nil
-                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid grading checkpoint identity.") }
-                let old = attempt.gradingEvidence?.first { $0.id == value.id }
-                if let old {
-                    guard old.exampleID == value.exampleID, old.split == value.split,
-                          old.candidateEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.candidate.utf8)),
-                          old.outputEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.output.utf8)),
-                          (old.ordinal == value.ordinal && old.state == .pending && value.awaitingRetry != true && [.completed, .invalidResponse, .providerFailed, .cancelled].contains(value.state))
-                          || (old.ordinal == value.ordinal && old.awaitingRetry == true && value.state == .cancelled && value.awaitingRetry != true)
-                          || (
-                              old.ordinal == 1 && value.ordinal == 1 && spec.gepa.pauseOnGradingFailure == true
-                                  && old.awaitingRetry != true && [.invalidResponse, .providerFailed].contains(old.state)
-                                  && value.state == .pending && value.awaitingRetry == true
-                          )
-                          || (
-                              value.ordinal == old.ordinal + 1 && value.state == .pending && value.awaitingRetry != true
-                                  && (spec.gepa.pauseOnGradingFailure == true ? old.awaitingRetry == true : old.state == .invalidResponse)
-                          )
-                    else { throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting grading checkpoint.") }
-                } else {
-                    guard value.ordinal == 1, value.state == .pending, value.awaitingRetry != true,
-                          (attempt.gradingEvidence?.count ?? 0) < spec.gepa.maxEvaluations
-                    else { throw PromptExperimentAuthorityError.runtimeUnavailable("Grading requires a new, budgeted evaluation.") }
-                }
-                if (value.ordinal == 2 && value.state == .pending) || value.awaitingRetry == true {
-                    let retries = (attempt.gradingEvidence ?? []).count(where: { $0.ordinal == 2 })
-                    guard attempt.status != .cancellationRequested, retries < (spec.gepa.maxJudgeRetries ?? 0) else {
-                        throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed judge-repair allowance is exhausted.")
-                    }
-                }
-                let candidateRef = try await store.installArtifact(Data(value.candidate.utf8), fileExtension: "txt")
-                let outputRef = try await store.installArtifact(Data(value.output.utf8), fileExtension: "txt")
-                // Judge responses can contain reference answers: never project their text to the lab agent/worker.
+                guard active.suite.cases.contains(where: { $0.id == value.exampleID && $0.split == value.split }),
+                      active.suite.grader.kind == .modelJudge,
+                      (1 ... 2).contains(value.ordinal)
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid grading checkpoint.") }
+                let candidateRef = try await store.installArtifact(Data(value.candidate.utf8))
+                let outputRef = try await store.installArtifact(Data(value.output.utf8))
+                // Judge responses can contain reference answers: kept host-private.
                 let responseRef: PromptExperimentArtifactReference? = if let response = value.response {
-                    try await store.installArtifact(Data(response.utf8), fileExtension: "txt")
+                    try await store.installArtifact(Data(response.utf8))
                 } else { nil }
-                var history = old?.history ?? []
-                let recordedState = value.awaitingRetry == true ? (old?.state ?? value.state) : value.state
-                if value.state != .pending || value.awaitingRetry == true {
-                    history.append(.init(ordinal: value.ordinal, state: recordedState, responseEvidence: responseRef, awaitingRetry: value.awaitingRetry))
-                }
-                let evidence = PromptExperimentGradingEvidence(
-                    id: value.id, exampleID: value.exampleID, split: value.split,
-                    candidateEvidence: candidateRef, outputEvidence: outputRef,
-                    ordinal: value.ordinal, state: recordedState, history: history, awaitingRetry: value.awaitingRetry
-                )
-                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
-                    var grades = attempt.gradingEvidence ?? []
-                    if let index = grades.firstIndex(where: { $0.id == value.id }) { grades[index] = evidence } else { grades.append(evidence) }
-                    attempt.gradingEvidence = grades
-                }
-                if value.awaitingRetry == true { resumeExecutionWaiters(experimentID: experimentID) }
-            case let .evaluation(id, candidate, evaluation):
-                guard let example = spec.examples.first(where: { $0.id == evaluation.exampleID }),
-                      example.split == evaluation.split, !candidate.isEmpty,
-                      spec.admitsPreparationEvaluation(candidate: candidate, exampleID: example.id),
-                      evaluation.score.map({ $0.isFinite && $0 >= spec.evaluator.minimumScore && $0 <= spec.evaluator.maximumScore }) == true,
-                      evaluation.elapsedSeconds.map({ $0.isFinite && $0 >= 0 }) != false,
-                      evaluation.failureKind != .infrastructure
-                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint is outside the sealed scope.") }
-                let candidateRef = try await store.installArtifact(Data(candidate.utf8), fileExtension: "txt")
-                let outputRef: PromptExperimentArtifactReference? = if let output = evaluation.output {
-                    try await store.installArtifact(Data(output.utf8), fileExtension: "txt")
-                } else { nil }
-                guard let current = records.first(where: { $0.id == experimentID }), current.currentPlan?.id == plan.id,
-                      let active = current.attempts.first(where: { $0.id == attemptID }),
-                      [.submitting, .running, .cancellationRequested].contains(active.status)
-                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Attempt settled while checkpoint artifacts were being saved.") }
-                let partial = PromptExperimentPartialEvaluation(id: id, candidateEvidence: candidateRef, evaluation: .init(
-                    id: id, candidateIndex: evaluation.candidateIndex, exampleID: evaluation.exampleID,
-                    split: evaluation.split, score: evaluation.score, feedback: evaluation.feedback,
-                    failureKind: evaluation.failureKind, outputEvidence: outputRef, elapsedSeconds: evaluation.elapsedSeconds
-                ))
-                if let old = attempt.partialEvaluations?.first(where: { $0.id == id }) {
-                    guard old == partial else { throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting evaluation checkpoint.") }
-                    return
-                }
-                guard (attempt.partialEvaluations?.count ?? 0) < spec.gepa.maxEvaluations else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint exceeds the sealed budget.")
-                }
-                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
-                    var partials = attempt.partialEvaluations ?? []
-                    partials.append(partial)
-                    attempt.partialEvaluations = partials
-                }
-            }
-        }
-
-        /// Hold the same save gate as ordinary status writes, but publish checkpoint fields only
-        /// after their canonical commit. Status mutations may proceed in memory during the await;
-        /// their saves wait here and snapshot the newly committed ledger after publication.
-        private func saveCheckpointUpdate(
-            experimentID: UUID, attemptID: UUID, planID: UUID,
-            update: (inout PromptExperimentAttempt) throws -> Void
-        ) async throws {
-            await acquirePersistence()
-            defer { releasePersistence() }
-            var staged = records
-            guard let i = staged.firstIndex(where: { $0.id == experimentID }),
-                  staged[i].currentPlan?.id == planID,
-                  let j = staged[i].attempts.firstIndex(where: { $0.id == attemptID }),
-                  [.submitting, .running, .cancellationRequested].contains(staged[i].attempts[j].status)
-            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint attempt is no longer active.") }
-            try update(&staged[i].attempts[j])
-            staged[i].updatedAt = now()
-            let report = try await store.saveRecords(staged)
-            // Do not replace status/diagnostics changed during the store actor suspension.
-            if let liveI = records.firstIndex(where: { $0.id == experimentID }),
-               let liveJ = records[liveI].attempts.firstIndex(where: { $0.id == attemptID })
-            {
-                records[liveI].attempts[liveJ].modelCalls = staged[i].attempts[j].modelCalls
-                records[liveI].attempts[liveJ].partialEvaluations = staged[i].attempts[j].partialEvaluations
-                records[liveI].attempts[liveJ].gradingEvidence = staged[i].attempts[j].gradingEvidence
-                records[liveI].updatedAt = max(records[liveI].updatedAt, staged[i].updatedAt)
-            }
-            projectionError = report.message
-        }
-
-        private func acquirePersistence() async {
-            if !persistenceBusy { persistenceBusy = true
-                return
-            }
-            await withCheckedContinuation { persistenceWaiters.append($0) }
-        }
-
-        private func releasePersistence() {
-            if persistenceWaiters.isEmpty { persistenceBusy = false }
-            else { persistenceWaiters.removeFirst().resume() }
-        }
-
-        private func updateProgress(experimentID: UUID, attemptID: UUID, message: String) async {
-            try? await mutate(experimentID: experimentID) { record in
-                guard record.phase == .running,
-                      let index = record.attempts.firstIndex(where: { $0.id == attemptID }),
-                      record.attempts[index].planID == record.currentPlan?.id,
-                      [.submitting, .running].contains(record.attempts[index].status)
-                else { return }
-                record.attempts[index].statusText = message
-                record.statusMessage = message
-            }
-        }
-
-        private func updateRuntimeObservation(
-            experimentID: UUID,
-            attemptID: UUID,
-            observation: PromptExperimentRuntimeObservation
-        ) async {
-            try? await mutate(experimentID: experimentID) { record in
-                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
-                let date = now()
-                var diagnostics = record.attempts[index].diagnostics
-                    ?? .initial(workerExpected: record.plan(for: record.attempts[index])?.optimization != nil, at: date)
-                let event: PromptExperimentDiagnosticEvent
-                switch observation {
-                case let .workerPrepared(stderrPath, protocolPath):
-                    diagnostics.processObservation = .preparing
-                    diagnostics.stderrLogRelativePath = stderrPath
-                    diagnostics.stdoutProtocolLogRelativePath = protocolPath
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "worker",
-                        event: "worker_prepared",
-                        detail: "redacted_logs_ready=true"
+                try mutateRun(experimentID: experimentID, runID: runID) { run in
+                    let old = run.gradings.first { $0.id == value.id }
+                    var history = old?.history ?? []
+                    if value.state != .pending {
+                        history.append(.init(ordinal: value.ordinal, state: value.state, responseEvidence: responseRef))
+                    }
+                    let evidence = PromptExperimentGradingEvidence(
+                        id: value.id, exampleID: value.exampleID, split: value.split,
+                        candidateEvidence: candidateRef, outputEvidence: outputRef,
+                        ordinal: value.ordinal, state: value.state, history: history
                     )
+                    if let i = run.gradings.firstIndex(where: { $0.id == value.id }) { run.gradings[i] = evidence } else { run.gradings.append(evidence) }
+                }
+            }
+            try await persist()
+        }
+
+        // MARK: - Diagnostics (throttled)
+
+        private func recordProgress(experimentID: UUID, runID: UUID, message: String) {
+            try? mutateRun(experimentID: experimentID, runID: runID) { run in
+                guard run.state.isActive else { return }
+                run.statusText = message
+                run.diagnostics?.latestProgress = message
+            }
+            scheduleDiagnosticsSave()
+        }
+
+        private func recordObservation(experimentID: UUID, runID: UUID, _ observation: PromptExperimentRuntimeObservation) {
+            let date = now()
+            try? mutateRun(experimentID: experimentID, runID: runID) { run in
+                var diagnostics = run.diagnostics ?? .initial(at: date)
+                switch observation {
+                case let .workerPrepared(stderr, stdout):
+                    diagnostics.stderrLogRelativePath = stderr
+                    diagnostics.stdoutProtocolLogRelativePath = stdout
+                    diagnostics.append(.init(observedAt: date, channel: "worker", event: "prepared", detail: nil))
                 case let .workerStarted(pid, identity):
                     diagnostics.processObservation = .runningObserved
                     diagnostics.workerPID = pid
                     diagnostics.workerProcessIdentity = identity
                     diagnostics.processStartedAt = date
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "worker",
-                        event: "worker_started",
-                        detail: "pid=\(pid); this is an observed launch, not a continuing liveness guarantee"
-                    )
+                    diagnostics.append(.init(observedAt: date, channel: "worker", event: "started", detail: "pid=\(pid)"))
                 case let .workerLaunchFailed(message):
                     diagnostics.processObservation = .launchFailed
-                    diagnostics.processExitedAt = date
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "worker",
-                        event: "worker_launch_failed",
-                        detail: String(message.prefix(300))
-                    )
+                    diagnostics.append(.init(observedAt: date, channel: "worker", event: "launch_failed", detail: message))
                 case let .workerExited(status, stderrBytes, stderrTruncated, protocolBytes, protocolTruncated):
                     diagnostics.processObservation = .exitedObserved
                     diagnostics.processExitedAt = date
@@ -1912,115 +784,144 @@
                     diagnostics.stderrLogTruncated = stderrTruncated
                     diagnostics.protocolLogByteCount = protocolBytes
                     diagnostics.protocolLogTruncated = protocolTruncated
-                    diagnostics.activeCallbackID = nil
-                    diagnostics.activeCallbackOperation = nil
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "worker",
-                        event: "worker_exited",
-                        detail: "status=\(status) stderr_bytes=\(stderrBytes) stderr_truncated=\(stderrTruncated) protocol_bytes=\(protocolBytes) protocol_truncated=\(protocolTruncated)"
-                    )
-                case let .protocolEvent(channel, name, detail):
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: channel,
-                        event: name,
-                        detail: detail
-                    )
+                    diagnostics.append(.init(observedAt: date, channel: "worker", event: "exited", detail: "status=\(status)"))
+                case let .protocolEvent(channel, event, detail):
+                    diagnostics.append(.init(observedAt: date, channel: channel, event: event, detail: detail))
                 case let .callbackStarted(id, operation):
                     diagnostics.activeCallbackID = id
                     diagnostics.activeCallbackOperation = operation
-                    diagnostics.linkedCallbackRuntime = nil
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "callback",
-                        event: "callback_started",
-                        detail: "id=\(id) operation=\(operation) payload=excluded"
-                    )
-                case let .callbackLinked(id, runtime):
-                    diagnostics.linkedCallbackRuntime = runtime
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "callback",
-                        event: "callback_linked",
-                        detail: "id=\(id) adapter=\(runtime.adapter) run_id=\(runtime.runID?.uuidString ?? "unavailable") provider=\(runtime.provider ?? "unavailable") model=\(runtime.model ?? "unavailable")"
-                    )
-                case let .callbackFinished(id, operation):
+                case let .callbackFinished(id, _):
                     if diagnostics.activeCallbackID == id {
                         diagnostics.activeCallbackID = nil
                         diagnostics.activeCallbackOperation = nil
                     }
-                    event = PromptExperimentDiagnosticEvent(
-                        observedAt: date,
-                        channel: "callback",
-                        event: "callback_finished",
-                        detail: "id=\(id) operation=\(operation)"
-                    )
                 }
-                diagnostics.append(event)
-                record.attempts[index].diagnostics = diagnostics
+                run.diagnostics = diagnostics
+            }
+            scheduleDiagnosticsSave()
+        }
+
+        private func scheduleDiagnosticsSave() {
+            guard pendingDiagnosticsSave == nil else { return }
+            let interval = diagnosticsSaveInterval
+            pendingDiagnosticsSave = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: interval)
+                guard let self else { return }
+                pendingDiagnosticsSave = nil
+                try? await persist()
             }
         }
 
-        private func mutate(
-            experimentID: UUID,
-            body: (inout PromptExperimentRecord) -> Void
-        ) async throws {
-            let index = try index(of: experimentID)
-            body(&records[index])
-            records[index].updatedAt = now()
-            try await persist()
-        }
+        // MARK: - Persistence (single writer)
 
-        private func restoreRecord(_ record: PromptExperimentRecord) {
-            if let index = records.firstIndex(where: { $0.id == record.id }) {
-                records[index] = record
-            } else {
-                records.append(record)
+        private func mutateRun(experimentID: UUID, runID: UUID, _ update: (inout PromptExperimentRun) throws -> Void) throws {
+            let position = try index(of: experimentID)
+            guard let runIndex = experiments[position].runs.firstIndex(where: { $0.id == runID }) else {
+                throw PromptExperimentAuthorityError.experimentNotFound
             }
-            records.sort { $0.updatedAt > $1.updatedAt }
+            try update(&experiments[position].runs[runIndex])
+            experiments[position].updatedAt = now()
         }
 
-        private func persist(restoring previousRecord: PromptExperimentRecord) async throws {
+        /// Saves the current in-memory state. Saves are serialized; each snapshots state after
+        /// acquiring the gate, so it includes every mutation made before it was requested.
+        private func persist(projecting projected: Set<UUID> = []) async throws {
+            await acquireSaveGate()
+            defer { releaseSaveGate() }
             do {
-                try await persist()
+                let report = try await store.save(experiments, projecting: projected)
+                persistenceError = nil
+                if report.message != nil || !projected.isEmpty { projectionError = report.message }
             } catch {
-                restoreRecord(previousRecord)
+                persistenceError = error.localizedDescription
                 throw error
             }
         }
 
-        private func index(of experimentID: UUID) throws -> Int {
-            guard let index = records.firstIndex(where: { $0.id == experimentID }) else {
-                throw PromptExperimentAuthorityError.experimentNotFound
+        private func acquireSaveGate() async {
+            guard isSaving else {
+                isSaving = true
+                return
             }
-            return index
+            await withCheckedContinuation { saveWaiters.append($0) }
         }
 
-        private func requireOwner(
-            _ record: PromptExperimentRecord,
-            expectedControllerSessionID: UUID?
-        ) throws {
-            guard let expectedControllerSessionID else { return }
-            guard record.controllerSessionID == expectedControllerSessionID else {
-                throw PromptExperimentAuthorityError.ownerMismatch
+        private func releaseSaveGate() {
+            if saveWaiters.isEmpty {
+                isSaving = false
+            } else {
+                saveWaiters.removeFirst().resume()
             }
         }
 
-        private func persist() async throws {
-            await acquirePersistence()
-            defer { releasePersistence() }
-            records.sort { $0.updatedAt > $1.updatedAt }
-            let report = try await store.saveRecords(records)
-            projectionError = report.message
+        /// Agents may select a retained GEPA index; only native UI may apply or reject it.
+        func proposePatch(experimentID: UUID, runID: UUID, candidateIndex: Int) async throws -> PromptExperimentProposal {
+            try await requireLoaded()
+            let position = try index(of: experimentID)
+            let experiment = experiments[position]
+            guard let run = experiment.runs.first(where: { $0.id == runID }),
+                  run.state == .completed || run.state == .stoppedBudget,
+                  let candidate = run.result?.candidates.first(where: { $0.index == candidateIndex })
+            else {
+                throw PromptExperimentAuthorityError.validation([.init(field: "candidate_index", message: "Choose a retained candidate from a completed or stopped-budget run.")])
+            }
+            let data = try await store.readArtifact(candidate.candidateEvidence)
+            let diff = try patchProposer.proposedDiff(
+                promptID: experiment.authority.promptID,
+                baselineSHA256: experiment.authority.promptResourceSHA256,
+                candidate: data
+            )
+            let diffReference = try await store.installArtifact(Data(diff.utf8), fileExtension: "diff")
+            let proposal = PromptExperimentProposal(
+                id: UUID(), runID: runID, candidateIndex: candidateIndex,
+                baselineResourceSHA256: experiment.authority.promptResourceSHA256,
+                candidateEvidence: candidate.candidateEvidence, diffEvidence: diffReference,
+                state: .proposed, createdAt: now(), decidedAt: nil
+            )
+            experiments[position].proposals.append(proposal)
+            experiments[position].updatedAt = now()
+            try await persist(projecting: [experimentID])
+            return proposal
         }
 
-        private static func liveTarget(selector: String) throws -> PromptExperimentResolvedTarget? {
-            try PromptExperimentTargetCatalog.resolve(selector)
+        func applyProposal(experimentID: UUID, proposalID: UUID) async throws {
+            try await decideProposal(experimentID: experimentID, proposalID: proposalID, apply: true)
         }
 
-        private static func liveTargets() -> [PromptExperimentResolvedTarget] {
-            PromptExperimentTargetCatalog.availableTargets()
+        func rejectProposal(experimentID: UUID, proposalID: UUID) async throws {
+            try await decideProposal(experimentID: experimentID, proposalID: proposalID, apply: false)
+        }
+
+        private func decideProposal(experimentID: UUID, proposalID: UUID, apply: Bool) async throws {
+            try await requireLoaded()
+            let position = try index(of: experimentID)
+            guard let proposalIndex = experiments[position].proposals.firstIndex(where: { $0.id == proposalID }),
+                  experiments[position].proposals[proposalIndex].state == .proposed
+            else {
+                throw PromptExperimentAuthorityError.validation([.init(field: "proposal_id", message: "Choose a pending proposal.")])
+            }
+            if apply {
+                let proposal = experiments[position].proposals[proposalIndex]
+                let candidate = try await store.readArtifact(proposal.candidateEvidence)
+                try patchProposer.apply(
+                    promptID: experiments[position].authority.promptID,
+                    baselineSHA256: proposal.baselineResourceSHA256,
+                    candidate: candidate
+                )
+            }
+            experiments[position].proposals[proposalIndex].state = apply ? .applied : .rejected
+            experiments[position].proposals[proposalIndex].decidedAt = now()
+            experiments[position].updatedAt = now()
+            try await persist(projecting: [experimentID])
+        }
+
+        func readArtifactText(_ reference: PromptExperimentArtifactReference) async -> String? {
+            guard let data = try? await store.readArtifact(reference) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+
+        func recordDirectoryURL(experimentID: UUID) async -> URL {
+            await store.recordDirectoryURL(experimentID: experimentID)
         }
     }
 #endif

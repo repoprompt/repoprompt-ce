@@ -1,0 +1,109 @@
+#if DEBUG
+    import SwiftUI
+
+    /// Native-only decision surface. MCP can create a proposal, not approve its source write.
+    struct PromptExperimentProposalReviewView: View {
+        @ObservedObject var service: PromptExperimentService
+        let experimentID: UUID
+        let proposalID: UUID
+        @Environment(\.dismiss) private var dismiss
+        @State private var diffText: String?
+        @State private var errorText: String?
+        @State private var isDeciding = false
+
+        private var experiment: PromptExperiment? {
+            service.experiment(id: experimentID)
+        }
+
+        private var proposal: PromptExperimentProposal? {
+            experiment?.proposals.first { $0.id == proposalID }
+        }
+
+        private var run: PromptExperimentRun? {
+            guard let proposal else { return nil }
+            return experiment?.runs.first { $0.id == proposal.runID }
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Review source prompt patch").font(.title2.bold())
+                if let experiment, let proposal {
+                    Text("\(experiment.authority.promptID.rawValue) · run \(run?.ordinal ?? 0) · candidate #\(proposal.candidateIndex)")
+                        .font(.subheadline)
+                    Text("Baseline SHA-256: \(proposal.baselineResourceSHA256)")
+                        .font(.caption.monospaced()).textSelection(.enabled)
+                    if let run {
+                        Text("Run: \(run.state.rawValue) · \(run.result?.assessment ?? run.statusText)")
+                            .font(.caption)
+                        Text("GEPA \(run.result?.upstreamRevision ?? "—") · \(run.result?.totalEvaluations ?? 0) evaluations · best score \(run.result?.bestScore.map { String(format: "%.3f", $0) } ?? "—")")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let heldOut = run.result?.heldOut {
+                            // Held-out cases never reach the proposer; this is the report-only check.
+                            Text("\(heldOut.summary) (best = GEPA candidate #\(run.result?.bestCandidateIndex.map(String.init) ?? "—"))")
+                                .font(.caption.bold())
+                        }
+                        if let result = run.result {
+                            ForEach(result.evaluations.filter { $0.candidateIndex == proposal.candidateIndex }) { evaluation in
+                                Text("\(evaluation.exampleID) [\(evaluation.split.rawValue)] · \(evaluation.score.map { String(format: "%.3f", $0) } ?? "—"): \(evaluation.feedback)")
+                                    .font(.caption).textSelection(.enabled)
+                            }
+                        }
+                    }
+                    Text("One-file unified diff").font(.headline)
+                    ScrollView([.vertical, .horizontal]) {
+                        Text(diffText ?? "Loading diff…")
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+                    if let errorText {
+                        Text(errorText).foregroundStyle(.red).font(.caption).textSelection(.enabled)
+                    }
+                    HStack {
+                        Button("Close") { dismiss() }
+                        Spacer()
+                        if proposal.state == .proposed {
+                            Button("Reject") { decide(apply: false) }
+                                .disabled(isDeciding)
+                            Button("Apply to Source") { decide(apply: true) }
+                                .disabled(isDeciding || diffText == nil)
+                        } else {
+                            Text(proposal.state.rawValue.capitalized).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    ContentUnavailableView("Proposal unavailable", systemImage: "doc.badge.questionmark")
+                }
+            }
+            .padding(20)
+            .frame(minWidth: 850, minHeight: 600)
+            .task(id: proposalID) {
+                guard let reference = proposal?.diffEvidence else {
+                    errorText = "The proposal has no diff artifact."
+                    return
+                }
+                diffText = await service.readArtifactText(reference)
+                if diffText == nil { errorText = "The diff artifact could not be read or verified." }
+            }
+        }
+
+        private func decide(apply: Bool) {
+            isDeciding = true
+            Task {
+                do {
+                    if apply {
+                        try await service.applyProposal(experimentID: experimentID, proposalID: proposalID)
+                    } else {
+                        try await service.rejectProposal(experimentID: experimentID, proposalID: proposalID)
+                    }
+                    dismiss()
+                } catch {
+                    errorText = error.localizedDescription
+                }
+                isDeciding = false
+            }
+        }
+    }
+#endif

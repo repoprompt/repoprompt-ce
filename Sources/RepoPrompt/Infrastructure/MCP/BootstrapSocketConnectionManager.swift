@@ -191,22 +191,6 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         startupFailureTransportSnapshot
     }
 
-    #if DEBUG
-        private var experimentFormInFlight = false
-
-        func requestExperimentForm(
-            message: String,
-            requestedSchema: Elicitation.RequestSchema
-        ) async throws -> CreateElicitation.Result {
-            guard !experimentFormInFlight else {
-                throw MCPError.invalidRequest("A previous experiment approval form is still open on this MCP connection. Dismiss it before requesting another; cancelled forms cannot authorize runs.")
-            }
-            experimentFormInFlight = true
-            defer { experimentFormInFlight = false }
-            return try await requestFormElicitation(message: message, requestedSchema: requestedSchema)
-        }
-    #endif
-
     func supportsFormElicitation() -> Bool {
         clientCapabilities?.elicitation?.form != nil
     }

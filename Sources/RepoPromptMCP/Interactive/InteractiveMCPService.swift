@@ -43,7 +43,6 @@ actor InteractiveMCPService: Service {
         // Enable raw JSON mode if requested
         await session.setRawJSONEnabled(options.rawJSON)
         await session.setDefaultToolCallTimeout(Self.timeoutPolicy(from: options.toolCallTimeoutSeconds))
-        await session.setFormElicitationEnabled(options.formElicitationEnabled)
 
         // Enable progress for direct tool calls (--call) only
         if options.callTool != nil {

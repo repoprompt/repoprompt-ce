@@ -171,5 +171,75 @@ import XCTest
             XCTAssertEqual(result, Data("{\"type\":\"host_request\"}".utf8))
             XCTAssertEqual(child.terminationStatus, 0)
         }
+
+        // MARK: Protocol v2
+
+        func testCompletedSummaryDecodesWithoutRewritingExampleIDKeys() throws {
+            let line = Data("""
+            {"protocol_version":2,"type":"completed","event_id":"completed","result":{"engine":"gepa",\
+            "upstream_revision":"\(PromptExperimentGEPAConfiguration.pinnedRevision)","stop_reason":"budget_exhausted",\
+            "has_incumbent":true,"candidates":[{"index":0,"sha256":"\(String(repeating: "a", count: 64))","parent_indices":[],"aggregate_score":0.5}],\
+            "best_candidate_index":0,"best_score":0.5,"baseline_score":0.5,"total_metric_calls":7,"wall_time_seconds":1.5,\
+            "held_out":{"baseline":{"scores":{"held_out_case_1":1},"average":1},"best":null},"proposer_usage":"reflection_calls=1"}}
+            """.utf8)
+            let terminal = try GEPAWorkerProtocol.decodeTerminal(line)
+            XCTAssertEqual(terminal.stopReason, "budget_exhausted")
+            XCTAssertTrue(terminal.hasIncumbent)
+            XCTAssertEqual(terminal.candidates.first?.aggregateScore, 0.5)
+            XCTAssertEqual(terminal.heldOut?.baseline?.scores, ["held_out_case_1": 1])
+            XCTAssertNil(terminal.heldOut?.best, "an unadmitted held-out pass stays unavailable")
+        }
+
+        func testHostRequestsAndRepliesUseTheTypedWireShape() throws {
+            let request = Data("""
+            {"protocol_version":2,"type":"host_request","id":"r1","operation":"evaluate",\
+            "payload":{"candidate":"c","candidate_sha256":"sha","example_id":"t_1","split":"training"}}
+            """.utf8)
+            let decoded = try GEPAWorkerProtocol.decodeHostRequest(request)
+            XCTAssertEqual(decoded.id, "r1")
+            XCTAssertEqual(decoded.request, .evaluate(.init(candidate: "c", candidateSHA256: "sha", exampleID: "t_1", split: "training")))
+            XCTAssertThrowsError(try GEPAWorkerProtocol.decodeHostRequest(Data(#"{"id":"x","operation":"mcp_model","payload":{}}"#.utf8)))
+
+            XCTAssertEqual(GEPAWorkerProtocol.HostReply.budgetExhausted.jsonObject(id: "r1")["status"] as? String, "budget_exhausted")
+            let failed = GEPAWorkerProtocol.HostReply.failed(code: "provider_rejected", message: "m").jsonObject(id: "r1")
+            XCTAssertEqual(failed["status"] as? String, "failed")
+            XCTAssertEqual(failed["failure_code"] as? String, "provider_rejected")
+            let evaluated = GEPAWorkerProtocol.HostReply.evaluated(.init(
+                evaluationID: "e", score: 1, feedback: "f", outputExcerpt: nil, replayed: true
+            )).jsonObject(id: "r1")
+            XCTAssertEqual(evaluated["status"] as? String, "ok")
+            XCTAssertEqual(evaluated["replayed"] as? Bool, true)
+            XCTAssertEqual(evaluated["protocol_version"] as? Int, 2)
+        }
+
+        func testGEPAWorkerEnvironmentDoesNotInheritProviderCredentials() {
+            let environment = PromptExperimentGEPAWorker.workerEnvironment(
+                home: URL(fileURLWithPath: "/tmp/gepa-home"),
+                temporaryDirectory: URL(fileURLWithPath: "/tmp/gepa-tmp")
+            )
+            // Locale keys are forwarded only when the host sets them, so the exact key set
+            // depends on the test environment; everything else is fixed.
+            let localeKeys: Set = ["LANG", "LC_ALL", "LC_CTYPE"]
+            XCTAssertEqual(Set(environment.keys).subtracting(localeKeys), ["HOME", "PATH", "TMPDIR"])
+            let host = ProcessInfo.processInfo.environment
+            for key in localeKeys {
+                XCTAssertEqual(environment[key], host[key].flatMap { $0.isEmpty ? nil : $0 }, key)
+            }
+            XCTAssertEqual(environment["PATH"], "/usr/bin:/bin")
+            XCTAssertEqual(environment["HOME"], "/tmp/gepa-home")
+            XCTAssertEqual(environment["TMPDIR"], "/tmp/gepa-tmp")
+            for secret in ["PYTHONHOME", "PYTHONPATH", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_HOME"] {
+                XCTAssertNil(environment[secret], secret)
+            }
+        }
+
+        func testCandidateEventDetailExcludesCandidateText() {
+            let detail = PromptExperimentGEPAWorker.safeProtocolDetail(type: "candidate", object: [
+                "candidate_index": 3,
+                "candidate_sha256": String(repeating: "b", count: 64),
+                "candidate": "SECRET_CANDIDATE_TEXT"
+            ])
+            XCTAssertEqual(detail, "candidate_index=3 candidate_sha256=\(String(repeating: "b", count: 64)) text=excluded")
+        }
     }
 #endif

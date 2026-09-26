@@ -47,7 +47,6 @@ actor ExecMCPService: Service {
         // Enable raw JSON mode if requested
         await session.setRawJSONEnabled(options.rawJSON)
         await session.setDefaultToolCallTimeout(Self.timeoutPolicy(from: options.toolCallTimeoutSeconds))
-        await session.setFormElicitationEnabled(options.formElicitationEnabled)
 
         // Enable progress notifications for exec mode
         await session.setProgressEnabled(true)

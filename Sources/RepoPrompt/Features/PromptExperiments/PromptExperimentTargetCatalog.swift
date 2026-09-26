@@ -3,14 +3,14 @@
 
     /// Prompt Experiment view over the existing Agent Mode target resolver and discovery catalog.
     /// Roles may follow the effective Agent Models profile; explicit compound IDs never mutate it.
+    /// Only providers with an enforced tool-free completion profile are offered.
     @MainActor
     enum PromptExperimentTargetCatalog {
         private static let supportedAgents: Set<AgentProviderKind> = [
             .claudeCode,
             .claudeCodeGLM,
             .kimiCode,
-            .customClaudeCompatible,
-            .codexExec
+            .customClaudeCompatible
         ]
 
         static func availableTargets(

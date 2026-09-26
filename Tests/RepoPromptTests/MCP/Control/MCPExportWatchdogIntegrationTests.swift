@@ -207,7 +207,7 @@ import XCTest
             }
         }
 
-        func testPromptExperimentRunDispatchSurvivesFormerBoundedDeadlineUntilResolution() async throws {
+        func testPromptExperimentStatusWaitSurvivesFormerBoundedDeadlineUntilResolution() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(
                     lease: lease,
@@ -241,9 +241,9 @@ import XCTest
                             let response = try await endpoint.callTool(
                                 name: MCPWindowToolName.promptExperiment,
                                 arguments: [
-                                    "op": "run",
+                                    "op": "status_or_wait",
                                     "experiment_id": UUID().uuidString,
-                                    "expected_plan_digest": "sealed-digest"
+                                    "timeout_seconds": 3600
                                 ]
                             )
                             firstSettlement.signalIfEmpty(false)

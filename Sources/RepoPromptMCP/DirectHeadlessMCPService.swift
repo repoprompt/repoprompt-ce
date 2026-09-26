@@ -68,7 +68,6 @@ actor DirectHeadlessMCPService {
     }
 
     func run() async throws {
-        let experimentTools = try Self.experimentTools(environment: environment)
         let prepared = try await prepareRuntime()
         let server = Server(
             name: "RepoPrompt CE",
@@ -86,9 +85,9 @@ actor DirectHeadlessMCPService {
                 connectionGeneration: prepared.connectionGeneration,
                 principal: prepared.principal,
                 policyProfile: .direct,
-                restrictedToolNames: experimentTools.map { Set(MCPDomainCanonicalToolDefinitions.definitions.map(\.name)).subtracting($0) } ?? [],
-                additionalToolNames: experimentTools?.intersection([MCPWindowToolName.applyEdits]) ?? [],
-                ephemeralGrantedOperations: experimentTools == nil ? Self.topLevelDefaultMutationOperations : []
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
             )
         )
         let transport = MCPStdioServerTransport(
@@ -97,15 +96,13 @@ actor DirectHeadlessMCPService {
         )
 
         do {
-            if experimentTools == nil {
-                try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
-                    await self?.servePrivateChild(
-                        fd: fd,
-                        peerPID: peerPID,
-                        handshake: handshake,
-                        prepared: prepared
-                    )
-                }
+            try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
+                await self?.servePrivateChild(
+                    fd: fd,
+                    peerPID: peerPID,
+                    handshake: handshake,
+                    prepared: prepared
+                )
             }
             try await server.start(transport: transport)
             let terminal = await transport.waitUntilTerminal()
@@ -128,19 +125,6 @@ actor DirectHeadlessMCPService {
             await teardown(prepared)
             throw error
         }
-    }
-
-    static func experimentTools(environment: [String: String]) throws -> Set<String>? {
-        guard let raw = environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] else { return nil }
-        let names = raw.split(separator: ",").map(String.init)
-        let allowed: Set = ["read_file", "file_search", "get_file_tree", "get_code_structure", "apply_edits"]
-        guard !names.isEmpty, names.count == Set(names).count, Set(names).isSubset(of: allowed),
-              environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"]?.isEmpty == false,
-              environment["REPOPROMPT_MCP_WORKING_DIRS"]?.isEmpty == false
-        else {
-            throw MCPError.invalidParams("Experiment MCP requires an isolated profile, explicit project roots and an experiment tool allowlist.")
-        }
-        return Set(names)
     }
 
     func prepareRuntime() async throws -> PreparedRuntime {

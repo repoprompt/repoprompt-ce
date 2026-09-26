@@ -18,6 +18,8 @@
         case rejected = "provider_rejected"
         case invalidResponse = "provider_invalid_response"
         case toolViolation = "provider_tool_violation"
+        /// The logical call's overall deadline (all attempts and backoff) elapsed.
+        case timedOut = "provider_timed_out"
         case unknown = "provider_unknown"
 
         var isRetryable: Bool {
@@ -25,7 +27,7 @@
             case .rateLimited, .temporarilyUnavailable, .transportInterrupted,
                  .incompleteResponse, .emptyResponse, .routingUnavailable:
                 true
-            case .rejected, .invalidResponse, .toolViolation, .unknown:
+            case .rejected, .invalidResponse, .toolViolation, .timedOut, .unknown:
                 false
             }
         }
@@ -41,6 +43,7 @@
             case .rejected: "The connected provider rejected the callback configuration or credentials."
             case .invalidResponse: "The connected provider returned an invalid response."
             case .toolViolation: "The prompt-only callback attempted to use a disabled tool."
+            case .timedOut: "The connected provider call exceeded its overall deadline."
             case .unknown: "The connected provider callback failed for an unclassified reason."
             }
         }
@@ -85,16 +88,28 @@
         }
     }
 
+    /// One prompt-only model completion. Cancellation is structured: cancelling the calling
+    /// task disposes only that call's provider, never another attempt's work.
+    @MainActor
+    protocol PromptExperimentModelCompleting: AnyObject {
+        func complete(
+            target: PromptExperimentResolvedTarget,
+            systemPrompt: String,
+            userPrompt: String,
+            callbackRoot: URL
+        ) async throws -> PromptExperimentConnectedModelCompletion
+    }
+
     /// One-shot model completion over the existing Agent provider/login stack.
     /// Built-ins are disabled; RepoPrompt MCP execution is denied by a run-scoped policy.
     @MainActor
-    final class PromptExperimentConnectedModelRunner {
-        private weak var windowState: WindowState?
-        private var activeProviders: [UUID: HeadlessAgentProvider] = [:]
-        private var cancellationGeneration = 0
+    final class PromptExperimentConnectedModelRunner: PromptExperimentModelCompleting {
+        /// Supplies any live window whose MCP server can host the run-scoped policy lease.
+        /// Runs are not pinned to the window that created or approved them.
+        private let windowProvider: @MainActor () -> WindowState?
 
-        init(windowState: WindowState) {
-            self.windowState = windowState
+        init(windowProvider: @escaping @MainActor () -> WindowState? = { WindowStatesManager.shared.allWindows.first }) {
+            self.windowProvider = windowProvider
         }
 
         static let codexIsolationLimitation = "Connected Codex cannot currently enforce the tool-free completion contract required by GEPA target/reflection/judge callbacks. Shell and MCP tool flags do not disable every native tool. No model is substituted; ordinary Codex Agent and Context Builder runs are unaffected."
@@ -115,43 +130,20 @@
             }
         }
 
-        /// Reject known-incompatible catalog selections before materializing or sealing an
-        /// environment. Runtime preflight repeats this check in case capabilities drift.
-        static func validateSealingTargets(
-            specification: PromptExperimentOptimizationSpecification,
-            targets: PromptExperimentOptimizationTargets
-        ) throws {
-            var roles: [(String, PromptExperimentResolvedTarget)] = []
-            if !specification.isPreparation { roles.append(("reflection", targets.reflection)) }
-            if [.connectedModel, .mcpAdapter].contains(specification.execution.adapter),
-               let target = targets.execution
-            {
-                roles.append(("execution", target))
-            }
-            if specification.evaluator.kind == .connectedModelJudge, let target = targets.judge {
-                roles.append(("judge", target))
-            }
-            let unsupported = roles.compactMap { role, target -> String? in
-                guard AgentProviderKind(rawValue: target.agentRaw) != nil else { return nil }
+        /// Every role must have an enforced tool-free completion profile. Reported per field.
+        static func targetErrors(_ targets: PromptExperimentTargets) -> [PromptExperimentFieldError] {
+            let roles: [(String, PromptExperimentResolvedTarget?)] = [
+                ("execution", targets.execution), ("reflection", targets.reflection), ("judge", targets.judge)
+            ]
+            return roles.compactMap { field, target in
+                guard let target else { return nil }
                 do {
                     try requirePromptOnlyTarget(target)
                     return nil
                 } catch {
-                    return "\(role) (\(target.selector); \(target.canonicalSelectionID)): \(error.localizedDescription)"
+                    return PromptExperimentFieldError(field: field, message: "\(target.selector): \(error.localizedDescription)")
                 }
             }
-            guard unsupported.isEmpty else {
-                throw PromptExperimentAuthorityError.targetUnavailable(
-                    "This plan cannot be sealed because its connected-model callback targets are incompatible:\n"
-                        + unsupported.joined(separator: "\n")
-                        + "\nChoose a prompt-only-capable target shown by capabilities, or use Context Builder execution where applicable."
-                )
-            }
-        }
-
-        static func preflight(_ plan: PromptExperimentPlan) throws {
-            guard let spec = plan.optimization, let targets = plan.optimizationTargets else { return }
-            try validateSealingTargets(specification: spec, targets: targets)
         }
 
         static func classifyProviderFailure(_ error: Error) -> PromptExperimentProviderFailure {
@@ -180,7 +172,9 @@
 
         static func classifyProviderDescription(_ detail: String?) -> PromptExperimentProviderFailure {
             let value = (detail ?? "").lowercased()
-            if value.contains("rate limit") || value.contains("too many requests") || value.contains("429") {
+            if value.contains("rate limit") || value.contains("rate_limit") || value.contains("too many requests")
+                || value.contains("429")
+            {
                 return .init(code: .rateLimited)
             }
             if value.contains("unauthorized") || value.contains("authentication") || value.contains("api key")
@@ -191,7 +185,8 @@
             }
             if value.contains("temporarily unavailable") || value.contains("service unavailable")
                 || value.contains("overloaded") || value.contains("http 503")
-                || value.contains("status code 503")
+                || value.contains("status code 503") || value.contains("error: 503")
+                || value.contains("error: 529")
             {
                 return .init(code: .temporarilyUnavailable)
             }
@@ -205,6 +200,17 @@
             return .init(code: .unknown)
         }
 
+        /// Claude-compatible CLIs report API overload / 429 as in-stream `error` events carrying text only.
+        /// Prefer a typed stop reason when present; otherwise classify the payload with the same closed
+        /// description rules so transient failures stay retryable within the invoker's retry cap.
+        static func classifyStreamError(_ event: AIStreamResult) -> PromptExperimentProviderFailure {
+            if let stopReason = event.stopReason {
+                let typed = classifyProviderDescription(stopReason)
+                if typed.code != .unknown { return typed }
+            }
+            return classifyProviderDescription(event.text)
+        }
+
         func complete(
             target: PromptExperimentResolvedTarget,
             systemPrompt: String,
@@ -213,12 +219,11 @@
         ) async throws -> PromptExperimentConnectedModelCompletion {
             // Before directory creation, policy leases, providers, or any model/process admission.
             try Self.requirePromptOnlyTarget(target)
-            let generation = cancellationGeneration
-            guard let windowState else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable("The bound Agent window is no longer available.")
+            guard let windowState = windowProvider() else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("No RepoPrompt window is open to host the provider policy.")
             }
             guard let agent = AgentProviderKind(rawValue: target.agentRaw),
-                  [.claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec].contains(agent)
+                  [.claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible].contains(agent)
             else {
                 throw PromptExperimentAuthorityError.targetUnavailable(
                     "The selected target has no proven prompt-only Prompt Experiment provider profile."
@@ -250,19 +255,14 @@
                 agentKind: agent,
                 modelString: target.modelRaw,
                 runType: .promptExperiment,
-                workspacePath: callbackRoot.path,
-                codexRunConstraints: agent == .codexExec
-                    ? .promptExperiment(workingDirectory: callbackRoot.path)
-                    : nil
+                workspacePath: callbackRoot.path
             )
-            guard generation == cancellationGeneration, !Task.isCancelled else {
+            guard !Task.isCancelled else {
                 await lease.failAndCleanup()
                 await provider.dispose()
                 throw CancellationError()
             }
-            activeProviders[runID] = provider
             defer {
-                activeProviders.removeValue(forKey: runID)
                 try? FileManager.default.removeItem(at: callbackRoot)
             }
 
@@ -282,9 +282,9 @@
                         case "tool_call", "tool_result":
                             throw PromptExperimentProviderFailure(code: .toolViolation)
                         case "error":
-                            // Provider stream error prose is not a trustworthy authority signal for
-                            // additional spend. Retry only typed transport failures or explicit states.
-                            throw PromptExperimentProviderFailure(code: .unknown)
+                            // Only the closed transient classes (rate limit, overload/503, transport) retry;
+                            // unrecognised prose stays `.unknown` and non-retryable.
+                            throw Self.classifyStreamError(event)
                         case "message_incomplete":
                             throw PromptExperimentProviderFailure(code: .incompleteResponse)
                         case "message_stop":
@@ -320,15 +320,6 @@
                 }
             } onCancel: {
                 Task { await provider.dispose() }
-            }
-        }
-
-        func cancelAll() async {
-            cancellationGeneration += 1
-            let providers = Array(activeProviders.values)
-            activeProviders.removeAll()
-            for provider in providers {
-                await provider.dispose()
             }
         }
     }

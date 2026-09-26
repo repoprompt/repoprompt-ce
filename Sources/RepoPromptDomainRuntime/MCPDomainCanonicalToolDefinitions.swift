@@ -1127,9 +1127,15 @@ package enum MCPDomainCanonicalToolDefinitions {
     #if DEBUG
         private static func promptExperimentDefinition() -> MCPDomainToolDefinition {
             let operations = MCPDomainToolCatalog.promptExperimentOperations
+            func string(_ description: String) -> Value {
+                .object(["type": .string("string"), "description": .string(description)])
+            }
+            func integer(_ description: String) -> Value {
+                .object(["type": .string("integer"), "description": .string(description)])
+            }
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
-                description: "Operate the DEBUG GEPA lab through MCP: capabilities, draft/setup, revise, seal, run, wait/status, cancel, read evidence, clone, rerun and continue. External clients use workspace-scoped ownership without an Agent session: capabilities returns workspace_id, required on subsequent calls. Run uses negotiated MCP form elicitation to approve the complete exact plan and starts automatically. Agent sessions retain session ownership and may choose approval_mode=mcp instead of native cards. No tool argument can approve or promote. Cold starts support reviewed stage=preparation batches before GEPA search; no experiment-wide deadline.",
+                description: "Optimize a RepoPrompt built-in prompt with upstream GEPA against its checked-in suite: targets, create_or_update (typed fields, aggregated field errors), request_approval (native card; only the user approves, which covers the whole cap and starts the first run), run (resume within the remaining approved cap), status_or_wait, cancel, propose_patch (reviewed source diff for a retained candidate). Changing an approved experiment's authority creates a new experiment. The tool cannot approve or apply a candidate.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -1137,39 +1143,24 @@ package enum MCPDomainCanonicalToolDefinitions {
                             "type": .string("string"),
                             "enum": .array(operations.map(Value.string))
                         ]),
-                        "workspace_id": .object([
-                            "type": .string("string"),
-                            "description": .string("External MCP operations require the workspace ID returned by capabilities, matching the bound workspace.")
-                        ]),
-                        "approval_mode": .object([
-                            "type": .string("string"), "enum": .array([.string("mcp"), .string("native")]),
-                            "description": .string("Agent sessions may select mcp form elicitation. External clients always use mcp; no native UI is required.")
-                        ]),
-                        "experiment_id": .object(["type": .string("string")]),
-                        "expected_draft_id": .object(["type": .string("string")]),
-                        "expected_draft_version": .object(["type": .string("integer")]),
-                        "expected_draft_digest": .object(["type": .string("string")]),
-                        "expected_plan_digest": .object(["type": .string("string")]),
-                        "grading_id": .object(["type": .string("string"), "description": .string("Exact pending grading ID for retry_grading; cannot resume an exited worker.")]),
-                        "candidate_index": .object([
-                            "type": .string("integer"),
-                            "description": .string("Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.")
-                        ]),
+                        "experiment_id": string("Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list)."),
+                        "expected_authority_digest": string("request_approval: the authority_digest you reviewed; refused if it changed."),
+                        "title": string("create_or_update: display title."),
+                        "prompt_id": string("create_or_update: built-in prompt ID from targets."),
+                        "suite_id": string("create_or_update: suite ID from targets; defaults to the prompt's checked-in suite."),
+                        "execution_target": string("create_or_update: prompt-only target selector for the evaluated model."),
+                        "reflection_target": string("create_or_update: prompt-only target selector for GEPA reflection."),
+                        "judge_target": string("create_or_update: judge target selector for model-judged suites."),
+                        "max_evaluations": integer("create_or_update: total evaluation cap the user approves."),
+                        "reflection_minibatch_size": integer("create_or_update: GEPA reflection minibatch size, 1-100."),
+                        "max_provider_retries": integer("create_or_update: retries per provider call for transient failures, 0-3."),
+                        "random_seed": integer("create_or_update: GEPA random seed."),
+                        "run_id": string("propose_patch: completed run UUID."),
+                        "candidate_index": integer("propose_patch: retained GEPA candidate index."),
                         "timeout_seconds": .object([
                             "type": .string("number"),
-                            "description": .string("For wait only: 0-3600 seconds before returning current progress. Default 120.")
-                        ]),
-                        "specification_json": .object([
-                            "type": .string("string"),
-                            "description": .string("Complete versioned optimization specification JSON returned by create/read. Includes objective, examples, evaluator, execution adapter, optional reviewed project snapshot, and GEPA configuration. Replaces the specification under draft version and digest checks.")
-                        ]),
-                        "title": .object(["type": .string("string")]),
-                        "task_input": .object(["type": .string("string")]),
-                        "synthetic_fixture": .object(["type": .string("string")]),
-                        "original_instructions": .object(["type": .string("string")]),
-                        "candidate_instructions": .object(["type": .string("string")]),
-                        "target_role": .object(["type": .string("string")]),
-                        "repetitions": .object(["type": .string("integer")])
+                            "description": .string("status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.")
+                        ])
                     ]),
                     "required": .array([.string("op")])
                 ]),

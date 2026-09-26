@@ -169,10 +169,9 @@ package enum MCPToolExecutionContractCatalog {
                 let operation = arguments["op"]?.stringValue?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
+                // Approval is native and non-blocking; only waiting and cancellation observe a lifecycle.
                 switch operation {
-                case "run":
-                    return .interactiveCancellable
-                case "wait", "cancel":
+                case "status_or_wait", "cancel":
                     return .lifecycleManagedCancellable
                 default:
                     return baseContract

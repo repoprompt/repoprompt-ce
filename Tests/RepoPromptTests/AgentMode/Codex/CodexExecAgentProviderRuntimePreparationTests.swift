@@ -3,58 +3,6 @@ import Foundation
 import XCTest
 
 final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
-    func testPromptExperimentConstraintsPinModelEffortCwdAndNativeToolRestrictions() {
-        let root = "/tmp/prompt-experiment-synthetic-root"
-        let constraints = CodexExecRunConstraints.promptExperiment(workingDirectory: root)
-        let command = CodexExecAgentProvider.buildCodexExecArguments(
-            selectedModelString: "gpt-5.6-sol-ultra",
-            serverEntries: [],
-            brokenServers: [],
-            fullAccess: true,
-            runConstraints: constraints
-        )
-
-        XCTAssertEqual(command.modelSpecifier.baseModel, "gpt-5.6-sol")
-        XCTAssertEqual(command.modelSpecifier.reasoningEffort, .ultra)
-        XCTAssertTrue(command.args.contains("--model"))
-        XCTAssertTrue(command.args.contains("gpt-5.6-sol"))
-        XCTAssertTrue(command.args.contains("model_reasoning_effort=ultra"))
-        XCTAssertTrue(command.args.contains("features.shell_tool=false"))
-        XCTAssertTrue(command.args.contains("features.unified_exec=false"))
-        XCTAssertTrue(command.args.contains("web_search=disabled"))
-        XCTAssertTrue(command.args.contains("features.multi_agent=false"))
-        XCTAssertTrue(command.args.contains("workspace-write"))
-        XCTAssertFalse(command.args.contains("--dangerously-bypass-approvals-and-sandbox"))
-        XCTAssertFalse(CodexExecAgentProvider.allowsModelFallback(runConstraints: constraints))
-
-        let resolution = CodexProviderHelpers.CodexExecutableResolution(
-            commandName: "codex",
-            resolvedCommand: "/usr/bin/codex",
-            status: .available,
-            runtime: nil,
-            userMessage: "",
-            debugMessage: ""
-        )
-        let process = CodexExecAgentProvider.processConfiguration(
-            for: resolution,
-            enableDebugLogging: false,
-            workingDirectory: constraints.workingDirectory
-        )
-        XCTAssertEqual(process.workingDirectory, root)
-    }
-
-    func testDefaultCodexExecBehaviorStillAllowsConfiguredFullAccessAndFallback() {
-        let command = CodexExecAgentProvider.buildCodexExecArguments(
-            selectedModelString: "gpt-5.6-sol-ultra",
-            serverEntries: [],
-            brokenServers: [],
-            fullAccess: true
-        )
-        XCTAssertTrue(command.args.contains("--dangerously-bypass-approvals-and-sandbox"))
-        XCTAssertFalse(command.args.contains("web_search=disabled"))
-        XCTAssertTrue(CodexExecAgentProvider.allowsModelFallback(runConstraints: nil))
-    }
-
     func testPrepareUsesRuntimeStateAuthorityAndMapsFailureBeforeMCPBootstrap() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexExecAgentProviderRuntimePreparationTests-\(UUID().uuidString)")

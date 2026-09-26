@@ -3542,12 +3542,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return .init(tabID: tabID, identity: current.identity)
     }
 
-    func validatePromptExperimentTarget(
-        _ target: AgentSessionLifecycleAuthority.MutationTarget
-    ) throws {
-        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .promptExperiment)
-    }
-
     @discardableResult
     private func requireCurrentAgentSessionLifecycleTarget(
         _ target: AgentSessionLifecycleAuthority.MutationTarget,

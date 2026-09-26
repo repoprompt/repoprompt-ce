@@ -2002,94 +2002,79 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Operate the DEBUG GEPA lab through MCP: capabilities, draft/setup, revise, seal, run, wait/status, cancel, read evidence, clone, rerun and continue. External clients use workspace-scoped ownership without an Agent session: capabilities returns workspace_id, required on subsequent calls. Run uses negotiated MCP form elicitation to approve the complete exact plan and starts automatically. Agent sessions retain session ownership and may choose approval_mode=mcp instead of native cards. No tool argument can approve or promote. Cold starts support reviewed stage=preparation batches before GEPA search; no experiment-wide deadline.",
+      "description" : "Optimize a RepoPrompt built-in prompt with upstream GEPA against its checked-in suite: targets, create_or_update (typed fields, aggregated field errors), request_approval (native card; only the user approves, which covers the whole cap and starts the first run), run (resume within the remaining approved cap), status_or_wait, cancel, propose_patch (reviewed source diff for a retained candidate). Changing an approved experiment's authority creates a new experiment. The tool cannot approve or apply a candidate.",
       "inputSchema" : {
         "properties" : {
-          "approval_mode" : {
-            "description" : "Agent sessions may select mcp form elicitation. External clients always use mcp; no native UI is required.",
-            "enum" : [
-              "mcp",
-              "native"
-            ],
-            "type" : "string"
-          },
           "candidate_index" : {
-            "description" : "Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.",
+            "description" : "propose_patch: retained GEPA candidate index.",
             "type" : "integer"
           },
-          "candidate_instructions" : {
+          "execution_target" : {
+            "description" : "create_or_update: prompt-only target selector for the evaluated model.",
             "type" : "string"
           },
-          "expected_draft_digest" : {
-            "type" : "string"
-          },
-          "expected_draft_id" : {
-            "type" : "string"
-          },
-          "expected_draft_version" : {
-            "type" : "integer"
-          },
-          "expected_plan_digest" : {
+          "expected_authority_digest" : {
+            "description" : "request_approval: the authority_digest you reviewed; refused if it changed.",
             "type" : "string"
           },
           "experiment_id" : {
+            "description" : "Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list).",
             "type" : "string"
           },
-          "grading_id" : {
-            "description" : "Exact pending grading ID for retry_grading; cannot resume an exited worker.",
+          "judge_target" : {
+            "description" : "create_or_update: judge target selector for model-judged suites.",
             "type" : "string"
+          },
+          "max_evaluations" : {
+            "description" : "create_or_update: total evaluation cap the user approves.",
+            "type" : "integer"
+          },
+          "max_provider_retries" : {
+            "description" : "create_or_update: retries per provider call for transient failures, 0-3.",
+            "type" : "integer"
           },
           "op" : {
             "enum" : [
-              "capabilities",
-              "list",
-              "setup",
-              "create_draft",
-              "update_draft",
-              "propose_seal",
-              "status",
+              "targets",
+              "create_or_update",
+              "request_approval",
               "run",
-              "wait",
+              "status_or_wait",
               "cancel",
-              "retry_grading",
-              "read",
-              "clone",
-              "clone_draft",
-              "rerun",
-              "propose_run_again",
-              "continue",
-              "propose_next_revision"
+              "propose_patch"
             ],
             "type" : "string"
           },
-          "original_instructions" : {
+          "prompt_id" : {
+            "description" : "create_or_update: built-in prompt ID from targets.",
             "type" : "string"
           },
-          "repetitions" : {
+          "random_seed" : {
+            "description" : "create_or_update: GEPA random seed.",
             "type" : "integer"
           },
-          "specification_json" : {
-            "description" : "Complete versioned optimization specification JSON returned by create/read. Includes objective, examples, evaluator, execution adapter, optional reviewed project snapshot, and GEPA configuration. Replaces the specification under draft version and digest checks.",
+          "reflection_minibatch_size" : {
+            "description" : "create_or_update: GEPA reflection minibatch size, 1-100.",
+            "type" : "integer"
+          },
+          "reflection_target" : {
+            "description" : "create_or_update: prompt-only target selector for GEPA reflection.",
             "type" : "string"
           },
-          "synthetic_fixture" : {
+          "run_id" : {
+            "description" : "propose_patch: completed run UUID.",
             "type" : "string"
           },
-          "target_role" : {
-            "type" : "string"
-          },
-          "task_input" : {
+          "suite_id" : {
+            "description" : "create_or_update: suite ID from targets; defaults to the prompt's checked-in suite.",
             "type" : "string"
           },
           "timeout_seconds" : {
-            "description" : "For wait only: 0-3600 seconds before returning current progress. Default 120.",
+            "description" : "status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.",
             "type" : "number"
           },
           "title" : {
-            "type" : "string"
-          },
-          "workspace_id" : {
-            "description" : "External MCP operations require the workspace ID returned by capabilities, matching the bound workspace.",
+            "description" : "create_or_update: display title.",
             "type" : "string"
           }
         },

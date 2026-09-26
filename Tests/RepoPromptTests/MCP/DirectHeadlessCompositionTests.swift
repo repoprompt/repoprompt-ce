@@ -7,22 +7,6 @@ import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
-    func testExperimentProfileRejectsControlToolsAndRequiresIsolatedRoots() throws {
-        var environment = ["REPOPROMPT_MCP_EXPERIMENT_TOOLS": "read_file"]
-        XCTAssertThrowsError(try DirectHeadlessMCPService.experimentTools(environment: environment))
-        environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"] = "/tmp/profile"
-        environment["REPOPROMPT_MCP_WORKING_DIRS"] = "/tmp/project"
-        XCTAssertEqual(try DirectHeadlessMCPService.experimentTools(environment: environment), ["read_file"])
-        environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] = "read_file,prompt_experiment"
-        XCTAssertThrowsError(try DirectHeadlessMCPService.experimentTools(environment: environment))
-        environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] = "read_file,apply_edits"
-        XCTAssertEqual(
-            try DirectHeadlessMCPService.experimentTools(environment: environment),
-            ["read_file", "apply_edits"]
-        )
-        XCTAssertNil(try DirectHeadlessMCPService.experimentTools(environment: [:]))
-    }
-
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")

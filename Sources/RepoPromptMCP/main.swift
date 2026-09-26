@@ -2602,11 +2602,6 @@ func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMode {
             interactiveOptions.rawJSON = true
             execOptions.rawJSON = true
 
-        case "--form-elicitation":
-            hasNonBackendUserArgs = true
-            interactiveOptions.formElicitationEnabled = true
-            execOptions.formElicitationEnabled = true
-
         case "--tool-timeout":
             i = args.index(after: i)
             guard i < args.endIndex, let seconds = parseToolTimeoutSeconds(args[i]) else {
@@ -3260,7 +3255,6 @@ func printInteractiveUsage() {
         -d, --describe <tool>      Describe a specific tool's parameters
         -c, --call <tool>          Call a tool directly
         -j, --json <arg>           JSON for --call (see JSON ARGUMENTS below)
-        --form-elicitation         Negotiate MCP forms and read responses from the terminal
         -s, --snapshot-tools <path>  Save tool list to JSON file
 
     JSON ARGUMENTS (-j / --json):
@@ -3352,7 +3346,6 @@ func printScriptingUsage() {
         --json, -j <arg>         JSON args: inline, @file, @-, or path.json
         --wait-for-server <s>    Wait up to N seconds for server
         --tool-timeout <s>       Tool call timeout seconds (default 300, 0 disables)
-        --form-elicitation       Negotiate MCP forms and read responses from stdin
         --fail-fast              Stop on first command failure
         -q, --quiet              Suppress non-essential output
         --verbose                Show debug/timing info

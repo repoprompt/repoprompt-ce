@@ -19,7 +19,6 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
-import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -251,29 +250,6 @@ def install_gepa(archive: Path, destination: Path, manifest: dict) -> None:
     write_record(package_root, dist_info)
 
 
-def install_mcp_dependencies(destination: Path, architecture: str, downloads: Path, lock: dict) -> None:
-    """Extract only hash-verified wheels; no pip, resolution, or build scripts during packaging."""
-    site = destination / "python/lib/python3.11/site-packages"
-    for spec in lock["targets"][architecture]:
-        wheel = acquire_download(spec, downloads, None)
-        with zipfile.ZipFile(wheel) as source:
-            for member in source.infolist():
-                relative = validated_relative(member.filename)
-                if member.is_dir():
-                    continue
-                if any(part.endswith(".data") for part in relative.parts):
-                    raise ContractError("MCP dependency wheels must install directly into site-packages")
-                if stat.S_ISLNK(member.external_attr >> 16):
-                    raise ContractError("MCP dependency wheel contains a symlink")
-                target = site / relative
-                if target.exists():
-                    raise ContractError(f"MCP dependency wheel collides with existing runtime file: {relative}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(source.read(member))
-                target.chmod(0o644)
-    # Original wheel metadata, RECORD hashes and license files remain intact.
-
-
 def record_digest(path: Path) -> str:
     encoded = base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).rstrip(b"=")
     return f"sha256={encoded.decode('ascii')}"
@@ -351,7 +327,6 @@ def write_provenance(root: Path, architecture: str, manifest: dict, python_archi
         "gepa_revision": manifest["gepa"]["revision"],
         "gepa_source_sha256": sha256(gepa_archive),
         "gepa_requires_dist": manifest["gepa"]["requiresDist"],
-        "mcp": manifest.get("mcp"),
         "tree_sha256": canonical_json_sha256(tree),
         "tree": tree,
     }
@@ -415,9 +390,7 @@ def clean_runtime_smoke(root: Path, architecture: str) -> None:
         "assert importlib.metadata.version('gepa')=='0.1.4';"
         "assert (d.requires or [])==[];"
         "assert u['vcs_info']['commit_id']=='0632cdb5dcc052e690eab439e1b4a7e3e9cfe407';"
-        "from gepa.optimize_anything import optimize_anything;"
-        "from gepa.adapters.mcp_adapter import MCPAdapter;"
-        "assert importlib.metadata.version('mcp')=='1.30.0'"
+        "from gepa.optimize_anything import optimize_anything"
     )
     with tempfile.TemporaryDirectory(prefix="RPCE Runtime Smoke With Spaces ") as temporary:
         temp = Path(temporary)
@@ -468,12 +441,10 @@ def verify_target(
         "minimum_macos": manifest["python"]["minimumMacOS"],
         "python_asset_sha256": expected["sha256"],
         "tree_sha256": expected["treeSha256"],
-        "mcp": manifest.get("mcp"),
         "gepa_version": manifest["gepa"]["version"],
         "gepa_revision": manifest["gepa"]["revision"],
         "gepa_source_sha256": manifest["gepa"]["source"]["sha256"],
         "gepa_requires_dist": manifest["gepa"]["requiresDist"],
-        "mcp": manifest.get("mcp"),
     }
     for key, value in exact.items():
         if provenance.get(key) != value:
@@ -519,11 +490,6 @@ def assemble_target(
     try:
         extract_python(python_archive, temporary)
         install_gepa(gepa_archive, temporary, manifest)
-        if "mcp" in manifest:
-            dependency_lock = json.loads((ROOT / "Vendor/PromptExperimentPython/mcp-dependencies.lock.json").read_text())
-            if canonical_json_sha256(dependency_lock) != manifest["mcp"]["lockSha256"]:
-                raise ContractError("MCP dependency lock digest mismatch")
-            install_mcp_dependencies(temporary, target, parent.parent / "downloads", dependency_lock)
         for bytecode in temporary.rglob("*.py[co]"):
             bytecode.unlink()
         for cache in sorted(temporary.rglob("__pycache__"), reverse=True):

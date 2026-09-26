@@ -96,7 +96,7 @@ import XCTest
             previousWindows = WindowStatesManager.shared.allWindows
             networkWasRunning = await ServerNetworkManager.shared.isRunning()
             window = WindowState(
-                contextBuilderProviderFactory: { [unowned self] _, _, path, _, _ in
+                contextBuilderProviderFactory: { [unowned self] _, _, path, _ in
                     constructed += 1
                     providerWorkspacePaths.append(path)
                     return Provider(driver: self)

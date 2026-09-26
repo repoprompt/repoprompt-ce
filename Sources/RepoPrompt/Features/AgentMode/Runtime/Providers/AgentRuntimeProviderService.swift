@@ -294,7 +294,6 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
-        codexRunConstraints: CodexExecRunConstraints? = nil,
         modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
@@ -336,8 +335,7 @@ final class AgentRuntimeProviderService {
             let config = CodexExecAgentConfig(
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging,
-                fullAccess: codexRunConstraints == nil && CodexAgentToolPreferences.permissionLevel() == .fullAccess,
-                runConstraints: codexRunConstraints
+                fullAccess: CodexAgentToolPreferences.permissionLevel() == .fullAccess
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")

@@ -15200,17 +15200,6 @@ actor ServerNetworkManager {
             .joined()
     }
 
-    #if DEBUG
-        func promptExperimentElicitationConnection(_ connectionID: UUID) async throws -> BootstrapSocketConnectionManager {
-            guard let connection = connections[connectionID] as? BootstrapSocketConnectionManager,
-                  await connection.supportsFormElicitation()
-            else {
-                throw MCPError.invalidRequest("MCP-only experiment approval requires a client that negotiates form elicitation. No run was approved or started. Reconnect with elicitation support; approval cannot be supplied as tool arguments.")
-            }
-            return connection
-        }
-    #endif
-
     /// Returns the verified peer PID for a bootstrap socket connection, if available.
     func peerPID(for connectionID: UUID) async -> Int? {
         guard let connection = connections[connectionID] else { return nil }

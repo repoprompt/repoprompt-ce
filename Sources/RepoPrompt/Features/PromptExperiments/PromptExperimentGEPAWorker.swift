@@ -2,36 +2,355 @@
     import Darwin
     import Foundation
 
-    struct PromptExperimentGEPAHostReply {
-        let ok: Bool
-        let output: String?
-        let score: Double?
-        let feedback: String?
-        let failureKind: PromptExperimentOptimizationFailureKind?
-        let error: String?
-        let elapsedSeconds: Double?
-        var promptTokens: Int?
-        var completionTokens: Int?
-        var failureCode: String?
+    /// NDJSON protocol v2 between the app and `AppResources/PromptExperiments/gepa_worker.py`.
+    ///
+    /// The worker streams small identity events (`candidate`, `evaluation`, `reflection`)
+    /// and ends with a `completed` summary carrying only GEPA indices, lineage, aggregate
+    /// scores, and content hashes. Candidate text crosses once per candidate in its own
+    /// event; evaluation outputs never cross back to the app because the app produced them.
+    /// Explicit coding keys (not snake-case strategies) keep example-ID dictionary keys intact.
+    enum GEPAWorkerProtocol {
+        static let version = 2
 
-        var jsonObject: [String: Any] {
-            var value: [String: Any] = ["ok": ok]
-            if let output { value["output"] = output }
-            if let score { value["score"] = score }
-            if let feedback { value["feedback"] = feedback }
-            if let failureKind { value["failure_kind"] = failureKind.rawValue }
-            if let error { value["error"] = error }
-            if let failureCode { value["failure_code"] = failureCode }
-            if let elapsedSeconds { value["elapsed_seconds"] = elapsedSeconds }
-            if let promptTokens { value["prompt_tokens"] = promptTokens }
-            if let completionTokens { value["completion_tokens"] = completionTokens }
-            return value
+        struct Example: Codable, Equatable {
+            let id: String
+            let split: String
+            let input: String
+        }
+
+        /// Held-out cases are scored host-side by identity; their inputs never cross to GEPA.
+        struct HeldOutExample: Codable, Equatable {
+            let id: String
+            let split: String
+        }
+
+        struct RunRequest: Encodable, Equatable {
+            let runName: String
+            let objective: String
+            let background: String
+            let seedCandidate: String?
+            let examples: [Example]
+            let heldOutExamples: [HeldOutExample]
+            /// Cumulative GEPA search cap (approved total minus the held-out reserve).
+            let searchMaxEvaluations: Int
+            let reflectionMinibatchSize: Int
+            let useMerge: Bool
+            let maxMergeInvocations: Int
+            let skipPerfectScore: Bool
+            let perfectScore: Double
+            let stopAtScore: Double?
+            let randomSeed: Int
+            let runDir: String
+            let outputDir: String
+
+            enum CodingKeys: String, CodingKey {
+                case runName = "run_name"
+                case objective
+                case background
+                case seedCandidate = "seed_candidate"
+                case examples
+                case heldOutExamples = "held_out_examples"
+                case searchMaxEvaluations = "search_max_evaluations"
+                case reflectionMinibatchSize = "reflection_minibatch_size"
+                case useMerge = "use_merge"
+                case maxMergeInvocations = "max_merge_invocations"
+                case skipPerfectScore = "skip_perfect_score"
+                case perfectScore = "perfect_score"
+                case stopAtScore = "stop_at_score"
+                case randomSeed = "random_seed"
+                case runDir = "run_dir"
+                case outputDir = "output_dir"
+            }
+        }
+
+        struct EvaluateRequest: Codable, Equatable {
+            let candidate: String
+            let candidateSHA256: String
+            let exampleID: String
+            let split: String
+
+            enum CodingKeys: String, CodingKey {
+                case candidate
+                case candidateSHA256 = "candidate_sha256"
+                case exampleID = "example_id"
+                case split
+            }
+        }
+
+        enum HostRequest: Equatable {
+            case reflect(prompt: String)
+            case evaluate(EvaluateRequest)
+        }
+
+        struct EvaluatedReply: Equatable {
+            let evaluationID: String
+            let score: Double
+            let feedback: String
+            let outputExcerpt: String?
+            let replayed: Bool
+            var promptTokens: Int?
+            var completionTokens: Int?
+        }
+
+        enum HostReply: Equatable {
+            case reflected(output: String, promptTokens: Int?, completionTokens: Int?)
+            case evaluated(EvaluatedReply)
+            /// Typed ledger refusal; the worker turns it into GEPA's clean budget stop.
+            case budgetExhausted
+            case failed(code: String?, message: String)
+
+            func jsonObject(id: String) -> [String: Any] {
+                var value: [String: Any] = ["protocol_version": version, "type": "host_response", "id": id]
+                switch self {
+                case let .reflected(output, promptTokens, completionTokens):
+                    value["status"] = "ok"
+                    value["output"] = output
+                    if let promptTokens { value["prompt_tokens"] = promptTokens }
+                    if let completionTokens { value["completion_tokens"] = completionTokens }
+                case let .evaluated(reply):
+                    value["status"] = "ok"
+                    value["evaluation_id"] = reply.evaluationID
+                    value["score"] = reply.score
+                    value["feedback"] = reply.feedback
+                    value["replayed"] = reply.replayed
+                    if let excerpt = reply.outputExcerpt { value["output_excerpt"] = excerpt }
+                    if let promptTokens = reply.promptTokens { value["prompt_tokens"] = promptTokens }
+                    if let completionTokens = reply.completionTokens { value["completion_tokens"] = completionTokens }
+                case .budgetExhausted:
+                    value["status"] = "budget_exhausted"
+                case let .failed(code, message):
+                    value["status"] = "failed"
+                    value["error"] = message
+                    if let code { value["failure_code"] = code }
+                }
+                return value
+            }
+        }
+
+        struct CandidateEvent: Decodable, Equatable {
+            let eventID: String
+            let candidateIndex: Int
+            let candidateSHA256: String
+            let candidate: String
+            let parentIndices: [Int]
+            let aggregateScore: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case eventID = "event_id"
+                case candidateIndex = "candidate_index"
+                case candidateSHA256 = "candidate_sha256"
+                case candidate
+                case parentIndices = "parent_indices"
+                case aggregateScore = "aggregate_score"
+            }
+        }
+
+        struct EvaluationEvent: Decodable, Equatable {
+            let eventID: String
+            let candidateSHA256: String
+            let exampleID: String
+            let split: String
+            let score: Double
+            let replayed: Bool
+
+            enum CodingKeys: String, CodingKey {
+                case eventID = "event_id"
+                case candidateSHA256 = "candidate_sha256"
+                case exampleID = "example_id"
+                case split
+                case score
+                case replayed
+            }
+        }
+
+        struct ReflectionEvent: Decodable, Equatable {
+            let eventID: String
+            /// `envelope` or `fenced_block` for an accepted candidate; `missing_envelope` or
+            /// `empty_candidate` when the reply was rejected and GEPA skipped the proposal.
+            let contract: String
+            let candidateSHA256: String
+
+            enum CodingKeys: String, CodingKey {
+                case eventID = "event_id"
+                case contract
+                case candidateSHA256 = "candidate_sha256"
+            }
+        }
+
+        enum Event: Equatable {
+            case candidate(CandidateEvent)
+            case evaluation(EvaluationEvent)
+            case reflection(ReflectionEvent)
+        }
+
+        struct TerminalCandidate: Codable, Equatable {
+            let index: Int
+            let sha256: String
+            let parentIndices: [Int]
+            let aggregateScore: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case index
+                case sha256
+                case parentIndices = "parent_indices"
+                case aggregateScore = "aggregate_score"
+            }
+        }
+
+        struct HeldOutScores: Codable, Equatable {
+            let scores: [String: Double]
+            let average: Double
+        }
+
+        struct HeldOut: Codable, Equatable {
+            /// Nil when the held-out pass could not be admitted; never a fabricated zero.
+            let baseline: HeldOutScores?
+            let best: HeldOutScores?
+        }
+
+        struct Terminal: Codable, Equatable {
+            let engine: String
+            let upstreamRevision: String
+            /// `completed` or `budget_exhausted`.
+            let stopReason: String
+            /// False when the budget ran out before GEPA saved any state; no winner exists.
+            let hasIncumbent: Bool
+            let candidates: [TerminalCandidate]
+            let bestCandidateIndex: Int?
+            let bestScore: Double?
+            let baselineScore: Double?
+            let totalMetricCalls: Int?
+            let wallTimeSeconds: Double?
+            let heldOut: HeldOut?
+            let proposerUsage: String
+
+            enum CodingKeys: String, CodingKey {
+                case engine
+                case upstreamRevision = "upstream_revision"
+                case stopReason = "stop_reason"
+                case hasIncumbent = "has_incumbent"
+                case candidates
+                case bestCandidateIndex = "best_candidate_index"
+                case bestScore = "best_score"
+                case baselineScore = "baseline_score"
+                case totalMetricCalls = "total_metric_calls"
+                case wallTimeSeconds = "wall_time_seconds"
+                case heldOut = "held_out"
+                case proposerUsage = "proposer_usage"
+            }
+        }
+
+        fileprivate struct Header: Decodable {
+            let protocolVersion: Int
+            let type: String
+
+            enum CodingKeys: String, CodingKey {
+                case protocolVersion = "protocol_version"
+                case type
+            }
+        }
+
+        fileprivate struct HostRequestHeader: Decodable {
+            let id: String
+            let operation: String
+        }
+
+        fileprivate struct Payload<Value: Decodable>: Decodable {
+            let payload: Value
+        }
+
+        fileprivate struct ReflectPayload: Decodable {
+            let prompt: String
+        }
+
+        fileprivate struct CompletedMessage: Decodable {
+            let result: Terminal
+        }
+
+        static func decodeHostRequest(_ data: Data) throws -> (id: String, request: HostRequest) {
+            let decoder = JSONDecoder()
+            let header = try decoder.decode(HostRequestHeader.self, from: data)
+            switch header.operation {
+            case "reflect":
+                return try (header.id, .reflect(prompt: decoder.decode(Payload<ReflectPayload>.self, from: data).payload.prompt))
+            case "evaluate":
+                return try (header.id, .evaluate(decoder.decode(Payload<EvaluateRequest>.self, from: data).payload))
+            default:
+                throw PromptExperimentGEPAWorker.WorkerError.protocolFailure("Unsupported GEPA host operation: \(header.operation)")
+            }
+        }
+
+        static func decodeEvent(type: String, data: Data) throws -> Event? {
+            let decoder = JSONDecoder()
+            switch type {
+            case "candidate": return try .candidate(decoder.decode(CandidateEvent.self, from: data))
+            case "evaluation": return try .evaluation(decoder.decode(EvaluationEvent.self, from: data))
+            case "reflection": return try .reflection(decoder.decode(ReflectionEvent.self, from: data))
+            default: return nil
+            }
+        }
+
+        static func decodeTerminal(_ data: Data) throws -> Terminal {
+            try JSONDecoder().decode(CompletedMessage.self, from: data).result
         }
     }
 
+    typealias GEPAWorkerHostHandler = @MainActor @Sendable (GEPAWorkerProtocol.HostRequest) async -> GEPAWorkerProtocol.HostReply
+    typealias GEPAWorkerEventHandler = @MainActor @Sendable (GEPAWorkerProtocol.Event) async throws -> Void
+
+    /// App-owned per-attempt worker files (process home, scratch, and redacted logs).
+    struct GEPAWorkerLayout: Equatable {
+        let attemptDirectory: URL
+        /// Relative to the Prompt Experiment store root, for persisted diagnostics.
+        let relativeAttemptDirectory: String
+
+        var home: URL {
+            attemptDirectory.appendingPathComponent("home", isDirectory: true)
+        }
+
+        var temporary: URL {
+            attemptDirectory.appendingPathComponent("tmp", isDirectory: true)
+        }
+
+        var stderrURL: URL {
+            attemptDirectory.appendingPathComponent("worker-stderr.log")
+        }
+
+        var protocolURL: URL {
+            attemptDirectory.appendingPathComponent("stdout-protocol.ndjson")
+        }
+
+        var stderrRelativePath: String {
+            "\(relativeAttemptDirectory)/worker-stderr.log"
+        }
+
+        var protocolRelativePath: String {
+            "\(relativeAttemptDirectory)/stdout-protocol.ndjson"
+        }
+    }
+
+    struct GEPAWorkerCompletion: Equatable {
+        let terminal: GEPAWorkerProtocol.Terminal
+        /// The exact final protocol line (small by construction), kept as raw evidence.
+        let rawResultJSON: Data
+    }
+
+    /// The process seam the run controller drives; tests substitute a scripted worker.
+    protocol GEPAWorkerRunning: AnyObject {
+        func run(
+            request: GEPAWorkerProtocol.RunRequest,
+            pythonSealValue: String,
+            layout: GEPAWorkerLayout,
+            host: @escaping GEPAWorkerHostHandler,
+            event: @escaping GEPAWorkerEventHandler,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+        ) async throws -> GEPAWorkerCompletion
+        func cancel()
+    }
+
     /// Runs the app-bundled, pinned Python GEPA environment. The child receives no provider
-    /// credentials; all model and workflow work round-trips to app-owned callbacks.
-    final class PromptExperimentGEPAWorker: @unchecked Sendable {
+    /// credentials; all model and grading work round-trips to app-owned callbacks.
+    final class PromptExperimentGEPAWorker: GEPAWorkerRunning, @unchecked Sendable {
         enum WorkerError: LocalizedError {
             case unavailable(String)
             case protocolFailure(String)
@@ -51,13 +370,6 @@
         private var process: Process?
         private var cancellationWriteHandle: FileHandle?
         private var didRequestCancellation = false
-        private var callbackPauses: [String: PromptExperimentCallbackClock] = [:]
-
-        func setCallbackPaused(_ id: String, paused: Bool) {
-            lock.lock()
-            callbackPauses[id]?.setPaused(paused, now: ProcessInfo.processInfo.systemUptime)
-            lock.unlock()
-        }
 
         static func resolveWorkerURL() throws -> URL {
             if let override = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_WORKER"], !override.isEmpty {
@@ -193,9 +505,8 @@
             assert importlib.metadata.version('gepa') == '\(expectedVersion)', 'GEPA version mismatch'
             assert revision == '\(expectedRevision)', 'GEPA git revision mismatch or unavailable'
             assert requires == [], f'Unexpected GEPA runtime dependencies: {requires}'
-            import gepa
-            import gepa.adapters.mcp_adapter
-            assert importlib.metadata.version("mcp") == "1.30.0", "MCP SDK version mismatch"
+            from gepa.optimize_anything import optimize_anything
+            from gepa.oa.budget import BudgetExhausted
             """
             try await Task.detached(priority: .utility) {
                 guard FileManager.default.isReadableFile(atPath: workerURL.path) else {
@@ -241,39 +552,30 @@
         }
 
         func run(
-            plan: PromptExperimentPlan,
-            attemptID: UUID,
-            host: @escaping @MainActor @Sendable (_ callbackID: String, _ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
-            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            request: GEPAWorkerProtocol.RunRequest,
+            pythonSealValue: String,
+            layout: GEPAWorkerLayout,
+            host: @escaping GEPAWorkerHostHandler,
+            event: @escaping GEPAWorkerEventHandler,
             observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
-        ) async throws -> PromptExperimentOptimizationRuntimeResult {
-            guard let specification = plan.optimization else {
-                throw WorkerError.protocolFailure("The GEPA worker received a legacy comparison plan.")
-            }
-            let runRoot = PromptExperimentStore.liveRootURL()
-                .appendingPathComponent("worker-runs", isDirectory: true)
-                .appendingPathComponent(attemptID.uuidString.lowercased(), isDirectory: true)
-            let runDirectory = runRoot.appendingPathComponent("gepa-run", isDirectory: true)
-            let outputDirectory = runRoot.appendingPathComponent("gepa-output", isDirectory: true)
-            let stderrURL = runRoot.appendingPathComponent("worker-stderr.log")
-            let protocolURL = runRoot.appendingPathComponent("stdout-protocol.ndjson")
-            let relativeRunRoot = "worker-runs/\(attemptID.uuidString.lowercased())"
-            let workerHome = runRoot.appendingPathComponent("home", isDirectory: true)
-            let workerTemporary = runRoot.appendingPathComponent("tmp", isDirectory: true)
+        ) async throws -> GEPAWorkerCompletion {
             let workerURL: URL
             let pythonExecutable: URL
             let stderrLog: SafeDiagnosticLog
             let protocolLog: SafeDiagnosticLog
+            let initial: Data
             do {
-                try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
-                try FileManager.default.createDirectory(at: workerHome, withIntermediateDirectories: true)
-                try FileManager.default.createDirectory(at: workerTemporary, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: layout.home, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: layout.temporary, withIntermediateDirectories: true)
                 workerURL = try Self.resolveWorkerURL()
-                pythonExecutable = try Self.resolvePythonExecutable(
-                    sealedValue: specification.gepa.pythonExecutablePath
+                pythonExecutable = try Self.resolvePythonExecutable(sealedValue: pythonSealValue)
+                stderrLog = try SafeDiagnosticLog(url: layout.stderrURL)
+                protocolLog = try SafeDiagnosticLog(url: layout.protocolURL)
+                let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request))
+                initial = try JSONSerialization.data(
+                    withJSONObject: ["protocol_version": GEPAWorkerProtocol.version, "type": "run", "request": body],
+                    options: [.sortedKeys]
                 )
-                stderrLog = try SafeDiagnosticLog(url: stderrURL)
-                protocolLog = try SafeDiagnosticLog(url: protocolURL)
             } catch {
                 await observation(.workerLaunchFailed(error.localizedDescription))
                 throw error
@@ -283,56 +585,9 @@
                 protocolLog.close()
             }
             await observation(.workerPrepared(
-                stderrLogRelativePath: "\(relativeRunRoot)/worker-stderr.log",
-                stdoutProtocolLogRelativePath: "\(relativeRunRoot)/stdout-protocol.ndjson"
+                stderrLogRelativePath: layout.stderrRelativePath,
+                stdoutProtocolLogRelativePath: layout.protocolRelativePath
             ))
-
-            // The worker receives only opaque IDs, splits, and current inputs. Expected outputs
-            // and reviewer notes remain in the app-owned sealed plan and are looked up by ID.
-            let examples: [[String: Any]] = specification.examples.map { example in
-                [
-                    "id": example.id,
-                    "split": example.split.rawValue,
-                    "input": example.input
-                ]
-            }
-            var request: [String: Any] = [
-                "run_name": "rpce-\(plan.id.uuidString.lowercased())",
-                "objective": specification.objective,
-                "background": specification.background,
-                "task_preservation": "Evaluator, dataset, permissions, targets, and output requirements are immutable under approved plan digest \(plan.digest).",
-                "examples": examples,
-                "max_evaluations": specification.gepa.maxEvaluations,
-                "max_provider_retries": specification.gepa.maxProviderRetries ?? 0,
-                "random_seed": specification.gepa.randomSeed,
-                "reflection_minibatch_size": specification.gepa.reflectionMinibatchSize ?? 3,
-                "use_merge": specification.gepa.useMerge ?? false,
-                "max_merge_invocations": specification.gepa.maxMergeInvocations ?? 5,
-                "skip_perfect_score": specification.gepa.skipPerfectScore ?? true,
-                "perfect_score": specification.evaluator.maximumScore,
-                "run_dir": runDirectory.path,
-                "run_directory_relative_path": "worker-runs/\(attemptID.uuidString.lowercased())",
-                "output_dir": outputDirectory.path
-            ]
-            if let mcp = specification.execution.mcp {
-                try mcp.verifyResolved()
-                request["mcp_adapter"] = try [
-                    "tool_names": mcp.toolNames, "component": mcp.component,
-                    "tool_definitions_json": mcp.toolDefinitionsJson ?? "", "server_sha256": mcp.serverSha256 ?? "",
-                    "server_path": PromptExperimentMCPConfiguration.serverURL().path,
-                    "project_root": URL(fileURLWithPath: plan.environment.isolatedRootPath).appendingPathComponent("project").path,
-                    "instructions": specification.execution.instructions
-                ]
-            }
-            request["stage"] = specification.isPreparation ? "preparation" : "search"
-            if specification.isPreparation { request["preparation_candidates"] = specification.preparationCandidates }
-            if let seed = specification.seedCandidate { request["seed_candidate"] = seed }
-            if let stop = specification.gepa.stopAtScore { request["stop_at_score"] = stop }
-            let initial: [String: Any] = [
-                "protocol_version": 1,
-                "type": "run",
-                "request": request
-            ]
 
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
@@ -344,12 +599,10 @@
                                 initial: initial,
                                 stderrLog: stderrLog,
                                 protocolLog: protocolLog,
-                                workerHome: workerHome,
-                                workerTemporary: workerTemporary,
+                                layout: layout,
                                 host: host,
-                                progress: progress,
-                                observation: observation,
-                                hostCallbackTimeoutSeconds: (specification.gepa.maxJudgeRetries ?? 0) > 0 ? 600 : 300
+                                event: event,
+                                observation: observation
                             ))
                         } catch {
                             continuation.resume(throwing: error)
@@ -364,16 +617,14 @@
         private func blockingRun(
             pythonExecutable: URL,
             workerURL: URL,
-            initial: [String: Any],
+            initial: Data,
             stderrLog: SafeDiagnosticLog,
             protocolLog: SafeDiagnosticLog,
-            workerHome: URL,
-            workerTemporary: URL,
-            host: @escaping @MainActor @Sendable (_ callbackID: String, _ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
-            progress: @escaping @MainActor @Sendable (String) async -> Void,
-            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
-            hostCallbackTimeoutSeconds: Int
-        ) throws -> PromptExperimentOptimizationRuntimeResult {
+            layout: GEPAWorkerLayout,
+            host: @escaping GEPAWorkerHostHandler,
+            event: @escaping GEPAWorkerEventHandler,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+        ) throws -> GEPAWorkerCompletion {
             let child = Process()
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
@@ -382,9 +633,8 @@
             child.executableURL = pythonExecutable
             child.arguments = ["-I", "-B", "-u", workerURL.path]
             // Deliberately do not inherit the app environment: provider credentials and
-            // authentication remain inside RepoPrompt. The worker receives only process
-            // mechanics and communicates every model request over the host protocol.
-            child.environment = Self.workerEnvironment(home: workerHome, temporaryDirectory: workerTemporary)
+            // authentication remain inside RepoPrompt.
+            child.environment = Self.workerEnvironment(home: layout.home, temporaryDirectory: layout.temporary)
             child.standardInput = stdinPipe
             child.standardOutput = stdoutPipe
             child.standardError = stderrPipe
@@ -464,7 +714,7 @@
                 child.interrupt()
                 throw CancellationError()
             }
-            try writeJSONLine(initial, to: stdinPipe.fileHandleForWriting)
+            try writeLine(initial, to: stdinPipe.fileHandleForWriting)
             try protocolLog.append(channel: "stdin", event: "run_request_written", detail: "payload=excluded")
             emitObservation(
                 .protocolEvent(channel: "stdin", event: "run_request_written", detail: "payload=excluded"),
@@ -474,104 +724,62 @@
                 handle: stdoutPipe.fileHandleForReading,
                 cancellationHandle: cancellationPipe.fileHandleForReading
             )
-            var terminal: PromptExperimentOptimizationRuntimeResult?
+            var completion: GEPAWorkerCompletion?
             var terminalError: Error?
             while let data = try reader.nextLine() {
-                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      object["protocol_version"] as? Int == 1,
-                      let type = object["type"] as? String
+                let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                guard let object,
+                      let header = try? JSONDecoder().decode(GEPAWorkerProtocol.Header.self, from: data),
+                      header.protocolVersion == GEPAWorkerProtocol.version
                 else {
                     try? protocolLog.append(channel: "stdout", event: "invalid_protocol", detail: nil)
                     throw WorkerError.protocolFailure("GEPA worker emitted invalid protocol JSON.")
                 }
+                let type = header.type
                 let protocolDetail = Self.safeProtocolDetail(type: type, object: object)
-                try protocolLog.append(
-                    channel: "stdout",
-                    event: type,
-                    detail: protocolDetail
-                )
-                emitObservation(
-                    .protocolEvent(
-                        channel: "stdout",
-                        event: type,
-                        detail: protocolDetail
-                    ),
-                    using: observation
-                )
+                try protocolLog.append(channel: "stdout", event: type, detail: protocolDetail)
+                emitObservation(.protocolEvent(channel: "stdout", event: type, detail: protocolDetail), using: observation)
                 switch type {
                 case "host_request":
-                    guard let id = object["id"] as? String,
-                          let operation = object["operation"] as? String,
-                          let payload = object["payload"] as? [String: Any]
-                    else { throw WorkerError.protocolFailure("GEPA host request is incomplete.") }
-                    var hostPayload = payload
-                    if let logicalID = object["logical_callback_id"] as? String,
-                       UUID(uuidString: logicalID) != nil
-                    {
-                        hostPayload["_rpce_logical_callback_id"] = logicalID
+                    let decoded: (id: String, request: GEPAWorkerProtocol.HostRequest)
+                    do {
+                        decoded = try GEPAWorkerProtocol.decodeHostRequest(data)
+                    } catch {
+                        throw WorkerError.protocolFailure("GEPA host request is incomplete.")
                     }
-                    emitObservation(.callbackStarted(id: id, operation: operation), using: observation)
-                    let semaphore = DispatchSemaphore(value: 0)
-                    let replyBox = PromptExperimentGEPAHostReplyBox()
-                    lock.lock()
-                    callbackPauses[id] = PromptExperimentCallbackClock(startedAt: ProcessInfo.processInfo.systemUptime)
-                    lock.unlock()
-                    defer {
-                        lock.lock()
-                        callbackPauses.removeValue(forKey: id)
-                        lock.unlock()
+                    let operation = switch decoded.request {
+                    case .reflect: "reflect"
+                    case .evaluate: "evaluate"
                     }
-                    let callback = Task { @MainActor in
-                        let reply = await host(id, operation, hostPayload)
-                        replyBox.store(reply)
-                        semaphore.signal()
+                    emitObservation(.callbackStarted(id: decoded.id, operation: operation), using: observation)
+                    let request = decoded.request
+                    let reply = try awaitMainActor(child: child) { await host(request) }
+                    emitObservation(.callbackFinished(id: decoded.id, operation: operation), using: observation)
+                    let response = try JSONSerialization.data(withJSONObject: reply.jsonObject(id: decoded.id), options: [.sortedKeys])
+                    try writeLine(response, to: stdinPipe.fileHandleForWriting)
+                case "candidate", "evaluation", "reflection":
+                    let decodedEvent: GEPAWorkerProtocol.Event?
+                    do {
+                        decodedEvent = try GEPAWorkerProtocol.decodeEvent(type: type, data: data)
+                    } catch {
+                        throw WorkerError.protocolFailure("GEPA \(type) event is invalid.")
                     }
-                    while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
-                        lock.lock()
-                        let cancelled = didRequestCancellation
-                        let activeSeconds = callbackPauses[id]?.activeSeconds(at: ProcessInfo.processInfo.systemUptime) ?? 0
-                        lock.unlock()
-                        if !child.isRunning {
-                            callback.cancel()
-                            throw WorkerError.infrastructureFailure("GEPA worker exited while its host callback was pending.")
-                        }
-                        if cancelled {
-                            callback.cancel()
-                            throw CancellationError()
-                        }
-                        if activeSeconds >= Double(hostCallbackTimeoutSeconds) {
-                            callback.cancel()
-                            throw WorkerError.infrastructureFailure("A RepoPrompt model/evaluator callback exceeded the sealed host timeout.")
+                    guard let decodedEvent else { throw WorkerError.protocolFailure("GEPA event type is unsupported.") }
+                    let outcome: Result<Void, Error> = try awaitMainActor(child: child) {
+                        do {
+                            try await event(decodedEvent)
+                            return .success(())
+                        } catch {
+                            return .failure(error)
                         }
                     }
-                    guard let reply = replyBox.load() else { throw WorkerError.protocolFailure("The app did not produce a host reply.") }
-                    emitObservation(.callbackFinished(id: id, operation: operation), using: observation)
-                    var response = reply.jsonObject
-                    response["protocol_version"] = 1
-                    response["type"] = "host_response"
-                    response["id"] = id
-                    try writeJSONLine(response, to: stdinPipe.fileHandleForWriting)
-                case "mcp_process":
-                    break // Payload-free PID/phase detail is already persisted above.
-                case "provider_retry":
-                    let operation = object["operation"] as? String ?? "provider callback"
-                    let next = object["next_attempt"] as? Int ?? 0
-                    let maximum = object["max_attempts"] as? Int ?? 0
-                    Task { @MainActor in
-                        await progress("Retrying \(operation) after a retryable provider failure (attempt \(next)/\(maximum)).")
-                    }
-                case "progress":
-                    let completed = object["completed_evaluations"] as? Int ?? 0
-                    let maximum = object["max_evaluations"] as? Int ?? 0
-                    let candidate = object["candidate_index"] as? Int ?? 0
-                    Task { @MainActor in
-                        await progress("Evaluated candidate \(candidate + 1) (\(completed)/\(maximum) budget calls).")
-                    }
+                    try outcome.get()
                 case "completed":
-                    guard let result = object["result"] as? [String: Any] else {
-                        throw WorkerError.protocolFailure("GEPA completion omitted its result.")
+                    do {
+                        completion = try GEPAWorkerCompletion(terminal: GEPAWorkerProtocol.decodeTerminal(data), rawResultJSON: data)
+                    } catch {
+                        throw WorkerError.protocolFailure("GEPA completion summary is invalid.")
                     }
-                    terminal = try decodeResult(result)
                 case "cancelled":
                     terminalError = CancellationError()
                 case "failed":
@@ -583,7 +791,7 @@
                 default:
                     throw WorkerError.protocolFailure("Unsupported GEPA worker message type: \(type)")
                 }
-                if terminal != nil || terminalError != nil { break }
+                if completion != nil || terminalError != nil { break }
             }
             stdinPipe.fileHandleForWriting.closeFile()
             child.waitUntilExit()
@@ -593,12 +801,41 @@
             lock.unlock()
             if cancelled { throw CancellationError() }
             if let terminalError { throw terminalError }
-            guard child.terminationStatus == 0, let terminal else {
+            guard child.terminationStatus == 0, let completion else {
                 throw WorkerError.infrastructureFailure(
                     "GEPA worker terminated without a result (status \(child.terminationStatus)); inspect the persisted attempt diagnostics and redacted worker logs."
                 )
             }
-            return terminal
+            return completion
+        }
+
+        /// Runs `operation` on the main actor while the protocol thread waits. Cancellation or
+        /// worker exit abandons the wait and cancels only this attempt's callback task.
+        private func awaitMainActor<Value>(
+            child: Process,
+            _ operation: @escaping @MainActor @Sendable () async -> Value
+        ) throws -> Value {
+            let semaphore = DispatchSemaphore(value: 0)
+            let box = PromptExperimentLockedBox<Value>()
+            let task = Task { @MainActor in
+                await box.store(operation())
+                semaphore.signal()
+            }
+            while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+                lock.lock()
+                let cancelled = didRequestCancellation
+                lock.unlock()
+                if cancelled {
+                    task.cancel()
+                    throw CancellationError()
+                }
+                if !child.isRunning {
+                    task.cancel()
+                    throw WorkerError.infrastructureFailure("GEPA worker exited while its host callback was pending.")
+                }
+            }
+            guard let value = box.load() else { throw WorkerError.protocolFailure("The app did not produce a host reply.") }
+            return value
         }
 
         private func emitObservation(
@@ -615,26 +852,23 @@
 
         static func safeProtocolDetail(type: String, object: [String: Any]) -> String? {
             switch type {
-            case "mcp_process":
-                let pid = object["pid"] as? Int ?? -1
-                let state = ["started", "closed"].contains(object["state"] as? String ?? "") ? (object["state"] as? String ?? "unknown") : "unknown"
-                return "mcp_server_pid=\(pid) state=\(state) payload=excluded"
             case "host_request":
                 let id = object["id"] as? String ?? "unknown"
-                let operation = object["operation"] as? String ?? "unknown"
-                return "callback_id=\(id) operation=\(operation) payload=excluded"
-            case "provider_retry":
-                let operation = ["reflect", "mcp_model"].contains(object["operation"] as? String ?? "")
+                let operation = ["reflect", "evaluate"].contains(object["operation"] as? String ?? "")
                     ? (object["operation"] as? String ?? "unknown") : "unknown"
-                let code = Self.safeProviderFailureCode(object["failure_code"]) ?? "unavailable"
-                let next = object["next_attempt"] as? Int ?? -1
-                let maximum = object["max_attempts"] as? Int ?? -1
-                return "operation=\(operation) failure_code=\(code) next_attempt=\(next) max_attempts=\(maximum) payload=excluded"
-            case "progress":
-                let completed = object["completed_evaluations"] as? Int ?? 0
-                let maximum = object["max_evaluations"] as? Int ?? 0
-                let candidate = object["candidate_index"] as? Int ?? 0
-                return "candidate=\(candidate) completed_evaluations=\(completed) max_evaluations=\(maximum)"
+                return "callback_id=\(id) operation=\(operation) payload=excluded"
+            case "candidate":
+                let index = object["candidate_index"] as? Int ?? -1
+                let digest = safeSHA256(object["candidate_sha256"]) ?? "unavailable"
+                return "candidate_index=\(index) candidate_sha256=\(digest) text=excluded"
+            case "evaluation":
+                let split = PromptExperimentDatasetSplit(rawValue: object["split"] as? String ?? "")?.rawValue ?? "unknown"
+                let replayed = object["replayed"] as? Bool ?? false
+                return "split=\(split) replayed=\(replayed) payload=excluded"
+            case "reflection":
+                let contract = ["envelope", "fenced_block", "raw"].contains(object["contract"] as? String ?? "")
+                    ? (object["contract"] as? String ?? "unknown") : "unknown"
+                return "contract=\(contract) payload=excluded"
             case "completed":
                 return "result_payload=excluded"
             case "cancelled":
@@ -654,12 +888,19 @@
                     return "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
                 }
                 let code = diagnostic["failure_code"] as? String
-                let safeCode = ["judge_invalid_response", "judge_provider_failed"].contains(code ?? "")
+                let safeCode = ["judge_invalid_response", "judge_provider_failed", "ledger_failure", "cancelled"].contains(code ?? "")
                     ? code! : (Self.safeProviderFailureCode(code) ?? "unavailable")
                 return "exception_type=\(exceptionType) source_frame=\(module).\(function):\(line) failure_code=\(safeCode) error_payload=excluded"
             default:
                 return nil
             }
+        }
+
+        private static func safeSHA256(_ rawValue: Any?) -> String? {
+            guard let value = rawValue as? String, value.count == 64,
+                  value.utf8.allSatisfy({ (48 ... 57).contains($0) || (97 ... 102).contains($0) })
+            else { return nil }
+            return value
         }
 
         private static func safeProviderFailureCode(_ rawValue: Any?) -> String? {
@@ -703,170 +944,10 @@
             return "[redacted \(data.count) bytes]"
         }
 
-        private func decodeResult(_ result: [String: Any]) throws -> PromptExperimentOptimizationRuntimeResult {
-            let raw = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-            guard let engine = result["engine"] as? String, ["gepa", "preparation"].contains(engine),
-                  result["upstream_revision"] as? String == PromptExperimentGEPAConfiguration.pinnedRevision,
-                  let candidates = result["candidates"] as? [String], !candidates.isEmpty,
-                  let rawParents = result["parent_indices"] as? [[Any]], rawParents.count == candidates.count,
-                  let rawScores = result["aggregate_scores"] as? [Any], rawScores.count == candidates.count,
-                  let rawEvaluations = result["evaluations"] as? [[String: Any]],
-                  let totalEvaluations = (result["total_evaluations"] as? NSNumber)?.intValue,
-                  totalEvaluations >= 0
-            else {
-                throw WorkerError.protocolFailure("GEPA result identity, candidate arrays, or evaluation counts are invalid.")
-            }
-            let parents = try rawParents.enumerated().map { index, values in
-                let decoded = values.compactMap { ($0 as? NSNumber)?.intValue }
-                guard decoded.count == values.count,
-                      decoded.allSatisfy({ $0 >= 0 && $0 < index })
-                else { throw WorkerError.protocolFailure("GEPA parent indices are invalid.") }
-                return decoded
-            }
-            let scores = try rawScores.map { value -> Double? in
-                guard !(value is NSNull) else { return nil }
-                guard let score = (value as? NSNumber)?.doubleValue, score.isFinite else {
-                    throw WorkerError.protocolFailure("GEPA emitted a non-finite aggregate score.")
-                }
-                return score
-            }
-            let bestIndex = (result["best_candidate_index"] as? NSNumber)?.intValue
-            if let bestIndex, !(0 ..< candidates.count).contains(bestIndex) {
-                throw WorkerError.protocolFailure("GEPA best candidate index is invalid.")
-            }
-            let candidatePromptSurfaces: [PromptExperimentPromptSurfaceMetrics?]?
-            if let rawSurfaces = result["candidate_prompt_surfaces"] as? [Any] {
-                guard rawSurfaces.count == candidates.count else {
-                    throw WorkerError.protocolFailure("GEPA prompt-surface evidence count is invalid.")
-                }
-                candidatePromptSurfaces = try rawSurfaces.map(decodePromptSurface)
-            } else {
-                candidatePromptSurfaces = nil
-            }
-            let paretoFrontierIndices: [Int]?
-            if let rawFrontier = result["pareto_frontier_indices"] as? [Any] {
-                let decoded = rawFrontier.compactMap { ($0 as? NSNumber)?.intValue }
-                guard decoded.count == rawFrontier.count,
-                      decoded == Array(Set(decoded)).sorted(),
-                      decoded.allSatisfy({ candidates.indices.contains($0) })
-                else {
-                    throw WorkerError.protocolFailure("GEPA Pareto frontier indices are invalid.")
-                }
-                paretoFrontierIndices = decoded
-            } else {
-                paretoFrontierIndices = nil
-            }
-            let evaluations = try rawEvaluations.map { value -> PromptExperimentOptimizationRuntimeEvaluation in
-                guard let candidate = (value["candidate_index"] as? NSNumber)?.intValue,
-                      candidate == -1 || (candidate >= 0 && candidate < candidates.count),
-                      let exampleID = value["example_id"] as? String, !exampleID.isEmpty,
-                      let splitRaw = value["split"] as? String,
-                      let split = PromptExperimentDatasetSplit(rawValue: splitRaw)
-                else { throw WorkerError.protocolFailure("GEPA evaluation identity is invalid.") }
-                let score = (value["score"] as? NSNumber)?.doubleValue
-                guard score?.isFinite != false else {
-                    throw WorkerError.protocolFailure("GEPA emitted a non-finite evaluation score.")
-                }
-                let failureRaw = value["failure_kind"] as? String
-                let failure = failureRaw.flatMap(PromptExperimentOptimizationFailureKind.init(rawValue:))
-                guard failureRaw == nil || failure != nil else {
-                    throw WorkerError.protocolFailure("GEPA emitted an unknown evaluation failure classification.")
-                }
-                return PromptExperimentOptimizationRuntimeEvaluation(
-                    candidateIndex: candidate,
-                    exampleID: exampleID,
-                    split: split,
-                    score: score,
-                    feedback: value["feedback"] as? String ?? "",
-                    failureKind: failure,
-                    output: value["output"] as? String,
-                    elapsedSeconds: (value["elapsed_seconds"] as? NSNumber)?.doubleValue
-                )
-            }
-            let baselineScore = (result["baseline_score"] as? NSNumber)?.doubleValue
-            let bestScore = (result["best_score"] as? NSNumber)?.doubleValue
-            let wallTime = (result["wall_time_seconds"] as? NSNumber)?.doubleValue
-            guard baselineScore?.isFinite != false,
-                  bestScore?.isFinite != false,
-                  wallTime?.isFinite != false,
-                  wallTime.map({ $0 >= 0 }) != false
-            else { throw WorkerError.protocolFailure("GEPA result metrics are invalid.") }
-            let relativeRunDirectory = result["run_directory_relative_path"] as? String
-            guard relativeRunDirectory.map({ !$0.hasPrefix("/") && !$0.split(separator: "/").contains("..") }) != false else {
-                throw WorkerError.protocolFailure("GEPA result artifact path is unsafe.")
-            }
-            return PromptExperimentOptimizationRuntimeResult(
-                engine: engine,
-                upstreamRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
-                baselineScore: baselineScore,
-                bestScore: bestScore,
-                bestCandidateIndex: bestIndex,
-                candidates: candidates,
-                parentIndices: parents,
-                aggregateScores: scores,
-                candidatePromptSurfaces: candidatePromptSurfaces,
-                paretoFrontierIndices: paretoFrontierIndices,
-                evaluations: evaluations,
-                totalEvaluations: totalEvaluations,
-                wallTimeSeconds: wallTime,
-                proposerUsage: result["proposer_usage"] as? String ?? "unavailable",
-                runDirectoryRelativePath: relativeRunDirectory,
-                rawResultJSON: raw
-            )
-        }
-
-        private func decodePromptSurface(_ value: Any) throws -> PromptExperimentPromptSurfaceMetrics? {
-            guard !(value is NSNull) else { return nil }
-            guard let object = value as? [String: Any],
-                  (object["schema_version"] as? NSNumber)?.intValue == 1,
-                  let adapter = object["adapter"] as? String, !adapter.isEmpty,
-                  let component = object["component"] as? String, !component.isEmpty,
-                  let candidateUTF8Bytes = (object["candidate_utf8_bytes"] as? NSNumber)?.intValue,
-                  let candidateCharacters = (object["candidate_characters"] as? NSNumber)?.intValue,
-                  let candidateWords = (object["candidate_words"] as? NSNumber)?.intValue,
-                  let candidateLines = (object["candidate_lines"] as? NSNumber)?.intValue,
-                  let fixedScaffoldUTF8Bytes = (object["fixed_scaffold_utf8_bytes"] as? NSNumber)?.intValue,
-                  let renderedSystemUTF8Bytes = (object["rendered_system_utf8_bytes"] as? NSNumber)?.intValue,
-                  let mutableInsertionCount = (object["mutable_insertion_count"] as? NSNumber)?.intValue,
-                  let fixedScaffoldSHA256 = object["fixed_scaffold_sha256"] as? String,
-                  let renderedSystemSHA256 = object["rendered_system_sha256"] as? String,
-                  let overlap = (object["candidate_fixed_scaffold_fourgram_overlap"] as? NSNumber)?.doubleValue,
-                  [
-                      candidateUTF8Bytes,
-                      candidateCharacters,
-                      candidateWords,
-                      fixedScaffoldUTF8Bytes,
-                      renderedSystemUTF8Bytes
-                  ].allSatisfy({ $0 >= 0 }),
-                  candidateLines >= 1,
-                  mutableInsertionCount == 1,
-                  fixedScaffoldSHA256.count == 64,
-                  renderedSystemSHA256.count == 64,
-                  overlap.isFinite, (0 ... 1).contains(overlap)
-            else {
-                throw WorkerError.protocolFailure("GEPA prompt-surface evidence is invalid.")
-            }
-            return PromptExperimentPromptSurfaceMetrics(
-                schemaVersion: 1,
-                adapter: adapter,
-                component: component,
-                candidateUTF8Bytes: candidateUTF8Bytes,
-                candidateCharacters: candidateCharacters,
-                candidateWords: candidateWords,
-                candidateLines: candidateLines,
-                fixedScaffoldUTF8Bytes: fixedScaffoldUTF8Bytes,
-                renderedSystemUTF8Bytes: renderedSystemUTF8Bytes,
-                mutableInsertionCount: mutableInsertionCount,
-                fixedScaffoldSHA256: fixedScaffoldSHA256,
-                renderedSystemSHA256: renderedSystemSHA256,
-                candidateFixedScaffoldFourgramOverlap: overlap
-            )
-        }
-
-        private func writeJSONLine(_ object: [String: Any], to handle: FileHandle) throws {
-            var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-            data.append(0x0A)
-            try handle.write(contentsOf: data)
+        private func writeLine(_ data: Data, to handle: FileHandle) throws {
+            var line = data
+            line.append(0x0A)
+            try handle.write(contentsOf: line)
         }
 
         private func requestCancellationEscalation(_ child: Process) {
@@ -987,17 +1068,17 @@
         }
     }
 
-    private final class PromptExperimentGEPAHostReplyBox: @unchecked Sendable {
+    final class PromptExperimentLockedBox<Value>: @unchecked Sendable {
         private let lock = NSLock()
-        private var value: PromptExperimentGEPAHostReply?
+        private var value: Value?
 
-        func store(_ reply: PromptExperimentGEPAHostReply) {
+        func store(_ newValue: Value) {
             lock.lock()
-            value = reply
+            value = newValue
             lock.unlock()
         }
 
-        func load() -> PromptExperimentGEPAHostReply? {
+        func load() -> Value? {
             lock.lock()
             defer { lock.unlock() }
             return value
