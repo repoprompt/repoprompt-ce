@@ -48,10 +48,17 @@
                                 .font(.caption.bold())
                         }
                         if let result = run.result {
-                            ForEach(result.evaluations.filter { $0.candidateIndex == proposal.candidateIndex }) { evaluation in
-                                Text("\(evaluation.exampleID) [\(evaluation.split.rawValue)] · \(evaluation.score.map { String(format: "%.3f", $0) } ?? "—"): \(evaluation.feedback)")
-                                    .font(.caption).textSelection(.enabled)
+                            // Capped so per-case evidence never squeezes the diff out of view.
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(result.evaluations.filter { $0.candidateIndex == proposal.candidateIndex }) { evaluation in
+                                        Text("\(evaluation.exampleID) [\(evaluation.split.rawValue)] · \(evaluation.score.map { String(format: "%.3f", $0) } ?? "—"): \(evaluation.feedback)")
+                                            .font(.caption).textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
                             }
+                            .frame(maxHeight: 160)
                         }
                     }
                     Text("One-file unified diff").font(.headline)
@@ -62,6 +69,8 @@
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .padding(8)
+                    .frame(minHeight: 320, maxHeight: .infinity)
+                    .layoutPriority(1)
                     .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
                     if let errorText {
                         Text(errorText).foregroundStyle(.red).font(.caption).textSelection(.enabled)
@@ -83,7 +92,7 @@
                 }
             }
             .padding(20)
-            .frame(minWidth: 850, minHeight: 600)
+            .frame(minWidth: 900, idealWidth: 1100, minHeight: 760, idealHeight: 900)
             .task(id: proposalID) {
                 guard let reference = proposal?.diffEvidence else {
                     errorText = "The proposal has no diff artifact."
