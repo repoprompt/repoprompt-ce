@@ -6,7 +6,9 @@ extension AgentModeViewModel {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             claudeContextUsageEstimator
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
+            acpContextUsageEstimator
+        case .codexExec:
             nil
         }
     }
@@ -64,6 +66,9 @@ extension AgentModeViewModel {
         session: TabSession
     ) {
         guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
+        // Whether the provider already reported occupancy this turn must be read before the
+        // finalization consumes its per-turn marker.
+        let heldOccupancy = estimator.hasOccupancyReportThisTurn(session: session)
         _ = estimator.ingestTurnFinalizationSignal(
             contextUsedTokens: contextUsedTokens,
             modelContextWindow: modelContextWindow,
@@ -75,8 +80,17 @@ extension AgentModeViewModel {
             completionTokens: completionTokens,
             contextUsedTokens: contextUsedTokens
         )
+        // A billed prompt-call count is a different quantity than occupancy: when the estimator
+        // held a live `usage_update` figure this turn, the billed report cannot disturb that
+        // figure's vouch — vouch the figure the provider actually reported this turn. Without a
+        // live occupancy report the billed report stands alone, vouch or withdraw. Note the vouch
+        // call treats nil and non-positive inputs as no-ops — only a positive reported count or
+        // window can vouch a figure or withdraw an existing vouch.
+        let vouchedCount: Int? = heldOccupancy
+            ? session.contextUsageSnapshot?.used
+            : contextUsedTokens
         session.noteLiveContextUsageReport(
-            contextUsedTokens: contextUsedTokens,
+            contextUsedTokens: vouchedCount,
             promptTokens: nil,
             modelContextWindow: modelContextWindow
         )
