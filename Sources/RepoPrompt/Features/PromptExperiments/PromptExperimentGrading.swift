@@ -82,7 +82,45 @@
         private static func jsonObject(_ text: String) -> [String: Any]? {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.hasPrefix("{") else { return nil }
-            return (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) as? [String: Any]
+            let repaired = escapingControlCharactersInStrings(trimmed)
+            return (try? JSONSerialization.jsonObject(with: Data(repaired.utf8))) as? [String: Any]
+        }
+
+        /// Judges sometimes emit raw newlines/tabs inside string literals (e.g. multi-paragraph
+        /// `feedback`), which strict JSON rejects. Escapes U+0000–U+001F only while inside a string
+        /// literal (tracking backslash escapes); structural whitespace outside strings is untouched.
+        static func escapingControlCharactersInStrings(_ text: String) -> String {
+            var result = String.UnicodeScalarView()
+            var inString = false
+            var escaped = false
+            for scalar in text.unicodeScalars {
+                guard inString else {
+                    if scalar == "\"" { inString = true }
+                    result.append(scalar)
+                    continue
+                }
+                if escaped {
+                    escaped = false
+                    result.append(scalar)
+                } else if scalar == "\\" {
+                    escaped = true
+                    result.append(scalar)
+                } else if scalar == "\"" {
+                    inString = false
+                    result.append(scalar)
+                } else if scalar.value < 0x20 {
+                    let replacement = switch scalar {
+                    case "\n": "\\n"
+                    case "\r": "\\r"
+                    case "\t": "\\t"
+                    default: String(format: "\\u%04x", scalar.value)
+                    }
+                    result.append(contentsOf: replacement.unicodeScalars)
+                } else {
+                    result.append(scalar)
+                }
+            }
+            return String(result)
         }
 
         /// The content of the last closed ``` fence whose info string is empty or `json`.

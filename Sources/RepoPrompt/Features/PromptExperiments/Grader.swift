@@ -57,7 +57,7 @@
                     throw PromptExperimentAuthorityError.runtimeUnavailable("The suite's judge target or rubric is unavailable.")
                 }
                 let judgePrompt = """
-                Evaluate the candidate run using the immutable rubric below. Return only JSON with numeric `score` and string `feedback`.
+                Evaluate the candidate run using the immutable rubric below. Return only JSON with numeric `score` and string `feedback`. Write any line breaks inside `feedback` as the escape sequence \\n, never as literal newlines.
                 Score range: \(minimumScore)...\(maximumScore)
                 Rubric:
                 \(rubric.text)
@@ -89,7 +89,7 @@
                             systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
                             userPrompt: judgePrompt + (
                                 repair
-                                    ? "\nThe previous judge attempt did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object with numeric score and string feedback, no surrounding prose."
+                                    ? "\nThe previous judge attempt did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object with numeric score and string feedback, no surrounding prose. Write line breaks inside feedback as \\n, never as literal newlines."
                                     : ""
                             )
                         ).output

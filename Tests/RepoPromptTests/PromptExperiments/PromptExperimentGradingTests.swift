@@ -137,6 +137,42 @@ import XCTest
             XCTAssertEqual(fenced?.score, 0.9, "the last fenced JSON block wins")
         }
 
+        func testGradeDecodingAcceptsRawControlCharactersInsideStrings() {
+            let raw = "{\"score\": 0.78, \"feedback\": \"Solid test.\n\nDeductions:\tminor\r\nend\"}"
+            let bare = PromptExperimentGrading.decode(raw, minimum: 0, maximum: 1)
+            XCTAssertEqual(bare?.score, 0.78)
+            XCTAssertEqual(bare?.feedback, "Solid test.\n\nDeductions:\tminor\r\nend")
+
+            let fenced = PromptExperimentGrading.decode(
+                "Verdict:\n```json\n{\"score\": 0.5,\n \"feedback\": \"line one\nline two\"}\n```\n",
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(fenced?.score, 0.5)
+            XCTAssertEqual(fenced?.feedback, "line one\nline two")
+
+            let embedded = PromptExperimentGrading.decode(
+                "Here: {\"score\":0.4,\"feedback\":\"a \\\"quoted\\\"\nb\"} done",
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(embedded?.feedback, "a \"quoted\"\nb")
+
+            let structural = PromptExperimentGrading.decode(
+                "{\n\t\"score\": 0.3,\r\n\t\"feedback\": \"escaped\\nalready\"\n}",
+                minimum: 0, maximum: 1
+            )
+            XCTAssertEqual(structural?.score, 0.3)
+            XCTAssertEqual(structural?.feedback, "escaped\nalready")
+
+            for invalid in [
+                "{\"score\": 2, \"feedback\": \"out\nof range\"}",
+                "{\"score\": \"0.5\", \"feedback\": \"string\nscore\"}",
+                "{\"score\": 0.5, \"feedback\": \"unterminated\n}",
+                "{\"score\": 0.5}"
+            ] {
+                XCTAssertNil(PromptExperimentGrading.decode(invalid, minimum: 0, maximum: 1), invalid)
+            }
+        }
+
         func testJudgeRepairIsAvailableForEveryEvaluationNotRunWide() async throws {
             let completer = ScriptedJudge()
             let invoker = PromptExperimentModelInvoker(
