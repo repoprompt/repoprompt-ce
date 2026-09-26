@@ -282,8 +282,10 @@ extension OracleViewModel {
         id rawID: String,
         tabID: UUID?,
         agentModeSessionID: UUID?,
-        agentModeRunID: UUID?
+        agentModeRunID: UUID?,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async throws -> ChatSession {
+        try contextBuilderScope?.checkpoint()
         let session: ChatSession
         if let loaded = resolveSession(id: rawID) {
             session = loaded
@@ -296,6 +298,7 @@ extension OracleViewModel {
                 throw ChatToolError.invalidParams("Chat with ID '\(rawID)' not found")
             }
 
+            try contextBuilderScope?.checkpoint()
             // Inactive headless generation deliberately avoids publishing into the active
             // workspace's chat catalog. Load only an explicitly requested continuation;
             // activation remains disabled for an inactive tab, so currentSession is untouched.
@@ -321,8 +324,10 @@ extension OracleViewModel {
     @MainActor
     private func resolveBackgroundTabID(
         for session: ChatSession,
-        fallbackTabID: UUID?
+        fallbackTabID: UUID?,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async -> UUID? {
+        guard contextBuilderScope?.isLive != false else { return nil }
         if let tabID = session.composeTabID,
            workspaceManager.composeTab(with: tabID) != nil
         {
@@ -336,7 +341,7 @@ extension OracleViewModel {
             return fallbackTabID
         }
 
-        return await ensureTabForSession(session)
+        return await ensureTabForSession(session, contextBuilderScope: contextBuilderScope)
     }
 
     private enum ChatInspectionScope: String {
@@ -605,18 +610,23 @@ extension OracleViewModel {
     private func activateResolvedChatSession(
         _ session: ChatSession,
         resolvedTabID: UUID?,
-        activateInUI: Bool
+        activateInUI: Bool,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async {
+        guard contextBuilderScope?.isLive != false else { return }
         if activateInUI {
             await switchToSession(session.id)
             return
         }
 
-        _ = await ensureSessionLoadedForBackground(session)
+        _ = await ensureSessionLoadedForBackground(session, contextBuilderScope: contextBuilderScope)
+        guard contextBuilderScope?.isLive != false else { return }
         let targetTabID = await resolveBackgroundTabID(
             for: session,
-            fallbackTabID: resolvedTabID
+            fallbackTabID: resolvedTabID,
+            contextBuilderScope: contextBuilderScope
         )
+        guard contextBuilderScope?.isLive != false else { return }
         if let targetTabID {
             workspaceManager.setActiveChatSessionID(session.id, forTabID: targetTabID)
         }
@@ -704,8 +714,10 @@ extension OracleViewModel {
         activateInUI: Bool = true,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
-        implicitSessionID: UUID? = nil
+        implicitSessionID: UUID? = nil,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async throws -> UUID {
+        try contextBuilderScope?.checkpoint()
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         if forceNew {
@@ -725,16 +737,20 @@ extension OracleViewModel {
                 id: idString,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
+                agentModeRunID: agentModeRunID,
+                contextBuilderScope: contextBuilderScope
             )
 
+            try contextBuilderScope?.checkpoint()
             await applyOracleOwnerIfNeeded(
                 sessionID: existing.id,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
+            try contextBuilderScope?.checkpoint()
+            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI, contextBuilderScope: contextBuilderScope)
+            try contextBuilderScope?.checkpoint()
 
             if let newName = desiredName,
                !newName.isEmpty,
@@ -797,10 +813,12 @@ extension OracleViewModel {
         resolvedExecution: ResolvedOracleExecution? = nil,
         resolvedLaneIndex: Int = 0,
         implicitSessionID: UUID? = nil,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
     {
+        try contextBuilderScope?.checkpoint()
         // ────────── 1. Validate & extract parameters ──────────
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
         if !removedArgs.isEmpty {
@@ -846,6 +864,10 @@ extension OracleViewModel {
             throw ChatToolError.internalError("Resolved Oracle lane index is invalid.")
         }
         let selectedModel = resolvedExecution.models[resolvedLaneIndex]
+        #if DEBUG
+            if let contextBuilderScope { await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel) }
+        #endif
+        try contextBuilderScope?.checkpoint()
         let selectionLabel = switch resolvedExecution.selection {
         case let .explicitPreset(_, name): "Model Preset \(name)"
         case let .automaticPreset(_, name): "Automatic Model Preset \(name)"
@@ -869,8 +891,10 @@ extension OracleViewModel {
             activateInUI: shouldActivate,
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID,
-            implicitSessionID: implicitSessionID
+            implicitSessionID: implicitSessionID,
+            contextBuilderScope: contextBuilderScope
         )
+        try contextBuilderScope?.checkpoint()
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
@@ -884,10 +908,12 @@ extension OracleViewModel {
         if requiresAuthorityPersistence {
             let sessionToPersist = sessions[sessionIndex]
             let savedURL = try await autosaveSession(sessionToPersist)
+            // Record the write that already happened, even if the lane expired during I/O.
             if let refreshedIndex = sessions.firstIndex(where: { $0.id == chatID }) {
                 sessions[refreshedIndex].fileURL = savedURL
                 sessions[refreshedIndex].savedAt = Date()
             }
+            try contextBuilderScope?.checkpoint()
         }
         setMCPSessionUIState(
             MCPSessionUIState(
@@ -917,6 +943,8 @@ extension OracleViewModel {
                 lookupContextOverride: lookupContextOverride,
                 reviewGitContextOverride: reviewGitContextOverride,
                 overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
+                contextBuilderScope: contextBuilderScope,
                 onProgress: onProgress
             )
         }
@@ -934,6 +962,7 @@ extension OracleViewModel {
             throw OracleContextBuilderCompletionError.missingExactQuery
         }
         let response = try await waitForContextBuilderCompletion(queryId)
+        try contextBuilderScope?.admitSuccess()
 
         // ────────── 6. Build typed reply ──────────
         let replyObj = ChatSendReply(

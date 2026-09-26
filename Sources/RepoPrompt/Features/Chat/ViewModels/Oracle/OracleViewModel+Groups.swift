@@ -99,6 +99,7 @@ extension OracleViewModel {
             capturedProfile: capturedProfile,
             selectionSnapshotOverride: selectionSnapshotOverride,
             resolvedStartExecution: resolvedStartExecution,
+            contextBuilderSupervision: nil,
             singleFallback: .executeSingleMCPValue
         ) {
         case let .singleMCPValue(value):
@@ -121,7 +122,8 @@ extension OracleViewModel {
         callbacks: AppOracleGroupExecutionCallbacks? = nil,
         capturedProfile: AgentModelsSettingsProfile? = nil,
         selectionSnapshotOverride: OracleSelectionSnapshot? = nil,
-        resolvedStartExecution: ResolvedOracleExecution? = nil
+        resolvedStartExecution: ResolvedOracleExecution? = nil,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision? = nil
     ) async throws -> OracleGroupRuntime.Completion {
         switch try await executeConfiguredRosterDispatch(
             args: args,
@@ -132,6 +134,7 @@ extension OracleViewModel {
             capturedProfile: capturedProfile,
             selectionSnapshotOverride: selectionSnapshotOverride,
             resolvedStartExecution: resolvedStartExecution,
+            contextBuilderSupervision: contextBuilderSupervision,
             singleFallback: .rejectTypedCompletion
         ) {
         case .singleMCPValue:
@@ -151,6 +154,7 @@ extension OracleViewModel {
         capturedProfile: AgentModelsSettingsProfile?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         resolvedStartExecution: ResolvedOracleExecution?,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?,
         singleFallback: AppOracleConfiguredRosterSingleFallback
     ) async throws -> AppOracleConfiguredRosterDispatch {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
@@ -236,7 +240,8 @@ extension OracleViewModel {
             selectionSnapshotOverride: selectionSnapshotOverride,
             existingGroup: selection.group,
             frozenInput: frozenInput,
-            callbacks: callbacks
+            callbacks: callbacks,
+            contextBuilderSupervision: contextBuilderSupervision
         )
         return .groupedCompletion(completion)
     }
@@ -324,7 +329,8 @@ extension OracleViewModel {
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,
-        callbacks: AppOracleGroupExecutionCallbacks?
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?
     ) async throws -> OracleGroupRuntime.Completion {
         let useTabPrompt = args["use_tab_prompt"]?.boolValue ?? false
         let rawMessage = args["message"]?.stringValue ?? ""
@@ -390,7 +396,8 @@ extension OracleViewModel {
                     startExecution: startExecution,
                     selectionSnapshotOverride: selectionSnapshotOverride,
                     executionContext: invocation.context,
-                    callbacks: callbacks
+                    callbacks: callbacks,
+                    supervision: contextBuilderSupervision
                 )
             },
             progress: { event in
@@ -589,7 +596,32 @@ extension OracleViewModel {
         startExecution: ResolvedOracleExecution?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         executionContext: OracleLaneExecutionContext,
-        callbacks: AppOracleGroupExecutionCallbacks?
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        supervision: ContextBuilderOracleGroupSupervision?
+    ) async throws -> OracleLaneExecutionResponse {
+        let scope = supervision?.makeLane(sessionID: member.memberID.rawValue)
+        let operation = {
+            try await self.executeOracleLaneBody(
+                member: member, args: args, promptVM: promptVM, tabContext: tabContext,
+                startExecution: startExecution, selectionSnapshotOverride: selectionSnapshotOverride,
+                executionContext: executionContext, callbacks: callbacks, scope: scope
+            )
+        }
+        if let scope { return try await scope.run(oracle: self, operation: operation) }
+        return try await operation()
+    }
+
+    @MainActor
+    private func executeOracleLaneBody(
+        member: OracleGroupMember,
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?,
+        startExecution: ResolvedOracleExecution?,
+        selectionSnapshotOverride: OracleSelectionSnapshot?,
+        executionContext: OracleLaneExecutionContext,
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        scope: ContextBuilderOracleLaneScope?
     ) async throws -> OracleLaneExecutionResponse {
         var laneArgs = args
         laneArgs["chat_id"] = .string(member.publicChatID)
@@ -621,6 +653,7 @@ extension OracleViewModel {
         }
         let resolvedModel = laneExecution.models[resolvedLaneIndex]
         let executionProfile = AppOracleGroupRouting.executionProfile(for: resolvedModel)
+        scope?.executionProfile = executionProfile
         let laneContext: OracleSendTabContext? = if member.laneID.index == 0 {
             tabContext
         } else if let tabContext {
@@ -638,17 +671,22 @@ extension OracleViewModel {
                     tabContext: laneContext,
                     resolvedExecution: laneExecution,
                     resolvedLaneIndex: resolvedLaneIndex,
+                    contextBuilderScope: scope,
                     onProgress: { text, reasoning in
                         partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+                        scope?.partialResponse = partialResponse
                         callbacks?.laneProgress(member.laneID, text, reasoning)
                     }
                 )
             } onCancel: { [weak self] in
-                Task { @MainActor in
-                    await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                // Scoped cancellation is owned by the lane's arbiter, not an ambient session lookup.
+                if scope == nil {
+                    Task { @MainActor in
+                        await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                    }
                 }
             }
-            if Task.isCancelled {
+            if scope == nil, Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
@@ -659,7 +697,7 @@ extension OracleViewModel {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
             }
             await executionContext.emitDelta(response)
-            if Task.isCancelled {
+            if scope == nil, Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
@@ -671,8 +709,8 @@ extension OracleViewModel {
                 executionProfile: executionProfile
             )
         } catch {
-            if Task.isCancelled || error is CancellationError {
-                await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+            if (scope == nil && Task.isCancelled) || error is CancellationError {
+                if scope == nil { await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true) }
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
                     executionProfile: executionProfile
