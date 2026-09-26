@@ -1,6 +1,11 @@
 #if DEBUG
     import SwiftUI
 
+    /// Identifiable wrapper so review sheets can use `sheet(item:)`.
+    struct PromptExperimentProposalSelection: Identifiable, Equatable {
+        let id: UUID
+    }
+
     /// Native-only decision surface. MCP can create a proposal, not approve its source write.
     struct PromptExperimentProposalReviewView: View {
         @ObservedObject var service: PromptExperimentService

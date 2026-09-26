@@ -130,8 +130,9 @@
     private struct PromptExperimentDetailView: View {
         @ObservedObject var service: PromptExperimentService
         let experiment: PromptExperiment
-        @State private var selectedProposalID: UUID?
-        @State private var showsProposalReview = false
+        /// Presented via `sheet(item:)` so the sheet never renders before its ID is set
+        /// (an `isPresented` sheet here showed an empty, undismissable modal).
+        @State private var reviewedProposal: PromptExperimentProposalSelection?
         @State private var proposalError: String?
 
         var body: some View {
@@ -186,8 +187,7 @@
                                                             let proposal = try await service.proposePatch(
                                                                 experimentID: experiment.id, runID: run.id, candidateIndex: candidate.index
                                                             )
-                                                            selectedProposalID = proposal.id
-                                                            showsProposalReview = true
+                                                            reviewedProposal = .init(id: proposal.id)
                                                         } catch {
                                                             proposalError = error.localizedDescription
                                                         }
@@ -219,8 +219,7 @@
                             } else {
                                 ForEach(experiment.proposals) { proposal in
                                     Button("Review candidate #\(proposal.candidateIndex) · \(proposal.state.rawValue)") {
-                                        selectedProposalID = proposal.id
-                                        showsProposalReview = true
+                                        reviewedProposal = .init(id: proposal.id)
                                     }
                                 }
                             }
@@ -238,10 +237,8 @@
                 }
                 .padding(20)
             }
-            .sheet(isPresented: $showsProposalReview) {
-                if let selectedProposalID {
-                    PromptExperimentProposalReviewView(service: service, experimentID: experiment.id, proposalID: selectedProposalID)
-                }
+            .sheet(item: $reviewedProposal) { selection in
+                PromptExperimentProposalReviewView(service: service, experimentID: experiment.id, proposalID: selection.id)
             }
         }
     }

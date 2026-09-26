@@ -8,8 +8,7 @@
         @ObservedObject private var service = PromptExperimentService.shared
         @State private var isExpanded = true
         @State private var showsStudio = false
-        @State private var showsProposalReview = false
-        @State private var selectedProposalID: UUID?
+        @State private var reviewedProposal: PromptExperimentProposalSelection?
 
         private var experimentID: UUID? {
             let keys = ["experiment_id"]
@@ -61,8 +60,7 @@
                         }
                         ForEach(experiment.proposals) { proposal in
                             Button("Review candidate #\(proposal.candidateIndex) · \(proposal.state.rawValue)") {
-                                selectedProposalID = proposal.id
-                                showsProposalReview = true
+                                reviewedProposal = .init(id: proposal.id)
                             }
                             .font(.caption)
                         }
@@ -78,9 +76,9 @@
             .sheet(isPresented: $showsStudio) {
                 PromptExperimentStudioView(service: service, initialSelection: experimentID)
             }
-            .sheet(isPresented: $showsProposalReview) {
-                if let experimentID, let selectedProposalID {
-                    PromptExperimentProposalReviewView(service: service, experimentID: experimentID, proposalID: selectedProposalID)
+            .sheet(item: $reviewedProposal) { selection in
+                if let experimentID {
+                    PromptExperimentProposalReviewView(service: service, experimentID: experimentID, proposalID: selection.id)
                 }
             }
         }
