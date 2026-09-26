@@ -5,15 +5,15 @@ import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
-    /// Negative controls for the read-file auto-selection drain consumers that #1049 left out of
-    /// scope. Each of these tools throws `CancellationError` for any drain that does not complete,
-    /// and `runTool` turns that into `MCPToolExecutionCancelledError`.
+    /// Regression coverage for the read-file auto-selection drain consumers that #1049 left out of
+    /// scope (#1071). A deferred or invalidated prerequisite must reach the caller as a typed
+    /// selection-prerequisite error rather than as `MCPToolExecutionCancelledError`, and a real
+    /// cancellation must stay cancellation.
     ///
     /// Every test drives a real bound `read_file`, then holds either the physical mirror or the
     /// canonical apply with a DEBUG gate, so the tool observes a real deferred or invalidated
-    /// prerequisite. Classification assertions state the intended behavior and fail while the
-    /// defect exists. Harness assertions (the tool waited on the read's own work, dispatched
-    /// nothing and rolled nothing back) and the controls pass on current main.
+    /// prerequisite. Classification assertions pin the caller-visible outcome; harness assertions
+    /// check that the tool waited on the read's own work, dispatched nothing and rolled nothing back.
     @MainActor
     final class MCPSelectionPrerequisiteErrorTests: XCTestCase {
         typealias ToolReply = (content: [MCP.Tool.Content], isError: Bool?)
@@ -107,6 +107,55 @@ import XCTest
             try await assertSocketInvalidatedCanonicalPrerequisite(MCPWindowToolName.getCodeStructure, [:])
         }
 
+        func testSocketInvalidatedManageSelectionGetPrerequisiteIsNotCancellation() async throws {
+            // `op=get` waits only for the canonical selection, so it can be invalidated but never deferred.
+            try await assertSocketInvalidatedCanonicalPrerequisite(MCPWindowToolName.manageSelection, ["op": .string("get")])
+        }
+
+        func testSocketDeferredPromptExportPrerequisiteFailsBeforeCommit() async throws {
+            try await withPrerequisite(timeout: .zero) { prerequisite in
+                try await prerequisite.acceptRead()
+                let network = ServerNetworkManager.shared
+                let connectionID = prerequisite.connection.connectionID
+                // Protected export admission needs a verified local peer, as in MCPExportWatchdogIntegrationTests.
+                await network.debugSetDomainPeerIdentityForTesting(
+                    connectionID: connectionID,
+                    identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:selection-prerequisite-export")
+                )
+                let operationID = "selection-prerequisite-export-\(UUID().uuidString)"
+                let exportPath = prerequisite.driver.fixture.rootPaths[0] + "/\(operationID).md"
+                var pendingError: Error?
+                do {
+                    let reply = try await prerequisite.driver.fixture.perform("socket prompt export deferred prerequisite") {
+                        try await prerequisite.call(MCPWindowToolName.prompt, [
+                            "op": .string("export"),
+                            "path": .string(exportPath),
+                            "operation_id": .string(operationID),
+                            "_rawJSON": .bool(true)
+                        ])
+                    }
+                    try prerequisite.assertCallerVisiblePrerequisiteError(reply, rawJSON: true, outcome: "deferred")
+                    prerequisite.assertMirrorWaiterSettled()
+                    prerequisite.assertSelectionUnchanged()
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "The rejected export wrote its file")
+                    let journal = try await AppDomainRuntimeComposition.shared.runtime.mutationJournal.snapshot()
+                    let record = try XCTUnwrap(
+                        journal.recordSnapshots.last { $0.operationID == operationID },
+                        "Missing mutation journal record for \(operationID)"
+                    )
+                    XCTAssertEqual(
+                        record.status,
+                        .failedBeforeCommit,
+                        "An unsatisfied selection prerequisite must settle the export as a failure before commit, not a cancellation"
+                    )
+                } catch {
+                    pendingError = error
+                }
+                await network.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
+                if let pendingError { throw pendingError }
+            }
+        }
+
         func testCancellationWhileWaitingRemainsCancellation() async throws {
             try await withPrerequisite(timeout: .seconds(60)) { prerequisite in
                 try await prerequisite.acceptRead()
@@ -155,6 +204,48 @@ import XCTest
                 XCTAssertNotEqual(reply.isError, true, text)
                 XCTAssertTrue(text.contains("README.md"), text)
                 XCTAssertEqual(prerequisite.coordinator.debugSnapshot().mirrorWorkerCount, 1)
+            }
+        }
+
+        func testPrerequisiteHelperReportsObservedTaskCancellationOverDeferredResult() async {
+            // The task is cancelled before its main-actor body can start, so the post-drain check
+            // observes cancellation even though the drain itself reported `.deferred`.
+            let task = Task { @MainActor () -> Error? in
+                do {
+                    try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { .deferred }
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            task.cancel()
+            let error = await task.value
+            XCTAssertTrue(error is CancellationError, "An observed task cancellation must win over a deferred result: \(String(describing: error))")
+        }
+
+        func testPrerequisiteHelperKeepsCancelledResultAsCancellation() async {
+            XCTAssertFalse(Task.isCancelled)
+            do {
+                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { .cancelled }
+                XCTFail("A cancelled prerequisite must not complete")
+            } catch {
+                XCTAssertTrue(error is CancellationError, "A cancelled drain result must stay cancellation: \(error)")
+            }
+        }
+
+        func testPrerequisiteHelperCompletesAndTypesUnsatisfiedResults() async throws {
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { .completed }
+            let unsatisfied: [(MCPReadFileAutoSelectionCoordinator.DrainResult, MCPSelectionPrerequisiteError)] = [
+                (.deferred, .deferred),
+                (.invalidated, .invalidated)
+            ]
+            for (result, expected) in unsatisfied {
+                do {
+                    try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { result }
+                    XCTFail("An unsatisfied prerequisite must not complete: \(result)")
+                } catch {
+                    XCTAssertEqual(error as? MCPSelectionPrerequisiteError, expected, "\(error)")
+                }
             }
         }
 
@@ -420,6 +511,12 @@ import XCTest
                     line: line
                 )
                 XCTAssertTrue(
+                    description.contains("selection_prerequisite_\(outcome)"),
+                    "The error does not carry the selection_prerequisite_\(outcome) code: \(description)",
+                    file: file,
+                    line: line
+                )
+                XCTAssertTrue(
                     error.localizedDescription.localizedCaseInsensitiveContains(outcome),
                     "The localized error does not name the \(outcome) prerequisite: \(error.localizedDescription)",
                     file: file,
@@ -459,6 +556,12 @@ import XCTest
                 XCTAssertTrue(
                     message.localizedCaseInsensitiveContains(outcome),
                     "The caller-visible error does not name the \(outcome) prerequisite: \(message)",
+                    file: file,
+                    line: line
+                )
+                XCTAssertTrue(
+                    message.contains("selection_prerequisite_\(outcome)"),
+                    "The caller-visible error does not carry the selection_prerequisite_\(outcome) code: \(message)",
                     file: file,
                     line: line
                 )

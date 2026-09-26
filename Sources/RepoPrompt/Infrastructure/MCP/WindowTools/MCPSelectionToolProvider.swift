@@ -180,8 +180,8 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         let drainRequirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement = op == "get"
             ? .canonicalSelection
             : .mirroredSelectionAndMetrics
-        guard try await dependencies.files.drainReadFileAutoSelection(metadata, drainRequirement) == .completed else {
-            throw CancellationError()
+        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+            try await dependencies.files.drainReadFileAutoSelection(metadata, drainRequirement)
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain, transition: .completed)
         try Task.checkCancellation()

@@ -1409,19 +1409,23 @@ final class MCPServerViewModel: ObservableObject {
         executeAskOracle: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                try await self.drainReadFileAutoSelection(
+                    metadata: metadata,
+                    requirement: .mirroredSelectionAndMetrics
+                )
+            }
             return try await oracleToolService.executeAskOracle(args: args)
         },
         executeOracleSend: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                try await self.drainReadFileAutoSelection(
+                    metadata: metadata,
+                    requirement: .mirroredSelectionAndMetrics
+                )
+            }
             return try await oracleToolService.executeOracleSend(args: args)
         },
         executeOracleChatLog: { [weak self] args in
@@ -4815,6 +4819,30 @@ final class MCPServerViewModel: ObservableObject {
             guard predecessorResult == .completed else { return predecessorResult }
         }
         return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
+    }
+
+    /// Runs one read-file auto-selection drain and throws unless its prerequisite completed.
+    /// Callers keep their own drain requirement and skip conditions. Two cases keep cancellation
+    /// classification (`CancellationError`): a task cancellation observed after the drain, whatever
+    /// the drain returned, and a `.cancelled` drain result, which can also come from a replayed
+    /// mirror settlement rather than this task. A deferred or invalidated prerequisite throws
+    /// `MCPSelectionPrerequisiteError`. Nothing is rolled back.
+    @MainActor
+    static func requireReadFileAutoSelectionPrerequisite(
+        _ drain: @MainActor () async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
+    ) async throws {
+        let prerequisite = try await drain()
+        try Task.checkCancellation()
+        switch prerequisite {
+        case .completed:
+            return
+        case .cancelled:
+            throw CancellationError()
+        case .deferred:
+            throw MCPSelectionPrerequisiteError.deferred
+        case .invalidated:
+            throw MCPSelectionPrerequisiteError.invalidated
+        }
     }
 
     @MainActor
