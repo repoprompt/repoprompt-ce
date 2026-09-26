@@ -358,9 +358,17 @@ enum MCPAgentRoleDefaultsService {
            let parsed = AgentModelSelectionID.parse(overrideRaw),
            let agent = AgentProviderKind(rawValue: parsed.agentRaw)
         {
-            // Codex may have dynamic model IDs, so defer its model-level validation. Other
-            // providers must still expose the stored model or the stale pin is non-executable.
+            // Codex may have dynamic model IDs, so defer its model-level validation. Cursor's
+            // catalogue is likewise not a release constant: it is discovery-backed and can be cold,
+            // stale or temporarily empty while Cursor itself is connected, so treating "not
+            // currently advertised" as non-executable here would silently swap a connected user's
+            // stored role model — and suppress its pin — for the recommendation. Defer it the same
+            // way; `AgentMCPSelectionResolver` rejects an unadvertised Cursor role model at
+            // admission, before a session is created or run, and the runner fence remains the final
+            // check. Other providers must still expose the stored model or the stale pin is
+            // non-executable, and an unavailable provider still falls back below.
             let modelIsExecutable = agent == .codexExec
+                || agent == .cursor
                 || AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability)
             if AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable {
                 let sel = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)

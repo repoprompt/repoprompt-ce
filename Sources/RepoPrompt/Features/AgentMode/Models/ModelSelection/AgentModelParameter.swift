@@ -142,8 +142,9 @@ struct ACPModelParameterIdentity: Hashable {
 
     static func canonicalBaseModelRaw(_ raw: String, providerID: ACPProviderID) -> String {
         if providerID == .cursor {
-            return CursorAIModelCatalog.option(matching: raw)?.rawValue
-                ?? ACPAIModelCatalog.normalizedCursorModelAlias(raw)
+            // Pure identity: a saved parameter pin must resolve to the same identity before and
+            // after Cursor's discovery snapshot warms, so this never consults membership.
+            return CursorAIModelCatalog.canonicalIdentity(raw)
         }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }

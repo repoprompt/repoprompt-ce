@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -191,9 +192,14 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(session.selectedModelRaw, AgentModel.claudeHaiku.rawValue)
     }
 
-    func testGlobalRouterOwnsFreshTaskWithSelectedPromptWorkflow() throws {
+    func testGlobalRouterOwnsFreshTaskWithSelectedPromptWorkflow() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
         let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        try await waitForRouterReadiness(
+            .ready(generation: 1, policyVersion: "fake-v1"),
+            backendID: backend.id,
+            viewModel: viewModel
+        )
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
@@ -209,13 +215,18 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(props.areModelControlsDisabled)
     }
 
-    func testMissingRouterCredentialPreservesPersistedEnablementIntent() throws {
+    func testMissingRouterCredentialPreservesPersistedEnablementIntent() async throws {
         let backend = ComposerRoutingBackend(
             outcome: .selectLast,
             readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
         )
         let (viewModel, store) = try makeRoutingViewModel(backend: backend)
         XCTAssertTrue(store.modelRouterConfiguration().enabled)
+
+        let expected: AgentTaskRouterBackendReadiness = .needsConfiguration(
+            generation: 1, reason: "Validate a TypeSafe API key."
+        )
+        try await waitForRouterReadiness(expected, backendID: backend.id, viewModel: viewModel)
 
         viewModel.handleModelRouterRuntimeChanged()
 
@@ -482,6 +493,30 @@ extension AgentComposerSubmissionAttemptTests {
         await Task.yield()
         XCTAssertTrue(sourceSession.items.isEmpty)
         XCTAssertTrue(destinationSession.items.isEmpty)
+    }
+
+    /// Runtime initialization publishes readiness asynchronously; assertions that depend on an
+    /// exact backend state must observe that publication rather than race the startup task.
+    private func waitForRouterReadiness(
+        _ expected: AgentTaskRouterBackendReadiness,
+        backendID: AgentTaskRouterBackendID,
+        viewModel: AgentModeViewModel
+    ) async throws {
+        let runtime = try XCTUnwrap(viewModel.modelRouterRuntime)
+        let readinessPublished = expectation(description: "Router published expected readiness")
+        var didFulfill = false
+        func fulfillIfPublished() {
+            guard !didFulfill, runtime.backendReadiness(backendID) == expected else { return }
+            didFulfill = true
+            readinessPublished.fulfill()
+        }
+        let observation = runtime.objectWillChange.sink { _ in
+            Task { @MainActor in fulfillIfPublished() }
+        }
+        fulfillIfPublished()
+        await fulfillment(of: [readinessPublished], timeout: 10)
+        observation.cancel()
+        XCTAssertEqual(runtime.backendReadiness(backendID), expected)
     }
 
     private func makeRoutingViewModel(

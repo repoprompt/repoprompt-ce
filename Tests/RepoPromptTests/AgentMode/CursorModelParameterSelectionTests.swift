@@ -4,6 +4,16 @@ import XCTest
 
 @MainActor
 final class CursorModelParameterSelectionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        CursorDiscoveredCatalogTestSupport.reset()
+    }
+
+    override func tearDown() {
+        CursorDiscoveredCatalogTestSupport.reset()
+        super.tearDown()
+    }
+
     func testChoiceResolutionPreservesExactWireValuesAndRejectsCaseCollisions() {
         let definition = ACPModelParameterDefinition(
             kind: .speed,
@@ -274,6 +284,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testResolverUsesPersistedCursorValueAndHidesControlsForOtherProviders() {
+        seedCursorCatalog()
         let persisted = ACPModelParameterSelection(
             providerID: .cursor,
             baseModelRaw: "grok-4.6",
@@ -452,8 +463,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testActiveCursorRunLocksParameterControlsAndRejectsDefensiveSelection() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        seedCursorCatalog()
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -508,7 +518,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(control.accessibilityValue, "High")
     }
 
-    func testSelectingKnownCursorModelPublishesLocalControlsSynchronously() {
+    func testSelectingDiscoveredCursorModelPublishesControlsSynchronously() {
+        seedCursorCatalog()
         let viewModel = makeViewModel(workspacePath: "/workspace-a")
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -526,7 +537,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(controls.map(\.selectedDisplayName), ["High", "Fast"])
     }
 
-    func testSwitchingKnownCursorModelsImmediatelyReplacesControls() {
+    func testSwitchingDiscoveredCursorModelsImmediatelyReplacesControls() {
+        seedCursorCatalog()
         let viewModel = makeViewModel(workspacePath: "/workspace-a")
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -588,6 +600,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testComposerShowsUnsupportedOpenCodeIntentWithoutChangingCursorFallback() throws {
+        seedCursorCatalog()
         for agent: AgentProviderKind in [.openCode, .cursor] {
             let workspacePath = "/workspace-a"
             let viewModel = makeViewModel(workspacePath: workspacePath)
@@ -987,10 +1000,16 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
     }
 
-    func testUnknownCursorModelHasNoControls() {
+    func testUndiscoveredCursorModelHasNoControls() {
+        seedCursorCatalog()
         XCTAssertTrue(ACPModelParameterResolver.resolve(
             providerID: .cursor,
             selectedModelRaw: "future-cursor-model",
+            persistedSelections: []
+        ).isEmpty)
+        XCTAssertFalse(ACPModelParameterResolver.resolve(
+            providerID: .cursor,
+            selectedModelRaw: "grok-4.6",
             persistedSelections: []
         ).isEmpty)
     }
@@ -1404,6 +1423,13 @@ final class CursorModelParameterSelectionTests: XCTestCase {
                 currentValueRaw: currentValueRaw
             )
         )
+    }
+
+    private func seedCursorCatalog(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog(file: file, line: line)
     }
 
     private func cursorEffortSelection(valueRaw: String) -> ACPModelParameterSelection {

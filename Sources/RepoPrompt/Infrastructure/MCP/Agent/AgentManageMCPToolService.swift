@@ -230,6 +230,10 @@ struct AgentManageMCPToolService {
         // serialized disposable-controller probe. Restrict OpenCode enrichment to the
         // advertised current/default model and dedupe canonical models so one enumeration
         // performs at most one probe. Cursor is synchronous and cheap.
+        // Enumeration reads discovered catalogs synchronously; warm the persisted ACP snapshot so
+        // list_agents cannot depend on another provider's incidental warm to advertise a cached
+        // Cursor catalog. No discovery or provider request.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
         var probedOpenCodeCanonicals = Set<String>()
         let openCodeCurrentModelRaw: String? = await OpenCodeACPModelPollingService.shared
             .latestSnapshot()?.models.currentModelRaw
@@ -795,11 +799,16 @@ struct AgentManageMCPToolService {
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
         // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
-        let selection = try AgentMCPSelectionResolver.resolve(
+        // Warm the persisted ACP snapshot before selection validation so a cached model is not
+        // rejected as unknown. This step makes no provider request; the resolver may discover
+        // Cursor models on demand if no snapshot exists.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        let selection = try await AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+            workspaceID: workspace.id,
+            workspacePath: workspace.repoPaths.first
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -941,10 +950,13 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM,
             workspace: workspace
         )
-        let selection = try AgentMCPSelectionResolver.resolve(
+        // See create_session: warm the persisted ACP catalog before model validation.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        let selection = try await AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+            workspaceID: workspace.id,
+            workspacePath: workspace.repoPaths.first
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(

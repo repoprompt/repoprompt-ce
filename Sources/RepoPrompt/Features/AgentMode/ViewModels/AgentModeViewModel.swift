@@ -2160,8 +2160,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static func shouldAdoptDiscoveredPreferredModel(
         for agent: AgentProviderKind
     ) -> Bool {
-        // Grok's default sends no model mutation. Cursor's release catalog is the
-        // selection authority, while discovery only reconciles runtime capabilities.
+        // Grok's default sends no model mutation. Cursor advertises a session's current model on
+        // every discovery tick, and CE pins Auto as its own default, so adopting that probed value
+        // would let a poll overwrite the user's saved choice. Discovery is Cursor's membership and
+        // metadata authority; it is deliberately not authority over what the user selected.
         agent != .grokBuild && agent != .cursor
     }
 

@@ -1,4 +1,4 @@
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
 
@@ -145,7 +145,19 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
-    func testCursorKnownModelPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorDiscoveredModelPassesCatalogValidationBeforePrompt() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(rawValue: "grok-4.6", displayName: "Cursor Grok 4.6", description: nil, isDefault: false)
+                ],
+                currentModelRaw: "grok-4.6"
+            ),
+            for: .cursor
+        ))
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: "grok-4.6"
@@ -154,7 +166,10 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, "grok-4.6")
     }
 
-    func testCursorAutoAliasPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorAutoAliasPassesCatalogValidationWithoutDiscovery() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: AgentModel.cursorAuto.rawValue
@@ -163,7 +178,10 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, AgentModel.cursorAuto.rawValue)
     }
 
-    func testCursorUnknownConcreteModelFailsClosedBeforePrompt() {
+    func testCursorUndiscoveredConcreteModelFailsClosedBeforePrompt() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
         XCTAssertThrowsError(try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: "cursor-future-model"
@@ -172,7 +190,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
                 return XCTFail("Expected invalid Cursor model configuration, got \(error)")
             }
             XCTAssertTrue(detail.contains("cursor-future-model"))
-            XCTAssertTrue(detail.contains("supported model catalog"))
+            XCTAssertTrue(detail.contains("last known model catalog"))
         }
     }
 }

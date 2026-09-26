@@ -422,9 +422,10 @@ enum ACPAIModelCatalog {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    /// Cursor discovery remains runtime authority for applying a selected model and
-    /// its parameters, but is deliberately not picker authority. The release-gated
-    /// catalog makes the non-Agent picker immediately available without an ACP session.
+    /// Cursor's discovery snapshot (live, else the persisted last-known one) is the picker's
+    /// membership authority through `CursorAIModelCatalog`. Auto stays pinned first so the
+    /// non-Agent picker remains usable before any ACP session exists. Applying a selected model
+    /// and its parameters remains live-session authoritative.
     private static func cursorModelOptionsForPicker() -> [AgentModelOption] {
         CursorAIModelCatalog.options
     }
