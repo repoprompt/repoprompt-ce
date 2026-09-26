@@ -1002,6 +1002,7 @@ final class ClaudeAgentModeCoordinator {
         autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
+        let auditTurnID = session.pendingTurnRuntimeAnchors.first?.userItemID
         var handler = toolHandler(for: session)
         handler.resetTurnState(for: session)
 
@@ -1210,6 +1211,15 @@ final class ClaudeAgentModeCoordinator {
                 else { return nil }
                 return ClaudeCodeEffortLevel.parse(autoEffortSelection.effortRaw)
             }()
+            if autoEffortSelection != nil, autoEffort == nil, let auditTurnID {
+                session.updateAutomationAudit(turnID: auditTurnID) {
+                    if $0.autoEffort.decision == .selected {
+                        $0.autoEffort.application = .fallbackToManual
+                        $0.autoEffort.fallbackApplied = true
+                    }
+                }
+                hostCapabilities.scheduleSave(session)
+            }
             if let desiredEffort = autoEffort ?? (appliedAutoEffortByTabID[session.tabID] == nil ? nil : manualEffort) {
                 do {
                     try await controller.applyModelAndEffort(
@@ -1217,6 +1227,12 @@ final class ClaudeAgentModeCoordinator {
                         effortLevel: desiredEffort
                     )
                     if autoEffort != nil {
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                $0.autoEffort.application = .controlAccepted
+                            }
+                            hostCapabilities.scheduleSave(session)
+                        }
                         appliedAutoEffortByTabID[session.tabID] = (controllerID, desiredEffort)
                     } else {
                         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
@@ -1229,6 +1245,15 @@ final class ClaudeAgentModeCoordinator {
                             effortLevel: manualEffort
                         )
                         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                if $0.autoEffort.decision == .selected {
+                                    $0.autoEffort.application = .fallbackToManual
+                                    $0.autoEffort.fallbackApplied = true
+                                }
+                            }
+                            hostCapabilities.scheduleSave(session)
+                        }
                     } catch {
                         return recordSendFailure(
                             "Claude could not restore manual effort before sending: \(error.localizedDescription)",
@@ -1299,7 +1324,22 @@ final class ClaudeAgentModeCoordinator {
                     monitoring.text,
                     instructions: instructions
                 )
+                if let auditTurnID {
+                    session.updateAutomationAudit(turnID: auditTurnID) {
+                        $0.providerDispatchAttempted = true
+                    }
+                    hostCapabilities.scheduleSave(session)
+                }
                 let turnID = try await controller.sendUserMessage(providerBoundText)
+                if let auditTurnID {
+                    session.updateAutomationAudit(turnID: auditTurnID) {
+                        $0.providerTurnAccepted = true
+                        if $0.router.decision == .selected {
+                            $0.router.application = .turnAccepted
+                        }
+                    }
+                    hostCapabilities.scheduleSave(session)
+                }
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
                 hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, monitoring.claim)

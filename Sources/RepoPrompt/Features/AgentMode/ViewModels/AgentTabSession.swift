@@ -756,6 +756,23 @@ final class AgentTabSession: ObservableObject {
     var providerSessionID: String?
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
+    var automationTurnAudit: [AgentAutomationTurnAudit] = []
+
+    func updateAutomationAudit(
+        turnID: UUID,
+        _ update: (inout AgentAutomationTurnAudit) -> Void
+    ) {
+        guard let index = automationTurnAudit.lastIndex(where: { $0.turnID == turnID }) else { return }
+        update(&automationTurnAudit[index])
+        isDirty = true
+    }
+
+    func appendAutomationAudit(_ record: AgentAutomationTurnAudit) {
+        automationTurnAudit.append(record)
+        automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
+        isDirty = true
+    }
+
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 

@@ -207,6 +207,9 @@ struct AgentSession: Codable, Identifiable {
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
     var providerTokenUsageByTurn: [AgentTokenUsagePersist]
 
+    /// Bounded, local-only Jev decision and provider-application evidence keyed by transcript turn ID.
+    var automationTurnAudit: [AgentAutomationTurnAudit]
+
     /// Codex native session identifiers (v2 thread and rollout path)
     var codexConversationID: String?
     var codexRolloutPath: String?
@@ -269,6 +272,7 @@ struct AgentSession: Codable, Identifiable {
         periodicIdleWakeEnabled: Bool = false,
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
+        automationTurnAudit: [AgentAutomationTurnAudit] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
         codexModel: String? = nil,
@@ -313,6 +317,7 @@ struct AgentSession: Codable, Identifiable {
         self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
         self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
+        self.automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
         self.codexModel = codexModel
@@ -359,6 +364,7 @@ struct AgentSession: Codable, Identifiable {
         case periodicIdleWakeEnabled
         case periodicIdleWakeIntervalSeconds
         case providerTokenUsageByTurn
+        case automationTurnAudit
         case codexConversationID
         case codexRolloutPath
         case codexModel
@@ -424,6 +430,9 @@ struct AgentSession: Codable, Identifiable {
                 ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
         )
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
+        automationTurnAudit = try AgentAutomationTurnAudit.retain(
+            container.decodeIfPresent([AgentAutomationTurnAudit].self, forKey: .automationTurnAudit) ?? []
+        )
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
         codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)

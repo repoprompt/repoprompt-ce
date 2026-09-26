@@ -6767,6 +6767,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
+        let auditTurnID = fallbackContext?.optimisticUserItemID
+            ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
         let activeSendRunAttemptID = wasRunAlreadyActive ? session.activeRunAttemptID : nil
@@ -6826,7 +6828,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
-        func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?) {
+        func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?, isAuto: Bool) {
             var manual = effectiveCodexSelection(for: session)
             guard !wasRunAlreadyActive,
                   let autoEffortSelection,
@@ -6845,11 +6847,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       modelRaw: session.selectedModelRaw,
                       advertised: advertisedModel.supportedReasoningEfforts
                   ).contains(autoEffortSelection.effortRaw)
-            else { return manual }
+            else { return (manual.model, manual.reasoningEffort, manual.serviceTier, false) }
             manual.reasoningEffort = autoEffortSelection.effortRaw
-            return manual
+            return (manual.model, manual.reasoningEffort, manual.serviceTier, true)
         }
-        let selection = turnSelection()
+        let initialSelection = turnSelection()
+        let selection = (
+            model: initialSelection.model,
+            reasoningEffort: initialSelection.reasoningEffort,
+            serviceTier: initialSelection.serviceTier
+        )
         session.codexPendingAuthRetryTurn = .init(
             text: text,
             images: attachments,
@@ -7194,20 +7201,44 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         controller: controller,
                         session: session
                     ) {
-                        let physicalSelection = autoEffortSelection == nil ? selection : turnSelection()
+                        let physicalSelection = autoEffortSelection == nil
+                            ? (model: selection.model, reasoningEffort: selection.reasoningEffort, serviceTier: selection.serviceTier, isAuto: false)
+                            : turnSelection()
                         if var pendingTurn = session.codexPendingAuthRetryTurn {
                             pendingTurn.model = physicalSelection.model
                             pendingTurn.reasoningEffort = physicalSelection.reasoningEffort
                             pendingTurn.serviceTier = physicalSelection.serviceTier
                             session.codexPendingAuthRetryTurn = pendingTurn
                         }
-                        return try await controller.startUserTurn(
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                $0.providerDispatchAttempted = true
+                            }
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        let receipt = try await controller.startUserTurn(
                             text: dispatchText,
                             images: attachments,
                             model: physicalSelection.model,
                             reasoningEffort: physicalSelection.reasoningEffort,
                             serviceTier: physicalSelection.serviceTier
                         )
+                        if let auditTurnID {
+                            session.updateAutomationAudit(turnID: auditTurnID) {
+                                $0.providerTurnAccepted = true
+                                if $0.router.decision == .selected {
+                                    $0.router.application = .turnAccepted
+                                }
+                                if physicalSelection.isAuto, $0.autoEffort.decision == .selected {
+                                    $0.autoEffort.application = .turnAccepted
+                                } else if $0.autoEffort.decision == .selected {
+                                    $0.autoEffort.application = .fallbackToManual
+                                    $0.autoEffort.fallbackApplied = true
+                                }
+                            }
+                            viewModel?.scheduleSave(for: session.tabID)
+                        }
+                        return receipt
                     }
                     dispatched = true
                 }
