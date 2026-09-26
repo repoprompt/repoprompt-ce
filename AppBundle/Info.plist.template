@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>__DISPLAY_NAME__</string>
+  <key>CFBundleName</key><string>__BUNDLE_NAME__</string>
   <key>CFBundleDisplayName</key><string>__DISPLAY_NAME__</string>
   <key>CFBundleIdentifier</key><string>__BUNDLE_ID__</string>
-  <key>CFBundleExecutable</key><string>__APP_NAME__</string>
+  <key>CFBundleExecutable</key><string>__EXECUTABLE_NAME__</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconFile</key><string>__ICON_NAME__</string>
   <key>CFBundleShortVersionString</key><string>__MARKETING_VERSION__</string>
   <key>CFBundleVersion</key><string>__BUILD_NUMBER__</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
@@ -22,7 +22,7 @@
   <key>RepoPromptIdentityMigrationAnchorRelativePath</key><string>IdentityMigration/RepoPromptIdentityAnchor</string>
   <key>RepoPromptSentryDSN</key><string></string>
   <key>LSEnvironment</key><dict><key>REPOPROMPT_LAUNCH_SOURCE</key><string>launchservices</string></dict>
-  <key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>com.pvncher.repoprompt.ce</string><key>CFBundleURLSchemes</key><array><string>repoprompt-ce</string></array><key>CFBundleURLIconFile</key><string>AppIcon</string></dict></array>
+  <key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>com.pvncher.repoprompt.ce</string><key>CFBundleURLSchemes</key><array><string>repoprompt-ce</string></array><key>CFBundleURLIconFile</key><string>__ICON_NAME__</string></dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
   <key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>RepoPrompt CE Document</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Default</string><key>LSItemContentTypes</key><array><string>com.pvncher.repoprompt.ce.document</string></array></dict></array>
   <key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>com.pvncher.repoprompt.ce.document</string><key>UTTypeDescription</key><string>RepoPrompt CE Document</string><key>UTTypeConformsTo</key><array><string>public.data</string></array></dict></array>

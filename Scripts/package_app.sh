@@ -107,11 +107,18 @@ IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
 if (( IS_RELEASE )); then
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BASE_BUNDLE_ID}"
+    BUNDLE_NAME="$DISPLAY_NAME"
+    PACKAGED_APP_EXECUTABLE="$APP_NAME"
+    ICON_NAME="AppIcon"
 else
     # Debug builds belong to the successor RepoPrompt identity even while
     # version.env is temporarily pinned to the legacy release identity for the
     # signed P -> T -> S migration rollout.
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-com.repoprompt.ce.debug}}"
+    DISPLAY_NAME="RepoPrompt CE Debug"
+    BUNDLE_NAME="RepoPromptDebug"
+    PACKAGED_APP_EXECUTABLE="RepoPromptDebug"
+    ICON_NAME="AppIconDebug"
 fi
 if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]]; then
     validate_stable_release_context \
@@ -312,11 +319,12 @@ if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
-for exe in "$APP_NAME" repoprompt-mcp; do
-    [[ -x "$BUILD_DIR/$exe" ]] || fail "Missing built executable: $BUILD_DIR/$exe"
-    run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"
-    run chmod +x "$APP_BUNDLE/Contents/MacOS/$exe"
-done
+[[ -x "$BUILD_DIR/$APP_NAME" ]] || fail "Missing built executable: $BUILD_DIR/$APP_NAME"
+run cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$PACKAGED_APP_EXECUTABLE"
+run chmod +x "$APP_BUNDLE/Contents/MacOS/$PACKAGED_APP_EXECUTABLE"
+[[ -x "$BUILD_DIR/repoprompt-mcp" ]] || fail "Missing built executable: $BUILD_DIR/repoprompt-mcp"
+run cp "$BUILD_DIR/repoprompt-mcp" "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+run chmod +x "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 run ln -sf ../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/repoprompt-mcp"
 run ln -sf ../../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/bin/repoprompt-mcp"
 run mkdir -p "$APP_BUNDLE/Contents/Resources/Legal"
@@ -329,17 +337,20 @@ run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" stage-bundle \
     --cache-root "$CODEX_CACHE_ROOT" \
     --bundle "$CODEX_APP_DIR"
 [[ ! -d AppResources ]] || run rsync -a AppResources/ "$APP_BUNDLE/Contents/Resources/"
+if (( ! IS_RELEASE )); then
+    run cp "$ROOT_DIR/AppBundle/AppIconDebug.icns" "$APP_BUNDLE/Contents/Resources/AppIconDebug.icns"
+fi
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
 shopt -u nullglob
 run "$CONTROL_PLANE_SCRIPTS_DIR/normalize_swiftpm_resource_bundles.sh" "$APP_BUNDLE"
-run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Packaged app SwiftPM resource bundle layout"
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Packaged app SwiftPM resource bundle layout" "$PACKAGED_APP_EXECUTABLE"
 
 phase "Writing Info.plist"
 run python3 - <<PY
 from pathlib import Path
 s=Path('AppBundle/Info.plist.template').read_text()
-for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION','__IDENTITY_MIGRATION_PHASE__':'$IDENTITY_MIGRATION_PHASE'}.items(): s=s.replace(k,v)
+for k,v in {'__BUNDLE_NAME__':'$BUNDLE_NAME','__EXECUTABLE_NAME__':'$PACKAGED_APP_EXECUTABLE','__ICON_NAME__':'$ICON_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION','__IDENTITY_MIGRATION_PHASE__':'$IDENTITY_MIGRATION_PHASE'}.items(): s=s.replace(k,v)
 Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
@@ -393,7 +404,7 @@ SPARKLE_FRAMEWORK="$BUILD_DIR/Sparkle.framework"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"
 run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
-run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$PACKAGED_APP_EXECUTABLE" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
 
 if (( ! IS_RELEASE )); then
@@ -512,7 +523,7 @@ verify_signed_app_identity(){
 }
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
-sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+sign_path "$APP_BUNDLE/Contents/MacOS/$PACKAGED_APP_EXECUTABLE"
 APP_SIGN_ARGS=()
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")

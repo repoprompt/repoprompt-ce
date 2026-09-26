@@ -35,6 +35,22 @@ class DebugPackagingIdentityTests(unittest.TestCase):
         self.assertNotIn("SIGN_IDENTITY_WAS_EXPLICIT", source)
         self.assertNotIn("$BASE_BUNDLE_ID.debug", source)
 
+    def test_debug_bundle_has_distinct_visible_and_process_identity(self) -> None:
+        source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        template = (ROOT_DIR / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
+
+        self.assertIn('DISPLAY_NAME="RepoPrompt CE Debug"', source)
+        self.assertIn('BUNDLE_NAME="RepoPromptDebug"', source)
+        self.assertIn('PACKAGED_APP_EXECUTABLE="RepoPromptDebug"', source)
+        self.assertIn('ICON_NAME="AppIconDebug"', source)
+        self.assertIn('PACKAGED_APP_EXECUTABLE="$APP_NAME"', source)
+        self.assertIn('ICON_NAME="AppIcon"', source)
+        self.assertIn("__EXECUTABLE_NAME__", template)
+        self.assertIn("__BUNDLE_NAME__", template)
+        self.assertIn("__ICON_NAME__", template)
+        self.assertTrue((ROOT_DIR / "AppBundle" / "AppIconDebug.icns").is_file())
+        self.assertIn('if (( ! IS_RELEASE )); then\n    run cp "$ROOT_DIR/AppBundle/AppIconDebug.icns"', source)
+
 
 class StableTipFloorTests(unittest.TestCase):
     def rollout(self, *arguments: str) -> subprocess.CompletedProcess[str]:

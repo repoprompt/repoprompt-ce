@@ -7143,11 +7143,17 @@ def debug_app_bundle_path() -> Path:
 
 
 def debug_app_executable_path() -> Path:
+    return debug_app_bundle_path() / "Contents" / "MacOS" / "RepoPromptDebug"
+
+
+def legacy_debug_app_executable_path() -> Path:
+    # Older installed debug bundles used the release executable name.
     return debug_app_bundle_path() / "Contents" / "MacOS" / "RepoPrompt"
 
 
 def find_debug_app_pids() -> List[str]:
-    return [str(pid) for pid in matching_processes(debug_app_executable_path())]
+    paths = (debug_app_executable_path(), legacy_debug_app_executable_path())
+    return sorted({str(pid) for path in paths for pid in matching_processes(path)})
 
 
 def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
@@ -7163,7 +7169,8 @@ def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
 
 
 def terminate_debug_app_processes() -> List[str]:
-    return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
+    paths = (debug_app_executable_path(), legacy_debug_app_executable_path())
+    return sorted({str(pid) for path in paths for pid in terminate_matching_processes(path)})
 
 
 def debug_app_provenance_path(bundle: Path) -> Path:
@@ -7368,7 +7375,7 @@ def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tupl
         if code != 0:
             cleanup_staged_debug_bundle(staged_bundle)
             return code, None
-        executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+        executable = staged_bundle / "Contents" / "MacOS" / "RepoPromptDebug"
         if not executable.is_file() or not os.access(executable, os.X_OK):
             print(f"ERROR: staged debug app is not launchable: {staged_bundle}", flush=True)
             cleanup_staged_debug_bundle(staged_bundle)
@@ -7403,7 +7410,7 @@ def activate_staged_debug_bundle(staged_bundle: Path, live_bundle: Optional[Path
     live = live_bundle or debug_app_bundle_path()
     if not staged_bundle.exists():
         raise ConductorError(f"staged debug app bundle is missing: {staged_bundle}")
-    executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+    executable = staged_bundle / "Contents" / "MacOS" / "RepoPromptDebug"
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise ConductorError(f"staged debug app bundle is not launchable: {staged_bundle}")
     live.parent.mkdir(parents=True, exist_ok=True)
@@ -7434,8 +7441,8 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
     staged_value = args.get("stagedBundle")
     staged_bundle = Path(str(staged_value)) if staged_value else None
     activated = False
-    executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
-    if staged_bundle is None and (not bundle.exists() or not executable.is_file() or not os.access(executable, os.X_OK)):
+    executables = (debug_app_executable_path(), legacy_debug_app_executable_path())
+    if staged_bundle is None and (not bundle.exists() or not any(path.is_file() and os.access(path, os.X_OK) for path in executables)):
         print(f"ERROR: existing debug app bundle is not launchable: {bundle}", flush=True)
         print("Build it first with './conductor build' or './conductor run'.", flush=True)
         return 1
