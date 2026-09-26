@@ -39,17 +39,39 @@ import XCTest
             SuiteCase(id: "v1", split: "validation", input: "validation input")
         ]
 
-        /// Writes `oracle-plan/prompt.md` and an exact-match `suite.json` under `root`.
-        static func makeRegistry(root: URL, prompt: String = "seed prompt", cases: [SuiteCase] = defaultCases, suiteID: String = "unit-suite") throws -> BuiltInPromptRegistry {
+        static let checklistRubric = """
+        # Unit checklist
+
+        Judge the answer.
+
+        - `answers` (weight 1): Does it answer the request?
+        - `grounded` (weight 1): Is it grounded in the context?
+        """
+
+        /// Writes `oracle-plan/prompt.md` and an exact-match `suite.json` under `root`, or a
+        /// model-judge suite with `judgeRubric` as its checklist.
+        static func makeRegistry(
+            root: URL,
+            prompt: String = "seed prompt",
+            cases: [SuiteCase] = defaultCases,
+            suiteID: String = "unit-suite",
+            judgeRubric: String? = nil
+        ) throws -> BuiltInPromptRegistry {
             let directory = root.appendingPathComponent("prompts/oracle-plan", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try Data("\(prompt)\n".utf8).write(to: directory.appendingPathComponent("prompt.md"))
+            if let judgeRubric {
+                try Data(judgeRubric.utf8).write(to: directory.appendingPathComponent("rubric.md"))
+            }
+            let grader: [String: Any] = judgeRubric == nil
+                ? ["kind": "exact_match", "score_range": ["min": 0, "max": 1]]
+                : ["kind": "model_judge", "score_range": ["min": 0, "max": 1], "rubric": "rubric.md"]
             let suite: [String: Any] = [
                 "schema_version": 1,
                 "suite_id": suiteID,
                 "prompt_id": "oracle-plan",
                 "prompt_variant": "built_in",
-                "grader": ["kind": "exact_match", "score_range": ["min": 0, "max": 1]],
+                "grader": grader,
                 "cases": cases.map { ["id": $0.id, "split": $0.split, "input": $0.input, "expected_output": $0.expected] }
             ]
             try JSONSerialization.data(withJSONObject: suite, options: [.sortedKeys]).write(to: directory.appendingPathComponent("suite.json"))
@@ -280,6 +302,31 @@ import XCTest
                 _ = try await harness.service.requestApproval(experimentID: experiment.id, expectedAuthorityDigest: nil)
                 XCTFail("An approved experiment is never re-approved")
             } catch PromptExperimentAuthorityError.alreadyApproved {}
+        }
+
+        func testJudgeDefaultsToADifferentModelThanReflectionAndAnIdenticalChoiceIsRejected() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root, judgeRubric: PromptExperimentTestFixtures.checklistRubric)
+            let service = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+
+            let defaults = try await service.createOrUpdate(PromptExperimentCreateRequest(promptID: "oracle-plan", maxEvaluations: 4))
+            XCTAssertEqual(defaults.authority.targets.judge, PromptExperimentTestFixtures.judge)
+
+            // Reflection moved onto the default judge's model: the default judge moves off it.
+            let moved = try await service.createOrUpdate(PromptExperimentCreateRequest(
+                promptID: "oracle-plan", reflectionTarget: "pair", maxEvaluations: 4
+            ))
+            let judge = try XCTUnwrap(moved.authority.targets.judge)
+            XCTAssertNotEqual(judge.canonicalSelectionID, moved.authority.targets.reflection.canonicalSelectionID)
+
+            do {
+                _ = try await service.createOrUpdate(PromptExperimentCreateRequest(
+                    promptID: "oracle-plan", judgeTarget: "design", maxEvaluations: 4
+                ))
+                XCTFail("A judge sharing the reflection model must be rejected")
+            } catch let PromptExperimentAuthorityError.validation(fields) {
+                XCTAssertEqual(fields.map(\.field), ["judge_target"])
+            }
         }
 
         func testChangingApprovedAuthorityCreatesANewExperiment() async throws {

@@ -193,12 +193,24 @@
             listTargets()
         }
 
+        /// The default judge never shares the reflection model: a judge that grades the
+        /// reflector's own proposals rewards its style (self-preference) instead of the rubric.
         func targetDefaults() -> PromptExperimentTargetDefaults {
-            PromptExperimentTargetDefaults(
+            let reflection = defaultTarget(role: Self.defaultReflectionRole)
+            return PromptExperimentTargetDefaults(
                 execution: defaultTarget(role: Self.defaultExecutionRole),
-                reflection: defaultTarget(role: Self.defaultReflectionRole),
-                judge: defaultTarget(role: Self.defaultJudgeRole)
+                reflection: reflection,
+                judge: defaultJudge(distinctFrom: reflection)
             )
+        }
+
+        private func defaultJudge(distinctFrom reflection: PromptExperimentResolvedTarget?) -> PromptExperimentResolvedTarget? {
+            guard let reflection else { return defaultTarget(role: Self.defaultJudgeRole) }
+            let preferred = [Self.defaultJudgeRole, Self.defaultExecutionRole, "explore"].compactMap { try? resolveTarget($0) }
+            return (preferred + listTargets()).first {
+                PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks($0)
+                    && $0.canonicalSelectionID != reflection.canonicalSelectionID
+            }
         }
 
         private func defaultTarget(role: String) -> PromptExperimentResolvedTarget? {
@@ -266,7 +278,17 @@
             var judge: PromptExperimentResolvedTarget?
             if let suite {
                 if suite.grader.kind == .modelJudge {
-                    judge = target("judge_target", request.judgeTarget, current: base?.authority.targets.judge, fallback: defaults.judge)
+                    // A changed reflection model re-derives a distinct default judge.
+                    let fallback = defaults.judge?.canonicalSelectionID == reflection?.canonicalSelectionID
+                        ? defaultJudge(distinctFrom: reflection)
+                        : defaults.judge
+                    let current = base?.authority.targets.judge.flatMap {
+                        $0.canonicalSelectionID == reflection?.canonicalSelectionID ? nil : $0
+                    }
+                    judge = target("judge_target", request.judgeTarget, current: current, fallback: fallback)
+                    if let judge, let reflection, judge.canonicalSelectionID == reflection.canonicalSelectionID {
+                        errors.append(.init(field: "judge_target", message: "The judge model must differ from the reflection model (\(reflection.displayName)); a model grading its own proposals favors its own style."))
+                    }
                 } else if request.judgeTarget != nil {
                     errors.append(.init(field: "judge_target", message: "Suite '\(suite.suiteID)' is graded by exact match; omit judge_target."))
                 }

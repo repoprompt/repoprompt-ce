@@ -71,12 +71,17 @@
         /// Surrounding prose is tolerated; the contract (finite in-range numeric score, string
         /// feedback) is still validated strictly.
         static func decode(_ raw: String, minimum: Double, maximum: Double) -> (score: Double, feedback: String)? {
+            guard let object = decodeObject(raw) else { return nil }
+            return validate(object, minimum: minimum, maximum: maximum)
+        }
+
+        /// The evaluator object in a judge reply, located as described on `decode`; contract
+        /// validation is the caller's.
+        static func decodeObject(_ raw: String) -> [String: Any]? {
             let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            let object = jsonObject(text)
+            return jsonObject(text)
                 ?? lastFencedJSONBlock(in: text).flatMap(jsonObject)
                 ?? firstBalancedJSONObject(in: text)
-            guard let object else { return nil }
-            return validate(object, minimum: minimum, maximum: maximum)
         }
 
         private static func jsonObject(_ text: String) -> [String: Any]? {
@@ -203,6 +208,19 @@
             checkpoint: (Int, PromptExperimentGradingState, String?) async throws -> Void,
             invoke: (Bool) async throws -> String
         ) async throws -> (score: Double, feedback: String) {
+            try await run(canRepair: canRepair, checkpoint: checkpoint, invoke: invoke) {
+                decode($0, minimum: minimum, maximum: maximum)
+            }
+        }
+
+        /// The shared judge loop for any reply contract: `decode` returns nil for a reply that
+        /// violates the contract, which earns at most one repair.
+        static func run<Value>(
+            canRepair: Bool,
+            checkpoint: (Int, PromptExperimentGradingState, String?) async throws -> Void,
+            invoke: (Bool) async throws -> String,
+            decode: (String) -> Value?
+        ) async throws -> Value {
             for ordinal in 1 ... (canRepair ? 2 : 1) {
                 try Task.checkCancellation()
                 try await checkpoint(ordinal, .pending, nil)
@@ -219,7 +237,7 @@
                         throw Failure.providerFailed
                     }
                     try Task.checkCancellation()
-                    if let value = decode(response, minimum: minimum, maximum: maximum) {
+                    if let value = decode(response) {
                         try await checkpoint(ordinal, .completed, response)
                         return value
                     }

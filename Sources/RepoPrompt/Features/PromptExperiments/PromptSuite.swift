@@ -34,6 +34,16 @@ struct PromptSuiteRubric: Equatable {
     let fileName: String
     let text: String
     let sha256: String
+    /// Weighted binary checks parsed from `text` (judge- or host-evaluated).
+    var checks: [PromptSuiteRubricCheck] = []
+    /// The rubric's free-text guidance for the judge (everything except the check lines).
+    var guidance: String = ""
+
+    /// A rubric whose checklist was parsed from `text`; throws for a malformed checklist.
+    static func checklist(fileName: String, text: String, sha256: String) throws -> Self {
+        let parsed = try PromptSuiteChecklistParser.parse(text)
+        return Self(fileName: fileName, text: text, sha256: sha256, checks: parsed.checks, guidance: parsed.guidance)
+    }
 }
 
 struct PromptSuiteGrader: Equatable {
@@ -103,6 +113,7 @@ enum PromptSuiteValidationError: Error, Equatable, LocalizedError {
     case invalidRubricReference(String)
     case rubricUnreadable(String)
     case emptyRubric(String)
+    case invalidRubricChecklist(file: String, detail: String)
     case noCases
     case duplicateCaseID(String)
     case unknownSplit(caseID: String, value: String)
@@ -128,6 +139,7 @@ enum PromptSuiteValidationError: Error, Equatable, LocalizedError {
         case let .invalidRubricReference(value): "Rubric reference '\(value)' must be a plain sibling file name."
         case let .rubricUnreadable(value): "Rubric '\(value)' could not be read as a regular UTF-8 file."
         case let .emptyRubric(value): "Rubric '\(value)' is empty."
+        case let .invalidRubricChecklist(file, detail): "Rubric '\(file)' is not a valid weighted checklist: \(detail). Use lines like - `id` (weight 2): question, or - `id` (weight 1, host: required_sections sections=A|B): description."
         case .noCases: "Suite has no cases."
         case let .duplicateCaseID(id): "Duplicate case id '\(id)'."
         case let .unknownSplit(caseID, value): "Case '\(caseID)' has unknown split '\(value)'."
@@ -234,7 +246,17 @@ enum PromptSuiteLoader {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PromptSuiteValidationError.emptyRubric(reference)
         }
-        return PromptSuiteRubric(fileName: reference, text: text, sha256: BuiltInPromptRegistry.sha256Hex(data))
+        do {
+            return try PromptSuiteRubric.checklist(fileName: reference, text: text, sha256: BuiltInPromptRegistry.sha256Hex(data))
+        } catch let failure as PromptSuiteChecklistParser.Failure {
+            let detail = switch failure {
+            case let .malformedCheck(line): "malformed check line '\(line.prefix(120))'"
+            case let .duplicateCheck(id): "duplicate check id '\(id)'"
+            case let .unknownHostCheck(kind): "unsupported host check '\(kind)'"
+            case .noChecks: "no checks"
+            }
+            throw PromptSuiteValidationError.invalidRubricChecklist(file: reference, detail: detail)
+        }
     }
 
     private static func validateCases(_ documents: [CaseDocument], graderKind: PromptSuiteGraderKind) throws -> [PromptSuiteCase] {

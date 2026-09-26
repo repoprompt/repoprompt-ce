@@ -183,9 +183,46 @@ final class PromptSuiteLoaderTests: XCTestCase {
         try Data("outside rubric".utf8).write(to: outside)
         assertRejects(judgeSuite(rubric: "linked.md"), .rubricUnreadable("linked.md"), symlinks: ["linked.md": outside])
 
-        let suite = try load(judgeSuite(rubric: "rubric.md"), files: ["rubric.md": "Score it."])
-        XCTAssertEqual(suite.grader.rubric?.text, "Score it.")
-        XCTAssertEqual(suite.grader.rubric?.sha256, BuiltInPromptRegistry.sha256Hex(Data("Score it.".utf8)))
+        let checklist = "Judge it.\n\n- `answers` (weight 2): Does it answer?\n- `short` (weight 1, host: no_code_patch max_block_lines=10): No patches.\n"
+        let suite = try load(judgeSuite(rubric: "rubric.md"), files: ["rubric.md": checklist])
+        XCTAssertEqual(suite.grader.rubric?.text, checklist)
+        XCTAssertEqual(suite.grader.rubric?.sha256, BuiltInPromptRegistry.sha256Hex(Data(checklist.utf8)))
+        XCTAssertEqual(suite.grader.rubric?.checks, [
+            PromptSuiteRubricCheck(id: "answers", weight: 2, text: "Does it answer?", evaluator: .judge),
+            PromptSuiteRubricCheck(id: "short", weight: 1, text: "No patches.", evaluator: .host(.noCodePatch(maxBlockLines: 10)))
+        ])
+        XCTAssertEqual(suite.grader.rubric?.guidance, "Judge it.")
+    }
+
+    func testHolisticOrMalformedChecklistRubricsAreRejected() {
+        func assertChecklistRejected(_ text: String, _ detail: String) {
+            assertRejects(
+                judgeSuite(rubric: "rubric.md"),
+                .invalidRubricChecklist(file: "rubric.md", detail: detail),
+                files: ["rubric.md": text]
+            )
+        }
+        assertChecklistRejected("Score it 0-10 holistically.", "no checks")
+        assertChecklistRejected("- `a` (weight 0): zero weight?", "malformed check line '- `a` (weight 0): zero weight?'")
+        assertChecklistRejected("- `a` (weight 1): one?\n- `a` (weight 2): again?", "duplicate check id 'a'")
+        assertChecklistRejected("- `a` (weight 1, host: telepathy): mind reading", "unsupported host check 'telepathy'")
+        assertChecklistRejected("- `a` (weight 1, host: required_sections): no sections", "unsupported host check 'required_sections needs sections='")
+    }
+
+    func testCheckedInOraclePlanRubricIsAWeightedChecklistWithHostChecks() throws {
+        let rubric = try XCTUnwrap(PromptSuiteLoader.load(promptID: .oraclePlan).grader.rubric)
+        XCTAssertEqual(rubric.checks.count, 13)
+        XCTAssertEqual(rubric.checks.reduce(0) { $0 + $1.weight }, 25)
+        let hosts = rubric.checks.compactMap { check -> PromptSuiteHostCheck? in
+            if case let .host(kind) = check.evaluator { return kind }
+            return nil
+        }
+        XCTAssertEqual(hosts, [
+            .requiredSections(["Summary", "Current-state analysis", "Design", "File-by-file impact", "Implementation order"]),
+            .noCodePatch(maxBlockLines: 25),
+            .pathsInContext
+        ])
+        XCTAssertFalse(rubric.guidance.contains("(weight"), "check lines are not repeated as guidance")
     }
 
     func testMissingSuiteFileIsUnreadable() throws {

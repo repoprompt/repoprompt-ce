@@ -9,11 +9,14 @@
         let proposerFeedback: String
         /// Full grader feedback, kept host-side (it can quote reference answers).
         let hostFeedback: String
+        /// Per-check verdicts for checklist grading (host checks first, then judge checks).
+        var checks: [PromptExperimentCheckResult] = []
     }
 
     /// Grades one target output with the suite's grader: exact match against the reviewed
-    /// expected output, or a connected-model judge applying the suite rubric (at most one
-    /// format repair per evaluation).
+    /// expected output, or a weighted binary checklist (CheckEval-style) whose host checks are
+    /// computed deterministically and whose judge checks a connected model answers with a
+    /// quoted failing span and a concrete fix (at most one format repair per evaluation).
     @MainActor
     final class PromptExperimentGrader {
         static let maximumProposerFeedbackCharacters = 16 * 1024
@@ -53,24 +56,21 @@
                     : "Expected:\n\(expected)\nActual:\n\(output)\nRevise the candidate to close this concrete gap without memorizing the example."
                 return grade(matched ? maximumScore : minimumScore, feedback, split: example.split)
             case .modelJudge:
-                guard let judgeTarget, let rubric = grader.rubric else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable("The suite's judge target or rubric is unavailable.")
+                guard let judgeTarget, let rubric = grader.rubric, !rubric.checks.isEmpty else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The suite's judge target or checklist rubric is unavailable.")
                 }
-                let judgePrompt = """
-                Evaluate the candidate run using the immutable rubric below. Return only JSON with numeric `score` and string `feedback`. Write any line breaks inside `feedback` as the escape sequence \\n, never as literal newlines.
-                Score range: \(minimumScore)...\(maximumScore)
-                Rubric:
-                \(rubric.text)
-                Input (the packaged user message the target received):
-                \(example.packagedUserMessage)
-                Reviewed reference output (may be unavailable):
-                \(example.expectedOutput ?? "unavailable")
-                Actual output:
-                \(output)
-                """
-                let judgment = try await PromptExperimentGrading.run(
-                    minimum: minimumScore,
-                    maximum: maximumScore,
+                let hostResults = PromptExperimentChecklist.evaluateHostChecks(rubric.checks, output: output, example: example)
+                guard rubric.checks.contains(where: { $0.evaluator == .judge }) else {
+                    return checklistGrade(hostResults, split: example.split)
+                }
+                let judgePrompt = PromptExperimentChecklist.judgePrompt(
+                    guidance: rubric.guidance,
+                    checks: rubric.checks,
+                    packagedInput: example.packagedUserMessage,
+                    reference: example.expectedOutput,
+                    output: output
+                )
+                let verdicts = try await PromptExperimentGrading.run(
                     canRepair: true,
                     checkpoint: { ordinal, state, response in
                         try await checkpoint(.grading(.init(
@@ -89,14 +89,22 @@
                             systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
                             userPrompt: judgePrompt + (
                                 repair
-                                    ? "\nThe previous judge attempt did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object with numeric score and string feedback, no surrounding prose. Write line breaks inside feedback as \\n, never as literal newlines."
+                                    ? "\nThe previous judge attempt did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME checklist. Return one JSON object {\"checks\":[...]} with exactly one entry per check id, a boolean pass, and a non-empty fix for every failing check, no surrounding prose. Write line breaks inside strings as \\n, never as literal newlines."
                                     : ""
                             )
                         ).output
-                    }
+                    },
+                    decode: { PromptExperimentChecklist.decodeJudgeVerdicts($0, checks: rubric.checks) }
                 )
-                return grade(judgment.score, judgment.feedback, split: example.split)
+                return checklistGrade(hostResults + verdicts, split: example.split)
             }
+        }
+
+        private func checklistGrade(_ results: [PromptExperimentCheckResult], split: PromptExperimentDatasetSplit) -> PromptExperimentGrade {
+            let score = PromptExperimentChecklist.score(results, minimum: minimumScore, maximum: maximumScore)
+            var value = grade(score, PromptExperimentChecklist.feedback(results, score: score), split: split)
+            value.checks = results
+            return value
         }
 
         private func grade(_ score: Double, _ feedback: String, split: PromptExperimentDatasetSplit) -> PromptExperimentGrade {

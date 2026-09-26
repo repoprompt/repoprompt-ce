@@ -182,11 +182,11 @@ import XCTest
                 callbackRootBase: FileManager.default.temporaryDirectory
                     .appendingPathComponent("grading-\(UUID().uuidString)", isDirectory: true)
             )
-            let grader = PromptExperimentGrader(
+            let grader = try PromptExperimentGrader(
                 grader: PromptSuiteGrader(
                     kind: .modelJudge,
                     scoreRange: .init(min: 0, max: 1),
-                    rubric: PromptSuiteRubric(fileName: "rubric.md", text: "Score it.", sha256: "x")
+                    rubric: PromptSuiteRubric.checklist(fileName: "rubric.md", text: PromptExperimentTestFixtures.checklistRubric, sha256: "x")
                 ),
                 judgeTarget: PromptExperimentTestFixtures.execution
             )
@@ -202,8 +202,144 @@ import XCTest
                     progress: { _ in }
                 )
                 XCTAssertEqual(grade.score, 0.5)
+                XCTAssertTrue(grade.proposerFeedback.contains("FAIL grounded (w1, judge): \u{201C}made up\u{201D} \u{2192} fix: cite the context"))
             }
             XCTAssertEqual(completer.calls, 8)
+        }
+
+        // MARK: Checklist
+
+        private static let checks = [
+            PromptSuiteRubricCheck(id: "a", weight: 3, text: "A?", evaluator: .judge),
+            PromptSuiteRubricCheck(id: "b", weight: 1, text: "B?", evaluator: .judge),
+            PromptSuiteRubricCheck(id: "h", weight: 1, text: "H", evaluator: .host(.pathsInContext))
+        ]
+
+        func testJudgeVerdictsMustCoverEveryJudgeCheckOnceWithBooleansAndFixes() {
+            let valid = #"Sure. {"checks":[{"id":"a","pass":true},{"id":"b","pass":false,"span":"x\ny","fix":"do z"}]}"#
+            let results = PromptExperimentChecklist.decodeJudgeVerdicts(valid, checks: Self.checks)
+            XCTAssertEqual(results, [
+                .init(id: "a", weight: 3, passed: true, span: "", fix: "", source: .judge),
+                .init(id: "b", weight: 1, passed: false, span: "x y", fix: "do z", source: .judge)
+            ])
+            for invalid in [
+                #"{"checks":[{"id":"a","pass":true}]}"#, // missing b
+                #"{"checks":[{"id":"a","pass":true},{"id":"a","pass":true},{"id":"b","pass":true}]}"#, // duplicate
+                #"{"checks":[{"id":"a","pass":1},{"id":"b","pass":true}]}"#, // not a boolean
+                #"{"checks":[{"id":"a","pass":true},{"id":"b","pass":false,"span":"x"}]}"#, // failing without fix
+                #"{"checks":[{"id":"a","pass":true},{"id":"b","pass":true},{"id":"h","pass":true}]}"#, // host check judged
+                #"{"score":0.5,"feedback":"holistic"}"#
+            ] {
+                XCTAssertNil(PromptExperimentChecklist.decodeJudgeVerdicts(invalid, checks: Self.checks), invalid)
+            }
+        }
+
+        func testChecklistScoreIsTheWeightedPassFractionAndFeedbackListsFailuresFirst() {
+            let results: [PromptExperimentCheckResult] = [
+                .init(id: "h", weight: 1, passed: true, span: "", fix: "", source: .host),
+                .init(id: "a", weight: 3, passed: false, span: "bad", fix: "better", source: .judge),
+                .init(id: "b", weight: 1, passed: true, span: "", fix: "", source: .judge)
+            ]
+            XCTAssertEqual(PromptExperimentChecklist.score(results, minimum: 0, maximum: 1), 0.4, accuracy: 1e-9)
+            XCTAssertEqual(PromptExperimentChecklist.score(results, minimum: 0, maximum: 10), 4, accuracy: 1e-9)
+            XCTAssertEqual(
+                PromptExperimentChecklist.feedback(results, score: 0.4),
+                "Checklist: 2/5 weight passed (score 0.400).\nFAIL a (w3, judge): \u{201C}bad\u{201D} \u{2192} fix: better\nPASS: h, b"
+            )
+        }
+
+        func testRequiredSectionsAcceptHeadingsAndBoldLabels() {
+            let sections = ["Summary", "Current-state analysis", "Implementation order"]
+            let complete = "## Summary\ntext\n2. **Current-state analysis** \u{2014} flow\n**Implementation order**\n1. step"
+            XCTAssertTrue(PromptExperimentChecklist.requiredSections(sections, output: complete).passed)
+            let missing = PromptExperimentChecklist.requiredSections(sections, output: "## Summary\nOnly a summary mentioning implementation order in prose.")
+            XCTAssertFalse(missing.passed)
+            XCTAssertEqual(missing.fix, "Add the missing section(s): Current-state analysis, Implementation order.")
+        }
+
+        func testNoCodePatchFlagsLongBlocksAndDiffsButAllowsSketches() {
+            let sketch = "Plan\n```swift\nprotocol Store { func load() }\n```"
+            XCTAssertTrue(PromptExperimentChecklist.noCodePatch(maxBlockLines: 3, output: sketch).passed)
+            let long = "```swift\n" + Array(repeating: "let x = 1", count: 4).joined(separator: "\n") + "\n```"
+            let longVerdict = PromptExperimentChecklist.noCodePatch(maxBlockLines: 3, output: long)
+            XCTAssertFalse(longVerdict.passed)
+            XCTAssertTrue(longVerdict.fix.contains("4-line code block"))
+            XCTAssertFalse(PromptExperimentChecklist.noCodePatch(maxBlockLines: 30, output: "```\n--- a/x.swift\n+++ b/x.swift\n@@ -1 +1 @@\n```").passed)
+            XCTAssertFalse(PromptExperimentChecklist.noCodePatch(maxBlockLines: 30, output: "```diff\n-a\n+b\n```").passed)
+        }
+
+        func testPathsInContextAllowsContextFilesAndNewFilesInKnownDirectoriesOnly() {
+            let example = PromptSuiteCase(
+                id: "t1", split: .training, input: "Change the ledger.", expectedOutput: nil,
+                context: PromptSuiteCaseContext(
+                    fileTree: "Sources/\n\u{2514}\u{2500}\u{2500} Lab/\n    \u{2514}\u{2500}\u{2500} Ledger.swift",
+                    files: [PromptSuiteContextFile(path: "Sources/Lab/Ledger.swift", content: "struct Ledger {}")]
+                )
+            )
+            let grounded = "Edit `Sources/Lab/Ledger.swift` and add Sources/Lab/LedgerCache.swift; see https://example.com/a/b.html."
+            XCTAssertEqual(PromptExperimentChecklist.referencedPaths(grounded), ["Sources/Lab/Ledger.swift", "Sources/Lab/LedgerCache.swift"])
+            XCTAssertTrue(PromptExperimentChecklist.pathsInContext(output: grounded, example: example).passed)
+            let fabricated = PromptExperimentChecklist.pathsInContext(output: "Update Sources/Imaginary/Engine.swift.", example: example)
+            XCTAssertFalse(fabricated.passed)
+            XCTAssertEqual(fabricated.span, "Sources/Imaginary/Engine.swift")
+        }
+
+        func testHostOnlyChecklistGradesWithoutAJudgeCall() async throws {
+            let completer = ScriptedJudge()
+            let rubric = try PromptSuiteRubric.checklist(
+                fileName: "rubric.md",
+                text: "- `sections` (weight 1, host: required_sections sections=Summary): Has a summary.",
+                sha256: "x"
+            )
+            let grader = PromptExperimentGrader(
+                grader: PromptSuiteGrader(kind: .modelJudge, scoreRange: .init(min: 0, max: 1), rubric: rubric),
+                judgeTarget: PromptExperimentTestFixtures.execution
+            )
+            let grade = try await grader.grade(
+                example: PromptSuiteCase(id: "t", split: .training, input: "input", expectedOutput: nil),
+                candidate: "candidate",
+                output: "# Summary\nDone.",
+                gradingID: UUID(),
+                invoker: PromptExperimentModelInvoker(
+                    completer: completer,
+                    policy: PromptExperimentProviderRetryPolicy(maxRetries: 0),
+                    checkpoint: { _ in },
+                    callbackRootBase: FileManager.default.temporaryDirectory.appendingPathComponent("grading-\(UUID().uuidString)")
+                ),
+                checkpoint: { _ in },
+                progress: { _ in }
+            )
+            XCTAssertEqual(grade.score, 1)
+            XCTAssertEqual(grade.checks.map(\.source), [.host])
+            XCTAssertEqual(completer.calls, 0)
+        }
+
+        func testHeldOutChecklistFeedbackIsWithheldFromTheProposer() async throws {
+            let rubric = try PromptSuiteRubric.checklist(
+                fileName: "rubric.md",
+                text: "- `sections` (weight 1, host: required_sections sections=Summary): Has a summary.",
+                sha256: "x"
+            )
+            let grader = PromptExperimentGrader(
+                grader: PromptSuiteGrader(kind: .modelJudge, scoreRange: .init(min: 0, max: 1), rubric: rubric),
+                judgeTarget: PromptExperimentTestFixtures.execution
+            )
+            let grade = try await grader.grade(
+                example: PromptSuiteCase(id: "h", split: .hiddenTest, input: "secret input", expectedOutput: nil),
+                candidate: "candidate",
+                output: "no sections",
+                gradingID: UUID(),
+                invoker: PromptExperimentModelInvoker(
+                    completer: ScriptedJudge(),
+                    policy: PromptExperimentProviderRetryPolicy(maxRetries: 0),
+                    checkpoint: { _ in },
+                    callbackRootBase: FileManager.default.temporaryDirectory.appendingPathComponent("grading-\(UUID().uuidString)")
+                ),
+                checkpoint: { _ in },
+                progress: { _ in }
+            )
+            XCTAssertEqual(grade.proposerFeedback, PromptSuiteSplit.heldOutFeedback)
+            XCTAssertTrue(grade.hostFeedback.contains("FAIL sections"))
         }
     }
 
@@ -220,7 +356,9 @@ import XCTest
             calls += 1
             let repair = userPrompt.contains("did not satisfy the evaluator JSON contract")
             return PromptExperimentConnectedModelCompletion(
-                output: repair ? #"{"score":0.5,"feedback":"ok"}"# : "I cannot decide yet.",
+                output: repair
+                    ? #"{"checks":[{"id":"answers","pass":true},{"id":"grounded","pass":false,"span":"made up","fix":"cite the context"}]}"#
+                    : #"{"score":0.5,"feedback":"holistic replies violate the checklist contract"}"#,
                 promptTokens: nil,
                 completionTokens: nil
             )
