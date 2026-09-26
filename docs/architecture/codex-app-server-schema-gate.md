@@ -196,6 +196,39 @@ licences are byte-identical to 0.156.0. The patch release adds GPT-6 Sol and Lun
 Codex's model catalog; model availability remains runtime-discovered rather than
 hard-coded by RepoPrompt.
 
+## Account rate-limit adoption findings (2026-09-22)
+
+Adopting `account/rateLimits/read` and `account/rateLimits/updated` expanded the bounded projection
+from 45 to 47 methods. Both members exist at the pinned `minimumCodexVersion` floor of 0.153.4, so
+the adoption needed no floor bump. The generated wire contract is camelCase (`limitId`,
+`usedPercent`, `normalModelSlug`), and `AccountRateLimitsUpdatedNotification` carries a single
+`rateLimits` bucket rather than a multi-bucket map. Fields that are required by their own schema but
+sit under an optional parent — `primary.usedPercent`, `credits.hasCredits`, `individualLimit.*` —
+are `conditional` in the gate's vocabulary, not `required`.
+
+**Known coverage gap: two newer fields are deliberately undeclared.** `ordinaryUsageAllowed`
+(response level) and `normalModelSlug` (bucket level) were added in Codex 0.155.1 and do **not**
+exist at the 0.153.4 floor. RPCE reads both when present.
+
+They are not in the contract because the gate cannot express "validate this path only when the
+schema declares it". `PRESENCE_VALUES` is `{required, optional, conditional}`, and all three assert
+that the path *is* declared: `consumed_path_errors` and the response-path loop both emit a hard
+error (`is no longer declared` / `does not declare it`) when `analyze_path` reports
+`declared == False`. Declaring either field today would therefore fail the gate at its own floor.
+
+Closing the gap properly means a new contract key (for example `conditionalResponse`) plus a fourth
+validation branch, matching updates to the fail-closed key allowlist and `validate_contract`, and
+new fake-CLI self-tests. That is a change to the gate framework itself, not to this feature's
+projection, so it is intentionally out of scope here.
+
+Consequence to carry forward: **these two fields currently have no drift protection.** If upstream
+renames or retypes them, the gate stays green and only RPCE's mapper tests
+(`CodexProviderQuotaMapperTests`, which assert both the floor-shaped payload where they are absent
+and the 0.155.1-shaped payload where they are present and typed) would notice. This is a real
+limitation, not silent coverage. **At the next floor bump to >= 0.155.1, declare both paths in the
+contract and delete this exemption** — at that point they become ordinary optional/nullable paths
+and need no framework change.
+
 ## Files and tests
 
 - `Scripts/check_codex_app_server_schema.py` generates and validates the bundle.

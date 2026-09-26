@@ -1483,6 +1483,20 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
     }
 
+    /// Opt-in, observe-only Codex account usage/quota display.
+    ///
+    /// Defaults to `false` in production. While disabled, no quota app-server client,
+    /// process, subscription, or polling is created.
+    func codexUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexUsageQuotaEnabled ?? false
+    }
+
+    func setCodexUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexUsageQuotaEnabled = enabled
+        }
+    }
+
     func globalCodexHookApprovalStrictModeEnabled() -> Bool {
         scalarPreferences.agentMode?.codexHookApprovalStrictModeEnabled ?? false
     }
