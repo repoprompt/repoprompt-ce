@@ -240,6 +240,46 @@ import XCTest
             XCTAssertEqual(snapshot.primaryRoots, [])
         }
 
+        /// Pins the isolation boundary behind the future Prompt Experiment `ContextBuilderHarness`:
+        /// a hidden, never-activated ephemeral workspace cannot obtain file-tool authority without
+        /// switching the user's active workspace (MCP reports `workspace_authority_superseded`).
+        /// Isolated Context Builder evaluation must therefore use headless `repoprompt-mcp` over a
+        /// per-evaluation snapshot rather than the window's workspace authority.
+        @MainActor
+        func testHiddenInactiveEphemeralWorkspaceCannotObtainFileToolRootCatalog() async throws {
+            let isolatedRoot = try makeTemporaryRoot(name: "IsolatedExperiment")
+            let source = WorkspaceModel(name: "Source", repoPaths: [])
+            let userWorkspace = WorkspaceModel(name: "User", repoPaths: [])
+            let manager = makeManager(workspaces: [source, userWorkspace], active: source)
+            let switched = await manager.switchWorkspace(to: userWorkspace, saveState: false, reason: "hidden-experiment-test")
+            XCTAssertTrue(switched.didSwitch)
+
+            let hidden = WorkspaceModel(
+                name: "Prompt Experiment",
+                repoPaths: [isolatedRoot.path],
+                ephemeralFlag: true,
+                isHiddenInMenus: true,
+                isSavedWorkspace: false
+            )
+            manager.workspaces.append(hidden)
+
+            do {
+                _ = try await manager.awaitWorkspaceRootCatalogSnapshot(workspaceID: hidden.id, timeout: .seconds(1))
+                XCTFail("A hidden inactive workspace must not publish a file-tool root catalog")
+            } catch let error as WorkspaceRootCatalogSnapshotError {
+                XCTAssertEqual(error, .workspaceNotActive)
+                let failure = MCPServerViewModel.fileToolAuthorityFailure(for: error)
+                XCTAssertEqual(failure, .superseded)
+                XCTAssertEqual(failure.errorCode, "workspace_authority_superseded")
+            }
+            XCTAssertEqual(manager.activeWorkspaceID, userWorkspace.id, "The user's active workspace must not be switched")
+            let userSnapshot = try await manager.awaitWorkspaceRootCatalogSnapshot(
+                workspaceID: userWorkspace.id,
+                timeout: .seconds(1)
+            )
+            XCTAssertEqual(userSnapshot.workspaceID, userWorkspace.id)
+        }
+
         @MainActor
         private func makeManager(
             workspaces: [WorkspaceModel],
