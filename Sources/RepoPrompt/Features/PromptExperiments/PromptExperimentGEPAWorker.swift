@@ -34,8 +34,12 @@
             /// Cumulative GEPA search cap (approved total minus the held-out reserve).
             let searchMaxEvaluations: Int
             /// Search admissions the host ledger still allows when this run starts; every
-            /// evaluation reply refreshes it for the worker's iteration-boundary stopper.
-            var searchRemaining: Int?
+            /// evaluation reply refreshes it for the worker's iteration-boundary stopper. Required:
+            /// the worker refuses to start without it.
+            let searchRemaining: Int
+            /// The seed's recorded answer length per visible case (ledger replicate 0), so
+            /// brevity keeps its real reference on a resume that never re-evaluates the seed.
+            var seedOutputCharacters: [String: Int]?
             /// The seed's held-out baseline from calibration; the reserve then scores only the incumbent.
             var heldOutBaseline: HeldOutScores?
             let reflectionMinibatchSize: Int
@@ -61,6 +65,7 @@
                 case heldOutExamples = "held_out_examples"
                 case searchMaxEvaluations = "search_max_evaluations"
                 case searchRemaining = "search_remaining"
+                case seedOutputCharacters = "seed_output_characters"
                 case heldOutBaseline = "held_out_baseline"
                 case reflectionMinibatchSize = "reflection_minibatch_size"
                 case useMerge = "use_merge"

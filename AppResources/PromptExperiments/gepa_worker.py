@@ -599,11 +599,18 @@ def main() -> int:
         if search_max_evaluations < 1:
             raise InfrastructureFailure("search evaluation budget must be positive")
         initial_remaining = body.get("search_remaining")
-        state = RunState(
-            search_remaining=initial_remaining
-            if isinstance(initial_remaining, int) and not isinstance(initial_remaining, bool) and initial_remaining >= 0
-            else search_max_evaluations
-        )
+        if not isinstance(initial_remaining, int) or isinstance(initial_remaining, bool) or initial_remaining < 0:
+            # Without the ledger's count the stopper could start an iteration the ledger
+            # cannot fund (e.g. on resume), losing that proposal mid-way. Fail fast.
+            raise InfrastructureFailure("run request is missing the host ledger's search_remaining")
+        state = RunState(search_remaining=initial_remaining)
+        supplied_lengths = body.get("seed_output_characters")
+        if isinstance(supplied_lengths, dict):
+            # The seed's recorded answer lengths from the ledger, so brevity keeps its real
+            # per-case reference on a resume that never re-evaluates the seed.
+            for case_id, length in supplied_lengths.items():
+                if isinstance(length, int) and not isinstance(length, bool) and length >= 0:
+                    state.seed_output_characters[str(case_id)] = length
         objective = str(body["objective"])
         background = str(body.get("background") or "")
         seed_candidate = body.get("seed_candidate")

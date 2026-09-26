@@ -547,7 +547,9 @@ import XCTest
                 .init(id: "h1", split: "hidden_test", input: "hidden input", expected: "SECRET_EXPECTED")
             ], maxEvaluations: 6)
             let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
-            let request = GEPARunController.makeWorkerRequest(execution: execution, runRoot: URL(fileURLWithPath: "/tmp/run"))
+            let request = GEPARunController.makeWorkerRequest(execution: execution, runRoot: URL(fileURLWithPath: "/tmp/run"), searchRemaining: 5)
+            XCTAssertEqual(request.searchRemaining, 5)
+            XCTAssertNil(request.seedOutputCharacters, "omitted when nothing is recorded")
             XCTAssertEqual(request.examples.map(\.id), ["t1", "v1"])
             XCTAssertEqual(request.heldOutExamples.map(\.id), ["h1"])
             XCTAssertEqual(request.searchMaxEvaluations, 5, "the held-out reserve (1 per hidden case, incumbent only) is excluded")
@@ -625,7 +627,7 @@ import XCTest
             let result = try await controller.wait(for: submit(controller, experiment: experiment))
             XCTAssertEqual(result.disposition, .completed)
             XCTAssertNil(worker.request?.heldOutBaseline)
-            let key = try GEPARunController.resolveExecution(experiment, registry: registry).calibrationKey
+            let key = try GEPARunController.resolveExecution(experiment, registry: registry).calibrationKey(registry: registry)
             XCTAssertNil(PromptExperimentCalibrationCache.load(storeRoot: root, key: key), "a failed calibration is never cached")
         }
 
@@ -735,12 +737,20 @@ import XCTest
                 reflection: PromptExperimentTestFixtures.reflection,
                 judge: PromptExperimentTestFixtures.judge
             )
-            func key(seed: String = "s", suite: String = "u", rubric: String? = "r", targets: PromptExperimentTargets = targets) -> String {
-                PromptExperimentCalibrationCache.key(promptID: .oraclePlan, seedSHA256: seed, suiteSHA256: suite, rubricSHA256: rubric, targets: targets)
+            func key(
+                seed: String = "s", suite: String = "u", rubric: String? = "r", targets: PromptExperimentTargets = targets,
+                retries: Int = 2, judgeTemplate: String? = "j"
+            ) -> String {
+                PromptExperimentCalibrationCache.key(
+                    promptID: .oraclePlan, renderedSeedSHA256: seed, suiteSHA256: suite, rubricSHA256: rubric, targets: targets,
+                    maxProviderRetries: retries, judgeTemplateSHA256: judgeTemplate
+                )
             }
             let base = key()
             XCTAssertEqual(base, key(), "deterministic")
-            XCTAssertNotEqual(base, key(seed: "t"))
+            XCTAssertNotEqual(base, key(seed: "t"), "rendered seed bytes, including code-owned suffixes")
+            XCTAssertNotEqual(base, key(retries: 0), "retries decide which measurements complete")
+            XCTAssertNotEqual(base, key(judgeTemplate: "k"), "the code-owned judge prompt shapes scores")
             XCTAssertNotEqual(base, key(suite: "v"))
             XCTAssertNotEqual(base, key(rubric: nil))
             XCTAssertNotEqual(base, key(targets: .init(execution: targets.reflection, reflection: targets.reflection, judge: targets.judge)))
@@ -749,6 +759,79 @@ import XCTest
                 base,
                 key(targets: .init(execution: targets.execution, reflection: PromptExperimentTestFixtures.judge, judge: targets.judge)),
                 "the reflection model never influences seed measurements"
+            )
+        }
+
+        func testExecutionCalibrationKeyDigestsTheRenderedSeedAndScoringSettings() throws {
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: makeRoot())
+            let zero = try GEPARunController.resolveExecution(
+                PromptExperimentTestFixtures.makeExperiment(registry: registry, maxProviderRetries: 0), registry: registry
+            )
+            let one = try GEPARunController.resolveExecution(
+                PromptExperimentTestFixtures.makeExperiment(registry: registry, maxProviderRetries: 1), registry: registry
+            )
+            let rendered = try ConnectedModelHarness.renderSystemPrompt(candidate: zero.baseline, promptID: .oraclePlan, registry: registry)
+            XCTAssertNotEqual(rendered, zero.baseline, "the key covers the code-owned response-format suffix, not just the resource")
+            XCTAssertEqual(try zero.calibrationKey(registry: registry), PromptExperimentCalibrationCache.key(
+                promptID: .oraclePlan,
+                renderedSeedSHA256: Self.sha(rendered),
+                suiteSHA256: zero.suite.suiteSHA256,
+                rubricSHA256: nil,
+                targets: zero.targets,
+                maxProviderRetries: 0,
+                judgeTemplateSHA256: nil
+            ))
+            XCTAssertNotEqual(try zero.calibrationKey(registry: registry), try one.calibrationKey(registry: registry))
+        }
+
+        func testResumeSendsTheSeedsRecordedAnswerLengthsAndTheLedgerRemaining() async throws {
+            let root = try makeRoot()
+            let (experiment, registry) = try makeExperiment(maxEvaluations: 6)
+            let completer = FakeCompleter()
+            completer.handler = { _, _, user in user.contains("validation") ? "good" : "bad answer" }
+            let first = FakeWorker { host, event in
+                try await Self.register(event, 0, "seed prompt", score: 1)
+                _ = await host(Self.evaluate("seed prompt", "v1", .validation))
+                _ = await host(Self.evaluate("seed prompt", "t1"))
+                return Self.terminal([("seed prompt", [], 1)], best: 0)
+            }
+            let second = FakeWorker { _, event in
+                try await Self.register(event, 0, "seed prompt", score: 1)
+                return Self.terminal([("seed prompt", [], 1)], best: 0)
+            }
+            let controller = makeController(root: root, registry: registry, completer: completer, workers: [first, second])
+            _ = try await controller.wait(for: submit(controller, experiment: experiment))
+            XCTAssertNil(first.request?.seedOutputCharacters, "nothing recorded before the first run")
+            XCTAssertEqual(first.request?.searchRemaining, 6)
+            _ = try await controller.wait(for: submit(controller, experiment: experiment))
+            XCTAssertEqual(second.request?.seedOutputCharacters, ["v1": 4, "t1": 10])
+            XCTAssertEqual(second.request?.searchRemaining, 4, "the resumed worker starts from the ledger's count")
+        }
+
+        func testSeedAnswerLengthsPreferGEPAsOwnPassOverReplicates() throws {
+            let directory = try makeRoot()
+            let ledger = try PromptExperimentBudgetLedger.open(
+                directory: directory, authorityDigest: "d", totalCap: 4, heldOutReserve: 1, calibrationReserve: 2,
+                gepaStateURL: directory.appendingPathComponent("gepa-run/gepa_state.bin")
+            )
+            func record(_ candidate: String, _ example: String, _ split: PromptExperimentDatasetSplit, replicate: Int, pool: PromptExperimentBudgetLedger.Pool?, characters: Int) throws {
+                guard case let .admitted(entry) = try ledger.admit(
+                    candidateSHA256: candidate, exampleID: example, split: split, replicate: replicate, pool: pool
+                ) else { return XCTFail("expected an admission") }
+                try ledger.settle(entry.evaluationID, outcome: .init(
+                    score: 1, proposerFeedback: "", outputExcerpt: nil, failureKind: nil,
+                    usage: .init(promptCharacters: 1, outputCharacters: characters, promptTokens: nil, completionTokens: nil)
+                ))
+            }
+            try record("seed", "v1", .validation, replicate: 1, pool: .calibration, characters: 90)
+            try record("seed", "v1", .validation, replicate: 0, pool: nil, characters: 40)
+            try record("seed", "v2", .validation, replicate: 2, pool: .calibration, characters: 70)
+            try record("seed", "h1", .hiddenTest, replicate: 0, pool: nil, characters: 5)
+            try record("other", "v3", .validation, replicate: 0, pool: nil, characters: 1)
+            XCTAssertEqual(
+                GEPARunController.seedOutputCharacters(seedSHA256: "seed", ledger: ledger),
+                ["v1": 40, "v2": 70],
+                "replicate 0 wins, replicates fill gaps, held-out and other candidates never leak"
             )
         }
 

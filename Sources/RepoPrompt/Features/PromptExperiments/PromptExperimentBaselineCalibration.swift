@@ -175,32 +175,43 @@
         static let directoryName = "calibration"
 
         private struct KeyMaterial: Encodable {
-            let namespace = "baseline-calibration-v1"
+            let namespace = "baseline-calibration-v2"
             let promptID: String
-            let seedSHA256: String
+            /// SHA-256 of the fully rendered seed system prompt (resource plus code-owned suffixes).
+            let renderedSeedSHA256: String
             let suiteSHA256: String
             let rubricSHA256: String?
             let execution: String
             let judge: String?
+            /// Which transient failures complete as scores rather than unavailable evidence.
+            let maxProviderRetries: Int
+            /// SHA-256 of the code-owned judge prompt template (nil without a model judge).
+            let judgeTemplateSHA256: String?
+            /// Format repairs per judged evaluation.
+            let judgeRepairs = 1
         }
 
         static func key(
             promptID: BuiltInPromptID,
-            seedSHA256: String,
+            renderedSeedSHA256: String,
             suiteSHA256: String,
             rubricSHA256: String?,
-            targets: PromptExperimentTargets
+            targets: PromptExperimentTargets,
+            maxProviderRetries: Int,
+            judgeTemplateSHA256: String?
         ) -> String {
             let material = KeyMaterial(
                 promptID: promptID.rawValue,
-                seedSHA256: seedSHA256,
+                renderedSeedSHA256: renderedSeedSHA256,
                 suiteSHA256: suiteSHA256,
                 rubricSHA256: rubricSHA256,
                 execution: targets.execution.canonicalSelectionID,
-                judge: targets.judge?.canonicalSelectionID
+                judge: targets.judge?.canonicalSelectionID,
+                maxProviderRetries: maxProviderRetries,
+                judgeTemplateSHA256: judgeTemplateSHA256
             )
             return (try? PromptExperimentDigest.canonicalSHA256(material))
-                ?? PromptExperimentDigest.sha256(Data("\(promptID.rawValue):\(seedSHA256):\(suiteSHA256)".utf8))
+                ?? PromptExperimentDigest.sha256(Data("\(promptID.rawValue):\(renderedSeedSHA256):\(suiteSHA256):\(maxProviderRetries)".utf8))
         }
 
         static func url(storeRoot: URL, key: String) -> URL {

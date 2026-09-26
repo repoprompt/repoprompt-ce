@@ -19,13 +19,26 @@
             PromptExperimentDigest.sha256(Data(baseline.utf8))
         }
 
-        var calibrationKey: String {
-            PromptExperimentCalibrationCache.key(
+        /// Keys the cross-experiment calibration cache by everything that shapes a seed score:
+        /// the exact system-prompt bytes the target receives (resource plus code-owned
+        /// suffixes), suite and rubric, execution and judge models, provider retries, and the
+        /// code-owned judge prompt template.
+        @MainActor
+        func calibrationKey(registry: BuiltInPromptRegistry) throws -> String {
+            let rendered = try ConnectedModelHarness.renderSystemPrompt(candidate: baseline, promptID: promptID, registry: registry)
+            let judgeTemplate: String? = suite.grader.kind == .modelJudge
+                ? PromptExperimentDigest.sha256(Data(PromptExperimentChecklist.judgePrompt(
+                    guidance: "", checks: [], packagedInput: "", reference: nil, output: ""
+                ).utf8))
+                : nil
+            return PromptExperimentCalibrationCache.key(
                 promptID: promptID,
-                seedSHA256: baselineSHA256,
+                renderedSeedSHA256: PromptExperimentDigest.sha256(Data(rendered.utf8)),
                 suiteSHA256: suite.suiteSHA256,
                 rubricSHA256: suite.grader.rubric?.sha256,
-                targets: targets
+                targets: targets,
+                maxProviderRetries: settings.maxProviderRetries,
+                judgeTemplateSHA256: judgeTemplate
             )
         }
     }
@@ -196,8 +209,9 @@
         static func makeWorkerRequest(
             execution: PromptExperimentExecution,
             runRoot: URL,
-            searchRemaining: Int? = nil,
-            heldOutBaseline: [String: Double]? = nil
+            searchRemaining: Int,
+            heldOutBaseline: [String: Double]? = nil,
+            seedOutputCharacters: [String: Int] = [:]
         ) -> GEPAWorkerProtocol.RunRequest {
             /// Only identifiers, splits, and development inputs cross to the worker; held-out
             /// inputs, expected outputs, and rubrics stay host-side.
@@ -216,6 +230,7 @@
                 searchMaxEvaluations: execution.maxEvaluations
                     - PromptExperimentBudgetLedger.heldOutReserve(for: execution.suite.cases),
                 searchRemaining: searchRemaining,
+                seedOutputCharacters: seedOutputCharacters.isEmpty ? nil : seedOutputCharacters,
                 heldOutBaseline: heldOutBaseline.flatMap { scores in
                     scores.isEmpty ? nil : GEPAWorkerProtocol.HeldOutScores(
                         scores: scores,
@@ -343,7 +358,8 @@
                         execution: execution,
                         runRoot: runRoot,
                         searchRemaining: ledger.remaining(in: .search),
-                        heldOutBaseline: run.calibration.heldOutScores
+                        heldOutBaseline: run.calibration.heldOutScores,
+                        seedOutputCharacters: Self.seedOutputCharacters(seedSHA256: execution.baselineSHA256, ledger: ledger)
                     )
                     let completion = try await worker.run(
                         request: workerRequest,
@@ -542,7 +558,7 @@
             guard !hidden.isEmpty || replicatesWanted > 0 else {
                 return CalibrationResult(heldOutScores: nil, source: nil)
             }
-            let key = execution.calibrationKey
+            let key = try execution.calibrationKey(registry: environment.registry)
             let seedSHA256 = execution.baselineSHA256
             let cached = PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key)
             var heldOut = cached.flatMap { $0.hasHeldOutBaseline(for: cases) ? $0.heldOutScores : nil }
@@ -777,6 +793,20 @@
                 bestHeldOut: terminal.heldOut?.best?.scores,
                 bestIsBaseline: texts[best] == seed
             )
+        }
+
+        /// The seed's recorded answer length per visible case, preferring GEPA's own pass
+        /// (replicate 0) over calibration replicates, for the worker's brevity reference.
+        static func seedOutputCharacters(seedSHA256: String, ledger: PromptExperimentBudgetLedger) -> [String: Int] {
+            var lengths: [String: (replicate: Int, characters: Int)] = [:]
+            for entry in ledger.document.entries
+                where entry.candidateSHA256 == seedSHA256 && entry.state == .completed && entry.split != .hiddenTest
+            {
+                guard let characters = entry.outcome?.usage?.outputCharacters else { continue }
+                if let existing = lengths[entry.exampleID], existing.replicate <= entry.replicate { continue }
+                lengths[entry.exampleID] = (entry.replicate, characters)
+            }
+            return lengths.mapValues(\.characters)
         }
 
         /// Averages over every completed evaluation of this exact text on visible splits

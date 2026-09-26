@@ -203,6 +203,8 @@ def run_worker(
                 # Most scenarios propose texts longer than their short seed; the ceiling
                 # itself is exercised by dedicated tests.
                 "prompt_character_ceiling_ratio": 100.0,
+                # The host always sends the ledger's count; evaluation replies refresh it.
+                "search_remaining": search_max_evaluations,
                 **(extra or {}),
             },
         }) + "\n")
@@ -535,6 +537,30 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertIn("Objective scores (higher is better): brevity 0.500, quality 0.000", prompt)
         self.assertIn("answer length 100 characters", prompt)
         self.assertNotIn("_prompt_characters", prompt)
+
+    def test_missing_search_remaining_fails_fast_before_any_evaluation(self) -> None:
+        for value in (None, -1, "7", True):
+            root = self.root / f"missing-{value}"
+            root.mkdir()
+            host = FakeHost(reflect=always("x"), score=exact("x"))
+            terminal, messages, code, stderr = run_worker(root, host, extra={"search_remaining": value})
+            self.assertEqual(terminal["type"], "failed", (value, stderr))
+            self.assertEqual(terminal["diagnostic"]["exception_type"], "InfrastructureFailure")
+            self.assertEqual(host.operations, [], "no evaluation or reflection before the check")
+
+    def test_supplied_seed_answer_lengths_are_the_brevity_reference(self) -> None:
+        # The ledger recorded a 200-character seed answer; this process sees it at 100.
+        # With the supplied reference the seed's answer brevity is 1.0 (half the reference),
+        # not the 0.5 a self-referenced length would give.
+        host = FakeHost(
+            reflect=always("improved candidate"), score=exact("improved candidate"),
+            output_characters=lambda candidate: 100,
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, extra={"seed_output_characters": {"example-1": 200, "bad": "x"}},
+        )
+        self.assert_completed(terminal, code, stderr)
+        self.assertIn("brevity 0.750, quality 0.000", host.reflect_prompts[0])
 
     def test_completion_reports_paired_per_case_validation_scores(self) -> None:
         host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"))
