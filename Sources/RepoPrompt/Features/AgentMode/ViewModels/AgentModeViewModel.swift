@@ -10593,6 +10593,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             signalsDeliveryAfterDispatch = false
         }
         let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
+        let submittedAutoEffortAudit = delivery == .startedRun
+            ? autoEffortChoice?.audit
+            : autoEffortChoice?.audit.discardedAfterMCPReclassification()
 
         let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
             ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -10622,7 +10625,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFilesToSend: [],
                         activeWorkflow: nativePreparedTurn.bubbleWorkflow,
                         nativePreparedTurn: nativePreparedTurn,
-                        codexAttemptID: codexAttemptID
+                        codexAttemptID: codexAttemptID,
+                        autoEffortAudit: submittedAutoEffortAudit
                     )
                 }
                 return submitUserTurn(
@@ -10630,7 +10634,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: session.tabID,
                     codexAttemptID: codexAttemptID,
                     autoEffortSelection: submittedAutoEffortSelection,
-                    autoEffortAudit: delivery == .startedRun ? autoEffortChoice?.audit : nil
+                    autoEffortAudit: submittedAutoEffortAudit
                 )
             }
             switch submission {

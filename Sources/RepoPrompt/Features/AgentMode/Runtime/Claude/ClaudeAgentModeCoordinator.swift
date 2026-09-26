@@ -1332,11 +1332,15 @@ final class ClaudeAgentModeCoordinator {
                 }
                 let turnID = try await controller.sendUserMessage(providerBoundText)
                 if let auditTurnID {
+                    let acceptedAutoEffortRaw = appliedAutoEffortByTabID[session.tabID].flatMap { applied in
+                        applied.controllerID == controllerID && applied.effort == autoEffort
+                            ? applied.effort.rawValue : nil
+                    }
                     session.updateAutomationAudit(turnID: auditTurnID) {
-                        $0.providerTurnAccepted = true
-                        if $0.router.decision == .selected {
-                            $0.router.application = .turnAccepted
-                        }
+                        $0.recordClaudeTurnAccepted(
+                            autoEffortRaw: acceptedAutoEffortRaw,
+                            manualEffortRaw: manualEffort.rawValue
+                        )
                     }
                     hostCapabilities.scheduleSave(session)
                 }

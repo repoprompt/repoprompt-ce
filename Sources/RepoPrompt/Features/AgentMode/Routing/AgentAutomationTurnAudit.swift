@@ -34,16 +34,34 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
         /// A judged choice was replaced by a deterministic/manual fallback, including effort-only fallback.
         var fallbackApplied = false
         var application: Application = .notObserved
+
+        func discardedAfterMCPReclassification() -> Self {
+            var result = self
+            if result.decision == .selected {
+                result.fallbackApplied = true
+                result.application = .fallbackToManual
+            }
+            return result
+        }
+    }
+
+    enum CodexDelivery: String, Codable {
+        case start
+        case steer
+        case queuedFallback
+        case fallbackStart
+        case managedAuthReplay
     }
 
     static let retainedTurnLimit = 128
 
-    var schemaVersion = 1
+    var schemaVersion = 2
     let turnID: UUID
     let createdAt: Date
     var router: Feature
     var autoEffort: Feature
-    /// Selection at local turn acceptance, not a provider-effective configuration.
+    /// Local selection, updated with the physical effort argument when a provider accepts a start.
+    /// This is never proof of effective effort or billing.
     var acceptedProviderRaw: String?
     var acceptedModelRaw: String?
     var acceptedEffortRaw: String?
@@ -51,6 +69,50 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
     var providerDispatchAttempted = false
     /// The provider accepted the user turn. This is not an effective-effort or billing receipt.
     var providerTurnAccepted = false
+    /// Codex's last observed delivery path. A queued fallback is local durability, not provider acceptance.
+    var codexDelivery: CodexDelivery?
+
+    mutating func recordCodexQueuedFallback() {
+        codexDelivery = .queuedFallback
+    }
+
+    mutating func recordCodexDispatch(_ delivery: CodexDelivery) {
+        codexDelivery = delivery
+        providerDispatchAttempted = true
+    }
+
+    mutating func recordCodexStartAccepted(effortRaw: String?, autoEffortApplied: Bool) {
+        providerTurnAccepted = true
+        acceptedEffortRaw = effortRaw
+        if router.decision == .selected {
+            router.application = .turnAccepted
+        }
+        if autoEffort.decision == .selected {
+            autoEffort.application = autoEffortApplied ? .turnAccepted : .fallbackToManual
+            autoEffort.fallbackApplied = !autoEffortApplied
+        }
+    }
+
+    mutating func recordCodexSteerAccepted() {
+        // A steer accepts content into an existing turn; it does not apply a new model selection.
+        providerTurnAccepted = true
+    }
+
+    mutating func recordClaudeTurnAccepted(autoEffortRaw: String?, manualEffortRaw: String) {
+        providerTurnAccepted = true
+        acceptedEffortRaw = autoEffortRaw ?? manualEffortRaw
+        if router.decision == .selected {
+            router.application = .turnAccepted
+        }
+        if autoEffort.decision == .selected {
+            if autoEffortRaw != nil, autoEffort.application == .controlAccepted {
+                autoEffort.application = .turnAccepted
+            } else {
+                autoEffort.application = .fallbackToManual
+                autoEffort.fallbackApplied = true
+            }
+        }
+    }
 
     static func retain(_ records: [Self]) -> [Self] {
         Array(records.suffix(retainedTurnLimit))
