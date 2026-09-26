@@ -227,6 +227,9 @@ template, actual, app_name, display_name, bundle_id, version, build, identity_mi
 text = Path(template).read_text(encoding="utf-8")
 for key, value in {
     "__APP_NAME__": app_name,
+    "__BUNDLE_NAME__": display_name,
+    "__EXECUTABLE_NAME__": app_name,
+    "__ICON_NAME__": "AppIcon",
     "__DISPLAY_NAME__": display_name,
     "__BUNDLE_ID__": bundle_id,
     "__MARKETING_VERSION__": version,
