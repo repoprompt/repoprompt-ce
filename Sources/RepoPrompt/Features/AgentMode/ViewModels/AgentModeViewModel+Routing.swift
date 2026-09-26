@@ -181,7 +181,7 @@ extension AgentModeViewModel {
         }
         let candidates = stagedResult.candidates
         let outcome = stagedResult.outcome
-        let routedAudit = AgentAutomationTurnAudit.Feature(
+        var routedAudit = AgentAutomationTurnAudit.Feature(
             configured: true,
             eligible: true,
             judgmentRequested: stagedResult.judgmentRequested,
@@ -221,6 +221,8 @@ extension AgentModeViewModel {
                     routerAudit: fallbackAudit
                 )
             }
+            routedAudit.chosenModelRaw = selected.target.modelRaw
+            routedAudit.chosenEffortRaw = selected.target.reasoningEffortRaw
             guard composerSubmitClaimIsCurrent(claim),
                   sessions[destinationTabID] === session,
                   modelRouterSettingsStore.modelRouterConfiguration().revision == configuration.revision,
@@ -388,7 +390,10 @@ extension AgentModeViewModel {
                 manualEffortRaw: manualEffortRaw,
                 effortRaw: chosen
             ),
-            .init(configured: true, eligible: true, judgmentRequested: true, decision: .selected)
+            .init(
+                configured: true, eligible: true, judgmentRequested: true, decision: .selected,
+                chosenModelRaw: modelRaw, chosenEffortRaw: chosen
+            )
         )
     }
 

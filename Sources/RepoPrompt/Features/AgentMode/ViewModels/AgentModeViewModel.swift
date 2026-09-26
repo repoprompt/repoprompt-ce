@@ -16695,7 +16695,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 turnID: userItem.id,
                 createdAt: userItem.timestamp,
                 router: routerAudit ?? defaultRouterAudit,
-                autoEffort: autoEffortAudit ?? defaultAutoAudit
+                autoEffort: autoEffortAudit ?? defaultAutoAudit,
+                acceptedProviderRaw: session.selectedAgent.rawValue,
+                acceptedModelRaw: session.selectedModelRaw,
+                acceptedEffortRaw: session.selectedReasoningEffortRaw
             )
         )
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)

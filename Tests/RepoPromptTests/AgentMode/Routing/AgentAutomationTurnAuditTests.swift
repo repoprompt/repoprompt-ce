@@ -13,9 +13,14 @@ final class AgentAutomationTurnAuditTests: XCTestCase {
                 eligible: true,
                 judgmentRequested: true,
                 decision: .selected,
+                chosenModelRaw: "gpt-6-sol",
+                chosenEffortRaw: "medium",
                 application: .turnAccepted
             ),
             autoEffort: .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled),
+            acceptedProviderRaw: "codexExec",
+            acceptedModelRaw: "gpt-6-sol",
+            acceptedEffortRaw: "low",
             providerTurnAccepted: true
         )
         let usage = AgentTokenUsagePersist(turnID: turnID, promptTokens: 12, completionTokens: 3)
@@ -27,6 +32,8 @@ final class AgentAutomationTurnAuditTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.automationTurnAudit, [audit])
+        XCTAssertEqual(decoded.automationTurnAudit.first?.router.chosenEffortRaw, "medium")
+        XCTAssertEqual(decoded.automationTurnAudit.first?.acceptedEffortRaw, "low")
         XCTAssertEqual(decoded.providerTokenUsageByTurn.first?.turnID, turnID)
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("promptExcerpt"))
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("providerEffective"))

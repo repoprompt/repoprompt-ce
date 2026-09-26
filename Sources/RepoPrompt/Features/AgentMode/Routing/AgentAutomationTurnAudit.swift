@@ -28,6 +28,9 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
         var eligible: Bool
         var judgmentRequested: Bool
         var decision: Decision
+        /// Non-content Jev choice, not proof of what the provider used.
+        var chosenModelRaw: String?
+        var chosenEffortRaw: String?
         /// A judged choice was replaced by a deterministic/manual fallback, including effort-only fallback.
         var fallbackApplied = false
         var application: Application = .notObserved
@@ -40,6 +43,10 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
     let createdAt: Date
     var router: Feature
     var autoEffort: Feature
+    /// Selection at local turn acceptance, not a provider-effective configuration.
+    var acceptedProviderRaw: String?
+    var acceptedModelRaw: String?
+    var acceptedEffortRaw: String?
     /// A physical provider send was attempted; a later acceptance is recorded separately.
     var providerDispatchAttempted = false
     /// The provider accepted the user turn. This is not an effective-effort or billing receipt.
