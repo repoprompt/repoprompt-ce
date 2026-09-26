@@ -3,14 +3,31 @@
     import SwiftUI
 
     /// App-wide library of experiments: authority, approval, runs, evidence, and proposals.
+    ///
+    /// Presented as a sheet from the in-session tool card, or standalone in its own window
+    /// (Window ▸ Prompt Experiments…) so experiments created by external MCP/CLI clients can
+    /// be reviewed and approved without an Agent Mode transcript.
     struct PromptExperimentStudioView: View {
         @ObservedObject var service: PromptExperimentService
         var initialSelection: UUID?
+        /// Sheets need an explicit Close button; the standalone window uses its title bar.
+        var showsCloseButton = true
         @Environment(\.dismiss) private var dismiss
         @State private var selectedExperimentID: UUID?
 
         private var sortedExperiments: [PromptExperiment] {
             service.experiments.sorted { $0.updatedAt > $1.updatedAt }
+        }
+
+        /// Experiments with an outstanding approval request, newest request first.
+        private var awaitingApproval: [PromptExperiment] {
+            service.experiments
+                .filter { $0.status == .awaitingApproval }
+                .sorted { ($0.approvalRequest?.requestedAt ?? $0.updatedAt) > ($1.approvalRequest?.requestedAt ?? $1.updatedAt) }
+        }
+
+        private var otherExperiments: [PromptExperiment] {
+            sortedExperiments.filter { $0.status != .awaitingApproval }
         }
 
         var body: some View {
@@ -28,13 +45,26 @@
                     if let projectionError = service.projectionError {
                         Label(projectionError, systemImage: "doc.badge.gearshape").font(.caption).foregroundStyle(.orange)
                     }
-                    ForEach(sortedExperiments) { experiment in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(experiment.title).lineLimit(1)
-                            Text("\(experiment.status.rawValue) · \(experiment.authority.promptID.rawValue)")
-                                .font(.caption).foregroundStyle(.secondary)
+                    if !awaitingApproval.isEmpty {
+                        Section {
+                            ForEach(awaitingApproval) { experiment in
+                                PromptExperimentAwaitingApprovalRow(experiment: experiment)
+                                    .tag(experiment.id)
+                            }
+                        } header: {
+                            Label("Awaiting approval (\(awaitingApproval.count))", systemImage: "exclamationmark.circle.fill")
+                                .foregroundStyle(.orange)
                         }
-                        .tag(experiment.id)
+                    }
+                    Section(awaitingApproval.isEmpty ? "Experiments" : "Other experiments") {
+                        ForEach(otherExperiments) { experiment in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(experiment.title).lineLimit(1)
+                                Text("\(experiment.status.rawValue) · \(experiment.authority.promptID.rawValue)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            .tag(experiment.id)
+                        }
                     }
                 }
                 .navigationTitle("Prompt Experiments")
@@ -51,14 +81,47 @@
             }
             .frame(minWidth: 920, minHeight: 650)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+                if showsCloseButton {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Close") { dismiss() }
+                    }
                 }
             }
             .task {
                 await service.load()
                 if selectedExperimentID == nil {
-                    selectedExperimentID = initialSelection ?? sortedExperiments.first?.id
+                    selectedExperimentID = initialSelection ?? awaitingApproval.first?.id ?? sortedExperiments.first?.id
+                }
+            }
+            .onChange(of: initialSelection) { _, newSelection in
+                // The standalone window is reused; retargeting it selects the requested experiment.
+                if let newSelection { selectedExperimentID = newSelection }
+            }
+            .onChange(of: awaitingApproval.map(\.id)) { oldIDs, newIDs in
+                // Surface a newly requested approval when nothing is selected yet.
+                if let selectedExperimentID, service.experiment(id: selectedExperimentID) != nil { return }
+                if let newID = newIDs.first(where: { !oldIDs.contains($0) }) ?? newIDs.first {
+                    selectedExperimentID = newID
+                }
+            }
+        }
+    }
+
+    /// Sidebar row for an experiment whose approval was requested but not yet decided.
+    private struct PromptExperimentAwaitingApprovalRow: View {
+        let experiment: PromptExperiment
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+                    Text(experiment.title).lineLimit(1).fontWeight(.semibold)
+                }
+                Text("\(experiment.authority.promptID.rawValue) · cap \(experiment.authority.maxEvaluations) evaluations")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let requestedAt = experiment.approvalRequest?.requestedAt {
+                    Text("Requested \(requestedAt, style: .relative) ago")
+                        .font(.caption2).foregroundStyle(.orange)
                 }
             }
         }
@@ -87,7 +150,10 @@
                             .padding(.horizontal, 8).padding(.vertical, 3)
                             .background(Color.pink.opacity(0.15), in: Capsule())
                     }
-                    GroupBox("Approved authority") {
+                    if experiment.status == .awaitingApproval {
+                        PromptExperimentApprovalRequestCallout(experiment: experiment)
+                    }
+                    GroupBox(experiment.status == .awaitingApproval ? "Requested authority" : "Approved authority") {
                         PromptExperimentAuthorityPanel(experiment: experiment)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -177,6 +243,33 @@
                     PromptExperimentProposalReviewView(service: service, experimentID: experiment.id, proposalID: selectedProposalID)
                 }
             }
+        }
+    }
+
+    /// Prominent banner for an outstanding approval request.
+    private struct PromptExperimentApprovalRequestCallout: View {
+        let experiment: PromptExperiment
+
+        var body: some View {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.title3)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Approval requested").font(.headline)
+                    if let requestedAt = experiment.approvalRequest?.requestedAt {
+                        Text("Requested \(requestedAt.formatted(date: .abbreviated, time: .standard)) by an agent or MCP client.")
+                            .font(.caption)
+                    }
+                    Text("Review the requested authority below, then approve up to \(experiment.authority.maxEvaluations) evaluations or decline under Approval and runs.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.orange.opacity(0.4)))
         }
     }
 #endif

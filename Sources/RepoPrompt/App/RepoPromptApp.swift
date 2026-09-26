@@ -176,6 +176,11 @@ struct RepoPromptSwiftUIApp: App {
                 HelpMenu()
                     .environmentObject(versionManager)
             }
+
+            #if DEBUG
+                // Window ▸ Prompt Experiments… (DEBUG-only lab)
+                PromptExperimentCommands()
+            #endif
         }
     }
 }

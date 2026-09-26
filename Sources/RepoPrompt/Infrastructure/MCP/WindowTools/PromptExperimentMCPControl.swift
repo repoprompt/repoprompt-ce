@@ -317,7 +317,7 @@
                 ]),
                 "notes": .array([
                     "Experiments optimize a built-in prompt against its checked-in suite. Targets must be prompt-only (no tools).",
-                    "request_approval shows a native card; only the user can approve. Approval covers the whole max_evaluations cap and starts the first run.",
+                    "request_approval shows a native card (in Agent Mode) and a pending entry in Window ▸ Prompt Experiments… (⌥⌘E); only the user can approve. Approval covers the whole max_evaluations cap and starts the first run.",
                     "run resumes an approved experiment within its remaining cap. Changing any authority field creates a new experiment that needs its own approval.",
                     "status_or_wait with experiment_id blocks until the approval or run state changes, or timeout_seconds elapses.",
                     "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff."
@@ -337,8 +337,8 @@
 
         static func nextAction(_ experiment: PromptExperiment) -> String {
             switch experiment.status {
-            case .unapproved: "request_approval, then tell the user to review the native card"
-            case .awaitingApproval: "status_or_wait until the user approves or declines in the native card"
+            case .unapproved: "request_approval, then tell the user to review the native card or Window ▸ Prompt Experiments… (⌥⌘E)"
+            case .awaitingApproval: "status_or_wait until the user approves or declines in the native card or Window ▸ Prompt Experiments… (⌥⌘E)"
             case .approved: "run"
             case .running: "status_or_wait"
             case .completed, .stoppedBudget:
