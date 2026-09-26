@@ -19,6 +19,9 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         .devin
     }
 
+    // Devin advertises complete model-and-effort variants as model choices; it deliberately does
+    // not opt into ACP's separate parameter picker.
+
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }

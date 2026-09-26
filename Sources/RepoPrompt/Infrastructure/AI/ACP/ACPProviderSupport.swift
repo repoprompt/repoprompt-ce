@@ -627,10 +627,27 @@ enum ACPPermissionOptionPolicy {
     /// Option IDs that must never be selected by an automatic or fallback path.
     /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
     /// bare kind match would otherwise select it and broaden approval beyond the request.
+    /// Devin's `switch_*`/`plan_*` options re-flag the running process's permission mode
+    /// mid-session — selecting one would drift the controller's launch-mode reuse key — and
+    /// the `*_global`/`all_fetches`/server-wide/`net_*_always` options grant beyond the
+    /// pending call's session scope. The explicit IDs document today's vocabulary; the
+    /// pattern rules in `isAutoSelectable` cover unlisted variants like `switch_smart`.
     static func denylistedAutoSelectOptionIDs(for providerID: ACPProviderID) -> Set<String> {
         switch providerID {
-        case .openCode, .cursor, .antigravity, .devin:
+        case .openCode, .cursor, .antigravity:
             []
+        case .devin:
+            [
+                "switch_bypass",
+                "switch_accept_edits",
+                "plan_normal",
+                "plan_accept_edits",
+                "plan_bypass",
+                "allow_always_global",
+                "allow_all_fetches",
+                "allow_server_always",
+                "net_allow_always"
+            ]
         case .grokBuild:
             ["enable-always-approve"]
         }
@@ -638,6 +655,29 @@ enum ACPPermissionOptionPolicy {
 
     static func isAutoSelectable(optionID: String?, for providerID: ACPProviderID) -> Bool {
         guard let normalized = normalizedOptionValue(optionID) else { return false }
-        return !denylistedAutoSelectOptionIDs(for: providerID).contains(normalized)
+        if denylistedAutoSelectOptionIDs(for: providerID).contains(normalized) { return false }
+        if providerID == .devin {
+            // Devin's option namespace is open-ended: `switch_*`/`plan_*` re-flag the
+            // running process's permission mode (drifting the launch-mode reuse key), and
+            // `*_global`/`*_always` grants persist beyond the pending call's session
+            // scope. `allow_always` itself stays selectable — it is Devin's tiered
+            // per-tool always-grant and remains a valid explicit user decision, though
+            // session-scoped decisions exclude it via `exceedsSessionScope`.
+            if normalized.hasPrefix("switch_") || normalized.hasPrefix("plan_") {
+                return false
+            }
+            if normalized.hasSuffix("_global") { return false }
+            if normalized != "allow_always", normalized.hasSuffix("_always") { return false }
+        }
+        return true
+    }
+
+    /// Options a session-scoped decision must not fall back to: the grant persists beyond
+    /// the session the decision was scoped to. Devin's `allow_always` is a persistent
+    /// per-tool grant a tier above `allow_session`; every broader Devin option is already
+    /// non-selectable outright, so this is the only residual widening case.
+    static func exceedsSessionScope(optionID: String?, for providerID: ACPProviderID) -> Bool {
+        guard providerID == .devin else { return false }
+        return normalizedOptionValue(optionID) == "allow_always"
     }
 }

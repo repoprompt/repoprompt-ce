@@ -403,40 +403,45 @@ extension MCPServerViewModel {
         }
 
         func contains(clientName: String, windowID: Int, runID: UUID) -> Bool {
-            storage[clientName]?[windowID]?[runID] != nil
+            guard let clientKey = MCPClientIdentity.storageKey(clientName) else { return false }
+            return storage[clientKey]?[windowID]?[runID] != nil
         }
 
         func contains(clientName: String, runID: UUID) -> Bool {
-            storage[clientName]?.values.contains { $0[runID] != nil } == true
+            guard let clientKey = MCPClientIdentity.storageKey(clientName) else { return false }
+            return storage[clientKey]?.values.contains { $0[runID] != nil } == true
         }
 
         @discardableResult
         mutating func enqueueReplacing(_ context: TabContextSnapshot, clientName: String, windowID: Int) -> Int {
+            // Launch hints and initialize-time names must share the same identity key.
+            guard let clientKey = MCPClientIdentity.storageKey(clientName) else { return 0 }
             guard let runID = context.runID else { return queueLength(clientName: clientName, windowID: windowID) }
 
             // Keep exactly one pending entry per run for a client. If the run is reinstalled
             // for a different window/tab before a socket claims it, the newest exact run
             // context wins deterministically instead of leaving FIFO order to decide.
-            if var windowMap = storage[clientName] {
+            if var windowMap = storage[clientKey] {
                 for existingWindowID in Array(windowMap.keys) {
                     windowMap[existingWindowID]?.removeValue(forKey: runID)
                     if windowMap[existingWindowID]?.isEmpty == true {
                         windowMap.removeValue(forKey: existingWindowID)
                     }
                 }
-                storage[clientName] = windowMap.isEmpty ? nil : windowMap
+                storage[clientKey] = windowMap.isEmpty ? nil : windowMap
             }
 
-            var windowMap = storage[clientName] ?? [:]
+            var windowMap = storage[clientKey] ?? [:]
             var runMap = windowMap[windowID] ?? [:]
             runMap[runID] = context
             windowMap[windowID] = runMap
-            storage[clientName] = windowMap
+            storage[clientKey] = windowMap
             return runMap.count
         }
 
         mutating func pop(clientName: String, windowID: Int, runID: UUID) -> (context: TabContextSnapshot?, remaining: Int) {
-            guard var windowMap = storage[clientName],
+            guard let clientKey = MCPClientIdentity.storageKey(clientName),
+                  var windowMap = storage[clientKey],
                   var runMap = windowMap[windowID]
             else {
                 return (nil, 0)
@@ -449,15 +454,17 @@ extension MCPServerViewModel {
                 windowMap[windowID] = runMap
             }
             if windowMap.isEmpty {
-                storage.removeValue(forKey: clientName)
+                storage.removeValue(forKey: clientKey)
             } else {
-                storage[clientName] = windowMap
+                storage[clientKey] = windowMap
             }
             return (context, runMap.count)
         }
 
         mutating func popByRunID(clientName: String, runID: UUID) -> (context: TabContextSnapshot?, windowID: Int?, remaining: Int) {
-            guard var windowMap = storage[clientName] else {
+            guard let clientKey = MCPClientIdentity.storageKey(clientName),
+                  var windowMap = storage[clientKey]
+            else {
                 return (nil, nil, 0)
             }
 
@@ -471,9 +478,9 @@ extension MCPServerViewModel {
                     windowMap[windowID] = runMap
                 }
                 if windowMap.isEmpty {
-                    storage.removeValue(forKey: clientName)
+                    storage.removeValue(forKey: clientKey)
                 } else {
-                    storage[clientName] = windowMap
+                    storage[clientKey] = windowMap
                 }
                 return (context, windowID, runMap.count)
             }
@@ -482,23 +489,27 @@ extension MCPServerViewModel {
         }
 
         func queueLength(clientName: String, windowID: Int) -> Int {
-            storage[clientName]?[windowID]?.count ?? 0
+            guard let clientKey = MCPClientIdentity.storageKey(clientName) else { return 0 }
+            return storage[clientKey]?[windowID]?.count ?? 0
         }
 
         mutating func clear(clientName: String) {
-            storage.removeValue(forKey: clientName)
+            guard let clientKey = MCPClientIdentity.storageKey(clientName) else { return }
+            storage.removeValue(forKey: clientKey)
         }
 
         /// Clear only one window queue for a given client.
         @discardableResult
         mutating func clear(clientName: String, windowID: Int) -> Int {
-            guard var windowMap = storage[clientName] else { return 0 }
+            guard let clientKey = MCPClientIdentity.storageKey(clientName),
+                  var windowMap = storage[clientKey]
+            else { return 0 }
             let removed = windowMap[windowID]?.count ?? 0
             windowMap.removeValue(forKey: windowID)
             if windowMap.isEmpty {
-                storage.removeValue(forKey: clientName)
+                storage.removeValue(forKey: clientKey)
             } else {
-                storage[clientName] = windowMap
+                storage[clientKey] = windowMap
             }
             return removed
         }

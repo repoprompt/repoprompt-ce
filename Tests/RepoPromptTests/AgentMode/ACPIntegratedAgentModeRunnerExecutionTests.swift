@@ -145,6 +145,15 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testDevinCombinedModelVariantIsAppliedBeforePrompt() throws {
+        let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
+            agentKind: .devin,
+            modelString: "swe-2-max"
+        )
+
+        XCTAssertEqual(model, "swe-2-max")
+    }
+
     func testCursorKnownModelPassesReleaseCatalogValidationBeforePrompt() throws {
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,

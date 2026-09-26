@@ -22,9 +22,8 @@ extension AgentModeViewModel {
         selections: [ACPModelParameterSelection]
     ) throws -> MCPModelParameterSelectionStagingRollback? {
         guard !selections.isEmpty else { return nil }
-        // Any ACP provider derived from the resolved agent may carry model parameters (Cursor,
-        // OpenCode). Deriving the agent here, rather than hardcoding Cursor, keeps the same
-        // guard, revision capture, and rollback contract for every ACP provider.
+        // Derive the provider from the selected agent. Final capability validation below uses
+        // the shared provider predicate rather than treating every ACP provider as parameterized.
         guard let agentRaw,
               let agent = AgentProviderKind(rawValue: agentRaw),
               agent.acpProviderID != nil,
@@ -143,13 +142,13 @@ extension AgentModeViewModel {
         selections: [ACPModelParameterSelection]
     ) throws {
         guard !selections.isEmpty else { return }
-        // One concept — which providers may carry model parameters — one answer: ACP providers
-        // (Cursor, OpenCode). Derive the provider from the selected agent and use the
-        // provider-aware canonicalisation rather than a hardcoded Cursor identity. A non-ACP
-        // agent is still rejected, and selections must match the selected provider AND model.
-        guard let providerID = selectedAgent.acpProviderID else {
+        // Parameter support is provider-specific, not a property of ACP itself. Devin encodes
+        // effort in its model variants, so it has no separate parameter channel.
+        guard let providerID = selectedAgent.acpProviderID,
+              ACPModelParameterResolver.supportsModelParameters(providerID)
+        else {
             throw MCPError.invalidParams(
-                "Model parameters are supported only for ACP providers; cannot apply them to \(selectedAgent.displayName)."
+                AgentMCPModelParameterSupport.unsupportedModelParametersMessage(for: selectedAgent)
             )
         }
         let selectedModelIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(

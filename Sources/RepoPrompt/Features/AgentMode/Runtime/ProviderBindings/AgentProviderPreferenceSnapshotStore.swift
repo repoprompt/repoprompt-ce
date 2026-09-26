@@ -156,11 +156,28 @@ final class AgentProviderPreferenceSnapshotStore {
             )
         case .devin:
             let level = effectiveDevinPermissionLevel(profile: profile)
-            // Devin's level becomes a launch-time `--permission-mode` argument. RepoPrompt
-            // does not auto-select Devin permission options, so the auto-approval flags stay
-            // false for every mode.
+            // The level is carried as an ACP session mode, not by the launch flag. Devin's
+            // `acp` subcommand does not consume `--permission-mode`: a session launched as
+            // `devin --permission-mode dangerous acp` reports `mode.currentValue ==
+            // "accept-edits"`, byte-identical to launching with no flag, so Full Approval
+            // never took effect. The flag is still passed for two reasons that do not depend
+            // on the agent acting on it: the one-shot CLI validates it, and it is load-bearing
+            // in the controller reuse key. Whether any path actually honours it is not
+            // established here -- placement and validation are separate from efficacy.
+            //
+            // A level change forces a fresh controller, because each level maps to a distinct
+            // `cliPermissionMode` in that reuse key, and the new level's mode is sent on that
+            // run. It does NOT follow that every level change takes effect: a level mapping to
+            // nil sends no mode, so a session resumed through `session/load` keeps whatever
+            // mode it already had -- including a `bypass` this provider set on an earlier run.
+            //
+            // Full Approval still settles a stranded pending prompt with the provider's
+            // session-scoped allow. Strict per-request auto-approval of RepoPrompt MCP tools
+            // is handled inside the session controller, not here.
             return AgentProviderRuntimePermissionBinding(
-                acpLaunchPermissionMode: level.cliPermissionMode
+                acpLaunchPermissionMode: level.cliPermissionMode,
+                acpSessionModeID: level.sessionModeID,
+                acceptsPendingACPApprovalWhenActivated: level == .fullApproval
             )
         }
     }

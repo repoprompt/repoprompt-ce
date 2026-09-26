@@ -57,6 +57,28 @@ final class DevinPermissionLevelTests: XCTestCase {
         }
     }
 
+    func testDevinUsesCombinedModelVariantsInsteadOfModelParameters() {
+        let selection = ACPModelParameterSelection(
+            providerID: .devin,
+            baseModelRaw: "swe-2-max",
+            kind: .thinking,
+            configID: "effort",
+            valueRaw: "max"
+        )
+
+        XCTAssertFalse(ACPModelParameterResolver.supportsModelParameters(.devin))
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .devin, selectedModelRaw: "swe-2-max"))
+        XCTAssertEqual(
+            ACPModelParameterResolver.effectiveSelections(
+                providerID: .devin,
+                selectedModelRaw: "swe-2-max",
+                persistedSelections: [selection]
+            ),
+            []
+        )
+        XCTAssertFalse(DevinACPAgentProvider(config: DevinAgentConfig()).supportsParameterizedModelPicker)
+    }
+
     // MARK: - Provider binding identity
 
     func testPermissionLevelIDExposesAllFiveDevinOptions() {
@@ -80,6 +102,155 @@ final class DevinPermissionLevelTests: XCTestCase {
     }
 
     // MARK: - Snapshot store
+
+    /// Devin's `acp` subcommand does not consume the top-level `--permission-mode` flag.
+    /// Probing the installed CLI 3000.11.1 directly, `devin --permission-mode dangerous acp`
+    /// reports `mode.currentValue == "accept-edits"` — byte-identical to `devin acp` with no
+    /// flag — so Full Approval never reached the agent. The level has to travel as an ACP
+    /// session mode, the way every other ACP provider already sends it.
+    @MainActor
+    func testFullApprovalCarriesTheBypassSessionModeBecauseTheLaunchFlagIsIgnored() throws {
+        let (store, _) = try makeStore(
+            securePermissions: AgentPermissionSecureStore(
+                secureStrings: DevinPermissionFakeSecureStringStore(),
+                notificationCenter: NotificationCenter()
+            )
+        )
+
+        store.setPermissionLevel(.devin(.fullApproval))
+        let binding = store.runtimePermission(for: .devin, profile: .userConfigured)
+
+        XCTAssertEqual(
+            binding.acpSessionModeID,
+            "bypass",
+            "Full Approval must be carried over ACP; the launch flag is ignored by `devin acp`."
+        )
+        // The flag is still emitted because the one-shot CLI path does honour it.
+        XCTAssertEqual(binding.acpLaunchPermissionMode, "dangerous")
+    }
+
+    @MainActor
+    func testSessionModeIsOnlySentForLevelsDevinActuallyAdvertises() throws {
+        let (store, _) = try makeStore(
+            securePermissions: AgentPermissionSecureStore(
+                secureStrings: DevinPermissionFakeSecureStringStore(),
+                notificationCenter: NotificationCenter()
+            )
+        )
+
+        // Devin can advertise different subsets by host/account/policy. These are the only
+        // explicit mappings RepoPrompt may request; the controller checks live availability.
+        store.setPermissionLevel(.devin(.acceptEdits))
+        XCTAssertEqual(store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID, "accept-edits")
+        store.setPermissionLevel(.devin(.smart))
+        XCTAssertEqual(store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID, "smart")
+
+        // Negative twins: there is no `normal`/`auto` member in that vocabulary, so these stay
+        // nil rather than being mapped to a guess that would silently change the level.
+        store.setPermissionLevel(.devin(.normal))
+        XCTAssertNil(store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID)
+        store.setPermissionLevel(.devin(.providerDefault))
+        XCTAssertNil(store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID)
+    }
+
+    /// The Safe Managed floor must not be escalated by the new mode channel.
+    @MainActor
+    func testManagedProfilesDoNotReceiveTheBypassSessionMode() throws {
+        let (store, _) = try makeStore(
+            securePermissions: AgentPermissionSecureStore(
+                secureStrings: DevinPermissionFakeSecureStringStore(),
+                notificationCenter: NotificationCenter()
+            )
+        )
+        store.setPermissionLevel(.devin(.fullApproval))
+
+        for profile in [
+            AgentProviderPermissionProfile.mcpSafeDefaults,
+            .providerOverride(.grokBuild(.fullAccess))
+        ] {
+            let binding = store.runtimePermission(for: .devin, profile: profile)
+            // The managed floor is Normal, which has no ACP mode equivalent, so nothing is
+            // sent. Asserting nil rather than "not bypass" states what is actually true --
+            // "not bypass" would also pass for any other mapping.
+            XCTAssertNil(
+                binding.acpSessionModeID,
+                "A managed profile must never inherit Full Approval's bypass mode."
+            )
+        }
+    }
+
+    /// Pinned at the request boundary, not the enum: an unattended Full Approval run must
+    /// carry the ACP session mode, because the launch flag it previously relied on is inert
+    /// for `devin acp`. Without this, headless Full Approval silently ran at the default
+    /// while `approvalPolicy: .declineUnsupported` failed the run on the first prompt.
+    func testHeadlessFullApprovalCarriesTheBypassSessionModeOnTheRunRequest() {
+        let request = DevinACPHeadlessAgentProvider.makeRunRequest(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: true),
+            workspacePath: "/tmp/ws",
+            message: AgentMessage(userMessage: "hi"),
+            configuredPermissionLevel: .fullApproval
+        )
+        XCTAssertEqual(request.sessionModeID, "bypass")
+        // The inert flag is still carried: it remains load-bearing for the controller reuse key.
+        XCTAssertEqual(request.launchPermissionMode, "dangerous")
+    }
+
+    func testHeadlessKeepsTheFloorForEveryLevelBelowFullApproval() {
+        for level: DevinAgentToolPreferences.PermissionLevel in [.providerDefault, .normal, .acceptEdits, .smart] {
+            let request = DevinACPHeadlessAgentProvider.makeRunRequest(
+                config: DevinAgentConfig(includeRepoPromptMCPServer: true),
+                workspacePath: "/tmp/ws",
+                message: AgentMessage(userMessage: "hi"),
+                configuredPermissionLevel: level
+            )
+            XCTAssertNil(
+                request.sessionModeID,
+                "\(level) must not escalate an unattended run."
+            )
+            XCTAssertEqual(request.launchPermissionMode, "auto")
+        }
+    }
+
+    /// Model discovery and any other run without the RepoPrompt MCP server must carry neither
+    /// carrier, so a discovery probe can never escalate.
+    func testHeadlessSendsNoModeWhenTheRepoPromptServerIsNotInjected() {
+        let request = DevinACPHeadlessAgentProvider.makeRunRequest(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: false),
+            workspacePath: "/tmp/ws",
+            message: AgentMessage(userMessage: "hi"),
+            configuredPermissionLevel: .fullApproval
+        )
+        XCTAssertNil(request.sessionModeID)
+        XCTAssertNil(request.launchPermissionMode)
+    }
+
+    /// KNOWN GAP, pinned deliberately rather than fixed.
+    ///
+    /// A session already placed in `bypass` retains it when a later run loads it: verified
+    /// against the real CLI 3000.11.1 -- `session/load` under both Normal-equivalent launch
+    /// forms reported `mode.currentValue == "bypass"`. Because `normal`/`providerDefault` map
+    /// to nil, a downgrade sends no reset, so the escalation survives the downgrade.
+    ///
+    /// This test pins the CURRENT behaviour so the gap cannot be closed accidentally without a
+    /// decision: the remedy requires choosing a value to reset to, and Devin's config-option
+    /// channel silently ignores `normal`/`auto`, so there may be no such value.
+    @MainActor
+    func testDowngradeSendsNoResetWhichIsWhyAResumedSessionKeepsBypass() throws {
+        let (store, _) = try makeStore(
+            securePermissions: AgentPermissionSecureStore(
+                secureStrings: DevinPermissionFakeSecureStringStore(),
+                notificationCenter: NotificationCenter()
+            )
+        )
+        store.setPermissionLevel(.devin(.fullApproval))
+        XCTAssertEqual(store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID, "bypass")
+
+        store.setPermissionLevel(.devin(.normal))
+        XCTAssertNil(
+            store.runtimePermission(for: .devin, profile: .userConfigured).acpSessionModeID,
+            "Downgrade sends no reset, so a resumed session keeps bypass (known gap)."
+        )
+    }
 
     @MainActor
     func testRuntimeBindingCarriesTheLaunchPermissionModeForEachProfile() throws {
@@ -107,12 +278,18 @@ final class DevinPermissionLevelTests: XCTestCase {
         let override = store.runtimePermission(for: .devin, profile: .providerOverride(.devin(.fullApproval)))
         XCTAssertEqual(override.acpLaunchPermissionMode, "dangerous")
 
-        // RepoPrompt never answers Devin's own permission requests, whatever the mode is.
+        // RepoPrompt never blanket-approves Devin's permission requests; Full Approval
+        // only settles a prompt that is already pending when the level escalates.
         for binding in [configured, override] {
             XCTAssertFalse(binding.autoApproveAllACPToolPermissions)
-            XCTAssertFalse(binding.acceptsPendingACPApprovalWhenActivated)
-            XCTAssertNil(binding.acpSessionModeID)
         }
+        // The level now also travels as an ACP session mode. This assertion previously
+        // required it to be nil, which encoded the assumption that `--permission-mode`
+        // carried the level -- an assumption the `acp` subcommand does not honour.
+        XCTAssertEqual(configured.acpSessionModeID, "accept-edits")
+        XCTAssertEqual(override.acpSessionModeID, "bypass")
+        XCTAssertFalse(configured.acceptsPendingACPApprovalWhenActivated)
+        XCTAssertTrue(override.acceptsPendingACPApprovalWhenActivated)
     }
 
     @MainActor
@@ -383,6 +560,19 @@ final class DevinPermissionLevelTests: XCTestCase {
                 "-p"
             ]
         )
+        XCTAssertEqual(
+            DevinCLIProvider.test_arguments(
+                modelName: nil,
+                promptFilePath: "/tmp/prompt.md",
+                permissionMode: "dangerous"
+            ),
+            [
+                "--respect-workspace-trust", "false",
+                "--permission-mode", "dangerous",
+                "--prompt-file", "/tmp/prompt.md",
+                "-p"
+            ]
+        )
     }
 
     func testOracleOneShotPromptRequestsOnePlainAnswerWithoutTools() {
@@ -428,21 +618,35 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertFalse(ACPAIModelCatalog.devinModelsFromStore().contains(.devinCustom(name: "default")))
     }
 
-    func testHeadlessMCPRunPinsAutoWhileOracleKeepsProviderDefault() {
+    func testHeadlessRunUsesTheAutoFloorUnlessFullApprovalIsConfigured() {
         let message = AgentMessage(systemPrompt: "system", userMessage: "prompt")
-        let headless = DevinACPHeadlessAgentProvider.makeRunRequest(
-            config: DevinAgentConfig(includeRepoPromptMCPServer: true),
-            workspacePath: "/tmp/workspace",
-            message: message
-        )
-        let oracle = DevinACPHeadlessAgentProvider.makeRunRequest(
-            config: DevinAgentConfig(includeRepoPromptMCPServer: false),
-            workspacePath: nil,
-            message: message
-        )
+        func request(
+            includeMCP: Bool,
+            level: Level
+        ) -> ACPRunRequest {
+            DevinACPHeadlessAgentProvider.makeRunRequest(
+                config: DevinAgentConfig(includeRepoPromptMCPServer: includeMCP),
+                workspacePath: includeMCP ? "/tmp/workspace" : nil,
+                message: message,
+                configuredPermissionLevel: level
+            )
+        }
 
-        XCTAssertEqual(headless.launchPermissionMode, "auto")
-        XCTAssertNil(oracle.launchPermissionMode)
+        for level in Level.allCases where level != .fullApproval {
+            XCTAssertEqual(
+                request(includeMCP: true, level: level).launchPermissionMode,
+                "auto",
+                "\(level) must not escalate an unattended run past the managed floor"
+            )
+        }
+        XCTAssertEqual(
+            request(includeMCP: true, level: .fullApproval).launchPermissionMode,
+            "dangerous"
+        )
+        // Model discovery injects no MCP server and keeps the provider default even
+        // under Full Approval.
+        XCTAssertNil(request(includeMCP: false, level: .fullApproval).launchPermissionMode)
+        XCTAssertNil(request(includeMCP: false, level: .normal).launchPermissionMode)
         XCTAssertTrue(AgentModelCatalog.AgentSelectionSurface.headless.allows(.devin))
         XCTAssertTrue(
             AgentRuntimeProviderService.shared.makeProvider(
@@ -451,6 +655,278 @@ final class DevinPermissionLevelTests: XCTestCase {
                 workspacePath: "/tmp/workspace"
             ) is DevinACPHeadlessAgentProvider
         )
+    }
+
+    // MARK: - Permission options
+
+    func testUnattendedModeOnlyEscalatesOnFullApproval() {
+        for level in Level.allCases {
+            XCTAssertEqual(
+                level.unattendedCLIPermissionMode,
+                level == .fullApproval ? "dangerous" : "auto",
+                "unexpected unattended mode for \(level)"
+            )
+        }
+    }
+
+    @MainActor
+    func testUnattendedLaunchPermissionModeReadsTheConfiguredLevel() throws {
+        let secureStrings = DevinPermissionFakeSecureStringStore()
+        let secureStore = AgentPermissionSecureStore(
+            secureStrings: secureStrings,
+            notificationCenter: NotificationCenter()
+        )
+        let suiteName = "DevinPermissionLevelTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(
+            DevinAgentToolPreferences.unattendedLaunchPermissionMode(
+                defaults: defaults,
+                secureStore: secureStore
+            ),
+            "auto"
+        )
+        secureStore.setDevinPermissionLevel(.smart)
+        XCTAssertEqual(
+            DevinAgentToolPreferences.unattendedLaunchPermissionMode(
+                defaults: defaults,
+                secureStore: secureStore
+            ),
+            "auto",
+            "smart still presumes a person answers residual prompts, so unattended stays auto"
+        )
+        secureStore.setDevinPermissionLevel(.fullApproval)
+        XCTAssertEqual(
+            DevinAgentToolPreferences.unattendedLaunchPermissionMode(
+                defaults: defaults,
+                secureStore: secureStore
+            ),
+            "dangerous"
+        )
+    }
+
+    func testDevinModeSwitchingAndGlobalOptionsAreNeverAutoSelectable() {
+        for optionID in [
+            "switch_bypass",
+            "switch_accept_edits",
+            "plan_normal",
+            "plan_accept_edits",
+            "plan_bypass",
+            "allow_always_global",
+            "allow_all_fetches",
+            "allow_server_always",
+            "net_allow_always",
+            // Unlisted variants the pattern rules must catch so a new Devin mode or
+            // global grant cannot silently become selectable.
+            "switch_smart",
+            "switch_auto",
+            "plan_smart",
+            "allow_tools_global",
+            "net_grant_always"
+        ] {
+            XCTAssertFalse(
+                ACPPermissionOptionPolicy.isAutoSelectable(optionID: optionID, for: .devin),
+                "\(optionID) escapes the pending request's scope and must stay user-decided"
+            )
+        }
+        for optionID in [
+            "allow_once",
+            "allow_session",
+            "allow_always",
+            "allow_server_session",
+            "net_allow_once",
+            "net_allow_session",
+            "reject_once"
+        ] {
+            XCTAssertTrue(
+                ACPPermissionOptionPolicy.isAutoSelectable(optionID: optionID, for: .devin),
+                "\(optionID) should remain selectable"
+            )
+        }
+    }
+
+    func testStrictRepoPromptAutoApprovalPicksAllowOnceForDevin() async throws {
+        let workspace = try makeTestDirectory(name: "DevinAutoApprovalTests")
+        let controller = try ACPAgentSessionController(
+            provider: ReuseKeyFakeDevinProvider(),
+            runRequest: makeRequest(workspacePath: workspace.path, launchPermissionMode: "auto")
+        )
+        // Mirrors a Devin session/request_permission payload for an injected MCP tool:
+        // the broadening options sit next to `allow_once` in the advertised list.
+        let options: [(optionID: String, kind: String)] = [
+            ("allow_once", "allow_once"),
+            ("allow_session", "allow_always"),
+            ("allow_always", "allow_always"),
+            ("allow_always_global", "allow_always"),
+            ("switch_bypass", "allow_always"),
+            ("reject_once", "reject_once")
+        ]
+        let payload: [String: Any] = [
+            "toolCall": [
+                "title": "RepoPromptCE: read_file",
+                "rawInput": ["server_name": "RepoPromptCE", "tool_name": "read_file"]
+            ],
+            "title": "RepoPromptCE: read_file"
+        ]
+
+        let selected = await controller.test_autoApprovalOptionID(
+            requestToolName: "RepoPromptCE: read_file",
+            requestPayload: payload,
+            options: options
+        )
+        XCTAssertEqual(selected, "allow_once")
+
+        let prefixed = await controller.test_autoApprovalOptionID(
+            requestToolName: "mcp__RepoPromptCE__apply_edits",
+            requestPayload: ["toolCall": ["title": "mcp__RepoPromptCE__apply_edits"]],
+            options: options
+        )
+        XCTAssertEqual(prefixed, "allow_once")
+
+        await controller.shutdown()
+    }
+
+    func testStrictRepoPromptAutoApprovalNeverPicksABroadeningOptionForDevin() async throws {
+        let workspace = try makeTestDirectory(name: "DevinAutoApprovalFloorTests")
+        let controller = try ACPAgentSessionController(
+            provider: ReuseKeyFakeDevinProvider(),
+            runRequest: makeRequest(workspacePath: workspace.path, launchPermissionMode: "auto")
+        )
+        let payload: [String: Any] = [
+            "toolCall": [
+                "title": "RepoPromptCE: read_file",
+                "rawInput": ["server_name": "RepoPromptCE", "tool_name": "read_file"]
+            ]
+        ]
+        // Without an allow-once option the request must surface rather than widening
+        // to a session/global/mode-switch grant.
+        let selected = await controller.test_autoApprovalOptionID(
+            requestToolName: "RepoPromptCE: read_file",
+            requestPayload: payload,
+            options: [
+                ("allow_session", "allow_always"),
+                ("allow_always_global", "allow_always"),
+                ("switch_bypass", "allow_always"),
+                ("reject_once", "reject_once")
+            ]
+        )
+        XCTAssertNil(selected)
+
+        // A denylisted ID stays unselectable even when it carries the allow-once kind
+        // the strict path prefers — the same failure mode as Grok's
+        // `enable-always-approve` typing. Without denylist enforcement inside the
+        // selector, `kind("allow_once")` would match `switch_bypass` here.
+        let disguised = await controller.test_autoApprovalOptionID(
+            requestToolName: "RepoPromptCE: read_file",
+            requestPayload: payload,
+            options: [
+                ("switch_bypass", "allow_once"),
+                ("reject_once", "reject_once")
+            ]
+        )
+        XCTAssertNil(disguised)
+
+        let disguisedAlongsideLegitimate = await controller.test_autoApprovalOptionID(
+            requestToolName: "RepoPromptCE: read_file",
+            requestPayload: payload,
+            options: [
+                ("switch_bypass", "allow_once"),
+                ("allow_once", "allow_once"),
+                ("reject_once", "reject_once")
+            ]
+        )
+        XCTAssertEqual(disguisedAlongsideLegitimate, "allow_once")
+        await controller.shutdown()
+    }
+
+    func testNonRepoPromptRequestsAreNotAutoApprovedForDevin() async throws {
+        let workspace = try makeTestDirectory(name: "DevinAutoApprovalNegativeTests")
+        let controller = try ACPAgentSessionController(
+            provider: ReuseKeyFakeDevinProvider(),
+            runRequest: makeRequest(workspacePath: workspace.path, launchPermissionMode: "auto")
+        )
+        let options: [(optionID: String, kind: String)] = [
+            ("allow_once", "allow_once"),
+            ("reject_once", "reject_once")
+        ]
+
+        let foreignTool = await controller.test_autoApprovalOptionID(
+            requestToolName: "Write /tmp/out.txt",
+            requestPayload: ["toolCall": ["title": "Write /tmp/out.txt"]],
+            options: options
+        )
+        XCTAssertNil(foreignTool)
+
+        // A bare known tool name without a server prefix or server identifier is not
+        // enough evidence — a generic dispatcher title must not auto-approve.
+        let uncorroborated = await controller.test_autoApprovalOptionID(
+            requestToolName: "read_file",
+            requestPayload: ["toolCall": ["title": "read_file"]],
+            options: options
+        )
+        XCTAssertNil(uncorroborated)
+
+        await controller.shutdown()
+    }
+
+    func testDevinSessionDecisionPrefersSessionGrantAndSkipsModeSwitches() async throws {
+        let workspace = try makeTestDirectory(name: "DevinSessionDecisionTests")
+        let controller = try ACPAgentSessionController(
+            provider: ReuseKeyFakeDevinProvider(),
+            runRequest: makeRequest(workspacePath: workspace.path, launchPermissionMode: "auto")
+        )
+        let options: [(optionID: String, kind: String)] = [
+            ("allow_once", "allow_once"),
+            ("allow_session", "allow_always"),
+            ("allow_always", "allow_always"),
+            ("switch_bypass", "allow_always"),
+            ("reject_once", "reject_once")
+        ]
+
+        let once = await controller.test_preferredAllowOptionID(options: options, sessionScoped: false)
+        let session = await controller.test_preferredAllowOptionID(options: options, sessionScoped: true)
+        XCTAssertEqual(once, "allow_once")
+        XCTAssertEqual(session, "allow_session")
+
+        // When `allow_session` is absent a session-scoped decision falls back to the
+        // per-request grant — never the persistent `allow_always` tier above it.
+        let withoutSessionGrant = await controller.test_preferredAllowOptionID(
+            options: [
+                ("allow_once", "allow_once"),
+                ("allow_always", "allow_always"),
+                ("reject_once", "reject_once")
+            ],
+            sessionScoped: true
+        )
+        XCTAssertEqual(withoutSessionGrant, "allow_once")
+
+        // Denylisted options can never be the selection. With only a mode switch and a
+        // reject on offer, no selectable allow remains: the decision responds
+        // `cancelled` rather than submitting the opposite of what was decided.
+        let narrowed = await controller.test_preferredAllowOptionID(
+            options: [("switch_bypass", "allow_always"), ("reject_once", "reject_once")],
+            sessionScoped: true
+        )
+        XCTAssertNil(narrowed)
+
+        // A session-scoped decision with only the persistent grant on offer likewise
+        // cancels rather than widening past the session it was scoped to.
+        let persistentOnly = await controller.test_preferredAllowOptionID(
+            options: [("allow_always", "allow_always"), ("reject_once", "reject_once")],
+            sessionScoped: true
+        )
+        XCTAssertNil(persistentOnly)
+
+        // A plain (non-session) accept still selects the only allow option offered.
+        let persistentOnlyPlainAccept = await controller.test_preferredAllowOptionID(
+            options: [("allow_always", "allow_always"), ("reject_once", "reject_once")],
+            sessionScoped: false
+        )
+        XCTAssertEqual(persistentOnlyPlainAccept, "allow_always")
+
+        await controller.shutdown()
     }
 
     // MARK: - Controller reuse key

@@ -239,12 +239,33 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
-            case .grokBuild, .devin:
-                // These providers take their permission level as a launch-time CLI flag
-                // (`--always-approve` / `--permission-mode`); it applies to newly launched
-                // processes and never mutates a running controller. The next run builds a
-                // fresh controller because `isCompatibleWith` keys on that flag.
+            case .grokBuild:
+                // Grok takes its permission level as a launch-time CLI flag
+                // (`--always-approve`); it applies to newly launched processes and never
+                // mutates a running controller. The next run builds a fresh controller
+                // because `isCompatibleWith` keys on that flag.
                 break
+            case .devin:
+                // Devin's level is likewise a launch-time `--permission-mode` flag, so the
+                // running process cannot be re-flagged. When the user escalates to Full
+                // Approval while a prompt is pending, settle it with the provider's
+                // session-scoped allow — never a mode-switch option — rather than leaving
+                // it stranded until the next relaunch.
+                let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
+                guard runtime.acceptsPendingACPApprovalWhenActivated,
+                      session.runState.isActive,
+                      let controller = session.acpController,
+                      let pendingApproval = session.pendingApproval else { continue }
+                Task { @MainActor in
+                    if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) settling pending Devin approval with session-scoped allow after Full Approval escalation") }
+                    await controller.respondToPermissionRequest(
+                        id: pendingApproval.requestID.displayValue,
+                        decision: .acceptForSession
+                    )
+                    if session.tabID == currentTabID {
+                        updateActiveBindings(session)
+                    }
+                }
             }
         }
 

@@ -21,6 +21,16 @@ enum AgentMCPModelParameterSupport {
         let valueRaw: String
     }
 
+    static func unsupportedModelParametersMessage(for agent: AgentProviderKind) -> String {
+        if agent == .devin {
+            return "Devin model and effort are combined model variants; choose one with `model_id`, not `model_parameters`."
+        }
+        guard agent.acpProviderID != nil else {
+            return "Model parameters are supported only for ACP providers; cannot apply them to \(agent.displayName)."
+        }
+        return "Model parameters are not supported for \(agent.displayName)."
+    }
+
     /// Cursor-only synchronous definitions (static catalogue). OpenCode parameter metadata is
     /// demand-scoped and asynchronous — use `definitions(agent:modelRaw:workspacePath:) async`,
     /// which acquires a one-shot observation for the resolved workspace/model first.
@@ -125,9 +135,12 @@ enum AgentMCPModelParameterSupport {
         let requests = try parseRequests(value)
         guard !requests.isEmpty else { return [] }
         guard let agent,
-              agent.acpProviderID != nil
+              let providerID = agent.acpProviderID
         else {
             throw MCPError.invalidParams("model_parameters are supported only for ACP models.")
+        }
+        guard ACPModelParameterResolver.supportsModelParameters(providerID) else {
+            throw MCPError.invalidParams(unsupportedModelParametersMessage(for: agent))
         }
         guard agent == .cursor else {
             throw MCPError.invalidParams(
@@ -158,6 +171,9 @@ enum AgentMCPModelParameterSupport {
               let providerID = agent.acpProviderID
         else {
             throw MCPError.invalidParams("model_parameters are supported only for ACP models.")
+        }
+        guard ACPModelParameterResolver.supportsModelParameters(providerID) else {
+            throw MCPError.invalidParams(unsupportedModelParametersMessage(for: agent))
         }
         switch providerID {
         case .cursor:

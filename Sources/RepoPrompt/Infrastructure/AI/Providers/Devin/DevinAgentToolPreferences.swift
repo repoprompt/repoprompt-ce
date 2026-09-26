@@ -8,6 +8,9 @@ enum DevinAgentToolPreferences {
     /// requires `--sandbox`, which this integration does not launch with.
     static let permissionModeArgumentName = "--permission-mode"
 
+    /// The only ACP mode RepoPrompt treats as an escalation that removes every approval prompt.
+    static let bypassSessionModeID = "bypass"
+
     /// Picker order is `allCases` order.
     enum PermissionLevel: String, CaseIterable {
         case providerDefault
@@ -34,15 +37,15 @@ enum DevinAgentToolPreferences {
         var detailText: String {
             switch self {
             case .providerDefault:
-                "No permission flag is passed; Devin uses its own configured default and decides when to ask. Applies to newly started Devin processes."
+                "No ACP mode or permission flag is selected; Devin uses its configured default and decides when to ask."
             case .normal:
-                "Starts Devin with `--permission-mode auto`; Devin auto-approves read-only tools and asks before actions that need approval. Applies to newly started Devin processes."
+                "No ACP mode is selected; Devin's configured default applies. Unattended one-shot runs use `--permission-mode auto`."
             case .acceptEdits:
-                "Starts Devin with `--permission-mode accept-edits`; workspace edits are accepted automatically, other actions still ask. Applies to newly started Devin processes."
+                "Selects Accept Edits over ACP when this Devin runtime advertises it; workspace edits are accepted automatically, other actions still ask."
             case .smart:
-                "Starts Devin with `--permission-mode smart`; Devin additionally auto-runs actions a fast model judges safe. Applies to newly started Devin processes."
+                "Selects Smart over ACP when this Devin runtime advertises it; Devin additionally auto-runs actions it judges safe."
             case .fullApproval:
-                "Starts Devin with `--permission-mode dangerous`; Devin runs tools without approval prompts. Applies to newly started Devin processes."
+                "Selects Bypass Permissions over ACP when this Devin runtime advertises it. Unattended one-shot runs, including Oracle, use `--permission-mode dangerous` because they cannot ask."
             }
         }
 
@@ -79,6 +82,76 @@ enum DevinAgentToolPreferences {
                 "smart"
             case .fullApproval:
                 "dangerous"
+            }
+        }
+
+        /// The ACP session mode for an unattended run, mirroring `unattendedCLIPermissionMode`.
+        ///
+        /// Only an explicitly configured Full Approval escalates, to `bypass`; every other
+        /// level sends nothing.
+        ///
+        /// Sending nothing is NOT a floor. On a fresh session it leaves whatever default the
+        /// agent chooses, and on a session resumed through `session/load` it leaves whatever
+        /// mode that session already had — which can be a `bypass` set by an earlier run.
+        /// Treating nil as a guaranteed floor is the mistake this note exists to prevent.
+        ///
+        /// This carrier is needed because the launch flag it mirrors is inert for `devin acp`
+        /// (see `sessionModeID`), so an unattended Full Approval run never reached the level
+        /// it was configured for.
+        var unattendedSessionModeID: String? {
+            switch self {
+            case .fullApproval:
+                DevinAgentToolPreferences.bypassSessionModeID
+            case .providerDefault, .normal, .acceptEdits, .smart:
+                nil
+            }
+        }
+
+        /// The `--permission-mode` an unattended launch may use for this configured level.
+        /// Unattended runs cannot surface approval prompts — the headless bridge declines
+        /// them — so only an explicit Full Approval escalates; intermediate levels like
+        /// `smart` presume a person answers the residual prompts, and mapping them to `auto`
+        /// keeps unattended behaviour deterministic.
+        ///
+        /// This value only reaches argv. `devin acp` ignores it entirely, so for headless ACP
+        /// runs the effective level comes from `unattendedSessionModeID`, not from here. Whether
+        /// the one-shot CLI path acts on it is not established; it is validated there, which is
+        /// not the same as being honoured, so this should not be read as a guaranteed floor.
+        var unattendedCLIPermissionMode: String {
+            switch self {
+            case .fullApproval:
+                "dangerous"
+            case .providerDefault, .normal, .acceptEdits, .smart:
+                "auto"
+            }
+        }
+
+        /// The ACP session mode for this level, or nil when Devin advertises no equivalent.
+        ///
+        /// `--permission-mode` is a top-level flag that the `acp` subcommand does not consume:
+        /// a session started as `devin --permission-mode dangerous acp` reports
+        /// `mode.currentValue == "accept-edits"`, identical to launching with no flag at all.
+        /// The mode has to be set over ACP instead, which is how every other ACP provider here
+        /// already does it. Mode availability is host-, account-, and policy-dependent: the
+        /// controller applies a requested value only when that runtime advertises it and never
+        /// substitutes another mode.
+        ///
+        /// `normal` and `providerDefault` stay nil deliberately: Devin's ACP mode vocabulary has
+        /// no `normal`/`auto` member, so there is nothing to map them to without guessing.
+        ///
+        /// Sending nothing is not a downgrade. On a session resumed through `session/load` the
+        /// previous mode survives, so a level that maps to nil cannot bring an earlier
+        /// escalation back down. That gap is open and tracked, not resolved here.
+        var sessionModeID: String? {
+            switch self {
+            case .providerDefault, .normal:
+                nil
+            case .acceptEdits:
+                "accept-edits"
+            case .smart:
+                "smart"
+            case .fullApproval:
+                DevinAgentToolPreferences.bypassSessionModeID
             }
         }
 
@@ -133,6 +206,16 @@ enum DevinAgentToolPreferences {
             return document.permissionLevel()
         }
         return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+    }
+
+    /// Resolves the `--permission-mode` for unattended launches from the configured level:
+    /// explicit Full Approval → `dangerous`, everything else → `auto`. See
+    /// `PermissionLevel.unattendedCLIPermissionMode` for the security posture.
+    static func unattendedLaunchPermissionMode(
+        defaults: UserDefaults = .standard,
+        secureStore: AgentPermissionSecureStore? = nil
+    ) -> String {
+        permissionLevel(defaults: defaults, secureStore: secureStore).unattendedCLIPermissionMode
     }
 
     static func setPermissionLevel(

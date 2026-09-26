@@ -503,6 +503,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard editingScope == expectedScope,
               let resolution = roleDefaultsResolutions.first(where: { $0.role == role }),
               resolution.effective.agent.acpProviderID == expectedProviderID,
+              ACPModelParameterResolver.supportsModelParameters(expectedProviderID),
               ACPModelParameterIdentity.canonicalBaseModelRaw(
                   resolution.effective.modelRaw,
                   providerID: expectedProviderID
@@ -545,6 +546,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard editingScope == expectedScope,
               let providerID = displayed.agent.acpProviderID,
               providerID == expectedProviderID,
+              ACPModelParameterResolver.supportsModelParameters(providerID),
               ACPModelParameterIdentity.canonicalBaseModelRaw(
                   displayed.modelRaw,
                   providerID: providerID

@@ -111,6 +111,7 @@ struct ACPModelParameterSelection: Codable, Hashable {
         activeBaseModelRaw: String,
         from selections: [Self]
     ) -> [Self] {
+        guard ACPModelParameterResolver.supportsModelParameters(providerID) else { return [] }
         let activeIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
             activeBaseModelRaw,
             providerID: providerID
@@ -156,6 +157,17 @@ struct ACPResolvedModelParameter: Equatable {
 }
 
 enum ACPModelParameterResolver {
+    /// Only these ACP providers advertise model parameters separately from the selected model.
+    /// Devin's model IDs already encode effort, so it deliberately remains a flat model list.
+    static func supportsModelParameters(_ providerID: ACPProviderID) -> Bool {
+        switch providerID {
+        case .cursor, .openCode:
+            true
+        case .grokBuild, .antigravity, .devin:
+            false
+        }
+    }
+
     static func resolve(
         providerID: ACPProviderID,
         selectedModelRaw: String,
@@ -216,17 +228,18 @@ enum ACPModelParameterResolver {
         workspacePath: String? = nil,
         openCodeParameters: OpenCodeACPModelParameterSnapshot? = nil
     ) -> ACPModelParameterSet? {
+        guard supportsModelParameters(providerID) else { return nil }
         switch providerID {
         case .cursor:
-            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            openCodeParameterSet(
+            return openCodeParameterSet(
                 selectedModelRaw: selectedModelRaw,
                 workspacePath: workspacePath,
                 observation: openCodeParameters
             )
-        default:
-            nil
+        case .grokBuild, .antigravity, .devin:
+            return nil
         }
     }
 

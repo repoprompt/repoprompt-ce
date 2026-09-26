@@ -4,6 +4,64 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testPendingDiscoveryContextSurvivesClientIdentityCasingAndTeardown() async throws {
+        let fixture = try await makeFixture(name: "client-identity")
+        defer { fixture.cleanup() }
+        let selection = StoredSelection(selectedPaths: [fixture.fileB.path])
+        try await fixture.seedCanonical(selection)
+        let context = try fixture.makeContext(selection: selection)
+        let server = fixture.window.mcpServer
+        server.installFrozenTabContext(clientID: nil, clientName: "cursor", context: context)
+
+        _ = server.registerPendingPolicyRunIDMapping(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "Cursor"
+        )
+
+        XCTAssertEqual(fixture.boundContext?.runID, fixture.runID)
+        XCTAssertEqual(fixture.boundContext?.selection, selection)
+        XCTAssertEqual(server.pendingContextQueueLength(clientName: "cursor", windowID: fixture.window.windowID), 0)
+        XCTAssertTrue(server.detachContextBuilderTabContextForDiscoveryTeardown(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID
+        ))
+        server.removeTabContext(
+            forConnectionID: fixture.connectionID,
+            clientName: "Cursor",
+            windowID: fixture.window.windowID,
+            runID: nil
+        )
+
+        let result = await server.commitContextBuilderTabContext(
+            connectionID: fixture.connectionID,
+            expectedRunID: fixture.runID,
+            isStillCurrent: { true }
+        )
+
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertEqual(result.committedTab?.tab.id, fixture.tabID)
+        XCTAssertEqual(result.committedTab?.tab.selection, selection)
+    }
+
+    func testPendingDiscoveryClientIdentityKeepsRunAndWindowFences() async throws {
+        let fixture = try await makeFixture(name: "client-identity-fences")
+        defer { fixture.cleanup() }
+        let context = try fixture.makeContext(selection: StoredSelection(selectedPaths: [fixture.fileA.path]))
+        var store = MCPServerViewModel.PendingRunScopedContextStore()
+        store.enqueueReplacing(context, clientName: "cursor", windowID: fixture.window.windowID)
+
+        XCTAssertNil(store.pop(clientName: "Devin", windowID: fixture.window.windowID, runID: fixture.runID).context)
+        XCTAssertNil(store.pop(clientName: "Cursor", windowID: fixture.window.windowID + 1, runID: fixture.runID).context)
+        XCTAssertNil(store.pop(clientName: "Cursor", windowID: fixture.window.windowID, runID: UUID()).context)
+        XCTAssertEqual(
+            store.pop(clientName: "Cursor", windowID: fixture.window.windowID, runID: fixture.runID).context?.tabID,
+            fixture.tabID
+        )
+        XCTAssertTrue(store.isEmpty)
+    }
+
     func testContextBuilderToolMutationPublishesCanonicalSelectionImmediately() async throws {
         let fixture = try await makeFixture(name: "immediate")
         defer { fixture.cleanup() }

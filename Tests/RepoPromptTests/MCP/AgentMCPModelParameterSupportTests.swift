@@ -96,6 +96,25 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
         XCTAssertTrue(AgentMCPModelParameterSupport.definitionValues(agent: .codexExec, modelRaw: "gpt-5").isEmpty)
     }
 
+    func testDevinParameterRequestsExplainThatEffortIsPartOfTheModelVariant() async {
+        let requested: Value = .array([
+            .object(["config_id": .string("effort"), "value": .string("max")])
+        ])
+
+        do {
+            _ = try await AgentMCPModelParameterSupport.resolve(
+                value: requested,
+                agent: .devin,
+                modelRaw: "swe-2-max",
+                workspacePath: "/workspace-a"
+            )
+            XCTFail("expected Devin model parameters to be rejected")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("combined model variants"))
+            XCTAssertTrue(error.localizedDescription.contains("model_id"))
+        }
+    }
+
     func testResolveRejectsUnknownConfigBeforeProducingSelections() throws {
         let requested: Value = .array([
             .object(["config_id": .string("unknown"), "value": .string("high")])
