@@ -419,6 +419,8 @@ final class AgentTabSession: ObservableObject {
         var serviceTier: String?
         var attachmentReservationID: UUID?
         var expectedTurnID: String?
+        var auditTurnID: UUID?
+        var autoEffortApplied = false
         var retryAttempted: Bool = false
         /// Final monitoring identity composed for the original physical dispatch, if any.
         var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
@@ -579,6 +581,7 @@ final class AgentTabSession: ObservableObject {
         let model: String?
         let reasoningEffort: String?
         let serviceTier: String?
+        var autoEffortApplied = false
         let attachmentReservationID: UUID?
         let optimisticUserItemID: UUID?
         let draftText: String
@@ -756,6 +759,23 @@ final class AgentTabSession: ObservableObject {
     var providerSessionID: String?
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
+    var automationTurnAudit: [AgentAutomationTurnAudit] = []
+
+    func updateAutomationAudit(
+        turnID: UUID,
+        _ update: (inout AgentAutomationTurnAudit) -> Void
+    ) {
+        guard let index = automationTurnAudit.lastIndex(where: { $0.turnID == turnID }) else { return }
+        update(&automationTurnAudit[index])
+        isDirty = true
+    }
+
+    func appendAutomationAudit(_ record: AgentAutomationTurnAudit) {
+        automationTurnAudit.append(record)
+        automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
+        isDirty = true
+    }
+
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
@@ -2094,6 +2114,9 @@ final class AgentTabSession: ObservableObject {
         suppressSourceItemsChanged = true
         items.remove(at: index)
         suppressSourceItemsChanged = false
+        // A rolled-back optimistic user turn never became a retained local submission.
+        // Keep provider-accepted evidence if a later UI cleanup removes its bubble.
+        automationTurnAudit.removeAll { $0.turnID == removed.id && !$0.providerTurnAccepted }
         reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
         rebuildToolCorrelationIndexes()
         finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))

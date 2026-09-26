@@ -710,6 +710,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     struct StagedTaskRoutingResult {
         let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
         let outcome: AgentTaskRoutingBackendOutcome
+        var judgmentRequested = false
+        var effortFallback = false
     }
 
     struct FreshTaskRoutingOwnership {
@@ -5677,6 +5679,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.providerSessionID = agentSession.providerSessionID
         session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
+        session.automationTurnAudit = agentSession.automationTurnAudit
         session.pendingHandoff = PendingHandoffState(
             payload: agentSession.pendingHandoffPayload,
             createdAt: agentSession.pendingHandoffCreatedAt,
@@ -6014,6 +6017,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
+        session.automationTurnAudit.removeAll()
         session.lastUserMessageAt = nil
         session.isDirty = false
     }
@@ -10556,9 +10560,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isNativePreparedTurn: nativePreparedTurn != nil,
             preserveRoutedInitialEffort: preserveRoutedInitialEffort
         )
-        let autoEffortSelection = judgesUserTurn
+        let autoEffortChoice = judgesUserTurn
             ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow)
             : nil
+        let autoEffortSelection = autoEffortChoice?.selection
         try Task.checkCancellation()
         guard mcpControlledSession(sessionID: sessionID) === session else {
             throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.")
@@ -10588,6 +10593,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             signalsDeliveryAfterDispatch = false
         }
         let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
+        let submittedAutoEffortAudit = delivery == .startedRun
+            ? autoEffortChoice?.audit
+            : autoEffortChoice?.audit.discardedAfterMCPReclassification()
 
         let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
             ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -10617,14 +10625,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFilesToSend: [],
                         activeWorkflow: nativePreparedTurn.bubbleWorkflow,
                         nativePreparedTurn: nativePreparedTurn,
-                        codexAttemptID: codexAttemptID
+                        codexAttemptID: codexAttemptID,
+                        autoEffortAudit: submittedAutoEffortAudit
                     )
                 }
                 return submitUserTurn(
                     text: trimmedText,
                     tabID: session.tabID,
                     codexAttemptID: codexAttemptID,
-                    autoEffortSelection: submittedAutoEffortSelection
+                    autoEffortSelection: submittedAutoEffortSelection,
+                    autoEffortAudit: submittedAutoEffortAudit
                 )
             }
             switch submission {
@@ -15230,6 +15240,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             periodicIdleWakeEnabled: session.oversight.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: session.oversight.periodicIdleWakeIntervalSeconds,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+            automationTurnAudit: session.automationTurnAudit,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
@@ -16085,7 +16096,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -16203,6 +16216,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     codexAttemptID: codexAttemptID,
                     rawDraftText: rawDraftText,
                     autoEffortSelection: autoEffortSelection,
+                    autoEffortAudit: autoEffortAudit,
+                    routerAudit: routerAudit,
                     restorationSelectedWorkflow: activeWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
                 )
@@ -16221,6 +16236,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
             autoEffortSelection: autoEffortSelection,
+            autoEffortAudit: autoEffortAudit,
+            routerAudit: routerAudit,
             restorationSelectedWorkflow: activeWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
@@ -16236,6 +16253,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) async {
@@ -16266,6 +16285,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
             autoEffortSelection: autoEffortSelection,
+            autoEffortAudit: autoEffortAudit,
+            routerAudit: routerAudit,
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
@@ -16566,6 +16587,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) -> UserTurnSubmissionResult {
@@ -16657,6 +16680,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        let routerConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
+        let defaultRouterAudit = AgentAutomationTurnAudit.Feature(
+            configured: routerConfiguration.enabled,
+            eligible: false,
+            judgmentRequested: false,
+            decision: routerConfiguration.enabled ? .ineligible : .disabled
+        )
+        let autoEffortEnabled = modelRouterSettingsStore.autoEffortEnabled()
+        let defaultAutoAudit = AgentAutomationTurnAudit.Feature(
+            configured: autoEffortEnabled,
+            eligible: false,
+            judgmentRequested: false,
+            decision: autoEffortEnabled ? .ineligible : .disabled
+        )
+        session.appendAutomationAudit(
+            AgentAutomationTurnAudit(
+                turnID: userItem.id,
+                createdAt: userItem.timestamp,
+                router: routerAudit ?? defaultRouterAudit,
+                autoEffort: autoEffortAudit ?? defaultAutoAudit,
+                acceptedProviderRaw: session.selectedAgent.rawValue,
+                acceptedModelRaw: session.selectedModelRaw,
+                acceptedEffortRaw: session.selectedReasoningEffortRaw
+            )
+        )
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
         // This is the single acceptance point for every local user turn, including waiting-instruction
         // continuations, and deliberately so: it is where the local user takes the submission gate.
@@ -20468,6 +20516,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
+        session.automationTurnAudit.removeAll()
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
         session.contextUsageSnapshot = nil
