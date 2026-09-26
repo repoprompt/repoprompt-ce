@@ -6,6 +6,75 @@ import XCTest
 
 @MainActor
 final class AgentChatTitlebarSafetyTests: XCTestCase {
+    func testActiveWorkspaceToolbarPresentationKeepsWorkspaceIdentityAcrossZeroOneAndSwitchStates() {
+        let zeroWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: nil,
+            workspaceCount: 0,
+            instanceNumber: nil,
+            chatTitle: "RepoPrompt CE"
+        )
+        XCTAssertEqual(zeroWorkspace.workspaceTitle, "No Workspace")
+        XCTAssertEqual(zeroWorkspace.workspaceTooltip, "No saved workspaces")
+        XCTAssertEqual(zeroWorkspace.accessibilityLabel, "Active workspace: No Workspace. Chat: RepoPrompt CE")
+
+        let alpha = WorkspaceModel(name: "Alpha", repoPaths: [])
+        let oneWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: alpha,
+            workspaceCount: 1,
+            instanceNumber: nil,
+            chatTitle: "T1 — Alpha chat"
+        )
+        XCTAssertEqual(oneWorkspace.workspaceTitle, "Alpha")
+        XCTAssertEqual(oneWorkspace.chatTitle, "T1 — Alpha chat")
+        XCTAssertEqual(oneWorkspace.workspaceTooltip, "Switch workspace")
+        XCTAssertTrue(oneWorkspace.showsDistinctChatTitle)
+
+        let beta = WorkspaceModel(name: "Beta", repoPaths: [])
+        let switchedWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: beta,
+            workspaceCount: 2,
+            instanceNumber: nil,
+            chatTitle: "T2 — Continued task"
+        )
+        XCTAssertEqual(switchedWorkspace.workspaceTitle, "Beta")
+        XCTAssertEqual(switchedWorkspace.chatTitle, "T2 — Continued task")
+        XCTAssertEqual(
+            switchedWorkspace.accessibilityLabel,
+            "Active workspace: Beta. Chat: T2 — Continued task"
+        )
+        XCTAssertNotEqual(switchedWorkspace.workspaceTitle, oneWorkspace.workspaceTitle)
+
+        let repeatedWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: alpha,
+            workspaceCount: 2,
+            instanceNumber: 2,
+            // The title cluster receives the resolved window title, including the instance suffix.
+            chatTitle: WindowTitleFormatter.compose(
+                workspaceTitle: "Alpha (2)",
+                agentSessionTitle: "Alpha",
+                duplicateWorkspaceTitle: alpha.name
+            )
+        )
+        XCTAssertEqual(repeatedWorkspace.workspaceTitle, "Alpha (2)")
+        XCTAssertFalse(repeatedWorkspace.showsDistinctChatTitle)
+        XCTAssertEqual(repeatedWorkspace.accessibilityLabel, "Active workspace: Alpha (2)")
+
+        let longWorkspace = WorkspaceModel(
+            name: "A workspace name long enough to exercise titlebar truncation",
+            repoPaths: []
+        )
+        let longWorkspacePresentation = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: longWorkspace,
+            workspaceCount: 1,
+            instanceNumber: nil,
+            chatTitle: "Long-name chat"
+        )
+        XCTAssertEqual(
+            longWorkspacePresentation.workspaceTitle,
+            "A workspace name long enough to exercise titlebar truncation"
+        )
+    }
+
     func testButtonPointerStandardAndAccessibilityActivationUseTargetAction() throws {
         let probe = ButtonActionProbe()
         let button = AgentChatOptionsButton()
