@@ -11149,7 +11149,9 @@ actor ServerNetworkManager {
         }
 
         if let liveAffinity = preferredExpectedPIDRunAffinity(for: clientName, clientPid: clientPid) {
-            await applyLiveRunAffinity(liveAffinity, clientName: clientName, connectionID: connectionID, reason: "expected-pid")
+            connectionLog(
+                "Expected-PID fallback matched established run \(liveAffinity.runID); refusing implicit run mapping without a pending per-connection policy"
+            )
             return
         }
 
