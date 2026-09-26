@@ -82,6 +82,30 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
+    func testOneShotRejectsImagesBeforeLaunchWithoutLeakingPayload() async {
+        let provider = GrokBuildOneShotHeadlessAgentProvider(
+            config: GrokBuildCLIProvider.test_makeHeadlessConfig(modelName: nil)
+        )
+        let message = AgentMessage(
+            systemPrompt: "system",
+            userMessage: "inspect",
+            transientImages: [
+                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Secret Diagram")
+            ]
+        )
+
+        do {
+            _ = try await provider.streamAgentMessage(message)
+            XCTFail("Expected Grok Build image rejection")
+        } catch let AIProviderError.invalidConfiguration(detail) {
+            XCTAssertTrue(detail.contains("image attachments"))
+            XCTAssertFalse(detail.contains("AQID"))
+            XCTAssertFalse(detail.contains("Secret Diagram"))
+        } catch {
+            XCTFail("Expected actionable provider configuration error, got \(error)")
+        }
+    }
+
     func testNonAgentAdapterMapsNonSuccessfulStopsToIncomplete() {
         let incompleteStopReasons = [
             "max_tokens",

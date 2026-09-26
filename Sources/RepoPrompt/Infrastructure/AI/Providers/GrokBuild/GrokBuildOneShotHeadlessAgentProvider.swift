@@ -1,8 +1,8 @@
 import Foundation
 
-/// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
+/// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
+/// one-shot prompt-file CLI and rejects images before launch.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
@@ -33,6 +33,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         guard message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build one-shot requests cannot resume a previous session."
+            )
+        }
+        guard message.transientImages.isEmpty else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot requests do not accept image attachments. Choose an image-capable Oracle model or remove the images and retry."
             )
         }
 

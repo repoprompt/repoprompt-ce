@@ -120,6 +120,7 @@ extension OracleViewModel {
         let agentModeRunID: UUID?
         let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
+        let transientImages: [AITransientImage]
 
         init(
             tabID: UUID,
@@ -128,7 +129,8 @@ extension OracleViewModel {
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
             activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
-            packaging: OracleSendPackagingContext
+            packaging: OracleSendPackagingContext,
+            transientImages: [AITransientImage] = []
         ) {
             self.tabID = tabID
             self.workspaceID = workspaceID
@@ -137,6 +139,7 @@ extension OracleViewModel {
             self.agentModeRunID = agentModeRunID
             self.activationPolicy = activationPolicy
             self.packaging = packaging
+            self.transientImages = transientImages
         }
     }
 
@@ -507,6 +510,14 @@ extension OracleViewModel {
         return true
     }
 
+    static func validateRawImageDispatchInvariant(_ args: [String: Value]) throws {
+        guard args["images"] == nil else {
+            throw ChatToolError.internalError(
+                "Raw ask_oracle image arguments must be consumed before Oracle dispatch."
+            )
+        }
+    }
+
     static func sessionMatchesOracleOwnerForExplicitContinuation(
         _ session: ChatSession,
         agentModeSessionID: UUID?,
@@ -802,6 +813,7 @@ extension OracleViewModel {
         -> [String: Value]
     {
         // ────────── 1. Validate & extract parameters ──────────
+        try Self.validateRawImageDispatchInvariant(args)
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
         if !removedArgs.isEmpty {
             throw ChatToolError.invalidParams(
@@ -855,6 +867,14 @@ extension OracleViewModel {
         case .contextBuilderUI: "Context Builder"
         }
         let mcpControlledModel = "\(mode.capitalized) mode • \(selectionLabel) (\(selectedModel.displayName))"
+        let transientImages = tabContext?.transientImages ?? []
+        if !transientImages.isEmpty,
+           !OracleImageRouteAdmission.supports(selectedModel)
+        {
+            throw ChatToolError.invalidParams(
+                "Image attachments are not supported by the selected Oracle model '\(selectedModel.displayName)' on provider '\(selectedModel.providerType.displayName)'."
+            )
+        }
         let overrideModelName = selectedModel.displayName
         let overrideChatPresetName = resolvedExecution.promptConfiguration.chatPreset.name
 
@@ -917,6 +937,7 @@ extension OracleViewModel {
                 lookupContextOverride: lookupContextOverride,
                 reviewGitContextOverride: reviewGitContextOverride,
                 overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                oracleTransientImages: transientImages,
                 onProgress: onProgress
             )
         }

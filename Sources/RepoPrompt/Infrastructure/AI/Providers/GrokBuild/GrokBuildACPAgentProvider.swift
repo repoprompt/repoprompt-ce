@@ -86,7 +86,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     ) throws -> [[String: Any]] {
         // Grok Build 1.0.3 advertises promptCapabilities.image = false over ACP, so v1 is
         // text-only: reject attachments explicitly instead of silently dropping them.
-        guard request.attachments.isEmpty else {
+        guard request.attachments.isEmpty, message.transientImages.isEmpty else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build does not advertise image support over ACP; remove attachments and retry."
             )
