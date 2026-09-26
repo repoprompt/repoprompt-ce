@@ -1246,7 +1246,21 @@ enum AgentSessionLinkResponseRenderer {
             ),
             "visible_row_count": .int(snapshot.visibleRowCount),
             "last_activity_at": .string(AgentMCPToolHelpers.timestamp(snapshot.lastActivityAt)),
-            "change_sequence": .int(Int(clamping: state.changeSequence))
+            "change_sequence": .int(Int(clamping: state.changeSequence)),
+            "context": contextLoadValue(snapshot.context)
+        ])
+    }
+
+    /// Target-global context load, or `null` when unknown. Always present, so a caller can tell
+    /// "unknown" apart from "this build does not report load". Numbers only; `used_percent` is not
+    /// clamped, so a load above the window stays visible.
+    static func contextLoadValue(_ context: DomainAgentSessionContextLoad?) -> Value {
+        guard let context else { return .null }
+        return .object([
+            "used_tokens": context.usedTokens.map { .int($0) } ?? .null,
+            "window_tokens": context.windowTokens.map { .int($0) } ?? .null,
+            "used_percent": context.usedPercent.map { .double($0) } ?? .null,
+            "confidence": .string(context.confidence.rawValue)
         ])
     }
 

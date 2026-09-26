@@ -18837,15 +18837,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
 
             case "usage":
-                if let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent),
-                   estimator.ingestUsageSignal(
-                       promptTokens: result.promptTokens,
-                       completionTokens: result.completionTokens,
-                       contextUsedTokens: result.contextUsedTokens,
-                       modelContextWindow: result.modelContextWindow,
-                       session: session
-                   ) != nil
-                {
+                if ingestNonCodexUsageReport(
+                    promptTokens: result.promptTokens,
+                    completionTokens: result.completionTokens,
+                    contextUsedTokens: result.contextUsedTokens,
+                    modelContextWindow: result.modelContextWindow,
+                    session: session
+                ) {
                     shouldUpdateBindings = true
                 }
 
@@ -18942,19 +18940,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
 
                 // Track per-turn token usage for resumable non-Codex agents.
-                if let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) {
-                    _ = estimator.ingestTurnFinalizationSignal(
-                        contextUsedTokens: result.contextUsedTokens,
-                        modelContextWindow: result.modelContextWindow,
-                        session: session
-                    )
-                    finalizeNonCodexTurnUsageIfNeeded(
-                        for: session,
-                        promptTokens: result.promptTokens,
-                        completionTokens: result.completionTokens,
-                        contextUsedTokens: result.contextUsedTokens
-                    )
-                }
+                ingestNonCodexTurnFinalization(
+                    promptTokens: result.promptTokens,
+                    completionTokens: result.completionTokens,
+                    contextUsedTokens: result.contextUsedTokens,
+                    modelContextWindow: result.modelContextWindow,
+                    session: session
+                )
                 shouldUpdateBindings = true
 
             case AIStreamResult.lifecycleType:

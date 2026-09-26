@@ -14,10 +14,72 @@ extension AgentModeViewModel {
     func applyCodexNativeContextUsage(_ usage: AgentContextUsage, session: TabSession) {
         session.codexContextUsage = usage
         _ = codexContextUsageEstimator.ingestNativeContextUsage(usage, session: session)
+        // A Codex report delivered after the tab switched provider is not the new provider's load.
+        guard session.selectedAgent == .codexExec else { return }
+        session.noteLiveContextUsageReport(
+            contextUsedTokens: usage.lastTotalTokens,
+            promptTokens: nil,
+            modelContextWindow: usage.modelContextWindow
+        )
+    }
+
+    /// Ingests one live usage report from a non-Codex provider stream and records which figures it
+    /// vouches for, even when the stored snapshot came out unchanged. Returns whether the session's
+    /// usage state changed.
+    func ingestNonCodexUsageReport(
+        promptTokens: Int?,
+        completionTokens: Int?,
+        contextUsedTokens: Int?,
+        modelContextWindow: Int?,
+        session: TabSession
+    ) -> Bool {
+        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return false }
+        let changed = estimator.ingestUsageSignal(
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            contextUsedTokens: contextUsedTokens,
+            modelContextWindow: modelContextWindow,
+            session: session
+        ) != nil
+        session.noteLiveContextUsageReport(
+            contextUsedTokens: contextUsedTokens,
+            promptTokens: promptTokens,
+            modelContextWindow: modelContextWindow
+        )
+        return changed
     }
 
     func refreshCodexContextUsageSnapshot(for session: TabSession) {
         _ = codexContextUsageEstimator.ingestNativeContextUsage(session.codexContextUsage, session: session)
+    }
+
+    /// Ingests a non-Codex provider's end-of-turn usage (`message_stop`), where Claude-compatible
+    /// providers report the context window, then records which figures it vouches for. The result's
+    /// aggregate billed prompt count is never treated as a context count.
+    func ingestNonCodexTurnFinalization(
+        promptTokens: Int?,
+        completionTokens: Int?,
+        contextUsedTokens: Int?,
+        modelContextWindow: Int?,
+        session: TabSession
+    ) {
+        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
+        _ = estimator.ingestTurnFinalizationSignal(
+            contextUsedTokens: contextUsedTokens,
+            modelContextWindow: modelContextWindow,
+            session: session
+        )
+        finalizeNonCodexTurnUsageIfNeeded(
+            for: session,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            contextUsedTokens: contextUsedTokens
+        )
+        session.noteLiveContextUsageReport(
+            contextUsedTokens: contextUsedTokens,
+            promptTokens: nil,
+            modelContextWindow: modelContextWindow
+        )
     }
 
     func clearContextUsageSnapshot(for session: TabSession) {

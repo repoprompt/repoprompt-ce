@@ -1294,6 +1294,171 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(restartedIdleState?.snapshot.idleSince, Date(timeIntervalSince1970: 4000))
     }
 
+    func testContextLoadDropsInvalidFiguresAndComputesAnUnclampedPercentage() throws {
+        XCTAssertNil(DomainAgentSessionContextLoad(usedTokens: nil, windowTokens: nil, confidence: .exact))
+        XCTAssertNil(DomainAgentSessionContextLoad(usedTokens: -1, windowTokens: 0, confidence: .exact))
+
+        let invalidWindow = try XCTUnwrap(
+            DomainAgentSessionContextLoad(usedTokens: 500, windowTokens: -10, confidence: .exact)
+        )
+        XCTAssertEqual(invalidWindow.usedTokens, 500)
+        XCTAssertNil(invalidWindow.windowTokens)
+        XCTAssertNil(invalidWindow.usedPercent)
+
+        let zero = try XCTUnwrap(
+            DomainAgentSessionContextLoad(usedTokens: 0, windowTokens: 200_000, confidence: .exact)
+        )
+        XCTAssertEqual(zero.usedPercent, 0, "A genuine zero stays zero")
+        XCTAssertEqual(
+            DomainAgentSessionContextLoad(usedTokens: 1, windowTokens: 3, confidence: .exact)?.usedPercent,
+            33.3
+        )
+        XCTAssertEqual(
+            DomainAgentSessionContextLoad(usedTokens: 980_376, windowTokens: 1_000_000, confidence: .exact)?
+                .usedPercent,
+            98.0
+        )
+        XCTAssertEqual(
+            DomainAgentSessionContextLoad(usedTokens: 1_020_000, windowTokens: 1_000_000, confidence: .exact)?
+                .usedPercent,
+            102.0
+        )
+        XCTAssertEqual(DomainAgentSessionContextLoad.Confidence.bestEffort.rawValue, "best_effort")
+    }
+
+    func testContextLoadSurvivesCanonicalizationAndJoinsChangeDetection() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorPoll,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        let baselineState = await authority.targetState(for: lease)
+        let baseline = try XCTUnwrap(baselineState)
+        XCTAssertNil(baseline.snapshot.context)
+
+        func loaded(_ used: Int) -> DomainAgentSessionObservationSnapshot {
+            let plain = makeSnapshot(sessionID: target.sessionID)
+            return DomainAgentSessionObservationSnapshot(
+                sessionID: plain.sessionID,
+                displayName: plain.displayName,
+                providerDisplayName: plain.providerDisplayName,
+                status: plain.status,
+                idleForSend: plain.idleForSend,
+                pendingInteractionKind: plain.pendingInteractionKind,
+                latestVisibleAssistantPreview: plain.latestVisibleAssistantPreview,
+                visibleRowCount: plain.visibleRowCount,
+                lastActivityAt: plain.lastActivityAt,
+                context: DomainAgentSessionContextLoad(usedTokens: used, windowTokens: 200_000, confidence: .exact)
+            )
+        }
+
+        guard case .accepted = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: loaded(150_000),
+            sourcePublicationSequence: 2
+        ) else { return XCTFail("A newly known load is a snapshot change") }
+        let firstState = await authority.targetState(for: lease)
+        let first = try XCTUnwrap(firstState)
+        XCTAssertEqual(first.snapshot.context?.usedTokens, 150_000)
+        XCTAssertEqual(first.snapshot.context?.windowTokens, 200_000)
+        XCTAssertEqual(first.changeSequence, baseline.changeSequence + 1)
+
+        guard case .unchanged = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: loaded(150_000),
+            sourcePublicationSequence: 3
+        ) else { return XCTFail("An identical load is not a change") }
+
+        guard case .accepted = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: loaded(180_000),
+            sourcePublicationSequence: 4
+        ) else { return XCTFail("A different load is a change") }
+        let secondState = await authority.targetState(for: lease)
+        let second = try XCTUnwrap(secondState)
+        XCTAssertEqual(second.snapshot.context?.usedTokens, 180_000)
+        XCTAssertEqual(second.changeSequence, first.changeSequence + 1)
+    }
+
+    /// A context-only difference is an ordinary snapshot change: it wakes `until: change`, but it
+    /// neither satisfies `idle`/`sendable` for a running target nor restarts an idle target's
+    /// `idle_since`.
+    func testContextOnlyChangeWakesChangeWaitsButNotIdleOrSendableAndKeepsIdleSince() async throws {
+        let clock = LinkTestClock(Date(timeIntervalSince1970: 1000))
+        let authority = makeAuthority(now: { clock.now })
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        try await activateLink(authority, observer: observer, target: target, status: .running)
+        let lease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+
+        func withContext(
+            _ status: DomainAgentSessionLinkStatus,
+            used: Int
+        ) -> DomainAgentSessionObservationSnapshot {
+            let plain = makeSnapshot(sessionID: target.sessionID, status: status)
+            return DomainAgentSessionObservationSnapshot(
+                sessionID: plain.sessionID,
+                displayName: plain.displayName,
+                providerDisplayName: plain.providerDisplayName,
+                status: plain.status,
+                idleForSend: plain.idleForSend,
+                pendingInteractionKind: plain.pendingInteractionKind,
+                latestVisibleAssistantPreview: plain.latestVisibleAssistantPreview,
+                visibleRowCount: plain.visibleRowCount,
+                lastActivityAt: plain.lastActivityAt,
+                context: DomainAgentSessionContextLoad(usedTokens: used, windowTokens: 200_000, confidence: .exact)
+            )
+        }
+
+        let baselineState = await authority.targetState(for: lease)
+        let cursor = try XCTUnwrap(baselineState?.waitCursor)
+        _ = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: withContext(.running, used: 120_000),
+            sourcePublicationSequence: 2
+        )
+        let changed = await authority.wait(
+            requests: [DomainAgentSessionLinkWaitRequest(lease: lease, cursor: cursor)],
+            until: .change,
+            timeoutSeconds: 0
+        )
+        XCTAssertEqual(changed.outcome, .changed(sessionID: target.sessionID))
+        XCTAssertEqual(changed.targets.first?.snapshot.context?.usedTokens, 120_000)
+        for predicate in [DomainAgentSessionLinkWaitPredicate.idle, .sendable] {
+            let result = await authority.wait(
+                requests: [DomainAgentSessionLinkWaitRequest(lease: lease, cursor: nil)],
+                until: predicate,
+                timeoutSeconds: 0
+            )
+            XCTAssertEqual(result.outcome, .timedOut, "\(predicate)")
+        }
+
+        _ = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: withContext(.idle, used: 130_000),
+            sourcePublicationSequence: 3
+        )
+        let idleState = await authority.targetState(for: lease)
+        let idleSince = try XCTUnwrap(idleState?.snapshot.idleSince)
+        clock.now = Date(timeIntervalSince1970: 2000)
+        guard case .accepted = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: withContext(.idle, used: 140_000),
+            sourcePublicationSequence: 4
+        ) else { return XCTFail("A context-only change on an idle target is a snapshot change") }
+        let refreshedState = await authority.targetState(for: lease)
+        XCTAssertEqual(refreshedState?.snapshot.idleSince, idleSince, "idle_since is not restarted")
+        XCTAssertEqual(refreshedState?.snapshot.context?.usedTokens, 140_000)
+    }
+
     func testSemanticReplayAdvancesPublicationHighWaterWithoutAdvancingChangeSequence() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()

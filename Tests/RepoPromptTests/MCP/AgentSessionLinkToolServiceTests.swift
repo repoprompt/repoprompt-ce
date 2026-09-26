@@ -251,7 +251,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 "session_id", "name", "provider", "status", "idle_for_send", "idle_since", "waiting_on",
                 "has_pending_interaction", "pending_interaction_kind",
                 "latest_visible_assistant_preview", "visible_row_count",
-                "last_activity_at", "change_sequence"
+                "last_activity_at", "change_sequence", "context"
             ]
         )
         for forbidden in [
@@ -304,6 +304,100 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(waiting["summary"]?.stringValue, "CI artifact")
         XCTAssertEqual(waiting["declared_at"]?.stringValue, AgentMCPToolHelpers.timestamp(declaredAt))
         XCTAssertFalse(object["idle_for_send"]?.boolValue ?? true)
+    }
+
+    private func makeContextTargetState(
+        context: DomainAgentSessionContextLoad?
+    ) -> DomainAgentSessionLinkTargetState {
+        let sessionID = UUID()
+        return DomainAgentSessionLinkTargetState(
+            sessionID: sessionID,
+            linkID: UUID(),
+            linkGeneration: 1,
+            snapshot: DomainAgentSessionObservationSnapshot(
+                sessionID: sessionID,
+                displayName: "Worker",
+                providerDisplayName: "Claude Code",
+                status: .running,
+                idleForSend: false,
+                pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil,
+                visibleRowCount: 1,
+                lastActivityAt: Date(timeIntervalSince1970: 10),
+                context: context
+            ),
+            changeSequence: 2,
+            waitCursor: "w"
+        )
+    }
+
+    func testSnapshotSerializesContextLoadAsNumbersOrNull() throws {
+        let full = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 175_000,
+            windowTokens: 200_000,
+            confidence: .exact
+        ))
+        let fullObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: full)).objectValue
+        )
+        let context = try XCTUnwrap(fullObject["context"]?.objectValue)
+        XCTAssertEqual(Set(context.keys), ["used_tokens", "window_tokens", "used_percent", "confidence"])
+        XCTAssertEqual(context["used_tokens"]?.intValue, 175_000)
+        XCTAssertEqual(context["window_tokens"]?.intValue, 200_000)
+        XCTAssertEqual(context["used_percent"]?.doubleValue, 87.5)
+        XCTAssertEqual(context["confidence"]?.stringValue, "exact")
+
+        let partial = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 1_050_000,
+            windowTokens: nil,
+            confidence: .bestEffort
+        ))
+        let partialObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: partial)).objectValue
+        )
+        let partialContext = try XCTUnwrap(partialObject["context"]?.objectValue)
+        XCTAssertEqual(partialContext["used_tokens"]?.intValue, 1_050_000)
+        XCTAssertEqual(partialContext["window_tokens"], .null)
+        XCTAssertEqual(partialContext["used_percent"], .null)
+        XCTAssertEqual(partialContext["confidence"]?.stringValue, "best_effort")
+
+        // Unknown load is an explicit null, so callers can tell it apart from an older build.
+        let unknownObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: nil)).objectValue
+        )
+        XCTAssertEqual(unknownObject["context"], .null)
+    }
+
+    func testPollAndWaitRowsCarryTheSameContextLoad() throws {
+        let load = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 210_000,
+            windowTokens: 200_000,
+            confidence: .exact
+        ))
+        let state = makeContextTargetState(context: load)
+        let expected = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(state).objectValue?["context"]
+        )
+        XCTAssertEqual(expected.objectValue?["used_percent"]?.doubleValue, 105.0, "Over-window load is not clamped")
+
+        let pollRow = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.pollTargetEntryValue(state, autoWakeSnooze: nil).objectValue
+        )
+        XCTAssertEqual(pollRow["snapshot"]?.objectValue?["context"], expected)
+
+        let result = DomainAgentSessionLinkWaitResult(
+            outcome: .changed(sessionID: state.sessionID),
+            targets: [state]
+        )
+        let singleWait = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.waitValue(result, isSingle: true).objectValue
+        )
+        XCTAssertEqual(singleWait["snapshot"]?.objectValue?["context"], expected)
+        let multiWait = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.waitValue(result, isSingle: false).objectValue
+        )
+        let multiRow = try XCTUnwrap(multiWait["targets"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
     }
 
     func testMultiTargetWaitResponseKeepsRequestOrderAndSuccessorCursorsForEveryTarget() throws {

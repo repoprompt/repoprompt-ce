@@ -171,6 +171,45 @@ package struct DomainAgentSessionWaitingOn: Hashable, Sendable {
     }
 }
 
+/// Context-window load RepoPrompt had recorded for a target when its snapshot was published, from the
+/// provider usage its context ring already shows. Numbers only: no provider payload, model name, or
+/// free-form text. A usage update alone does not publish a snapshot, so the value can lag the
+/// provider; it confers no authority, and `nil` means unknown, never empty.
+package struct DomainAgentSessionContextLoad: Hashable, Sendable {
+    /// How the usage was obtained, mirroring the app's existing context-usage confidence labels.
+    package enum Confidence: String, CaseIterable, Hashable, Sendable {
+        /// Provider-reported context occupancy for the latest request.
+        case exact
+        /// A provider figure that is not a direct occupancy report, such as billed prompt tokens.
+        case bestEffort = "best_effort"
+        /// Rebuilt from persisted history rather than observed live.
+        case inferred
+    }
+
+    package let usedTokens: Int?
+    package let windowTokens: Int?
+    package let confidence: Confidence
+
+    /// Returns `nil` unless at least one valid figure is known. Negative used counts and
+    /// non-positive windows are dropped rather than clamped, so invalid data never looks valid.
+    package init?(usedTokens: Int?, windowTokens: Int?, confidence: Confidence) {
+        let used = usedTokens.flatMap { $0 >= 0 ? $0 : nil }
+        let window = windowTokens.flatMap { $0 > 0 ? $0 : nil }
+        guard used != nil || window != nil else { return nil }
+        self.usedTokens = used
+        self.windowTokens = window
+        self.confidence = confidence
+    }
+
+    /// Share of the window in use, as a percentage rounded to one decimal; `nil` unless both
+    /// figures are known. Deliberately not clamped: above 100 means the provider reported more
+    /// context than its window, which is exactly the state an observer needs to see.
+    package var usedPercent: Double? {
+        guard let usedTokens, let windowTokens else { return nil }
+        return (Double(usedTokens) / Double(windowTokens) * 1000).rounded() / 10
+    }
+}
+
 package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
@@ -183,6 +222,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let latestVisibleAssistantPreview: String?
     package let visibleRowCount: Int
     package let lastActivityAt: Date
+    /// Target-global context load, identical for every authorized observer; `nil` when unknown.
+    package let context: DomainAgentSessionContextLoad?
 
     package var hasPendingInteraction: Bool {
         pendingInteractionKind != nil
@@ -201,7 +242,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind?,
         latestVisibleAssistantPreview: String?,
         visibleRowCount: Int,
-        lastActivityAt: Date
+        lastActivityAt: Date,
+        context: DomainAgentSessionContextLoad? = nil
     ) {
         self.sessionID = sessionID
         self.displayName = DomainAgentSessionLinkTextBudget.normalized(
@@ -224,6 +266,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         )
         self.visibleRowCount = max(0, visibleRowCount)
         self.lastActivityAt = lastActivityAt
+        self.context = context
     }
 }
 

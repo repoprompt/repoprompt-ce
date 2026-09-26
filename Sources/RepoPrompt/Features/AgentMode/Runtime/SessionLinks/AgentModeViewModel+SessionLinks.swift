@@ -523,7 +523,44 @@ extension AgentModeViewModel {
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
             visibleRowCount: session.transcriptCanonicalVisibleRowCount,
-            lastActivityAt: session.lastActivityAt
+            lastActivityAt: session.lastActivityAt,
+            context: observationContextLoad(for: session)
+        )
+    }
+
+    /// The context load the target's context ring already shows, as recorded by its provider's usage
+    /// estimator: Claude-family stream usage or Codex native token usage.
+    ///
+    /// ACP-backed providers have no context estimator yet, so any usage value on their tab is not
+    /// theirs to report and stays unknown. Usage written before the current provider was selected is
+    /// not reported either: a count or window is reported only while it still equals the value the
+    /// current provider's own live usage report produced, since the last provider change, compaction
+    /// (count only), or relaunch. The UI's fallback windows and tool-derived estimates are never exported;
+    /// the existing confidence label travels with the figures.
+    static func observationContextLoad(for session: TabSession) -> DomainAgentSessionContextLoad? {
+        switch session.selectedAgent {
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
+            break
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
+            return nil
+        }
+        guard let usage = session.contextUsageSnapshot else { return nil }
+        // A compaction signal carries the pre-compaction count forward; it no longer describes the
+        // context, so only the window can still be current until the next usage report.
+        let countIsCurrent = usage.source != .compactionSignal
+            && usage.used.map { TabSession.ContextUsageVouch(agent: session.selectedAgent, tokens: $0) }
+            == session.vouchedContextCount
+        let windowIsCurrent = usage.window.map { TabSession.ContextUsageVouch(agent: session.selectedAgent, tokens: $0) }
+            == session.vouchedContextWindow
+        let confidence: DomainAgentSessionContextLoad.Confidence = switch usage.confidence {
+        case .exact: .exact
+        case .bestEffort: .bestEffort
+        case .inferred: .inferred
+        }
+        return DomainAgentSessionContextLoad(
+            usedTokens: countIsCurrent ? usage.used : nil,
+            windowTokens: windowIsCurrent ? usage.window : nil,
+            confidence: confidence
         )
     }
 

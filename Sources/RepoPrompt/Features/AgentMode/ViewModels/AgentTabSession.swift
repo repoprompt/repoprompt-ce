@@ -686,8 +686,27 @@ final class AgentTabSession: ObservableObject {
     }
 
     // Settings (per-tab)
-    var selectedAgent: AgentProviderKind = .claudeCode
-    var selectedModelRaw: String = AgentModel.defaultModel.rawValue
+
+    var selectedAgent: AgentProviderKind = .claudeCode {
+        didSet {
+            // Usage recorded under another provider must never be reported as this provider's load.
+            if selectedAgent != oldValue {
+                vouchedContextCount = nil
+                vouchedContextWindow = nil
+            }
+        }
+    }
+
+    var selectedModelRaw: String = AgentModel.defaultModel.rawValue {
+        didSet {
+            // A different model can have a different window; wait for its own report.
+            if selectedModelRaw != oldValue {
+                vouchedContextCount = nil
+                vouchedContextWindow = nil
+            }
+        }
+    }
+
     var selectedReasoningEffortRaw: String?
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
@@ -785,8 +804,56 @@ final class AgentTabSession: ObservableObject {
     var codexModel: String?
     var codexReasoningEffort: String?
     @Published var codexContextUsage: AgentContextUsage? = nil
-    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil
-    var contextCompactedAt: Date?
+    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil {
+        didSet {
+            if contextUsageSnapshot == nil {
+                vouchedContextCount = nil
+                vouchedContextWindow = nil
+            }
+        }
+    }
+
+    var contextCompactedAt: Date? {
+        didSet {
+            // A compaction invalidates the count; the window is unchanged.
+            if contextCompactedAt != oldValue { vouchedContextCount = nil }
+        }
+    }
+
+    /// A context figure and the provider whose own live usage report produced it.
+    struct ContextUsageVouch: Equatable {
+        let agent: AgentProviderKind
+        let tokens: Int
+    }
+
+    /// The context count and window the selected provider's own live usage reports produced, for
+    /// session-link oversight only (the context ring is unaffected). A stored figure is reported only
+    /// while it equals its vouch, so any later write with a different value invalidates it. A provider
+    /// change clears both, a compaction clears the count, and clearing the usage clears both. Not
+    /// persisted, so restored figures are never reported as current load.
+    private(set) var vouchedContextCount: ContextUsageVouch?
+    private(set) var vouchedContextWindow: ContextUsageVouch?
+
+    /// Records which figures a live usage report from the selected provider vouches for. The report's
+    /// context count (or, only when it carried none, its prompt count) vouches for the stored count
+    /// only if they match; a conflicting count (for example one the estimator rejected and replaced
+    /// with a carried-forward or smaller fallback value) withdraws the vouch. The window works the
+    /// same way. Reports without a positive count or window (output-only usage) change nothing, so a
+    /// reported zero stays unvouched, matching the estimators' "zero means absent" convention.
+    func noteLiveContextUsageReport(contextUsedTokens: Int?, promptTokens: Int?, modelContextWindow: Int?) {
+        let reportedCount = (contextUsedTokens ?? 0) > 0 ? contextUsedTokens : promptTokens
+        if let reportedCount, reportedCount > 0 {
+            vouchedContextCount = contextUsageSnapshot?.used == reportedCount
+                ? ContextUsageVouch(agent: selectedAgent, tokens: reportedCount)
+                : nil
+        }
+        if let window = modelContextWindow, window > 0 {
+            vouchedContextWindow = contextUsageSnapshot?.window == window
+                ? ContextUsageVouch(agent: selectedAgent, tokens: window)
+                : nil
+        }
+    }
+
     var codexNeedsReconnect: Bool = false
     var codexNativeStartupDisposition: AgentModeViewModel.CodexNativeStartupDisposition?
     var codexResumeTimeoutState: AgentModeViewModel.CodexResumeTimeoutState = .init()
