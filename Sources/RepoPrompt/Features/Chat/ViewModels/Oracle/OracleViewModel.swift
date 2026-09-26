@@ -3478,6 +3478,7 @@ class OracleViewModel: ObservableObject {
             let sessionName = sessions.first(where: { $0.id == sessionID })?.name
             NotificationService.shared.notifyChatComplete(
                 chatName: sessionName,
+                groupID: sessionID,
                 fallbackToDockBounce: true
             )
         }

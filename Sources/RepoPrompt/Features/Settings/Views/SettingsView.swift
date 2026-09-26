@@ -255,7 +255,7 @@ struct SettingsView: View {
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
+            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -304,6 +304,9 @@ struct SettingsView: View {
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .telemetry:
             TelemetrySettingsView()
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .notifications:
+            NotificationSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .chatSettings:
             ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
@@ -522,6 +525,7 @@ enum SettingsTab: String, CaseIterable {
     case keyboardShortcuts
     case advanced
     case telemetry
+    case notifications
     case chatSettings
     case apiGeneral
     case openRouter
@@ -552,6 +556,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "Keyboard Shortcuts"
         case .advanced: "Advanced"
         case .telemetry: "Telemetry"
+        case .notifications: "Notifications"
         case .chatSettings: "Chat Settings"
         case .apiGeneral: "API Providers"
         case .openRouter: "OpenRouter"
@@ -584,6 +589,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "keyboard"
         case .advanced: "gearshape.2"
         case .telemetry: "lock.shield"
+        case .notifications: "bell.badge"
         case .chatSettings: "message"
         case .apiGeneral: "key"
         case .openRouter: "network"
@@ -634,7 +640,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
+        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
             .general
 
         // Copy & Chat workflows
@@ -739,6 +745,20 @@ enum SettingsTab: String, CaseIterable {
             ]
         case .telemetry:
             ["telemetry", "privacy", "crash", "diagnostics", "sentry"]
+        case .notifications:
+            [
+                "notifications",
+                "alerts",
+                "banner",
+                "badge",
+                "dock",
+                "approve",
+                "approval",
+                "reply",
+                "question",
+                "turn complete",
+                "sound"
+            ]
         case .chatSettings:
             [
                 "chat",

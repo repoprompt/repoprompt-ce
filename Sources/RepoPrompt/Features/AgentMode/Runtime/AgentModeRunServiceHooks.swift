@@ -48,6 +48,8 @@ extension AgentModeRunService {
         let setAgentRunActive: (AgentTabSession, Bool) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
         let notifyAgentTurnComplete: (AgentTabSession) -> Void
+        /// Defaulted so hosts and test doubles that predate failure notifications stay source-compatible.
+        var notifyAgentTurnFailed: (AgentTabSession, String?) -> Void = { _, _ in }
     }
 
     /// Session binding/run-state observation invoked from the central run
@@ -285,6 +287,9 @@ extension AgentModeRunService.Hooks {
                 },
                 notifyAgentTurnComplete: {
                     presentation.notifyAgentTurnComplete(session)
+                },
+                notifyAgentTurnFailed: { errorText in
+                    presentation.notifyAgentTurnFailed(session, errorText)
                 },
                 scheduleSave: {
                     persistence.scheduleSave(session)

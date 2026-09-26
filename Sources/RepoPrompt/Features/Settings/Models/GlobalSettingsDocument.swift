@@ -647,6 +647,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var telemetry: TelemetrySettings?
     var modelOverrides: ModelOverrideSettingsData?
     var modelRouter: ModelRouterSettings?
+    /// Additive, schema-neutral group: every field is optional and typed readers fall back to
+    /// `NotificationPreferences.defaults`. Older typed readers ignore the unknown key, and the
+    /// raw-preserving save path keeps it, so it deliberately does not raise `requiredSchemaVersion`.
+    var notifications: NotificationSettings?
 
     init(
         ui: UISettings? = nil,
@@ -658,7 +662,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
         modelOverrides: ModelOverrideSettingsData? = nil,
-        modelRouter: ModelRouterSettings? = nil
+        modelRouter: ModelRouterSettings? = nil,
+        notifications: NotificationSettings? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -670,6 +675,51 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
         self.modelRouter = modelRouter
+        self.notifications = notifications
+    }
+
+    struct NotificationSettings: Codable, Equatable {
+        var enabled: Bool?
+        var agentInteractions: Bool?
+        var agentInstructionWaits: Bool?
+        var agentTurnComplete: Bool?
+        var agentTurnFailed: Bool?
+        var chatComplete: Bool?
+        var contextBuilderComplete: Bool?
+        var approveFromNotifications: Bool?
+        var answerFromNotifications: Bool?
+        var replyFromCompletion: Bool?
+        var showDetails: Bool?
+        var notifyWhileActive: Bool?
+        var completionsWhileActive: Bool?
+        var includeAgentDrivenSessions: Bool?
+        var dockBadge: Bool?
+        var mcpAskUserNotifyInsteadOfActivate: Bool?
+
+        init() {}
+
+        /// Resolves stored overrides over the product defaults.
+        func resolved(over defaults: NotificationPreferences = .defaults) -> NotificationPreferences {
+            var preferences = defaults
+            preferences.enabled = enabled ?? defaults.enabled
+            preferences.agentInteractions = agentInteractions ?? defaults.agentInteractions
+            preferences.agentInstructionWaits = agentInstructionWaits ?? defaults.agentInstructionWaits
+            preferences.agentTurnComplete = agentTurnComplete ?? defaults.agentTurnComplete
+            preferences.agentTurnFailed = agentTurnFailed ?? defaults.agentTurnFailed
+            preferences.chatComplete = chatComplete ?? defaults.chatComplete
+            preferences.contextBuilderComplete = contextBuilderComplete ?? defaults.contextBuilderComplete
+            preferences.approveFromNotifications = approveFromNotifications ?? defaults.approveFromNotifications
+            preferences.answerFromNotifications = answerFromNotifications ?? defaults.answerFromNotifications
+            preferences.replyFromCompletion = replyFromCompletion ?? defaults.replyFromCompletion
+            preferences.showDetails = showDetails ?? defaults.showDetails
+            preferences.notifyWhileActive = notifyWhileActive ?? defaults.notifyWhileActive
+            preferences.completionsWhileActive = completionsWhileActive ?? defaults.completionsWhileActive
+            preferences.includeAgentDrivenSessions = includeAgentDrivenSessions ?? defaults.includeAgentDrivenSessions
+            preferences.dockBadge = dockBadge ?? defaults.dockBadge
+            preferences.mcpAskUserNotifyInsteadOfActivate = mcpAskUserNotifyInsteadOfActivate
+                ?? defaults.mcpAskUserNotifyInsteadOfActivate
+            return preferences
+        }
     }
 
     struct ModelRouterSettings: Codable, Equatable {
