@@ -88,10 +88,15 @@
     }
 
     struct PromptExperimentGEPASettings: Codable, Equatable {
-        var reflectionMinibatchSize = 3
+        static let candidateSelectionStrategies = ["current_best", "pareto", "epsilon_greedy", "top_k_pareto"]
+
+        /// Small minibatches buy more proposals per budget (a rejected proposal costs 2m).
+        var reflectionMinibatchSize = 2
         var useMerge = false
         var maxMergeInvocations = 5
         var skipPerfectScore = true
+        /// GEPA parent selection; `current_best` always refines the incumbent.
+        var candidateSelectionStrategy = "current_best"
         var randomSeed = 0
         var stopAtScore: Double?
         /// Additional invocations per logical provider call for classified transient failures.
@@ -114,7 +119,11 @@
         let rubricSHA256: String?
         let targets: PromptExperimentTargets
         let settings: PromptExperimentGEPASettings
+        /// The approved search cap: GEPA's seed validation pass, proposals, and the held-out
+        /// reserve for the incumbent.
         let maxEvaluations: Int
+        /// The separately approved baseline-calibration line (spent only on a cache miss).
+        let calibrationEvaluations: Int
         let pythonSealValue: String
         let gepaRevision: String
 
@@ -160,6 +169,54 @@
         case infrastructure
     }
 
+    /// Size and cost of one evaluation, always recorded (tokens only when the provider reports them).
+    struct PromptExperimentEvaluationUsage: Codable, Equatable {
+        /// Characters in the evaluated candidate prompt body.
+        let promptCharacters: Int
+        /// Characters in the target's output.
+        let outputCharacters: Int
+        let promptTokens: Int?
+        let completionTokens: Int?
+    }
+
+    /// Per-candidate averages over every completed evaluation of that exact text.
+    struct PromptExperimentCandidateUsage: Codable, Equatable {
+        let promptCharacters: Int
+        let evaluations: Int
+        let averageOutputCharacters: Double?
+        let tokenReportedEvaluations: Int
+        let averagePromptTokens: Double?
+        let averageCompletionTokens: Double?
+
+        static func aggregate(promptCharacters: Int, usages: [PromptExperimentEvaluationUsage]) -> Self {
+            func average(_ values: [Int]) -> Double? {
+                values.isEmpty ? nil : Double(values.reduce(0, +)) / Double(values.count)
+            }
+            let prompts = usages.compactMap(\.promptTokens)
+            let completions = usages.compactMap(\.completionTokens)
+            return Self(
+                promptCharacters: promptCharacters,
+                evaluations: usages.count,
+                averageOutputCharacters: average(usages.map(\.outputCharacters)),
+                tokenReportedEvaluations: max(prompts.count, completions.count),
+                averagePromptTokens: average(prompts),
+                averageCompletionTokens: average(completions)
+            )
+        }
+
+        var summary: String {
+            var parts = ["prompt \(promptCharacters) chars"]
+            if let averageOutputCharacters {
+                parts.append("output avg \(Int(averageOutputCharacters.rounded())) chars")
+            }
+            if let averageCompletionTokens {
+                parts.append("completion avg \(Int(averageCompletionTokens.rounded())) tok")
+            }
+            parts.append("\(evaluations) eval\(evaluations == 1 ? "" : "s")")
+            return parts.joined(separator: " · ")
+        }
+    }
+
     struct PromptExperimentEvaluationEvidence: Codable, Equatable, Identifiable {
         let id: UUID
         /// GEPA pool index when the evaluated text belongs to exactly one retained candidate; else -1.
@@ -171,6 +228,7 @@
         let failureKind: PromptExperimentOptimizationFailureKind?
         let outputEvidence: PromptExperimentArtifactReference?
         let elapsedSeconds: Double?
+        var usage: PromptExperimentEvaluationUsage?
     }
 
     /// Scored evidence committed as it is produced; not a final ranking.
@@ -189,6 +247,7 @@
         let aggregateScore: Double?
         let isBaseline: Bool
         let isBest: Bool
+        var usage: PromptExperimentCandidateUsage?
     }
 
     /// Report-only held-out averages for the seed and GEPA's best candidate. A nil side means
@@ -196,12 +255,29 @@
     struct PromptExperimentHeldOutSummary: Codable, Equatable {
         let baselineAverage: Double?
         let bestAverage: Double?
+        /// Where the seed's held-out baseline came from.
+        var baselineSource: PromptExperimentCalibrationSource?
 
         var summary: String {
             func format(_ value: Double?) -> String {
                 value.map { String(format: "%.3f", $0) } ?? "unavailable"
             }
-            return "Held-out average: baseline \(format(baselineAverage)) → best \(format(bestAverage))."
+            let source = baselineSource.map { " (baseline \($0.label))" } ?? ""
+            return "Held-out average: baseline \(format(baselineAverage)) → best \(format(bestAverage))\(source)."
+        }
+    }
+
+    enum PromptExperimentCalibrationSource: String, Codable, Equatable {
+        /// Reused from an earlier experiment with the same seed, suite, rubric, and targets.
+        case cache
+        /// Scored by this experiment's pre-search calibration pass.
+        case calibrated
+
+        var label: String {
+            switch self {
+            case .cache: "reused from the calibration cache"
+            case .calibrated: "calibrated before search"
+            }
         }
     }
 
@@ -220,11 +296,17 @@
         let stopReason: String?
         /// Nil when the suite has no held-out cases or no incumbent was saved.
         var heldOut: PromptExperimentHeldOutSummary?
+        /// True when the ledger-aware stopper declined to start an iteration it could not finish.
+        var stoppedBeforeUnfinishableIteration: Bool?
 
         var assessment: String {
-            let budgetNote = stopReason == "budget_exhausted"
-                ? " Stopped at the approved evaluation budget; the reported best is GEPA's saved incumbent."
-                : ""
+            let budgetNote: String = if stopReason == "budget_exhausted" {
+                stoppedBeforeUnfinishableIteration == true
+                    ? " Stopped before an iteration the remaining budget could not finish; the reported best is GEPA's saved incumbent."
+                    : " Stopped at the approved evaluation budget; the reported best is GEPA's saved incumbent."
+            } else {
+                ""
+            }
             let heldOutNote = heldOut.map { " " + $0.summary } ?? ""
             if candidates.count == 1 {
                 return "Only the starting candidate was retained after \(totalEvaluations) evaluations; improvement was not demonstrated." + budgetNote + heldOutNote
@@ -325,6 +407,8 @@
         var gradings: [PromptExperimentGradingEvidence]
         var result: PromptExperimentOptimizationResult?
         var error: String?
+        /// Cumulative baseline-calibration admissions after this run (separate approved line).
+        var calibrationAdmissions: Int?
     }
 
     // MARK: - Proposals
@@ -395,6 +479,10 @@
             max(0, authority.maxEvaluations - admissionsUsed)
         }
 
+        var calibrationAdmissionsUsed: Int {
+            runs.compactMap(\.calibrationAdmissions).max() ?? 0
+        }
+
         var status: PromptExperimentStatus {
             if activeRun != nil { return .running }
             if approvalRequest != nil, !isApproved { return .awaitingApproval }
@@ -410,10 +498,10 @@
         }
     }
 
-    /// Canonical store document. Schema 7 starts the Experiment/Run/Proposal model; earlier
-    /// lab documents are discarded, never migrated.
+    /// Canonical store document. Schema 8 adds the baseline-calibration line and usage
+    /// evidence; earlier lab documents are discarded, never migrated.
     struct PromptExperimentDocument: Codable {
-        static let schemaVersion = 7
+        static let schemaVersion = 8
         let schemaVersion: Int
         var experiments: [PromptExperiment]
 
@@ -434,6 +522,7 @@
         let failureKind: PromptExperimentOptimizationFailureKind?
         let output: String?
         let elapsedSeconds: Double?
+        var usage: PromptExperimentEvaluationUsage?
     }
 
     struct PromptExperimentOptimizationRuntimeResult: Codable, Equatable {
@@ -453,6 +542,9 @@
         /// `completed` or `budget_exhausted` (GEPA's saved incumbent at the approved cap).
         let stopReason: String?
         var heldOut: PromptExperimentHeldOutSummary?
+        var stoppedBeforeUnfinishableIteration: Bool?
+        /// Index-aligned with `candidates`, from every completed ledger evaluation of that text.
+        var candidateUsage: [PromptExperimentCandidateUsage?] = []
     }
 
     enum PromptExperimentCheckpoint: Equatable {
@@ -498,9 +590,10 @@
     struct PromptExperimentRuntimeResult: Equatable {
         let disposition: PromptExperimentRuntimeDisposition
         let optimization: PromptExperimentOptimizationRuntimeResult?
-        /// Cumulative ledger admissions after the run (nil when the ledger never opened).
+        /// Cumulative capped ledger admissions after the run (nil when the ledger never opened).
         let admissionsAfter: Int?
         let interruptedAdmissionsSettled: Int
+        var calibrationAdmissionsAfter: Int?
     }
 
     enum PromptExperimentSubmissionError: LocalizedError, Equatable {

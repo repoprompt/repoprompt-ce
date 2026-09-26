@@ -10,6 +10,8 @@
         let output: String
         let failureKind: PromptExperimentOptimizationFailureKind?
         let elapsedSeconds: Double
+        /// Candidate/output size and the target call's token usage when reported.
+        var usage: PromptExperimentEvaluationUsage?
     }
 
     /// Executes a candidate against one sealed example and grades the result.

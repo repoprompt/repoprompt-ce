@@ -77,6 +77,7 @@ import XCTest
                 targets: PromptExperimentTargets(execution: execution, reflection: reflection, judge: nil),
                 settings: settings,
                 maxEvaluations: maxEvaluations,
+                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases),
                 pythonSealValue: "bundle://PromptExperimentPython/test/python/bin/python3.11",
                 gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
             )

@@ -48,6 +48,9 @@
                                 .font(.caption.bold())
                         }
                         if let result = run.result {
+                            let usage = { (index: Int?) in result.candidates.first { $0.index == index }?.usage?.summary ?? "—" }
+                            Text("Size: baseline \(usage(0)) → proposed \(usage(proposal.candidateIndex))")
+                                .font(.caption).foregroundStyle(.secondary)
                             // Capped so per-case evidence never squeezes the diff out of view.
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 6) {

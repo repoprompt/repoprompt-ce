@@ -29,8 +29,11 @@ sys.path.insert(0, str(WORKER.parent))
 from gepa_worker import (  # noqa: E402
     REFLECTION_BEGIN,
     REFLECTION_END,
+    build_reflection_prompt,
     delimit_for_gepa,
     extract_reflection_candidate,
+    fenced,
+    full_iteration_cost,
 )
 
 FENCE_HEAVY = """Instructions:
@@ -72,7 +75,10 @@ class FakeHost:
         memo: dict[str, dict[str, Any]] | None = None,
         feedback: Callable[[str], str] | None = None,
         output_excerpt: Callable[[str], str] | None = None,
+        report_remaining: bool = True,
     ) -> None:
+        self.report_remaining = report_remaining
+        self.reflect_prompts: list[str] = []
         self.reflect_fn = reflect
         self.score_fn = score
         self.search_cap = search_cap
@@ -94,6 +100,7 @@ class FakeHost:
         payload = message["payload"]
         if operation == "reflect":
             self.reflections += 1
+            self.reflect_prompts.append(payload["prompt"])
             return {"status": "ok", "output": self.reflect_fn(payload["prompt"], self.reflections),
                     "prompt_tokens": 11, "completion_tokens": 5}
         assert operation == "evaluate"
@@ -103,7 +110,7 @@ class FakeHost:
         key = f"{payload['candidate_sha256']}\0{payload['split']}\0{payload['example_id']}"
         if key in self.memo:
             self.replays += 1
-            return dict(self.memo[key], replayed=True)
+            return self.with_remaining(dict(self.memo[key], replayed=True), payload)
         held_out = payload["split"] == "hidden_test"
         if held_out and self.held_out_admitted >= self.held_out_cap:
             self.budget_refusals += 1
@@ -128,6 +135,11 @@ class FakeHost:
         if self.output_excerpt_fn:
             response["output_excerpt"] = self.output_excerpt_fn(candidate)
         self.memo[key] = response
+        return self.with_remaining(dict(response), payload)
+
+    def with_remaining(self, response: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        if self.report_remaining and payload["split"] != "hidden_test":
+            response["search_remaining"] = max(0, self.search_cap - self.search_admitted)
         return response
 
 
@@ -144,6 +156,7 @@ def run_worker(
     minibatch: int = 2,
     interrupt_on_first_request: bool = False,
     max_messages: int = 400,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int, str]:
     process = subprocess.Popen(
         [sys.executable, "-I", "-B", str(WORKER)],
@@ -180,6 +193,7 @@ def run_worker(
                 "random_seed": 0,
                 "run_dir": str(root / "gepa-run"),
                 "output_dir": str(root / "gepa-output"),
+                **(extra or {}),
             },
         }) + "\n")
         process.stdin.flush()
@@ -255,6 +269,40 @@ class ReflectionContractTests(unittest.TestCase):
         )
 
 
+class ReflectionPromptTests(unittest.TestCase):
+    def test_fenced_outlasts_embedded_backtick_runs(self) -> None:
+        block = fenced("a\n````\nb\n```")
+        self.assertTrue(block.startswith("`````\n"), block)
+        self.assertTrue(block.endswith("\n`````"), block)
+        self.assertTrue(fenced("plain").startswith("```\n"))
+
+    def test_prompt_carries_request_score_feedback_and_output_but_not_bookkeeping(self) -> None:
+        prompt = build_reflection_prompt(
+            objective="OBJECTIVE_MARKER",
+            background="BACKGROUND_MARKER",
+            current=FENCE_HEAVY,
+            records=[{
+                "request": "REQUEST_MARKER",
+                "score": 0.25,
+                "feedback": "FEEDBACK_MARKER",
+                "output": "HEAD_MARKER [… omitted …] TAIL_MARKER",
+                "_budget": {"used": 3, "BUDGET_MARKER": True},
+                "Scores (Higher is Better)": {"quality": 0.25, "brevity": 0.5},
+            }],
+        )
+        for marker in ("OBJECTIVE_MARKER", "BACKGROUND_MARKER", "REQUEST_MARKER", "FEEDBACK_MARKER",
+                       "HEAD_MARKER", "TAIL_MARKER", "score 0.250", "brevity 0.500", REFLECTION_BEGIN, REFLECTION_END):
+            self.assertIn(marker, prompt)
+        self.assertNotIn("BUDGET_MARKER", prompt)
+        self.assertNotIn("_budget", prompt)
+        self.assertIn(f"({len(FENCE_HEAVY)} characters)", prompt)
+        self.assertIn("````\n" + FENCE_HEAVY + "\n````", prompt, "the candidate is fenced safely")
+
+    def test_full_iteration_cost(self) -> None:
+        self.assertEqual(full_iteration_cost(minibatch=2, training=6, validation=3), 7)
+        self.assertEqual(full_iteration_cost(minibatch=3, training=1, validation=0), 3)
+
+
 class GEPAWorkerRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -306,27 +354,65 @@ class GEPAWorkerRunTests(unittest.TestCase):
         contracts = [m["contract"] for m in messages if m["type"] == "reflection"]
         self.assertTrue(contracts and set(contracts) == {"envelope"}, contracts)
 
-    def test_host_budget_exhaustion_stops_cleanly_with_incumbent(self) -> None:
+    BUDGET_EXAMPLES = [
+        {"id": "t1", "split": "training", "input": "one"},
+        {"id": "t2", "split": "training", "input": "two"},
+        {"id": "v1", "split": "validation", "input": "three"},
+    ]
+
+    @staticmethod
+    def revising_reflect() -> Callable[[str, int], str]:
         counter = {"n": 0}
 
         def reflect(prompt: str, count: int) -> str:
             counter["n"] += 1
             return envelope(f"candidate revision {counter['n']}")
 
-        def score(candidate: str, payload: dict[str, Any]) -> float:
-            return 0.0 if candidate == "bad candidate" else min(0.9, 0.1 * len(candidate.split()))
+        return reflect
 
-        host = FakeHost(reflect=reflect, score=score, search_cap=7)
+    @staticmethod
+    def rising_score(candidate: str, payload: dict[str, Any]) -> float:
+        return 0.0 if candidate == "bad candidate" else min(0.9, 0.1 * len(candidate.split()))
+
+    def test_ledger_stopper_never_starts_an_iteration_it_cannot_finish(self) -> None:
+        # Iteration cost = 2 * 2 + 1 = 5. Seed validation takes 1 of 7, leaving 6: one
+        # iteration runs, then 1-2 remain and the stopper ends the search at the boundary.
+        host = FakeHost(reflect=self.revising_reflect(), score=self.rising_score, search_cap=7)
         terminal, messages, code, stderr = run_worker(
-            self.root, host,
-            examples=[
-                {"id": "t1", "split": "training", "input": "one"},
-                {"id": "t2", "split": "training", "input": "two"},
-                {"id": "v1", "split": "validation", "input": "three"},
-            ],
-            search_max_evaluations=100,
-            stop_at_score=None,
-            skip_perfect_score=False,
+            self.root, host, examples=self.BUDGET_EXAMPLES,
+            search_max_evaluations=7, stop_at_score=None, skip_perfect_score=False,
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["stop_reason"], "budget_exhausted")
+        self.assertTrue(result["stopped_before_unfinishable_iteration"])
+        self.assertEqual(result["iteration_cost"], 5)
+        self.assertEqual(host.budget_refusals, 0, "no iteration was abandoned mid-way")
+        self.assertLess(result["search_remaining"], 5)
+        self.assertEqual(host.reflections, 1)
+        self.assertTrue(result["has_incumbent"])
+        self.assertEqual(self.registered(messages)[0], "bad candidate")
+
+    def test_ledger_remaining_not_gepa_counts_drives_the_stopper(self) -> None:
+        # The host says only 4 search admissions remain (e.g. earlier runs spent the rest):
+        # after the seed pass 3 remain, below one iteration, so GEPA proposes nothing.
+        host = FakeHost(reflect=self.revising_reflect(), score=self.rising_score, search_cap=4)
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, examples=self.BUDGET_EXAMPLES,
+            search_max_evaluations=100, stop_at_score=None, skip_perfect_score=False,
+            extra={"search_remaining": 4},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(host.reflections, 0)
+        self.assertEqual(host.search_admitted, 1)
+        self.assertTrue(result["stopped_before_unfinishable_iteration"])
+
+    def test_host_budget_refusal_still_stops_cleanly_with_incumbent(self) -> None:
+        # Without remaining counts the stopper cannot see the ceiling; the ledger's hard
+        # refusal remains the backstop and the saved incumbent is reported.
+        host = FakeHost(reflect=self.revising_reflect(), score=self.rising_score, search_cap=7, report_remaining=False)
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, examples=self.BUDGET_EXAMPLES,
+            search_max_evaluations=100, stop_at_score=None, skip_perfect_score=False,
         )
         result = self.assert_completed(terminal, code, stderr)
         self.assertEqual(result["stop_reason"], "budget_exhausted")
@@ -337,6 +423,32 @@ class GEPAWorkerRunTests(unittest.TestCase):
         texts = self.registered(messages)
         self.assertTrue(all(c["index"] in texts for c in result["candidates"]))
         self.assertEqual(texts[0], "bad candidate")
+
+    def test_reflection_prompt_sees_case_request_and_head_tail_output(self) -> None:
+        host = FakeHost(
+            reflect=always("improved candidate"),
+            score=exact("improved candidate"),
+            output_excerpt=lambda candidate: "HEAD_PART [… omitted …] TAIL_PART",
+        )
+        terminal, messages, code, stderr = run_worker(self.root, host)
+        self.assert_completed(terminal, code, stderr)
+        prompt = host.reflect_prompts[0]
+        self.assertIn("Return the required words.", prompt, "the case request reaches reflection")
+        self.assertIn("TAIL_PART", prompt)
+        self.assertIn("score 0.000", prompt)
+        self.assertNotIn("_budget", prompt)
+        self.assertIn("Produce the exact words improved candidate.", prompt, "objective survives the custom proposer")
+
+    def test_identical_proposal_is_skipped_without_spending_a_child_pass(self) -> None:
+        def reflect(prompt: str, count: int) -> str:
+            return envelope("bad candidate" if count == 1 else "improved candidate")
+
+        host = FakeHost(reflect=reflect, score=exact("improved candidate"))
+        terminal, messages, code, stderr = run_worker(self.root, host)
+        result = self.assert_completed(terminal, code, stderr)
+        usage = dict(item.split("=") for item in result["proposer_usage"].split(","))
+        self.assertEqual(int(usage["skipped_identical_proposals"]), 1)
+        self.assertEqual(result["best_score"], 1.0)
 
     def test_budget_exhaustion_before_any_saved_state_reports_no_incumbent(self) -> None:
         host = FakeHost(reflect=always("x"), score=exact("x"), search_cap=1)
@@ -472,8 +584,8 @@ class GEPAWorkerRunTests(unittest.TestCase):
             result = self.assert_completed(terminal, code_value, stderr)
             self.assertEqual(result["stop_reason"], "completed")
             self.assertTrue(result["has_incumbent"])
-            self.assertIsNone(result["held_out"]["baseline"], "a failed held-out score is unavailable, never zero")
-            self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0})
+            self.assertIsNone(result["held_out"]["best"], "a failed held-out score is unavailable, never zero")
+            self.assertIsNone(result["held_out"]["baseline"], "no calibration baseline was supplied")
             self.assertEqual(self.registered(messages)[result["best_candidate_index"]], "improved candidate")
 
     def test_held_out_ledger_failure_still_fails_the_run(self) -> None:
@@ -490,25 +602,70 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertEqual(terminal["type"], "failed", stderr)
         self.assertEqual(terminal["diagnostic"]["failure_code"], "ledger_failure")
 
-    def test_held_out_scores_seed_and_best_and_degrades_to_unavailable(self) -> None:
+    def test_supplied_held_out_baseline_is_reused_and_only_the_incumbent_is_scored(self) -> None:
+        held_out = [{"id": "h1", "split": "hidden_test"}, {"id": "h2", "split": "hidden_test"}]
+        host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"), held_out_cap=2)
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, held_out=held_out,
+            extra={"held_out_baseline": {"scores": {"h1": 0.25, "h2": 0.75}, "average": 0.5}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["held_out"]["baseline"], {"scores": {"h1": 0.25, "h2": 0.75}, "average": 0.5})
+        self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0, "h2": 1.0})
+        hidden = [p for p in host.evaluate_payloads if p["split"] == "hidden_test"]
+        self.assertEqual({p["candidate"] for p in hidden}, {"improved candidate"}, "the seed is never re-scored")
+        self.assertEqual(host.held_out_admitted, 2, "a |hidden| reserve suffices")
+
+    def test_mismatched_held_out_baseline_is_ignored(self) -> None:
+        held_out = [{"id": "h1", "split": "hidden_test"}]
+        host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"))
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, held_out=held_out,
+            extra={"held_out_baseline": {"scores": {"other": 1.0}, "average": 1.0}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertIsNone(result["held_out"]["baseline"], "no fabricated or mismatched baseline")
+        self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0})
+
+    def test_held_out_without_supplied_baseline_scores_only_the_best(self) -> None:
         held_out = [{"id": "h1", "split": "hidden_test"}]
         host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"))
         terminal, messages, code, stderr = run_worker(self.root, host, held_out=held_out)
         result = self.assert_completed(terminal, code, stderr)
-        self.assertEqual(result["held_out"]["baseline"]["scores"], {"h1": 0.0})
+        self.assertIsNone(result["held_out"]["baseline"], "without calibration the baseline is unavailable")
         self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0})
         visible = [p for p in host.evaluate_payloads if p["split"] != "hidden_test"]
         self.assertTrue(visible and all(p["example_id"] != "h1" for p in visible))
 
         other = Path(self.root / "second")
         other.mkdir()
-        limited = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"), held_out_cap=1)
+        limited = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"), held_out_cap=0)
         terminal, messages, code, stderr = run_worker(other, limited, held_out=held_out)
         result = self.assert_completed(terminal, code, stderr)
-        self.assertEqual(result["held_out"]["baseline"]["scores"], {"h1": 0.0})
         self.assertIsNone(result["held_out"]["best"], "an unadmitted held-out pass is unavailable, never zero")
         self.assertEqual(result["stop_reason"], "completed", "a spent held-out reserve never relabels the search")
         self.assertEqual(limited.budget_refusals, 1, "only the held-out reserve refused an admission")
+
+    def test_seed_still_best_scores_the_seed_once_when_no_baseline_was_supplied(self) -> None:
+        # The reflector keeps re-proposing one rejected text. Its replays are free, so only
+        # the repeat skip and the reflection ceiling end the loop; the seed stays best.
+        held_out = [{"id": "h1", "split": "hidden_test"}]
+        host = FakeHost(
+            reflect=always("worse"), score=lambda c, p: 0.5 if c == "bad candidate" else 0.0, search_cap=12,
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, held_out=held_out, search_max_evaluations=12, stop_at_score=None,
+            skip_perfect_score=False,
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["best_candidate_index"], 0)
+        self.assertTrue(result["reflection_limit_reached"])
+        self.assertEqual(host.reflections, 12)
+        usage = dict(item.split("=") for item in result["proposer_usage"].split(","))
+        self.assertEqual(int(usage["skipped_repeated_proposals"]), 11)
+        self.assertEqual(host.search_admitted, 2, "seed pass plus the single distinct child")
+        self.assertEqual(result["held_out"]["baseline"], result["held_out"]["best"])
+        self.assertEqual(host.held_out_admitted, 1)
 
     def test_failure_envelope_exposes_safe_class_and_frame_without_exception_text(self) -> None:
         secret = "HOST_PRIVATE_INFRASTRUCTURE_SECRET_CANARY"

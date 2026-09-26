@@ -12,7 +12,22 @@
         let targets: PromptExperimentTargets
         let settings: PromptExperimentGEPASettings
         let maxEvaluations: Int
+        let calibrationEvaluations: Int
         let pythonSealValue: String
+
+        var baselineSHA256: String {
+            PromptExperimentDigest.sha256(Data(baseline.utf8))
+        }
+
+        var calibrationKey: String {
+            PromptExperimentCalibrationCache.key(
+                promptID: promptID,
+                seedSHA256: baselineSHA256,
+                suiteSHA256: suite.suiteSHA256,
+                rubricSHA256: suite.grader.rubric?.sha256,
+                targets: targets
+            )
+        }
     }
 
     /// GEPA-native prompt-only runtime.
@@ -49,6 +64,18 @@
             let value: PromptExperimentOptimizationRuntimeEvaluation
         }
 
+        /// One admitted-or-replayed logical evaluation through the ledger.
+        private enum LedgerEvaluation {
+            case exhausted(PromptExperimentBudgetLedger.Pool)
+            case recorded(PromptExperimentBudgetLedger.Entry, PromptExperimentBudgetLedger.Outcome)
+            case spent(PromptExperimentBudgetLedger.Entry, PromptExperimentBudgetLedger.Outcome)
+        }
+
+        private struct CalibrationResult {
+            let heldOutScores: [String: Double]?
+            let source: PromptExperimentCalibrationSource?
+        }
+
         @MainActor
         private final class ActiveRun {
             let runID: UUID
@@ -65,6 +92,7 @@
             var evaluations: [RecordedEvaluation] = []
             var spentEvaluations = 0
             var replayedEvaluations = 0
+            var calibration = CalibrationResult(heldOutScores: nil, source: nil)
 
             init(
                 runID: UUID,
@@ -137,6 +165,9 @@
             guard authority.maxEvaluations >= minimum else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The approved cap of \(authority.maxEvaluations) evaluations is below the minimum of \(minimum) for one mutation-and-validation cycle.")
             }
+            guard authority.calibrationEvaluations == PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases) else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The approved baseline-calibration line no longer matches the suite. Create a new experiment.")
+            }
             if let targetError = PromptExperimentConnectedModelRunner.targetErrors(authority.targets).first {
                 throw PromptExperimentAuthorityError.targetUnavailable("\(targetError.field): \(targetError.message)")
             }
@@ -149,6 +180,7 @@
                 targets: authority.targets,
                 settings: authority.settings,
                 maxEvaluations: authority.maxEvaluations,
+                calibrationEvaluations: authority.calibrationEvaluations,
                 pythonSealValue: authority.pythonSealValue
             )
         }
@@ -157,7 +189,12 @@
             "gepa-runs/\(experimentID.uuidString.lowercased())/\(authorityDigest.prefix(32))"
         }
 
-        static func makeWorkerRequest(execution: PromptExperimentExecution, runRoot: URL) -> GEPAWorkerProtocol.RunRequest {
+        static func makeWorkerRequest(
+            execution: PromptExperimentExecution,
+            runRoot: URL,
+            searchRemaining: Int? = nil,
+            heldOutBaseline: [String: Double]? = nil
+        ) -> GEPAWorkerProtocol.RunRequest {
             /// Only identifiers, splits, and development inputs cross to the worker; held-out
             /// inputs, expected outputs, and rubrics stay host-side.
             func wire(_ example: PromptSuiteCase) -> GEPAWorkerProtocol.Example {
@@ -174,10 +211,18 @@
                     .map { GEPAWorkerProtocol.HeldOutExample(id: $0.id, split: $0.split.rawValue) },
                 searchMaxEvaluations: execution.maxEvaluations
                     - PromptExperimentBudgetLedger.heldOutReserve(for: execution.suite.cases),
+                searchRemaining: searchRemaining,
+                heldOutBaseline: heldOutBaseline.flatMap { scores in
+                    scores.isEmpty ? nil : GEPAWorkerProtocol.HeldOutScores(
+                        scores: scores,
+                        average: scores.values.reduce(0, +) / Double(scores.count)
+                    )
+                },
                 reflectionMinibatchSize: settings.reflectionMinibatchSize,
                 useMerge: settings.useMerge,
                 maxMergeInvocations: settings.maxMergeInvocations,
                 skipPerfectScore: settings.skipPerfectScore,
+                candidateSelectionStrategy: settings.candidateSelectionStrategy,
                 perfectScore: execution.suite.grader.scoreRange.max,
                 stopAtScore: settings.stopAtScore,
                 randomSeed: settings.randomSeed,
@@ -233,6 +278,7 @@
                     authorityDigest: execution.authorityDigest,
                     totalCap: execution.maxEvaluations,
                     heldOutReserve: PromptExperimentBudgetLedger.heldOutReserve(for: execution.suite.cases),
+                    calibrationReserve: execution.calibrationEvaluations,
                     gepaStateURL: runRoot.appendingPathComponent("gepa-run/gepa_state.bin"),
                     now: environment.now
                 )
@@ -277,7 +323,6 @@
                 checkpoint: checkpoint
             )
             runs[runID] = run
-            let workerRequest = Self.makeWorkerRequest(execution: execution, runRoot: runRoot)
             let layout = GEPAWorkerLayout(
                 attemptDirectory: runRoot
                     .appendingPathComponent("runs", isDirectory: true)
@@ -287,6 +332,13 @@
             run.task = Task { @MainActor [self] in
                 defer { activeRunDirectories.remove(relativeRunDirectory) }
                 do {
+                    run.calibration = try await calibrate(run)
+                    let workerRequest = Self.makeWorkerRequest(
+                        execution: execution,
+                        runRoot: runRoot,
+                        searchRemaining: ledger.remaining(in: .search),
+                        heldOutBaseline: run.calibration.heldOutScores
+                    )
                     let completion = try await worker.run(
                         request: workerRequest,
                         pythonSealValue: execution.pythonSealValue,
@@ -305,7 +357,7 @@
             let interrupted = ledger.interruptedSettledOnOpen > 0
                 ? " \(ledger.interruptedSettledOnOpen) unsettled evaluation(s) from an interrupted run were settled as spent."
                 : ""
-            await progress("Pinned GEPA \(PromptExperimentGEPAConfiguration.packageVersion) worker admitted; \(ledger.totalAdmitted)/\(execution.maxEvaluations) approved evaluations already used.\(interrupted)")
+            await progress("Pinned GEPA \(PromptExperimentGEPAConfiguration.packageVersion) worker admitted; \(ledger.cappedAdmitted)/\(execution.maxEvaluations) approved search evaluations already used.\(interrupted)")
             return PromptExperimentRuntimeHandle(id: runID)
         }
 
@@ -367,13 +419,18 @@
             else {
                 return .failed(code: nil, message: "GEPA requested an evaluation outside the suite.")
             }
-            let admission: PromptExperimentBudgetLedger.Admission
+            let result: LedgerEvaluation
             do {
-                admission = try run.ledger.admit(candidateSHA256: request.candidateSHA256, exampleID: example.id, split: split)
+                result = try await admitAndEvaluate(
+                    run,
+                    candidate: request.candidate,
+                    candidateSHA256: request.candidateSHA256,
+                    example: example
+                )
             } catch {
                 return Self.failureReply(error)
             }
-            switch admission {
+            switch result {
             case let .exhausted(pool):
                 await run.progress(
                     pool == .heldOut
@@ -381,62 +438,150 @@
                         : "The approved evaluation cap is reached; GEPA stops with its saved incumbent."
                 )
                 return .budgetExhausted
-            case let .recorded(entry):
-                guard let outcome = entry.outcome else {
-                    return .failed(code: "ledger_failure", message: "A completed ledger entry has no outcome.")
-                }
-                run.replayedEvaluations += 1
+            case let .recorded(entry, outcome), let .spent(entry, outcome):
+                let replayed = if case .recorded = result { true } else { false }
                 return .evaluated(.init(
                     evaluationID: entry.evaluationID.uuidString,
                     score: outcome.score,
                     feedback: outcome.proposerFeedback,
-                    outputExcerpt: outcome.outputExcerpt,
-                    replayed: true
+                    outputExcerpt: split == .hiddenTest ? nil : outcome.outputExcerpt,
+                    replayed: replayed,
+                    promptTokens: outcome.usage?.promptTokens,
+                    completionTokens: outcome.usage?.completionTokens,
+                    searchRemaining: run.ledger.remaining(in: .search)
                 ))
+            }
+        }
+
+        /// The single ledger-admitted evaluation path shared by GEPA callbacks and baseline
+        /// calibration: replay a completed logical evaluation, refuse an exhausted pool, or
+        /// admit durably, spend, settle, and checkpoint. Throws provider, grading, ledger,
+        /// and cancellation failures after settling a spent admission as failed.
+        private func admitAndEvaluate(
+            _ run: ActiveRun,
+            candidate: String,
+            candidateSHA256: String,
+            example: PromptSuiteCase,
+            replicate: Int = 0,
+            pool: PromptExperimentBudgetLedger.Pool? = nil
+        ) async throws -> LedgerEvaluation {
+            let admission = try run.ledger.admit(
+                candidateSHA256: candidateSHA256,
+                exampleID: example.id,
+                split: example.split,
+                replicate: replicate,
+                pool: pool
+            )
+            switch admission {
+            case let .exhausted(pool):
+                return .exhausted(pool)
+            case let .recorded(entry):
+                guard let outcome = entry.outcome else {
+                    throw PromptExperimentBudgetLedger.LedgerError.unreadable("A completed ledger entry has no outcome.")
+                }
+                run.replayedEvaluations += 1
+                return .recorded(entry, outcome)
             case let .admitted(entry):
                 run.spentEvaluations += 1
                 do {
                     let outcome = try await run.harness.evaluate(
-                        candidate: request.candidate,
+                        candidate: candidate,
                         example: example,
                         evaluationID: entry.evaluationID
                     )
-                    let excerpt = split == .hiddenTest ? nil : PromptExperimentGrader.bounded(
-                        outcome.output,
-                        limit: ConnectedModelHarness.maximumOutputExcerptCharacters
-                    )
-                    try run.ledger.settle(entry.evaluationID, outcome: .init(
+                    let settled = PromptExperimentBudgetLedger.Outcome(
                         score: outcome.score,
                         proposerFeedback: outcome.proposerFeedback,
-                        outputExcerpt: excerpt,
-                        failureKind: outcome.failureKind
-                    ))
+                        outputExcerpt: example.split == .hiddenTest ? nil : ConnectedModelHarness.outputExcerpt(outcome.output),
+                        failureKind: outcome.failureKind,
+                        usage: outcome.usage
+                    )
+                    try run.ledger.settle(entry.evaluationID, outcome: settled)
                     let value = PromptExperimentOptimizationRuntimeEvaluation(
                         candidateIndex: -1,
                         exampleID: example.id,
-                        split: split,
+                        split: example.split,
                         score: outcome.score,
                         feedback: outcome.proposerFeedback,
                         failureKind: outcome.failureKind,
                         output: outcome.output,
-                        elapsedSeconds: outcome.elapsedSeconds
+                        elapsedSeconds: outcome.elapsedSeconds,
+                        usage: outcome.usage
                     )
-                    try await run.checkpoint(.evaluation(id: entry.evaluationID, candidate: request.candidate, value: value))
-                    run.evaluations.append(RecordedEvaluation(candidateSHA256: request.candidateSHA256, value: value))
-                    return .evaluated(.init(
-                        evaluationID: entry.evaluationID.uuidString,
-                        score: outcome.score,
-                        feedback: outcome.proposerFeedback,
-                        outputExcerpt: excerpt,
-                        replayed: false
-                    ))
+                    try await run.checkpoint(.evaluation(id: entry.evaluationID, candidate: candidate, value: value))
+                    run.evaluations.append(RecordedEvaluation(candidateSHA256: candidateSHA256, value: value))
+                    return .spent(entry, settled)
                 } catch {
                     if run.ledger.document.entries.contains(where: { $0.evaluationID == entry.evaluationID && $0.state == .admitted }) {
                         try? run.ledger.settle(entry.evaluationID, outcome: nil)
                     }
-                    return Self.failureReply(error)
+                    throw error
                 }
             }
+        }
+
+        // MARK: - Baseline calibration
+
+        /// Seed-only measurements before GEPA starts, charged to the separately approved
+        /// calibration line and cached across experiments with the same seed, suite, rubric,
+        /// and targets. A cache hit spends nothing. Held-out results are report-only, so a
+        /// provider or judge failure (or a spent line) leaves the baseline unavailable instead
+        /// of failing the search; ledger failures and cancellation still end the run.
+        private func calibrate(_ run: ActiveRun) async throws -> CalibrationResult {
+            let execution = run.execution
+            let hidden = execution.suite.cases.filter { $0.split == .hiddenTest }
+            guard !hidden.isEmpty else { return CalibrationResult(heldOutScores: nil, source: nil) }
+            let key = execution.calibrationKey
+            if let cached = PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key),
+               cached.isComplete(for: execution.suite.cases),
+               let scores = cached.heldOutScores
+            {
+                await run.progress("Reusing the cached seed held-out baseline for this seed, suite, rubric, and target set; no calibration evaluations spent.")
+                return CalibrationResult(heldOutScores: scores, source: .cache)
+            }
+            await run.progress("Calibrating the seed baseline: scoring \(hidden.count) held-out case(s) once on the separately approved calibration line.")
+            let seedSHA256 = execution.baselineSHA256
+            var scores: [String: Double] = [:]
+            for example in hidden {
+                let result: LedgerEvaluation
+                do {
+                    result = try await admitAndEvaluate(
+                        run,
+                        candidate: execution.baseline,
+                        candidateSHA256: seedSHA256,
+                        example: example,
+                        pool: .calibration
+                    )
+                } catch let failure as PromptExperimentProviderFailure {
+                    await run.progress("Seed held-out calibration failed (\(failure.code.rawValue)); the held-out baseline is reported as unavailable.")
+                    return CalibrationResult(heldOutScores: nil, source: nil)
+                } catch is PromptExperimentGrading.Failure {
+                    await run.progress("Seed held-out calibration could not be graded; the held-out baseline is reported as unavailable.")
+                    return CalibrationResult(heldOutScores: nil, source: nil)
+                }
+                switch result {
+                case .exhausted:
+                    await run.progress("The calibration line is used up; the held-out baseline is reported as unavailable.")
+                    return CalibrationResult(heldOutScores: nil, source: nil)
+                case let .recorded(_, outcome), let .spent(_, outcome):
+                    scores[example.id] = outcome.score
+                }
+            }
+            do {
+                try PromptExperimentCalibrationCache.save(
+                    PromptExperimentBaselineCalibration(
+                        schemaVersion: PromptExperimentBaselineCalibration.schemaVersion,
+                        key: key,
+                        seedSHA256: seedSHA256,
+                        heldOutScores: scores,
+                        createdAt: environment.now()
+                    ),
+                    storeRoot: environment.storeRoot
+                )
+            } catch {
+                await run.progress("The calibration cache could not be saved (\(error.localizedDescription)); later experiments will calibrate again.")
+            }
+            return CalibrationResult(heldOutScores: scores, source: .calibrated)
         }
 
         private func handleEvent(_ run: ActiveRun, _ event: GEPAWorkerProtocol.Event) async throws {
@@ -461,7 +606,7 @@
                 let score = candidate.aggregateScore.map { String(format: " (validation %.3f)", $0) } ?? ""
                 await run.progress("GEPA registered candidate \(candidate.candidateIndex + 1)\(score).")
             case let .evaluation(evaluation):
-                await run.progress("Evaluated \(evaluation.split) case \(evaluation.exampleID)\(evaluation.replayed ? " (replayed from the ledger)" : ""); \(run.ledger.totalAdmitted)/\(run.execution.maxEvaluations) approved evaluations used.")
+                await run.progress("Evaluated \(evaluation.split) case \(evaluation.exampleID)\(evaluation.replayed ? " (replayed from the ledger)" : ""); \(run.ledger.cappedAdmitted)/\(run.execution.maxEvaluations) approved search evaluations used.")
             case let .reflection(reflection):
                 switch reflection.contract {
                 case "envelope":
@@ -511,10 +656,11 @@
                     feedback: value.feedback,
                     failureKind: value.failureKind,
                     output: value.output,
-                    elapsedSeconds: value.elapsedSeconds
+                    elapsedSeconds: value.elapsedSeconds,
+                    usage: value.usage
                 )
             }
-            let optimization = PromptExperimentOptimizationRuntimeResult(
+            var optimization = PromptExperimentOptimizationRuntimeResult(
                 engine: "gepa",
                 upstreamRevision: terminal.upstreamRevision,
                 baselineScore: terminal.baselineScore,
@@ -530,10 +676,28 @@
                 rawResultJSON: completion.rawResultJSON,
                 stopReason: terminal.stopReason,
                 heldOut: terminal.heldOut.map {
-                    PromptExperimentHeldOutSummary(baselineAverage: $0.baseline?.average, bestAverage: $0.best?.average)
-                }
+                    PromptExperimentHeldOutSummary(
+                        baselineAverage: $0.baseline?.average,
+                        bestAverage: $0.best?.average,
+                        baselineSource: $0.baseline == nil ? nil : run.calibration.source
+                    )
+                },
+                stoppedBeforeUnfinishableIteration: terminal.stoppedBeforeUnfinishableIteration
             )
+            optimization.candidateUsage = texts.map { Self.candidateUsage(text: $0, ledger: run.ledger) }
             return runtimeResult(run, terminal.stopReason == "budget_exhausted" ? .stoppedBudget : .completed, optimization: optimization)
+        }
+
+        /// Averages over every completed evaluation of this exact text on visible splits
+        /// (replays included, since the ledger holds the whole experiment).
+        static func candidateUsage(text: String, ledger: PromptExperimentBudgetLedger) -> PromptExperimentCandidateUsage? {
+            let sha256 = PromptExperimentDigest.sha256(Data(text.utf8))
+            let usages = ledger.document.entries.compactMap { entry -> PromptExperimentEvaluationUsage? in
+                guard entry.candidateSHA256 == sha256, entry.state == .completed, entry.split != .hiddenTest else { return nil }
+                return entry.outcome?.usage
+            }
+            guard !usages.isEmpty else { return nil }
+            return .aggregate(promptCharacters: text.count, usages: usages)
         }
 
         private func runtimeResult(
@@ -544,8 +708,9 @@
             PromptExperimentRuntimeResult(
                 disposition: disposition,
                 optimization: optimization,
-                admissionsAfter: run.ledger.totalAdmitted,
-                interruptedAdmissionsSettled: run.ledger.interruptedSettledOnOpen
+                admissionsAfter: run.ledger.cappedAdmitted,
+                interruptedAdmissionsSettled: run.ledger.interruptedSettledOnOpen,
+                calibrationAdmissionsAfter: run.ledger.calibrationAdmitted
             )
         }
 

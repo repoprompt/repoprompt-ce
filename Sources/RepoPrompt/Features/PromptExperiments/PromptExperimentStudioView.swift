@@ -179,6 +179,9 @@
                                         VStack(alignment: .leading, spacing: 3) {
                                             Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · best" : "") · score \(candidate.aggregateScore.map { String(format: "%.3f", $0) } ?? "—") · parents \(candidate.parentIndices.map(String.init).joined(separator: ", "))")
                                                 .font(.caption.bold())
+                                            if let usage = candidate.usage {
+                                                Text(usage.summary).font(.caption).foregroundStyle(.secondary)
+                                            }
                                             Text(candidate.candidatePreview).font(.caption).lineLimit(6).textSelection(.enabled)
                                             if run.state == .completed || run.state == .stoppedBudget {
                                                 Button("Propose source patch") {

@@ -209,6 +209,7 @@
                 "- Suite: `\(authority.suiteID)` (`\(authority.suiteSHA256)`)",
                 "- Targets: execution \(authority.targets.execution.displayName); reflection \(authority.targets.reflection.displayName); judge \(authority.targets.judge?.displayName ?? "not used")",
                 "- Approved cap: \(authority.maxEvaluations) evaluations; used \(experiment.admissionsUsed); remaining \(experiment.remainingEvaluations)",
+                "- Baseline calibration line: up to \(authority.calibrationEvaluations) evaluations; used \(experiment.calibrationAdmissionsUsed)",
                 "- Authority digest: `\(experiment.authorityDigest)`",
                 "- Approval: \(experiment.approval.map { "native, \(iso8601.string(from: $0.approvedAt))" } ?? "not approved")",
                 "",

@@ -323,6 +323,7 @@
                 targets: PromptExperimentTargets(execution: execution, reflection: reflection, judge: judge),
                 settings: settings,
                 maxEvaluations: maxEvaluations,
+                calibrationEvaluations: PromptExperimentBudgetLedger.calibrationEvaluations(cases: suite.cases),
                 pythonSealValue: pythonSealValue(),
                 gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
             )
@@ -432,7 +433,7 @@
             guard activeRun == nil else { throw PromptExperimentAuthorityError.runActive }
             let used = max(
                 experiment.admissionsUsed,
-                PromptExperimentBudgetLedger.peekTotalAdmitted(directory: runtime.runDirectoryURL(for: experiment))
+                PromptExperimentBudgetLedger.peekCappedAdmitted(directory: runtime.runDirectoryURL(for: experiment))
             )
             guard used < experiment.authority.maxEvaluations else { throw PromptExperimentAuthorityError.budgetExhausted }
             let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
@@ -587,6 +588,7 @@
             try? mutateRun(experimentID: experimentID, runID: runID) { run in
                 run.settledAt = now()
                 run.admissionsAfter = result.admissionsAfter
+                run.calibrationAdmissions = result.calibrationAdmissionsAfter
                 run.interruptedAdmissionsSettled = result.interruptedAdmissionsSettled
                 run.result = installed
                 switch result.disposition {
@@ -629,7 +631,8 @@
                     candidatePreview: String(candidate.prefix(600)),
                     aggregateScore: index < runtime.aggregateScores.count ? runtime.aggregateScores[index] : nil,
                     isBaseline: index == 0,
-                    isBest: index == runtime.bestCandidateIndex
+                    isBest: index == runtime.bestCandidateIndex,
+                    usage: index < runtime.candidateUsage.count ? runtime.candidateUsage[index] : nil
                 ))
             }
             var evaluations: [PromptExperimentEvaluationEvidence] = []
@@ -651,7 +654,8 @@
                     feedback: evaluation.feedback,
                     failureKind: evaluation.failureKind,
                     outputEvidence: outputEvidence,
-                    elapsedSeconds: evaluation.elapsedSeconds
+                    elapsedSeconds: evaluation.elapsedSeconds,
+                    usage: evaluation.usage
                 ))
             }
             return PromptExperimentOptimizationResult(
@@ -667,7 +671,8 @@
                 proposerUsage: runtime.proposerUsage,
                 rawResultEvidence: rawResultEvidence,
                 stopReason: runtime.stopReason,
-                heldOut: runtime.heldOut
+                heldOut: runtime.heldOut,
+                stoppedBeforeUnfinishableIteration: runtime.stoppedBeforeUnfinishableIteration
             )
         }
 
@@ -716,7 +721,8 @@
                     run.evaluations.append(PromptExperimentScoredEvaluation(id: id, candidateEvidence: candidateRef, evaluation: .init(
                         id: id, candidateIndex: evaluation.candidateIndex, exampleID: evaluation.exampleID,
                         split: evaluation.split, score: evaluation.score, feedback: evaluation.feedback,
-                        failureKind: evaluation.failureKind, outputEvidence: outputRef, elapsedSeconds: evaluation.elapsedSeconds
+                        failureKind: evaluation.failureKind, outputEvidence: outputRef, elapsedSeconds: evaluation.elapsedSeconds,
+                        usage: evaluation.usage
                     )))
                 }
             case let .grading(value):

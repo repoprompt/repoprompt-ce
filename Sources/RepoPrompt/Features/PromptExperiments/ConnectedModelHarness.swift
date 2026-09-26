@@ -31,7 +31,18 @@
     /// the answer with the suite grader.
     @MainActor
     final class ConnectedModelHarness: PromptHarness {
-        static let maximumOutputExcerptCharacters = 8 * 1024
+        /// Proposer excerpts keep the start and the end of an answer (later sections such as
+        /// risks and tests are where plans usually fall short) with an explicit omission marker.
+        static let outputExcerptHeadCharacters = 3 * 1024
+        static let outputExcerptTailCharacters = 3 * 1024
+
+        static func outputExcerpt(_ output: String) -> String {
+            let head = outputExcerptHeadCharacters
+            let tail = outputExcerptTailCharacters
+            guard output.count > head + tail else { return output }
+            let omitted = output.count - head - tail
+            return "\(output.prefix(head))\n\n[… \(omitted) characters omitted from the middle of this output; RepoPrompt retains the full text …]\n\n\(output.suffix(tail))"
+        }
 
         private let promptID: BuiltInPromptID
         private let executionTarget: PromptExperimentResolvedTarget
@@ -83,8 +94,9 @@
             let systemPrompt = try Self.renderSystemPrompt(candidate: candidate, promptID: promptID, registry: registry)
             await progress("Evaluating a candidate on suite case \(example.id).")
             let output: String
+            let usage: PromptExperimentEvaluationUsage
             do {
-                output = try await invoker.invoke(
+                let completion = try await invoker.invoke(
                     target: executionTarget,
                     role: "execution",
                     systemPrompt: systemPrompt,
@@ -92,7 +104,14 @@
                     onRetry: { [progress] retry, code, delay in
                         await progress("Retrying the target call after \(code.rawValue) (retry \(retry)) in \(String(format: "%.1f", delay))s.")
                     }
-                ).output
+                )
+                output = completion.output
+                usage = PromptExperimentEvaluationUsage(
+                    promptCharacters: candidate.count,
+                    outputCharacters: output.count,
+                    promptTokens: completion.promptTokens,
+                    completionTokens: completion.completionTokens
+                )
             } catch let failure as PromptExperimentProviderFailure where failure.code == .toolViolation {
                 // The candidate steered a tool-free target into a tool call: a candidate outcome.
                 let feedback = "The candidate caused the target to request a disabled tool. Prompt-only targets must answer directly."
@@ -101,7 +120,10 @@
                     proposerFeedback: example.split.proposerFacingFeedback(feedback),
                     output: "",
                     failureKind: .candidate,
-                    elapsedSeconds: max(0, uptime() - started)
+                    elapsedSeconds: max(0, uptime() - started),
+                    usage: PromptExperimentEvaluationUsage(
+                        promptCharacters: candidate.count, outputCharacters: 0, promptTokens: nil, completionTokens: nil
+                    )
                 )
             }
             let grade = try await grader.grade(
@@ -118,7 +140,8 @@
                 proposerFeedback: grade.proposerFeedback,
                 output: output,
                 failureKind: nil,
-                elapsedSeconds: max(0, uptime() - started)
+                elapsedSeconds: max(0, uptime() - started),
+                usage: usage
             )
         }
     }

@@ -89,19 +89,21 @@ import XCTest
         private final class FakeWorker: GEPAWorkerRunning {
             let script: Script
             private(set) var cancelled = false
+            private(set) var request: GEPAWorkerProtocol.RunRequest?
 
             init(script: @escaping Script) {
                 self.script = script
             }
 
             func run(
-                request _: GEPAWorkerProtocol.RunRequest,
+                request: GEPAWorkerProtocol.RunRequest,
                 pythonSealValue _: String,
                 layout _: GEPAWorkerLayout,
                 host: @escaping GEPAWorkerHostHandler,
                 event: @escaping GEPAWorkerEventHandler,
                 observation _: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
             ) async throws -> GEPAWorkerCompletion {
+                self.request = request
                 let terminal = try await script(host, event)
                 return try GEPAWorkerCompletion(terminal: terminal, rawResultJSON: JSONEncoder().encode(terminal))
             }
@@ -514,6 +516,7 @@ import XCTest
                 targets: experiment.authority.targets,
                 settings: experiment.authority.settings,
                 maxEvaluations: 3,
+                calibrationEvaluations: 0,
                 pythonSealValue: experiment.authority.pythonSealValue,
                 gepaRevision: experiment.authority.gepaRevision
             )
@@ -525,7 +528,7 @@ import XCTest
             let runRoot = root.appendingPathComponent(GEPARunController.runDirectoryRelativePath(experimentID: experiment.id, authorityDigest: experiment.authorityDigest))
             let crashed = try PromptExperimentBudgetLedger.open(
                 directory: runRoot, authorityDigest: experiment.authorityDigest, totalCap: 4, heldOutReserve: 0,
-                gepaStateURL: runRoot.appendingPathComponent("gepa-run/gepa_state.bin")
+                calibrationReserve: 0, gepaStateURL: runRoot.appendingPathComponent("gepa-run/gepa_state.bin")
             )
             _ = try crashed.admit(candidateSHA256: "x", exampleID: "t1", split: .training)
             let worker = FakeWorker { _, event in
@@ -547,13 +550,141 @@ import XCTest
             let request = GEPARunController.makeWorkerRequest(execution: execution, runRoot: URL(fileURLWithPath: "/tmp/run"))
             XCTAssertEqual(request.examples.map(\.id), ["t1", "v1"])
             XCTAssertEqual(request.heldOutExamples.map(\.id), ["h1"])
-            XCTAssertEqual(request.searchMaxEvaluations, 4, "the held-out reserve (2 per hidden case) is excluded")
+            XCTAssertEqual(request.searchMaxEvaluations, 5, "the held-out reserve (1 per hidden case, incumbent only) is excluded")
             XCTAssertEqual(request.seedCandidate, "seed prompt", "the seed is the built-in baseline")
+            XCTAssertEqual(request.reflectionMinibatchSize, 2)
+            XCTAssertEqual(request.candidateSelectionStrategy, "current_best")
+            XCTAssertFalse(request.useMerge)
+            XCTAssertNil(request.heldOutBaseline)
             let wire = try String(decoding: JSONEncoder().encode(request), as: UTF8.self)
             XCTAssertFalse(wire.contains("SECRET"))
             XCTAssertFalse(wire.contains("\"good\""))
             XCTAssertFalse(wire.contains("hidden input"), "held-out inputs never cross to the worker")
             XCTAssertEqual(request.heldOutExamples, [.init(id: "h1", split: "hidden_test")])
+        }
+
+        // MARK: Baseline calibration
+
+        private static let hiddenCases = PromptExperimentTestFixtures.defaultCases + [
+            .init(id: "h1", split: "hidden_test", input: "hidden input")
+        ]
+
+        func testSeedHeldOutBaselineIsCalibratedOnceThenReusedAcrossExperiments() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: makeRoot(), cases: Self.hiddenCases)
+            let first = try PromptExperimentTestFixtures.makeExperiment(registry: registry, maxEvaluations: 6)
+            let second = try PromptExperimentTestFixtures.makeExperiment(registry: registry, maxEvaluations: 6)
+            XCTAssertEqual(first.authority.calibrationEvaluations, 1)
+            let completer = FakeCompleter()
+            func worker() -> FakeWorker {
+                FakeWorker { _, event in
+                    try await Self.register(event, 0, "seed prompt", score: 1)
+                    return Self.terminal(
+                        [("seed prompt", [], 1)], best: 0,
+                        heldOut: .init(baseline: .init(scores: ["h1": 1], average: 1), best: .init(scores: ["h1": 1], average: 1))
+                    )
+                }
+            }
+            let workers = [worker(), worker()]
+            let controller = makeController(root: root, registry: registry, completer: completer, workers: workers)
+
+            let calibrated = try await controller.wait(for: submit(controller, experiment: first))
+            XCTAssertEqual(completer.executionCalls, 1, "the seed's held-out case is scored once before search")
+            XCTAssertEqual(workers[0].request?.heldOutBaseline, .init(scores: ["h1": 1], average: 1))
+            XCTAssertEqual(calibrated.calibrationAdmissionsAfter, 1)
+            XCTAssertEqual(calibrated.admissionsAfter, 0, "calibration is outside the approved search cap")
+            XCTAssertEqual(calibrated.optimization?.heldOut?.baselineSource, .calibrated)
+            XCTAssertEqual(try ledger(root: root, experiment: first).entries.map(\.pool), [.calibration])
+
+            let reused = try await controller.wait(for: submit(controller, experiment: second))
+            XCTAssertEqual(completer.executionCalls, 1, "a matching cache entry spends nothing")
+            XCTAssertEqual(workers[1].request?.heldOutBaseline, .init(scores: ["h1": 1], average: 1))
+            XCTAssertEqual(reused.calibrationAdmissionsAfter, 0)
+            XCTAssertEqual(reused.optimization?.heldOut?.baselineSource, .cache)
+            XCTAssertTrue(reused.optimization?.heldOut?.summary.contains("reused from the calibration cache") == true)
+        }
+
+        func testCalibrationFailureLeavesTheBaselineUnavailableWithoutFailingTheSearch() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: makeRoot(), cases: Self.hiddenCases)
+            let experiment = try PromptExperimentTestFixtures.makeExperiment(registry: registry, maxEvaluations: 6)
+            let completer = FakeCompleter()
+            completer.handler = { _, _, user in
+                if user.contains("hidden input") { throw PromptExperimentProviderFailure(code: .rejected) }
+                return "good"
+            }
+            let worker = FakeWorker { _, event in
+                try await Self.register(event, 0, "seed prompt", score: 1)
+                return Self.terminal([("seed prompt", [], 1)], best: 0)
+            }
+            let controller = makeController(root: root, registry: registry, completer: completer, workers: [worker])
+            let result = try await controller.wait(for: submit(controller, experiment: experiment))
+            XCTAssertEqual(result.disposition, .completed)
+            XCTAssertNil(worker.request?.heldOutBaseline)
+            let key = try GEPARunController.resolveExecution(experiment, registry: registry).calibrationKey
+            XCTAssertNil(PromptExperimentCalibrationCache.load(storeRoot: root, key: key), "a failed calibration is never cached")
+        }
+
+        func testCalibrationKeyChangesWithEveryMeasuredInput() {
+            let targets = PromptExperimentTargets(
+                execution: PromptExperimentTestFixtures.execution,
+                reflection: PromptExperimentTestFixtures.reflection,
+                judge: PromptExperimentTestFixtures.judge
+            )
+            func key(seed: String = "s", suite: String = "u", rubric: String? = "r", targets: PromptExperimentTargets = targets) -> String {
+                PromptExperimentCalibrationCache.key(promptID: .oraclePlan, seedSHA256: seed, suiteSHA256: suite, rubricSHA256: rubric, targets: targets)
+            }
+            let base = key()
+            XCTAssertEqual(base, key(), "deterministic")
+            XCTAssertNotEqual(base, key(seed: "t"))
+            XCTAssertNotEqual(base, key(suite: "v"))
+            XCTAssertNotEqual(base, key(rubric: nil))
+            XCTAssertNotEqual(base, key(targets: .init(execution: targets.reflection, reflection: targets.reflection, judge: targets.judge)))
+            XCTAssertNotEqual(base, key(targets: .init(execution: targets.execution, reflection: targets.reflection, judge: targets.reflection)))
+            XCTAssertEqual(
+                base,
+                key(targets: .init(execution: targets.execution, reflection: PromptExperimentTestFixtures.judge, judge: targets.judge)),
+                "the reflection model never influences seed measurements"
+            )
+        }
+
+        func testEvaluationRepliesCarryLedgerRemainingAndUsageAggregatesPerCandidate() async throws {
+            let root = try makeRoot()
+            let (experiment, registry) = try makeExperiment(maxEvaluations: 5)
+            let replies = Recorder<GEPAWorkerProtocol.HostReply>()
+            let worker = FakeWorker { host, event in
+                try await Self.register(event, 0, "seed prompt", score: 1)
+                for request in [Self.evaluate("seed prompt", "v1", .validation), Self.evaluate("seed prompt", "t1"), Self.evaluate("seed prompt", "t1")] {
+                    await replies.append(host(request))
+                }
+                return Self.terminal([("seed prompt", [], 1)], best: 0)
+            }
+            let controller = makeController(root: root, registry: registry, completer: FakeCompleter(), workers: [worker])
+            let result = try await controller.wait(for: submit(controller, experiment: experiment))
+            let remaining = replies.values.compactMap { reply -> Int? in
+                if case let .evaluated(value) = reply { return value.searchRemaining }
+                return nil
+            }
+            XCTAssertEqual(remaining, [4, 3, 3], "a replay spends nothing and reports the same remaining count")
+            guard case let .evaluated(first) = replies.values.first else { return XCTFail("Expected a scored reply") }
+            XCTAssertEqual(first.promptTokens, 3)
+            XCTAssertEqual(first.completionTokens, 2)
+            let usage = try XCTUnwrap(result.optimization?.candidateUsage.first ?? nil)
+            XCTAssertEqual(usage.promptCharacters, "seed prompt".count)
+            XCTAssertEqual(usage.evaluations, 2)
+            XCTAssertEqual(usage.averageOutputCharacters, 4)
+            XCTAssertEqual(usage.averageCompletionTokens, 2)
+            XCTAssertEqual(result.optimization?.evaluations.first?.usage?.outputCharacters, 4)
+        }
+
+        func testOutputExcerptKeepsHeadAndTailWithAnOmissionMarker() {
+            let head = String(repeating: "H", count: 4000)
+            let tail = String(repeating: "T", count: 4000)
+            let excerpt = ConnectedModelHarness.outputExcerpt(head + tail)
+            XCTAssertTrue(excerpt.hasPrefix(String(repeating: "H", count: 3072)))
+            XCTAssertTrue(excerpt.hasSuffix(String(repeating: "T", count: 3072)))
+            XCTAssertTrue(excerpt.contains("1856 characters omitted"))
+            XCTAssertEqual(ConnectedModelHarness.outputExcerpt("short"), "short")
         }
 
         func testCaseInputIsPackagedLikeAProductionOracleUserMessage() throws {

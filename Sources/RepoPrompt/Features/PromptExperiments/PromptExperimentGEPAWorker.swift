@@ -33,10 +33,16 @@
             let heldOutExamples: [HeldOutExample]
             /// Cumulative GEPA search cap (approved total minus the held-out reserve).
             let searchMaxEvaluations: Int
+            /// Search admissions the host ledger still allows when this run starts; every
+            /// evaluation reply refreshes it for the worker's iteration-boundary stopper.
+            var searchRemaining: Int?
+            /// The seed's held-out baseline from calibration; the reserve then scores only the incumbent.
+            var heldOutBaseline: HeldOutScores?
             let reflectionMinibatchSize: Int
             let useMerge: Bool
             let maxMergeInvocations: Int
             let skipPerfectScore: Bool
+            let candidateSelectionStrategy: String
             let perfectScore: Double
             let stopAtScore: Double?
             let randomSeed: Int
@@ -51,10 +57,13 @@
                 case examples
                 case heldOutExamples = "held_out_examples"
                 case searchMaxEvaluations = "search_max_evaluations"
+                case searchRemaining = "search_remaining"
+                case heldOutBaseline = "held_out_baseline"
                 case reflectionMinibatchSize = "reflection_minibatch_size"
                 case useMerge = "use_merge"
                 case maxMergeInvocations = "max_merge_invocations"
                 case skipPerfectScore = "skip_perfect_score"
+                case candidateSelectionStrategy = "candidate_selection_strategy"
                 case perfectScore = "perfect_score"
                 case stopAtScore = "stop_at_score"
                 case randomSeed = "random_seed"
@@ -90,6 +99,8 @@
             let replayed: Bool
             var promptTokens: Int?
             var completionTokens: Int?
+            /// Search-pool admissions left after this evaluation (host ledger authority).
+            var searchRemaining: Int?
         }
 
         enum HostReply: Equatable {
@@ -116,6 +127,7 @@
                     if let excerpt = reply.outputExcerpt { value["output_excerpt"] = excerpt }
                     if let promptTokens = reply.promptTokens { value["prompt_tokens"] = promptTokens }
                     if let completionTokens = reply.completionTokens { value["completion_tokens"] = completionTokens }
+                    if let searchRemaining = reply.searchRemaining { value["search_remaining"] = searchRemaining }
                 case .budgetExhausted:
                     value["status"] = "budget_exhausted"
                 case let .failed(code, message):
@@ -223,6 +235,9 @@
             let wallTimeSeconds: Double?
             let heldOut: HeldOut?
             let proposerUsage: String
+            var searchRemaining: Int?
+            var iterationCost: Int?
+            var stoppedBeforeUnfinishableIteration: Bool?
 
             enum CodingKeys: String, CodingKey {
                 case engine
@@ -237,6 +252,9 @@
                 case wallTimeSeconds = "wall_time_seconds"
                 case heldOut = "held_out"
                 case proposerUsage = "proposer_usage"
+                case searchRemaining = "search_remaining"
+                case iterationCost = "iteration_cost"
+                case stoppedBeforeUnfinishableIteration = "stopped_before_unfinishable_iteration"
             }
         }
 

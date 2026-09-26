@@ -291,7 +291,8 @@
                         })),
                         "minimum_max_evaluations": .int(PromptExperimentBudgetLedger.minimumApprovableEvaluations(
                             cases: suite.cases, reflectionMinibatchSize: PromptExperimentGEPASettings().reflectionMinibatchSize
-                        ))
+                        )),
+                        "budget_guide": budgetGuide(cases: suite.cases, minibatch: PromptExperimentGEPASettings().reflectionMinibatchSize)
                     ])
                 } catch {
                     value["suite"] = .null
@@ -322,6 +323,33 @@
                     "status_or_wait with experiment_id blocks until the approval or run state changes, or timeout_seconds elapses.",
                     "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff."
                 ].map(Value.string))
+            ])
+        }
+
+        /// How the default settings spend a cap on this suite, so a caller can size `max_evaluations`.
+        static func budgetGuide(cases: [PromptSuiteCase], minibatch: Int) -> Value {
+            let shape = PromptExperimentBudgetLedger.searchShape(cases: cases, reflectionMinibatchSize: minibatch)
+            return .object([
+                "seed_validation_pass": .int(shape.validationPass),
+                "accepted_proposal_cost": .int(shape.iterationCost),
+                "rejected_proposal_cost": .int(shape.iterationCost - shape.validationPass),
+                "held_out_reserve": .int(PromptExperimentBudgetLedger.heldOutReserve(for: cases)),
+                "calibration_evaluations": .int(PromptExperimentBudgetLedger.calibrationEvaluations(cases: cases)),
+                "expected_proposals_at_25": .int(PromptExperimentBudgetLedger.expectedProposals(
+                    cap: 25, cases: cases, reflectionMinibatchSize: minibatch
+                )),
+                "note": .string("Calibration is a separate approved line, spent only when the cross-experiment baseline cache misses. The worker never starts an iteration the remaining cap cannot finish.")
+            ])
+        }
+
+        static func usageValue(_ usage: PromptExperimentCandidateUsage) -> Value {
+            .object([
+                "prompt_characters": .int(usage.promptCharacters),
+                "evaluations": .int(usage.evaluations),
+                "average_output_characters": usage.averageOutputCharacters.map(Value.double) ?? .null,
+                "token_reported_evaluations": .int(usage.tokenReportedEvaluations),
+                "average_prompt_tokens": usage.averagePromptTokens.map(Value.double) ?? .null,
+                "average_completion_tokens": usage.averageCompletionTokens.map(Value.double) ?? .null
             ])
         }
 
@@ -380,13 +408,16 @@
                     "reflection_target": targetValue(authority.targets.reflection),
                     "judge_target": authority.targets.judge.map(targetValue) ?? .null,
                     "max_evaluations": .int(authority.maxEvaluations),
+                    "calibration_evaluations": .int(authority.calibrationEvaluations),
                     "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
+                    "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
                     "max_provider_retries": .int(settings.maxProviderRetries),
                     "random_seed": .int(settings.randomSeed),
                     "gepa_revision": .string(authority.gepaRevision)
                 ]),
                 "admissions_used": .int(experiment.admissionsUsed),
                 "remaining_evaluations": .int(experiment.remainingEvaluations),
+                "calibration_admissions_used": .int(experiment.calibrationAdmissionsUsed),
                 "approval_requested_at": experiment.approvalRequest.map { .string(iso8601.string(from: $0.requestedAt)) } ?? .null,
                 "approved_at": experiment.approval.map { .string(iso8601.string(from: $0.approvedAt)) } ?? .null,
                 "runs": .array(experiment.runs.map(runValue)),
@@ -409,6 +440,7 @@
                 "status_text": .string(run.statusText),
                 "admissions_before": .int(run.admissionsBefore),
                 "admissions_after": run.admissionsAfter.map(Value.int) ?? .null,
+                "calibration_admissions": run.calibrationAdmissions.map(Value.int) ?? .null,
                 "interrupted_admissions_settled": .int(run.interruptedAdmissionsSettled),
                 "uncertain_remote_settlement": .bool(run.uncertainRemoteSettlement),
                 "scored_evaluations": .int(run.evaluations.count),
@@ -432,7 +464,11 @@
                 if let summary = result.heldOut {
                     let baseline: Value = summary.baselineAverage.map(Value.double) ?? .null
                     let best: Value = summary.bestAverage.map(Value.double) ?? .null
-                    heldOut = .object(["baseline_average": baseline, "best_average": best])
+                    heldOut = .object([
+                        "baseline_average": baseline,
+                        "best_average": best,
+                        "baseline_source": summary.baselineSource.map { .string($0.rawValue) } ?? .null
+                    ])
                 }
                 value["result"] = .object([
                     "stop_reason": result.stopReason.map(Value.string) ?? .null,
@@ -450,7 +486,8 @@
                             "is_baseline": .bool(candidate.isBaseline),
                             "is_best": .bool(candidate.isBest),
                             "sha256": .string(candidate.candidateEvidence.sha256),
-                            "preview": .string(candidate.candidatePreview)
+                            "preview": .string(candidate.candidatePreview),
+                            "usage": candidate.usage.map(usageValue) ?? .null
                         ])
                     })
                 ])

@@ -15,7 +15,8 @@
                 field("Reflection model", authority.targets.reflection.displayName)
                 field("Judge", authority.targets.judge?.displayName ?? "Exact match (no judge model)")
                 field("Evaluation cap", "\(authority.maxEvaluations) total · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
-                field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
+                field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
+                field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
                 field("Authority digest", String(experiment.authorityDigest.prefix(24)))
             }
         }
