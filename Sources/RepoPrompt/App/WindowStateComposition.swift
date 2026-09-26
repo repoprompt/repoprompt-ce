@@ -48,14 +48,20 @@ enum WindowStateCompositionFactory {
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                enableCatalogShardShadowValidation: false
+                enableCatalogShardShadowValidation: false,
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
             )
         #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore()
+            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
+            )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
         let workspaceSearchService = WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        if injectedWorkspaceFileContextStore == nil {
+            workspaceFilesViewModel.bindNonGitCodeMapsSetting(settingsStore)
+        }
 
         // 2) AI queries
         let keyManager = injectedKeyManager ?? KeyManager()

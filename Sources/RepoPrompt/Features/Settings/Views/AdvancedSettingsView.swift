@@ -223,6 +223,15 @@ struct AdvancedSettingsView: View {
                     )
                 )
 
+                SettingToggle(
+                    title: "Enable Code Maps in non-Git folders",
+                    description: "Off by default for existing workspaces. Enable to allow background Code Map scanning for plain folders.",
+                    isOn: Binding(
+                        get: { globalSettings.nonGitCodeMapsEnabled },
+                        set: { globalSettings.setNonGitCodeMapsEnabled($0) }
+                    )
+                )
+
                 if globalSettings.codeMapsGloballyDisabled {
                     Text("Code Maps are disabled globally. Existing Copy and Chat Code Map modes are preserved and will take effect again when this is turned off.")
                         .font(.subheadline)

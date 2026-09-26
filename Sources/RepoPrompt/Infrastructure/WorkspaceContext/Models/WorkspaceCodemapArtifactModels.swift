@@ -1,6 +1,19 @@
 import Foundation
 import RepoPromptCodeMapCore
 
+/// Catalog paths retain the user's loaded spelling; capabilities use physical root paths.
+/// Equality is evaluated at use time so a retargeted symlink cannot keep serving old evidence.
+enum WorkspaceCodemapRootPathBinding {
+    static func matches(_ candidateRootPath: String, authorizedRootURL: URL) -> Bool {
+        if candidateRootPath == authorizedRootURL.path {
+            return true
+        }
+        return URL(fileURLWithPath: candidateRootPath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path ==
+            authorizedRootURL.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+}
+
 struct WorkspaceCodemapArtifactBindingIdentity: Hashable {
     let rootID: UUID
     let rootLifetimeID: UUID
@@ -125,8 +138,9 @@ struct WorkspaceCodemapSourceExpectation: Hashable {
         sourceAuthority: WorkspaceCodemapSourceAuthorityToken
     ) -> WorkspaceCodemapSourceExpectation? {
         guard sourceAuthority.isBound(to: bindingIdentity),
-              locatorIdentity.repositoryNamespace == sourceAuthority.repositoryAuthority.repositoryNamespace,
-              locatorIdentity.objectFormat == sourceAuthority.repositoryAuthority.objectFormat
+              let gitAuthority = sourceAuthority.gitAuthority,
+              locatorIdentity.repositoryNamespace == gitAuthority.repositoryNamespace,
+              locatorIdentity.objectFormat == gitAuthority.objectFormat
         else { return nil }
         return WorkspaceCodemapSourceExpectation(
             storage: .cleanGitBlob(
@@ -164,8 +178,9 @@ struct WorkspaceCodemapSourceExpectation: Hashable {
         guard sourceAuthority.isBound(to: bindingIdentity) else { return false }
         switch storage {
         case let .cleanGitBlob(locatorIdentity, authority):
-            return locatorIdentity.repositoryNamespace == authority.repositoryAuthority.repositoryNamespace &&
-                locatorIdentity.objectFormat == authority.repositoryAuthority.objectFormat
+            guard let gitAuthority = authority.gitAuthority else { return false }
+            return locatorIdentity.repositoryNamespace == gitAuthority.repositoryNamespace &&
+                locatorIdentity.objectFormat == gitAuthority.objectFormat
         case .validatedWorktree:
             return true
         }
@@ -279,7 +294,7 @@ enum WorkspaceCodemapArtifactCompletionDisposition: Equatable {
     case fullPathMismatch
     case requestGenerationMismatch
     case catalogGenerationMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case unvalidatedSourceAuthority
     case sourceAuthorityRootEpochMismatch
     case sourceAuthorityPathMismatch
@@ -424,14 +439,17 @@ struct WorkspaceCodemapArtifactBinding: Equatable {
     ) -> WorkspaceCodemapArtifactCompletionDisposition? {
         let receivedAuthority = received.sourceAuthority
         let expectedAuthority = expected.sourceAuthority
-        guard receivedAuthority.repositoryAuthority == expectedAuthority.repositoryAuthority else {
-            return .repositoryAuthorityMismatch
+        guard receivedAuthority.rootAuthority == expectedAuthority.rootAuthority else {
+            return .rootAuthorityMismatch
         }
         guard receivedAuthority.rootEpoch == expectedAuthority.rootEpoch else {
             return .sourceAuthorityRootEpochMismatch
         }
-        guard receivedAuthority.standardizedRepositoryRelativePath ==
-            expectedAuthority.standardizedRepositoryRelativePath
+        guard receivedAuthority.standardizedLoadedRootPath ==
+            expectedAuthority.standardizedLoadedRootPath,
+            receivedAuthority.candidateRootRelativePath ==
+            expectedAuthority.candidateRootRelativePath,
+            receivedAuthority.evidence == expectedAuthority.evidence
         else {
             return .sourceAuthorityPathMismatch
         }
@@ -462,17 +480,17 @@ struct WorkspaceCodemapArtifactBinding: Equatable {
 }
 
 private extension WorkspaceCodemapSourceAuthorityToken {
+    /// Binding uses the common loaded-root coordinates both source modes share; Git's repository
+    /// coordinates remain internal to its own evidence.
     func isBound(to identity: WorkspaceCodemapArtifactBindingIdentity) -> Bool {
-        guard isFactoryValidated,
-              rootEpoch.rootID == identity.rootID,
-              rootEpoch.rootLifetimeID == identity.rootLifetimeID
-        else { return false }
-        let expectedRepositoryRelativePath = if repositoryRelativeLoadedRootPrefix.isEmpty {
-            identity.standardizedRelativePath
-        } else {
-            repositoryRelativeLoadedRootPrefix + "/" + identity.standardizedRelativePath
-        }
-        return standardizedRepositoryRelativePath == expectedRepositoryRelativePath
+        isFactoryValidated &&
+            rootEpoch.rootID == identity.rootID &&
+            rootEpoch.rootLifetimeID == identity.rootLifetimeID &&
+            WorkspaceCodemapRootPathBinding.matches(
+                identity.standardizedRootPath,
+                authorizedRootURL: URL(fileURLWithPath: standardizedLoadedRootPath, isDirectory: true)
+            ) &&
+            candidateRootRelativePath == identity.standardizedRelativePath
     }
 }
 

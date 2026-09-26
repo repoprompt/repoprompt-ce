@@ -92,7 +92,10 @@ final class IgnoreRules {
 
     /// Creates a new instance that starts with the shared default ignore layer.
     init(policy: IgnoreRulePolicy) {
-        tail = IgnoreRules.baseNode
+        tail = switch policy {
+        case .nonGitRoot: IgnoreRules.nonGitBaseNode
+        case .gitRoot: IgnoreRules.baseNode
+        }
         self.policy = policy
     }
 
@@ -280,6 +283,10 @@ final class IgnoreRules {
     Thumbs.db
     """
 
+    /// Jujutsu metadata is a secondary default only for non-Git roots. Adding it to the
+    /// shared base changes historical Git-backed traversal and can hide user content.
+    private static let nonGitJJIgnoreContent = ".jj"
+
     private static let mandatoryGitBaseNode: RulesNode = {
         let compiled = GitignoreCompiler.compile(content: mandatoryGitIgnoreContent)
         return RulesNode(compiled: compiled, authority: .mandatoryGit, parent: nil)
@@ -290,6 +297,11 @@ final class IgnoreRules {
     private static let baseNode: RulesNode = {
         let compiled = GitignoreCompiler.compile(content: secondaryDefaultIgnoreContent)
         return RulesNode(compiled: compiled, authority: .secondary, parent: mandatoryGitBaseNode)
+    }()
+
+    private static let nonGitBaseNode: RulesNode = {
+        let compiled = GitignoreCompiler.compile(content: nonGitJJIgnoreContent)
+        return RulesNode(compiled: compiled, authority: .secondary, parent: baseNode)
     }()
 }
 

@@ -828,6 +828,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var rootShellPersistenceKeysByRootKey: [RootKey: WorkspaceRootShellPersistenceKey] = [:]
     private var partitionStoreSaveCancellable: AnyCancellable?
     private var fileSystemSettingsCancellable: AnyCancellable?
+    private var nonGitCodeMapsSettingCancellable: AnyCancellable?
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
@@ -13206,6 +13207,15 @@ extension WorkspaceFilesViewModel {
             )
         }
         return nil
+    }
+
+    func bindNonGitCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        nonGitCodeMapsSettingCancellable = settings.$nonGitCodeMapsEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                Task { await self.workspaceFileContextStore.setNonGitCodeMapsEnabled(enabled) }
+            }
     }
 
     private func subscribeToFileSystemPreferenceChanges() {

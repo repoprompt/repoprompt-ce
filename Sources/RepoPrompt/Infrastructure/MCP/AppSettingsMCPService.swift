@@ -854,6 +854,13 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.globalCodeMapsDisabled()) },
             write: { try $0.setCodeMapsGloballyDisabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "code_maps.non_git_enabled",
+            group: "code_maps",
+            description: "Explicit opt-in for Code Maps in non-Git folders. Existing settings without this key remain disabled.",
+            read: { .bool($0.nonGitCodeMapsEnabled) },
+            write: { try $0.setNonGitCodeMapsEnabled(requiredBool(from: $1)) }
+        ),
 
         // Agent Mode behavior. This exposes durable prompt-shaping preferences only;
         // internal provider/runtime toggles remain omitted.
