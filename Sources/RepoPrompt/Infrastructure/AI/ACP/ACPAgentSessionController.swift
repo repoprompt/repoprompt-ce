@@ -1269,21 +1269,6 @@ actor ACPAgentSessionController {
         func debugPromptSettlementWaiterCount() -> Int {
             promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
         }
-
-        /// Observes one locally allocated request without exposing its continuation or changing ownership.
-        struct DebugPendingRequestSnapshot {
-            let method: String?
-            let promptRunning: Bool
-            let didEmitTerminal: Bool
-        }
-
-        func debugPendingRequestSnapshot(requestID: Int) -> DebugPendingRequestSnapshot {
-            DebugPendingRequestSnapshot(
-                method: pendingRequests[JSONRPCID.int(requestID).storageKey]?.method,
-                promptRunning: state == .promptRunning,
-                didEmitTerminal: didEmitTerminal
-            )
-        }
     #endif
 
     func interruptActivePromptForSteering(timeoutSeconds: TimeInterval = 15) async throws {
@@ -1596,39 +1581,13 @@ actor ACPAgentSessionController {
         return result
     }
 
-    /// Pure envelope policy for decoded JSON. The caller must first route server requests
-    /// and exhaust owned-request correlation; provider recognition supplies only ID vocabulary.
+    /// The caller must first route server requests and exhaust owned-request correlation.
+    /// Known maintenance replies are ignored regardless of their payload or protocol version.
     nonisolated static func isRecognizedUnmatchedResponse(
         _ json: [String: Any],
         provider: any ACPAgentProvider
     ) -> Bool {
-        guard let id = json["id"] as? String,
-              !json.keys.contains("method"),
-              json["jsonrpc"] as? String == "2.0"
-        else { return false }
-
-        let hasResult = json.keys.contains("result")
-        let hasError = json.keys.contains("error")
-        guard hasResult != hasError else { return false }
-        if hasError {
-            guard let error = json["error"] as? [String: Any],
-                  error["message"] is String,
-                  let code = error["code"] as? NSNumber,
-                  CFGetTypeID(code) != CFBooleanGetTypeID(),
-                  code.doubleValue.isFinite
-            else { return false }
-
-            // JSONSerialization can retain high-precision fractions as NSDecimalNumber.
-            // Do not round those to Double before deciding whether the decoded value is integral.
-            if let decimal = code as? NSDecimalNumber {
-                var value = decimal.decimalValue
-                var integral = Decimal()
-                NSDecimalRound(&integral, &value, 0, .down)
-                guard integral == value else { return false }
-            } else {
-                guard code.doubleValue.rounded(.towardZero) == code.doubleValue else { return false }
-            }
-        }
+        guard let id = json["id"] as? String, !json.keys.contains("method") else { return false }
         return provider.recognizesUnmatchedResponseID(id)
     }
 
