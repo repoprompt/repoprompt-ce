@@ -29,24 +29,17 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
 
     /// The epoch a live occupancy report belongs to — the same fields that reset the session's
     /// vouches, so a marker cannot extend a report into an epoch it was not made in.
-    private struct OccupancyEpoch: Equatable {
-        let agent: AgentProviderKind
-        let modelRaw: String
+    private func occupancyEpoch(for session: AgentTabSession) -> AgentTabSession.ContextOccupancyEpoch {
+        AgentTabSession.ContextOccupancyEpoch(agent: session.selectedAgent, modelRaw: session.selectedModelRaw)
     }
 
-    private func occupancyEpoch(for session: AgentTabSession) -> OccupancyEpoch {
-        OccupancyEpoch(agent: session.selectedAgent, modelRaw: session.selectedModelRaw)
-    }
-
-    /// Sessions whose current turn included a `usage_update` occupancy report, stamped with the
-    /// epoch it was reported under. Consumed at turn finalization and cleared at `beginTurn`;
-    /// a stale entry only makes the estimator conservative about billed counts. Steering
-    /// prompts inside one run each consume it, so a steering turn's own billed count is
-    /// evaluated on its own.
-    private var sessionsWithOccupancyReportThisTurn: [ObjectIdentifier: OccupancyEpoch] = [:]
-
+    /// Whether the session's current turn included a `usage_update` occupancy report, stamped with
+    /// the epoch it was reported under (`AgentTabSession.acpOccupancyReportThisTurn`). Consumed at
+    /// turn finalization and cleared at `beginTurn`; a stale marker only makes the estimator
+    /// conservative about billed counts. Steering prompts inside one run each consume it, so a
+    /// steering turn's own billed count is evaluated on its own.
     func hasOccupancyReportThisTurn(session: AgentTabSession) -> Bool {
-        sessionsWithOccupancyReportThisTurn[ObjectIdentifier(session)] == occupancyEpoch(for: session)
+        session.acpOccupancyReportThisTurn == occupancyEpoch(for: session)
             && session.contextUsageSnapshot?.used != nil
     }
 
@@ -71,7 +64,7 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
     }
 
     func beginTurn(session: AgentTabSession, initialMessage _: String) {
-        sessionsWithOccupancyReportThisTurn.removeValue(forKey: ObjectIdentifier(session))
+        session.acpOccupancyReportThisTurn = nil
     }
 
     func addUserInputTokens(_: Int, session _: AgentTabSession) {}
@@ -104,16 +97,20 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
         // cannot fit the window) releases the hold. Window-only and context-free updates carry
         // no occupancy claim and leave the marker alone.
         if reportedUsed != nil {
-            sessionsWithOccupancyReportThisTurn[ObjectIdentifier(session)] = occupancyEpoch(for: session)
+            session.acpOccupancyReportThisTurn = occupancyEpoch(for: session)
         } else if contextUsedTokens != nil {
-            sessionsWithOccupancyReportThisTurn.removeValue(forKey: ObjectIdentifier(session))
+            session.acpOccupancyReportThisTurn = nil
         }
+        // `used` is required in `usage_update`, so an explicit count that yields no usable figure
+        // (`used: 0` after a context reset, or one that cannot fit the window) is a real report that
+        // the previous count is no longer current: it is dropped, not carried forward.
+        let explicitCountWithoutFigure = contextUsedTokens != nil && reportedUsed == nil
         // A call carrying no fresh figure must not relabel the snapshot it would carry forward.
-        guard reportedUsed != nil || freshWindow != nil else { return nil }
+        guard reportedUsed != nil || freshWindow != nil || explicitCountWithoutFigure else { return nil }
         // A carried-forward figure that no longer fits a freshly reported window is not current
         // — for the count or the total the ring falls back to when the count is absent.
-        var resolvedUsed = reportedUsed ?? existing?.lastTotalTokens
-        var resolvedTotal = resolvedUsed ?? existing?.totalTotalTokens
+        var resolvedUsed = explicitCountWithoutFigure ? nil : (reportedUsed ?? existing?.lastTotalTokens)
+        var resolvedTotal = explicitCountWithoutFigure ? nil : (resolvedUsed ?? existing?.totalTotalTokens)
         if let freshWindow {
             if let used = resolvedUsed, used > freshWindow {
                 resolvedUsed = nil
@@ -155,15 +152,16 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
         )
         // The per-turn occupancy marker belongs to the turn this finalization ends; consume it
         // up front so even an early return resets it for the next prompt.
-        let sawOccupancyThisTurn = sessionsWithOccupancyReportThisTurn.removeValue(
-            forKey: ObjectIdentifier(session)
-        )
+        let sawOccupancyThisTurn = session.acpOccupancyReportThisTurn
+        session.acpOccupancyReportThisTurn = nil
         // A call carrying no fresh figure must not relabel the snapshot it would carry forward;
         // a positive report still counts as fresh even when the window bound rejects it.
         let rejectedOverWindow = normalizedPositive(contextUsedTokens) != nil && reportedUsed == nil
         guard reportedUsed != nil || freshWindow != nil || rejectedOverWindow else { return nil }
         // A billed prompt-call count can be cumulative across the turn's internal requests, so it
-        // never replaces a same-turn occupancy figure or a stored figure from an earlier turn.
+        // never replaces a same-turn occupancy figure. Without one, it replaces a figure stored by
+        // an earlier turn, being the later report; oversight never exports it (see
+        // `AgentModeViewModel.observationContextLoad`).
         // The marker requires a current figure to hold: the snapshot is reset on provider or
         // model change and on clear, while the usage store is not.
         let holdsOccupancy = sawOccupancyThisTurn == occupancyEpoch(for: session)

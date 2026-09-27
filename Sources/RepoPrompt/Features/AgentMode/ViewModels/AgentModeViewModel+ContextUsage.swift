@@ -80,6 +80,15 @@ extension AgentModeViewModel {
             completionTokens: completionTokens,
             contextUsedTokens: contextUsedTokens
         )
+        // An ACP turn that ended without its own `usage_update` occupancy report leaves any stored
+        // count from an earlier turn outdated, and its billed count is ring-only (see
+        // `observationContextLoad`), so the count vouch is withdrawn and no billed count takes one.
+        // Vouch presence then always matches whether a count is exported, and its transitions
+        // republish (a later `usage_update` confirming the same figure establishes a vouch).
+        if session.selectedAgent.acpProviderID != nil, !heldOccupancy {
+            session.withdrawContextCountVouch(notingWindow: modelContextWindow)
+            return
+        }
         // A billed prompt-call count is a different quantity than occupancy: when the estimator
         // held a live `usage_update` figure this turn, the billed report cannot disturb that
         // figure's vouch — vouch the figure the provider actually reported this turn. Without a

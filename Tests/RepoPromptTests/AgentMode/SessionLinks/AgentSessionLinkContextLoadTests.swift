@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -76,17 +77,34 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertEqual(context.usedPercent, 87.5)
     }
 
-    func testFallbackAndInferredUsageKeepTheirConfidenceLabels() throws {
+    /// The exported label says how the report that vouched the count obtained it: a prompt-count
+    /// fallback is `best_effort`, a reported occupancy count is `exact` even when it re-confirms a
+    /// figure the ring shows as rebuilt, and a rebuilt figure no live report confirmed is not exported.
+    func testTheExportedLabelDescribesTheVouchingReport() throws {
+        let tabID = UUID()
+        let fallback = AgentModeViewModel.TabSession(tabID: tabID)
+        fallback.selectedAgent = .claudeCode
+        fallback.contextUsageSnapshot = usage(40000, nil, confidence: .bestEffort)
+        fallback.noteLiveContextUsageReport(contextUsedTokens: nil, promptTokens: 40000, modelContextWindow: nil)
         let partial = try XCTUnwrap(
-            snapshot(agent: .claudeCode, usage: usage(40000, nil, confidence: .bestEffort)).context
+            AgentModeViewModel.observationSnapshot(for: fallback, candidate: makeCandidate(tabID: tabID)).context
         )
         XCTAssertEqual(partial.confidence, .bestEffort)
         XCTAssertEqual(partial.usedTokens, 40000)
         XCTAssertNil(partial.windowTokens)
         XCTAssertNil(partial.usedPercent, "A percentage needs both figures")
 
-        let inferred = snapshot(agent: .claudeCodeGLM, usage: usage(120_000, 1_000_000, confidence: .inferred))
-        XCTAssertEqual(inferred.context?.confidence, .inferred)
+        let reconfirmed = snapshot(agent: .claudeCodeGLM, usage: usage(120_000, 1_000_000, confidence: .inferred))
+        XCTAssertEqual(reconfirmed.context?.usedTokens, 120_000)
+        XCTAssertEqual(reconfirmed.context?.confidence, .exact)
+
+        let rebuiltOnly = snapshot(
+            agent: .claudeCodeGLM,
+            usage: usage(120_000, 1_000_000, confidence: .inferred),
+            liveReport: false
+        )
+        XCTAssertNil(rebuiltOnly.context?.usedTokens)
+        XCTAssertNil(rebuiltOnly.context?.confidence)
     }
 
     func testNoRecordedUsageIsUnknownNotZero() {
@@ -430,11 +448,12 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(context.usedTokens)
         XCTAssertEqual(context.windowTokens, 272_000)
         XCTAssertNil(context.usedPercent)
+        XCTAssertNil(context.confidence, "A confidence label describes the count, and there is none")
     }
 
-    /// Prompt-response usage is billed per-call input, not a sampled occupancy, so it is labelled
-    /// `best_effort` — but only while the turn had no `usage_update` occupancy report.
-    func testACPTurnFinalizationReportsBilledCountsAsBestEffort() {
+    /// Prompt-response usage is billed per-call input (possibly a per-turn total), not a sampled
+    /// occupancy: the ring shows it as `best_effort`, but oversight never exports it as the count.
+    func testACPTurnFinalizationKeepsBilledCountsInTheRingOnly() {
         let viewModel = makeViewModel()
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
@@ -448,8 +467,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 95000, completionTokens: 4000, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 95000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
         XCTAssertNil(reported()?.windowTokens, "Prompt-response usage carries no window")
     }
 
@@ -540,8 +562,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 95000, completionTokens: 4000, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 95000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
 
         // A size-only update carries the billed count forward without relabelling it.
         _ = viewModel.ingestNonCodexUsageReport(
@@ -583,8 +608,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 95000, completionTokens: 4000, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 95000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
         XCTAssertEqual(reported()?.windowTokens, 200_000)
     }
 
@@ -615,8 +643,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 60000, completionTokens: 4000, contextUsedTokens: 60000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 60000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 60000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
     }
 
     /// A fresh window reported inside a finalization bounds a held occupancy figure too: a
@@ -646,8 +677,8 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
     }
 
     /// A window-only `usage_update` carries no occupancy claim, so the turn's hold survives it:
-    /// the billed count stays suppressed and the earlier occupancy figure keeps its vouch, now
-    /// labelled best_effort because the latest update did not re-confirm the count.
+    /// the billed count stays suppressed and the earlier occupancy figure keeps its vouch. The ring
+    /// relabels it best_effort, but oversight keeps `exact`: nothing refuted the reported occupancy.
     func testACPWindowOnlyUpdateKeepsTheOccupancyHold() {
         let viewModel = makeViewModel()
         let tabID = UUID()
@@ -671,7 +702,8 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             modelContextWindow: nil, session: session
         )
         XCTAssertEqual(reported()?.usedTokens, 180_000, "The held occupancy stays exported")
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertEqual(reported()?.confidence, .exact)
         XCTAssertEqual(reported()?.windowTokens, 200_000)
     }
 
@@ -726,8 +758,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 95000, completionTokens: 4000, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 95000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
     }
 
     /// A finalization carrying no usable figure must not relabel a better snapshot.
@@ -839,8 +874,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             promptTokens: 95000, completionTokens: 4000, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(reported()?.usedTokens, 95000)
-        XCTAssertEqual(reported()?.confidence, .bestEffort)
+        // The ring keeps the billed figure; oversight never exports an ACP billed count.
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertEqual(session.contextUsageSnapshot?.confidence, .bestEffort)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertNil(reported()?.confidence)
 
         _ = viewModel.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 40000,
@@ -870,5 +908,267 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertTrue(session.providerTokenUsageByTurn.isEmpty)
         XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
         XCTAssertNil(session.activeNonCodexTurnTokenAccumulator)
+    }
+
+    // MARK: - Review follow-ups (#1077)
+
+    /// Claude's end-of-turn rebuild relabels the snapshot `bestEffort` without changing its figures;
+    /// oversight keeps the label the count was vouched with, so an idle target still reads `exact`.
+    func testClaudeIdleCountKeepsTheLabelItWasVouchedWith() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.selectedAgent = .claudeCode
+        session.activeNonCodexTurnTokenAccumulator = AgentModeViewModel.NonCodexTurnTokenAccumulator()
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: 3, completionTokens: nil, contextUsedTokens: 152_500,
+            modelContextWindow: nil, session: session
+        )
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: 2_400_000, completionTokens: 8000, contextUsedTokens: nil,
+            modelContextWindow: 200_000, session: session
+        )
+
+        let context = try XCTUnwrap(
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+        )
+        XCTAssertEqual(context.usedTokens, 152_500)
+        XCTAssertEqual(context.windowTokens, 200_000)
+        XCTAssertEqual(context.confidence, .exact)
+    }
+
+    /// `used` is required in `usage_update`, so `used: 0` is a real report: the previous count is no
+    /// longer current in the ring or in oversight.
+    func testACPExplicitZeroOccupancyDropsThePreviousCount() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.selectedAgent = .openCode
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
+            modelContextWindow: 200_000, session: session
+        )
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 0,
+            modelContextWindow: 200_000, session: session
+        )
+
+        XCTAssertNil(session.contextUsageSnapshot?.used)
+        XCTAssertNil(session.vouchedContextCount)
+        let context = try XCTUnwrap(
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+        )
+        XCTAssertNil(context.usedTokens)
+        XCTAssertEqual(context.windowTokens, 200_000)
+        XCTAssertNil(context.confidence)
+
+        // Also without a window in the same report.
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 150_000)
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 0,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertNil(session.contextUsageSnapshot?.used)
+    }
+
+    /// A vouch appearing or disappearing changes the export even on an otherwise idle target, so it
+    /// republishes, once per change; a vouch moving between figures rides the report that wrote them.
+    func testVouchPresenceChangesRepublishTheSnapshotOnce() {
+        let viewModel = makeViewModel()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        var signals = 0
+        let subscription = session.monitorObservationSignal.sink { signals += 1 }
+        defer { subscription.cancel() }
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 90000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertNotNil(session.vouchedContextCount)
+        XCTAssertEqual(signals, 1, "Establishing a vouch republishes")
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 95000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(session.vouchedContextCount?.tokens, 95000)
+        XCTAssertEqual(signals, 1, "A vouch moving to a new figure needs no extra signal")
+
+        session.selectedModelRaw = "a-different-model"
+        XCTAssertNil(session.vouchedContextCount)
+        XCTAssertEqual(signals, 2, "A model switch on an idle target republishes the withdrawn load")
+
+        session.contextCompactedAt = Date()
+        XCTAssertEqual(signals, 2, "Nothing left to withdraw, nothing to republish")
+    }
+
+    /// The same figure re-vouched by a different kind of report changes only the exported label, and
+    /// that alone republishes.
+    func testALabelOnlyChangeRepublishes() throws {
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.selectedAgent = .claudeCode
+        session.contextUsageSnapshot = usage(40000, nil, confidence: .bestEffort)
+        session.noteLiveContextUsageReport(contextUsedTokens: nil, promptTokens: 40000, modelContextWindow: nil)
+        var signals = 0
+        let subscription = session.monitorObservationSignal.sink { signals += 1 }
+        defer { subscription.cancel() }
+
+        session.noteLiveContextUsageReport(contextUsedTokens: 40000, promptTokens: nil, modelContextWindow: nil)
+
+        let context = try XCTUnwrap(
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+        )
+        XCTAssertEqual(context.confidence, .exact)
+        XCTAssertEqual(signals, 1)
+    }
+
+    /// A figure restored at launch is not current; a live report confirming the identical figure
+    /// leaves the stored snapshot unchanged but makes it current, and that alone republishes.
+    func testReconfirmingAnUnchangedRestoredFigureRepublishes() {
+        let viewModel = makeViewModel()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.contextUsageSnapshot = usage(400_000, 1_000_000, source: .codexNativeUsage)
+        XCTAssertNil(session.vouchedContextCount)
+        var signals = 0
+        let subscription = session.monitorObservationSignal.sink { signals += 1 }
+        defer { subscription.cancel() }
+
+        session.noteLiveContextUsageReport(contextUsedTokens: 400_000, promptTokens: nil, modelContextWindow: 1_000_000)
+
+        XCTAssertNotNil(session.vouchedContextCount)
+        XCTAssertNotNil(session.vouchedContextWindow)
+        XCTAssertEqual(signals, 1, "Count and window established together republish once")
+    }
+
+    func testClearingBothVouchesRepublishesOnce() {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.contextUsageSnapshot = usage(90000, 200_000)
+        session.noteLiveContextUsageReport(contextUsedTokens: 90000, promptTokens: nil, modelContextWindow: 200_000)
+        var signals = 0
+        let subscription = session.monitorObservationSignal.sink { signals += 1 }
+        defer { subscription.cancel() }
+
+        session.contextUsageSnapshot = nil
+
+        XCTAssertNil(session.vouchedContextCount)
+        XCTAssertNil(session.vouchedContextWindow)
+        XCTAssertEqual(signals, 1)
+    }
+
+    /// A window-only `usage_update` relabels the ring's carried count `best_effort`; the occupancy the
+    /// provider reported is still what oversight exports, as `exact`.
+    func testACPWindowOnlyUpdateCannotDowngradeTheExportedOccupancyLabel() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.selectedAgent = .devin
+        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "turn")
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000,
+            modelContextWindow: 200_000, session: session
+        )
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: 250_000, session: session
+        )
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: 120_000, completionTokens: 900, contextUsedTokens: 120_000,
+            modelContextWindow: nil, session: session
+        )
+
+        let context = try XCTUnwrap(
+            AgentModeViewModel.observationSnapshot(for: session, candidate: makeCandidate(tabID: tabID)).context
+        )
+        XCTAssertEqual(context.usedTokens, 100_000)
+        XCTAssertEqual(context.confidence, .exact)
+    }
+
+    /// The same figure can move between a ring-only billed count and an exported occupancy count
+    /// without the stored snapshot's number changing; either move republishes.
+    func testASameFigureMovingBetweenBilledAndOccupancyRepublishes() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let candidate = makeCandidate(tabID: tabID)
+        func reported() -> DomainAgentSessionContextLoad? {
+            AgentModeViewModel.observationSnapshot(for: session, candidate: candidate).context
+        }
+        session.selectedAgent = .grokBuild
+        var signals = 0
+        let subscription = session.monitorObservationSignal.sink { signals += 1 }
+        defer { subscription.cancel() }
+
+        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "one")
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 95000)
+        XCTAssertNil(session.vouchedContextCount, "A billed count never takes a vouch")
+        XCTAssertNil(reported()?.usedTokens)
+        let afterBilled = signals
+
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 95000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(reported()?.usedTokens, 95000)
+        XCTAssertEqual(reported()?.confidence, .exact)
+        XCTAssertEqual(signals, afterBilled + 1, "Occupancy confirming the same figure republishes")
+
+        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "two")
+        viewModel.ingestNonCodexTurnFinalization(
+            promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(session.contextUsageSnapshot?.source, .turnFinalization)
+        XCTAssertNil(reported()?.usedTokens)
+        XCTAssertEqual(signals, afterBilled + 2, "A billed count replacing occupancy republishes")
+    }
+
+    /// The per-turn ACP occupancy marker lives on the session, so a new session object can never
+    /// inherit another's hold.
+    func testACPOccupancyMarkerBelongsToItsSession() {
+        let viewModel = makeViewModel()
+        let first = AgentModeViewModel.TabSession(tabID: UUID())
+        first.selectedAgent = .devin
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 120_000,
+            modelContextWindow: 200_000, session: first
+        )
+        XCTAssertNotNil(first.acpOccupancyReportThisTurn)
+
+        let second = AgentModeViewModel.TabSession(tabID: UUID())
+        second.selectedAgent = .devin
+        XCTAssertNil(second.acpOccupancyReportThisTurn)
+        XCTAssertFalse(viewModel.acpContextUsageEstimator.hasOccupancyReportThisTurn(session: second))
+
+        viewModel.acpContextUsageEstimator.beginTurn(session: first, initialMessage: "next")
+        XCTAssertNil(first.acpOccupancyReportThisTurn)
+    }
+
+    func testConfidenceIsNullWheneverNoCountIsKnown() {
+        XCTAssertNil(DomainAgentSessionContextLoad(usedTokens: nil, windowTokens: 200_000, confidence: .inferred)?.confidence)
+        XCTAssertEqual(
+            DomainAgentSessionContextLoad(usedTokens: 1, windowTokens: nil, confidence: .inferred)?.confidence,
+            .inferred
+        )
+        let rendered = AgentSessionLinkResponseRenderer.contextLoadValue(
+            DomainAgentSessionContextLoad(usedTokens: nil, windowTokens: 200_000, confidence: .exact)
+        )
+        guard case .null? = rendered.objectValue?["confidence"] else {
+            return XCTFail("confidence must render as null without a count")
+        }
     }
 }

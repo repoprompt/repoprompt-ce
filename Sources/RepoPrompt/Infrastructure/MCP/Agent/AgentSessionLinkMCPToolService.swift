@@ -1260,7 +1260,7 @@ enum AgentSessionLinkResponseRenderer {
             "used_tokens": context.usedTokens.map { .int($0) } ?? .null,
             "window_tokens": context.windowTokens.map { .int($0) } ?? .null,
             "used_percent": context.usedPercent.map { .double($0) } ?? .null,
-            "confidence": .string(context.confidence.rawValue)
+            "confidence": context.confidence.map { .string($0.rawValue) } ?? .null
         ])
     }
 

@@ -44,7 +44,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             **Operations**: list | poll | wait | read | send | cancel_pending_send | set_waiting_on | snooze_auto_wake | request_attention
 
             - `list`: refresh authorized outbound targets.
-            - `poll`: get sanitized snapshots, `wait_cursor`, `idle_for_send`, `waiting_on`, `context` (context-window load when the snapshot was published, also in `wait`; `null` if unknown), snooze, `pending_send`, and `last_pending_send_result`.
+            - `poll`: get sanitized snapshots, `wait_cursor`, `idle_for_send`, `waiting_on`, `context` (context-window load when the snapshot was published, also in `wait`; `null` if unknown; `confidence` of `used_tokens` is `exact` for provider-reported occupancy or `best_effort` for a count taken from prompt tokens, `null` without a count), snooze, `pending_send`, and `last_pending_send_result`.
             - `wait`: event-driven wait using returned cursor(s); never busy-poll. `until` is `change`, `idle`, or `sendable`; a second wait for one target returns `wait_already_pending`.
             - `read`: paged redacted user-visible transcript. Reuse `next_cursor`; `cursor_reset` may repeat rows. `tail` pages newer rows (`has_more: false` means none newer); use `from: "start"` for older history.
             - `send`: attributed delivery. Send only when `idle_for_send: true`, or queue with `delivery: "when_sendable"`. One queued message per link; a second key returns `pending_send_exists` unless `replace_pending: true` replaces it. A workflow applies to this message only.

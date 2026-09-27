@@ -180,7 +180,7 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
     package enum Confidence: String, CaseIterable, Hashable, Sendable {
         /// Provider-reported context occupancy for the latest request.
         case exact
-        /// A provider figure that is not a direct occupancy report, such as billed prompt tokens.
+        /// A provider figure that is not a direct occupancy report, such as prompt tokens.
         case bestEffort = "best_effort"
         /// Rebuilt from persisted history rather than observed live.
         case inferred
@@ -188,17 +188,19 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
 
     package let usedTokens: Int?
     package let windowTokens: Int?
-    package let confidence: Confidence
+    /// How the used count was obtained; `nil` whenever no count is known, since it describes nothing
+    /// then. Producers always label a known count.
+    package let confidence: Confidence?
 
     /// Returns `nil` unless at least one valid figure is known. Negative used counts and
     /// non-positive windows are dropped rather than clamped, so invalid data never looks valid.
-    package init?(usedTokens: Int?, windowTokens: Int?, confidence: Confidence) {
+    package init?(usedTokens: Int?, windowTokens: Int?, confidence: Confidence?) {
         let used = usedTokens.flatMap { $0 >= 0 ? $0 : nil }
         let window = windowTokens.flatMap { $0 > 0 ? $0 : nil }
         guard used != nil || window != nil else { return nil }
         self.usedTokens = used
         self.windowTokens = window
-        self.confidence = confidence
+        self.confidence = used == nil ? nil : confidence
     }
 
     /// Share of the window in use, as a percentage rounded to one decimal; `nil` unless both
