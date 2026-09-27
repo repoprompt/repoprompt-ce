@@ -382,7 +382,12 @@ struct MessageBubble: View {
                     }
                 } else {
                     // Normal view mode
-                    CollapsibleUserMessage(text: message.content)
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if !message.imageAttachments.isEmpty {
+                            ImageAttachmentStrip(attachments: message.imageAttachments)
+                        }
+                        CollapsibleUserMessage(text: message.content)
+                    }
                 }
             }
             .padding(12)
@@ -550,6 +555,79 @@ private struct ForkButtonOverlay: View {
             }
         }
         .hoverTooltip("Fork chat from this message")
+    }
+}
+
+/// Horizontal row of image thumbnails attached to a user message. Tapping a
+/// chip opens a larger preview popover.
+private struct ImageAttachmentStrip: View {
+    let attachments: [AIChatImageAttachment]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(attachments) { attachment in
+                    ImageAttachmentChip(attachment: attachment)
+                }
+            }
+        }
+    }
+}
+
+private struct ImageAttachmentChip: View {
+    let attachment: AIChatImageAttachment
+    @State private var isHovering = false
+    @State private var showingPreview = false
+
+    var body: some View {
+        Button(action: { showingPreview = true }) {
+            Group {
+                if let nsImage = NSImage(data: attachment.thumbnailData) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Image(systemName: "photo")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 48, height: 48)
+            .clipped()
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(BubbleColors.borderBlue, lineWidth: 1)
+                    .opacity(isHovering ? 1 : 0.5)
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                isHovering = hovering
+            }
+        }
+        .hoverTooltip(attachment.title ?? "Attached image")
+        .popover(isPresented: $showingPreview, arrowEdge: .bottom) {
+            ImageAttachmentPreview(attachment: attachment)
+        }
+    }
+}
+
+private struct ImageAttachmentPreview: View {
+    let attachment: AIChatImageAttachment
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let nsImage = NSImage(data: attachment.thumbnailData) {
+                Image(nsImage: nsImage)
+            }
+            if let title = attachment.title, !title.isEmpty {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
     }
 }
 
