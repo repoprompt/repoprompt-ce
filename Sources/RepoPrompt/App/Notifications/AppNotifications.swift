@@ -1,6 +1,10 @@
 import Foundation
 
 extension Notification.Name {
+    /// Posted by `GlobalSettingsStore` after the notification preference group changes.
+    static let notificationPreferencesDidChange = Notification.Name("RepoPromptNotificationPreferencesDidChange")
+    /// Posted when the UI should open Settings to the Notifications tab.
+    static let showNotificationSettingsTab = Notification.Name("showNotificationSettingsTab")
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
     /// `object` should be the WindowState to target; when omitted, the focused/latest window is used.

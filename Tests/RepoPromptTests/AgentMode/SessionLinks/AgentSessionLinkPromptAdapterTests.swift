@@ -908,6 +908,119 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    // MARK: Mid-session capability notice
+
+    /// A running Codex overseer is told about a Manage change inside its current turn: one native
+    /// `turn/steer` carrying exactly the RepoPrompt-authored notice, with no new turn, no user row,
+    /// no follow-up queue, and no composer change. A stale notice or a refused steer delivers nothing,
+    /// and an idle or non-Codex overseer is classified as deferred rather than pushed to.
+    func testCapabilityNoticeSteersTheRunningCodexOverseerWithoutStartingWorkOrTouchingTheComposer() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        fixture.session.beginRunAttempt(source: "test.codex.capability-notice.seed")
+        _ = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session,
+            text: "seed turn",
+            attachments: []
+        )
+        fixture.controller.markActiveTurn(id: "turn-1")
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-1"),
+            session: fixture.session,
+            sourceController: fixture.controller
+        )
+        XCTAssertEqual(fixture.session.runState, .running)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkCapabilityNoticeRoute(for: endpoint), .codexRunningTurn)
+
+        let notice = try DomainAgentSessionLinkCapabilityNotice(
+            linkID: UUID(),
+            linkGeneration: 1,
+            targetSessionID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-00000000BEEF")),
+            managed: true,
+            observerLinkSetRevision: 2,
+            sequence: 1,
+            changedAt: Date(timeIntervalSince1970: 1000)
+        )
+        let text = AgentSessionLinkPrompts.capabilityChangeNotice([notice])
+        fixture.viewModel.storeDraftText(for: fixture.tabID, "the user's own draft")
+        let startedBefore = fixture.controller.startedTurns
+        let userRowsBefore = fixture.session.items.filter { $0.kind == .user }.map(\.id)
+        let itemCountBefore = fixture.session.items.count
+
+        let stale = await fixture.viewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: endpoint,
+            providerText: text,
+            notices: [notice],
+            isCurrent: { false }
+        )
+        XCTAssertFalse(stale, "a notice the authority no longer vouches for is never sent")
+        XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
+
+        let delivered = await fixture.viewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: endpoint,
+            providerText: text,
+            notices: [notice],
+            isCurrent: { true }
+        )
+        XCTAssertTrue(delivered)
+        XCTAssertEqual(fixture.controller.steeredTurns, [text], "exactly the notice, into the running turn")
+        XCTAssertEqual(fixture.controller.startedTurns, startedBefore, "no new turn")
+        XCTAssertEqual(fixture.session.runState, .running)
+        XCTAssertEqual(fixture.session.items.filter { $0.kind == .user }.map(\.id), userRowsBefore, "never a user row")
+        XCTAssertEqual(fixture.session.items.count, itemCountBefore + 1)
+        let row = try XCTUnwrap(fixture.session.items.last)
+        XCTAssertEqual(row.kind, .system)
+        XCTAssertEqual(row.text, AgentModeViewModel.agentSessionLinkCapabilityNoticeRowText([notice]))
+        XCTAssertFalse(row.text.contains(notice.targetSessionID.uuidString), "the row names no session")
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "the user's own draft")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+
+        fixture.controller.steerFailure = .noActiveTurn(
+            CodexAppServerClient.RequestFailure(
+                method: "turn/steer",
+                code: nil,
+                message: "no active turn",
+                data: nil
+            )
+        )
+        let refused = await fixture.viewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: endpoint,
+            providerText: text,
+            notices: [notice],
+            isCurrent: { true }
+        )
+        XCTAssertFalse(refused, "a refused steer is reported, never retried onto another turn or queued")
+        XCTAssertEqual(fixture.controller.startedTurns, startedBefore)
+        XCTAssertEqual(fixture.session.items.count, itemCountBefore + 1, "no provenance row for an undelivered notice")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        fixture.controller.steerFailure = nil
+
+        fixture.session.runState = .waitingForUser
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkCapabilityNoticeRoute(for: endpoint),
+            .unavailable(.observerBusy),
+            "a turn waiting on its user or a prompt is never steered"
+        )
+        fixture.session.runState = .completed
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkCapabilityNoticeRoute(for: endpoint), .unavailable(.observerIdle))
+        fixture.session.runState = .running
+        fixture.session.selectedAgent = .claudeCode
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkCapabilityNoticeRoute(for: endpoint),
+            .unavailable(.providerCannotTakeMidTurnNotice),
+            "Claude-native steering interrupts the turn, so it is never used for a notice"
+        )
+        let claudeDelivered = await fixture.viewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: endpoint,
+            providerText: text,
+            notices: [notice],
+            isCurrent: { true }
+        )
+        XCTAssertFalse(claudeDelivered)
+        XCTAssertEqual(fixture.controller.steeredTurns, [text])
+    }
+
     // MARK: Queued fallback
 
     func testQueuedFallbackComposesAtDrainTimeWithCurrentMembership() async throws {

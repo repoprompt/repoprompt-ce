@@ -332,6 +332,86 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
+    // MARK: - Management delegation
+
+    /// Routes one managed steer to the exact owning window, refusing during teardown before any
+    /// target state is touched. Nothing here focuses or activates the window.
+    func agentSessionLinkPerformSteer(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkSendRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformSteer(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
+    /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
+    func agentSessionLinkPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkPendingInteractionInspection {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID),
+              !window.isClosing
+        else { return .none }
+        return window.agentModeViewModel.agentSessionLinkPendingInteraction(for: candidate)
+    }
+
+    /// Classifies the exact observer's window-owned session; refuses during teardown.
+    func agentSessionLinkCapabilityNoticeRoute(
+        for observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkCapabilityNoticeRoute {
+        guard !isTerminating,
+              let window = window(withID: observerEndpoint.windowID),
+              !window.isClosing
+        else { return .unavailable(.observerUnavailable) }
+        return window.agentModeViewModel.agentSessionLinkCapabilityNoticeRoute(for: observerEndpoint)
+    }
+
+    /// Routes one capability notice to the exact observer's owning window, refusing during teardown.
+    func agentSessionLinkDeliverCapabilityNotice(
+        to observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        providerText: String,
+        notices: [DomainAgentSessionLinkCapabilityNotice],
+        isCurrent: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        guard !isTerminating,
+              let window = window(withID: observerEndpoint.windowID),
+              !window.isClosing
+        else { return false }
+        return await window.agentModeViewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: observerEndpoint,
+            providerText: providerText,
+            notices: notices,
+            isCurrent: isCurrent
+        )
+    }
+
+    /// Routes one observer answer to the exact owning window, refusing during teardown.
+    func agentSessionLinkRespondToPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkInteractionResponseRequest,
+        authorize: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> AgentSessionLinkInteractionResponseOutcome {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID),
+              !window.isClosing
+        else { return .unavailable }
+        return await window.agentModeViewModel.agentSessionLinkRespondToPendingInteraction(
+            for: candidate,
+            request: request,
+            authorize: authorize
+        )
+    }
+
     // MARK: - Launch restoration inputs
 
     /// Identity-only descriptors for every compose-tab binding in every window's active workspace.

@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -34,6 +35,30 @@ class DebugPackagingIdentityTests(unittest.TestCase):
         )
         self.assertNotIn("SIGN_IDENTITY_WAS_EXPLICIT", source)
         self.assertNotIn("$BASE_BUNDLE_ID.debug", source)
+
+    def test_debug_bundle_has_distinct_visible_and_process_identity(self) -> None:
+        source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        template = (ROOT_DIR / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
+
+        self.assertIn('DISPLAY_NAME="RepoPrompt CE Debug"', source)
+        self.assertIn('BUNDLE_NAME="RepoPromptDebug"', source)
+        self.assertIn('PACKAGED_APP_EXECUTABLE="RepoPromptDebug"', source)
+        self.assertIn('ICON_NAME="AppIconDebug"', source)
+        self.assertIn('PACKAGED_APP_EXECUTABLE="$APP_NAME"', source)
+        self.assertIn('ICON_NAME="AppIcon"', source)
+        self.assertIn("__EXECUTABLE_NAME__", template)
+        self.assertIn("__BUNDLE_NAME__", template)
+        self.assertIn("__ICON_NAME__", template)
+        self.assertTrue((ROOT_DIR / "AppBundle" / "AppIconDebug.icns").is_file())
+        self.assertIn('if (( ! IS_RELEASE )); then\n    run cp "$ROOT_DIR/AppBundle/AppIconDebug.icns"', source)
+
+    def test_staged_release_validator_substitutes_every_template_placeholder(self) -> None:
+        template = (ROOT_DIR / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
+        validator = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
+        placeholders = set(re.findall(r"__[A-Z0-9_]+__", template))
+        self.assertTrue(placeholders)
+        for placeholder in sorted(placeholders):
+            self.assertIn(f'"{placeholder}":', validator, placeholder)
 
 
 class StableTipFloorTests(unittest.TestCase):

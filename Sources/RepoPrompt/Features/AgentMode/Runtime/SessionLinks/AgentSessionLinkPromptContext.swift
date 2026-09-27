@@ -684,6 +684,9 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// it is part of what decides whether a retry of the same dispatch may reuse this fragment.
     let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
     let fragment: String
+    /// The exact observer incarnation this claim was rendered for. Acceptance settles that
+    /// endpoint's capability notices, never whichever incarnation is published by then.
+    var observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
 
     // MARK: Membership readers
 
@@ -1194,7 +1197,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             passiveQueue: fingerprint.passiveQueue,
             passive: passiveComponent,
             laneGuidanceMode: laneGuidanceMode,
-            fragment: rendered.fragment
+            fragment: rendered.fragment,
+            observerEndpoint: epoch.endpoint
         )
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport

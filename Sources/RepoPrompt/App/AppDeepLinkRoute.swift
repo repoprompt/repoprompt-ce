@@ -19,12 +19,32 @@ struct AgentSessionDeepLinkRoute: Equatable {
     let workspaceID: UUID
     let tabID: UUID
     let sessionID: UUID?
+    /// Optional pending interaction the route should reveal after activation. Absent routes keep
+    /// the original "open the session" behavior.
+    let interactionID: UUID?
 
-    init(windowID: Int? = nil, workspaceID: UUID, tabID: UUID, sessionID: UUID? = nil) {
+    init(
+        windowID: Int? = nil,
+        workspaceID: UUID,
+        tabID: UUID,
+        sessionID: UUID? = nil,
+        interactionID: UUID? = nil
+    ) {
         self.windowID = windowID
         self.workspaceID = workspaceID
         self.tabID = tabID
         self.sessionID = sessionID
+        self.interactionID = interactionID
+    }
+
+    func withInteractionID(_ interactionID: UUID?) -> AgentSessionDeepLinkRoute {
+        AgentSessionDeepLinkRoute(
+            windowID: windowID,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            sessionID: sessionID,
+            interactionID: interactionID
+        )
     }
 
     var notificationUserInfo: [AnyHashable: Any] {
@@ -39,6 +59,9 @@ struct AgentSessionDeepLinkRoute: Equatable {
         }
         if let sessionID {
             userInfo[AppDeepLinkRouteUserInfoKey.sessionID] = sessionID.uuidString
+        }
+        if let interactionID {
+            userInfo[AppDeepLinkRouteUserInfoKey.interactionID] = interactionID.uuidString
         }
         return userInfo
     }
@@ -59,27 +82,31 @@ struct AgentSessionDeepLinkRoute: Equatable {
         if let windowID {
             queryItems.append(URLQueryItem(name: AppDeepLinkRouteQueryItem.windowID, value: String(windowID)))
         }
+        if let interactionID {
+            queryItems.append(URLQueryItem(name: AppDeepLinkRouteQueryItem.interactionID, value: interactionID.uuidString))
+        }
         components.queryItems = queryItems
 
         return components.url ?? URL(string: "\(AppDeepLinkURLScheme.canonical)://agent/session")!
     }
 
     static func parse(notificationUserInfo userInfo: [AnyHashable: Any]) -> AgentSessionDeepLinkRoute? {
-        guard stringValue(for: AppDeepLinkRouteUserInfoKey.routeKind, in: userInfo) == AppDeepLinkRouteUserInfoValue.agentSessionKind else {
+        let reader = NotificationUserInfoReader(userInfo)
+        guard reader.string(AppDeepLinkRouteUserInfoKey.routeKind) == AppDeepLinkRouteUserInfoValue.agentSessionKind else {
             return nil
         }
-        guard intValue(for: AppDeepLinkRouteUserInfoKey.routeVersion, in: userInfo) == AppDeepLinkRouteUserInfoValue.currentRouteVersion else {
+        guard reader.int(AppDeepLinkRouteUserInfoKey.routeVersion) == AppDeepLinkRouteUserInfoValue.currentRouteVersion else {
             return nil
         }
-        guard let workspaceID = uuidValue(for: AppDeepLinkRouteUserInfoKey.workspaceID, in: userInfo),
-              let tabID = uuidValue(for: AppDeepLinkRouteUserInfoKey.tabID, in: userInfo)
+        guard let workspaceID = reader.uuid(AppDeepLinkRouteUserInfoKey.workspaceID),
+              let tabID = reader.uuid(AppDeepLinkRouteUserInfoKey.tabID)
         else {
             return nil
         }
 
         let sessionID: UUID?
-        if value(for: AppDeepLinkRouteUserInfoKey.sessionID, in: userInfo) != nil {
-            guard let parsedSessionID = uuidValue(for: AppDeepLinkRouteUserInfoKey.sessionID, in: userInfo) else {
+        if reader.contains(AppDeepLinkRouteUserInfoKey.sessionID) {
+            guard let parsedSessionID = reader.uuid(AppDeepLinkRouteUserInfoKey.sessionID) else {
                 return nil
             }
             sessionID = parsedSessionID
@@ -88,10 +115,11 @@ struct AgentSessionDeepLinkRoute: Equatable {
         }
 
         return AgentSessionDeepLinkRoute(
-            windowID: intValue(for: AppDeepLinkRouteUserInfoKey.windowID, in: userInfo),
+            windowID: reader.int(AppDeepLinkRouteUserInfoKey.windowID),
             workspaceID: workspaceID,
             tabID: tabID,
-            sessionID: sessionID
+            sessionID: sessionID,
+            interactionID: reader.uuid(AppDeepLinkRouteUserInfoKey.interactionID)
         )
     }
 
@@ -124,50 +152,9 @@ struct AgentSessionDeepLinkRoute: Equatable {
             windowID: intQueryItem(AppDeepLinkRouteQueryItem.windowID, in: components),
             workspaceID: workspaceID,
             tabID: tabID,
-            sessionID: sessionID
+            sessionID: sessionID,
+            interactionID: uuidQueryItem(AppDeepLinkRouteQueryItem.interactionID, in: components)
         )
-    }
-
-    private static func value(for key: String, in userInfo: [AnyHashable: Any]) -> Any? {
-        userInfo.first { entry in
-            if let stringKey = entry.key.base as? String {
-                return stringKey == key
-            }
-            if let stringKey = entry.key.base as? NSString {
-                return stringKey as String == key
-            }
-            return false
-        }?.value
-    }
-
-    private static func stringValue(for key: String, in userInfo: [AnyHashable: Any]) -> String? {
-        guard let rawValue = value(for: key, in: userInfo) else { return nil }
-        if let string = rawValue as? String {
-            return string
-        }
-        if let string = rawValue as? NSString {
-            return string as String
-        }
-        return nil
-    }
-
-    private static func intValue(for key: String, in userInfo: [AnyHashable: Any]) -> Int? {
-        guard let rawValue = value(for: key, in: userInfo) else { return nil }
-        if let int = rawValue as? Int {
-            return int
-        }
-        if let number = rawValue as? NSNumber {
-            return number.intValue
-        }
-        if let string = rawValue as? String {
-            return Int(string)
-        }
-        return nil
-    }
-
-    private static func uuidValue(for key: String, in userInfo: [AnyHashable: Any]) -> UUID? {
-        guard let string = stringValue(for: key, in: userInfo) else { return nil }
-        return UUID(uuidString: string)
     }
 
     private static func queryItemValue(_ name: String, in components: URLComponents) -> String? {
@@ -216,6 +203,76 @@ enum AppDeepLinkRoute: Equatable {
     }
 }
 
+/// Tolerant reader for `UNNotificationContent.userInfo`, which round-trips through property-list
+/// bridging: keys may arrive as `String` or `NSString`, and numbers as `Int`, `NSNumber`, or strings.
+struct NotificationUserInfoReader {
+    private let userInfo: [AnyHashable: Any]
+
+    init(_ userInfo: [AnyHashable: Any]) {
+        self.userInfo = userInfo
+    }
+
+    func contains(_ key: String) -> Bool {
+        value(key) != nil
+    }
+
+    func value(_ key: String) -> Any? {
+        userInfo.first { entry in
+            if let stringKey = entry.key.base as? String {
+                return stringKey == key
+            }
+            if let stringKey = entry.key.base as? NSString {
+                return stringKey as String == key
+            }
+            return false
+        }?.value
+    }
+
+    func string(_ key: String) -> String? {
+        guard let rawValue = value(key) else { return nil }
+        if let string = rawValue as? String {
+            return string
+        }
+        if let string = rawValue as? NSString {
+            return string as String
+        }
+        return nil
+    }
+
+    func int(_ key: String) -> Int? {
+        guard let rawValue = value(key) else { return nil }
+        if let int = rawValue as? Int {
+            return int
+        }
+        if let number = rawValue as? NSNumber {
+            return number.intValue
+        }
+        if let string = rawValue as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    func double(_ key: String) -> Double? {
+        guard let rawValue = value(key) else { return nil }
+        if let double = rawValue as? Double {
+            return double
+        }
+        if let number = rawValue as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = rawValue as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
+    func uuid(_ key: String) -> UUID? {
+        guard let string = string(key) else { return nil }
+        return UUID(uuidString: string)
+    }
+}
+
 enum AppDeepLinkURLParseResult: Equatable {
     case route(AppDeepLinkRoute)
     case invalidScopedRoute
@@ -247,6 +304,7 @@ enum AppDeepLinkRouteUserInfoKey {
     static let workspaceID = "workspace_id"
     static let tabID = "tab_id"
     static let sessionID = "session_id"
+    static let interactionID = "interaction_id"
 }
 
 enum AppDeepLinkRouteUserInfoValue {
@@ -259,4 +317,5 @@ enum AppDeepLinkRouteQueryItem {
     static let workspaceID = "workspace_id"
     static let tabID = "tab_id"
     static let sessionID = "session_id"
+    static let interactionID = "interaction_id"
 }

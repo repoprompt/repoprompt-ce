@@ -11,12 +11,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import debug_app_process  # noqa: E402
+import conductor  # noqa: E402
 
 
 class FakeInspector:
@@ -51,11 +53,11 @@ class DebugAppProcessTests(unittest.TestCase):
     def test_only_exact_debug_executable_is_included(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            debug = self.make_executable(root, "Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app/Contents/MacOS/RepoPrompt")
+            debug = self.make_executable(root, "Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app/Contents/MacOS/RepoPromptDebug")
             production = self.make_executable(root, "Applications/RepoPrompt.app/Contents/MacOS/RepoPrompt")
             ce_release = self.make_executable(root, "Applications/RepoPrompt CE.app/Contents/MacOS/RepoPrompt")
             inspector = FakeInspector(
-                {101: "RepoPrompt", 102: "RepoPrompt", 103: "RepoPrompt", 104: "Other"},
+                {101: "RepoPromptDebug", 102: "RepoPrompt", 103: "RepoPrompt", 104: "Other"},
                 {101: debug, 102: production, 103: ce_release, 104: debug},
             )
 
@@ -66,9 +68,9 @@ class DebugAppProcessTests(unittest.TestCase):
     def test_termination_revalidates_identity_and_rejects_pid_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            debug = self.make_executable(root, "Debug/RepoPrompt.app/Contents/MacOS/RepoPrompt")
+            debug = self.make_executable(root, "Debug/RepoPrompt.app/Contents/MacOS/RepoPromptDebug")
             production = self.make_executable(root, "Production/RepoPrompt.app/Contents/MacOS/RepoPrompt")
-            inspector = FakeInspector({201: "RepoPrompt"}, {201: [debug, production]})
+            inspector = FakeInspector({201: "RepoPromptDebug"}, {201: [debug, production]})
             signals: list[tuple[int, int]] = []
 
             with self.assertRaisesRegex(debug_app_process.ProcessIdentityError, "executable changed"):
@@ -82,8 +84,8 @@ class DebugAppProcessTests(unittest.TestCase):
 
     def test_matching_identity_is_revalidated_then_signaled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_executable(Path(tmp), "Debug/RepoPrompt.app/Contents/MacOS/RepoPrompt")
-            inspector = FakeInspector({301: "RepoPrompt"}, {301: [debug, debug]})
+            debug = self.make_executable(Path(tmp), "Debug/RepoPrompt.app/Contents/MacOS/RepoPromptDebug")
+            inspector = FakeInspector({301: "RepoPromptDebug"}, {301: [debug, debug]})
             signals: list[tuple[int, int]] = []
 
             signaled = debug_app_process.terminate_matching_processes(
@@ -97,8 +99,8 @@ class DebugAppProcessTests(unittest.TestCase):
 
     def test_missing_target_is_normal_not_installed_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "DebugApps" / "RepoPrompt.app" / "Contents" / "MacOS" / "RepoPrompt"
-            inspector = FakeInspector({101: "RepoPrompt"}, {})
+            missing = Path(tmp) / "DebugApps" / "RepoPrompt.app" / "Contents" / "MacOS" / "RepoPromptDebug"
+            inspector = FakeInspector({101: "RepoPromptDebug"}, {})
             signals: list[tuple[int, int]] = []
 
             matches = debug_app_process.matching_processes(missing, inspector)
@@ -114,9 +116,9 @@ class DebugAppProcessTests(unittest.TestCase):
 
     def test_unresolvable_named_candidate_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_executable(Path(tmp), "Debug/RepoPrompt.app/Contents/MacOS/RepoPrompt")
+            debug = self.make_executable(Path(tmp), "Debug/RepoPrompt.app/Contents/MacOS/RepoPromptDebug")
             inspector = FakeInspector(
-                {401: "RepoPrompt"},
+                {401: "RepoPromptDebug"},
                 {401: debug_app_process.ProcessIdentityError("identity unavailable")},
             )
 
@@ -125,6 +127,21 @@ class DebugAppProcessTests(unittest.TestCase):
 
 
 class LifecycleSurfaceTests(unittest.TestCase):
+    def test_conductor_tracks_new_and_legacy_debug_executables(self) -> None:
+        bundle = Path("/tmp/RepoPrompt.app")
+        observed: list[str] = []
+
+        def matching(path: Path) -> list[int]:
+            observed.append(path.name)
+            return [101] if path.name == "RepoPromptDebug" else [102]
+
+        with patch.object(conductor, "debug_app_bundle_path", return_value=bundle), patch.object(
+            conductor, "matching_processes", side_effect=matching
+        ):
+            self.assertEqual(conductor.find_debug_app_pids(), ["101", "102"])
+
+        self.assertEqual(observed, ["RepoPromptDebug", "RepoPrompt"])
+
     @staticmethod
     def copy_finder_launcher(root: Path) -> Path:
         launcher = root / "Launch RepoPrompt CE.command"
@@ -141,7 +158,8 @@ class LifecycleSurfaceTests(unittest.TestCase):
             self.assertNotIn("pkill -x RepoPrompt", source)
         self.assertIn('exec python3 -u "$ROOT_DIR/Scripts/conductor.py" __operation_runner "$PAYLOAD"', run_script)
         self.assertIn('"kind": "debug_app_build_then_launch"', run_script)
-        self.assertIn("terminate_matching_processes(debug_app_executable_path())", conductor_script)
+        self.assertIn("terminate_matching_processes(path)", conductor_script)
+        self.assertIn("legacy_debug_app_executable_path()", conductor_script)
         self.assertIn("safe coordinated launcher requires Python 3", finder_launcher)
         self.assertIn("No uncoordinated fallback is provided", finder_launcher)
         self.assertNotIn("LAUNCH_MODE", finder_launcher)

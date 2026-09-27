@@ -1874,6 +1874,27 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         updateModelOverridesScalar(commit: commit, mutation)
     }
 
+    // MARK: - Notifications
+
+    func notificationPreferences() -> NotificationPreferences {
+        (scalarPreferences.notifications ?? GlobalScalarPreferences.NotificationSettings()).resolved()
+    }
+
+    func updateNotificationSettings(
+        commit: Bool = true,
+        _ mutation: (inout GlobalScalarPreferences.NotificationSettings) -> Void
+    ) {
+        let before = scalarPreferences.notifications
+        updateScalarPreferences(commit: commit) { preferences in
+            var settings = preferences.notifications ?? GlobalScalarPreferences.NotificationSettings()
+            mutation(&settings)
+            preferences.notifications = settings
+        }
+        if before != scalarPreferences.notifications {
+            NotificationCenter.default.post(name: .notificationPreferencesDidChange, object: self)
+        }
+    }
+
     private func updateUIScalar(
         commit: Bool,
         _ mutation: (inout GlobalScalarPreferences.UISettings) -> Void

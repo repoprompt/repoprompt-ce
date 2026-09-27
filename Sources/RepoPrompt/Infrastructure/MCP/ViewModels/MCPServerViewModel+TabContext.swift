@@ -4887,6 +4887,7 @@ extension MCPServerViewModel {
             let tabName = committedTab.tab.name
             NotificationService.shared.notifyContextBuilderComplete(
                 tabName: tabName,
+                tabID: committedTab.tab.id,
                 fallbackToDockBounce: true
             )
         }

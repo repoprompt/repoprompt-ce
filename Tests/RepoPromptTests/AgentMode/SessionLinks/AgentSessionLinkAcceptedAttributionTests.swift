@@ -242,7 +242,7 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
                 attribution: attribution
             ),
             "[lane-update] RepoPrompt auto-woke this session and delivered updates for overseen lane "
-                + "\u{201C}Build API\u{201D} and 2 other overseen lanes."
+                + "\u{201C}Build API\u{201D} (now idle) and 2 other overseen lanes."
         )
     }
 
@@ -284,7 +284,7 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
                 attribution: attribution
             ),
             "[lane-update] RepoPrompt auto-woke this session and delivered an update for overseen "
-                + "lane \u{201C}Build API\u{201D}. "
+                + "lane \u{201C}Build API\u{201D} (now idle). "
                 + AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
         )
     }
@@ -509,8 +509,8 @@ final class AgentSessionLinkAcceptedAttributionTests: XCTestCase {
         XCTAssertEqual(
             AgentLaneUpdateDisplayAttribution.richDisplayText(for: row),
             "[lane-update] RepoPrompt auto-woke this session and delivered updates for overseen "
-                + "lanes \u{201C}kidfriendly-nova: Build API\u{201D} and "
-                + "\u{201C}RepoPrompt (main): Docs\u{201D}."
+                + "lanes \u{201C}kidfriendly-nova: Build API\u{201D} (now idle) and "
+                + "\u{201C}RepoPrompt (main): Docs\u{201D} (now idle)."
         )
     }
 }

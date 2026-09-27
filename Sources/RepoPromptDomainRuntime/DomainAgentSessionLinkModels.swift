@@ -45,6 +45,13 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
     case wait
     case read
     case sendWhenIdle = "send_when_idle"
+    /// The user's explicit delegation of *management* over one exact target: inspecting and
+    /// answering its pending prompts and steering its runs on the user's behalf.
+    ///
+    /// Never part of `version1`, never inferred from role, parentage, or another grant, and never
+    /// carried across a relink, fork, or restart. Only an explicit user action on one exact link
+    /// generation adds or removes it (`DomainAgentSessionLinkAuthority.setManagement`).
+    case manage
 
     /// V1 capabilities are fixed and never inferred from role or parentage.
     package static let version1: Set<DomainAgentSessionLinkCapability> = [
@@ -53,6 +60,9 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
         .read,
         .sendWhenIdle,
     ]
+
+    /// A watch grant plus the user's explicit management delegation.
+    package static let managed: Set<DomainAgentSessionLinkCapability> = version1.union([.manage])
 }
 
 package struct DomainAgentSessionLinkGrant: Identifiable, Hashable, Sendable {
@@ -171,6 +181,47 @@ package struct DomainAgentSessionWaitingOn: Hashable, Sendable {
     }
 }
 
+/// Context-window load RepoPrompt had recorded for a target when its snapshot was published, from the
+/// provider usage its context ring already shows. Numbers only: no provider payload, model name, or
+/// free-form text. A usage update alone does not publish a snapshot, so the value can lag the
+/// provider; it confers no authority, and `nil` means unknown, never empty.
+package struct DomainAgentSessionContextLoad: Hashable, Sendable {
+    /// How the usage was obtained, mirroring the app's existing context-usage confidence labels.
+    package enum Confidence: String, CaseIterable, Hashable, Sendable {
+        /// Provider-reported context occupancy for the latest request.
+        case exact
+        /// A provider figure that is not a direct occupancy report, such as prompt tokens.
+        case bestEffort = "best_effort"
+        /// Rebuilt from persisted history rather than observed live.
+        case inferred
+    }
+
+    package let usedTokens: Int?
+    package let windowTokens: Int?
+    /// How the used count was obtained; `nil` whenever no count is known, since it describes nothing
+    /// then. Producers always label a known count.
+    package let confidence: Confidence?
+
+    /// Returns `nil` unless at least one valid figure is known. Negative used counts and
+    /// non-positive windows are dropped rather than clamped, so invalid data never looks valid.
+    package init?(usedTokens: Int?, windowTokens: Int?, confidence: Confidence?) {
+        let used = usedTokens.flatMap { $0 >= 0 ? $0 : nil }
+        let window = windowTokens.flatMap { $0 > 0 ? $0 : nil }
+        guard used != nil || window != nil else { return nil }
+        self.usedTokens = used
+        self.windowTokens = window
+        self.confidence = used == nil ? nil : confidence
+    }
+
+    /// Share of the window in use, as a percentage rounded to one decimal; `nil` unless both
+    /// figures are known. Deliberately not clamped: above 100 means the provider reported more
+    /// context than its window, which is exactly the state an observer needs to see.
+    package var usedPercent: Double? {
+        guard let usedTokens, let windowTokens else { return nil }
+        return (Double(usedTokens) / Double(windowTokens) * 1000).rounded() / 10
+    }
+}
+
 package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let sessionID: UUID
     package let displayName: String?
@@ -183,6 +234,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
     package let latestVisibleAssistantPreview: String?
     package let visibleRowCount: Int
     package let lastActivityAt: Date
+    /// Target-global context load, identical for every authorized observer; `nil` when unknown.
+    package let context: DomainAgentSessionContextLoad?
 
     package var hasPendingInteraction: Bool {
         pendingInteractionKind != nil
@@ -201,7 +254,8 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind?,
         latestVisibleAssistantPreview: String?,
         visibleRowCount: Int,
-        lastActivityAt: Date
+        lastActivityAt: Date,
+        context: DomainAgentSessionContextLoad? = nil
     ) {
         self.sessionID = sessionID
         self.displayName = DomainAgentSessionLinkTextBudget.normalized(
@@ -224,6 +278,7 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         )
         self.visibleRowCount = max(0, visibleRowCount)
         self.lastActivityAt = lastActivityAt
+        self.context = context
     }
 }
 
@@ -290,7 +345,8 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
 /// Deterministically ordered inventory for one endpoint.
 package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
-    /// Advances only when this observer's grant membership changes.
+    /// Advances only when this observer's grant membership changes, or when the user changes the
+    /// management delegation of one of its grants (the capabilities this observer is told about).
     package let linkSetRevision: UInt64
     package let authorityRevision: UInt64
     package let items: [DomainAgentSessionLinkInventoryItem]
@@ -667,10 +723,14 @@ package enum DomainAgentSessionLinkWaitOutcome: Equatable, Sendable {
     case linkUnavailable(sessionID: UUID)
     case cursorExpired(sessionID: UUID)
     case invalidRequest
+    /// The user changed the observer's management delegation on the named link while this wait was
+    /// parked. The wait ends early so the running model learns its new capabilities now; the
+    /// successor cursors consume no target change and may be passed straight back to another wait.
+    case capabilitiesChanged(sessionID: UUID)
 
     package var triggeredSessionID: UUID? {
         switch self {
-        case let .changed(sessionID), let .idle(sessionID):
+        case let .changed(sessionID), let .idle(sessionID), let .capabilitiesChanged(sessionID):
             sessionID
         case let .revoked(notice):
             notice.targetSessionID
@@ -685,10 +745,18 @@ package struct DomainAgentSessionLinkWaitResult: Equatable, Sendable {
     package let outcome: DomainAgentSessionLinkWaitOutcome
     /// Successor cursors for every authorized target, in request order.
     package let targets: [DomainAgentSessionLinkTargetState]
+    /// Capability-change notices claimed for this result in the same actor turn that woke it, so a
+    /// `capabilities_changed` wake always carries what it was woken for. Empty for other outcomes.
+    package let capabilityNotices: [DomainAgentSessionLinkCapabilityNotice]
 
-    package init(outcome: DomainAgentSessionLinkWaitOutcome, targets: [DomainAgentSessionLinkTargetState]) {
+    package init(
+        outcome: DomainAgentSessionLinkWaitOutcome,
+        targets: [DomainAgentSessionLinkTargetState],
+        capabilityNotices: [DomainAgentSessionLinkCapabilityNotice] = []
+    ) {
         self.outcome = outcome
         self.targets = targets
+        self.capabilityNotices = capabilityNotices
     }
 }
 
@@ -778,6 +846,16 @@ package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable
     case persisted
     case runStarted = "run_started"
     case runStartFailed = "run_start_failed"
+    /// A managed `steer` the provider confirmed it accepted into the target's active turn.
+    case steered
+    /// A managed `steer` accepted into the target's interrupt-steering queue. The provider receives
+    /// it at the next safe interruption point of the active turn.
+    case queuedInterrupt = "queued_interrupt"
+    /// A managed `steer` accepted into the target's follow-up queue. It is delivered when the active
+    /// turn reaches its next boundary.
+    case queuedFollowUp = "queued_follow_up"
+    /// A managed `steer` delivered as the answer to the target's own wait for its next instruction.
+    case deliveredToWaitingInstruction = "delivered_to_waiting_instruction"
 }
 
 package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
@@ -869,8 +947,72 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     /// The authorization linearization fence was won before manual revocation.
     case committed
     case linkRevoked
+    /// The delivery required the user's management delegation, and the user withdrew it before the
+    /// fence. The link itself may still be active; nothing was delivered.
+    case managementRevoked
     case unknownReservation
     case shuttingDown
+}
+
+// MARK: - Management delegation
+
+/// Outcome of one explicit user change to a link's management delegation.
+package enum DomainAgentSessionLinkManagementDisposition: Equatable, Sendable {
+    /// The capability set changed. `observerInventory` is read in the same actor turn as the write,
+    /// for the same reason activation returns one: the caller can republish without a race.
+    case changed(
+        DomainAgentSessionLinkGrant,
+        observerInventory: DomainAgentSessionLinkInventory
+    )
+    /// The exact grant already had the requested state.
+    case unchanged(DomainAgentSessionLinkGrant)
+    /// The exact link generation is gone, or its recorded endpoints no longer match.
+    case notFound
+    case shuttingDown
+}
+
+/// One pending, observer-facing statement that the user changed what the observer may do on one
+/// exact link generation, owed to that observer's **running** model until some channel delivers it.
+///
+/// Authority changes are immediate and never wait for this: the grant's capability set is the only
+/// authorization input. The notice exists so a model already mid-turn stops reasoning from the
+/// capabilities it was told about earlier — including its own earlier refusals — rather than
+/// discovering the change only at its next turn.
+///
+/// Scoped to the exact observer endpoint and link generation that changed. A notice never names a
+/// session the observer was not granted, never reaches the target, and never transfers to another
+/// incarnation, a relinked generation, or a session the target itself oversees.
+package struct DomainAgentSessionLinkCapabilityNotice: Equatable, Hashable, Sendable {
+    package let linkID: UUID
+    package let linkGeneration: UInt64
+    package let targetSessionID: UUID
+    /// The management state the user just set. Always equal to the grant's state when delivered:
+    /// every later change replaces this notice rather than queueing behind it.
+    package let managed: Bool
+    /// The observer's link-set revision the change produced. An accepted inventory block at or past
+    /// this revision already told the model the same fact.
+    package let observerLinkSetRevision: UInt64
+    /// Per-observer-endpoint order of changes, so a restored notice never overwrites a newer one.
+    package let sequence: UInt64
+    package let changedAt: Date
+
+    package init(
+        linkID: UUID,
+        linkGeneration: UInt64,
+        targetSessionID: UUID,
+        managed: Bool,
+        observerLinkSetRevision: UInt64,
+        sequence: UInt64,
+        changedAt: Date
+    ) {
+        self.linkID = linkID
+        self.linkGeneration = linkGeneration
+        self.targetSessionID = targetSessionID
+        self.managed = managed
+        self.observerLinkSetRevision = observerLinkSetRevision
+        self.sequence = sequence
+        self.changedAt = changedAt
+    }
 }
 
 // MARK: - Change events
@@ -880,6 +1022,9 @@ package struct DomainAgentSessionLinkChangeEvent: Hashable, Sendable {
     package enum Kind: String, CaseIterable, Hashable, Sendable {
         case activated
         case revoked
+        /// One exact grant's capability set changed in place (the user's management delegation).
+        /// Membership is unchanged, but the observer's advertised capabilities are not.
+        case capabilitiesChanged = "capabilities_changed"
         case targetStateChanged = "target_state_changed"
         case draining
         case shutdown

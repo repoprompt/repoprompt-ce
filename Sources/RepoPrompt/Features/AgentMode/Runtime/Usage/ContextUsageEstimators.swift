@@ -4,6 +4,7 @@ enum ContextUsageSnapshotSource: String, Codable, Equatable {
     case claudeUsageEvent
     case geminiUsageEvent
     case codexNativeUsage
+    case acpUsageEvent
     case turnFinalization
     case persistedTurns
     case compactionSignal
@@ -99,6 +100,12 @@ protocol ContextUsageEstimating: AnyObject {
         _ usage: AgentContextUsage?,
         session: AgentTabSession
     ) -> ContextUsageSnapshot?
+
+    /// Whether this turn has already produced a provider-reported occupancy figure — the
+    /// estimator can then prefer that figure over billed prompt-call counts, and the vouch for
+    /// it is allowed to stand across a billed report. `false` for estimators whose reports are
+    /// themselves the occupancy claim.
+    func hasOccupancyReportThisTurn(session: AgentTabSession) -> Bool
 }
 
 extension ContextUsageEstimating {
@@ -109,5 +116,9 @@ extension ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         _ = usage
         return nil
+    }
+
+    func hasOccupancyReportThisTurn(session _: AgentTabSession) -> Bool {
+        false
     }
 }

@@ -38,15 +38,20 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     private func entry(
         _ index: Int,
         name: String?,
-        reference overrideReference: DomainAgentSessionLinkReference? = nil
+        reference overrideReference: DomainAgentSessionLinkReference? = nil,
+        from fromStatus: AgentSessionLinkPassiveStatusNotices.Status = .running,
+        to toStatus: AgentSessionLinkPassiveStatusNotices.Status = .idle,
+        targetSessionID: UUID = UUID(),
+        preview: String? = nil
     ) -> AgentSessionLinkPassiveStatusNotices.PendingEntry {
         AgentSessionLinkPassiveStatusNotices.PendingEntry(
             reference: overrideReference ?? reference(index),
             targetEndpoint: endpoint(),
-            targetSessionID: UUID(),
+            targetSessionID: targetSessionID,
             displayName: name,
-            fromStatus: .running,
-            toStatus: .idle,
+            fromStatus: fromStatus,
+            toStatus: toStatus,
+            latestVisibleAssistantPreview: preview,
             changeSequence: UInt64(index + 1)
         )
     }
@@ -100,28 +105,28 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     func testOneNamedLaneRendersTheSingularNamedSentence() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API"]),
-            "\(opening) an update for overseen lane \u{201C}Build API\u{201D}."
+            "\(opening) an update for overseen lane \u{201C}Build API\u{201D} (now idle)."
         )
     }
 
     func testOneNamedLaneWithOneUnnamedLaneUsesTheSingularOtherPhrase() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API", nil]),
-            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} and 1 other overseen lane."
+            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} (now idle) and 1 other overseen lane."
         )
     }
 
     func testOneNamedLaneWithSeveralUnnamedLanesUsesThePluralOtherPhrase() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API", nil, nil, nil]),
-            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} and 3 other overseen lanes."
+            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} (now idle) and 3 other overseen lanes."
         )
     }
 
     func testTwoNamedLanesAreJoinedWithAnd() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API", "Docs"]),
-            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} and \u{201C}Docs\u{201D}."
+            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} (now idle) and \u{201C}Docs\u{201D} (now idle)."
         )
     }
 
@@ -145,8 +150,8 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
                 names: ["Build API", "Docs"],
                 locationLabelsByReference: locations
             ),
-            "\(opening) updates for overseen lanes \u{201C}kidfriendly-nova: Build API\u{201D} "
-                + "and \u{201C}RepoPrompt (main): Docs\u{201D}."
+            "\(opening) updates for overseen lanes \u{201C}kidfriendly-nova: Build API\u{201D} (now idle) "
+                + "and \u{201C}RepoPrompt (main): Docs\u{201D} (now idle)."
         )
     }
 
@@ -182,14 +187,14 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     func testTwoNamedLanesWithOneOtherLaneUseTheSerialForm() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API", "Docs", nil]),
-            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D}, \u{201C}Docs\u{201D}, and 1 other overseen lane."
+            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} (now idle), \u{201C}Docs\u{201D} (now idle), and 1 other overseen lane."
         )
     }
 
     func testTwoNamedLanesWithSeveralOtherLanesUseThePluralSerialForm() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API", "Docs", "Infra", "Release"]),
-            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D}, \u{201C}Docs\u{201D}, and 2 other overseen lanes."
+            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} (now idle), \u{201C}Docs\u{201D} (now idle), and 2 other overseen lanes."
         )
     }
 
@@ -201,7 +206,7 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(built.attributedLaneCount, 2)
         XCTAssertEqual(
             try sentence(names: ["Build API", "Build API"]),
-            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} and 1 other overseen lane."
+            "\(opening) updates for overseen lane \u{201C}Build API\u{201D} (now idle) and 1 other overseen lane."
         )
     }
 
@@ -244,7 +249,7 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
     func testMixedOverflowAppendsExactlyTheDisclosureSentence() throws {
         XCTAssertEqual(
             try sentence(names: ["Build API"], overflow: true),
-            "\(opening) an update for overseen lane \u{201C}Build API\u{201D}. "
+            "\(opening) an update for overseen lane \u{201C}Build API\u{201D} (now idle). "
                 + AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
         )
     }
@@ -440,7 +445,7 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(row.laneUpdateDisplayAttribution, built)
         XCTAssertEqual(
             AgentLaneUpdateDisplayAttribution.richDisplayText(for: row),
-            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} and \u{201C}Docs\u{201D}."
+            "\(opening) updates for overseen lanes \u{201C}Build API\u{201D} (now idle) and \u{201C}Docs\u{201D} (now idle)."
         )
     }
 
@@ -449,6 +454,412 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         let row = AgentChatItem.laneUpdateAutoWake(wakeID: UUID(), acceptedAt: Date())
         XCTAssertNil(row.laneUpdateDisplayAttribution)
         XCTAssertNil(AgentLaneUpdateDisplayAttribution.richDisplayText(for: row))
+    }
+
+    // MARK: - Claim-time lane status
+
+    private typealias Change = AgentLaneUpdateDisplayAttribution.LaneStatusChange
+
+    /// Which linked session did what: each named lane carries the change of the exact rendered entry
+    /// that supplied its label, in rendered order.
+    func testEachLabelCarriesItsOwnRenderedEntryStatus() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: "Alpha", from: .running, to: .waiting),
+                entry(1, name: "Beta", from: .running, to: .idle),
+                entry(2, name: "Gamma", from: .waiting, to: .idle)
+            ],
+            includesUnattributedOverflow: false
+        ))
+
+        XCTAssertEqual(built.labels, ["Alpha", "Beta"])
+        XCTAssertEqual(built.labelStatusChanges, [
+            Change(from: .running, to: .waiting),
+            Change(from: .running, to: .idle)
+        ])
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.richDisplayText(
+                rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+                attribution: built
+            ),
+            "\(opening) updates for overseen lanes \u{201C}Alpha\u{201D} (waiting for input), "
+                + "\u{201C}Beta\u{201D} (now idle), and 1 other overseen lane."
+        )
+    }
+
+    /// An unnamed lane and a duplicate-named lane are skipped for labels, and must be skipped for
+    /// statuses too — otherwise a later lane's change would be attached to an earlier lane's name.
+    func testSkippedLanesNeverShiftStatusesOntoOtherLabels() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: nil, from: .running, to: .waiting),
+                entry(1, name: "Alpha", from: .running, to: .idle),
+                entry(2, name: "Alpha", from: .running, to: .waiting),
+                entry(3, name: "Beta", from: .idle, to: .waiting)
+            ],
+            includesUnattributedOverflow: false
+        ))
+
+        XCTAssertEqual(built.labels, ["Alpha", "Beta"])
+        XCTAssertEqual(built.labelStatusChanges, [
+            Change(from: .running, to: .idle),
+            Change(from: .idle, to: .waiting)
+        ])
+        XCTAssertEqual(built.attributedLaneCount, 4)
+    }
+
+    /// RepoPrompt observed that a target stopped, not that its work succeeded.
+    func testNoStatusPhraseClaimsSuccess() {
+        XCTAssertEqual(AgentLaneUpdateDisplayAttribution.LaneStatus.idle.currentStatePhrase, "now idle")
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.LaneStatus.waiting.currentStatePhrase,
+            "waiting for input"
+        )
+        for status in AgentLaneUpdateDisplayAttribution.LaneStatus.allCases {
+            let phrases = [
+                status.currentStatePhrase,
+                status.title,
+                Change(from: .running, to: status).changeDescription
+            ].map { $0.lowercased() }
+            for phrase in phrases {
+                for claim in ["done", "success", "succeed", "complete", "finish", "passed"] {
+                    XCTAssertFalse(phrase.contains(claim), "\(status): \(phrase)")
+                }
+            }
+        }
+    }
+
+    func testReducerStatusVocabularyMapsOneToOne() {
+        for status in AgentSessionLinkPassiveStatusNotices.Status.allCases {
+            XCTAssertEqual(
+                AgentLaneUpdateDisplayAttribution.LaneStatus(status).rawValue,
+                status.rawValue
+            )
+        }
+    }
+
+    /// Only the coarse enum pair is persisted alongside the labels.
+    func testStatusesRoundTripAsTheCoarsePairOnly() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: "Alpha", from: .running, to: .waiting, preview: "SECRET PREVIEW")
+            ],
+            includesUnattributedOverflow: false
+        ))
+        let data = try JSONEncoder().encode(built)
+        XCTAssertEqual(try JSONDecoder().decode(AgentLaneUpdateDisplayAttribution.self, from: data), built)
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let changes = try XCTUnwrap(object["labelStatusChanges"] as? [[String: Any]])
+        XCTAssertEqual(changes.count, 1)
+        XCTAssertEqual(Set(changes[0].keys), ["from", "to"])
+        XCTAssertEqual(changes[0]["from"] as? String, "running")
+        XCTAssertEqual(changes[0]["to"] as? String, "waiting")
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("SECRET PREVIEW"))
+    }
+
+    /// Rows written before statuses were captured keep their labels and simply show no status.
+    func testLegacyLabelsOnlyPayloadStaysValidWithoutStatuses() throws {
+        let legacy = try JSONDecoder().decode(
+            AgentLaneUpdateDisplayAttribution.self,
+            from: Data(#"{"labels":["Alpha","Beta"],"attributedLaneCount":5}"#.utf8)
+        )
+        XCTAssertTrue(legacy.isValid)
+        XCTAssertNil(legacy.labelStatusChanges)
+
+        let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: legacy
+        ))
+        XCTAssertEqual(presentation.lanes.map(\.label), ["Alpha", "Beta"])
+        XCTAssertEqual(presentation.lanes.map(\.statusChange), [nil, nil])
+        XCTAssertEqual(presentation.additionalLanesText, "+3 more overseen lanes")
+        XCTAssertEqual(
+            presentation.accessibilityLabel,
+            "Lane update. RepoPrompt auto-woke this session for 5 overseen lanes. "
+                + "\u{201C}Alpha\u{201D}, status not recorded. "
+                + "\u{201C}Beta\u{201D}, status not recorded. "
+                + "Plus 3 more overseen lanes."
+        )
+    }
+
+    /// A bad status array is decoration gone wrong, not a reason to lose exact labels — and it must
+    /// never pair a lane with a status it may not have had.
+    func testMalformedStatusesDegradeToLabelsOnly() throws {
+        let payloads = [
+            #"{"labels":["Alpha"],"attributedLaneCount":1,"labelStatusChanges":"idle"}"#,
+            #"{"labels":["Alpha"],"attributedLaneCount":1,"labelStatusChanges":[{"from":"running","to":"done"}]}"#,
+            #"{"labels":["Alpha"],"attributedLaneCount":1,"labelStatusChanges":[{"from":"running"}]}"#,
+            #"{"labels":["Alpha"],"attributedLaneCount":1,"labelStatusChanges":[]}"#,
+            #"{"labels":["Alpha"],"attributedLaneCount":2,"labelStatusChanges":[{"from":"running","to":"idle"},{"from":"running","to":"waiting"}]}"#
+        ]
+        for payload in payloads {
+            let decoded = try JSONDecoder().decode(
+                AgentLaneUpdateDisplayAttribution.self,
+                from: Data(payload.utf8)
+            )
+            XCTAssertTrue(decoded.isValid, payload)
+            XCTAssertEqual(decoded.labels, ["Alpha"], payload)
+            XCTAssertNil(decoded.labelStatusChanges, payload)
+
+            let reencoded = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any]
+            )
+            XCTAssertNil(reencoded["labelStatusChanges"], "a dropped array must not be resaved: \(payload)")
+        }
+    }
+
+    // MARK: - Row presentation
+
+    func testRowPresentationListsEachLaneWithItsStatusAndATruthfulPlusTail() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: "Alpha", from: .running, to: .waiting),
+                entry(1, name: "Beta", from: .running, to: .idle),
+                entry(2, name: "Gamma"),
+                entry(3, name: nil),
+                entry(4, name: "Delta")
+            ],
+            includesUnattributedOverflow: true,
+            locationLabelsByReference: [reference(1): "kidfriendly-nova"]
+        ))
+        let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: built
+        ))
+
+        XCTAssertEqual(AgentLaneUpdateDisplayAttribution.RowPresentation.title, "Lane update")
+        XCTAssertEqual(presentation.summary, "RepoPrompt auto-woke this session for 5 overseen lanes.")
+        XCTAssertEqual(presentation.lanes.map(\.quotedLabel), [
+            "\u{201C}Alpha\u{201D}",
+            "\u{201C}kidfriendly-nova: Beta\u{201D}"
+        ])
+        XCTAssertEqual(
+            presentation.lanes.map { $0.statusChange?.to.currentStatePhrase },
+            ["waiting for input", "now idle"]
+        )
+        XCTAssertEqual(presentation.additionalLaneCount, 3)
+        XCTAssertEqual(presentation.additionalLanesText, "+3 more overseen lanes")
+        XCTAssertEqual(
+            presentation.overflowNote,
+            AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
+        )
+        XCTAssertEqual(
+            presentation.accessibilityLabel,
+            "Lane update. RepoPrompt auto-woke this session for 5 overseen lanes. "
+                + "\u{201C}Alpha\u{201D} changed from Running to Waiting for input. "
+                + "\u{201C}kidfriendly-nova: Beta\u{201D} changed from Running to Idle. "
+                + "Plus 3 more overseen lanes. "
+                + AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
+        )
+    }
+
+    func testSingleExtraLaneUsesTheSingularPlusTail() throws {
+        let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: attribution(names: ["Alpha", "Beta", "Gamma"])
+        ))
+        XCTAssertEqual(presentation.additionalLanesText, "+1 more overseen lane")
+        XCTAssertNil(presentation.overflowNote)
+    }
+
+    /// With nothing named, the summary already states the whole count; a `+N` would be additional
+    /// to nothing.
+    func testUnnamedOnlyBatchStatesTheCountWithoutAPlusTail() throws {
+        let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: attribution(names: [nil, nil, nil])
+        ))
+        XCTAssertEqual(presentation.summary, "RepoPrompt auto-woke this session for 3 overseen lanes.")
+        XCTAssertTrue(presentation.lanes.isEmpty)
+        XCTAssertNil(presentation.additionalLanesText)
+
+        let single = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: attribution(names: [nil])
+        ))
+        XCTAssertEqual(single.summary, "RepoPrompt auto-woke this session for 1 overseen lane.")
+    }
+
+    /// Legacy, malformed, and overflow-only rows still get the system row, with the generic body that
+    /// was already the whole truth for them.
+    func testCanonicalRowsWithoutPresentableMetadataUseTheGenericBody() throws {
+        let malformed = try JSONDecoder().decode(
+            AgentLaneUpdateDisplayAttribution.self,
+            from: Data(#"{"labels":["A","A"],"attributedLaneCount":2}"#.utf8)
+        )
+        let overflowOnly = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [],
+            includesUnattributedOverflow: true
+        ))
+        for candidate in [nil, malformed, overflowOnly] {
+            let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+                rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+                attribution: candidate
+            ))
+            XCTAssertEqual(presentation.summary, AgentLaneUpdateDisplayAttribution.genericRowSummary)
+            XCTAssertTrue(presentation.lanes.isEmpty)
+            XCTAssertNil(presentation.additionalLanesText)
+            XCTAssertNil(presentation.overflowNote)
+            XCTAssertEqual(
+                presentation.accessibilityLabel,
+                "Lane update. " + AgentLaneUpdateDisplayAttribution.genericRowSummary
+            )
+        }
+    }
+
+    // MARK: - Accessibility reading
+
+    /// VoiceOver hears a readable event, never the raw provider-facing marker, for every shape of row.
+    func testAccessibilityLabelNeverSpeaksTheRawMarker() throws {
+        let candidates: [AgentLaneUpdateDisplayAttribution?] = [
+            nil,
+            attribution(names: [nil, nil]),
+            attribution(names: ["Alpha"], overflow: true),
+            attribution(names: ["Alpha", "Beta", "Gamma"])
+        ]
+        for candidate in candidates {
+            let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+                rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+                attribution: candidate
+            ))
+            XCTAssertTrue(presentation.accessibilityLabel.hasPrefix("Lane update. "))
+            XCTAssertFalse(presentation.accessibilityLabel.contains("[lane-update]"))
+            XCTAssertFalse(presentation.accessibilityLabel.contains("["))
+        }
+    }
+
+    /// The spoken reading carries the full from→to transition that sighted users get on hover, in
+    /// the past tense, so an old transcript never sounds like it describes the lane's current state.
+    func testAccessibilityLabelSpeaksPastTenseTransitionsNotCurrentState() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: "Alpha", from: .waiting, to: .idle),
+                entry(1, name: "Beta", from: .idle, to: .waiting)
+            ],
+            includesUnattributedOverflow: false
+        ))
+        let label = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: built
+        )).accessibilityLabel
+
+        XCTAssertEqual(
+            label,
+            "Lane update. RepoPrompt auto-woke this session for 2 overseen lanes. "
+                + "\u{201C}Alpha\u{201D} changed from Waiting for input to Idle. "
+                + "\u{201C}Beta\u{201D} changed from Idle to Waiting for input."
+        )
+        for status in AgentLaneUpdateDisplayAttribution.LaneStatus.allCases {
+            XCTAssertFalse(
+                label.contains(status.currentStatePhrase),
+                "current-state phrasing must not be spoken: \(status.currentStatePhrase)"
+            )
+        }
+    }
+
+    func testAccessibilityLabelUsesSingularPlusTail() throws {
+        let label = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: attribution(names: ["Alpha", nil])
+        )).accessibilityLabel
+        XCTAssertTrue(label.hasSuffix(
+            "\u{201C}Alpha\u{201D} changed from Running to Idle. Plus 1 more overseen lane."
+        ))
+    }
+
+    /// Delivery time is spoken with date context, from the same formatter the visible stamp uses.
+    func testAccessibilityDeliveryValueIncludesDateContext() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let locale = Locale(identifier: "en_US_POSIX")
+        let delivered = Date(timeIntervalSince1970: 1_790_000_000)
+
+        let sameDay = MessageTimestampFormatter.string(
+            from: delivered,
+            includeDateContext: true,
+            now: delivered.addingTimeInterval(60),
+            calendar: calendar,
+            locale: locale
+        )
+        let earlier = MessageTimestampFormatter.string(
+            from: delivered,
+            includeDateContext: true,
+            now: delivered.addingTimeInterval(60 * 60 * 24 * 40),
+            calendar: calendar,
+            locale: locale
+        )
+        XCTAssertNotEqual(sameDay, earlier, "an older delivery must carry its date")
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: sameDay),
+            "Delivered \(sameDay)"
+        )
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: earlier),
+            "Delivered \(earlier)"
+        )
+    }
+
+    func testRowPresentationIsDeclinedForOtherRows() throws {
+        let built = try XCTUnwrap(attribution(names: ["Alpha"]))
+        XCTAssertNil(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: "[lane-update] something a different build wrote.",
+            attribution: built
+        ))
+        XCTAssertNil(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            for: AgentChatItem.system("Context compacted.")
+        ))
+        var assistantRow = AgentChatItem.assistant(
+            AgentLaneUpdateDisplayAttribution.canonicalSystemText
+        )
+        assistantRow.laneUpdateDisplayAttribution = built
+        XCTAssertNil(AgentLaneUpdateDisplayAttribution.rowPresentation(for: assistantRow))
+
+        let accepted = AgentChatItem.laneUpdateAutoWake(
+            wakeID: UUID(),
+            acceptedAt: Date(),
+            displayAttribution: built
+        )
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.rowPresentation(for: accepted)?.lanes.map(\.label),
+            ["Alpha"]
+        )
+    }
+
+    /// Nothing that identifies a target beyond its sanitized label reaches any displayed string.
+    func testRowPresentationCarriesNoIdentityOrPreview() throws {
+        let targetSessionID = UUID()
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(
+                    0,
+                    name: "Alpha",
+                    from: .running,
+                    to: .waiting,
+                    targetSessionID: targetSessionID,
+                    preview: "SECRET PREVIEW /Users/local/private.swift"
+                )
+            ],
+            includesUnattributedOverflow: false
+        ))
+        let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: built
+        ))
+        let displayed = [presentation.summary, presentation.accessibilityLabel]
+            + presentation.lanes.flatMap { [$0.quotedLabel, $0.statusChange?.changeDescription ?? ""] }
+        for string in displayed {
+            for forbidden in [
+                targetSessionID.uuidString,
+                reference(0).linkID.uuidString,
+                "SECRET PREVIEW",
+                "/Users/"
+            ] {
+                XCTAssertFalse(string.contains(forbidden), "\(forbidden) leaked into \(string)")
+            }
+        }
     }
 
     // MARK: - Malformed metadata
@@ -622,6 +1033,8 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
             "RepoPrompt (main)",
             "overseen lane",
             "overseen lanes",
+            "now idle",
+            "labelStatusChanges",
             AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
         ] {
             XCTAssertFalse(

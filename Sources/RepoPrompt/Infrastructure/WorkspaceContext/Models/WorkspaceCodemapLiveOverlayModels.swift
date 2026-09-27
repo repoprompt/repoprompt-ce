@@ -538,3 +538,31 @@ final class WorkspaceCodemapSharedArtifactLease: Sendable {
         lease.closeSynchronously()
     }
 }
+
+/// How the overlay rebuilds its root-local graph ledger after a graph-index publication.
+/// `.alwaysFull` exists so tests can prove the path-scoped reconciliation is exact.
+enum WorkspaceCodemapGraphReconcileMode: Hashable {
+    case incremental
+    case alwaysFull
+}
+
+/// Diagnostics for the root-local graph ledger. Visit counts measure reconciliation work, which
+/// for graph-index publications scales with the publication, not with the resident slot count.
+struct WorkspaceCodemapGraphLedgerAccounting: Hashable {
+    let slotCount: Int
+    let changedSetFileIDCount: Int
+    let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let floorGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let acknowledgedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let incrementalReconcileCount: UInt64
+    let fullReconcileCount: UInt64
+    let incrementalFallbackCount: UInt64
+    let lastReconcileVisitCount: UInt64
+    let maximumIncrementalReconcileVisitCount: UInt64
+    let totalReconcileVisitCount: UInt64
+    let lastDiffSlotCount: Int
+    let floorResetCount: UInt64
+    let acknowledgedPruneCount: UInt64
+    /// Whether path-scoped reconciliation may resolve live state through the path index.
+    let liveEntriesIndexedByPath: Bool
+}

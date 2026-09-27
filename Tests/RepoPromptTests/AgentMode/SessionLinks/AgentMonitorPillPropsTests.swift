@@ -18,7 +18,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         hasUnreadActivity: Bool = false,
         targetRoute: AgentSessionDeepLinkRoute? = nil,
         autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
-        isAutoWakeEffectivelySelected: Bool = false
+        isAutoWakeEffectivelySelected: Bool = false,
+        autoApprovalEnabled: Bool = false
     ) -> AgentMonitorPillProps.Outbound {
         AgentMonitorPillProps.Outbound(
             linkID: UUID(),
@@ -33,7 +34,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             hasUnreadActivity: hasUnreadActivity,
             targetRoute: targetRoute,
             autoWakeSnooze: autoWakeSnooze,
-            isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected
+            isAutoWakeEffectivelySelected: isAutoWakeEffectivelySelected,
+            autoApprovalEnabled: autoApprovalEnabled
         )
     }
 
@@ -474,6 +476,15 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             roleAllowsOutboundMonitoring: true
         )
         XCTAssertTrue(settled.canAdd)
+    }
+
+    func testAutoApprovalIsOffByDefaultAndSurvivesPresentationOverlay() {
+        XCTAssertFalse(outbound().autoApprovalEnabled)
+        let selected = outbound(autoApprovalEnabled: true)
+        XCTAssertTrue(selected.withAutoWakeState(snooze: nil, isEffectivelySelected: true).autoApprovalEnabled)
+        let props = makeProps(outbound: [selected])
+        XCTAssertTrue(props.withCanAddReason("changed").outbound[0].autoApprovalEnabled)
+        XCTAssertTrue(props.withPersistence(.noDurableLayer, eligibilityReason: nil).outbound[0].autoApprovalEnabled)
     }
 
     func testOverlayPreservesAuthoritativeLinkAndNoticeProjection() {

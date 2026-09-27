@@ -18,9 +18,10 @@ import RepoPromptDomainRuntime
 /// - The row's raw `.system` text stays exactly `canonicalSystemText`, so provider replay,
 ///   cross-session reads, exports, sync projections, and telemetry keep saying the generic thing.
 ///   Every one of those projections selects `text` explicitly, which is what keeps this field local.
-/// - No UUID, link reference, endpoint identity, target preview, path, provider, status payload, or
-///   admission-cause information is retained. Only at most two already-capped display labels, a
-///   distinct lane count, and one overflow Boolean.
+/// - No UUID, link reference, endpoint identity, target preview, path, provider, waiting reason,
+///   readiness bit, timestamp, or admission-cause information is retained. Only at most two
+///   already-capped display labels, each with the coarse claim-time status change of the rendered
+///   entry it names, a distinct lane count, and one overflow Boolean.
 /// - Task and UI location labels are untrusted target-derived data. They are sanitized here against
 ///   format and bidi controls. A location is prefixed only when the complete compound label fits the
 ///   `DomainAgentSessionLinkTextBudget`; otherwise the identifying task survives unchanged. Labels
@@ -43,16 +44,27 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
     /// Whether the rendered envelope also disclosed dropped changes with no retained attribution.
     public let includesUnattributedOverflow: Bool
 
+    /// The claim-time status change of the rendered entry each label names, index-aligned with
+    /// `labels`.
+    ///
+    /// Optional because rows written before this field existed carry only labels, and because a
+    /// malformed or misaligned array degrades to exactly that labels-only form rather than taking the
+    /// labels down with it. Only the coarse enum pair is kept: never a preview, a waiting reason, a
+    /// readiness bit, or an observation time.
+    public let labelStatusChanges: [LaneStatusChange]?
+
     /// Unvalidated storage. Private on purpose: every producer goes through `make(...)`, and every
     /// consumer goes through `validated`, so an invalid value can only originate from decoding.
     private init(
         unchecked labels: [String],
         attributedLaneCount: Int,
-        includesUnattributedOverflow: Bool
+        includesUnattributedOverflow: Bool,
+        labelStatusChanges: [LaneStatusChange]? = nil
     ) {
         self.labels = labels
         self.attributedLaneCount = attributedLaneCount
         self.includesUnattributedOverflow = includesUnattributedOverflow
+        self.labelStatusChanges = labelStatusChanges
     }
 
     /// The representation a malformed payload decodes to.
@@ -86,6 +98,7 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
         }
         guard labels.count <= attributedLaneCount else { return false }
         guard attributedLaneCount > 0 || labels.isEmpty else { return false }
+        if let labelStatusChanges, labelStatusChanges.count != labels.count { return false }
         // Metadata that claims neither a lane nor an omission describes nothing at all.
         return attributedLaneCount > 0 || includesUnattributedOverflow
     }
@@ -131,6 +144,7 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
         }
 
         var labels: [String] = []
+        var statusChanges: [LaneStatusChange] = []
         for entry in distinctEntries {
             guard labels.count < maximumLabelCount else { break }
             // An unnamed lane, or one whose whole name was invisible scalars, is counted but not
@@ -142,12 +156,16 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
             )
             guard !labels.contains(label) else { continue }
             labels.append(label)
+            // The same immutable rendered entry that supplied the label supplies its status, so a
+            // named lane can never be paired with another lane's change.
+            statusChanges.append(LaneStatusChange(entry))
         }
 
         return AgentLaneUpdateDisplayAttribution(
             unchecked: labels,
             attributedLaneCount: distinctEntries.count,
-            includesUnattributedOverflow: includesUnattributedOverflow
+            includesUnattributedOverflow: includesUnattributedOverflow,
+            labelStatusChanges: statusChanges
         ).validated
     }
 
@@ -214,6 +232,7 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
         case labels
         case attributedLaneCount
         case includesUnattributedOverflow
+        case labelStatusChanges
     }
 
     /// Never throws. A malformed container, a malformed field type, or a missing required field
@@ -238,10 +257,21 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
             Bool.self,
             forKey: .includesUnattributedOverflow
         )
+        // Statuses are decoration on labels that are already exact. A legacy row has none, and an
+        // unknown status word or an array that no longer lines up with the labels degrades to the
+        // labels-only form rather than pairing a lane with a status it may not have had.
+        var statusChanges = (try? container.decodeIfPresent(
+            [LaneStatusChange].self,
+            forKey: .labelStatusChanges
+        )) ?? nil
+        if let decoded = statusChanges, decoded.count != labels.count {
+            statusChanges = nil
+        }
         self.init(
             unchecked: labels,
             attributedLaneCount: attributedLaneCount,
-            includesUnattributedOverflow: overflow ?? false
+            includesUnattributedOverflow: overflow ?? false,
+            labelStatusChanges: statusChanges
         )
     }
 
@@ -256,6 +286,78 @@ public struct AgentLaneUpdateDisplayAttribution: Codable, Sendable, Equatable, H
         try container.encode(labels, forKey: .labels)
         try container.encode(attributedLaneCount, forKey: .attributedLaneCount)
         try container.encode(includesUnattributedOverflow, forKey: .includesUnattributedOverflow)
+        try container.encodeIfPresent(labelStatusChanges, forKey: .labelStatusChanges)
+    }
+}
+
+// MARK: - Claim-time lane status
+
+public extension AgentLaneUpdateDisplayAttribution {
+    /// A lane's coarse status, mirrored from the passive reducer's vocabulary so the persisted form
+    /// does not depend on an internal runtime type.
+    enum LaneStatus: String, Codable, Sendable, Hashable, CaseIterable {
+        case idle
+        case running
+        case waiting
+        case unavailable
+
+        /// What the lane is doing now, phrased as an observation.
+        ///
+        /// Idle is deliberately just idle: RepoPrompt observed that the target stopped, not that its
+        /// work succeeded, so no phrase may read as done, finished, or complete.
+        public var currentStatePhrase: String {
+            switch self {
+            case .idle: "now idle"
+            case .running: "now running"
+            case .waiting: "waiting for input"
+            case .unavailable: "now unavailable"
+            }
+        }
+
+        /// Title-case state name for the hover detail. `waiting` is the monitor's awaiting-user
+        /// state, so it is spelled out as waiting for input rather than left ambiguous.
+        public var title: String {
+            switch self {
+            case .idle: "Idle"
+            case .running: "Running"
+            case .waiting: "Waiting for input"
+            case .unavailable: "Unavailable"
+            }
+        }
+    }
+
+    /// The first-to-final status interval the rendered entry carried when this turn was claimed.
+    struct LaneStatusChange: Codable, Sendable, Equatable, Hashable {
+        public let from: LaneStatus
+        public let to: LaneStatus
+
+        public init(from: LaneStatus, to: LaneStatus) {
+            self.from = from
+            self.to = to
+        }
+
+        /// Hover detail; never shown as the primary status.
+        public var changeDescription: String {
+            "Changed from \(from.title) to \(to.title)"
+        }
+    }
+}
+
+extension AgentLaneUpdateDisplayAttribution.LaneStatus {
+    /// Exhaustive so a new reducer status has to be classified here rather than silently narrated.
+    init(_ status: AgentSessionLinkPassiveStatusNotices.Status) {
+        switch status {
+        case .idle: self = .idle
+        case .running: self = .running
+        case .waiting: self = .waiting
+        case .unavailable: self = .unavailable
+        }
+    }
+}
+
+extension AgentLaneUpdateDisplayAttribution.LaneStatusChange {
+    init(_ entry: AgentSessionLinkPassiveStatusNotices.PendingEntry) {
+        self.init(from: .init(entry.fromStatus), to: .init(entry.toStatus))
     }
 }
 
@@ -302,6 +404,132 @@ public extension AgentLaneUpdateDisplayAttribution {
     }
 }
 
+// MARK: - Structured row presentation
+
+extension AgentLaneUpdateDisplayAttribution {
+    /// The scannable local row for one canonical lane-update item: a fixed system header, one line per
+    /// named lane with its claim-time status, a truthful `+N more` tail, and the overflow disclosure.
+    ///
+    /// Every field is derived from the same validated claim-time metadata as `richDisplayText`. The
+    /// accessibility reading is computed from these fields rather than stored, so what VoiceOver hears
+    /// can never drift from what the row shows.
+    struct RowPresentation: Equatable {
+        struct Lane: Equatable {
+            /// Sanitized, target-derived text. Rendered verbatim, never through Markdown.
+            let label: String
+            /// `nil` for rows written before statuses were captured.
+            let statusChange: LaneStatusChange?
+
+            /// Wrapped in the grammar's own delimiters, which sanitization guarantees a label cannot
+            /// contain, so a name can never appear to end early and continue as RepoPrompt prose.
+            var quotedLabel: String {
+                AgentLaneUpdateDisplayAttribution.quoted(label)
+            }
+        }
+
+        static let title = "Lane update"
+
+        /// One line under the header: who woke the session and, when known, for how many lanes.
+        let summary: String
+        let lanes: [Lane]
+        /// Delivered lanes not listed by name. Zero whenever `lanes` is empty, because the summary
+        /// already states the whole count and a bare `+N` would read as additional to nothing.
+        let additionalLaneCount: Int
+        let overflowNote: String?
+
+        var additionalLanesText: String? {
+            guard additionalLaneCount > 0 else { return nil }
+            return additionalLaneCount == 1
+                ? "+1 more overseen lane"
+                : "+\(additionalLaneCount) more overseen lanes"
+        }
+
+        /// The whole event as VoiceOver should hear it: no raw `[lane-update]` marker, and each named
+        /// lane's full claim-time transition, which sighted users otherwise only get on hover.
+        ///
+        /// Transitions are phrased in the past tense ("changed from Running to Idle") rather than
+        /// with the visible row's "now idle", because a spoken row has no adjacent timestamp to anchor
+        /// "now" and an old transcript must not sound like it describes the lane's current state.
+        var accessibilityLabel: String {
+            var sentences = ["\(Self.title).", summary]
+            for lane in lanes {
+                if let change = lane.statusChange {
+                    sentences.append(
+                        "\(lane.quotedLabel) changed from \(change.from.title) to \(change.to.title)."
+                    )
+                } else {
+                    sentences.append("\(lane.quotedLabel), status not recorded.")
+                }
+            }
+            if additionalLaneCount > 0 {
+                sentences.append(
+                    additionalLaneCount == 1
+                        ? "Plus 1 more overseen lane."
+                        : "Plus \(additionalLaneCount) more overseen lanes."
+                )
+            }
+            if let overflowNote {
+                sentences.append(overflowNote)
+            }
+            return sentences.joined(separator: " ")
+        }
+
+        /// The accessibility value carrying when the update was delivered, given the row's
+        /// already-formatted timestamp.
+        static func accessibilityDeliveryValue(timestamp: String) -> String {
+            "Delivered \(timestamp)"
+        }
+    }
+
+    /// The generic body shown when a canonical row has no presentable lane metadata.
+    static let genericRowSummary =
+        "RepoPrompt auto-woke this session for overseen-session status updates."
+
+    /// The structured row for a canonical lane-update item, or `nil` for every other row.
+    ///
+    /// Keyed off the exact canonical raw text, so only rows this feature wrote are restyled. Legacy,
+    /// malformed, and overflow-only metadata still get the system row styling, with the generic body
+    /// that was already the whole truth for them.
+    static func rowPresentation(for item: AgentChatItem) -> RowPresentation? {
+        guard item.kind == .system else { return nil }
+        return rowPresentation(rawText: item.text, attribution: item.laneUpdateDisplayAttribution)
+    }
+
+    static func rowPresentation(
+        rawText: String,
+        attribution: AgentLaneUpdateDisplayAttribution?
+    ) -> RowPresentation? {
+        guard rawText == canonicalSystemText else { return nil }
+        guard let attribution = attribution?.validated,
+              attribution.attributedLaneCount > 0
+        else {
+            return RowPresentation(
+                summary: genericRowSummary,
+                lanes: [],
+                additionalLaneCount: 0,
+                overflowNote: nil
+            )
+        }
+        let lanes = attribution.labels.enumerated().map { index, label in
+            RowPresentation.Lane(
+                label: label,
+                statusChange: attribution.labelStatusChanges?[index]
+            )
+        }
+        let count = attribution.attributedLaneCount
+        return RowPresentation(
+            summary: count == 1
+                ? "RepoPrompt auto-woke this session for 1 overseen lane."
+                : "RepoPrompt auto-woke this session for \(count) overseen lanes.",
+            lanes: lanes,
+            additionalLaneCount: lanes.isEmpty ? 0 : count - lanes.count,
+            overflowNote: attribution.includesUnattributedOverflow
+                ? unattributedOverflowSentence
+                : nil
+        )
+    }
+}
+
 private extension AgentLaneUpdateDisplayAttribution {
     static let sentenceOpening = "[lane-update] RepoPrompt auto-woke this session and delivered"
 
@@ -316,19 +544,27 @@ private extension AgentLaneUpdateDisplayAttribution {
                 ? "\(Self.sentenceOpening) an update for an overseen lane."
                 : "\(Self.sentenceOpening) updates for \(attributedLaneCount) overseen lanes."
         case 1:
-            let first = Self.quoted(labels[0])
+            let first = describedLabel(at: 0)
             guard additional > 0 else {
                 return "\(Self.sentenceOpening) an update for overseen lane \(first)."
             }
             return "\(Self.sentenceOpening) updates for overseen lane \(first) and \(Self.otherLanePhrase(additional))."
         default:
-            let first = Self.quoted(labels[0])
-            let second = Self.quoted(labels[1])
+            let first = describedLabel(at: 0)
+            let second = describedLabel(at: 1)
             guard additional > 0 else {
                 return "\(Self.sentenceOpening) updates for overseen lanes \(first) and \(second)."
             }
             return "\(Self.sentenceOpening) updates for overseen lanes \(first), \(second), and \(Self.otherLanePhrase(additional))."
         }
+    }
+
+    /// A quoted label followed, when captured, by its claim-time state in parentheses. The status is
+    /// outside the quotes so it always reads as RepoPrompt's observation rather than part of a name.
+    func describedLabel(at index: Int) -> String {
+        let quotedLabel = Self.quoted(labels[index])
+        guard let change = labelStatusChanges?[index] else { return quotedLabel }
+        return "\(quotedLabel) (\(change.to.currentStatePhrase))"
     }
 
     static func otherLanePhrase(_ count: Int) -> String {

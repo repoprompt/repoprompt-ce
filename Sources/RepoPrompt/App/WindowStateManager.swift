@@ -1062,6 +1062,8 @@ class WindowStatesManager: ObservableObject {
         // Eager revocation for both endpoints of every link this window held. Operation-time identity
         // revalidation still catches a missed hook, but the surviving endpoint should learn now.
         invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
+        // Retract every attention notification this window owned; its sessions are gone.
+        NotificationService.shared.agentNotifications.removeWindow(state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)

@@ -26,10 +26,10 @@
       "agent_explore": ["start", "poll", "wait", "cancel"],
       "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
       "agent_manage": ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"],
-      "agent_session_link": ["list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on", "snooze_auto_wake", "request_attention"],
+      "agent_session_link": ["list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on", "snooze_auto_wake", "request_attention", "get_interaction", "respond", "steer"],
       "history": ["list_sessions", "search", "time", "get_session"]
     },
-    "canonical_discriminated_action_count": 95,
+    "canonical_discriminated_action_count": 98,
     "actionless_tool_count": 12,
     "actionless_tools": {
       "get_code_structure": {

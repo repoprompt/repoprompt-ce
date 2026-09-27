@@ -39,7 +39,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     init(
         name: String,
-        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none
+        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
+        enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
+        graphPullPause: WorkspaceCodemapGraphPullPause = .production
     ) throws {
         let registry = WorkspaceCodemapBindingIntegrationRegistry()
         let builtSourceTexts = CodemapLockedValues<String>()
@@ -86,7 +88,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
                             hooks: capabilityHooks
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
-                        catalogClient: registry.makeBindingCatalogClient()
+                        catalogClient: registry.makeBindingCatalogClient(),
+                        policy: enginePolicy,
+                        graphPullPause: graphPullPause
                     )
                 }
             ))

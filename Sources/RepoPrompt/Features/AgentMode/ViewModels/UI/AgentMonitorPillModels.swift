@@ -276,6 +276,34 @@ enum AgentMonitorAutoWakeCopy {
     static let missingReason = "That Agent session is no longer active."
 }
 
+/// High-trust, exact-link permission delegation shown only in the observer dashboard.
+enum AgentMonitorAutoApprovalCopy {
+    static let laneLabel = "Auto-approve permissions"
+    static let bulkLabel = "Auto-approve provider permissions"
+    static let selectAll = "Select all watched"
+    static let deselectAll = "Deselect all watched"
+    static let tooltip = "Automatically accept new provider tool, command, file-change, and elevated permission prompts for this exact linked session. A prompt already waiting stays manual. Questions, app reviews, and unrelated approvals stay manual. This choice ends on unlink, relink, or app restart."
+    static let unavailableMessage = "That oversight link is no longer active."
+}
+
+/// The user's explicit, exact-link **management** delegation: the overseer may act for the user in
+/// that one session. The lane label and badge say so plainly, because a link that is merely watched
+/// and one that is managed confer very different powers.
+enum AgentMonitorManagementCopy {
+    static let laneLabel = "Manage"
+    static let badge = "Managing"
+    static let inboundBadge = "Manages this session"
+    static let tooltip = "Let this overseer act for you in this session: answer its approval, permission, and question prompts, steer or redirect its running turns, and give it new instructions. Each answer applies to the current prompt only; session-wide approvals, hook trust, worktree merges, and secret inputs stay with you, and nothing is answered unless the overseer is working on your instructions. Off: it can only watch and send messages when the session is idle. Management ends on unlink, relink, or app restart."
+    static let inboundTooltip = "You let this overseer manage this session: it can answer this session's prompts and steer its turns for you. Turn it off from the overseer's Oversee dashboard, or unlink it here."
+    static let unavailableMessage = "That oversight link is no longer active."
+    static let addLabel = "Also manage"
+    static let addGrantFailedMessage = "The session is now overseen, but management could not be turned on. Use Manage on its row to try again."
+
+    static func accessibilityLabel(displayName: String) -> String {
+        "Let this session manage \(displayName)"
+    }
+}
+
 /// Why the observer's own `Wake now` cannot run, or `nil` when it can.
 ///
 /// Shared by the action result and button availability.
@@ -999,6 +1027,11 @@ struct AgentMonitorPillProps: Equatable {
         /// It gates the set/extend offers and nothing else: a deselected lane that is still snoozed
         /// must remain clearable, which is why Clear is not gated on it.
         let isAutoWakeEffectivelySelected: Bool
+        /// Explicit permission delegation for this exact grant; never inferred from Auto-wake.
+        let autoApprovalEnabled: Bool
+        /// The user's management delegation on this exact grant, read from the authority's grant
+        /// capabilities. Independent of auto-approval.
+        let managementEnabled: Bool
 
         init(
             linkID: UUID,
@@ -1013,7 +1046,9 @@ struct AgentMonitorPillProps: Equatable {
             hasUnreadActivity: Bool = false,
             targetRoute: AgentSessionDeepLinkRoute? = nil,
             autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
-            isAutoWakeEffectivelySelected: Bool = false
+            isAutoWakeEffectivelySelected: Bool = false,
+            autoApprovalEnabled: Bool = false,
+            managementEnabled: Bool = false
         ) {
             self.linkID = linkID
             self.generation = generation
@@ -1028,6 +1063,8 @@ struct AgentMonitorPillProps: Equatable {
             self.targetRoute = targetRoute
             self.autoWakeSnooze = autoWakeSnooze
             self.isAutoWakeEffectivelySelected = isAutoWakeEffectivelySelected
+            self.autoApprovalEnabled = autoApprovalEnabled
+            self.managementEnabled = managementEnabled
         }
 
         /// The same row carrying observer-local Auto-wake policy.
@@ -1057,7 +1094,9 @@ struct AgentMonitorPillProps: Equatable {
                 hasUnreadActivity: hasUnreadActivity,
                 targetRoute: targetRoute,
                 autoWakeSnooze: snooze,
-                isAutoWakeEffectivelySelected: isEffectivelySelected
+                isAutoWakeEffectivelySelected: isEffectivelySelected,
+                autoApprovalEnabled: autoApprovalEnabled,
+                managementEnabled: managementEnabled
             )
         }
 
@@ -1151,7 +1190,8 @@ struct AgentMonitorPillProps: Equatable {
         var accessibilityDescription: String {
             let location = AgentMonitorAccessibilityLocationPhrase.clause(locationLabel)
             let unread = hasUnreadActivity ? ", New activity" : ""
-            return "Overseeing \(displayName)\(location), session \(fullID), "
+            let role = managementEnabled ? "Managing" : "Overseeing"
+            return "\(role) \(displayName)\(location), session \(fullID), "
                 + "\(status.accessibilityLabel), \(activityAccessibilityLabel)\(unread)"
         }
 
@@ -1223,6 +1263,9 @@ struct AgentMonitorPillProps: Equatable {
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let displayName: String
         let providerDisplayName: String?
+        /// The user delegated management of this session to this observer: it may answer this
+        /// session's prompts and steer its turns. Shown to the target's own user, never inferred.
+        var isManaging: Bool = false
 
         var id: UUID {
             linkID
@@ -1289,7 +1332,9 @@ struct AgentMonitorPillProps: Equatable {
         }
 
         var accessibilityDescription: String {
-            "Overseen by \(displayName), session \(fullID)"
+            isManaging
+                ? "Overseen and managed by \(displayName), session \(fullID)"
+                : "Overseen by \(displayName), session \(fullID)"
         }
 
         /// VoiceOver label for this row's Unlink control, phrased from the overseen session's side.

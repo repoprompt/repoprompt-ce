@@ -523,7 +523,47 @@ extension AgentModeViewModel {
             pendingInteractionKind: projection.pendingInteractionKind,
             latestVisibleAssistantPreview: latestVisibleAssistantPreview(for: session),
             visibleRowCount: session.transcriptCanonicalVisibleRowCount,
-            lastActivityAt: session.lastActivityAt
+            lastActivityAt: session.lastActivityAt,
+            context: observationContextLoad(for: session)
+        )
+    }
+
+    /// The context load the target's context ring already shows, as recorded by its provider's usage
+    /// estimator: Claude-family stream usage, Codex native token usage, or ACP `usage_update`
+    /// occupancy.
+    ///
+    /// Usage written before the current provider was selected is not reported: a count or window is
+    /// reported only while it still equals the value the current provider's own live usage report
+    /// produced, since the last provider change, compaction (count only), or relaunch. The UI's
+    /// fallback windows and tool-derived estimates are never exported. An ACP count taken from
+    /// prompt-response billing stays in the ring only: it can be a per-turn total rather than
+    /// occupancy, just as Claude's billed aggregate is never used as a count. The confidence label is
+    /// the one the count was vouched with, and is `nil` whenever no count is exported.
+    static func observationContextLoad(for session: TabSession) -> DomainAgentSessionContextLoad? {
+        guard let usage = session.contextUsageSnapshot else { return nil }
+        // `ACPContextUsageEstimator` stores a billed count only under `.turnFinalization` (a later
+        // window-only update keeps that source), and occupancy only under `.acpUsageEvent`.
+        let isACPBilledCount = session.selectedAgent.acpProviderID != nil && usage.source == .turnFinalization
+        // A compaction signal carries the pre-compaction count forward; it no longer describes the
+        // context, so only the window can still be current until the next usage report.
+        let countIsCurrent = usage.source != .compactionSignal
+            && !isACPBilledCount
+            && usage.used.map { TabSession.ContextUsageVouch(agent: session.selectedAgent, tokens: $0) }
+            == session.vouchedContextCount
+        let windowIsCurrent = usage.window.map { TabSession.ContextUsageVouch(agent: session.selectedAgent, tokens: $0) }
+            == session.vouchedContextWindow
+        let countConfidence = countIsCurrent ? (session.vouchedContextCountConfidence ?? usage.confidence) : nil
+        let confidence: DomainAgentSessionContextLoad.Confidence? = countConfidence.map { label in
+            switch label {
+            case .exact: .exact
+            case .bestEffort: .bestEffort
+            case .inferred: .inferred
+            }
+        }
+        return DomainAgentSessionContextLoad(
+            usedTokens: countIsCurrent ? usage.used : nil,
+            windowTokens: windowIsCurrent ? usage.window : nil,
+            confidence: confidence
         )
     }
 

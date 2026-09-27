@@ -311,6 +311,9 @@ final class AgentRunTerminalCommitBarrier {
         binding.hooks.updateBindings()
         if request.notifyTurnComplete {
             binding.hooks.notifyAgentTurnComplete()
+        } else if request.terminalState == .failed {
+            // Successors and queued follow-ups only exist for completed turns, so a failure is final.
+            binding.hooks.notifyAgentTurnFailed(request.errorText)
         }
         binding.hooks.scheduleSave()
         let publicationResult = await binding.hooks.publishTerminalCommit(

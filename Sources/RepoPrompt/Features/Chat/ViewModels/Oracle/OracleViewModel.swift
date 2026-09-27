@@ -3475,9 +3475,11 @@ class OracleViewModel: ObservableObject {
             clearMCPSessionUIState(for: sessionID)
 
             // Trigger notification when AI response is complete
-            let sessionName = sessions.first(where: { $0.id == sessionID })?.name
+            let session = sessions.first(where: { $0.id == sessionID })
             NotificationService.shared.notifyChatComplete(
-                chatName: sessionName,
+                chatName: session?.name,
+                groupID: sessionID,
+                agentLink: session.flatMap(ChatNotificationAgentLink.init(chatSession:)),
                 fallbackToDockBounce: true
             )
         }
@@ -3828,7 +3830,9 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func renameComposeTabIfDefault(tabID: UUID, sessionName: String) {
         let trimmed = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // A placeholder ("Untitled Chat", "New Chat") is no better than "T3"; for agent-owned Oracle
+        // chats it would also become the agent session's display name.
+        guard !ChatSession.isPlaceholderName(trimmed) else { return }
         guard let tab = workspaceManager.composeTab(with: tabID) else { return }
         guard isDefaultComposeTabName(tab.name) else { return }
         if tab.name != trimmed {

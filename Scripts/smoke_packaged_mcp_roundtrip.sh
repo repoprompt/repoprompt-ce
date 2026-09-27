@@ -115,12 +115,17 @@ if [[ -n "$ARTIFACT_MANIFEST" ]]; then
 fi
 
 CANONICAL_PATHS="$(python3 - "$APP_BUNDLE" <<'PYTHON'
+import plistlib
 import stat
 import sys
 from pathlib import Path
 
 app = Path(sys.argv[1]).resolve(strict=True)
-app_executable = (app / "Contents" / "MacOS" / "RepoPrompt").resolve(strict=True)
+with (app / "Contents" / "Info.plist").open("rb") as source:
+    executable_name = plistlib.load(source).get("CFBundleExecutable")
+if not isinstance(executable_name, str) or not executable_name or Path(executable_name).name != executable_name:
+    raise SystemExit(f"ERROR: invalid packaged CFBundleExecutable: {executable_name!r}")
+app_executable = (app / "Contents" / "MacOS" / executable_name).resolve(strict=True)
 helper = (app / "Contents" / "MacOS" / "repoprompt-mcp").resolve(strict=True)
 for label, path in (("app executable", app_executable), ("MCP helper", helper)):
     if not path.is_relative_to(app):

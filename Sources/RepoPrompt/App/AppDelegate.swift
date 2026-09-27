@@ -128,6 +128,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     // MARK: - NSApplicationDelegate
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // The notification delegate must be installed before launch finishes so a click that launched
+        // the app is delivered. This does not prompt for authorization (that stays in didFinishLaunching).
+        NotificationService.shared.installDelegate()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
@@ -235,6 +241,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
             await shutdownDomainRuntimeForTermination()
+            await NotificationService.shared.prepareForTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 

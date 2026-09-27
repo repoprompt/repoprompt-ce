@@ -138,7 +138,7 @@ extension AgentModeViewModel {
         let commit = await commitAuthorization()
         guard commit == .committed else {
             releaseComposerSubmitClaim(claim)
-            return .blocked(commit == .shuttingDown ? .shuttingDown : .linkRevoked)
+            return .blocked(commit.refusal)
         }
 
         // 5. The commit awaited, so every identity and readiness fact must be re-proven — including
@@ -275,7 +275,8 @@ extension AgentModeViewModel {
             sourceName: request.observerDisplayName,
             linkID: request.linkID,
             linkGeneration: request.linkGeneration,
-            message: request.message
+            message: request.message,
+            framing: request.framing
         )
         // A per-message workflow is applied to the provider payload only. `session.selectedWorkflow`
         // is never read, written, or restored here, which is what makes preserving the target's own
@@ -311,7 +312,7 @@ extension AgentModeViewModel {
 
     /// The live session for an endpoint, or `nil` unless every identity field still matches
     /// byte-for-byte and generation-for-generation.
-    private func agentSessionLinkLiveSession(
+    func agentSessionLinkLiveSession(
         matching candidate: AgentSessionLinkEndpointCandidate
     ) -> TabSession? {
         guard let session = sessions[candidate.tabID],

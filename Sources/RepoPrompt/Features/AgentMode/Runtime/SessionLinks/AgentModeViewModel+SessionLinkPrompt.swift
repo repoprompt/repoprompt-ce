@@ -953,6 +953,7 @@ extension AgentModeViewModel {
         }
         if let claim {
             agentSessionLinkPromptClaimStore.accept(claim)
+            agentSessionLinkAcknowledgeCapabilityNotices(for: claim)
             if let passive = claim.passive {
                 AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(
                     passive.receipt, observerEndpoint: passive.observerEndpoint
@@ -965,6 +966,7 @@ extension AgentModeViewModel {
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)
+        agentSessionLinkAcknowledgeCapabilityNotices(for: claim)
         guard let passive = claim.passive else { return }
         agentSessionLinkRecordAcceptedAutoWake(claim)
         AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(

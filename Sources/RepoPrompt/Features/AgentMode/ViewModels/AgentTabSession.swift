@@ -290,6 +290,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var mcpStateObservationCancellable: AnyCancellable?
+    var permissionAutoApprovalCancellable: AnyCancellable?
     var mcpControlCleanupTask: Task<Void, Never>?
     var mcpControlActivationGeneration: UInt64 = 0
     var mcpFollowUpRunPendingUpdatedAt: Date?
@@ -419,6 +420,8 @@ final class AgentTabSession: ObservableObject {
         var serviceTier: String?
         var attachmentReservationID: UUID?
         var expectedTurnID: String?
+        var auditTurnID: UUID?
+        var autoEffortApplied = false
         var retryAttempted: Bool = false
         /// Final monitoring identity composed for the original physical dispatch, if any.
         var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
@@ -579,6 +582,7 @@ final class AgentTabSession: ObservableObject {
         let model: String?
         let reasoningEffort: String?
         let serviceTier: String?
+        var autoEffortApplied = false
         let attachmentReservationID: UUID?
         let optimisticUserItemID: UUID?
         let draftText: String
@@ -683,8 +687,31 @@ final class AgentTabSession: ObservableObject {
     }
 
     // Settings (per-tab)
-    var selectedAgent: AgentProviderKind = .claudeCode
-    var selectedModelRaw: String = AgentModel.defaultModel.rawValue
+
+    var selectedAgent: AgentProviderKind = .claudeCode {
+        didSet {
+            // Usage recorded under another provider must never be reported as this provider's load.
+            if selectedAgent != oldValue {
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            }
+        }
+    }
+
+    var selectedModelRaw: String = AgentModel.defaultModel.rawValue {
+        didSet {
+            // A different model can have a different window; wait for its own report.
+            if selectedModelRaw != oldValue {
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            }
+        }
+    }
+
     var selectedReasoningEffortRaw: String?
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
@@ -756,6 +783,23 @@ final class AgentTabSession: ObservableObject {
     var providerSessionID: String?
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
+    var automationTurnAudit: [AgentAutomationTurnAudit] = []
+
+    func updateAutomationAudit(
+        turnID: UUID,
+        _ update: (inout AgentAutomationTurnAudit) -> Void
+    ) {
+        guard let index = automationTurnAudit.lastIndex(where: { $0.turnID == turnID }) else { return }
+        update(&automationTurnAudit[index])
+        isDirty = true
+    }
+
+    func appendAutomationAudit(_ record: AgentAutomationTurnAudit) {
+        automationTurnAudit.append(record)
+        automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
+        isDirty = true
+    }
+
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
@@ -765,8 +809,139 @@ final class AgentTabSession: ObservableObject {
     var codexModel: String?
     var codexReasoningEffort: String?
     @Published var codexContextUsage: AgentContextUsage? = nil
-    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil
-    var contextCompactedAt: Date?
+    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil {
+        didSet {
+            if contextUsageSnapshot == nil {
+                batchingContextVouchSignals {
+                    vouchedContextCount = nil
+                    vouchedContextWindow = nil
+                }
+            } else if contextUsageSnapshot?.used == nil {
+                // No stored count is left for a vouch to describe.
+                vouchedContextCount = nil
+            }
+        }
+    }
+
+    var contextCompactedAt: Date? {
+        didSet {
+            // A compaction invalidates the count; the window is unchanged.
+            if contextCompactedAt != oldValue { vouchedContextCount = nil }
+        }
+    }
+
+    /// A context figure and the provider whose own live usage report produced it.
+    struct ContextUsageVouch: Equatable {
+        let agent: AgentProviderKind
+        let tokens: Int
+    }
+
+    /// The context count and window the selected provider's own live usage reports produced, for
+    /// session-link oversight only (the context ring is unaffected). A stored figure is reported only
+    /// while it equals its vouch, so any later write with a different value invalidates it. A provider
+    /// change clears both, a compaction clears the count, and clearing the usage clears both. Not
+    /// persisted, so restored figures are never reported as current load.
+    private(set) var vouchedContextCount: ContextUsageVouch? {
+        didSet {
+            if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
+            noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
+        }
+    }
+
+    private(set) var vouchedContextWindow: ContextUsageVouch? {
+        didSet { noteContextVouchTransition(from: oldValue, to: vouchedContextWindow) }
+    }
+
+    /// How the report that vouched the count obtained it: `exact` for a reported occupancy count,
+    /// `bestEffort` for a prompt-count fallback. Estimators may relabel the stored snapshot later
+    /// without changing its figures (Claude's end-of-turn rebuild marks it `bestEffort`; a window-only
+    /// ACP update does too), so oversight reports how the vouched figure was produced instead.
+    private(set) var vouchedContextCountConfidence: ContextUsageSnapshotConfidence?
+
+    private var contextVouchSignalBatchDepth = 0
+    private var contextVouchSignalPending = false
+
+    /// A vouch appearing or disappearing changes what oversight exports even when no other
+    /// observation input moved (a model switch or compaction on an idle target withdraws one; a report
+    /// that re-confirms an unchanged stored figure establishes one), so it republishes the snapshot.
+    /// A vouch moving from one figure to another rides the report that wrote the figure.
+    ///
+    /// Invariant: every path that moves a vouch between figures does so while applying the report that
+    /// wrote the new figure into `contextUsageSnapshot`, so presence changes (and label changes, see
+    /// `noteLiveContextUsageReport`) are the only vouch-only changes to the export.
+    private func noteContextVouchTransition(from oldValue: ContextUsageVouch?, to newValue: ContextUsageVouch?) {
+        guard (oldValue == nil) != (newValue == nil) else { return }
+        noteContextExportChangedWithoutSnapshotWrite()
+    }
+
+    private func noteContextExportChangedWithoutSnapshotWrite() {
+        if contextVouchSignalBatchDepth > 0 {
+            contextVouchSignalPending = true
+        } else {
+            noteMonitorObservationInputsChanged()
+        }
+    }
+
+    /// Withdraws the count vouch (the stored figure stays in the ring) and re-evaluates the window
+    /// vouch against `modelContextWindow`, republishing at most once for both.
+    func withdrawContextCountVouch(notingWindow modelContextWindow: Int?) {
+        batchingContextVouchSignals {
+            vouchedContextCount = nil
+            noteLiveContextUsageReport(contextUsedTokens: nil, promptTokens: nil, modelContextWindow: modelContextWindow)
+        }
+    }
+
+    /// Applies several vouch changes and republishes at most once, after all of them.
+    private func batchingContextVouchSignals(_ changes: () -> Void) {
+        contextVouchSignalBatchDepth += 1
+        changes()
+        contextVouchSignalBatchDepth -= 1
+        guard contextVouchSignalBatchDepth == 0, contextVouchSignalPending else { return }
+        contextVouchSignalPending = false
+        noteMonitorObservationInputsChanged()
+    }
+
+    /// The model epoch an ACP `usage_update` occupancy report belongs to, marked for the current
+    /// turn only. Consumed at turn finalization and cleared when a turn begins; kept on the session
+    /// so it can never outlive or be inherited across session objects.
+    struct ContextOccupancyEpoch: Equatable {
+        let agent: AgentProviderKind
+        let modelRaw: String
+    }
+
+    var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
+
+    /// Records which figures a live usage report from the selected provider vouches for. The report's
+    /// context count (or, only when it carried none, its prompt count) vouches for the stored count
+    /// only if they match; a conflicting count (for example one the estimator rejected and replaced
+    /// with a carried-forward or smaller fallback value) withdraws the vouch. The window works the
+    /// same way. Reports without a positive count or window (output-only usage) change nothing, so a
+    /// reported zero stays unvouched, matching the estimators' "zero means absent" convention.
+    func noteLiveContextUsageReport(contextUsedTokens: Int?, promptTokens: Int?, modelContextWindow: Int?) {
+        let reportsOccupancy = (contextUsedTokens ?? 0) > 0
+        let reportedCount = reportsOccupancy ? contextUsedTokens : promptTokens
+        batchingContextVouchSignals {
+            if let reportedCount, reportedCount > 0 {
+                if contextUsageSnapshot?.used == reportedCount {
+                    let previousLabel = vouchedContextCount == nil ? nil : vouchedContextCountConfidence
+                    vouchedContextCount = ContextUsageVouch(agent: selectedAgent, tokens: reportedCount)
+                    vouchedContextCountConfidence = reportsOccupancy ? .exact : .bestEffort
+                    // The same figure re-vouched by a different kind of report changes only its label.
+                    if let previousLabel, previousLabel != vouchedContextCountConfidence {
+                        noteContextExportChangedWithoutSnapshotWrite()
+                    }
+                } else {
+                    vouchedContextCount = nil
+                }
+            }
+            if let window = modelContextWindow, window > 0 {
+                vouchedContextWindow = contextUsageSnapshot?.window == window
+                    ? ContextUsageVouch(agent: selectedAgent, tokens: window)
+                    : nil
+            }
+        }
+    }
+
     var codexNeedsReconnect: Bool = false
     var codexNativeStartupDisposition: AgentModeViewModel.CodexNativeStartupDisposition?
     var codexResumeTimeoutState: AgentModeViewModel.CodexResumeTimeoutState = .init()
@@ -2094,6 +2269,9 @@ final class AgentTabSession: ObservableObject {
         suppressSourceItemsChanged = true
         items.remove(at: index)
         suppressSourceItemsChanged = false
+        // A rolled-back optimistic user turn never became a retained local submission.
+        // Keep provider-accepted evidence if a later UI cleanup removes its bubble.
+        automationTurnAudit.removeAll { $0.turnID == removed.id && !$0.providerTurnAccepted }
         reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
         rebuildToolCorrelationIndexes()
         finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))

@@ -2,6 +2,13 @@ import Foundation
 
 public struct ClaudeSDKNDJSONTranslator {
     public private(set) var cliSessionID: String?
+    /// The session's main model as `system/init` announced it, in the CLI's own naming (which keeps
+    /// variant suffixes such as `[1m]`).
+    private var initModel: String?
+    /// The model the latest main-thread response named, in the API's naming. A live model switch
+    /// announces no new `init`, so this is what keeps the session model current; once set it is the
+    /// authority, and a later `init` never demotes it.
+    private var responseModel: String?
     private var toolNameByToolUseID: [String: String] = [:]
     private var invocationIDByToolUseID: [String: UUID] = [:]
     private let enableDebugLogging: Bool
@@ -94,6 +101,9 @@ public struct ClaudeSDKNDJSONTranslator {
             if let sessionID = firstString(in: json, keys: ["session_id", "sessionId"]) {
                 cliSessionID = sessionID
             }
+            if !isSubagentMessage(json) {
+                if let model = Self.modelName(json["model"]) { initModel = model }
+            }
             return [ClaudeProviderStreamResult(type: ClaudeProviderStreamResult.lifecycleType, text: "initialized")]
         }
 
@@ -185,8 +195,14 @@ public struct ClaudeSDKNDJSONTranslator {
 
     private mutating func parseAssistantMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
+        if !isSubagentMessage(json) {
+            if let model = Self.modelName(payload["model"]) { responseModel = model }
+        }
         let usageResult: ClaudeProviderStreamResult? = {
-            guard let usage = parseUsage(payload["usage"] as? [String: Any]) else { return nil }
+            // A sub-agent's usage describes its own context, not this session's.
+            guard !isSubagentMessage(json),
+                  let usage = parseUsage(payload["usage"] as? [String: Any])
+            else { return nil }
             return ClaudeProviderStreamResult(
                 type: "usage",
                 text: nil,
@@ -374,9 +390,11 @@ public struct ClaudeSDKNDJSONTranslator {
             return []
 
         case "message_start":
-            guard let message = event["message"] as? [String: Any],
-                  let usage = parseUsage(message["usage"] as? [String: Any])
-            else {
+            guard !isSubagentMessage(json), let message = event["message"] as? [String: Any] else {
+                return []
+            }
+            if let model = Self.modelName(message["model"]) { responseModel = model }
+            guard let usage = parseUsage(message["usage"] as? [String: Any]) else {
                 return []
             }
             return [
@@ -391,7 +409,7 @@ public struct ClaudeSDKNDJSONTranslator {
 
         case "message_delta":
             var results: [ClaudeProviderStreamResult] = []
-            if let usage = parseUsage(event["usage"] as? [String: Any]) {
+            if !isSubagentMessage(json), let usage = parseUsage(event["usage"] as? [String: Any]) {
                 results.append(
                     ClaudeProviderStreamResult(
                         type: "usage",
@@ -402,7 +420,10 @@ public struct ClaudeSDKNDJSONTranslator {
                     )
                 )
             }
-            if let delta = event["delta"] as? [String: Any],
+            // A sub-agent's stop ends its own response, not one of this session's: forwarding it would
+            // run this session's turn finalization mid-turn.
+            if !isSubagentMessage(json),
+               let delta = event["delta"] as? [String: Any],
                let stopReason = firstString(in: delta, keys: ["stop_reason", "stopReason"]),
                !stopReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
@@ -411,6 +432,7 @@ public struct ClaudeSDKNDJSONTranslator {
             return results
 
         case "message_stop":
+            guard !isSubagentMessage(json) else { return [] }
             return [ClaudeProviderStreamResult(type: "message_stop", text: nil)]
 
         default:
@@ -874,15 +896,77 @@ public struct ClaudeSDKNDJSONTranslator {
         value as? [String: Any] ?? [:]
     }
 
+    /// Whether a stream message comes from a sub-agent (Task tool) rather than this session's main
+    /// thread: the SDK tags those with the invoking tool use's ID.
+    private func isSubagentMessage(_ json: [String: Any]) -> Bool {
+        guard let parent = firstString(in: json, keys: ["parent_tool_use_id", "parentToolUseId"]) else { return false }
+        return !parent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// A usable model name, or `nil` for missing and placeholder names: the CLI tags messages it
+    /// makes up itself (API errors, interruptions) with `<synthetic>`.
+    private static func modelName(_ value: Any?) -> String? {
+        guard let model = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              !model.hasPrefix("<")
+        else { return nil }
+        return model
+    }
+
+    /// This session's context window from `result.modelUsage`, which is keyed by model (in the CLI's
+    /// naming) and can also list auxiliary models used during the turn, for example a smaller model
+    /// for a sub-task. It is unknown rather than guessed from dictionary order whenever the entries
+    /// do not identify it:
+    /// - Once a response has named the model, a name carrying an explicit variant takes that entry;
+    ///   otherwise the entries for that model, ignoring variant suffixes, must agree on one window.
+    ///   Responses usually name the model without the suffix, so a session that used both `model`
+    ///   and `model[1m]` cannot tell which is current. A response name matching no entry identifies
+    ///   nothing.
+    /// - Before that, the `init` name is the CLI's own: a lone entry is taken as the session model's
+    ///   whatever it is called (compatible backends may report it under another name), then its exact
+    ///   entry, then a unique window among same-model entries.
+    /// - With no model known at all, only a window every entry agrees on stands.
     private func parseModelContextWindow(_ value: [String: Any]?) -> Int? {
         guard let value else { return nil }
-        for (_, usageAny) in value {
-            guard let usage = usageAny as? [String: Any] else { continue }
-            if let contextWindow = numberToInt(usage["contextWindow"]), contextWindow > 0 {
-                return contextWindow
-            }
+        var windows: [String: Int] = [:]
+        for (model, usageAny) in value {
+            guard let usage = usageAny as? [String: Any],
+                  let contextWindow = numberToInt(usage["contextWindow"]),
+                  contextWindow > 0
+            else { continue }
+            windows[model] = contextWindow
         }
-        return nil
+        func sameModelWindows(_ model: String) -> Set<Int> {
+            let base = Self.baseModelID(model)
+            return Set(windows.filter { Self.baseModelID($0.key) == base }.values)
+        }
+        if let responseModel {
+            // A response naming an explicit variant identifies that variant's entry.
+            if Self.baseModelID(responseModel) != responseModel, let window = windows[responseModel] {
+                return window
+            }
+            let candidates = sameModelWindows(responseModel)
+            return candidates.count == 1 ? candidates.first : nil
+        }
+        if let initModel {
+            if value.count == 1, windows.count == 1 {
+                return windows.values.first
+            }
+            if let window = windows[initModel] {
+                return window
+            }
+            let candidates = sameModelWindows(initModel)
+            return candidates.count == 1 ? candidates.first : nil
+        }
+        let distinct = Set(windows.values)
+        return distinct.count == 1 ? distinct.first : nil
+    }
+
+    /// A model ID without a trailing bracketed variant such as `[1m]`.
+    private static func baseModelID(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasSuffix("]"), let open = trimmed.lastIndex(of: "[") else { return trimmed }
+        return String(trimmed[..<open])
     }
 
     private func parseUsage(_ value: [String: Any]?) -> TokenUsage? {

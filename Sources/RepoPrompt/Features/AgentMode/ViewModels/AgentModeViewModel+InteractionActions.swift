@@ -2,6 +2,19 @@ import Foundation
 
 @MainActor
 extension AgentModeViewModel {
+    /// Id-checked approval submission: applies `decision` only while `requestID` is still the pending
+    /// approval for `tabID`. Returns whether that approval was consumed.
+    @discardableResult
+    func submitApprovalDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
+        guard let session = sessions[tabID], session.pendingApproval?.id == requestID else {
+            return false
+        }
+        submitApprovalDecision(tabID: tabID, decision: decision)
+        return session.pendingApproval?.id != requestID
+    }
+
+    /// Unchecked variant resolving whatever approval is currently pending. Prefer the id-checked
+    /// overload for any caller that captured the request earlier (cards, notifications).
     func submitApprovalDecision(tabID: UUID, decision: AgentApprovalDecision) {
         guard let session = sessions[tabID],
               let request = session.pendingApproval

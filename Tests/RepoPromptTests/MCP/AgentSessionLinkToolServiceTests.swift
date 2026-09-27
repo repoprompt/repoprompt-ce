@@ -5,8 +5,9 @@ import RepoPromptDomainRuntime
 import XCTest
 
 /// Wire contract for `agent_session_link`: strict argument validation, opaque paging, and response
-/// shapes that can never carry interaction identifiers, prompts, tool payloads, paths, or worktree
-/// metadata.
+/// shapes that never carry interaction identifiers, prompts, tool payloads, paths, or worktree
+/// metadata — except the redacted interaction that `get_interaction` returns on a link where the user
+/// delegated management (`manage`).
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
     // MARK: - Strict allowed keys
@@ -251,7 +252,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 "session_id", "name", "provider", "status", "idle_for_send", "idle_since", "waiting_on",
                 "has_pending_interaction", "pending_interaction_kind",
                 "latest_visible_assistant_preview", "visible_row_count",
-                "last_activity_at", "change_sequence"
+                "last_activity_at", "change_sequence", "context"
             ]
         )
         for forbidden in [
@@ -304,6 +305,100 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(waiting["summary"]?.stringValue, "CI artifact")
         XCTAssertEqual(waiting["declared_at"]?.stringValue, AgentMCPToolHelpers.timestamp(declaredAt))
         XCTAssertFalse(object["idle_for_send"]?.boolValue ?? true)
+    }
+
+    private func makeContextTargetState(
+        context: DomainAgentSessionContextLoad?
+    ) -> DomainAgentSessionLinkTargetState {
+        let sessionID = UUID()
+        return DomainAgentSessionLinkTargetState(
+            sessionID: sessionID,
+            linkID: UUID(),
+            linkGeneration: 1,
+            snapshot: DomainAgentSessionObservationSnapshot(
+                sessionID: sessionID,
+                displayName: "Worker",
+                providerDisplayName: "Claude Code",
+                status: .running,
+                idleForSend: false,
+                pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil,
+                visibleRowCount: 1,
+                lastActivityAt: Date(timeIntervalSince1970: 10),
+                context: context
+            ),
+            changeSequence: 2,
+            waitCursor: "w"
+        )
+    }
+
+    func testSnapshotSerializesContextLoadAsNumbersOrNull() throws {
+        let full = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 175_000,
+            windowTokens: 200_000,
+            confidence: .exact
+        ))
+        let fullObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: full)).objectValue
+        )
+        let context = try XCTUnwrap(fullObject["context"]?.objectValue)
+        XCTAssertEqual(Set(context.keys), ["used_tokens", "window_tokens", "used_percent", "confidence"])
+        XCTAssertEqual(context["used_tokens"]?.intValue, 175_000)
+        XCTAssertEqual(context["window_tokens"]?.intValue, 200_000)
+        XCTAssertEqual(context["used_percent"]?.doubleValue, 87.5)
+        XCTAssertEqual(context["confidence"]?.stringValue, "exact")
+
+        let partial = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 1_050_000,
+            windowTokens: nil,
+            confidence: .bestEffort
+        ))
+        let partialObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: partial)).objectValue
+        )
+        let partialContext = try XCTUnwrap(partialObject["context"]?.objectValue)
+        XCTAssertEqual(partialContext["used_tokens"]?.intValue, 1_050_000)
+        XCTAssertEqual(partialContext["window_tokens"], .null)
+        XCTAssertEqual(partialContext["used_percent"], .null)
+        XCTAssertEqual(partialContext["confidence"]?.stringValue, "best_effort")
+
+        // Unknown load is an explicit null, so callers can tell it apart from an older build.
+        let unknownObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(makeContextTargetState(context: nil)).objectValue
+        )
+        XCTAssertEqual(unknownObject["context"], .null)
+    }
+
+    func testPollAndWaitRowsCarryTheSameContextLoad() throws {
+        let load = try XCTUnwrap(DomainAgentSessionContextLoad(
+            usedTokens: 210_000,
+            windowTokens: 200_000,
+            confidence: .exact
+        ))
+        let state = makeContextTargetState(context: load)
+        let expected = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.snapshotValue(state).objectValue?["context"]
+        )
+        XCTAssertEqual(expected.objectValue?["used_percent"]?.doubleValue, 105.0, "Over-window load is not clamped")
+
+        let pollRow = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.pollTargetEntryValue(state, autoWakeSnooze: nil).objectValue
+        )
+        XCTAssertEqual(pollRow["snapshot"]?.objectValue?["context"], expected)
+
+        let result = DomainAgentSessionLinkWaitResult(
+            outcome: .changed(sessionID: state.sessionID),
+            targets: [state]
+        )
+        let singleWait = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.waitValue(result, isSingle: true).objectValue
+        )
+        XCTAssertEqual(singleWait["snapshot"]?.objectValue?["context"], expected)
+        let multiWait = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.waitValue(result, isSingle: false).objectValue
+        )
+        let multiRow = try XCTUnwrap(multiWait["targets"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
     }
 
     func testMultiTargetWaitResponseKeepsRequestOrderAndSuccessorCursorsForEveryTarget() throws {
@@ -408,7 +503,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             "`waiting_on` is separate/non-atomic and may lag",
             "Do not invent or abandon instructed work",
             "surface ambiguity/surprises",
-            "Never answer/bypass another session’s interaction",
+            "Answer or steer another session only via `respond`/`steer` where `managed` is true",
             "Sends are attributed",
             "never impersonate the user"
         ] {
@@ -989,12 +1084,532 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - Management (get_interaction / respond / steer)
+
+    /// Executes one call and unwraps its object result, outside `XCTUnwrap`'s synchronous autoclosure.
+    private static func executeObject(
+        _ service: AgentSessionLinkMCPToolService,
+        args: [String: Value]
+    ) async throws -> [String: Value] {
+        let value = try await service.execute(args: args)
+        return try XCTUnwrap(value.objectValue)
+    }
+
+    func testManagementOperationsAcceptOnlyTheirDocumentedFields() {
+        XCTAssertEqual(AgentSessionLinkMCPToolService.getInteractionKeys, ["op", "session_id"])
+        XCTAssertEqual(
+            AgentSessionLinkMCPToolService.respondKeys,
+            ["op", "session_id", "interaction_id", "response", "answers", "skip", "content", "meta"]
+        )
+        XCTAssertEqual(
+            AgentSessionLinkMCPToolService.steerKeys,
+            ["op", "session_id", "message", "idempotency_key"]
+        )
+        // An observer may not amend exec policy, start a workflow, or fan out on another's behalf.
+        XCTAssertTrue(AgentSessionLinkMCPToolService.respondKeys.isDisjoint(with: [
+            "amendment", "workflow_id", "workflow_name", "session_ids", "message", "decision"
+        ]))
+        // A steer is one instruction delivered now, under the target's own settings.
+        XCTAssertTrue(AgentSessionLinkMCPToolService.steerKeys.isDisjoint(with: [
+            "workflow_id", "workflow_name", "delivery", "replace_pending", "session_ids", "model_id"
+        ]))
+    }
+
+    func testWatchOnlyLinkReportsManagementNotGrantedAndReachesNothing() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+
+        let inspected = try await Self.executeObject(fixture.service, args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        XCTAssertEqual(inspected["result"]?.stringValue, "management_not_granted")
+        XCTAssertEqual(inspected["managed"], .bool(false))
+        XCTAssertNil(inspected["interaction"], "no payload without management")
+        XCTAssertFalse("\(inspected)".contains(Self.sampleInteractionPrompt))
+
+        let responded = try await fixture.service.execute(args: [
+            "op": .string("respond"),
+            "session_id": sessionID,
+            "interaction_id": .string(UUID().uuidString),
+            "response": .string("accept")
+        ])
+        XCTAssertEqual(responded.objectValue?["result"]?.stringValue, "management_not_granted")
+        XCTAssertTrue(fixture.host.respondRequests.isEmpty, "nothing reaches the target without management")
+
+        let steered = try await fixture.service.execute(args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("Stop and summarize."),
+            "idempotency_key": .string("steer-watch-only")
+        ])
+        XCTAssertEqual(steered.objectValue?["result"]?.stringValue, "management_not_granted")
+        XCTAssertEqual(steered.objectValue?["applied"], .bool(false))
+        XCTAssertTrue(fixture.host.steerRequests.isEmpty)
+
+        // The observer is told the truth about its capabilities wherever it looks.
+        let listed = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        let item = try XCTUnwrap(listed["items"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(item["managed"], .bool(false))
+        XCTAssertFalse(item["capabilities"]?.arrayValue?.contains(.string("manage")) ?? true)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertEqual(polled["managed"], .bool(false))
+
+        // An unlinked session is the ordinary indistinguishable denial, never a management hint.
+        for op in ["get_interaction", "steer"] {
+            var args: [String: Value] = ["op": .string(op), "session_id": .string(UUID().uuidString)]
+            if op == "steer" {
+                args["message"] = .string("hello")
+                args["idempotency_key"] = .string("unlinked")
+            }
+            do {
+                _ = try await fixture.service.execute(args: args)
+                XCTFail("an unlinked target must be denied for \(op)")
+            } catch let error as MCPError {
+                XCTAssertTrue("\(error)".contains("No active session link"), op)
+            }
+        }
+    }
+
+    func testCapabilityNoticeMergeKeepsEveryLinkAndOnlyItsNewestState() throws {
+        let firstSession = UUID()
+        let secondSession = UUID()
+        let thirdSession = UUID()
+        func notice(_ sessionID: UUID, managed: Bool, sequence: UInt64) -> DomainAgentSessionLinkCapabilityNotice {
+            DomainAgentSessionLinkCapabilityNotice(
+                linkID: sessionID,
+                linkGeneration: 1,
+                targetSessionID: sessionID,
+                managed: managed,
+                observerLinkSetRevision: sequence,
+                sequence: sequence,
+                changedAt: Date(timeIntervalSince1970: TimeInterval(sequence))
+            )
+        }
+
+        // The parked wait claimed two links. While its result was being wrapped, a third link
+        // changed and the first link was toggled again. Neither the second nor third may disappear.
+        let alreadyRendered = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(firstSession, managed: true, sequence: 1),
+            notice(secondSession, managed: true, sequence: 2)
+        ])
+        let merged = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(thirdSession, managed: true, sequence: 3),
+            notice(firstSession, managed: false, sequence: 4)
+        ], merging: alreadyRendered)
+        let changes = try XCTUnwrap(merged.objectValue?["changes"]?.arrayValue)
+        XCTAssertEqual(changes.count, 3, "one current row per linked session")
+        func managed(_ sessionID: UUID) -> Bool? {
+            changes.first { $0.objectValue?["session_id"]?.stringValue == sessionID.uuidString }?
+                .objectValue?["managed"]?.boolValue
+        }
+        XCTAssertEqual(managed(firstSession), false, "the later withdrawal supersedes the earlier grant")
+        XCTAssertEqual(managed(secondSession), true, "the wait's other claimed notice survives")
+        XCTAssertEqual(managed(thirdSession), true, "the late notice is also delivered")
+
+        let repeatedInOneBatch = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(firstSession, managed: true, sequence: 1),
+            notice(firstSession, managed: false, sequence: 4)
+        ])
+        let repeatedChanges = try XCTUnwrap(repeatedInOneBatch.objectValue?["changes"]?.arrayValue)
+        XCTAssertEqual(repeatedChanges.count, 1)
+        XCTAssertEqual(repeatedChanges.first?.objectValue?["managed"], .bool(false))
+    }
+
+    /// A running overseer parked in `wait` learns about a Manage change at once, and the correction
+    /// rides exactly one result — including a structured refusal, which is where a model still
+    /// reasoning from older capabilities most needs it.
+    func testManageChangeWakesAParkedWaitWithTheNoticeAndRidesExactlyOneResult() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(polled["capability_notice"], "nothing is owed before a change")
+        let cursor = try XCTUnwrap(polled["wait_cursor"])
+
+        let service = fixture.service
+        let waiting = Task { @MainActor in
+            try await Self.executeObject(service, args: [
+                "op": .string("wait"),
+                "session_id": sessionID,
+                "cursor": cursor,
+                "timeout_seconds": .int(30)
+            ])
+        }
+        for _ in 0 ..< 400 {
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let parked = await fixture.authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(parked, 1)
+
+        let report = await fixture.bridge.setManagementReporting(
+            true,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        guard case .changed = report else { return XCTFail("expected a change, got \(report)") }
+        let woken = try await waiting.value
+        XCTAssertEqual(woken["result"]?.stringValue, "capabilities_changed")
+        XCTAssertEqual(woken["triggered_session_id"], sessionID)
+        XCTAssertNotNil(woken["wait_cursor"]?.stringValue, "the model may wait again from the returned cursor")
+        XCTAssertTrue(woken["detail"]?.stringValue?.contains("capability_notice") ?? false)
+        let notice = try XCTUnwrap(woken["capability_notice"]?.objectValue)
+        XCTAssertEqual(notice["notice"]?.stringValue, AgentSessionLinkPrompts.capabilityChangeNoticeText)
+        let change = try XCTUnwrap(notice["changes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(change["session_id"], sessionID)
+        XCTAssertEqual(change["managed"], .bool(true))
+        XCTAssertEqual(change["management_operations"]?.stringValue, "available")
+
+        let next = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(next["capability_notice"], "a delivered notice is not repeated")
+        XCTAssertEqual(next["managed"], .bool(true))
+
+        // Withdrawn with no wait parked: the very next result carries it, even a refusal.
+        _ = await fixture.bridge.setManagement(
+            false,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        let refused = try await Self.executeObject(fixture.service, args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("continue"),
+            "idempotency_key": .string("after-withdrawal")
+        ])
+        XCTAssertEqual(refused["result"]?.stringValue, "management_not_granted")
+        let withdrawal = try XCTUnwrap(refused["capability_notice"]?.objectValue?["changes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(withdrawal["managed"], .bool(false))
+        XCTAssertEqual(withdrawal["management_operations"]?.stringValue, "withdrawn")
+        let afterRefusal = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(afterRefusal["capability_notice"])
+    }
+
+    func testManagedLinkInspectsAnswersAndSteersAndReportsTheGrant() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let granted = await fixture.bridge.setManagement(
+            true,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertTrue(granted)
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+
+        let listed = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        let item = try XCTUnwrap(listed["items"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(item["managed"], .bool(true))
+        XCTAssertTrue(item["capabilities"]?.arrayValue?.contains(.string("manage")) ?? false)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertEqual(polled["managed"], .bool(true))
+
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let inspected = try await Self.executeObject(fixture.service, args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        XCTAssertEqual(inspected["result"]?.stringValue, "pending")
+        XCTAssertEqual(inspected["managed"], .bool(true))
+        XCTAssertEqual(inspected["respondable"], .bool(true))
+        XCTAssertEqual(inspected["manual_only_reason"], .null)
+        XCTAssertEqual(inspected["interaction"]?.objectValue?["prompt"]?.stringValue, Self.sampleInteractionPrompt)
+        XCTAssertEqual(inspected["notice"]?.stringValue, AgentSessionLinkMCPToolService.untrustedContentNotice)
+
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .hookApproval)
+        let manual = try await Self.executeObject(fixture.service, args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        XCTAssertEqual(manual["respondable"], .bool(false))
+        XCTAssertEqual(manual["manual_only_reason"]?.stringValue, "hook_approval")
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .instructionPrompt)
+        let waiting = try await Self.executeObject(fixture.service, args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        XCTAssertEqual(waiting["note"]?.stringValue, AgentSessionLinkResponseRenderer.instructionWaitNote)
+
+        let interactionID = UUID()
+        func respond(_ extra: [String: Value] = ["response": .string("accept")]) async throws -> [String: Value] {
+            var args: [String: Value] = [
+                "op": .string("respond"),
+                "session_id": sessionID,
+                "interaction_id": .string(interactionID.uuidString)
+            ]
+            args.merge(extra) { _, new in new }
+            let value = try await fixture.service.execute(args: args)
+            return try XCTUnwrap(value.objectValue)
+        }
+
+        fixture.host.respondOutcome = .submitted(kind: .approval, decision: "accept")
+        let submitted = try await respond()
+        XCTAssertEqual(submitted["result"]?.stringValue, "submitted")
+        XCTAssertEqual(submitted["applied"], .bool(true))
+        XCTAssertEqual(submitted["managed"], .bool(true))
+        XCTAssertEqual(submitted["decision"]?.stringValue, "accept")
+        XCTAssertEqual(submitted["answered_by_session_id"]?.stringValue, fixture.observer.sessionID.uuidString)
+        XCTAssertEqual(fixture.host.respondRequests.last?.interactionID, interactionID)
+        XCTAssertEqual(fixture.host.respondAuthorizations.last, true, "the final fence must still hold")
+
+        let current = UUID()
+        fixture.host.respondOutcome = .interactionMismatch(currentInteractionID: current)
+        let mismatch = try await respond()
+        XCTAssertEqual(mismatch["result"]?.stringValue, "interaction_mismatch")
+        XCTAssertEqual(mismatch["applied"], .bool(false))
+        XCTAssertEqual(mismatch["current_interaction_id"]?.stringValue, current.uuidString)
+
+        fixture.host.respondOutcome = .manualOnly(.persistentDecision)
+        let persistent = try await respond(["response": .string("accept_for_session")])
+        XCTAssertEqual(persistent["result"]?.stringValue, "manual_only")
+        XCTAssertEqual(persistent["manual_only_reason"]?.stringValue, "persistent_decision")
+
+        fixture.host.respondOutcome = .invalid("response must be one of: accept, decline, cancel.")
+        do {
+            _ = try await respond(["response": .string("maybe")])
+            XCTFail("an answer that does not fit must be an invalid-params error")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("response must be one of"))
+        }
+
+        for rejected: [String: Value] in [
+            ["amendment": .string("allow ls")],
+            ["interaction_id": .string("not-a-uuid")]
+        ] {
+            do {
+                _ = try await respond(rejected)
+                XCTFail("\(rejected) must be refused before anything is authorized")
+            } catch is MCPError {}
+        }
+
+        // Steer: one managed instruction, framed as the user's delegated direction, exactly once.
+        func steer(
+            _ message: String = "Stop the refactor and summarize what changed.",
+            key: String = "steer-1"
+        ) async throws -> [String: Value] {
+            let value = try await fixture.service.execute(args: [
+                "op": .string("steer"),
+                "session_id": sessionID,
+                "message": .string(message),
+                "idempotency_key": .string(key)
+            ])
+            return try XCTUnwrap(value.objectValue)
+        }
+        let itemID = UUID()
+        fixture.host.steerOutcome = .delivered(AgentSessionLinkSendDelivery(
+            targetItemID: itemID,
+            acceptedAt: Date(timeIntervalSince1970: 1200),
+            deliveryState: .steered,
+            resultingRunState: "running"
+        ))
+        let steered = try await steer()
+        XCTAssertEqual(steered["result"]?.stringValue, "delivered")
+        XCTAssertEqual(steered["delivery_state"]?.stringValue, "steered")
+        XCTAssertEqual(steered["target_item_id"]?.stringValue, itemID.uuidString)
+        XCTAssertEqual(steered["managed"], .bool(true))
+        XCTAssertEqual(steered["steered_by_session_id"]?.stringValue, fixture.observer.sessionID.uuidString)
+        XCTAssertEqual(steered["duplicate"], .bool(false))
+        XCTAssertEqual(fixture.host.steerRequests.last?.framing, .management)
+        XCTAssertEqual(fixture.host.steerRequests.last?.message, "Stop the refactor and summarize what changed.")
+        XCTAssertEqual(fixture.host.steerCommits.last, .committed)
+
+        // A retry of the same key replays the stored receipt and never steers twice.
+        let replay = try await steer()
+        XCTAssertEqual(replay["duplicate"], .bool(true))
+        XCTAssertEqual(replay["target_item_id"]?.stringValue, itemID.uuidString)
+        XCTAssertEqual(fixture.host.steerRequests.count, 1)
+        // One key names one delivery: different words, or a send under the steer's key, conflict.
+        let conflict = try await steer("Different instruction")
+        XCTAssertEqual(conflict["result"]?.stringValue, "idempotency_conflict")
+        XCTAssertEqual(fixture.host.steerRequests.count, 1)
+        let sendUnderSteerKey = try await Self.executeObject(fixture.service, args: [
+            "op": .string("send"),
+            "session_id": sessionID,
+            "message": .string("Stop the refactor and summarize what changed."),
+            "idempotency_key": .string("steer-1")
+        ])
+        XCTAssertEqual(
+            sendUnderSteerKey["result"]?.stringValue,
+            "idempotency_conflict",
+            "the same words under a steer key are a different operation, never a replay"
+        )
+
+        // A prompt blocks a steer: it is structured, retryable, and delivers nothing.
+        fixture.host.steerOutcome = .blocked(.targetAwaitingInteraction)
+        let blocked = try await steer("Keep going.", key: "steer-2")
+        XCTAssertEqual(blocked["result"]?.stringValue, "target_awaiting_interaction")
+        XCTAssertEqual(blocked["delivered"], .bool(false))
+        XCTAssertEqual(blocked["retryable"], .bool(true))
+        // The key was released, so the same instruction can be retried once the prompt is answered.
+        fixture.host.steerOutcome = .delivered(AgentSessionLinkSendDelivery(
+            targetItemID: UUID(),
+            acceptedAt: Date(timeIntervalSince1970: 1300),
+            deliveryState: .queuedInterrupt,
+            resultingRunState: "running"
+        ))
+        let retried = try await steer("Keep going.", key: "steer-2")
+        XCTAssertEqual(retried["delivery_state"]?.stringValue, "queued_interrupt")
+
+        // An unconfirmed provider outcome spends the key: the observer must read before retrying.
+        fixture.host.steerOutcome = .blocked(.steerUnconfirmed)
+        let unconfirmed = try await steer("Check the tests.", key: "steer-3")
+        XCTAssertEqual(unconfirmed["result"]?.stringValue, "steer_unconfirmed")
+        XCTAssertEqual(unconfirmed["delivered_unknown"], .bool(true))
+        XCTAssertEqual(unconfirmed["retryable"], .bool(false))
+
+        for rejected: [String: Value] in [
+            ["op": .string("steer"), "session_id": sessionID, "message": .string("x")],
+            ["op": .string("steer"), "session_id": sessionID, "idempotency_key": .string("k")],
+            [
+                "op": .string("steer"), "session_id": sessionID, "message": .string("x"),
+                "idempotency_key": .string("k"), "workflow_name": .string("Review")
+            ]
+        ] {
+            do {
+                _ = try await fixture.service.execute(args: rejected)
+                XCTFail("\(rejected) must be refused before anything is authorized")
+            } catch is MCPError {}
+        }
+
+        // Revoked between authorization and the final fence: the uniform denial, nothing applied.
+        let requestsBeforeStop = fixture.host.respondRequests.count
+        _ = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        do {
+            _ = try await respond()
+            XCTFail("a revoked link must deny")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+        XCTAssertEqual(fixture.host.respondRequests.count, requestsBeforeStop)
+    }
+
+    /// A mid-session grant or withdrawal changes effective authority at once: the next call reports
+    /// it, and an operation already past authorization loses at its own final fence.
+    func testManagementWithdrawnMidSessionRevokesAtTheNextFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let observer = fixture.observer.domainEndpoint
+        let target = fixture.target.domainEndpoint
+        let bridge = fixture.bridge
+        func setManaged(_ enabled: Bool) async {
+            let applied = await bridge.setManagement(
+                enabled,
+                observerEndpoint: observer,
+                targetEndpoint: target,
+                expectedReference: reference
+            )
+            XCTAssertTrue(applied)
+        }
+        await setManaged(true)
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+
+        // Withdrawn after authorization, before the respond fence: nothing is applied.
+        fixture.host.respondOutcome = .submitted(kind: .approval, decision: "accept")
+        fixture.host.beforeRespondAuthorize = { await setManaged(false) }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("respond"),
+                "session_id": sessionID,
+                "interaction_id": .string(UUID().uuidString),
+                "response": .string("accept")
+            ])
+            XCTFail("a withdrawn delegation must not answer")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+        XCTAssertEqual(fixture.host.respondAuthorizations.last, false)
+        fixture.host.beforeRespondAuthorize = nil
+
+        // The very next call reports the new authority, without waiting for a new turn.
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertEqual(polled["managed"], .bool(false))
+        let inspected = try await fixture.service.execute(args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        XCTAssertEqual(inspected.objectValue?["result"]?.stringValue, "management_not_granted")
+
+        // Re-granted, then withdrawn again at the steer commit fence: delivered nothing, key released.
+        await setManaged(true)
+        fixture.host.steerOutcome = .delivered(AgentSessionLinkSendDelivery(
+            targetItemID: UUID(),
+            acceptedAt: Date(timeIntervalSince1970: 1400),
+            deliveryState: .steered,
+            resultingRunState: "running"
+        ))
+        fixture.host.beforeSteerCommit = { await setManaged(false) }
+        let revoked = try await Self.executeObject(fixture.service, args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("Wrap up."),
+            "idempotency_key": .string("steer-mid")
+        ])
+        XCTAssertEqual(revoked["result"]?.stringValue, "management_revoked")
+        XCTAssertEqual(revoked["delivered"], .bool(false))
+        XCTAssertEqual(revoked["managed"], .bool(false), "the result reports the authority held now")
+        XCTAssertEqual(fixture.host.steerCommits.last, .managementRevoked)
+        fixture.host.beforeSteerCommit = nil
+
+        await setManaged(true)
+        let retried = try await Self.executeObject(fixture.service, args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("Wrap up."),
+            "idempotency_key": .string("steer-mid")
+        ])
+        XCTAssertEqual(retried["result"]?.stringValue, "delivered", "the refused key was never spent")
+        XCTAssertEqual(retried["duplicate"], .bool(false))
+    }
+
+    private static let sampleInteractionPrompt = "Run the migration script?"
+
+    private static func sampleInspection(
+        manualOnly: AgentSessionLinkInteractionManualOnlyReason?
+    ) -> AgentSessionLinkPendingInteractionInspection {
+        AgentSessionLinkPendingInteractionInspection(
+            interaction: AgentRunMCPSnapshot.Interaction(
+                id: UUID(),
+                kind: .approval,
+                responseType: .decision,
+                title: "Command approval",
+                prompt: sampleInteractionPrompt,
+                context: nil,
+                allowsMultiple: nil,
+                options: [.init(label: "accept"), .init(label: "decline"), .init(label: "cancel")],
+                fields: [],
+                details: []
+            ),
+            manualOnlyReason: manualOnly
+        )
+    }
+
     func testOperationHelpNamesEverySupportedOperation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
             "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
-            "snooze_auto_wake", "request_attention"
+            "snooze_auto_wake", "request_attention", "get_interaction", "respond"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
@@ -1660,6 +2275,55 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.targetNotIdle)
+        }
+
+        // MARK: Management
+
+        var pendingInteractionInspection: AgentSessionLinkPendingInteractionInspection = .none
+        var respondOutcome: AgentSessionLinkInteractionResponseOutcome = .noPendingInteraction
+        var respondRequests: [AgentSessionLinkInteractionResponseRequest] = []
+        var respondAuthorizations: [Bool] = []
+        /// Runs just before the bridge's final respond fence, so a test can withdraw management there.
+        var beforeRespondAuthorize: (@MainActor () async -> Void)?
+        var steerOutcome: AgentSessionLinkSendTransactionOutcome = .blocked(.targetBusy)
+        var steerRequests: [AgentSessionLinkSendRequest] = []
+        var steerCommits: [AgentSessionLinkSendCommitOutcome] = []
+        /// Runs just before the steer commit fence, so a test can withdraw management there.
+        var beforeSteerCommit: (@MainActor () async -> Void)?
+
+        func agentSessionLinkPendingInteraction(
+            for _: AgentSessionLinkEndpointCandidate
+        ) -> AgentSessionLinkPendingInteractionInspection {
+            pendingInteractionInspection
+        }
+
+        /// Mirrors the real host contract: the bridge's final fence runs before anything is applied.
+        func agentSessionLinkRespondToPendingInteraction(
+            for _: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkInteractionResponseRequest,
+            authorize: @escaping @MainActor @Sendable () async -> Bool
+        ) async -> AgentSessionLinkInteractionResponseOutcome {
+            respondRequests.append(request)
+            await beforeRespondAuthorize?()
+            let authorized = await authorize()
+            respondAuthorizations.append(authorized)
+            return authorized ? respondOutcome : .unavailable
+        }
+
+        /// Mirrors the real host contract: nothing is delivered unless the bridge's commit fence,
+        /// which re-proves the management delegation, is won first.
+        func agentSessionLinkPerformSteer(
+            to _: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkSendRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            steerRequests.append(request)
+            await beforeSteerCommit?()
+            let commit = await commitAuthorization()
+            steerCommits.append(commit)
+            guard commit == .committed else { return .blocked(commit.refusal) }
+            return steerOutcome
         }
     }
 

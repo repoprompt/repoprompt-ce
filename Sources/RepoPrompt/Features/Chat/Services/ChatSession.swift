@@ -176,6 +176,24 @@ struct ChatSession: Codable, Identifiable {
             )
         return collapsed.isEmpty ? "Untitled Chat" : collapsed
     }
+
+    /// Default names assigned before a chat has a real title (`validatedName` fallback, the
+    /// compose "New Chat" default, and the memberwise-init default). Compared case-insensitively.
+    private static let placeholderNames: Set = ["untitled", "untitled chat", "new chat"]
+
+    /// Whether `name` is empty or one of the placeholder defaults, so it carries no identifying
+    /// information for the user (e.g. in notifications or when naming a compose tab).
+    static func isPlaceholderName(_ name: String?) -> Bool {
+        displayableName(name) == nil
+    }
+
+    /// Whitespace-collapsed `name`, or `nil` when it is empty or a placeholder default.
+    static func displayableName(_ name: String?) -> String? {
+        guard let name else { return nil }
+        let collapsed = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !collapsed.isEmpty, !placeholderNames.contains(collapsed.lowercased()) else { return nil }
+        return collapsed
+    }
 }
 
 extension ChatSession {
