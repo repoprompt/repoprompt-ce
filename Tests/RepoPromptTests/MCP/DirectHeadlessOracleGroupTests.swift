@@ -158,6 +158,34 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(try fixture.calls().isEmpty)
     }
 
+    func testAskOracleRejectsImagesBeforeProviderWork() async throws {
+        let fixture = try Fixture(name: "ask-oracle-images-rejected")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "ask_oracle",
+                arguments: [
+                    "message": .string("inspect this screenshot"),
+                    "images": .array([.object(["path": .string("/tmp/shot.png")])])
+                ]
+            )
+            XCTFail("Expected images rejection on the direct headless backend")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .unsupportedImageAttachments)
+        }
+        XCTAssertTrue(try fixture.calls().isEmpty)
+    }
+
     func testNamedDirectContinuationStaysSingleLaneAfterEnablingGroupedSettings() async throws {
         let fixture = try Fixture(name: "named-direct-grouped-settings")
         defer { fixture.cleanup() }

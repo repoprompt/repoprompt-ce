@@ -65,6 +65,21 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         }
     }
 
+    func testCanonicalAskOracleAdvertisesImageAttachments() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "ask_oracle"))
+        XCTAssertTrue(definition.description.contains("`images`"), "ask_oracle description must document images")
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let images = try XCTUnwrap(properties["images"]?.objectValue)
+        XCTAssertEqual(images["type"], .string("array"))
+        XCTAssertEqual(images["maxItems"], .int(OracleImageAttachmentLimits.production.maxCount))
+        let items = try XCTUnwrap(images["items"]?.objectValue)
+        XCTAssertEqual(items["required"], .array([.string("path")]))
+        let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
+        XCTAssertEqual(itemProperties["path"]?.objectValue?["type"], .string("string"))
+        XCTAssertEqual(itemProperties["title"]?.objectValue?["type"], .string("string"))
+    }
+
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
         XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
             "message": .string("Reply OK"),

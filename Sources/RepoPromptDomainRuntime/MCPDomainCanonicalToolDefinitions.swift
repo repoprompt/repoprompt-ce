@@ -1113,7 +1113,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
-        return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions).map(advertiseModelParameters)
+        return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
+            .map(advertiseModelParameters)
+            .map(advertiseOracleImageAttachments)
     }
 
     private static func advertiseModelParameters(
@@ -1148,6 +1150,57 @@ package enum MCPDomainCanonicalToolDefinitions {
             name: definition.name,
             description: definition.description
                 + "\n\n**Cursor parameters**: `\(operations)` accept `model_parameters` as exact `config_id` and `value` pairs for app-backed Cursor sessions. Discover choices in `agent_manage.list_agents`; catalog `current_value` is the catalog default, not a live session value. Selections are applied before prompting and returned in session snapshots. Standalone headless sessions reject parameter overrides.",
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// The vendored `ask_oracle` definition predates Oracle image attachments, so
+    /// canonicalization advertises the app-backend `images` contract here instead of
+    /// re-vendoring the blob. The direct headless backend cannot resolve workspace
+    /// images and rejects the argument at execution time rather than dropping it.
+    private static func advertiseOracleImageAttachments(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.askOracle,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"],
+              properties["images"] == nil
+        else { return definition }
+
+        let limits = OracleImageAttachmentLimits.production
+        properties["images"] = .object([
+            "type": .string("array"),
+            "description": .string("Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` (including screenshots saved under a workspace root) and may include transient `title`. Unsupported transports, remote URLs, and paths outside loaded roots are rejected. Max \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total. Requires the app backend; the direct headless backend rejects `images`."),
+            "items": .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "path": .object([
+                        "type": .string("string"),
+                        "description": .string("Canonical absolute path inside a currently loaded workspace root")
+                    ]),
+                    "title": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional transient image title"),
+                        "maxLength": .int(200)
+                    ])
+                ]),
+                "required": .array([.string("path")])
+            ]),
+            "maxItems": .int(limits.maxCount)
+        ])
+        schema["properties"] = .object(properties)
+
+        var description = definition.description
+        let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine. Remote URLs, relative paths, and files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total. Requires the app backend; the direct headless backend rejects `images`."
+        if !description.contains(imageUsage) {
+            description += "\n\n\(imageUsage)"
+        }
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault

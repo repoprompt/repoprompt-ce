@@ -57,6 +57,26 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable {
     }
 }
 
+/// Oracle image attachment limits shared by the app loader, advertised MCP
+/// schemas, and the canonical catalog projection.
+package struct OracleImageAttachmentLimits: Equatable {
+    package let maxCount: Int
+    package let maxBytesPerImage: Int
+    package let maxTotalBytes: Int
+
+    package init(maxCount: Int, maxBytesPerImage: Int, maxTotalBytes: Int) {
+        self.maxCount = maxCount
+        self.maxBytesPerImage = maxBytesPerImage
+        self.maxTotalBytes = maxTotalBytes
+    }
+
+    package static let production = OracleImageAttachmentLimits(
+        maxCount: 10,
+        maxBytesPerImage: 20 * 1024 * 1024,
+        maxTotalBytes: 50 * 1024 * 1024
+    )
+}
+
 /// Product limits and canonical settings keys. Lane identity itself remains unbounded.
 package enum OracleRosterContract {
     package static let minimumCount = 1

@@ -836,7 +836,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Agent-mode oracle send/continue tool.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nUse `oracle_chat_log` after compaction to recover recent oracle messages. Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
+      "description" : "Agent-mode oracle send/continue tool.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nUse `oracle_chat_log` after compaction to recover recent oracle messages. Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.\n\nOptional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine. Remote URLs, relative paths, and files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: 10 images, 20 MiB each, 50 MiB total. Requires the app backend; the direct headless backend rejects `images`.",
       "inputSchema" : {
         "properties" : {
           "chat_id" : {
@@ -846,6 +846,28 @@
           "export_response" : {
             "description" : "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt.",
             "type" : "boolean"
+          },
+          "images" : {
+            "description" : "Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` (including screenshots saved under a workspace root) and may include transient `title`. Unsupported transports, remote URLs, and paths outside loaded roots are rejected. Max 10 images, 20 MiB each, 50 MiB total. Requires the app backend; the direct headless backend rejects `images`.",
+            "items" : {
+              "properties" : {
+                "path" : {
+                  "description" : "Canonical absolute path inside a currently loaded workspace root",
+                  "type" : "string"
+                },
+                "title" : {
+                  "description" : "Optional transient image title",
+                  "maxLength" : 200,
+                  "type" : "string"
+                }
+              },
+              "required" : [
+                "path"
+              ],
+              "type" : "object"
+            },
+            "maxItems" : 10,
+            "type" : "array"
           },
           "message" : {
             "description" : "Your message to send",
