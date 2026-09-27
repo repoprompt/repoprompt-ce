@@ -1678,7 +1678,7 @@ actor ACPAgentSessionController {
             }
             if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
                 let responseKind = json.keys.contains("result") ? "result" : "error"
-                diagnose(.info("Ignored provider-recognized unmatched ACP response provider=\(provider.providerID.rawValue) id=\(id.displayValue) kind=\(responseKind)."))
+                log("Ignored provider-recognized unmatched ACP response provider=\(provider.providerID.rawValue) id=\(id.displayValue) kind=\(responseKind).")
                 return
             }
             diagnose(.unmatchedResponse(id: id.displayValue, line: rawLine))

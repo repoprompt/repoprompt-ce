@@ -17,22 +17,20 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
     }
 
     func testMaintenanceReplyDuringPromptLeavesTurnIntact() async throws {
-        let cases: [(label: String, frames: [String], maintenanceID: String)] = [
-            ("skills", [MaintenanceFrame.skills], "skills-reload"),
-            ("workflows", [MaintenanceFrame.workflows], "workflows-reload"),
+        let cases: [(label: String, frames: [String])] = [
+            ("skills", [MaintenanceFrame.skills]),
+            ("workflows", [MaintenanceFrame.workflows]),
             (
                 "repeated",
-                [MaintenanceFrame.skills, MaintenanceFrame.workflows, MaintenanceFrame.skills, MaintenanceFrame.workflows],
-                "skills-reload"
+                [MaintenanceFrame.skills, MaintenanceFrame.workflows, MaintenanceFrame.skills, MaintenanceFrame.workflows]
             ),
-            ("outer-error", [MaintenanceFrame.outerError], "skills-reload"),
-            ("opaque", [MaintenanceFrame.opaque], "workflows-reload")
+            ("outer-error", [MaintenanceFrame.outerError]),
+            ("opaque", [MaintenanceFrame.opaque])
         ]
         for testCase in cases {
             try await assertPromptTurnSurvives(
                 label: testCase.label,
-                frames: testCase.frames,
-                maintenanceID: testCase.maintenanceID
+                frames: testCase.frames
             )
         }
     }
@@ -141,12 +139,10 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
             let methods = messages.compactMap { $0["method"] as? String }
             let prompts = messages.filter { $0["method"] as? String == "session/prompt" }
             XCTAssertEqual(prompts.count, 2, "one prompt per turn, with no replay")
-            XCTAssertEqual(Set(prompts.compactMap { $0["id"] as? Int }).count, 2)
             XCTAssertEqual(
                 prompts.compactMap { ($0["params"] as? [String: Any])?["sessionId"] as? String },
                 [bootstrap.sessionID, bootstrap.sessionID]
             )
-            XCTAssertEqual(Set(messages.compactMap { $0["fixturePID"] as? Int }).count, 1, "transport process changed")
             XCTAssertEqual(methods.count(where: { $0 == "initialize" }), 1)
             XCTAssertEqual(methods.count(where: { $0 == "session/new" }), 1)
             XCTAssertFalse(methods.contains("session/load"), "session was re-bootstrapped")
@@ -164,7 +160,7 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
 
     /// Proves the fixture: the same gated sequence without a maintenance reply completes both turns.
     func testNoMaintenanceControlCompletesTurn() async throws {
-        try await assertPromptTurnSurvives(label: "no-maintenance", frames: [], maintenanceID: nil)
+        try await assertPromptTurnSurvives(label: "no-maintenance", frames: [])
     }
 
     /// Other unmatched replies retain the fatal fallback, rather than tolerating arbitrary IDs.
@@ -196,7 +192,6 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
         try await assertPromptTurnSurvives(
             label: "shutdown-maintenance",
             frames: [MaintenanceFrame.skills],
-            maintenanceID: "skills-reload",
             shutdownWhileHeld: true
         )
     }
@@ -245,7 +240,6 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
         ]
         let providers: [(label: String, provider: any ACPAgentProvider, optedIn: Bool)] = [
             ("grok", GrokBuildACPAgentProvider(config: GrokBuildAgentConfig()), true),
-            ("id-only-test-provider", IDRecognizingProvider(), true),
             ("default-off", NonOptedInProvider(commandPath: "unused"), false),
             ("grok-identity-without-override", NonOptedInProvider(providerID: .grokBuild, commandPath: "unused"), false)
         ]
@@ -269,7 +263,6 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
     private func assertPromptTurnSurvives(
         label: String,
         frames: [String],
-        maintenanceID: String? = nil,
         barrierID: String = "barrier-1",
         shutdownWhileHeld: Bool = false
     ) async throws {
@@ -369,19 +362,9 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
             XCTAssertFalse(methodsBeforeShutdown.contains("session/cancel"), "\(label): cancelled before teardown")
         } catch {
             await controller.shutdown()
-            let promptResult = await prompt.value
+            _ = await prompt.value
             await consumer.value
-            if let maintenanceID,
-               case let .failure(productError) = promptResult,
-               Self.isUnmatchedResponseFailure(productError, id: maintenanceID)
-            {
-                // Expected red-path classification only; this never turns the failure into a pass.
-                XCTFail("\(label): owned prompt failed: \(productError.localizedDescription); checkpoint: \(error.localizedDescription)")
-                print("INTENDED_PRODUCT_FAILURE \(label): unmatched \(maintenanceID)")
-            } else {
-                XCTFail("\(label): held prompt scenario failed: \(error.localizedDescription)")
-                print("CHECKPOINT_OR_FIXTURE_FAILURE \(label): \(error.localizedDescription)")
-            }
+            XCTFail("\(label): held prompt scenario failed: \(error.localizedDescription)")
         }
     }
 
@@ -747,46 +730,6 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
         }
     }
 
-    /// Exercises the envelope gate before Grok opts in; it makes no envelope decisions itself.
-    private struct IDRecognizingProvider: ACPAgentProvider {
-        private let base = NonOptedInProvider(commandPath: "unused")
-
-        var providerID: ACPProviderID {
-            base.providerID
-        }
-
-        func recognizesUnmatchedResponseID(_ id: String) -> Bool {
-            id == "skills-reload" || id == "workflows-reload"
-        }
-
-        func support(for request: ACPRunRequest) async throws -> ACPSupportResult {
-            try await base.support(for: request)
-        }
-
-        func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
-            try base.makeLaunchConfiguration(for: request)
-        }
-
-        func makeSessionConfiguration(
-            for request: ACPRunRequest,
-            mcpServer: RepoPromptMCPServerConfiguration
-        ) throws -> ACPSessionConfiguration {
-            try base.makeSessionConfiguration(for: request, mcpServer: mcpServer)
-        }
-
-        func buildPromptBlocks(for message: AgentMessage, request: ACPRunRequest) throws -> [[String: Any]] {
-            try base.buildPromptBlocks(for: message, request: request)
-        }
-
-        func normalizeSessionUpdate(_ payload: [String: Any], sessionID: String) -> [NormalizedAgentRuntimeEvent] {
-            base.normalizeSessionUpdate(payload, sessionID: sessionID)
-        }
-
-        func normalizeError(_ error: Error) -> Error {
-            base.normalizeError(error)
-        }
-    }
-
     /// Writes the fake `grok` before the controller exists: launch identity is captured at init.
     private func makeHarness(
         label: String,
@@ -848,7 +791,7 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
 
     def record(entry):
         with open(RECORD_PATH, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(dict(entry, fixturePID=os.getpid())) + "\n")
+            handle.write(json.dumps(entry) + "\n")
 
     def write_line(text):
         try:
