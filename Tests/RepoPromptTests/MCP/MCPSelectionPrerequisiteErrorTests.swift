@@ -83,6 +83,26 @@ import XCTest
             }
         }
 
+        func testSocketDeferredPrerequisiteAfterFileSearchIsNotCancellation() async throws {
+            // An eligible content file_search enqueues into the same auto-selection coordinator as read_file.
+            try await withPrerequisite(timeout: .zero) { prerequisite in
+                try await prerequisite.acceptRead(source: MCPWindowToolName.search, arguments: [
+                    "pattern": .string("fixture"),
+                    "mode": .string("content"),
+                    "context_lines": .int(2),
+                    "path": .string(prerequisite.readPath)
+                ])
+                let reply = try await prerequisite.driver.fixture.perform("socket manage_selection deferred after file_search") {
+                    try await prerequisite.call(MCPWindowToolName.manageSelection, prerequisite.addArguments)
+                }
+                try prerequisite.assertCallerVisiblePrerequisiteError(reply, rawJSON: false, outcome: "deferred")
+                let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+                XCTAssertTrue(text.contains("file_search"), "The message must not attribute the selection to read_file alone: \(text)")
+                prerequisite.assertMirrorWaiterSettled()
+                prerequisite.assertSelectionUnchanged()
+            }
+        }
+
         func testSocketDeferredWorkspaceContextPrerequisiteIsNotCancellation() async throws {
             try await withPrerequisite(timeout: .zero) { prerequisite in
                 try await prerequisite.acceptRead()
@@ -378,13 +398,14 @@ import XCTest
                 coordinator.setMirrorWaitTimeoutForTesting(timeout)
             }
 
-            /// Accepts and applies a real read's canonical selection while its physical mirror is held.
-            func acceptRead() async throws {
+            /// Accepts and applies a real auto-selection's canonical selection while its physical mirror
+            /// is held. The source is a `read_file` of `readPath` unless another eligible call is given.
+            func acceptRead(source toolName: String = MCPWindowToolName.readFile, arguments: [String: MCP.Value]? = nil) async throws {
                 let before = try XCTUnwrap(currentSelection)
                 XCTAssertFalse(before.selectedPaths.contains(readPath))
                 XCTAssertFalse(before.selectedPaths.contains(addPath))
-                let reply = try await driver.fixture.perform("real prerequisite read") {
-                    try await self.call(MCPWindowToolName.readFile, ["path": .string(self.readPath)])
+                let reply = try await driver.fixture.perform("real prerequisite \(toolName)") {
+                    try await self.call(toolName, arguments ?? ["path": .string(self.readPath)])
                 }
                 XCTAssertNotEqual(reply.isError, true, ContextBuilderMultiRootDiscoveryDriver.text(reply))
                 try await driver.fixture.awaitGateEvent(mirrorEntered)
@@ -399,7 +420,13 @@ import XCTest
                 })?.requiredMirrorTicket)
                 XCTAssertGreaterThan(try XCTUnwrap(requiredTicket), 0)
                 acceptedSelection = try XCTUnwrap(currentSelection)
-                XCTAssertTrue(try XCTUnwrap(acceptedSelection).selectedPaths.contains(readPath))
+                let accepted = try XCTUnwrap(acceptedSelection)
+                // A read selects the whole file; an eligible content search selects slices of it.
+                XCTAssertTrue(
+                    accepted.selectedPaths.contains(readPath)
+                        || (toolName != MCPWindowToolName.readFile && accepted.slices[readPath] != nil),
+                    "The \(toolName) auto-selection did not select \(readPath): \(accepted)"
+                )
                 XCTAssertNotEqual(acceptedSelection, before)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWorkerCount, 1)

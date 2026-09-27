@@ -4821,7 +4821,8 @@ final class MCPServerViewModel: ObservableObject {
         return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
     }
 
-    /// Runs one read-file auto-selection drain and throws unless its prerequisite completed.
+    /// Runs one read-file auto-selection drain, which also covers eligible `file_search` selections,
+    /// and throws unless its prerequisite completed.
     /// Callers keep their own drain requirement and skip conditions. Two cases keep cancellation
     /// classification (`CancellationError`): a task cancellation observed after the drain, whatever
     /// the drain returned, and a `.cancelled` drain result, which can also come from a replayed
