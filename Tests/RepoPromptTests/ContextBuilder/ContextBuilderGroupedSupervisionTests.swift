@@ -295,6 +295,7 @@ import XCTest
             try await withHarness { harness in
                 var refused: ContextBuilderOracleLaneScope?
                 let oracle = harness.driver.window.oracleViewModel
+                defer { if let refused { oracle.unpinSession(refused.sessionID) } }
                 oracle.contextBuilderBeforeAvailabilityForTesting = { scope, model in
                     // sendMessage has appended this lane's user turn; its query bind comes next.
                     guard model == .gpt54Mini else { return }
@@ -310,15 +311,15 @@ import XCTest
                 try await harness.wait(harness.settled)
                 XCTAssertNil(harness.error)
                 let scope = try XCTUnwrap(refused)
-                defer { oracle.unpinSession(scope.sessionID) }
                 XCTAssertNil(scope.queryID)
                 XCTAssertNil(scope.streamID)
                 XCTAssertTrue(scope.hasDrainedForTesting)
                 XCTAssertEqual(harness.registeredModels, [.gpt54])
                 XCTAssertEqual(harness.uiReply?.oracleGroup?.result.oracleResults.map(\.status), [.cancelled, .completed])
+                XCTAssertTrue(oracle.isSessionPinnedForTesting(scope.sessionID))
                 XCTAssertEqual(
-                    oracle.messagesSnapshot(for: scope.sessionID).filter(\.isUser).map(\.content), [],
-                    "A refused bind must not leave the lane's user turn unanswered"
+                    oracle.messagesSnapshot(for: scope.sessionID).map(\.id), [],
+                    "A refused bind must leave the fresh lane chat empty"
                 )
             }
         }
