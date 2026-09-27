@@ -159,10 +159,9 @@ import XCTest
                     prerequisite.assertSelectionUnchanged()
                     XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "The rejected export wrote its file")
                     let journal = try await AppDomainRuntimeComposition.shared.runtime.mutationJournal.snapshot()
-                    let record = try XCTUnwrap(
-                        journal.recordSnapshots.last { $0.operationID == operationID },
-                        "Missing mutation journal record for \(operationID)"
-                    )
+                    let records = journal.recordSnapshots.filter { $0.operationID == operationID }
+                    XCTAssertEqual(records.count, 1, "Expected exactly one mutation journal record for \(operationID)")
+                    let record = try XCTUnwrap(records.first, "Missing mutation journal record for \(operationID)")
                     XCTAssertEqual(
                         record.status,
                         .failedBeforeCommit,
@@ -222,34 +221,51 @@ import XCTest
                 }
                 let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
                 XCTAssertNotEqual(reply.isError, true, text)
-                XCTAssertTrue(text.contains("README.md"), text)
+                // Both fixture roots hold a README.md. The read's own root must list it as selected, and
+                // the other root must not appear in the selected tree.
+                let readRoot = URL(fileURLWithPath: prerequisite.readPath).deletingLastPathComponent().lastPathComponent
+                let addRoot = URL(fileURLWithPath: prerequisite.addPath).deletingLastPathComponent().lastPathComponent
+                XCTAssertTrue(text.contains("\n\(readRoot)\n└── README.md *"), text)
+                XCTAssertFalse(text.components(separatedBy: "\n").contains(addRoot), text)
                 XCTAssertEqual(prerequisite.coordinator.debugSnapshot().mirrorWorkerCount, 1)
             }
         }
 
-        func testPrerequisiteHelperReportsObservedTaskCancellationOverDeferredResult() async {
-            // The task is cancelled before its main-actor body can start, so the post-drain check
-            // observes cancellation even though the drain itself reported `.deferred`.
-            let task = Task { @MainActor () -> Error? in
-                do {
-                    try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { .deferred }
-                    return nil
-                } catch {
-                    return error
-                }
+        func testPrerequisiteHelperReportsObservedTaskCancellationAfterTheDrain() async {
+            // The task is cancelled before its main-actor body can start. The drain still runs, and the
+            // post-drain check then reports the task's cancellation whatever the drain returned.
+            for result: MCPReadFileAutoSelectionCoordinator.DrainResult in [.completed, .deferred, .invalidated] {
+                let outcome = await helperOutcomeInCancelledTask(returning: result)
+                XCTAssertTrue(outcome.drained, "The drain must run before the cancellation check: \(result)")
+                XCTAssertTrue(
+                    outcome.error is CancellationError,
+                    "An observed task cancellation must win over \(result): \(String(describing: outcome.error))"
+                )
             }
-            task.cancel()
-            let error = await task.value
-            XCTAssertTrue(error is CancellationError, "An observed task cancellation must win over a deferred result: \(String(describing: error))")
         }
 
         func testPrerequisiteHelperKeepsCancelledResultAsCancellation() async {
             XCTAssertFalse(Task.isCancelled)
+            var drained = false
             do {
-                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { .cancelled }
+                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                    drained = true
+                    return .cancelled
+                }
                 XCTFail("A cancelled prerequisite must not complete")
             } catch {
                 XCTAssertTrue(error is CancellationError, "A cancelled drain result must stay cancellation: \(error)")
+            }
+            XCTAssertTrue(drained)
+        }
+
+        func testPrerequisiteHelperPropagatesDrainErrorUnchanged() async {
+            struct DrainSentinel: Error, Equatable {}
+            do {
+                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite { throw DrainSentinel() }
+                XCTFail("A throwing drain must not complete")
+            } catch {
+                XCTAssertEqual(error as? DrainSentinel, DrainSentinel(), "A drain error must propagate unchanged: \(error)")
             }
         }
 
@@ -267,6 +283,27 @@ import XCTest
                     XCTAssertEqual(error as? MCPSelectionPrerequisiteError, expected, "\(error)")
                 }
             }
+        }
+
+        /// Runs the helper in a task cancelled before its main-actor body can start, and reports whether
+        /// the drain ran and what the helper threw.
+        private func helperOutcomeInCancelledTask(
+            returning result: MCPReadFileAutoSelectionCoordinator.DrainResult
+        ) async -> (drained: Bool, error: Error?) {
+            let task = Task { @MainActor () -> (drained: Bool, error: Error?) in
+                var drained = false
+                do {
+                    try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                        drained = true
+                        return result
+                    }
+                    return (drained, nil)
+                } catch {
+                    return (drained, error)
+                }
+            }
+            task.cancel()
+            return await task.value
         }
 
         private func assertSocketInvalidatedCanonicalPrerequisite(
