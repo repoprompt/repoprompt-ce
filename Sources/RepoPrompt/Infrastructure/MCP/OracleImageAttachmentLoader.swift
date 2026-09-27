@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptDomainRuntime
 
 struct OracleImageRequest: Equatable {
     let index: Int
@@ -85,18 +86,6 @@ struct OracleImageUnavailableRoot: Equatable {
 struct OracleImageWorkspaceAuthority: Equatable {
     let roots: [OracleImageRootProjection]
     var unavailableRoots: [OracleImageUnavailableRoot] = []
-}
-
-struct OracleImageAttachmentLimits: Equatable {
-    let maxCount: Int
-    let maxBytesPerImage: Int
-    let maxTotalBytes: Int
-
-    static let production = OracleImageAttachmentLimits(
-        maxCount: 10,
-        maxBytesPerImage: 20 * 1024 * 1024,
-        maxTotalBytes: 50 * 1024 * 1024
-    )
 }
 
 enum OracleImageLoadError: Error, LocalizedError, Equatable {
