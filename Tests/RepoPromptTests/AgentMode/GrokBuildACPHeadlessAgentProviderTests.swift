@@ -104,6 +104,16 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertTrue(requestConfig.alwaysApproveTools)
     }
 
+    func testMaintenanceRecognitionIsForwardedThroughProviderExistential() {
+        let provider: any ACPAgentProvider = EnvForwardingGrokProvider(
+            config: GrokBuildAgentConfig(),
+            extraEnvironment: [:]
+        )
+        XCTAssertTrue(provider.recognizesUnmatchedResponseID("skills-reload"))
+        XCTAssertTrue(provider.recognizesUnmatchedResponseID("workflows-reload"))
+        XCTAssertFalse(provider.recognizesUnmatchedResponseID("other-reload"))
+    }
+
     // MARK: - Harness
 
     private struct Harness {
@@ -319,6 +329,10 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
 
     func normalizeError(_ error: Error) -> Error {
         inner.normalizeError(error)
+    }
+
+    func recognizesUnmatchedResponseID(_ id: String) -> Bool {
+        inner.recognizesUnmatchedResponseID(id)
     }
 }
 

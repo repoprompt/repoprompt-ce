@@ -26,6 +26,10 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         .grokBuild
     }
 
+    func recognizesUnmatchedResponseID(_ id: String) -> Bool {
+        id == "skills-reload" || id == "workflows-reload"
+    }
+
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
