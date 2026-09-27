@@ -3229,7 +3229,13 @@ class OracleViewModel: ObservableObject {
 
         // Create a placeholder AI response
         let aiResponseId = UUID()
-        guard contextBuilderScope?.bind(queryID: aiResponseId) != false else { return nil }
+        guard contextBuilderScope?.bind(queryID: aiResponseId) != false else {
+            // Refused before any query exists: undo this call's own user turn (no suspension since the
+            // append), so the lane chat never keeps an unanswered turn that a continuation would replay.
+            withSessionMessages(targetSessionID) { msgs in msgs.removeAll { $0.id == userId } }
+            purgeMessageCaches(for: userId)
+            return nil
+        }
         contextBuilderScopes[aiResponseId] = contextBuilderScope
         let aiPlaceholder = AIChatMessage(
             id: aiResponseId,

@@ -291,6 +291,38 @@ import XCTest
             }
         }
 
+        func testRefusedBindRollsBackUserTurnWithoutProviderDispatch() async throws {
+            try await withHarness { harness in
+                var refused: ContextBuilderOracleLaneScope?
+                let oracle = harness.driver.window.oracleViewModel
+                oracle.contextBuilderBeforeAvailabilityForTesting = { scope, model in
+                    // sendMessage has appended this lane's user turn; its query bind comes next.
+                    guard model == .gpt54Mini else { return }
+                    refused = scope
+                    // Keep the chat resident, as a displayed or recently viewed chat stays;
+                    // otherwise tool_chatSend's unpin unloads it and hides the unsaved turn.
+                    oracle.pinSession(scope.sessionID)
+                    scope.cancellation.request()
+                }
+                try harness.startUI()
+                try await harness.waitForStream(.gpt54)
+                harness.complete(.gpt54, text: "available sibling")
+                try await harness.wait(harness.settled)
+                XCTAssertNil(harness.error)
+                let scope = try XCTUnwrap(refused)
+                defer { oracle.unpinSession(scope.sessionID) }
+                XCTAssertNil(scope.queryID)
+                XCTAssertNil(scope.streamID)
+                XCTAssertTrue(scope.hasDrainedForTesting)
+                XCTAssertEqual(harness.registeredModels, [.gpt54])
+                XCTAssertEqual(harness.uiReply?.oracleGroup?.result.oracleResults.map(\.status), [.cancelled, .completed])
+                XCTAssertEqual(
+                    oracle.messagesSnapshot(for: scope.sessionID).filter(\.isUser).map(\.content), [],
+                    "A refused bind must not leave the lane's user turn unanswered"
+                )
+            }
+        }
+
         func testTimedOutFinalizerDrainsWithoutClearingReplacementDuringOuterCancellation() async throws {
             try await withHarness { harness in
                 let driver = harness.driver
