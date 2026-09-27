@@ -1,3 +1,4 @@
+import AppKit
 @testable import RepoPromptApp
 import XCTest
 
@@ -53,6 +54,86 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertNil(legacy.oracleLaneIndex)
         XCTAssertNil(legacy.oracleGroupSize)
         XCTAssertNil(legacy.oracleExecutionAuthority)
+    }
+
+    func testStoredMessageImageAttachmentsRoundTripAndRemainOptionalForLegacy() throws {
+        let attachment = AIChatImageAttachment(
+            mediaType: "image/png",
+            title: "screenshot",
+            thumbnailData: Data([0xFF, 0xD8, 0xFF, 0xE0])
+        )
+        let original = StoredMessage(
+            isUser: true,
+            rawText: "look at this",
+            sequenceIndex: 3,
+            imageAttachments: [attachment]
+        )
+
+        let encoded = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(StoredMessage.self, from: encoded)
+        XCTAssertEqual(decoded.imageAttachments?.count, 1)
+        XCTAssertEqual(decoded.imageAttachments?.first?.mediaType, "image/png")
+        XCTAssertEqual(decoded.imageAttachments?.first?.title, "screenshot")
+        XCTAssertEqual(decoded.imageAttachments?.first?.thumbnailData, attachment.thumbnailData)
+
+        // Legacy payloads without the field must still decode.
+        let legacy = """
+        {
+          "id": "\(UUID().uuidString)",
+          "isUser": true,
+          "rawText": "base",
+          "timestamp": 0,
+          "sequenceIndex": 0
+        }
+        """
+        let legacyDecoded = try JSONDecoder().decode(StoredMessage.self, from: Data(legacy.utf8))
+        XCTAssertNil(legacyDecoded.imageAttachments)
+    }
+
+    func testTransientImageThumbnailsProduceBoundedOpaqueJPEGPreviews() async {
+        // 1200x800 fully transparent PNG: the thumbnail must be bounded and matted
+        // onto white, since JPEG drops alpha and would otherwise render black.
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 1200,
+            pixelsHigh: 800,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let png = bitmap.representation(using: .png, properties: [:])
+        else {
+            XCTFail("Failed to construct PNG fixture")
+            return
+        }
+
+        let transient = AITransientImage(
+            bytes: png,
+            mediaType: .png,
+            title: "big screenshot"
+        )
+        let attachments = await AIChatImageAttachment.thumbnails(from: [transient])
+
+        XCTAssertEqual(attachments.count, 1)
+        guard let attachment = attachments.first else { return }
+        XCTAssertEqual(attachment.mediaType, "image/png")
+        XCTAssertEqual(attachment.title, "big screenshot")
+
+        guard let thumb = NSBitmapImageRep(data: attachment.thumbnailData) else {
+            XCTFail("Thumbnail did not decode")
+            return
+        }
+        XCTAssertEqual(max(thumb.pixelsWide, thumb.pixelsHigh), AIChatImageAttachment.thumbnailMaxPixelSize)
+        let center = thumb.colorAt(x: thumb.pixelsWide / 2, y: thumb.pixelsHigh / 2)?.usingColorSpace(.deviceRGB)
+        XCTAssertGreaterThan(center?.brightnessComponent ?? 0, 0.95)
+
+        // Corrupt bytes must be skipped rather than crashing.
+        let corrupt = AITransientImage(bytes: Data([0x00, 0x01]), mediaType: .png, title: nil)
+        let corruptAttachments = await AIChatImageAttachment.thumbnails(from: [corrupt])
+        XCTAssertTrue(corruptAttachments.isEmpty)
     }
 
     func testStoredMessageOmitsLegacyDelegateAndCombinedTextFields() throws {

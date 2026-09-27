@@ -2399,6 +2399,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
+                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -2949,6 +2950,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
+                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -3176,12 +3178,14 @@ class OracleViewModel: ObservableObject {
         ensureSessionStorage(targetSessionID)
 
         // Create the user message
+        let imageAttachments = await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
         let userId = UUID()
         let userMessage = AIChatMessage(
             id: userId,
             content: newUserMessage,
             isUser: true,
-            sequenceIndex: nextSequenceIndex(for: targetSessionID)
+            sequenceIndex: nextSequenceIndex(for: targetSessionID),
+            imageAttachments: imageAttachments
         )
         withSessionMessages(targetSessionID) { msgs in
             msgs.append(userMessage)
@@ -4058,7 +4062,8 @@ class OracleViewModel: ObservableObject {
             isFinalized: true,
             sequenceIndex: stored.sequenceIndex,
             allowedFilePaths: stored.allowedFilePaths ?? [],
-            modelName: stored.modelName
+            modelName: stored.modelName,
+            imageAttachments: stored.imageAttachments ?? []
         )
 
         let tokenInfo = ChatTokenInfo(

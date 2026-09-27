@@ -9,6 +9,31 @@ import Foundation
 
 // MARK: - Supporting Models
 
+/// A persisted preview of an image that was attached to a user message. Stores
+/// only a small downscaled thumbnail — never the full-resolution bytes — so
+/// transcripts can render what was sent without bloating session files.
+struct AIChatImageAttachment: Codable, Equatable, Identifiable, Sendable {
+    let id: UUID
+    /// MIME type of the original image (e.g. "image/png").
+    let mediaType: String
+    /// Optional user/agent-supplied caption.
+    let title: String?
+    /// Downscaled preview bytes (JPEG), capped in dimension and size.
+    let thumbnailData: Data
+
+    init(
+        id: UUID = UUID(),
+        mediaType: String,
+        title: String? = nil,
+        thumbnailData: Data
+    ) {
+        self.id = id
+        self.mediaType = mediaType
+        self.title = title
+        self.thumbnailData = thumbnailData
+    }
+}
+
 struct AIChatMessage: Identifiable, Equatable {
     let id: UUID
     private(set) var content: String
@@ -21,6 +46,9 @@ struct AIChatMessage: Identifiable, Equatable {
 
     /// The user's selected file paths at the time this message was created.
     private(set) var allowedFilePaths: [String] = []
+
+    /// Image attachments sent with this message (thumbnails only).
+    private(set) var imageAttachments: [AIChatImageAttachment] = []
 
     /// Quick access to how many files were selected when this message was created.
     var selectedFileCount: Int {
@@ -46,7 +74,8 @@ struct AIChatMessage: Identifiable, Equatable {
         sequenceIndex: Int = 0,
         allowedFilePaths: [String] = [],
         reasoningContent: String = "",
-        modelName: String? = nil
+        modelName: String? = nil,
+        imageAttachments: [AIChatImageAttachment] = []
     ) {
         self.id = id
         self.content = content
@@ -56,6 +85,7 @@ struct AIChatMessage: Identifiable, Equatable {
         self.isFinalized = isFinalized
         self.reasoningContent = reasoningContent
         self.modelName = modelName
+        self.imageAttachments = imageAttachments
     }
 
     static func == (lhs: AIChatMessage, rhs: AIChatMessage) -> Bool {
@@ -101,5 +131,6 @@ struct AIChatMessage: Identifiable, Equatable {
         updateContent("")
         updateReasoningContent("")
         setAllowedPaths([])
+        imageAttachments = []
     }
 }
