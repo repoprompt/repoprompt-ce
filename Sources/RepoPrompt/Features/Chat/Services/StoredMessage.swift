@@ -62,7 +62,7 @@ struct StoredMessage: Codable {
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(sequenceIndex, forKey: .sequenceIndex)
         try container.encode(allowedFilePaths, forKey: .allowedFilePaths)
-        try container.encode(imageAttachments, forKey: .imageAttachments)
+        try container.encodeIfPresent(imageAttachments, forKey: .imageAttachments)
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encode(cost, forKey: .cost)
