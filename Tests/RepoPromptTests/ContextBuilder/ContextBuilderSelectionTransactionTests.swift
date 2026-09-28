@@ -4,6 +4,104 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testPendingPolicyReplacementInheritsDisplacedDiscoveryContext() async throws {
+        let fixture = try await makeFixture(name: "replacement-handover")
+        defer { fixture.cleanup() }
+        let initialSelection = StoredSelection(selectedPaths: [fixture.fileA.path])
+        try await fixture.seedCanonical(initialSelection)
+        let server = fixture.window.mcpServer
+        try server.installFrozenTabContext(
+            clientID: nil,
+            clientName: "devin",
+            context: fixture.makeContext(selection: initialSelection)
+        )
+        XCTAssertNotNil(server.registerPendingPolicyRunIDMapping(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "devin"
+        ))
+        let discoveredSelection = StoredSelection(selectedPaths: [fixture.fileB.path])
+        server.tabContextByConnectionID[fixture.connectionID]?.selection = discoveredSelection
+
+        let successorID = UUID()
+        let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            connectionID: successorID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "devin"
+        ))
+        XCTAssertEqual(token.displacedConnectionID, fixture.connectionID)
+        XCTAssertEqual(server.tabContextByConnectionID[successorID]?.runID, fixture.runID)
+        XCTAssertEqual(server.tabContextByConnectionID[successorID]?.selection, discoveredSelection)
+
+        // The displaced connection is then torn down as a replacement, not a discovery EOF.
+        XCTAssertFalse(server.detachContextBuilderTabContextForDiscoveryTeardown(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID
+        ))
+        server.removeTabContext(
+            forConnectionID: fixture.connectionID,
+            clientName: "devin",
+            windowID: fixture.window.windowID,
+            runID: nil
+        )
+
+        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(runID: fixture.runID), successorID)
+        let result = await server.commitContextBuilderTabContext(
+            connectionID: successorID,
+            expectedRunID: fixture.runID,
+            isStillCurrent: { true }
+        )
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertEqual(result.committedTab?.tab.selection, discoveredSelection)
+    }
+
+    func testRolledBackPendingPolicyReplacementKeepsDisplacedDiscoveryContext() async throws {
+        let fixture = try await makeFixture(name: "replacement-rollback")
+        defer { fixture.cleanup() }
+        let selection = StoredSelection(selectedPaths: [fixture.fileA.path])
+        let server = fixture.window.mcpServer
+        try server.installFrozenTabContext(clientID: nil, clientName: "devin", context: fixture.makeContext(selection: selection))
+        XCTAssertNotNil(server.registerPendingPolicyRunIDMapping(
+            connectionID: fixture.connectionID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "devin"
+        ))
+        let successorID = UUID()
+        let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            connectionID: successorID,
+            runID: fixture.runID,
+            windowID: fixture.window.windowID,
+            clientName: "devin"
+        ))
+
+        XCTAssertEqual(
+            server.rollbackPendingPolicyRunIDMapping(
+                token,
+                clientName: "devin",
+                windowID: fixture.window.windowID,
+                signalRoutingFailure: false
+            ),
+            .restored
+        )
+
+        // Rollback drops only the successor's inherited copy; the displaced snapshot is untouched.
+        XCTAssertNil(server.tabContextByConnectionID[successorID])
+        XCTAssertEqual(fixture.boundContext?.runID, fixture.runID)
+        XCTAssertEqual(fixture.boundContext?.selection, selection)
+        XCTAssertEqual(server.pendingContextQueueLength(clientName: "devin", windowID: fixture.window.windowID), 0)
+    }
+
+    func testDiscoveryRoutingErrorDoesNotSuggestDisabledBindContext() {
+        XCTAssertTrue(DiscoverMCPToolPolicy.restrictedTools.contains("bind_context"))
+        let message = MCPServerViewModel.tabContextRoutingErrorMessage(toolName: "git", runPurpose: .discoverRun)
+        XCTAssertTrue(message.contains("No tab context is bound for git"))
+        XCTAssertFalse(message.contains("bind_context"))
+        XCTAssertTrue(MCPServerViewModel.tabContextRoutingErrorMessage(toolName: "git").contains("bind_context"))
+    }
+
     func testContextBuilderToolMutationPublishesCanonicalSelectionImmediately() async throws {
         let fixture = try await makeFixture(name: "immediate")
         defer { fixture.cleanup() }
