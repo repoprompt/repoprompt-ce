@@ -4336,8 +4336,12 @@ enum AgentTranscriptIO {
             logHandoffDebug("tool preview pruned tool=\(toolName) status=\(toolExecution.status.rawValue)")
             return nil
         }
+        // A block can hold several result rows for one invocation (for example an ACP
+        // provider completion plus a later argument-less duplicate), so take arguments
+        // from whichever row actually carries them rather than from `sourceRow` alone.
         let argsJSON = localizedGroupedHistoryPreviewArgsJSON(
-            from: sourceRow,
+            from: toolCallRow?.toolArgsJSON
+                ?? visibleRows.last(where: { $0.kind == .toolResult && $0.toolArgsJSON != nil })?.toolArgsJSON,
             execution: toolExecution
         )
         logHandoffDebug("tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
@@ -4373,24 +4377,25 @@ enum AgentTranscriptIO {
         }
     }
 
+    /// Never falls back to the tool result payload: a result summary rendered inside
+    /// `<tool_call>` reads as the call's arguments.
     private static func localizedGroupedHistoryPreviewArgsJSON(
-        from sourceRow: AgentChatItem,
+        from toolArgsJSON: String?,
         execution: AgentTranscriptToolExecution?
     ) -> String? {
-        var object = AgentTranscriptToolNormalizer.jsonObject(from: sourceRow.toolArgsJSON)
-            ?? AgentTranscriptToolNormalizer.jsonObject(from: sourceRow.toolResultJSON)
-            ?? [:]
+        var object = AgentTranscriptToolNormalizer.jsonObject(from: toolArgsJSON) ?? [:]
         if let execution {
             if !execution.keyPaths.isEmpty, object["key_paths"] == nil {
                 object["key_paths"] = Array(execution.keyPaths.prefix(4))
             }
         }
-        guard JSONSerialization.isValidJSONObject(object),
+        guard !object.isEmpty,
+              JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         else {
-            return sourceRow.toolArgsJSON ?? sourceRow.toolResultJSON
+            return toolArgsJSON
         }
-        return String(data: data, encoding: .utf8) ?? sourceRow.toolArgsJSON ?? sourceRow.toolResultJSON
+        return String(data: data, encoding: .utf8) ?? toolArgsJSON
     }
 
     private static func renderableRows(for turn: AgentTranscriptTurn, includeArchivedPresentation: Bool) -> [AgentChatItem] {
