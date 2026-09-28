@@ -59,6 +59,17 @@ enum AgentTranscriptToolVisibilityPolicy {
         return normalized
     }
 
+    /// The provider's own tool name when `normalizedVisibleToolName` maps it onto a different
+    /// RepoPrompt alias (for example Devin's `grep` → `file_search`); nil when the names agree.
+    static func aliasedProviderToolName(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty,
+              MCPIntegrationHelper.canonicalRepoPromptToolName(trimmed) == nil
+        else { return nil }
+        let normalized = normalizedToolNameForComparison(trimmed) ?? trimmed.lowercased()
+        guard let alias = canonicalAlias(forNormalizedName: normalized), alias != normalized else { return nil }
+        return trimmed
+    }
+
     private static func shouldSuppressRow(_ row: AgentChatItem, execution: AgentTranscriptToolExecution?) -> Bool {
         guard row.kind == .toolCall || row.kind == .toolResult else { return false }
         let rawToolName = execution?.toolName ?? row.toolName

@@ -1530,6 +1530,7 @@ enum AgentTranscriptToolNormalizer {
         let execution = AgentTranscriptToolExecution(
             stableExecutionID: stableExecutionID(for: item),
             toolName: normalizedToolName.isEmpty ? item.toolName : normalizedToolName,
+            providerToolName: AgentTranscriptToolVisibilityPolicy.aliasedProviderToolName(item.toolName),
             invocationID: item.toolInvocationID,
             argsJSON: item.toolArgsJSON,
             resultJSON: item.toolResultJSON,
@@ -3654,7 +3655,10 @@ enum AgentTranscriptIO {
                     pos += 1
                 case .toolCall:
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
-                          let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName) else { continue }
+                          let visibleToolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName)
+                    else { continue }
+                    // Name the tool as the provider called it, not by the RepoPrompt card alias.
+                    let toolName = AgentTranscriptToolVisibilityPolicy.aliasedProviderToolName(row.toolName) ?? visibleToolName
                     let args = truncateArgs(row.toolArgsJSON, max: maxToolArgsCharacters)
                     let xml = args.isEmpty
                         ? "<tool_call name=\"\(toolName)\"/>"
@@ -4341,15 +4345,14 @@ enum AgentTranscriptIO {
         // from whichever row actually carries them rather than from `sourceRow` alone.
         let argsJSON = localizedGroupedHistoryPreviewArgsJSON(
             from: toolCallRow?.toolArgsJSON
-                ?? visibleRows.last(where: { $0.kind == .toolResult && $0.toolArgsJSON != nil })?.toolArgsJSON,
-            execution: toolExecution
+                ?? visibleRows.last(where: { $0.kind == .toolResult && $0.toolArgsJSON != nil })?.toolArgsJSON
         )
         logHandoffDebug("tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
         return AgentChatItem(
             timestamp: sourceRow.timestamp,
             kind: .toolCall,
             text: "",
-            toolName: toolName,
+            toolName: AgentTranscriptToolVisibilityPolicy.aliasedProviderToolName(sourceRow.toolName) ?? toolName,
             toolArgsJSON: argsJSON,
             sequenceIndex: sourceRow.sequenceIndex,
             isStreaming: false
@@ -4377,19 +4380,11 @@ enum AgentTranscriptIO {
         }
     }
 
-    /// Never falls back to the tool result payload: a result summary rendered inside
-    /// `<tool_call>` reads as the call's arguments.
-    private static func localizedGroupedHistoryPreviewArgsJSON(
-        from toolArgsJSON: String?,
-        execution: AgentTranscriptToolExecution?
-    ) -> String? {
-        var object = AgentTranscriptToolNormalizer.jsonObject(from: toolArgsJSON) ?? [:]
-        if let execution {
-            if !execution.keyPaths.isEmpty, object["key_paths"] == nil {
-                object["key_paths"] = Array(execution.keyPaths.prefix(4))
-            }
-        }
-        guard !object.isEmpty,
+    /// Emits only what the provider sent: never the tool result payload and never
+    /// RepoPrompt-derived fields such as `key_paths`, which would read as call arguments.
+    private static func localizedGroupedHistoryPreviewArgsJSON(from toolArgsJSON: String?) -> String? {
+        guard let object = AgentTranscriptToolNormalizer.jsonObject(from: toolArgsJSON),
+              !object.isEmpty,
               JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         else {

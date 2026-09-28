@@ -38,6 +38,9 @@ public enum AgentTranscriptToolStatus: String, Codable, Sendable, Equatable {
 public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
     public var stableExecutionID: String
     public var toolName: String?
+    /// The provider's own tool name when `toolName` is a RepoPrompt alias of it (for example
+    /// Devin's `grep` stored as `file_search`); nil when the names agree.
+    public var providerToolName: String?
     public var invocationID: UUID?
     public var argsJSON: String?
     public var resultJSON: String?
@@ -52,6 +55,7 @@ public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
     public init(
         stableExecutionID: String,
         toolName: String?,
+        providerToolName: String? = nil,
         invocationID: UUID?,
         argsJSON: String?,
         resultJSON: String?,
@@ -65,6 +69,7 @@ public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
     ) {
         self.stableExecutionID = stableExecutionID
         self.toolName = toolName
+        self.providerToolName = providerToolName
         self.invocationID = invocationID
         self.argsJSON = argsJSON
         self.resultJSON = resultJSON
@@ -175,7 +180,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             text: overrideText ?? text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
-            toolName: toolExecution?.toolName,
+            toolName: toolExecution?.providerToolName ?? toolExecution?.toolName,
             toolInvocationID: toolExecution?.invocationID,
             toolArgsJSON: toolExecution?.argsJSON,
             toolResultJSON: toolExecution?.resultJSON,

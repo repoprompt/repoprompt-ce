@@ -62,4 +62,34 @@ final class AgentSpartanLogToolCallArgsTests: XCTestCase {
         XCTAssertTrue(xml.contains(#"<tool_call name="ask_oracle"/>"#), xml)
         XCTAssertFalse(xml.contains("summary_only"), xml)
     }
+
+    /// Devin's native `grep` is aliased to `file_search` for tool cards; get_log must still show
+    /// the provider's own tool name and exactly the arguments it sent, including after the
+    /// transcript is persisted and reloaded.
+    func testProviderNativeToolKeepsItsNameAndArgumentsAcrossPersistence() throws {
+        let invocationID = try XCTUnwrap(UUID(uuidString: "C5D14F51-E34A-12C0-EE1F-E2C91DEB2B1C"))
+        var grepResult = AgentChatItem.toolResult(
+            name: "grep",
+            invocationID: invocationID,
+            resultJSON: #"{"status":"success"}"#,
+            isError: false,
+            sequenceIndex: 2
+        )
+        grepResult.toolArgsJSON = #"{"file_pattern":"**/*.swift","path":"/repo/Sources","query":"disableAll"}"#
+        let transcript = AgentTranscriptIO.importLegacyItems([
+            .user("review", sequenceIndex: 0),
+            .assistant("Searching.", sequenceIndex: 1),
+            grepResult,
+            .assistant("Done.", sequenceIndex: 3)
+        ])
+        let reloaded = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(transcript))
+        let expected = #"<tool_call name="grep">{"file_pattern":"**\/*.swift","path":"\/repo\/Sources","query":"disableAll"}</tool_call>"#
+
+        for candidate in [transcript, reloaded] {
+            let xml = AgentTranscriptIO.buildSpartanLogXML(from: candidate)
+            XCTAssertTrue(xml.contains(expected), xml)
+            XCTAssertFalse(xml.contains("key_paths"), xml)
+            XCTAssertFalse(xml.contains("file_search"), xml)
+        }
+    }
 }
