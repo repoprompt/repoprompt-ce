@@ -217,7 +217,7 @@ final class OracleImageSerializationTests: XCTestCase {
         let message = makeMessage()
         let openCode = OpenCodeCLIProvider.test_makeAgentMessage(from: message)
         let cursor = CursorCLIProvider.test_makeAgentMessage(from: message)
-        let devin = DevinCLIProvider.test_makeAgentMessage(from: message)
+        let devin = DevinCLIProvider.test_makeImageAgentMessage(from: message)
 
         XCTAssertEqual(openCode.transientImages, message.transientImages)
         XCTAssertEqual(cursor.transientImages, message.transientImages)
@@ -225,9 +225,9 @@ final class OracleImageSerializationTests: XCTestCase {
     }
 
     func testDevinACPPromptBlocksCarryTransientImages() throws {
-        let message = DevinCLIProvider.test_makeAgentMessage(from: makeMessage())
+        let message = DevinCLIProvider.test_makeImageAgentMessage(from: makeMessage())
         let provider = DevinACPAgentProvider(
-            config: DevinCLIProvider.test_makeHeadlessConfig(modelName: nil)
+            config: DevinCLIProvider().test_makeImageHeadlessConfig(modelName: nil)
         )
         let blocks = try provider.buildPromptBlocks(
             for: message,
