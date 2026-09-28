@@ -5,29 +5,29 @@ import XCTest
 
 final class OracleGroupDeliveryContractTests: XCTestCase {
     func testContractIsSilentForSingleLaneAndDescribesEveryLaneOtherwise() throws {
-        let single = [OracleGroupDeliveryContract.Lane(laneIndex: 0, modelID: "m", status: "Completed", response: "x")]
+        let single = [OracleGroupDeliveryContract.Lane(laneIndex: 0, modelID: "m", chatID: "chat-0", status: "Completed", response: "x")]
         XCTAssertNil(OracleGroupDeliveryContract.preamble(lanes: single))
         XCTAssertNil(OracleGroupDeliveryContract.endMarker(laneCount: 1))
         XCTAssertNil(OracleGroupDeliveryContract.followUpReminder(laneCount: 1))
         XCTAssertNil(OracleGroupDeliveryContract.exportReadingRequirement(laneCount: 1))
 
         let preamble = OracleGroupDeliveryContract.preamble(lanes: [
-            .init(laneIndex: 2, modelID: nil, status: "Failed", response: nil),
-            .init(laneIndex: 1, modelID: "model-b", status: "Failed", response: " \n", partialResponse: "part\r\nial\n"),
-            .init(laneIndex: 0, modelID: "model-a", status: "Completed", response: "one\ntwo\nthree\n")
+            .init(laneIndex: 2, modelID: nil, chatID: "chat-2", status: "Failed", response: nil),
+            .init(laneIndex: 1, modelID: "model-b", chatID: "chat-1", status: "Failed", response: " \n", partialResponse: "part\r\nial\n"),
+            .init(laneIndex: 0, modelID: "model-a", chatID: "chat-0", status: "Completed", response: "one\ntwo\nthree\n")
         ])
         let text = try XCTUnwrap(preamble)
         XCTAssertTrue(text.contains(
-            "3 independent answers to the same request follow. Lane order is not a ranking. "
-                + "A follow-up continues the whole group and re-runs every lane, including any that failed, whichever lane's chat id is used."
+            "3 independent answers to the same request follow. Lane order is not a ranking; "
+                + "the first lane supplies the top-level continuation handle, and a follow-up re-runs every lane."
         ), text)
         XCTAssertFalse(text.contains("only the chat that follow-ups continue"), text)
-        XCTAssertTrue(text.contains("- Read every lane through the end-of-group marker. If a lane or the marker is missing"), text)
+        XCTAssertTrue(text.contains("Read every lane through the end-of-group marker (`End of Oracle group: 3 lanes above.`)"), text)
         XCTAssertTrue(text.hasSuffix("""
         Lanes (3):
-        - Oracle — `model-a` — Completed
-        - Oracle 2 — `model-b` — Failed (partial)
-        - Oracle 3 — model unspecified — Failed
+        - Oracle — `model-a` — Completed — chat ID `chat-0`
+        - Oracle 2 — `model-b` — Failed (partial) — chat ID `chat-1`
+        - Oracle 3 — model unspecified — Failed — chat ID `chat-2`
         """), text)
         XCTAssertFalse(text.contains(" line"), text)
     }
@@ -43,7 +43,7 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         ]
         for (response, partial, expected) in cases {
             let lane = OracleGroupDeliveryContract.Lane(
-                laneIndex: 0, modelID: nil, status: "Failed", response: response, partialResponse: partial
+                laneIndex: 0, modelID: nil, chatID: "chat-0", status: "Failed", response: response, partialResponse: partial
             )
             XCTAssertEqual(lane.isPartial, expected, "response: \(String(describing: response)), partial: \(String(describing: partial))")
         }
@@ -61,7 +61,7 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         let warning = try XCTUnwrap(text.range(of: "Warning [slow_lane]"))
         XCTAssertLessThan(guidance.lowerBound, firstLane.lowerBound)
         XCTAssertLessThan(firstLane.lowerBound, warning.lowerBound)
-        XCTAssertTrue(text.contains("- Oracle 2 — `model-1` — Completed\n"), text)
+        XCTAssertTrue(text.contains("- Oracle 2 — `model-1` — Completed — chat ID `chat-1`\n"), text)
         XCTAssertTrue(text.hasSuffix("\n\nEnd of Oracle group: 2 lanes above.\n"), text)
         XCTAssertEqual(
             text.split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init),
@@ -116,7 +116,7 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
             try XCTUnwrap(markdown.range(of: "**Reconciling these Oracle lanes**")).lowerBound,
             try XCTUnwrap(markdown.range(of: "## Oracle results")).lowerBound
         )
-        XCTAssertTrue(markdown.contains("- Oracle 2 — `model-1` — failed (partial)"), markdown)
+        XCTAssertTrue(markdown.contains("- Oracle 2 — `model-1` — failed (partial) — chat ID `chat-1`"), markdown)
         XCTAssertTrue(markdown.hasSuffix("\n\nEnd of Oracle group: 2 lanes above."), markdown)
     }
 
@@ -129,6 +129,8 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         let grouped = AgentOracleExport.instruction(path: path, oracleLaneCount: 3)
         XCTAssertTrue(grouped.hasPrefix(single + " "), grouped)
         XCTAssertTrue(grouped.contains("The file contains 3 independent Oracle lanes"), grouped)
+        XCTAssertTrue(grouped.contains("read through the \"End of Oracle group\" marker"), grouped)
+        XCTAssertFalse(grouped.contains("read it to the end"), grouped)
     }
 
     func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsUnchanged() {

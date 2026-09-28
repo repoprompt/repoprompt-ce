@@ -20,6 +20,18 @@ final class ReviewPromptUpgradeTests: XCTestCase {
         XCTAssertFalse(prompts.isKnownPreviousCanonical(retitled))
     }
 
+    func testUneditedV3ReviewPromptUpgradesAndEditedCopiesArePreserved() {
+        let prompts = makePromptViewModel()
+        let v3 = prompts.previousReviewPromptV3
+        XCTAssertEqual(v3.id, prompts.reviewPrompt.id)
+        XCTAssertNotEqual(v3.content, prompts.reviewPrompt.content)
+        XCTAssertTrue(prompts.isKnownPreviousCanonical(v3))
+
+        var edited = v3
+        edited.content += "\nMy extra rule."
+        XCTAssertFalse(prompts.isKnownPreviousCanonical(edited))
+    }
+
     func testV1ReviewFingerprintStillUpgrades() {
         let prompts = makePromptViewModel()
         let v1 = PromptViewModel.StoredPrompt(
@@ -32,9 +44,10 @@ final class ReviewPromptUpgradeTests: XCTestCase {
 
     func testCurrentReviewPromptAsksForComparableFindings() {
         let content = makePromptViewModel().reviewPrompt.content
+        XCTAssertFalse(content.contains("one of several independent reviews"))
+        XCTAssertFalse(content.contains("**Confidence**"))
         for required in [
             "\t- **Location**: file and line or symbol.",
-            "**Confidence**: Confirmed, Likely, or Speculative.",
             "Merge findings that share a root cause.",
             "`Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`"
         ] {

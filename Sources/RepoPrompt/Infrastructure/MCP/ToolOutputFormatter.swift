@@ -4573,6 +4573,7 @@ extension ToolOutputFormatter {
             OracleGroupDeliveryContract.Lane(
                 laneIndex: lane.laneIndex,
                 modelID: lane.modelID,
+                chatID: lane.chatID,
                 status: lane.status.rawValue,
                 response: lane.response,
                 partialResponse: lane.partialResponse

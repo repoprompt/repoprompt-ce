@@ -124,6 +124,7 @@ enum AgentOracleExport {
             OracleGroupDeliveryContract.Lane(
                 laneIndex: lane.laneIndex,
                 modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                chatID: lane.chatID,
                 status: lane.status.rawValue,
                 response: lane.response,
                 partialResponse: lane.error?.partialResponse
