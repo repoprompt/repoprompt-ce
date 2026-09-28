@@ -13,18 +13,40 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
 
         let preamble = OracleGroupDeliveryContract.preamble(lanes: [
             .init(laneIndex: 2, modelID: nil, status: "Failed", response: nil),
-            .init(laneIndex: 1, modelID: "model-b", status: "Failed", response: nil, partialResponse: "part\r\nial\n"),
+            .init(laneIndex: 1, modelID: "model-b", status: "Failed", response: " \n", partialResponse: "part\r\nial\n"),
             .init(laneIndex: 0, modelID: "model-a", status: "Completed", response: "one\ntwo\nthree\n")
         ])
         let text = try XCTUnwrap(preamble)
-        XCTAssertTrue(text.contains("3 independent answers to the same request follow. Lane order is not a ranking"), text)
-        XCTAssertTrue(text.contains("Read every lane through the line `End of Oracle group: 3 lanes above.`"), text)
+        XCTAssertTrue(text.contains(
+            "3 independent answers to the same request follow. Lane order is not a ranking. "
+                + "A follow-up continues the whole group and re-runs every lane, including any that failed, whichever lane's chat id is used."
+        ), text)
+        XCTAssertFalse(text.contains("only the chat that follow-ups continue"), text)
+        XCTAssertTrue(text.contains("- Read every lane through the end-of-group marker. If a lane or the marker is missing"), text)
         XCTAssertTrue(text.hasSuffix("""
         Lanes (3):
-        - Oracle — `model-a` — Completed — 3 lines
-        - Oracle 2 — `model-b` — Failed — 2 lines (partial)
-        - Oracle 3 — model unspecified — Failed — 0 lines
+        - Oracle — `model-a` — Completed
+        - Oracle 2 — `model-b` — Failed (partial)
+        - Oracle 3 — model unspecified — Failed
         """), text)
+        XCTAssertFalse(text.contains(" line"), text)
+    }
+
+    func testLaneIsPartialOnlyWhenResponseIsBlankAndPartialIsNot() {
+        let cases: [(response: String?, partial: String?, expected: Bool)] = [
+            ("answer", nil, false),
+            ("answer", "partial", false),
+            (nil, "partial", true),
+            (" \n\t", "partial", true),
+            (nil, nil, false),
+            (" \n", " \r\n", false)
+        ]
+        for (response, partial, expected) in cases {
+            let lane = OracleGroupDeliveryContract.Lane(
+                laneIndex: 0, modelID: nil, status: "Failed", response: response, partialResponse: partial
+            )
+            XCTAssertEqual(lane.isPartial, expected, "response: \(String(describing: response)), partial: \(String(describing: partial))")
+        }
     }
 
     func testInlineGroupPutsGuidanceBeforeLanesAndEndMarkerLast() throws {
@@ -39,48 +61,30 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         let warning = try XCTUnwrap(text.range(of: "Warning [slow_lane]"))
         XCTAssertLessThan(guidance.lowerBound, firstLane.lowerBound)
         XCTAssertLessThan(firstLane.lowerBound, warning.lowerBound)
-        XCTAssertTrue(text.contains("- Oracle 2 — `model-1` — Completed — 2 lines"), text)
-        XCTAssertTrue(text.hasSuffix("\n\nEnd of Oracle group: 2 lanes above."), text)
+        XCTAssertTrue(text.contains("- Oracle 2 — `model-1` — Completed\n"), text)
+        XCTAssertTrue(text.hasSuffix("\n\nEnd of Oracle group: 2 lanes above.\n"), text)
+        XCTAssertEqual(
+            text.split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init),
+            "End of Oracle group: 2 lanes above."
+        )
         XCTAssertFalse(text.localizedCaseInsensitiveContains("synthesis"))
     }
 
-    func testOracleExportLayoutMovesGroupedResponsesAheadOfPromptAndSelection() throws {
-        let raw: Value = try .object([
-            "prompt": .string("the final prompt"),
-            "selection": .string("the selection"),
-            "response_type": .string("review"),
-            "review": .object(groupFields(lanes: [lane(index: 0, response: "a"), lane(index: 1, response: "b")]))
+    func testGroupedAskOracleEndMarkerStaysOnItsOwnLineWhenBlocksAreConcatenated() throws {
+        var fields = try groupFields(lanes: [
+            lane(index: 0, response: "primary answer"),
+            lane(index: 1, response: "adviser answer")
         ])
-        let inline = joinedText(ToolOutputFormatter.formatDiscoverContext(value: raw))
-        let export = joinedText(ToolOutputFormatter.formatDiscoverContext(value: raw, layout: .oracleExport))
+        fields["oracle_export_path"] = .string("/tmp/prompt-exports/oracle.md")
+        let blocks = texts(ToolOutputFormatter.formatAskOracle(args: [:], value: .object(fields), emitResources: false))
+        XCTAssertGreaterThanOrEqual(blocks.count, 2)
 
-        XCTAssertLessThan(
-            try XCTUnwrap(inline.range(of: "## Final Prompt")).lowerBound,
-            try XCTUnwrap(inline.range(of: "## Code Review")).lowerBound
+        let concatenated = blocks.joined()
+        XCTAssertTrue(
+            concatenated.contains("\nEnd of Oracle group: 2 lanes above.\n### Oracle export"),
+            concatenated
         )
-        XCTAssertTrue(export.hasPrefix("## Code Review"), export)
-        XCTAssertLessThan(
-            try XCTUnwrap(export.range(of: "End of Oracle group: 2 lanes above.")).lowerBound,
-            try XCTUnwrap(export.range(of: "## Final Prompt")).lowerBound
-        )
-        XCTAssertLessThan(
-            try XCTUnwrap(export.range(of: "## Final Prompt")).lowerBound,
-            try XCTUnwrap(export.range(of: "## Selection")).lowerBound
-        )
-    }
-
-    func testOracleExportLayoutKeepsSingleLaneOutputUnchanged() {
-        let raw: Value = .object([
-            "prompt": .string("the final prompt"),
-            "selection": .string("the selection"),
-            "response_type": .string("plan"),
-            "plan": .object(["chat_id": .string("chat-0"), "response": .string("only answer")])
-        ])
-        let inline = texts(ToolOutputFormatter.formatDiscoverContext(value: raw))
-        // Pre-change layout: context block first, then the plan heading block prefixed by the section separator.
-        XCTAssertEqual(inline.first, "## Final Prompt\nthe final prompt\n\n## Selection\nthe selection")
-        XCTAssertEqual(inline.dropFirst().first, "\n\n---\n\n## Generated Plan\n")
-        XCTAssertEqual(texts(ToolOutputFormatter.formatDiscoverContext(value: raw, layout: .oracleExport)), inline)
+        XCTAssertFalse(concatenated.contains("lanes above.###"), concatenated)
     }
 
     func testGroupedExportFileFramesLanesWithManifestAndEndMarker() throws {
@@ -112,7 +116,7 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
             try XCTUnwrap(markdown.range(of: "**Reconciling these Oracle lanes**")).lowerBound,
             try XCTUnwrap(markdown.range(of: "## Oracle results")).lowerBound
         )
-        XCTAssertTrue(markdown.contains("- Oracle 2 — `model-1` — failed — 1 line (partial)"), markdown)
+        XCTAssertTrue(markdown.contains("- Oracle 2 — `model-1` — failed (partial)"), markdown)
         XCTAssertTrue(markdown.hasSuffix("\n\nEnd of Oracle group: 2 lanes above."), markdown)
     }
 

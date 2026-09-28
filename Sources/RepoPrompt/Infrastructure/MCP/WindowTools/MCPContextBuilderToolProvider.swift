@@ -946,11 +946,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                    planReply != nil || reviewReply != nil
                 {
                     let resultForExport = makeResult(oracleExportPath: nil)
-                    let exportBlocks = ToolOutputFormatter.formatDiscoverContext(
-                        value: resultForExport.toMCPValue(),
-                        layout: .oracleExport
-                    )
-                    let markdown = exportBlocks
+                    let markdown = ToolOutputFormatter.formatDiscoverContext(value: resultForExport.toMCPValue())
                         .compactMap { block -> String? in
                             switch block {
                             case .text(text: let text, annotations: _, _meta: _):

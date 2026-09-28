@@ -13,22 +13,15 @@ package enum OracleGroupDeliveryContract {
         package let laneIndex: Int
         package let modelID: String?
         package let status: String
-        package let responseLineCount: Int
         package let isPartial: Bool
 
         package init(laneIndex: Int, modelID: String?, status: String, response: String?, partialResponse: String? = nil) {
             self.laneIndex = laneIndex
             self.modelID = modelID
             self.status = status
-            let hasResponse = Self.lineCount(response) > 0
-            responseLineCount = Self.lineCount(hasResponse ? response : partialResponse)
-            isPartial = !hasResponse && responseLineCount > 0
-        }
-
-        private static func lineCount(_ text: String?) -> Int {
-            let trimmed = text?.trimmingCharacters(in: .newlines) ?? ""
-            guard !trimmed.trimmingCharacters(in: .whitespaces).isEmpty else { return 0 }
-            return trimmed.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).count
+            let hasResponse = !(response ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasPartial = !(partialResponse ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            isPartial = !hasResponse && hasPartial
         }
     }
 
@@ -38,8 +31,8 @@ package enum OracleGroupDeliveryContract {
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
         var lines = [
             "**Reconciling these Oracle lanes**",
-            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane (`\(OracleRosterContract.displayLabel(laneIndex: 0))`) is only the chat that follow-ups continue, not a more authoritative answer.",
-            "- Read every lane through the line `\(endMarkerText(laneCount: ordered.count))` If a lane or that line is missing, the output was cut off: recover it or say so.",
+            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking. A follow-up continues the whole group and re-runs every lane, including any that failed, whichever lane's chat id is used.",
+            "- Read every lane through the end-of-group marker. If a lane or the marker is missing, the output was cut off: recover it or say so.",
             "- Work claim by claim: list each lane's findings, group them by root cause, and note which lanes raised each.",
             "- Weigh claims by evidence, not by answer length, lane order, or provider. Agreement across lanes raises confidence but is not proof.",
             "- A point raised by only one lane is a candidate, not noise. Check single-lane and conflicting claims against the code before adopting or rejecting them.",
@@ -49,8 +42,8 @@ package enum OracleGroupDeliveryContract {
         ]
         lines += ordered.map { lane in
             let model = lane.modelID.map { "`\($0)`" } ?? "model unspecified"
-            let size = (lane.responseLineCount == 1 ? "1 line" : "\(lane.responseLineCount) lines") + (lane.isPartial ? " (partial)" : "")
-            return "- \(OracleRosterContract.displayLabel(laneIndex: lane.laneIndex)) — \(model) — \(lane.status) — \(size)"
+            let partial = lane.isPartial ? " (partial)" : ""
+            return "- \(OracleRosterContract.displayLabel(laneIndex: lane.laneIndex)) — \(model) — \(lane.status)\(partial)"
         }
         return lines.joined(separator: "\n")
     }
