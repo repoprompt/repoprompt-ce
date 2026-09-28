@@ -32,8 +32,8 @@ package enum OracleGroupDeliveryContract {
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
         var lines = [
             "**Reconciling these Oracle lanes**",
-            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a follow-up re-runs every lane.",
-            "- Read every lane through the end-of-group marker (`\(endMarkerText(laneCount: ordered.count))`). If that marker or a listed lane is missing, recover it using its chat ID or say which evidence is missing.",
+            "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane.",
+            "- Read every lane through the end-of-group marker (`\(endMarkerText(laneCount: ordered.count))`). If the marker or a lane is missing, page the export or try the read-only `oracle_chat_log` with that lane's chat ID. Logs may be scoped or clipped; report any remaining gap. Do not start a follow-up just to retrieve prior text.",
             "- Reconcile by evidence, not lane order, answer length, or model identity: check material single-lane and conflicting claims against the code, and report unresolved disagreements. A failed or partial lane is incomplete evidence.",
             "",
             "Lanes (\(ordered.count)):"

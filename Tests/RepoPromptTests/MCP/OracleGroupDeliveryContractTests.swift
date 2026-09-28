@@ -19,10 +19,12 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         let text = try XCTUnwrap(preamble)
         XCTAssertTrue(text.contains(
             "3 independent answers to the same request follow. Lane order is not a ranking; "
-                + "the first lane supplies the top-level continuation handle, and a follow-up re-runs every lane."
+                + "the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane."
         ), text)
         XCTAssertFalse(text.contains("only the chat that follow-ups continue"), text)
         XCTAssertTrue(text.contains("Read every lane through the end-of-group marker (`End of Oracle group: 3 lanes above.`)"), text)
+        XCTAssertTrue(text.contains("read-only `oracle_chat_log` with that lane's chat ID"), text)
+        XCTAssertTrue(text.contains("Do not start a follow-up just to retrieve prior text."), text)
         XCTAssertTrue(text.hasSuffix("""
         Lanes (3):
         - Oracle — `model-a` — Completed — chat ID `chat-0`
