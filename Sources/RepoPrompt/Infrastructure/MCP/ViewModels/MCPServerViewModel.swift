@@ -7100,7 +7100,10 @@ final class MCPServerViewModel: ObservableObject {
         )
         return OracleExportFile(
             path: resolvedPath,
-            instruction: AgentOracleExport.instruction(path: resolvedPath)
+            instruction: AgentOracleExport.instruction(
+                path: resolvedPath,
+                oracleLaneCount: request.groupResult?.oracleResults.count
+            )
         )
     }
 

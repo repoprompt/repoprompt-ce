@@ -1610,7 +1610,8 @@ class PromptViewModel: ObservableObject {
     /// and is safe to auto-upgrade to the current canonical version.
     private var previousCanonicalBuiltIns: [UUID: [StoredPrompt]] {
         [
-            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4]
+            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4],
+            reviewPrompt.id: [previousReviewPromptV2]
         ]
     }
 
@@ -2169,7 +2170,8 @@ class PromptViewModel: ObservableObject {
         """
     )
 
-    private let reviewPrompt = StoredPrompt(
+    /// Review prompt v2, kept verbatim so unedited copies upgrade to the current version.
+    let previousReviewPromptV2 = StoredPrompt(
         id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
         title: "[Review]",
         content: """
@@ -2204,6 +2206,55 @@ class PromptViewModel: ObservableObject {
         1. One-paragraph summary of what the changes accomplish.
         2. Findings grouped by severity (P0 → P1 → P2), each with: file reference, what's wrong, and a concrete suggestion. Omit empty severity groups.
         3. If no issues found at a severity level, skip it — don't pad the review.
+        """
+    )
+
+    let reviewPrompt = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        Your review may be one of several independent reviews of the same change that another agent will reconcile, so make every finding self-contained and comparable.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Each finding must include:**
+        \t- **Location**: file and line or symbol.
+        \t- **Problem**: what is wrong and the condition that triggers it.
+        \t- **Evidence**: what in the diff or code shows it; say when it is inferred rather than shown.
+        \t- **Fix**: the smallest concrete correction.
+        \t- **Confidence**: Confirmed, Likely, or Speculative.
+
+        Merge findings that share a root cause. Do not claim tests or runtime checks you did not perform.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), in the format above. Omit empty severity groups and don't pad the review; keep minor style notes brief and file them as P2.
+        3. End with a single line: `Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`.
         """
     )
 
@@ -5794,7 +5845,7 @@ class PromptViewModel: ObservableObject {
 
     /// Checks if a persisted built-in prompt matches a known previous canonical version.
     /// Exact matches are preferred so we do not overwrite user-customized prompts.
-    private func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
+    func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
         if let previousVariants = previousCanonicalBuiltIns[prompt.id],
            previousVariants.contains(where: { $0.title == prompt.title && $0.content == prompt.content })
         {

@@ -4443,7 +4443,14 @@ extension ToolOutputFormatter {
         return formatGeneric(value: value)
     }
 
-    static func formatDiscoverContext(value: Value) -> [MCP.Tool.Content] {
+    /// `oracleExport` moves generated multi-lane Oracle responses ahead of the
+    /// prompt and selection so partial reads of an export file reach every lane.
+    enum DiscoverContextLayout {
+        case inline
+        case oracleExport
+    }
+
+    static func formatDiscoverContext(value: Value, layout: DiscoverContextLayout = .inline) -> [MCP.Tool.Content] {
         if case let .object(obj) = value {
             var out: [String] = []
             if let statusStr = obj["status"]?.stringValue {
@@ -4469,7 +4476,10 @@ extension ToolOutputFormatter {
                 out.append(selection)
             }
 
-            var blocks: [MCP.Tool.Content] = out.isEmpty ? [] : [.text(out.joined(separator: "\n"))]
+            let contextSection: DiscoverContextSection? = out.isEmpty
+                ? nil
+                : DiscoverContextSection(leadingText: out.joined(separator: "\n"), trailingBlocks: [], isOracleGroup: false)
+            var responseSections: [DiscoverContextSection] = []
 
             // If plan/question was generated, format it using oracle_send formatter
             if let planObj = obj["plan"], case .object = planObj {
@@ -4483,26 +4493,23 @@ extension ToolOutputFormatter {
                 default:
                     "## Generated Response"
                 }
-                let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
-                    blocks.append(.text(separator + groupBlock))
-                } else {
-                    blocks.append(.text("\(separator)\(heading)\n"))
-                    let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
-                    blocks.append(contentsOf: planBlocks)
-                }
+                responseSections.append(discoverContextResponseSection(value: planObj, heading: heading))
             }
 
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
+                responseSections.append(discoverContextResponseSection(value: reviewObj, heading: "## Code Review"))
+            }
+
+            let responsesFirst = layout == .oracleExport && responseSections.contains(where: \.isOracleGroup)
+            let orderedSections = responsesFirst
+                ? responseSections + [contextSection].compactMap(\.self)
+                : [contextSection].compactMap(\.self) + responseSections
+            var blocks: [MCP.Tool.Content] = []
+            for section in orderedSections {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
-                    blocks.append(.text(separator + groupBlock))
-                } else {
-                    blocks.append(.text("\(separator)## Code Review\n"))
-                    let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
-                    blocks.append(contentsOf: reviewBlocks)
-                }
+                blocks.append(.text(separator + section.leadingText))
+                blocks.append(contentsOf: section.trailingBlocks)
             }
 
             // Follow-up hint
@@ -4524,6 +4531,23 @@ extension ToolOutputFormatter {
             return blocks
         }
         return formatGeneric(value: value)
+    }
+
+    private struct DiscoverContextSection {
+        let leadingText: String
+        let trailingBlocks: [MCP.Tool.Content]
+        let isOracleGroup: Bool
+    }
+
+    private static func discoverContextResponseSection(value: Value, heading: String) -> DiscoverContextSection {
+        if let groupBlock = formatOracleGroup(value: value, heading: heading) {
+            return DiscoverContextSection(leadingText: groupBlock, trailingBlocks: [], isOracleGroup: true)
+        }
+        return DiscoverContextSection(
+            leadingText: "\(heading)\n",
+            trailingBlocks: formatChatSend(args: [:], value: value, emitResources: false),
+            isOracleGroup: false
+        )
     }
 
     private static func formatOracleGroup(
@@ -4569,6 +4593,18 @@ extension ToolOutputFormatter {
                 errorMessage: lane.error?.message
             )
         })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }) {
+            lines.append("")
+            lines.append(preamble)
+        }
         let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
         if !laneMarkdown.isEmpty {
             lines.append("")
@@ -4579,6 +4615,10 @@ extension ToolOutputFormatter {
                 lines.append("")
                 lines.append("Warning [\(warning.code)]: \(warning.message)")
             }
+        }
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
         }
         return lines.joined(separator: "\n")
     }
