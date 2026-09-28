@@ -1688,6 +1688,23 @@ final class ACPIntegratedAgentModeRunner {
         }
     }
 
+    private func settledToolResultItemIndex(
+        in session: AgentTabSession,
+        storedToolName: String,
+        invocationID: UUID
+    ) -> Int? {
+        indexedThenActiveTurnToolCandidates(
+            indexedIndices: session.indexedToolItemIndices(invocationID: invocationID),
+            session: session,
+            where: {
+                $0.kind == .toolResult
+                    && $0.toolInvocationID == invocationID
+                    && self.hasSameNormalizedToolName($0.toolName, storedToolName)
+                    && self.hasNonEmptyPayload($0.toolResultJSON)
+            }
+        ).indices.last
+    }
+
     private func hasExactToolInvocationSignature(
         _ item: AgentChatItem,
         storedToolName: String,
@@ -2035,6 +2052,14 @@ final class ACPIntegratedAgentModeRunner {
                     toolTrackingHooks.addToolOutputTokens(result.resultJSON, session)
                 }
                 session.replaceItem(at: index, with: updated)
+            } else if result.argsJSON == nil,
+                      let invocationID = result.invocationID,
+                      settledToolResultItemIndex(in: session, storedToolName: storedToolName, invocationID: invocationID) != nil
+            {
+                // Devin repeats `tool_call_update(completed)` without `rawInput` after the row has
+                // settled. The repeat names no call and carries a thinner result, so keep the
+                // settled row rather than appending an argument-less duplicate.
+                return true
             } else {
                 if hasNonEmptyPayload(result.resultJSON) {
                     toolTrackingHooks.addToolOutputTokens(result.resultJSON, session)
