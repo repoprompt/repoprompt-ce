@@ -237,8 +237,7 @@ final class OracleImageSerializationTests: XCTestCase {
                 workspacePath: nil,
                 resumeSessionID: nil,
                 attachments: [],
-                taskLabelKind: nil,
-                launchPermissionMode: nil
+                taskLabelKind: nil
             )
         )
         let imageBlock = try XCTUnwrap(blocks.last)
