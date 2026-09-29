@@ -12,7 +12,7 @@ import Foundation
 /// A persisted preview of an image that was attached to a user message. Stores
 /// only a small downscaled thumbnail — never the full-resolution bytes — so
 /// transcripts can render what was sent without bloating session files.
-struct AIChatImageAttachment: Codable, Equatable, Identifiable, Sendable {
+struct AIChatImageAttachment: Codable, Equatable, Identifiable {
     let id: UUID
     /// MIME type of the original image (e.g. "image/png").
     let mediaType: String

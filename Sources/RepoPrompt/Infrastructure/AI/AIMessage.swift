@@ -1,7 +1,7 @@
 import Foundation
 import SwiftOpenAI
 
-enum AIImageMediaType: String, Equatable, Sendable {
+enum AIImageMediaType: String, Equatable {
     case png = "image/png"
     case jpeg = "image/jpeg"
     case gif = "image/gif"
@@ -9,7 +9,7 @@ enum AIImageMediaType: String, Equatable, Sendable {
 }
 
 /// Request-scoped Oracle image data. Deliberately non-Codable and path-free.
-struct AITransientImage: Equatable, Sendable {
+struct AITransientImage: Equatable {
     let bytes: Data
     let mediaType: AIImageMediaType
     let title: String?
