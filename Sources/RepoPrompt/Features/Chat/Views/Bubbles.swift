@@ -558,6 +558,26 @@ private struct ForkButtonOverlay: View {
     }
 }
 
+/// Decodes each persisted thumbnail once, so hover changes and transcript
+/// re-renders reuse the same `NSImage` instead of re-decoding JPEG bytes on
+/// the main thread.
+@MainActor
+private enum ImageAttachmentImageCache {
+    private static let cache: NSCache<NSUUID, NSImage> = {
+        let cache = NSCache<NSUUID, NSImage>()
+        cache.countLimit = 256
+        return cache
+    }()
+
+    static func image(for attachment: AIChatImageAttachment) -> NSImage? {
+        let key = attachment.id as NSUUID
+        if let cached = cache.object(forKey: key) { return cached }
+        guard let image = NSImage(data: attachment.thumbnailData) else { return nil }
+        cache.setObject(image, forKey: key)
+        return image
+    }
+}
+
 /// Horizontal row of image thumbnails attached to a user message. Tapping a
 /// chip opens a larger preview popover.
 private struct ImageAttachmentStrip: View {
@@ -582,7 +602,7 @@ private struct ImageAttachmentChip: View {
     var body: some View {
         Button(action: { showingPreview = true }) {
             Group {
-                if let nsImage = NSImage(data: attachment.thumbnailData) {
+                if let nsImage = ImageAttachmentImageCache.image(for: attachment) {
                     Image(nsImage: nsImage)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
@@ -618,7 +638,7 @@ private struct ImageAttachmentPreview: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if let nsImage = NSImage(data: attachment.thumbnailData) {
+            if let nsImage = ImageAttachmentImageCache.image(for: attachment) {
                 Image(nsImage: nsImage)
             }
             if let title = attachment.title, !title.isEmpty {

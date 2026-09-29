@@ -3178,7 +3178,11 @@ class OracleViewModel: ObservableObject {
         ensureSessionStorage(targetSessionID)
 
         // Create the user message
-        let imageAttachments = await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
+        // Only suspend when images are attached so the text-only path keeps
+        // creating the user message synchronously on the main actor.
+        let imageAttachments = oracleTransientImages.isEmpty
+            ? []
+            : await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
         let userId = UUID()
         let userMessage = AIChatMessage(
             id: userId,
