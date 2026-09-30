@@ -21,6 +21,8 @@ enum ProcessLaunchPurpose: Equatable {
     case cliRunner
     case codexAppServer
     case codexPreflight
+    case codexCredentialLogout
+    case figmaProviderLogin
     case claudeNative
     case acpAgent(providerID: String?)
     case sidebarAgentTerminal(provider: String?)
@@ -73,6 +75,12 @@ enum ProcessEnvironmentBuilder {
         }
     }
 
+    static var canonicalDefaultUserHome: String? {
+        let path = FileManager.default.homeDirectoryForCurrentUser.path
+        guard !path.isEmpty, path.hasPrefix("/") else { return nil }
+        return path
+    }
+
     static func build(
         _ request: ProcessEnvironmentRequest,
         shellEnvironmentProvider: ShellEnvironmentProvider
@@ -95,10 +103,12 @@ enum ProcessEnvironmentBuilder {
         }
 
         let merged = composedEnvironment(
+            for: request.purpose,
             base: baseSnapshot.environment,
             inherited: request.inheritedEnvironment,
             overrides: request.overrides,
-            additionalRemovedKeys: request.additionalRemovedKeys
+            additionalRemovedKeys: ProcessEnvironmentSanitizer.removedKeys(for: request.purpose)
+                .union(request.additionalRemovedKeys)
         )
 
         return ProcessEnvironmentResult(
@@ -110,7 +120,7 @@ enum ProcessEnvironmentBuilder {
 
     private static func preferredShellCaptureMode(for purpose: ProcessLaunchPurpose) -> ShellEnvironmentCaptureMode {
         switch purpose {
-        case .codexAppServer, .codexPreflight:
+        case .codexAppServer, .codexPreflight, .codexCredentialLogout:
             .loginShell
         default:
             .interactiveLoginShell
@@ -125,7 +135,7 @@ enum ProcessEnvironmentBuilder {
         guard !forceRefreshShellEnvironment else { return false }
         guard launchContext.source == .terminalInherited else { return false }
         switch purpose {
-        case .codexAppServer, .codexPreflight, .shellEnvironmentProbe:
+        case .codexAppServer, .codexPreflight, .codexCredentialLogout, .shellEnvironmentProbe:
             return false
         default:
             return true
@@ -133,6 +143,7 @@ enum ProcessEnvironmentBuilder {
     }
 
     static func composedEnvironment(
+        for purpose: ProcessLaunchPurpose,
         base: [String: String],
         inherited: [String: String],
         overrides: [String: String] = [:],
@@ -149,9 +160,15 @@ enum ProcessEnvironmentBuilder {
         for (key, value) in overrides {
             environment[key] = value
         }
-        if environment["HOME"].map({ !$0.isEmpty }) != true {
+
+        if purpose == .figmaProviderLogin {
+            if let canonicalUserHome = canonicalDefaultUserHome {
+                environment["HOME"] = canonicalUserHome
+            }
+        } else if environment["HOME"].map({ !$0.isEmpty }) != true {
             environment["HOME"] = NSHomeDirectory()
         }
+
         if environment["TERM"].map({ !$0.isEmpty }) != true {
             environment["TERM"] = "xterm-256color"
         }

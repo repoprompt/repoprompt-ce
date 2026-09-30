@@ -679,6 +679,17 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        /// Resolves external MCP access after the runtime has parsed the exact configured
+        /// server entry. This is consumed only when emitting thread/start or thread/resume
+        /// overrides; a Settings change therefore affects the next binding, never a live turn.
+        var figmaMCPAccessProvider: @MainActor () -> ExternalMCPAgentAccessResolution = {
+            .init(isAllowed: false, source: .unavailable)
+        }
+
+        /// Retires only this controller's Figma binding. The closure is intentionally
+        /// controller-instance scoped so a replacement run in the same tab is unaffected.
+        var figmaMCPBindingRetirementHandler: @MainActor @Sendable () -> Void = {}
+
         var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
@@ -687,17 +698,43 @@ final class CodexNativeSessionController {
         /// environment and passed through unchanged. Inject in tests; production uses the default below.
         var repoPromptMCPProvisioner: (CodexRuntimeAuthority.Runtime) async throws -> Void = Options.ensureDefaultRepoPromptMCPProvisioning
 
-        /// Fails closed only on a real `ensureServerForDiscovery(runtime:)` directory-create/config-write
+        /// Fails closed only on a real `ensureRepoPromptServerForDiscovery(runtime:)` directory-create/config-write
         /// failure — an existing entry needing no change reports success, so a healthy no-op is not misread.
         private static func ensureDefaultRepoPromptMCPProvisioning(
             runtime: CodexRuntimeAuthority.Runtime
         ) async throws {
-            let result = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+            let result = CodexIntegrationConfiguration.ensureRepoPromptServerForDiscovery(runtime: runtime)
             guard result.success else {
                 throw AIProviderError.invalidConfiguration(
                     detail: result.errorMessage ?? MCPBootstrapReadinessError.provisioningUnavailable.localizedDescription
                 )
             }
+        }
+
+        @MainActor
+        private static func agentModeFeaturePolicy(
+            capabilitiesProvider: @escaping @MainActor () -> CodexCapabilitySettings,
+            goalSupportEnabledProvider: @escaping @MainActor () -> Bool,
+            reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool,
+            memoriesEnabledProvider: @escaping @MainActor () -> Bool,
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool,
+            figmaMCPAccessProvider: @escaping @MainActor () -> ExternalMCPAgentAccessResolution
+        ) -> (
+            capabilities: CodexCapabilitySettings,
+            goalSupportEnabled: Bool,
+            reasoningSummariesEnabled: Bool,
+            memoriesEnabled: Bool,
+            computerUseEnabled: Bool,
+            figmaMCPAccess: ExternalMCPAgentAccessResolution
+        ) {
+            (
+                capabilities: capabilitiesProvider(),
+                goalSupportEnabled: goalSupportEnabledProvider(),
+                reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
+                memoriesEnabled: memoriesEnabledProvider(),
+                computerUseEnabled: computerUseEnabledProvider(),
+                figmaMCPAccess: figmaMCPAccessProvider()
+            )
         }
 
         static func agentModeDefault(
@@ -710,20 +747,23 @@ final class CodexNativeSessionController {
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            figmaMCPAccessProvider: @escaping @MainActor () -> ExternalMCPAgentAccessResolution = {
+                .init(isAllowed: false, source: .unavailable)
+            },
+            figmaMCPBindingRetirementHandler: @escaping @MainActor @Sendable () -> Void = {}
         ) -> Options {
             Options(
                 requestTimeout: 120,
                 configOverridesProvider: {
-                    let featurePolicy = await MainActor.run {
-                        (
-                            capabilities: capabilitiesProvider(),
-                            goalSupportEnabled: goalSupportEnabledProvider(),
-                            reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
-                            memoriesEnabled: memoriesEnabledProvider(),
-                            computerUseEnabled: computerUseEnabledProvider()
-                        )
-                    }
+                    let featurePolicy = await Options.agentModeFeaturePolicy(
+                        capabilitiesProvider: capabilitiesProvider,
+                        goalSupportEnabledProvider: goalSupportEnabledProvider,
+                        reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
+                        memoriesEnabledProvider: memoriesEnabledProvider,
+                        computerUseEnabledProvider: computerUseEnabledProvider,
+                        figmaMCPAccessProvider: figmaMCPAccessProvider
+                    )
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
@@ -731,7 +771,8 @@ final class CodexNativeSessionController {
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        figmaMCPAccess: featurePolicy.figmaMCPAccess
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -744,6 +785,8 @@ final class CodexNativeSessionController {
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider,
+                figmaMCPAccessProvider: figmaMCPAccessProvider,
+                figmaMCPBindingRetirementHandler: figmaMCPBindingRetirementHandler,
                 skillExtraRootsProvider: {
                     [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
                 }
@@ -904,6 +947,9 @@ final class CodexNativeSessionController {
     /// notification and serverRequest streams end. Protected by `eventsContinuationLock`.
     /// Never reset — this controller is single-use (coordinator creates a fresh instance on reconnect).
     private var didHandleTransportEnd = false
+    /// Protected by `eventsContinuationLock`; prevents duplicate retirement callbacks across
+    /// startup failure, explicit shutdown, and transport termination.
+    private var didRetireFigmaMCPBinding = false
     private var emittedToolEventDedupKeys: Set<String> = []
     private var isBindingSession = false
     private var bufferedInbound: [BufferedInbound] = []
@@ -1554,11 +1600,21 @@ final class CodexNativeSessionController {
     }
 
     private func markStartOrResumeFailed() {
-        withEventsStateLock {
-            if lifecycleState == .binding {
-                lifecycleState = .fresh
-            }
+        let shouldRetire = withEventsStateLock { () -> Bool in
+            guard lifecycleState == .binding else { return false }
+            lifecycleState = .fresh
+            guard !didRetireFigmaMCPBinding else { return false }
+            didRetireFigmaMCPBinding = true
+            return true
         }
+        if shouldRetire {
+            notifyFigmaMCPBindingRetirement()
+        }
+    }
+
+    private func notifyFigmaMCPBindingRetirement() {
+        let handler = options.figmaMCPBindingRetirementHandler
+        Task { @MainActor in handler() }
     }
 
     private func ensureBindingCanComplete() throws {
@@ -2600,6 +2656,14 @@ final class CodexNativeSessionController {
         if expectedMCPClientName != nil {
             await client.clearExpectedAgentPIDRegistration()
         }
+        let shouldRetire = withEventsStateLock { () -> Bool in
+            guard lifecycleState != .terminated else { return false }
+            lifecycleState = .terminated
+            guard !didRetireFigmaMCPBinding else { return false }
+            didRetireFigmaMCPBinding = true
+            return true
+        }
+        if shouldRetire { notifyFigmaMCPBindingRetirement() }
         if clientShutdownBehavior == .stopOnShutdown {
             #if DEBUG
                 let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
@@ -3285,6 +3349,12 @@ final class CodexNativeSessionController {
             return true
         }
         guard shouldHandle else { return }
+        let shouldRetire = withEventsStateLock { () -> Bool in
+            guard !didRetireFigmaMCPBinding else { return false }
+            didRetireFigmaMCPBinding = true
+            return true
+        }
+        if shouldRetire { notifyFigmaMCPBindingRetirement() }
 
         Self.logCodexDebug("[CodexNativeController] transport stream ended source=\(source), emitting error + finishing events")
         if let scope = pendingTurnFailureScope(),
@@ -4859,7 +4929,12 @@ final class CodexNativeSessionController {
 
     private func computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
         let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
+        let finalOverrides = await options.configOverridesProvider()
+        let computerUseIsEffectivelyEnabled = finalOverrides[
+            "mcp_servers.\(Self.computerUseMCPServerName).enabled"
+        ] as? Bool == true
         guard computerUseEnabled,
+              computerUseIsEffectivelyEnabled,
               options.approvalPolicyProvider() == .never,
               options.sandboxModeProvider() == .dangerFullAccess,
               Self.isComputerUseMCPElicitationRequest(params: params)
@@ -9127,7 +9202,8 @@ final class CodexNativeSessionController {
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        figmaMCPAccess: ExternalMCPAgentAccessResolution = .init(isAllowed: false, source: .unavailable)
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
@@ -9148,11 +9224,13 @@ final class CodexNativeSessionController {
                 capabilities: capabilities
             )
         )
+        let figmaAccess = figmaMCPAccess
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            computerUseEnabled: computerUseEnabled,
+            figmaAccessAllowed: figmaAccess.isAllowed
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
@@ -9165,11 +9243,25 @@ final class CodexNativeSessionController {
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         enabledMCPServerNames: Set<String>,
         suppressThirdPartyMCPServers: Bool,
-        computerUseEnabled: Bool
+        computerUseEnabled: Bool,
+        figmaAccessAllowed: Bool = false
     ) -> [String: Any] {
         var effectiveEnabledNames = suppressThirdPartyMCPServers
             ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
             : enabledMCPServerNames
+        // Figma is the single narrow exception to child-session third-party suppression: an
+        // app-wide connected registration enables this fixed read-only server for every Codex
+        // Agent Mode session. All other external servers retain their existing generic policy.
+        let figmaServerName = CodexIntegrationConfiguration.settingsManagedFigmaServerName
+        let hasCanonicalFigma = serverEntries.contains { $0.identity == .canonicalFigma }
+        if figmaAccessAllowed, hasCanonicalFigma {
+            effectiveEnabledNames.insert(figmaServerName)
+        } else {
+            effectiveEnabledNames.remove(figmaServerName)
+        }
+        let explicitlyDisabledNames = Set(serverEntries.compactMap { entry in
+            entry.isExplicitlyDisabled ? entry.normalizedName : nil
+        })
         if computerUseEnabled,
            serverEntries.contains(where: {
                $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
@@ -9177,14 +9269,31 @@ final class CodexNativeSessionController {
         {
             effectiveEnabledNames.insert(Self.computerUseMCPServerName)
         }
+        // Explicit Codex disablement is the final authority, including for the
+        // computer-use convenience insertion above.
+        effectiveEnabledNames.subtract(explicitlyDisabledNames)
         return CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
                 enabledNormalizedNames: effectiveEnabledNames,
                 repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
-                exceptBroken: []
+                exceptBroken: explicitlyDisabledNames
             )
         )
+    }
+
+    static func externalMCPRuntimeAvailability(
+        for serverEntries: [MCPIntegrationHelper.CodexServerEntry]
+    ) -> ExternalMCPRuntimeAvailability {
+        guard let figma = serverEntries.first(where: {
+            $0.identity == .canonicalFigma
+        }) else {
+            return .unavailable
+        }
+        if figma.isExplicitlyDisabled {
+            return .externallyExplicitlyDisabled
+        }
+        return figma.isEnabled ? .available : .disabled
     }
 }
 

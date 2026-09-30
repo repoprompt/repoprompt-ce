@@ -22,7 +22,8 @@ final class OracleCancellationAuthorityTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: cancellationKind == .explicit ? -9340 : -9341,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory

@@ -1069,6 +1069,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         let rawWorkspacePath = "/workspace-root/child/.."
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: rawWorkspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")
@@ -1130,6 +1131,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")
@@ -1212,6 +1214,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")
@@ -1286,6 +1289,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")
@@ -1347,6 +1351,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
 
     private func makeViewModel(workspacePath: String? = nil) -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Picker-only tests must not start a Codex session")

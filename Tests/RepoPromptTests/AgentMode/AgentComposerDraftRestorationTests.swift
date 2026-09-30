@@ -188,6 +188,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
 
     private func makeViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Draft restoration tests must not start Codex")
             },

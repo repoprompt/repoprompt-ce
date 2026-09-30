@@ -44,6 +44,15 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         _ = await AppDomainRuntimeComposition.shared.runtime.shutdown()
     }
 
+    /// The one app-owned Figma/provider graph is forwarded to windows, Settings, and runtimes.
+    let externalMCPComposition: AppExternalMCPComposition
+    var figmaMCPIntegrationCoordinator: FigmaMCPIntegrationCoordinator {
+        externalMCPComposition.figmaCoordinator
+    }
+
+    private var workspacePowerObserverTokens: [NSObjectProtocol] = []
+    private var externalMCPTerminationDrainTask: Task<Void, Never>?
+
     // MARK: - Global references
 
     let sparkleManager: SparkleUpdaterManager
@@ -61,6 +70,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // MARK: - Init
 
     override init() {
+        let figmaCoordinator = FigmaMCPIntegrationCoordinator(
+            runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority()
+        )
+        externalMCPComposition = AppExternalMCPComposition(
+            figmaCoordinator: figmaCoordinator,
+            terminalSessionController: FigmaMCPProviderTerminalHandoff.SessionController(),
+            cursorToolSurfaceObserver: CursorFigmaMCPSettingsToolSurfaceObserver()
+        )
         appDelegateDebugLog("Appcounter \(AppDelegate.appCounter)")
         AppDelegate.appCounter += 1
 
@@ -156,6 +173,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // any connection can report a complete catalog. Readiness is observation-only.
         startGlobalMCPServiceRegistration()
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
+            // Reconcile saved Figma state without opening OAuth. The coordinator starts fail-closed
+            // and publishes only an authenticated result for the exact current definition.
+            _ = externalMCPComposition.registry.registeredProviders
+            figmaMCPIntegrationCoordinator.requestPassiveRefresh(trigger: .launchRefresh)
+            installFigmaMCPApplicationLifecycleObservers()
+
             // Request notification authorization
             Task {
                 await NotificationService.shared.requestAuthorization()
@@ -190,6 +213,27 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     // MARK: - Application Lifecycle
 
+    private func installFigmaMCPApplicationLifecycleObservers() {
+        guard workspacePowerObserverTokens.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        workspacePowerObserverTokens = [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.figmaMCPIntegrationCoordinator.applicationWillSleep() }
+            },
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.figmaMCPIntegrationCoordinator.applicationDidWake() }
+            }
+        ]
+    }
+
+    private func stopFigmaMCPApplicationLifecycleObservers() {
+        figmaMCPIntegrationCoordinator.applicationWillTerminate()
+        externalMCPComposition.applicationWillTerminate()
+        let center = NSWorkspace.shared.notificationCenter
+        workspacePowerObserverTokens.forEach(center.removeObserver)
+        workspacePowerObserverTokens.removeAll()
+    }
+
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         dockMenuController.makeMenu()
     }
@@ -222,6 +266,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
         // exactly the saved oversight the next launch is supposed to restore.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+        stopFigmaMCPApplicationLifecycleObservers()
 
         // 2) Persist the final restorable window session before async shutdown begins.
         // Using .terminateLater lets us do async work without deadlocking.
@@ -240,6 +285,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await externalMCPComposition.awaitApplicationTermination()
             await shutdownDomainRuntimeForTermination()
             await NotificationService.shared.prepareForTermination()
             sender.reply(toApplicationShouldTerminate: true)
@@ -259,12 +305,24 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
         // bounded `.terminateLater` settlement above, never from work attempted here.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+        stopFigmaMCPApplicationLifecycleObservers()
+        startFallbackExternalMCPTerminationDrain()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }
     }
 
     // MARK: - App Teardown
+
+    /// `applicationWillTerminate` is synchronous, so retain the bounded drain rather than
+    /// blocking AppKit's main thread while it completes.
+    private func startFallbackExternalMCPTerminationDrain() {
+        guard externalMCPTerminationDrainTask == nil else { return }
+        let composition = externalMCPComposition
+        externalMCPTerminationDrainTask = Task { @MainActor in
+            await composition.awaitApplicationTermination()
+        }
+    }
 
     private func shutdownDomainRuntimeForTermination() async {
         domainRuntimeStartupTask?.cancel()

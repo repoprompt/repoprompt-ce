@@ -199,7 +199,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
-        return WindowState()
+        return WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
     }
 
     @MainActor
@@ -260,6 +260,13 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
                 connection: connectionManager,
                 pendingClientID: clientName
             )
+            await networkManager.debugSetDomainPeerIdentityForTesting(
+                connectionID: connectionID,
+                identity: .verified(
+                    processID: Int(getpid()),
+                    fingerprint: "test:verified:bind-context-routing-authority"
+                )
+            )
             _ = await networkManager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
 
             do {
@@ -275,6 +282,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             } catch {
                 await clientTransport.disconnect()
                 await connectionManager.stop()
+                await networkManager.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
                 await networkManager.debugRemoveConnection(connectionID)
                 if !wasNetworkManagerRunning {
                     await networkManager.stop()
@@ -332,6 +340,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             let networkManager = ServerNetworkManager.shared
             await client.disconnect()
             await connectionManager.stop()
+            await networkManager.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
             await networkManager.debugRemoveConnection(connectionID)
             if !wasNetworkManagerRunning {
                 await networkManager.stop()

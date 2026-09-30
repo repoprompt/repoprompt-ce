@@ -169,7 +169,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
     private func makeFixture(name: String) async throws -> Fixture {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         WindowStatesManager.shared.registerWindowState(window)
         await window.workspaceManager.awaitInitialized()

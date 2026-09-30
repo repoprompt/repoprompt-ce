@@ -1071,6 +1071,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority,
         codexModelPollingService: CodexModelPollingService = .shared
     ) {
         self.promptManager = promptManager
@@ -1084,7 +1085,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 for: agent,
                 modelString: modelString,
                 workspacePath: workspacePath,
-                modelParameterSelections: modelParameterSelections
+                modelParameterSelections: modelParameterSelections,
+                runtimeAvailability: runtimeAvailability
             )
         }
         refreshAvailableAgents()

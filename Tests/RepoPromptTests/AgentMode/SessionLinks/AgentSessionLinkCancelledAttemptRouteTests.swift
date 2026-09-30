@@ -349,6 +349,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
 
     private func makeBareViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -731,7 +732,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
         private func makeWindow() -> WindowState {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let window = WindowState()
+            let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             return window
         }

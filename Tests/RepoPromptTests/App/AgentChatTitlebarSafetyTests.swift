@@ -633,7 +633,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
 
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         await window.workspaceManager.awaitInitialized()

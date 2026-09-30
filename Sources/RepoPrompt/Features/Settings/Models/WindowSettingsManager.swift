@@ -147,7 +147,6 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
     // Overlay per workspace for THIS WINDOW ONLY
     @Published private var copyOverlays: [UUID: CopyGlobalSettings] = [:]
     @Published private var chatOverlays: [UUID: ChatGlobalSettings] = [:]
-
     // Policy: off by default to ensure isolation. Can be surfaced in Settings UI.
     @AppStorage("autoPersistWindowSettings") private var autoPersistWindowSettings: Bool = false
 
@@ -225,6 +224,39 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
 
     func globalRecommendationProviderFilter() -> Set<RecommendationProviderKind> {
         store.globalRecommendationProviderFilter()
+    }
+
+    // MARK: - External MCP Integrations
+
+    /// Compatibility APIs for the removed Figma window policy. They intentionally retain no state.
+    func setTransientExternalMCPAccessOverride(
+        _: ExternalMCPAgentAccessPolicy,
+        for _: ExternalMCPIntegrationProvider,
+        workspaceID _: UUID
+    ) {}
+
+    func transientExternalMCPAccessOverride(
+        for _: ExternalMCPIntegrationProvider,
+        workspaceID _: UUID?
+    ) -> ExternalMCPAgentAccessPolicy? {
+        nil
+    }
+
+    func clearTransientExternalMCPAccessOverrides(for _: UUID) {}
+
+    func resolvedExternalMCPAgentAccess(
+        for provider: ExternalMCPIntegrationProvider,
+        workspaceID: UUID?,
+        runtimeAvailability: ExternalMCPRuntimeAvailability,
+        sessionPolicy: ExternalMCPAgentSessionPolicy
+    ) -> ExternalMCPAgentAccessResolution {
+        store.resolvedExternalMCPAgentAccess(
+            for: provider,
+            workspaceID: workspaceID,
+            runtimeAvailability: runtimeAvailability,
+            sessionPolicy: sessionPolicy,
+            windowOverride: nil
+        )
     }
 
     // MARK: - Scalar global settings
@@ -436,5 +468,6 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
     func discardWindowOverrides(for workspaceID: UUID) {
         copyOverlays[workspaceID] = store.copySettings(for: workspaceID)
         chatOverlays[workspaceID] = store.chatSettings(for: workspaceID)
+        clearTransientExternalMCPAccessOverrides(for: workspaceID)
     }
 }

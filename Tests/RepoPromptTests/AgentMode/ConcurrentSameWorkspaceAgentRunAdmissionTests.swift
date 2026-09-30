@@ -1971,8 +1971,8 @@ import XCTest
             }
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let firstWindow = WindowState(domainRuntime: firstRuntime)
-            let secondWindow = WindowState(domainRuntime: secondRuntime)
+            let firstWindow = WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: firstRuntime)
+            let secondWindow = WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: secondRuntime)
             WindowStatesManager.shared.registerWindowState(firstWindow)
             WindowStatesManager.shared.registerWindowState(secondWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -2177,7 +2177,7 @@ import XCTest
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let window = WindowState(domainRuntime: runtime)
+            let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: runtime)
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             do {
@@ -2259,7 +2259,7 @@ import XCTest
         func makePeerWindow() async throws -> WindowState {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let peer = WindowState(domainRuntime: runtime)
+            let peer = WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: runtime)
             WindowStatesManager.shared.registerWindowState(peer)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             peerWindows.append(peer)

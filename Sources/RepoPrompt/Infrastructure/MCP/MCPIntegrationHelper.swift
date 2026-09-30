@@ -244,12 +244,11 @@ enum MCPIntegrationHelper {
         resolveRepoPromptToolName(rawName)?.hasExplicitServerPrefix ?? false
     }
 
+    /// Privileged server identity must be the exact configured name. Do not normalize or
+    /// accept substrings here: permission payloads originate outside RepoPrompt and a
+    /// similarly named third-party server must never inherit RepoPrompt auto-approval.
     static func isRepoPromptServerIdentifier(_ rawValue: String?) -> Bool {
-        guard let rawValue else { return false }
-        let lowered = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer || lowered.contains(repoPromptServer)
+        rawValue == repoPromptMCPServerName
     }
 
     static func repoPromptPermissionAutoApprovalMatch(
@@ -297,7 +296,7 @@ enum MCPIntegrationHelper {
     static func repoPromptPermissionServerIdentifier(in requestPayload: [String: Any]) -> String? {
         for serverName in permissionRequestServerCandidates(input: requestPayload) {
             guard isRepoPromptServerIdentifier(serverName) else { continue }
-            return serverName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return serverName
         }
         return nil
     }
@@ -311,7 +310,7 @@ enum MCPIntegrationHelper {
     private static func repoPromptPermissionLabelMatch(_ rawLabel: String?) -> RepoPromptPermissionAutoApprovalMatch? {
         guard let label = trimmedPermissionRequestString(rawLabel) else { return nil }
         let legacyServerLabel = "(\(repoPromptMCPServerName) MCP Server)"
-        if label.localizedCaseInsensitiveContains(legacyServerLabel) {
+        if label == legacyServerLabel {
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .serverIdentifier,
                 normalizedToolName: nil,
@@ -334,13 +333,7 @@ enum MCPIntegrationHelper {
     }
 
     private static func isRepoPromptPermissionServerLabel(_ rawLabel: String) -> Bool {
-        let lowered = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer
-            || lowered.hasPrefix("\(repoPromptServer)-")
-            || lowered.hasPrefix("\(repoPromptServer) ")
-            || lowered.contains("\(repoPromptServer) mcp server")
+        rawLabel == repoPromptMCPServerName
     }
 
     private static func permissionRequestLabelCandidates(input: [String: Any]) -> [String] {
@@ -380,41 +373,46 @@ enum MCPIntegrationHelper {
     }
 
     private static func permissionRequestServerCandidates(input: [String: Any]) -> [String] {
-        collectPermissionRequestStrings(
-            from: input,
-            paths: [
-                ["server_name"],
-                ["serverName"],
-                ["server"],
-                ["mcp_server"],
-                ["mcpServer"],
-                ["rawInput", "server_name"],
-                ["rawInput", "serverName"],
-                ["rawInput", "server"],
-                ["rawInput", "mcp_server"],
-                ["rawInput", "mcpServer"],
-                ["serverInfo", "name"],
-                ["tool", "server"],
-                ["tool", "server_name"],
-                ["tool", "serverName"],
-                ["toolCall", "server"],
-                ["toolCall", "server_name"],
-                ["toolCall", "serverName"],
-                ["rawInput", "toolCall", "server"],
-                ["rawInput", "toolCall", "server_name"],
-                ["rawInput", "toolCall", "serverName"],
-                ["request", "server"],
-                ["request", "server_name"],
-                ["request", "serverName"],
-                ["request", "tool", "server"],
-                ["request", "tool", "server_name"],
-                ["request", "tool", "serverName"],
-                ["request", "toolCall", "server"],
-                ["request", "toolCall", "server_name"],
-                ["request", "toolCall", "serverName"],
-                ["request", "_meta", "connector_name"]
-            ]
-        )
+        // Server identity is a privilege boundary. Unlike user-facing labels/tool names,
+        // preserve the raw string so whitespace cannot normalize an impostor into the
+        // RepoPrompt server identity.
+        let paths = [
+            ["server_name"],
+            ["serverName"],
+            ["server"],
+            ["mcp_server"],
+            ["mcpServer"],
+            ["rawInput", "server_name"],
+            ["rawInput", "serverName"],
+            ["rawInput", "server"],
+            ["rawInput", "mcp_server"],
+            ["rawInput", "mcpServer"],
+            ["serverInfo", "name"],
+            ["tool", "server"],
+            ["tool", "server_name"],
+            ["tool", "serverName"],
+            ["toolCall", "server"],
+            ["toolCall", "server_name"],
+            ["toolCall", "serverName"],
+            ["rawInput", "toolCall", "server"],
+            ["rawInput", "toolCall", "server_name"],
+            ["rawInput", "toolCall", "serverName"],
+            ["request", "server"],
+            ["request", "server_name"],
+            ["request", "serverName"],
+            ["request", "tool", "server"],
+            ["request", "tool", "server_name"],
+            ["request", "tool", "serverName"],
+            ["request", "toolCall", "server"],
+            ["request", "toolCall", "server_name"],
+            ["request", "toolCall", "serverName"],
+            ["request", "_meta", "connector_name"]
+        ]
+        let values = paths.compactMap { path -> String? in
+            permissionRequestValue(at: path, in: input) as? String
+        }
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
     }
 
     private static func permissionRequestToolNameCandidates(input: [String: Any]) -> [String] {

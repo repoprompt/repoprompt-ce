@@ -83,7 +83,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
                         Button("Import compatible settings…") { isPresentingImportConfirmation = true }
                         Button("Reset global settings…") { isPresentingResetConfirmation = true }
                             .buttonStyle(.borderless)
-                    case .corruptUnrecoverable, .automaticSchemaNormalizationFailed:
+                    case .corruptUnrecoverable, .invalidExternalMCPSettings(_), .automaticSchemaNormalizationFailed:
                         Button("Reset global settings…") { isPresentingResetConfirmation = true }
                     }
                     Button("Show file") { revealGlobalSettingsFile() }
@@ -187,7 +187,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
         case .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
             "Reload settings from disk before making further changes."
         case .unsupportedFutureSchema, .incompatibleSchema, .corruptUnrecoverable,
-             .automaticSchemaNormalizationFailed:
+             .invalidExternalMCPSettings(_), .automaticSchemaNormalizationFailed:
             "The current globalSettings.json will be moved to the Backups folder and your current in-memory settings will be written to a fresh current-schema file. Your settings will then save normally. This cannot be undone."
         }
     }
@@ -200,6 +200,8 @@ struct GlobalSettingsPersistenceBlockBanner: View {
             "Global settings can't be saved: this settings file was written by a different or unrecognized RepoPrompt settings schema. The file is preserved and won't be modified. Changes won't persist until you import or recover."
         case .corruptUnrecoverable:
             "Global settings can't be saved: the settings file is unreadable or malformed and remains preserved. Changes won't persist until you explicitly recover it."
+        case .invalidExternalMCPSettings:
+            "Global settings can't be saved: external MCP settings are invalid. The original file is preserved until you recover or import safe settings."
         case .saveFailed:
             if store.isPendingPreservingMigrationRetry {
                 "RepoPrompt could not finish updating your settings. Your original settings file is preserved. Check file permissions or available disk space, then try again."

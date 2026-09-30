@@ -25,6 +25,7 @@ final class AgentSessionOversightReadinessTests: XCTestCase {
 
     private func makeViewModel() -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 71,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

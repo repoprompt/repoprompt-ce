@@ -517,16 +517,18 @@ enum CodexAgentToolPreferences {
 
     static func mcpServerEnabled(
         normalizedName: String,
+        forceDisabled: Bool = false,
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) -> Bool {
         if isRepoPromptServer(normalizedName) {
             return true
         }
+        guard !forceDisabled else { return false }
+        let key = normalizedKey(normalizedName)
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             return secureStore.codexPermissions().mcpServerEnabled(normalizedName: normalizedName)
         }
-        let key = normalizedKey(normalizedName)
         return storedMCPServerToggles(defaults: defaults)[key] ?? false
     }
 
@@ -560,7 +562,12 @@ enum CodexAgentToolPreferences {
     ) -> Set<String> {
         var enabled: Set<String> = [MCPIntegrationHelper.repoPromptMCPServerName]
         for entry in entries {
-            if mcpServerEnabled(normalizedName: entry.normalizedName, defaults: defaults, secureStore: secureStore) {
+            if mcpServerEnabled(
+                normalizedName: entry.normalizedName,
+                forceDisabled: entry.isExplicitlyDisabled,
+                defaults: defaults,
+                secureStore: secureStore
+            ) {
                 enabled.insert(entry.normalizedName)
             }
         }
@@ -595,7 +602,10 @@ enum CodexAgentToolPreferences {
         return defaults === UserDefaults.standard ? AgentPermissionSecureStore.shared : nil
     }
 
-    private static func isRepoPromptServer(_ normalizedName: String) -> Bool {
-        normalizedName.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+    /// This exemption is a privilege boundary, not a display-name comparison. Callers that
+    /// normalize third-party TOML names must not cause a case variant or containing name to
+    /// inherit RepoPrompt's always-enabled policy.
+    private static func isRepoPromptServer(_ serverName: String) -> Bool {
+        serverName == MCPIntegrationHelper.repoPromptMCPServerName
     }
 }

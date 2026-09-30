@@ -3,6 +3,7 @@ import Foundation
 import XCTest
 
 final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
+    @MainActor
     func testPrepareUsesRuntimeStateAuthorityAndMapsFailureBeforeMCPBootstrap() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexExecAgentProviderRuntimePreparationTests-\(UUID().uuidString)")
@@ -14,6 +15,7 @@ final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
         let recorder = PreparedRuntimeRecorder()
         let provider = CodexExecAgentProvider(
             config: .init(commandName: executable.path, additionalPathHints: []),
+            runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority(),
             runtimeStatePreparer: { runtime in
                 recorder.record(runtime)
                 throw RuntimePreparationFailure.conflict

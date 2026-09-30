@@ -1,13 +1,10 @@
 import Foundation
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
-    private enum LaunchContract {
-        static let configContentEnvironmentKey = "OPENCODE_CONFIG_CONTENT"
-    }
-
     private let config: OpenCodeAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: OpenCodeACPLaunchResolver
+    private let externalMCPBinding: OpenCodeExternalMCPRuntimeBinding?
 
     #if DEBUG
         var test_config: OpenCodeAgentConfig {
@@ -18,15 +15,21 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
     init(
         config: OpenCodeAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: OpenCodeACPLaunchResolver = OpenCodeACPLaunchResolver()
+        launchResolver: OpenCodeACPLaunchResolver = OpenCodeACPLaunchResolver(),
+        externalMCPBinding: OpenCodeExternalMCPRuntimeBinding? = nil
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.externalMCPBinding = externalMCPBinding
     }
 
     var providerID: ACPProviderID {
         .openCode
+    }
+
+    var externalMCPBindingLease: ExternalMCPRuntimeBindingLease? {
+        externalMCPBinding?.lease
     }
 
     var supportsParameterizedModelPicker: Bool {
@@ -49,6 +52,19 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
+        if let externalMCPBinding {
+            guard externalMCPBinding.lease.isAccepted,
+                  !externalMCPBinding.lease.isRevoked,
+                  !externalMCPBinding.lease.cancellationToken.isCancelled,
+                  externalMCPBinding.lease.sessionClass == .topLevel,
+                  externalMCPBinding.integrationID == externalMCPBinding.lease.integrationID,
+                  externalMCPBinding.lease.runtimeIdentity.executableIdentity == resolvedLaunch.executableIdentity.canonicalPath,
+                  config.includeManagedConfigOverlay,
+                  config.toolProfile == .agentMode
+            else {
+                throw OpenCodeIntegrationConfiguration.ExternalMCPConfigurationError.invalidSchema
+            }
+        }
         var environment: [String: String] = [:]
 
         if config.includeManagedConfigOverlay {
@@ -62,9 +78,10 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
                     workingDirectory: workingDirectory
                 )
             }
-            environment[LaunchContract.configContentEnvironmentKey] = try OpenCodeIntegrationConfiguration.ephemeralACPConfigJSON(
+            environment[OpenCodeIntegrationConfiguration.configContentEnvironmentKey] = try OpenCodeIntegrationConfiguration.ephemeralACPConfigJSON(
                 includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
-                repoPromptMCPConfiguration: repoPromptMCPConfiguration
+                repoPromptMCPConfiguration: repoPromptMCPConfiguration,
+                externalMCP: externalMCPBinding?.externalMCP
             )
         }
 
@@ -139,6 +156,9 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
             return AIProviderError.invalidConfiguration(detail: "OpenCode CLI not found. Install it and ensure `opencode` is available on PATH.")
         }
         if error is OpenCodeACPLaunchResolutionError || error is ExecutableFileIdentityError {
+            return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
+        }
+        if error is OpenCodeIntegrationConfiguration.ExternalMCPConfigurationError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
         if (error as NSError).domain == NSCocoaErrorDomain {

@@ -239,6 +239,8 @@ class WindowState: ObservableObject {
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
+    let figmaMCPIntegrationCoordinator: FigmaMCPIntegrationCoordinator
+    let externalMCPComposition: AppExternalMCPComposition
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
@@ -508,8 +510,9 @@ class WindowState: ObservableObject {
 
     // MARK: - Initialization
 
-    convenience init() {
+    convenience init(externalMCPComposition: AppExternalMCPComposition) {
         self.init(
+            externalMCPComposition: externalMCPComposition,
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
@@ -517,8 +520,9 @@ class WindowState: ObservableObject {
         )
     }
 
-    convenience init(domainRuntime: MCPDomainRuntime) {
+    convenience init(externalMCPComposition: AppExternalMCPComposition, domainRuntime: MCPDomainRuntime) {
         self.init(
+            externalMCPComposition: externalMCPComposition,
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
@@ -528,6 +532,7 @@ class WindowState: ObservableObject {
 
     #if DEBUG
         convenience init(
+            externalMCPComposition: AppExternalMCPComposition,
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
             keyManager: KeyManager,
@@ -535,6 +540,7 @@ class WindowState: ObservableObject {
             loadStoredAPISettingsDataOnInit: Bool
         ) {
             self.init(
+                externalMCPComposition: externalMCPComposition,
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
                 codexModelPollingService: codexModelPollingService,
@@ -547,8 +553,12 @@ class WindowState: ObservableObject {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
         }
 
-        convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
+        convenience init(
+            externalMCPComposition: AppExternalMCPComposition,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
             self.init(
+                externalMCPComposition: externalMCPComposition,
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: true,
                 codexModelPollingService: .shared,
@@ -557,10 +567,12 @@ class WindowState: ObservableObject {
         }
 
         convenience init(
+            externalMCPComposition: AppExternalMCPComposition,
             codexModelPollingService: CodexModelPollingService,
             loadStoredAPISettingsDataOnInit: Bool
         ) {
             self.init(
+                externalMCPComposition: externalMCPComposition,
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
                 codexModelPollingService: codexModelPollingService,
@@ -568,8 +580,12 @@ class WindowState: ObservableObject {
             )
         }
 
-        convenience init(workspaceFileContextStore: WorkspaceFileContextStore) {
+        convenience init(
+            externalMCPComposition: AppExternalMCPComposition,
+            workspaceFileContextStore: WorkspaceFileContextStore
+        ) {
             self.init(
+                externalMCPComposition: externalMCPComposition,
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: true,
                 codexModelPollingService: .shared,
@@ -579,10 +595,12 @@ class WindowState: ObservableObject {
         }
 
         convenience init(
+            externalMCPComposition: AppExternalMCPComposition,
             domainRuntime: MCPDomainRuntime?,
             storedPromptPersistence: any StoredPromptPersistenceServing
         ) {
             self.init(
+                externalMCPComposition: externalMCPComposition,
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: true,
                 codexModelPollingService: .shared,
@@ -594,6 +612,7 @@ class WindowState: ObservableObject {
     #endif
 
     private init(
+        externalMCPComposition: AppExternalMCPComposition,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
@@ -602,6 +621,7 @@ class WindowState: ObservableObject {
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil
     ) {
+        self.externalMCPComposition = externalMCPComposition
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
@@ -618,6 +638,7 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            externalMCPComposition: externalMCPComposition,
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             keyManager: injectedKeyManager,
@@ -632,6 +653,7 @@ class WindowState: ObservableObject {
         selectionCoordinator = composition.selectionCoordinator
         workspaceFilesViewModel = composition.workspaceFilesViewModel
         settingsManager = composition.settingsManager
+        figmaMCPIntegrationCoordinator = composition.figmaMCPIntegrationCoordinator
         promptManager = composition.promptManager
         oracleViewModel = composition.oracleViewModel
         apiSettingsViewModel = composition.apiSettingsViewModel

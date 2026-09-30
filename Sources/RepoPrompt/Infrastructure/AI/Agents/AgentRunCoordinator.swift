@@ -101,13 +101,15 @@ final class AgentRunCoordinator {
         agentKind: AgentProviderKind,
         modelString: String?,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
+        workspacePath: String? = nil,
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority
     ) -> HeadlessAgentProvider {
         AgentRuntimeProviderService.shared.makeProvider(
             for: agentKind,
             modelString: modelString,
             runType: runType,
-            workspacePath: workspacePath
+            workspacePath: workspacePath,
+            runtimeAvailability: runtimeAvailability
         )
     }
 

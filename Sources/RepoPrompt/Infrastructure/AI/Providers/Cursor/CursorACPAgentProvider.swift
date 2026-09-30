@@ -4,6 +4,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: CursorACPLaunchResolver
+    private let externalMCPBinding: ExternalMCPRuntimeBindingLease?
 
     #if DEBUG
         var test_config: CursorAgentConfig {
@@ -14,15 +15,21 @@ struct CursorACPAgentProvider: ACPAgentProvider {
     init(
         config: CursorAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver()
+        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver(),
+        externalMCPBinding: ExternalMCPRuntimeBindingLease? = nil
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.externalMCPBinding = externalMCPBinding
     }
 
     var providerID: ACPProviderID {
         .cursor
+    }
+
+    var externalMCPBindingLease: ExternalMCPRuntimeBindingLease? {
+        externalMCPBinding
     }
 
     var supportsParameterizedModelPicker: Bool {
@@ -118,10 +125,31 @@ struct CursorACPAgentProvider: ACPAgentProvider {
             .new
         }
 
+        let externalMCPServers: [ACPRemoteMCPServerConfiguration]
+        if let externalMCPBinding {
+            guard externalMCPBinding.isAccepted,
+                  !externalMCPBinding.isRevoked,
+                  !externalMCPBinding.cancellationToken.isCancelled,
+                  externalMCPBinding.sessionClass == .topLevel,
+                  externalMCPBinding.runtimeIdentity.provider == .cursor,
+                  externalMCPBinding.runtimeIdentity.runtimeKind == .acp,
+                  externalMCPBinding.integrationID == ExternalMCPIntegrationDefinition.figma().integrationID
+            else {
+                throw AIProviderError.invalidConfiguration(detail: "Cursor Figma MCP binding is no longer valid.")
+            }
+            externalMCPServers = [ACPRemoteMCPServerConfiguration(
+                name: ExternalMCPIntegrationDefinition.figma().serverName,
+                url: "https://mcp.figma.com/mcp"
+            )]
+        } else {
+            externalMCPServers = []
+        }
+
         return try ACPSessionConfiguration(
             mode: mode,
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
-            mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : []
+            mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : [],
+            externalMCPServers: externalMCPServers
         )
     }
 

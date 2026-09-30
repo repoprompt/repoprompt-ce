@@ -30,6 +30,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
     @MainActor
     func testFreshHandoffDestinationDoesNotInheritCreatorProvenance() {
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -52,7 +53,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         defer { try? FileManager.default.removeItem(at: root) }

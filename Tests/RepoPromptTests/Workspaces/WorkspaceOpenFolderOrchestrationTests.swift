@@ -2011,6 +2011,7 @@ import XCTest
                 windowID: -1300 - Int.random(in: 1 ... 99),
                 deferredInitialAgentSystemWorkspaceRefresh: true,
                 sharedMCPService: MCPService(),
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 domainRuntime: domainRuntime
             )
             managers.append(composition.workspaceManager)

@@ -8,6 +8,7 @@ struct WindowStateComposition {
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
+    let figmaMCPIntegrationCoordinator: FigmaMCPIntegrationCoordinator
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
@@ -32,7 +33,8 @@ enum WindowStateCompositionFactory {
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
-        settingsStore: GlobalSettingsStore = .shared,
+        externalMCPComposition: AppExternalMCPComposition,
+        settingsStore: GlobalSettingsStore? = nil,
         domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         keyManager injectedKeyManager: KeyManager? = nil,
@@ -44,6 +46,8 @@ enum WindowStateCompositionFactory {
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) -> WindowStateComposition {
+        let settingsStore = settingsStore ?? .shared
+        let figmaMCPIntegrationCoordinator = externalMCPComposition.figmaCoordinator
         let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
@@ -178,16 +182,19 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
+            runtimeAvailability: externalMCPComposition.figmaCoordinator.runtimeAvailabilityAuthority,
             codexModelPollingService: codexModelPollingService
         )
 
         // 13) Agent mode (for minimal agent UI)
         let agentModeViewModel = AgentModeViewModel(
+            externalMCPComposition: externalMCPComposition,
             windowID: windowID,
             promptManager: promptManager,
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
+            settingsManager: settingsManager,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
             modelRouterRuntime: modelRouterRuntime
@@ -238,6 +245,7 @@ enum WindowStateCompositionFactory {
                 selectionCoordinator: selectionCoordinator,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
+                figmaMCPIntegrationCoordinator: figmaMCPIntegrationCoordinator,
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
@@ -260,6 +268,7 @@ enum WindowStateCompositionFactory {
                 selectionCoordinator: selectionCoordinator,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
+                figmaMCPIntegrationCoordinator: figmaMCPIntegrationCoordinator,
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,

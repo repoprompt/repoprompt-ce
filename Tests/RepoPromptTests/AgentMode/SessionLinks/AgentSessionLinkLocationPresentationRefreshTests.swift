@@ -276,6 +276,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
 
     private func makeLiveViewModel(tabID: UUID, workspaceName: String) throws -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 91,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

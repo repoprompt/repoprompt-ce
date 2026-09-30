@@ -3,6 +3,7 @@ import Foundation
 import XCTest
 
 final class CursorProductionFactoryTests: XCTestCase {
+    @MainActor
     func testProductionFactoriesUseAutomaticCommandSelection() async throws {
         let interactiveProvider = try await ACPAgentProviderFactory.makeProvider(
             for: .cursor,
@@ -13,7 +14,8 @@ final class CursorProductionFactoryTests: XCTestCase {
         )
         let headlessProvider = AgentRuntimeProviderService.shared.makeProvider(
             for: .cursor,
-            modelString: "cursor-model"
+            modelString: "cursor-model",
+            runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority()
         )
         let headlessCursorProvider = try XCTUnwrap(
             headlessProvider as? CursorACPHeadlessAgentProvider

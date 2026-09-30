@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
@@ -88,8 +89,8 @@ enum CodexRuntimeAuthority {
             fileManager: FileManager = .default,
             ordinaryCodexHomeURL: URL? = nil
         ) throws {
-            try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            try Self.prepareIsolatedDirectory(at: statePaths.codexHome, fileManager: fileManager)
+            try Self.prepareIsolatedDirectory(at: statePaths.sqliteHome, fileManager: fileManager)
             let ordinaryCodexHome = ordinaryCodexHomeURL
                 ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
             try CodexGlobalInstructionsProjection.prepare(
@@ -98,6 +99,52 @@ enum CodexRuntimeAuthority {
                 fileManager: fileManager
             )
         }
+
+        private static func prepareIsolatedDirectory(at url: URL, fileManager: FileManager) throws {
+            let standardizedURL = url.standardizedFileURL
+            var current = URL(fileURLWithPath: "/", isDirectory: true)
+            var enforcingIsolation = false
+            for component in standardizedURL.pathComponents.dropFirst() {
+                current.appendPathComponent(component, isDirectory: true)
+                enforcingIsolation = enforcingIsolation || component == "RepoPrompt CE"
+                if enforcingIsolation,
+                   (try? fileManager.destinationOfSymbolicLink(atPath: current.path)) != nil
+                {
+                    throw CocoaError(.fileWriteFileExists)
+                }
+                if fileManager.fileExists(atPath: current.path) {
+                    var isDirectory: ObjCBool = false
+                    guard fileManager.fileExists(atPath: current.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                        throw CocoaError(.fileWriteFileExists)
+                    }
+                    if enforcingIsolation {
+                        let attributes = try fileManager.attributesOfItem(atPath: current.path)
+                        guard Self.isManagedDirectoryOwnedByCurrentUser(attributes) else {
+                            throw CocoaError(.fileWriteNoPermission)
+                        }
+                    }
+                } else {
+                    try fileManager.createDirectory(at: current, withIntermediateDirectories: false)
+                }
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: standardizedURL.path)
+        }
+
+        private static func isManagedDirectoryOwnedByCurrentUser(
+            _ attributes: [FileAttributeKey: Any]
+        ) -> Bool {
+            guard let ownerID = attributes[.ownerAccountID] as? NSNumber else { return false }
+            return ownerID.uint32Value == getuid()
+        }
+
+        #if DEBUG
+            static func test_isManagedDirectoryOwnedByCurrentUser(_ ownerID: UInt32?) -> Bool {
+                let attributes: [FileAttributeKey: Any] = ownerID.map {
+                    [.ownerAccountID: NSNumber(value: $0)]
+                } ?? [:]
+                return isManagedDirectoryOwnedByCurrentUser(attributes)
+            }
+        #endif
 
         var redactedDiagnosticSummary: String {
             let provenance = switch source {

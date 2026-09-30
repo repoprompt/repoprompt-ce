@@ -180,7 +180,7 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
 
     @MainActor
     private final class Fixture {
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         let endpoint: DomainAgentSessionLinkEndpointIdentity
         var origin: AgentSelfMCPCallOrigin?
         var resolvedEndpoint: DomainAgentSessionLinkEndpointIdentity?

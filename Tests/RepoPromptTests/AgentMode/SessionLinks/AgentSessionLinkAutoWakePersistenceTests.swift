@@ -19,6 +19,7 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
         )
         let decodedOff = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(savedOff))
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

@@ -12,6 +12,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private var runner: CLIProcessRunner?
     private let config: CodexExecAgentConfig
     private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    private let runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority
     private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
@@ -24,12 +25,14 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     init(
         config: CodexExecAgentConfig,
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority,
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
             try $0.prepareState()
         }
     ) {
         self.config = config
+        self.runtimeAvailability = runtimeAvailability
         self.launchSnapshot = launchSnapshot
         self.runtimeStatePreparer = runtimeStatePreparer
         if enableDebugLogging {
@@ -52,7 +55,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         selectedModelString: String?,
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         brokenServers: Set<String>,
-        fullAccess: Bool = false
+        fullAccess: Bool = false,
+        figmaAccessAllowed: Bool = false
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
         let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
@@ -71,11 +75,21 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             modelReasoningSummary: nil
         )
         let toolOverrideArgs = CodexOverrides.cliConfigArgs(toolPolicy: toolPolicy)
+        var enabledServerNames: Set<String> = [MCPIntegrationHelper.repoPromptMCPServerName]
+        if figmaAccessAllowed,
+           serverEntries.contains(where: { $0.identity == .canonicalFigma })
+        {
+            enabledServerNames.insert(CodexIntegrationConfiguration.settingsManagedFigmaServerName)
+        }
+        let explicitlyDisabledNames = Set(serverEntries.compactMap { entry in
+            entry.isExplicitlyDisabled ? entry.normalizedName : nil
+        })
         let serverOverrideArgs = CodexOverrides.cliMCPServerArgs(
             entries: serverEntries,
-            policy: .enableOnlyRepoPrompt(
+            policy: .enableSelected(
+                enabledNormalizedNames: enabledServerNames,
                 repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
-                exceptBroken: brokenServers
+                exceptBroken: brokenServers.union(explicitlyDisabledNames)
             )
         )
 
@@ -92,6 +106,22 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
 
         return (args, modelSpecifier)
+    }
+
+    @MainActor
+    static func resolvedFigmaAccessAllowed(
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry],
+        settingsStore: GlobalSettingsStore? = nil,
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority
+    ) -> Bool {
+        let settingsStore = settingsStore ?? .shared
+        let configuredAvailability = CodexNativeSessionController.externalMCPRuntimeAvailability(
+            for: serverEntries
+        )
+        return runtimeAvailability.resolvedAgentAccess(
+            settingsStore: settingsStore,
+            configuredAvailability: configuredAvailability
+        ).isAllowed
     }
 
     static func processConfiguration(
@@ -159,7 +189,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Ensuring Codex MCP server entry")
         }
-        let ensureResult = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+        let ensureResult = CodexIntegrationConfiguration.ensureRepoPromptServerForDiscovery(runtime: runtime)
         guard ensureResult.success else {
             throw AIProviderError.invalidConfiguration(
                 detail: ensureResult.errorMessage ?? "Failed to install RepoPrompt MCP config for Codex."
@@ -229,11 +259,39 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
                                 let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
                                 let brokenServers = await CodexBrokenServersCache.shared.getAll()
+                                // Resolve and subscribe in one MainActor transaction. Explicit revocation
+                                // is also MainActor-isolated, so Sign Out cannot slip between an allowed
+                                // decision and installation of the active-run cancellation observer.
+                                let figmaBinding = await MainActor.run { () -> (isAllowed: Bool, observer: NSObjectProtocol?) in
+                                    let isAllowed = Self.resolvedFigmaAccessAllowed(
+                                        serverEntries: serverEntries,
+                                        runtimeAvailability: runtimeAvailability
+                                    )
+                                    guard isAllowed else { return (false, nil) }
+                                    let observer = NotificationCenter.default.addObserver(
+                                        forName: FigmaMCPRuntimeAvailabilityAuthority.explicitRevocationNotification,
+                                        object: nil,
+                                        queue: nil
+                                    ) { [weak self] _ in
+                                        // Cancelling the stream task triggers the existing aggressive runner
+                                        // teardown, so an explicit disconnect also revokes an active headless run.
+                                        self?.streamTask?.cancel()
+                                    }
+                                    return (true, observer)
+                                }
+                                let figmaAccessAllowed = figmaBinding.isAllowed
+                                let figmaRevocationObserver = figmaBinding.observer
+                                defer {
+                                    if let figmaRevocationObserver {
+                                        NotificationCenter.default.removeObserver(figmaRevocationObserver)
+                                    }
+                                }
                                 let command = Self.buildCodexExecArguments(
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
-                                    fullAccess: config.fullAccess
+                                    fullAccess: config.fullAccess,
+                                    figmaAccessAllowed: figmaAccessAllowed
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier

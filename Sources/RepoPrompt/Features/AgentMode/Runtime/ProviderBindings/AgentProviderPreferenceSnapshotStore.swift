@@ -485,6 +485,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 let key = normalizedServerToggleKey(entry.normalizedName)
                 states[key] = CodexAgentToolPreferences.mcpServerEnabled(
                     normalizedName: entry.normalizedName,
+                    forceDisabled: entry.isExplicitlyDisabled,
                     defaults: defaults,
                     secureStore: securePermissions
                 )

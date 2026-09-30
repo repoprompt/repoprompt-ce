@@ -392,6 +392,7 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
 
     private func makeViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: -991,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

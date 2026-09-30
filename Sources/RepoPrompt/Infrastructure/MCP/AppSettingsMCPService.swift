@@ -333,6 +333,8 @@ final class AppSettingsMCPService: Service {
             "incompatible_schema"
         case .corruptUnrecoverable:
             "corrupt_unrecoverable"
+        case let .invalidExternalMCPSettings(category):
+            "invalid_external_mcp_settings_\(category.rawValue)"
         case .saveFailed:
             "save_failed"
         case .writerBusy:
@@ -356,6 +358,8 @@ final class AppSettingsMCPService: Service {
             "Setting was applied in memory, but globalSettings.json was written by a different or unrecognized RepoPrompt settings schema; it will not persist until the settings file is imported or recovered."
         case .corruptUnrecoverable:
             "Setting was applied in memory, but globalSettings.json is unreadable or malformed and remains preserved; it will not persist until the settings file is explicitly recovered."
+        case .invalidExternalMCPSettings:
+            "Setting was applied in memory, but external MCP settings are invalid; the original file is preserved until explicit recovery or safe import."
         case .saveFailed:
             "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
         case .writerBusy:

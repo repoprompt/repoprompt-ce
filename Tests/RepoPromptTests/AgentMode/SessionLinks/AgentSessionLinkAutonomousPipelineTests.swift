@@ -398,6 +398,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
     private func makeNode(windowID: Int, displayName: String) throws -> Node {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: windowID,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

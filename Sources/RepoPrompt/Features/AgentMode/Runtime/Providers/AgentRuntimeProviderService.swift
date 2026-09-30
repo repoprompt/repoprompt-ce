@@ -267,7 +267,8 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
-        modelParameterSelections: [ACPModelParameterSelection] = []
+        modelParameterSelections: [ACPModelParameterSelection] = [],
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -307,7 +308,10 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")
             }
-            return CodexExecAgentProvider(config: config)
+            return CodexExecAgentProvider(
+                config: config,
+                runtimeAvailability: runtimeAvailability
+            )
         case .openCode:
             let config = OpenCodeAgentConfig(
                 modelString: modelString,

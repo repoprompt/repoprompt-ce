@@ -1572,7 +1572,7 @@ actor CodexAppServerClient {
         let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
         let resolution = launchContext.resolution
         if provisionsRepoPromptMCPOnStart {
-            let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+            let provisioning = CodexIntegrationConfiguration.ensureRepoPromptServerForDiscovery(runtime: runtime)
             guard provisioning.success else {
                 throw ClientError.executableUnavailable(
                     provisioning.errorMessage ?? "RepoPrompt could not prepare its owned Codex configuration."

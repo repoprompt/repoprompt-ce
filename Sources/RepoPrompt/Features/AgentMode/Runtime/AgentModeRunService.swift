@@ -7,6 +7,7 @@ final class AgentModeRunService {
         let windowID: Int
         let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
         let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
+        var acpProviderFactoryWithExternalMCP: AgentModeViewModel.ACPProviderFactoryWithExternalMCP?
         let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
         let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
@@ -18,6 +19,10 @@ final class AgentModeRunService {
         let providerRuntimePermissionResolver: (_ agent: AgentProviderKind, _ profile: AgentProviderPermissionProfile) -> AgentProviderRuntimePermissionBinding
         /// Promotes an immutable launch review snapshot to the exact process run before its MCP
         /// bootstrap lease can expose nested tools.
+        /// Idempotent run-level backstop for bindings whose controller never reached a
+        /// durable terminal lifecycle callback.
+        var retireFigmaMCPBindingForRun: (_ runID: UUID) -> Void = { _ in }
+        var recordExternalMCPBindingForRun: (_ tabID: UUID, _ runID: UUID, _ lease: ExternalMCPRuntimeBindingLease) -> Void = { _, _, _ in }
         let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
         let cancelMCPToolsForRun: (_ runID: UUID, _ reason: String) -> Void
         /// Waits until the given runID has zero active MCP tool executions.
@@ -128,6 +133,8 @@ final class AgentModeRunService {
             terminalCommitBarrier: terminalCommitBarrier,
             toolTrackingHooks: toolTrackingHooks,
             providerFactory: dependencies.acpProviderFactory,
+            providerFactoryWithExternalMCP: dependencies.acpProviderFactoryWithExternalMCP,
+            recordExternalMCPBindingForRun: dependencies.recordExternalMCPBindingForRun,
             controllerFactory: dependencies.acpControllerFactory
         )
     }
@@ -663,6 +670,7 @@ final class AgentModeRunService {
 
     private func failBeforeProviderStartup(session: AgentTabSession, message: String) async {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
+        let runID = session.runID
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
@@ -680,6 +688,9 @@ final class AgentModeRunService {
                 return nil
             }
         ))
+        if session.selectedAgent == .codexExec, let runID {
+            dependencies.retireFigmaMCPBindingForRun(runID)
+        }
     }
 
     private func isCurrentACPSteeringAttempt(
@@ -1304,12 +1315,14 @@ final class AgentModeRunService {
     func cancelRun(
         tabID: UUID,
         session: AgentTabSession,
+        expectedRunID: UUID? = nil,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished,
         origin: CancellationOrigin = .internalLifecycle,
         admission: AgentRunCancellationAdmission? = nil,
         outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
     ) async {
+        guard expectedRunID == nil || session.runID == expectedRunID else { return }
         if let admission {
             // Pending starts are withdrawn synchronously by their producer owner, not terminalized.
             guard admission.scope == .activeRun, admission.claim(for: session) else { return }
@@ -1333,6 +1346,9 @@ final class AgentModeRunService {
                     for: revision.ownership,
                     lifecycle: session.runLifecycle
                 )
+            }
+            if session.selectedAgent == .codexExec, let runID = session.runID {
+                dependencies.retireFigmaMCPBindingForRun(runID)
             }
             return
         }
@@ -1474,6 +1490,9 @@ final class AgentModeRunService {
             if committedRevision?.ownership == ownership {
                 outcomeRecorder?.recordTeardownCompleted()
             }
+        }
+        if session.selectedAgent == .codexExec, let runID = session.runID {
+            dependencies.retireFigmaMCPBindingForRun(runID)
         }
     }
 

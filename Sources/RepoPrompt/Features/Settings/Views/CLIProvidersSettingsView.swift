@@ -254,90 +254,16 @@ struct CLIProvidersSettingsView: View {
         isExpanded: Binding<Bool>,
         @ViewBuilder expandedContent: () -> some View
     ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Collapsed header — always visible
-            HStack(spacing: 10) {
-                // Provider name
-                Text(title)
-                    .font(.headline)
-                    .foregroundColor(.primary)
-
-                // Info link (separate button, not nested)
-                Button(action: { openURL(infoURL) }) {
-                    Image(systemName: "info.circle")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(PlainButtonStyle())
-
-                Spacer()
-
-                // Status badge
-                connectionBadge(
-                    isConnected: isConnected,
-                    connectedLabel: connectedLabel,
-                    disconnectedLabel: disconnectedLabel
-                )
-
-                // Chevron
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
-                    .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.wrappedValue.toggle()
-                }
-            }
-
-            // Expanded detail
-            if isExpanded.wrappedValue {
-                VStack(alignment: .leading, spacing: 12) {
-                    Divider()
-                        .padding(.horizontal, 12)
-
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 12)
-
-                    expandedContent()
-                        .padding(.horizontal, 12)
-                }
-                .padding(.bottom, 12)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
-        )
-    }
-
-    private func connectionBadge(
-        isConnected: Bool,
-        connectedLabel: String = "Connected",
-        disconnectedLabel: String = "Not Connected"
-    ) -> some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(isConnected ? Color.green : Color.secondary.opacity(0.4))
-                .frame(width: 7, height: 7)
-            Text(isConnected ? connectedLabel : disconnectedLabel)
-                .font(.caption)
-                .foregroundColor(isConnected ? .green : .secondary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(
-            Capsule()
-                .fill(isConnected ? Color.green.opacity(0.1) : Color.secondary.opacity(0.08))
+        SettingsProviderAccordionCard(
+            title: title,
+            subtitle: subtitle,
+            status: isConnected ? .connected : .notConnected,
+            connectedLabel: connectedLabel,
+            disconnectedLabel: disconnectedLabel,
+            isExpanded: isExpanded,
+            infoAction: { openURL(infoURL) },
+            infoAccessibilityLabel: "More information about \(title)",
+            expandedContent: expandedContent
         )
     }
 
@@ -441,25 +367,25 @@ struct CLIProvidersSettingsView: View {
                 if viewModel.isClaudeCodeConnected {
                     // Actions
                     HStack(spacing: 8) {
-                        Button(action: { testClaudeCodeConnection() }) {
-                            if isLoadingClaudeCode {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
-                            }
-                        }
-                        .disabled(isLoadingClaudeCode)
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Test Connection",
+                            systemImage: "antenna.radiowaves.left.and.right",
+                            isLoading: isLoadingClaudeCode,
+                            isDisabled: isLoadingClaudeCode,
+                            accessibilityLabel: isLoadingClaudeCode ? "Testing Claude Code connection" : nil,
+                            accessibilityHint: "Checks the Claude Code connection.",
+                            action: testClaudeCodeConnection
+                        )
 
                         Spacer()
 
-                        Button(action: { signOutFromClaudeCode() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Sign Out",
+                            systemImage: "rectangle.portrait.and.arrow.right",
+                            role: .secondary,
+                            accessibilityHint: "Signs out of Claude Code.",
+                            action: signOutFromClaudeCode
+                        )
                     }
 
                     directProviderInlineControls(for: .claude)
@@ -1858,33 +1784,29 @@ struct CLIProvidersSettingsView: View {
                     }
 
                     HStack(spacing: 8) {
-                        Button(action: { testCodexConnection() }) {
-                            if isLoadingCodex {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
-                            }
-                        }
-                        .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Test Connection",
+                            systemImage: "antenna.radiowaves.left.and.right",
+                            isLoading: isLoadingCodex,
+                            isDisabled: isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress,
+                            accessibilityLabel: isLoadingCodex ? "Testing Codex connection" : nil,
+                            accessibilityHint: "Checks the Codex connection.",
+                            action: testCodexConnection
+                        )
 
                         Spacer()
 
                         if viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true {
-                            Button(action: requestCodexSignOutConfirmation) {
-                                if isSigningOutCodex {
-                                    ProgressView()
-                                        .scaleEffect(0.6)
-                                        .frame(height: 16)
-                                } else {
-                                    Text("Sign Out")
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
-                            .buttonStyle(CustomButtonStyle())
+                            SettingsProviderConnectionActionButton(
+                                title: "Sign Out",
+                                systemImage: "rectangle.portrait.and.arrow.right",
+                                isLoading: isSigningOutCodex,
+                                isDisabled: isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress,
+                                role: .secondary,
+                                accessibilityLabel: isSigningOutCodex ? "Signing out of Codex" : nil,
+                                accessibilityHint: "Signs out of Codex.",
+                                action: requestCodexSignOutConfirmation
+                            )
                         }
                     }
 
@@ -2022,25 +1944,25 @@ struct CLIProvidersSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 if viewModel.isOpenCodeConnected {
                     HStack(spacing: 8) {
-                        Button(action: { testOpenCodeConnection() }) {
-                            if isLoadingOpenCode {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
-                            }
-                        }
-                        .disabled(isLoadingOpenCode)
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Test Connection",
+                            systemImage: "antenna.radiowaves.left.and.right",
+                            isLoading: isLoadingOpenCode,
+                            isDisabled: isLoadingOpenCode,
+                            accessibilityLabel: isLoadingOpenCode ? "Testing OpenCode connection" : nil,
+                            accessibilityHint: "Checks the OpenCode connection.",
+                            action: testOpenCodeConnection
+                        )
 
                         Spacer()
 
-                        Button(action: { signOutFromOpenCode() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Sign Out",
+                            systemImage: "rectangle.portrait.and.arrow.right",
+                            role: .secondary,
+                            accessibilityHint: "Signs out of OpenCode.",
+                            action: signOutFromOpenCode
+                        )
                     }
 
                     Text(openCodeModelSummary)
@@ -2230,25 +2152,25 @@ struct CLIProvidersSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 if viewModel.isGrokBuildConnected {
                     HStack(spacing: 8) {
-                        Button(action: { testGrokBuildConnection() }) {
-                            if isLoadingGrokBuild {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
-                            }
-                        }
-                        .disabled(isLoadingGrokBuild)
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Test Connection",
+                            systemImage: "antenna.radiowaves.left.and.right",
+                            isLoading: isLoadingGrokBuild,
+                            isDisabled: isLoadingGrokBuild,
+                            accessibilityLabel: isLoadingGrokBuild ? "Testing Grok connection" : nil,
+                            accessibilityHint: "Checks the Grok connection.",
+                            action: testGrokBuildConnection
+                        )
 
                         Spacer()
 
-                        Button(action: { signOutFromGrokBuild() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(CustomButtonStyle())
+                        SettingsProviderConnectionActionButton(
+                            title: "Sign Out",
+                            systemImage: "rectangle.portrait.and.arrow.right",
+                            role: .secondary,
+                            accessibilityHint: "Signs out of Grok.",
+                            action: signOutFromGrokBuild
+                        )
                     }
 
                     Text(grokBuildModelSummary)

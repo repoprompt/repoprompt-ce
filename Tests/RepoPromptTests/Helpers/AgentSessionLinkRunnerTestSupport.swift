@@ -98,6 +98,7 @@ final class AgentSessionLinkRunnerHarness {
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },

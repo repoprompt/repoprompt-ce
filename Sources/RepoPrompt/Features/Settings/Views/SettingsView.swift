@@ -36,10 +36,10 @@ struct SettingsView: View {
     }
 
     /// Canonical sidebar order. Agent-mode first, then General (app-wide
-    /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
-    /// workflow.
+    /// preferences), Router, MCP, MCP integrations, models/providers, workspaces,
+    /// and the copy-&-chat workflow.
     static let sidebarSectionOrder: [TabSection] = [
-        .agentMode, .router, .general, .mcp, .api, .workspaces, .copyChat
+        .agentMode, .router, .general, .mcp, .mcpIntegrations, .api, .workspaces, .copyChat
     ]
 
     /// Legacy alias tabs that are kept in the enum for deep-link and
@@ -172,11 +172,25 @@ struct SettingsView: View {
 
     private func sidebarRow(for tab: SettingsTab) -> some View {
         HStack(spacing: fontPreset.scaledClamped(6, max: 9)) {
-            Label(tab.title, systemImage: tab.iconName)
-                .labelStyle(.titleAndIcon)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            Label {
+                Text(tab.title)
+            } icon: {
+                if tab == .mcpIntegrations {
+                    FigmaBrandIcon(visibleHeight: fontPreset.scaledMetric(FigmaBrandIconGeometry.settingsVisibleHeight))
+                        .frame(
+                            width: fontPreset.scaledMetric(FigmaBrandIconGeometry.settingsIconSlotWidth),
+                            height: fontPreset.scaledMetric(FigmaBrandIconGeometry.settingsVisibleHeight),
+                            alignment: .center
+                        )
+                        .offset(y: fontPreset.scaledMetric(FigmaBrandIconGeometry.settingsVerticalAlignmentOffset))
+                } else {
+                    Image(systemName: tab.iconName)
+                }
+            }
+            .labelStyle(.titleAndIcon)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+            .lineLimit(1)
+            .truncationMode(.tail)
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
@@ -250,6 +264,8 @@ struct SettingsView: View {
             [.modelRouter]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
+        case .mcpIntegrations:
+            [.mcpIntegrations]
         case .api:
             [.apiGeneral, .openRouter, .customProvider, .modelOverrides]
         case .workspaces:
@@ -289,6 +305,16 @@ struct SettingsView: View {
         case .mcpTools:
             MCPToolsSettingsView(server: windowState.mcpServer)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .mcpIntegrations:
+            MCPIntegrationsSettingsView(
+                settingsManager: windowState.settingsManager,
+                coordinator: windowState.figmaMCPIntegrationCoordinator,
+                externalMCPComposition: windowState.externalMCPComposition,
+                apiSettingsViewModel: apiSettingsViewModel,
+                onNavigate: { selectedTab = $0 }
+            )
+            .id(windowState.settingsManager.windowID)
+            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .permissions:
             PermissionsSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -492,6 +518,7 @@ enum TabSection: String, Identifiable {
     case agentMode
     case router
     case mcp
+    case mcpIntegrations
     case api
     case workspaces
     case general
@@ -505,7 +532,10 @@ enum TabSection: String, Identifiable {
         switch self {
         case .agentMode: "Agent Mode"
         case .router: "Router"
+        // RepoPrompt's incoming MCP server settings.
         case .mcp: "MCP Server"
+        // External services consumed by Agent Mode.
+        case .mcpIntegrations: "MCP Integrations"
         case .api: "Models & Providers"
         case .workspaces: "Workspaces"
         case .general: "General"
@@ -521,6 +551,7 @@ enum SettingsTab: String, CaseIterable {
     case licenseUpdates
     case mcp
     case mcpTools
+    case mcpIntegrations // External MCP services consumed by RepoPrompt
     case permissions // Workspace approvals (RepoPrompt-mutating operations)
     case keyboardShortcuts
     case advanced
@@ -550,8 +581,9 @@ enum SettingsTab: String, CaseIterable {
         switch self {
         case .appearance: "Appearance"
         case .licenseUpdates: "Updates"
-        case .mcp: "MCP Server"
+        case .mcp: "Server"
         case .mcpTools: "Tools"
+        case .mcpIntegrations: "Figma"
         case .permissions: "Workspace Approvals"
         case .keyboardShortcuts: "Keyboard Shortcuts"
         case .advanced: "Advanced"
@@ -579,12 +611,22 @@ enum SettingsTab: String, CaseIterable {
         }
     }
 
+    /// Breadcrumbs used by the Settings window title. Integration panes can add
+    /// their category here without changing the sidebar or detail-page title.
+    var windowTitleBreadcrumbs: [String] {
+        switch self {
+        case .mcpIntegrations: ["MCP Integration", title]
+        default: [title]
+        }
+    }
+
     var iconName: String {
         switch self {
         case .appearance: "paintbrush"
         case .licenseUpdates: "arrow.down.circle"
         case .mcp: "server.rack"
         case .mcpTools: "wrench.and.screwdriver"
+        case .mcpIntegrations: "point.3.connected.trianglepath.dotted"
         case .permissions: "shield.checkered"
         case .keyboardShortcuts: "keyboard"
         case .advanced: "gearshape.2"
@@ -630,6 +672,10 @@ enum SettingsTab: String, CaseIterable {
         // MCP Server
         case .mcp, .mcpTools, .permissions, .modelPresets:
             .mcp
+
+        // MCP integrations
+        case .mcpIntegrations:
+            .mcpIntegrations
 
         // Models & Providers (Oracle + API key providers)
         case .apiGeneral, .openRouter, .customProvider, .modelOverrides:
@@ -910,7 +956,7 @@ enum SettingsTab: String, CaseIterable {
                 "model context protocol",
                 "enable mcp",
                 "disable mcp",
-                "mcp connection",
+                "mcp integrations",
                 "mcp status",
                 "connect mcp",
                 "mcp settings",
@@ -928,6 +974,19 @@ enum SettingsTab: String, CaseIterable {
                 "tool list",
                 "tool permissions",
                 "mcp tool settings"
+            ]
+        case .mcpIntegrations:
+            [
+                "mcp integrations",
+                "external mcp",
+                "figma",
+                "connect figma",
+                "figma oauth",
+                "figma authorization",
+                "figma tools",
+                "disconnect figma",
+                "agent mode figma",
+                "external tools"
             ]
         case .permissions:
             [

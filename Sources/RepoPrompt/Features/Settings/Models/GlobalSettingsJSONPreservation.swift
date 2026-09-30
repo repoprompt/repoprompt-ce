@@ -35,7 +35,17 @@ enum GlobalSettingsJSONPreservation {
             for key in ["schemaVersion", "schemaLineage", "updatedAt"] {
                 result[key] = header[key]
             }
+            // External MCP registrations are an atomic, security-sensitive typed value.
+            // Never preserve retired or unknown members inside their array entries.
+            if let definitions = header["externalMCPConnections"] {
+                result["externalMCPConnections"] = definitions
+            } else {
+                result.removeValue(forKey: "externalMCPConnections")
+            }
         }
+        // Workspace-scoped external MCP access was retired; do not preserve it as
+        // an opaque unknown field after the typed model deliberately discards it.
+        result.removeValue(forKey: "externalMCPAccessByWorkspaceID")
         return try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     }
 

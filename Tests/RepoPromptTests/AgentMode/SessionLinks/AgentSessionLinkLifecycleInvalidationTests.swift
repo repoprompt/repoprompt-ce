@@ -36,6 +36,7 @@ final class AgentSessionLinkLifecycleInvalidationTests: XCTestCase {
 
     private func makeViewModel(tabID: UUID) throws -> (AgentModeViewModel, UUID) {
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 41,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -94,6 +95,7 @@ final class AgentSessionLinkLifecycleInvalidationTests: XCTestCase {
 
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 42,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

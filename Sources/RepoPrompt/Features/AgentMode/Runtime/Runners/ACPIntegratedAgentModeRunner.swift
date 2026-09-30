@@ -61,6 +61,8 @@ final class ACPIntegratedAgentModeRunner {
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
     private let providerFactory: AgentModeViewModel.ACPProviderFactory
+    private let providerFactoryWithExternalMCP: AgentModeViewModel.ACPProviderFactoryWithExternalMCP?
+    private let recordExternalMCPBindingForRun: (_ tabID: UUID, _ runID: UUID, _ lease: ExternalMCPRuntimeBindingLease) -> Void
     private let controllerFactory: AgentModeViewModel.ACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
@@ -166,12 +168,16 @@ final class ACPIntegratedAgentModeRunner {
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
         providerFactory: @escaping AgentModeViewModel.ACPProviderFactory,
+        providerFactoryWithExternalMCP: AgentModeViewModel.ACPProviderFactoryWithExternalMCP? = nil,
+        recordExternalMCPBindingForRun: @escaping (_ tabID: UUID, _ runID: UUID, _ lease: ExternalMCPRuntimeBindingLease) -> Void = { _, _, _ in },
         controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory
     ) {
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
         self.toolTrackingHooks = toolTrackingHooks
         self.providerFactory = providerFactory
+        self.providerFactoryWithExternalMCP = providerFactoryWithExternalMCP
+        self.recordExternalMCPBindingForRun = recordExternalMCPBindingForRun
         self.controllerFactory = controllerFactory
     }
 
@@ -292,7 +298,12 @@ final class ACPIntegratedAgentModeRunner {
 
         let provider: any ACPAgentProvider
         do {
-            guard let created = try await providerFactory(runRequest.agentKind, runRequest.modelString) else {
+            let created: (any ACPAgentProvider)? = if let providerFactoryWithExternalMCP {
+                try await providerFactoryWithExternalMCP(runID, freshRunRequest)
+            } else {
+                try await providerFactory(runRequest.agentKind, runRequest.modelString)
+            }
+            guard let created else {
                 await failBeforeProviderSend(
                     tabID: tabID,
                     session: session,
@@ -315,10 +326,14 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
+        let revokeExternalMCPBinding: () async -> Void = {
+            _ = await provider.externalMCPBindingLease?.revoke()
+        }
         let support: ACPSupportResult
         do {
             support = try await provider.support(for: freshRunRequest)
         } catch is CancellationError {
+            await revokeExternalMCPBinding()
             await cancelBeforeProviderSend(
                 session: session,
                 runID: runID,
@@ -327,6 +342,7 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         } catch {
+            await revokeExternalMCPBinding()
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -337,8 +353,12 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
-        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else {
+            await revokeExternalMCPBinding()
+            return
+        }
         guard support == .supported else {
+            await revokeExternalMCPBinding()
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -353,6 +373,7 @@ final class ACPIntegratedAgentModeRunner {
         do {
             controller = try controllerFactory(provider, freshRunRequest)
         } catch {
+            await revokeExternalMCPBinding()
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -366,6 +387,10 @@ final class ACPIntegratedAgentModeRunner {
 
         await controller.setExpectedMCPRunID(runID)
         session.acpController = controller
+        let externalMCPBindingLease = provider.externalMCPBindingLease
+        if let externalMCPBindingLease, externalMCPBindingLease.isAccepted {
+            recordExternalMCPBindingForRun(tabID, runID, externalMCPBindingLease)
+        }
         let requiresPrePromptMCPRouting = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
             let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
@@ -387,6 +412,8 @@ final class ACPIntegratedAgentModeRunner {
                 default:
                     break
                 }
+                // Revoke external MCP only after provider teardown and RepoPrompt MCP cleanup.
+                _ = await externalMCPBindingLease?.revoke()
             }
         }
         session.agentTask = Task { [weak self, weak session] in

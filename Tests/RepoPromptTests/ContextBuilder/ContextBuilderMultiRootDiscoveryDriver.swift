@@ -96,6 +96,7 @@ import XCTest
             previousWindows = WindowStatesManager.shared.allWindows
             networkWasRunning = await ServerNetworkManager.shared.isRunning()
             window = WindowState(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 contextBuilderProviderFactory: { [unowned self] _, _, path, _ in
                     constructed += 1
                     providerWorkspacePaths.append(path)

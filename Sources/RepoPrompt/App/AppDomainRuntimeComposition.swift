@@ -250,7 +250,7 @@ final class AppGlobalMCPServiceComposition {
     private let registrationAttempt = SharedRegistrationAttempt<RegistrationHandles>()
     private var status: RegistrationStatus = .idle
 
-    private init(
+    init(
         runtime: MCPDomainRuntime,
         windowStates: WindowStatesManager,
         networkManager: ServerNetworkManager
@@ -348,16 +348,24 @@ final class AppGlobalMCPServiceComposition {
             await windowRoutingService.prepareDomainTools()
             let appSettingsTools = await appSettingsService.tools
             let windowRoutingTools = await windowRoutingService.tools
-            let requests = try [
+            let appSettingsBindings = try runtime.prepareAppDomainBindings(
+                tools: appSettingsTools,
+                interactionAdapter: nil
+            )
+            let windowRoutingBindings = try runtime.prepareAppDomainBindings(
+                tools: windowRoutingTools,
+                interactionAdapter: nil
+            )
+            let requests = [
                 MCPDomainToolRegistrationRequest(
                     registrationID: appSettingsService.domainRegistrationID,
                     scope: .application,
-                    bindings: appSettingsTools.map { try $0.domainBinding() }
+                    bindings: appSettingsBindings
                 ),
                 MCPDomainToolRegistrationRequest(
                     registrationID: windowRoutingService.domainRegistrationID,
                     scope: .application,
-                    bindings: windowRoutingTools.map { try $0.domainBinding() }
+                    bindings: windowRoutingBindings
                 )
             ]
             let results = try await runtime.toolRegistry.registerAtomically(requests)

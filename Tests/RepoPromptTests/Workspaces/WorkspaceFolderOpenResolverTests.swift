@@ -183,7 +183,8 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         return WindowStateCompositionFactory.make(
             windowID: -1200 - Int.random(in: 1 ... 99),
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
     }
 }

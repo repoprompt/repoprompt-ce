@@ -10,7 +10,8 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9325,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory

@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-09-19. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-09-19. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces. External MCP definition persistence is the app-owned boundary described in [`external-mcp.md`](external-mcp.md); provider adapters never receive settings files or credentials.
 
 ## Durable settings file
 

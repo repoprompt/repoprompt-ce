@@ -1066,7 +1066,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: Self.allocateFixtureWindowID(),
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
 

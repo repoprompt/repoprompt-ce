@@ -172,12 +172,13 @@ final class SettingsWindowCoordinator: NSObject, NSWindowDelegate {
         window.title = Self.windowTitle(for: tab)
     }
 
-    /// Format the window title as `Settings — <Tab Title>`. Falls back to the
-    /// plain "Settings" label if the tab's title is empty, which should not
-    /// happen in practice but keeps the chrome sensible if it ever does.
-    private static func windowTitle(for tab: SettingsTab) -> String {
-        let tabTitle = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return tabTitle.isEmpty ? "Settings" : "Settings — \(tabTitle)"
+    /// Format the window title from the selected pane's breadcrumbs, falling
+    /// back to plain "Settings" if a pane has no nonempty title components.
+    static func windowTitle(for tab: SettingsTab) -> String {
+        let breadcrumbs = tab.windowTitleBreadcrumbs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return (["Settings"] + breadcrumbs).joined(separator: " — ")
     }
 
     private func clearWindowReferences() {

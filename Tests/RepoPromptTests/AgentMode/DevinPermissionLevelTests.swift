@@ -428,6 +428,7 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertFalse(ACPAIModelCatalog.devinModelsFromStore().contains(.devinCustom(name: "default")))
     }
 
+    @MainActor
     func testHeadlessMCPRunPinsAutoWhileOracleKeepsProviderDefault() {
         let message = AgentMessage(systemPrompt: "system", userMessage: "prompt")
         let headless = DevinACPHeadlessAgentProvider.makeRunRequest(
@@ -448,7 +449,8 @@ final class DevinPermissionLevelTests: XCTestCase {
             AgentRuntimeProviderService.shared.makeProvider(
                 for: .devin,
                 modelString: "swe-2-high",
-                workspacePath: "/tmp/workspace"
+                workspacePath: "/tmp/workspace",
+                runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority()
             ) is DevinACPHeadlessAgentProvider
         )
     }

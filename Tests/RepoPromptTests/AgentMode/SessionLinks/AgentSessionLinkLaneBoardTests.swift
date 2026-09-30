@@ -162,6 +162,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
 
     func testUnavailableSessionUsesTheSharedBlockerVocabulary() {
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")
@@ -258,6 +259,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
     func testLiveAndPersistedChildrenAppearOnParentsActualObservationSnapshot() throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")
@@ -344,6 +346,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
     func testUnhydratedLiveChildKeepsPersistedParentAndInPlaceUnbindRebuildsCensus() throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")
@@ -408,6 +411,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
     func testChildRunAndCleanupRepublishParentBoardWithoutManualRebuild() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")
@@ -482,6 +486,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
     func testCensusRefreshKeepsLastGoodPersistedListWhenMetadataIsUnavailable() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")
@@ -548,6 +553,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             try? FileManager.default.removeItem(at: root)
         }
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Lane-board tests must not start a provider")

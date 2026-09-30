@@ -88,7 +88,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
 
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         WindowStatesManager.shared.registerWindowState(window)
         defer {
             WindowStatesManager.shared.unregisterWindowState(window)

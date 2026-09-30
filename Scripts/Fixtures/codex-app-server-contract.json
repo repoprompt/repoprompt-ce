@@ -65,6 +65,71 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "mcpServer/oauth/login",
+      "alwaysSent": [
+        "name"
+      ],
+      "maySend": [
+        "clientRegistration",
+        "scopes",
+        "threadId",
+        "timeoutSecs"
+      ],
+      "responseSchema": "v2/McpServerOauthLoginResponse.json",
+      "consumedResponse": [
+        {
+          "path": "authorizationUrl",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "config/mcpServer/reload"
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "mcpServerStatus/list",
+      "alwaysSent": [
+        "detail"
+      ],
+      "maySend": [
+        "cursor",
+        "limit",
+        "threadId"
+      ],
+      "enumValues": {
+        "detail": [
+          "toolsAndAuthOnly"
+        ]
+      },
+      "responseSchema": "v2/ListMcpServerStatusResponse.json",
+      "consumedResponse": [
+        {
+          "path": "data",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].name",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].authStatus",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].tools",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "model/list",
       "alwaysSent": [
         "limit"

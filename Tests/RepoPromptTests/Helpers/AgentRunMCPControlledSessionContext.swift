@@ -32,7 +32,7 @@ final class AgentRunMCPControlledSessionContext {
         settings.setMCPAutoStart(false, commit: false)
         defer { settings.setMCPAutoStart(previousAutoStart, commit: false) }
 
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         WindowStatesManager.shared.registerWindowState(window)
         do {
             let workspace = window.workspaceManager.createWorkspace(

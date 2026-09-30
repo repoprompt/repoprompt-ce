@@ -9,8 +9,8 @@ final class WindowStateTabbingTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
 
-        let firstState = WindowState()
-        let secondState = WindowState()
+        let firstState = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
+        let secondState = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         let firstWindow = makeTestWindow()
         let secondWindow = makeTestWindow()
         firstWindow.tabbingMode = .disallowed

@@ -2184,7 +2184,7 @@ actor ACPAgentSessionController {
                     params: [
                         "sessionId": existingSessionID,
                         "cwd": sessionConfiguration.workingDirectory,
-                        "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
+                        "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject) + sessionConfiguration.externalMCPServers.map(\.acpJSONObject)
                     ]
                 )
                 let response = requestResponse.result
@@ -2235,7 +2235,7 @@ actor ACPAgentSessionController {
             method: "session/new",
             params: [
                 "cwd": sessionConfiguration.workingDirectory,
-                "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
+                "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject) + sessionConfiguration.externalMCPServers.map(\.acpJSONObject)
             ]
         )
         let response = requestResponse.result
@@ -2599,12 +2599,15 @@ actor ACPAgentSessionController {
     }
 
     private func logSessionMCPInjection() {
-        guard !sessionConfiguration.mcpServers.isEmpty else {
+        guard !sessionConfiguration.mcpServers.isEmpty || !sessionConfiguration.externalMCPServers.isEmpty else {
             log("ACP session mcpServers empty")
             return
         }
         for server in sessionConfiguration.mcpServers {
             log("ACP session mcpServer name=\(server.name) command=\(server.command) argsCount=\(server.args.count) envCount=\(server.env.count)")
+        }
+        for server in sessionConfiguration.externalMCPServers {
+            log("ACP session external mcpServer name=\(server.name) url=\(server.url)")
         }
     }
 

@@ -32,6 +32,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
 
     private func makeViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Context-load tests must not start a Codex session")

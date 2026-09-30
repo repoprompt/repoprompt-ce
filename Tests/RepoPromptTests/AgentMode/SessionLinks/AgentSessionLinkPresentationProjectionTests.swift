@@ -29,6 +29,7 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
     private func makeFixture() throws -> Fixture {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 81,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

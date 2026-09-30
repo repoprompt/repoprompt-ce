@@ -13,6 +13,7 @@ enum ACPAgentProviderFactory {
     static func makeProvider(
         for agentKind: AgentProviderKind,
         modelString: String?,
+        externalMCPBindingLease: ExternalMCPRuntimeBindingLease? = nil,
         grokAPIKeyProvider: GrokAPIKeyProvider = {
             try await KeyManager().getAPIKey(for: .grok)
         }
@@ -24,14 +25,22 @@ enum ACPAgentProviderFactory {
                     modelString: modelString,
                     enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
                     toolProfile: .agentMode
-                )
+                ),
+                externalMCPBinding: externalMCPBindingLease.map {
+                    OpenCodeExternalMCPRuntimeBinding(
+                        integrationID: ExternalMCPIntegrationDefinition.figma().integrationID,
+                        externalMCP: .figma(serverName: ExternalMCPIntegrationDefinition.figma().serverName),
+                        lease: $0
+                    )
+                }
             )
         case .cursor:
             CursorACPAgentProvider(
                 config: CursorAgentConfig(
                     enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
                     modelString: modelString
-                )
+                ),
+                externalMCPBinding: externalMCPBindingLease
             )
         case .grokBuild:
             try await GrokBuildACPAgentProvider(

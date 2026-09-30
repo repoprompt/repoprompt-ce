@@ -232,7 +232,7 @@
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
-            let window = WindowState()
+            let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             await window.workspaceManager.awaitInitialized()
             window.workspaceManager.workspaces = [activeWorkspace]
             _ = await window.workspaceManager.switchWorkspace(

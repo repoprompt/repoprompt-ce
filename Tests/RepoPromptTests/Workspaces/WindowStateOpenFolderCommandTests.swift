@@ -2748,6 +2748,7 @@ import XCTest
                 fileURL: storageRoot.appendingPathComponent("SavedPrompts.json")
             )
             let window = WindowState(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 domainRuntime: domainRuntime,
                 storedPromptPersistence: StoredPromptPersistenceService(storage: promptStorage)
             )

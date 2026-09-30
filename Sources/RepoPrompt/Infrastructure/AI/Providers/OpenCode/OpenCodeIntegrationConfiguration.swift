@@ -6,6 +6,41 @@ import Foundation
 /// per-process ACP overlays, explicit persistent MCP install config, and cleanup of legacy
 /// RepoPrompt-managed persistent entries.
 enum OpenCodeIntegrationConfiguration {
+    enum OpenCodeEphemeralExternalMCP: Equatable {
+        case figma(serverName: String)
+
+        var serverName: String {
+            switch self {
+            case let .figma(serverName):
+                serverName
+            }
+        }
+    }
+
+    enum ExternalMCPConfigurationError: Error, Equatable, LocalizedError {
+        case invalidJSON
+        case invalidSchema
+        case invalidAgentContainer
+        case invalidMCPContainer
+        case invalidMCPEntry(String)
+        case caseInsensitiveCollision([String])
+        case conflictingExistingEntry(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidJSON: "OpenCode external MCP config is not valid JSON."
+            case .invalidSchema: "OpenCode external MCP config has an incompatible schema."
+            case .invalidAgentContainer: "OpenCode external MCP config has an invalid agent container."
+            case .invalidMCPContainer: "OpenCode external MCP config has an invalid MCP container."
+            case let .invalidMCPEntry(name): "OpenCode external MCP entry '\(name)' is invalid."
+            case let .caseInsensitiveCollision(names): "OpenCode external MCP server names collide: \(names.joined(separator: ", "))."
+            case let .conflictingExistingEntry(name): "OpenCode external MCP entry '\(name)' conflicts with the managed Figma entry."
+            }
+        }
+    }
+
+    static let configContentEnvironmentKey = "OPENCODE_CONFIG_CONTENT"
+    static let figmaRemoteMCPURL = "https://mcp.figma.com/mcp"
     private static let configSchemaURL = "https://opencode.ai/config.json"
     private static let mcpTimeoutMilliseconds = 14_400_000
     private static let disabledMCPCommand = "/usr/bin/false"
@@ -131,14 +166,66 @@ enum OpenCodeIntegrationConfiguration {
     /// Serializes the process-ephemeral OpenCode config overlay for `OPENCODE_CONFIG_CONTENT`.
     static func ephemeralACPConfigJSON(
         includeRepoPromptMCPServer: Bool,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
+        externalMCP: OpenCodeEphemeralExternalMCP? = nil
     ) throws -> String {
-        let dict = ephemeralACPConfigDict(
+        let base = try serialize(ephemeralACPConfigDict(
             includeRepoPromptMCPServer: includeRepoPromptMCPServer,
             repoPromptMCPConfiguration: repoPromptMCPConfiguration
-        )
+        ))
+        return if let externalMCP {
+            try mergingExternalMCP(externalMCP, intoConfigContent: base)
+        } else {
+            base
+        }
+    }
+
+    static func mergingExternalMCP(
+        _ externalMCP: OpenCodeEphemeralExternalMCP,
+        intoConfigContent content: String
+    ) throws -> String {
+        guard let data = content.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw ExternalMCPConfigurationError.invalidJSON }
+        guard root["$schema"] as? String == configSchemaURL else { throw ExternalMCPConfigurationError.invalidSchema }
+        guard root["agent"] is [String: Any] else { throw ExternalMCPConfigurationError.invalidAgentContainer }
+        guard var servers = root["mcp"] as? [String: Any] else { throw ExternalMCPConfigurationError.invalidMCPContainer }
+
+        let keys = servers.keys.sorted()
+        for key in keys where !(servers[key] is [String: Any]) {
+            throw ExternalMCPConfigurationError.invalidMCPEntry(key)
+        }
+        let folded = Dictionary(grouping: keys, by: { $0.lowercased() })
+        if let collision = folded.values.first(where: { $0.count > 1 }) {
+            throw ExternalMCPConfigurationError.caseInsensitiveCollision(collision.sorted())
+        }
+
+        let serverName: String = switch externalMCP {
+        case let .figma(name): name
+        }
+        let canonical: [String: Any] = [
+            "type": "remote",
+            "url": figmaRemoteMCPURL,
+            "enabled": true
+        ]
+        if let existingKey = keys.first(where: { $0 == serverName }) {
+            guard NSDictionary(dictionary: servers[existingKey] as! [String: Any]).isEqual(to: canonical) else {
+                throw ExternalMCPConfigurationError.conflictingExistingEntry(existingKey)
+            }
+        } else if keys.first(where: { $0.lowercased() == serverName.lowercased() }) != nil {
+            throw ExternalMCPConfigurationError.caseInsensitiveCollision([serverName, keys.first { $0.lowercased() == serverName.lowercased() }!].sorted())
+        } else {
+            servers[serverName] = canonical
+        }
+
+        var result = root
+        result["mcp"] = servers
+        return try serialize(result)
+    }
+
+    private static func serialize(_ object: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(
-            withJSONObject: dict,
+            withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         guard let string = String(data: data, encoding: .utf8) else {

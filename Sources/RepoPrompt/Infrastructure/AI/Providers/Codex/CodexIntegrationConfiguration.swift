@@ -1,4 +1,6 @@
+import Darwin
 import Foundation
+import OSLog
 import RepoPromptShared
 
 /// Codex-specific integration configuration helpers.
@@ -25,9 +27,22 @@ enum CodexIntegrationConfiguration {
     /// Serializes in-process read-modify-write access to RepoPrompt's owned Codex config across concurrent
     /// Codex startup/provisioning paths. Cross-process writers remain outside this lock's scope.
     private static let fileLock = NSLock()
+    private static let provisioningLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "CodexMCPProvisioning")
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
     private static let repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration.repoPrompt
     private static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
+    /// Delimits the MCP blocks mirrored from the user's normal Codex home into RepoPrompt's
+    /// isolated Codex home. Only this generated region is replaced on later launches; all other
+    /// user-authored isolated-home configuration remains untouched.
+    private static let managedExternalMCPBeginMarker = "# BEGIN RepoPrompt CE managed external Codex MCP servers"
+    private static let managedExternalMCPEndMarker = "# END RepoPrompt CE managed external Codex MCP servers"
+    /// This region is distinct from the read-only import above. It contains only a
+    /// connection explicitly created from RepoPrompt Settings and is never populated
+    /// from the user's global Codex config.
+    private static let settingsManagedMCPBeginMarker = "# BEGIN RepoPrompt CE Settings managed Codex MCP connections"
+    private static let settingsManagedMCPEndMarker = "# END RepoPrompt CE Settings managed Codex MCP connections"
+    static let settingsManagedFigmaServerName = "figma"
+    static let settingsManagedFigmaURL = "https://mcp.figma.com/mcp"
     private static var serverCommand: String {
         repoPromptMCPConfiguration.command
     }
@@ -37,10 +52,309 @@ enum CodexIntegrationConfiguration {
         return "[\(values.joined(separator: ", "))]"
     }
 
+    enum MCPServerIdentity: Equatable {
+        case canonicalFigma
+        case figmaAlias
+        case other
+    }
+
     struct ServerEntry {
         let rawName: String
         let normalizedName: String
         let cliPathComponent: String
+        /// The server's explicit/default Codex enablement. This is imported as configuration, not
+        /// an authorization bypass: Agent Mode's own permission profile may still suppress it.
+        let isEnabled: Bool
+        /// An explicit (or malformed, therefore fail-closed) disabled value in Codex config.
+        /// A RepoPrompt UI preference must not revive a server the user disabled globally.
+        let isExplicitlyDisabled: Bool
+        let identity: MCPServerIdentity
+
+        init(
+            rawName: String,
+            normalizedName: String,
+            cliPathComponent: String,
+            isEnabled: Bool = false,
+            isExplicitlyDisabled: Bool = false,
+            identity: MCPServerIdentity = .other
+        ) {
+            self.rawName = rawName
+            self.normalizedName = normalizedName
+            self.cliPathComponent = cliPathComponent
+            self.isEnabled = isEnabled
+            self.isExplicitlyDisabled = isExplicitlyDisabled
+            self.identity = identity
+        }
+    }
+
+    enum ExternalMCPSourceOutcome {
+        case absent
+        case valid(content: String, candidateIndex: Int)
+        case invalid(candidateIndex: Int)
+        /// A readable candidate changed while it was being inspected. Treat this as a
+        /// transient unavailable source rather than importing an unverified snapshot.
+        case changed(candidateIndex: Int)
+        case unavailable
+    }
+
+    enum ManagedExternalMCPMarkerProblem: String, Equatable {
+        case duplicateBegin
+        case duplicateEnd
+        case orphanBegin
+        case orphanEnd
+        case reversed
+        case nested
+        case invalidRegion
+    }
+
+    enum ManagedExternalMCPMarkerClassification: Equatable {
+        case absent
+        case valid(Range<Int>)
+        case malformed(ManagedExternalMCPMarkerProblem)
+    }
+
+    enum ExternalMCPDegradation: Equatable {
+        case sourceUnavailable
+        case sourceChanged
+        case sourceInvalid
+        case malformedMarkers(ManagedExternalMCPMarkerProblem)
+    }
+
+    struct ExternalMCPMergeResult {
+        let content: String
+        let changed: Bool
+        let importedServerNames: [String]
+        let skippedConflictingServerNames: [String]
+        let degradations: [ExternalMCPDegradation]
+    }
+
+    struct ConfigurationFileFingerprint: Equatable {
+        /// Intentionally opaque to diagnostics. Equality detects a concurrent replacement
+        /// without exposing paths, file content, metadata, or a reusable content hash.
+        let bytes: Data?
+
+        static let absent = Self(bytes: nil)
+    }
+
+    struct ExternalConfigSourceReader {
+        /// Returns nil only when the candidate is missing. Read/decoding failures throw.
+        let readUTF8: (URL) throws -> String?
+        /// Optional because focused parser tests need not model the filesystem. Production
+        /// injection always supplies it and samples before and after each successful read.
+        let fingerprint: ((URL) throws -> ConfigurationFileFingerprint)?
+
+        init(
+            readUTF8: @escaping (URL) throws -> String?,
+            fingerprint: ((URL) throws -> ConfigurationFileFingerprint)? = nil
+        ) {
+            self.readUTF8 = readUTF8
+            self.fingerprint = fingerprint
+        }
+    }
+
+    struct ManagedConfigStore {
+        /// Returns nil only when the managed file is missing. Read/decoding failures throw.
+        let readUTF8: (URL) throws -> String?
+        let replaceAtomically: (String, URL) throws -> Void
+        let readBack: (URL) throws -> Data
+        /// Optional only for legacy/focused test seams. The production store compares this
+        /// immediately before replacement to avoid clobbering a cross-process update.
+        let fingerprint: ((URL) throws -> ConfigurationFileFingerprint)?
+
+        init(
+            readUTF8: @escaping (URL) throws -> String?,
+            replaceAtomically: @escaping (String, URL) throws -> Void,
+            readBack: @escaping (URL) throws -> Data,
+            fingerprint: ((URL) throws -> ConfigurationFileFingerprint)? = nil
+        ) {
+            self.readUTF8 = readUTF8
+            self.replaceAtomically = replaceAtomically
+            self.readBack = readBack
+            self.fingerprint = fingerprint
+        }
+    }
+
+    struct ProvisioningDiagnosticSink {
+        let record: (String) -> Void
+    }
+
+    struct CancellationCheckpoint {
+        let isCancelled: () -> Bool
+    }
+
+    struct ProvisioningDependencies {
+        let sourceReader: ExternalConfigSourceReader
+        let managedStore: ManagedConfigStore
+        let diagnostics: ProvisioningDiagnosticSink
+        let cancellation: CancellationCheckpoint
+
+        static func live(fileManager: FileManager = .default) -> ProvisioningDependencies {
+            ProvisioningDependencies(
+                sourceReader: ExternalConfigSourceReader(
+                    readUTF8: { url in
+                        do {
+                            return try String(contentsOf: url, encoding: .utf8)
+                        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                            return nil
+                        }
+                    },
+                    fingerprint: { url in
+                        do {
+                            return try .init(bytes: Data(contentsOf: url))
+                        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                            return .absent
+                        }
+                    }
+                ),
+                managedStore: ManagedConfigStore(
+                    readUTF8: { url in
+                        do {
+                            return try String(contentsOf: url, encoding: .utf8)
+                        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                            return nil
+                        }
+                    },
+                    replaceAtomically: { content, url in
+                        let existingAttributes: [FileAttributeKey: Any]
+                        do {
+                            existingAttributes = try fileManager.attributesOfItem(atPath: url.path)
+                        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                            existingAttributes = [:]
+                        } catch let error as POSIXError where error.code == .ENOENT {
+                            // A first-run isolated config legitimately does not exist yet.
+                            // Treat only the precise missing-target outcome as creatable; other
+                            // attribute failures must continue to fail closed.
+                            existingAttributes = [:]
+                        }
+                        if let owner = existingAttributes[.ownerAccountID] as? NSNumber,
+                           owner.intValue != Int32(getuid())
+                        {
+                            throw POSIXError(.EPERM)
+                        }
+                        let existingPermissions = (existingAttributes[.posixPermissions] as? NSNumber)?.intValue
+                        // Preserve only owner-readable/writable/executable bits. A file with
+                        // group/world access must not be carried forward into an isolated home.
+                        let permissions = existingPermissions.map { $0 & 0o700 } ?? 0o600
+                        let restrictivePermissions = permissions == 0 ? 0o600 : permissions
+                        let temporaryURL = url.deletingLastPathComponent()
+                            .appendingPathComponent(".\(url.lastPathComponent).repoprompt-\(UUID().uuidString).tmp")
+                        defer { try? fileManager.removeItem(at: temporaryURL) }
+                        try Data(content.utf8).write(to: temporaryURL, options: .withoutOverwriting)
+                        try fileManager.setAttributes([.posixPermissions: restrictivePermissions], ofItemAtPath: temporaryURL.path)
+                        guard rename(temporaryURL.path, url.path) == 0 else {
+                            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                        }
+                    },
+                    readBack: { try Data(contentsOf: $0) },
+                    fingerprint: { url in
+                        do {
+                            return try .init(bytes: Data(contentsOf: url))
+                        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                            return .absent
+                        }
+                    }
+                ),
+                diagnostics: ProvisioningDiagnosticSink { message in
+                    provisioningLogger.notice("\(message, privacy: .public)")
+                },
+                cancellation: CancellationCheckpoint { false }
+            )
+        }
+    }
+
+    enum PersistentMCPUpdateMode {
+        case install
+        case discovery
+        /// Bootstrap only the app-owned RepoPromptCE server. External MCP source files
+        /// are intentionally not inspected or merged on fresh Agent Mode construction.
+        case repoPromptOnly
+    }
+
+    enum PersistentMCPUpdateStatus: Equatable {
+        case updated
+        case unchanged
+        case cancelled
+        case failed(PersistentMCPUpdateFailure)
+    }
+
+    enum PersistentMCPUpdateFailure: Equatable {
+        case managedRead
+        case policyConflict(String)
+        case unsafeManagedMarkers
+        case managedWrite
+        case targetChanged
+        case readBack
+        case readBackMismatch
+    }
+
+    struct PersistentMCPUpdateResult {
+        let status: PersistentMCPUpdateStatus
+        let wasRepoPromptServerPresent: Bool
+        let degradations: [ExternalMCPDegradation]
+    }
+
+    /// The result of a Settings-owned external connection registration. This is deliberately
+    /// separate from global external-config import: disconnect may only remove an exact region
+    /// that RepoPrompt Settings created and subsequently verified.
+    enum SettingsManagedMCPUpdateStatus: Equatable {
+        case updated
+        case unchanged
+        case cancelled
+        case failed(SettingsManagedMCPUpdateFailure)
+    }
+
+    enum SettingsManagedMCPUpdateFailure: Equatable {
+        case runtimePreparation
+        case managedRead
+        case unsafeMarkers
+        case unrecognizedOwnedRegion
+        case serverNameConflict
+        case targetChanged
+        case managedWrite
+        case readBack
+        case readBackMismatch
+    }
+
+    /// Structural, nonsecret inspection used by Settings before it offers a user-owned
+    /// Figma block for adoption. It deliberately does not expose its TOML content, URL,
+    /// headers, or any OAuth data.
+    enum ExistingFigmaServerInspection: Equatable {
+        case absent
+        case imported
+        case canonicalImported(isEnabled: Bool)
+        case canonicalExplicitlyDisabled
+        case conflictingAlias
+        case settingsManaged
+        case unsafe
+    }
+
+    /// Exposes whether the caller must retain a nonsecret cleanup/retry tombstone. A failed
+    /// read-back or cancellation after rename may have changed the file even though the
+    /// transaction cannot safely publish a completed connection state.
+    enum SettingsManagedMCPRecovery: Equatable {
+        case none
+        case replacementMayHaveCommitted
+    }
+
+    struct SettingsManagedMCPUpdateResult: Equatable {
+        let status: SettingsManagedMCPUpdateStatus
+        let hasSettingsManagedFigma: Bool
+        let recovery: SettingsManagedMCPRecovery
+
+        init(
+            status: SettingsManagedMCPUpdateStatus,
+            hasSettingsManagedFigma: Bool,
+            recovery: SettingsManagedMCPRecovery = .none
+        ) {
+            self.status = status
+            self.hasSettingsManagedFigma = hasSettingsManagedFigma
+            self.recovery = recovery
+        }
+    }
+
+    private struct MCPServerBlock {
+        let entry: ServerEntry
+        let lines: [String]
     }
 
     struct PersistentMCPConfigMutationResult {
@@ -109,6 +423,35 @@ enum CodexIntegrationConfiguration {
         configDirectoryURL().appendingPathComponent("config.toml")
     }
 
+    /// The normal, user-owned Codex config. RepoPrompt never writes this file; it mirrors only
+    /// MCP server definitions into its own state home so the bundled runtime can retain isolation.
+    static func externalUserConfigURL(fileManager: FileManager = .default) -> URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+            .appendingPathComponent("config.toml")
+    }
+
+    /// GUI-hosted processes can report a container-style Foundation home while the user's normal
+    /// Codex configuration follows the login-shell HOME. Probe all non-mutating candidates in a
+    /// deterministic order; the first readable config wins.
+    static func externalUserConfigURLs(fileManager: FileManager = .default) -> [URL] {
+        var homes: [URL] = []
+        if let value = ProcessInfo.processInfo.environment["HOME"], !value.isEmpty {
+            homes.append(URL(fileURLWithPath: value, isDirectory: true))
+        }
+        homes.append(URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true))
+        homes.append(fileManager.homeDirectoryForCurrentUser)
+
+        var seen = Set<URL>()
+        return homes.compactMap { home in
+            let url = home
+                .standardizedFileURL
+                .appendingPathComponent(".codex", isDirectory: true)
+                .appendingPathComponent("config.toml")
+            return seen.insert(url).inserted ? url : nil
+        }
+    }
+
     static func cliPathComponent(forNormalizedServerName name: String) -> String {
         guard !name.isEmpty else { return "\"\"" }
         if name.unicodeScalars.allSatisfy({ tomlBareKeyCharacters.contains($0) }) {
@@ -138,12 +481,34 @@ enum CodexIntegrationConfiguration {
         return "\"\(escaped)\""
     }
 
+    enum ManagedMCPConfigReadOutcome: Equatable {
+        case missing
+        case unreadable
+        case malformed
+        case valid([ServerEntry])
+    }
+
+    /// Explicitly models isolated-config read failures for callers that must decide whether
+    /// provisioning can proceed. The legacy array adapter remains only for non-authoritative
+    /// UI discovery; it never uses `fileExists`/`try?` to collapse state before this boundary.
+    static func managedMCPConfigReadOutcome(at url: URL = configURL()) -> ManagedMCPConfigReadOutcome {
+        let content: String
+        do {
+            content = try String(contentsOf: url, encoding: .utf8)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return .missing
+        } catch {
+            return .unreadable
+        }
+        guard isolatedMCPConfigIsStructurallyValid(content) else { return .malformed }
+        return .valid(mcpServerEntries(fromConfigContent: content))
+    }
+
     static func mcpServerEntries() -> [ServerEntry] {
-        let fm = FileManager.default
-        let configURL = configURL()
-        guard fm.fileExists(atPath: configURL.path) else { return [] }
-        guard let content = try? String(contentsOf: configURL, encoding: .utf8) else { return [] }
-        return mcpServerEntries(fromConfigContent: content)
+        switch managedMCPConfigReadOutcome() {
+        case let .valid(entries): entries
+        case .missing, .unreadable, .malformed: []
+        }
     }
 
     static func mcpServerEntries(from content: String) -> [ServerEntry] {
@@ -151,19 +516,7 @@ enum CodexIntegrationConfiguration {
     }
 
     static func mcpServerEntries(fromConfigContent content: String) -> [ServerEntry] {
-        var seenNormalizedNames = Set<String>()
-        var ordered: [ServerEntry] = []
-
-        for line in splitTOMLLines(content) {
-            guard let serverName = mcpServerName(fromHeaderLine: line) else { continue }
-            guard !serverName.normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-            guard seenNormalizedNames.insert(serverName.normalized).inserted else { continue }
-
-            let cliPath = cliPathComponent(forNormalizedServerName: serverName.normalized)
-            ordered.append(ServerEntry(rawName: serverName.raw, normalizedName: serverName.normalized, cliPathComponent: cliPath))
-        }
-
-        return ordered
+        mcpServerBlocks(fromConfigContent: content).map(\.entry)
     }
 
     static func mcpServerNames() -> [String] {
@@ -184,43 +537,62 @@ enum CodexIntegrationConfiguration {
         ) {
         case let .success(resolved):
             runtime = resolved
-        case let .failure(failure):
-            return (false, false, failure.localizedDescription)
+        case .failure:
+            return (false, false, "RepoPrompt could not resolve its bundled Codex runtime.")
         }
 
         fileLock.lock()
         defer { fileLock.unlock() }
 
         let fm = FileManager.default
-        let configURL = configURL()
+        // Use the same isolated CODEX_HOME as the runtime that will be launched; this must
+        // happen before Codex starts MCP discovery.
+        let configURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
 
         do {
             try runtime.prepareState(fileManager: fm)
-
-            let content: String = if fm.fileExists(atPath: configURL.path) {
-                (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
-            } else {
-                ""
-            }
-
-            let mutation = mutatedPersistentMCPConfigContent(
-                from: content,
-                defaultEnabledIfMissing: true,
-                forceEnabled: true
-            )
-            if let conflictMessage = mutation.conflictMessage {
-                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
-            }
-            if mutation.changed {
-                try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
-            }
-
-            UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
-            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
-            print("CodexIntegrationConfiguration – Codex install failed: \(error)")
-            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
+            return (false, false, "RepoPrompt could not prepare its isolated Codex state.")
         }
+
+        let result = reconcilePersistentMCPConfig(
+            at: configURL,
+            externalCandidates: externalUserConfigURLs(fileManager: fm),
+            mode: .install,
+            dependencies: .live(fileManager: fm)
+        )
+        return legacyProvisioningResult(result)
+    }
+
+    /// Ensures only the app-owned RepoPrompt MCP server exists for discovery runs. This
+    /// boundary is used by fresh Agent Mode startup; Figma/external reconciliation belongs
+    /// to the app-lifetime Figma coordinator.
+    @discardableResult
+    static func ensureRepoPromptServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch CodexRuntimeAuthority.resolve() {
+        case let .success(resolved):
+            ensureRepoPromptServerForDiscovery(runtime: resolved)
+        case .failure:
+            (false, false, "RepoPrompt could not resolve its bundled Codex runtime.")
+        }
+    }
+
+    @discardableResult
+    static func ensureRepoPromptServerForDiscovery(
+        runtime: CodexRuntimeAuthority.Runtime
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        let configURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+        do { try runtime.prepareState(fileManager: FileManager.default) }
+        catch { return (false, false, "RepoPrompt could not prepare its isolated Codex state.") }
+        let result = reconcilePersistentMCPConfig(
+            at: configURL,
+            externalCandidates: [],
+            mode: .repoPromptOnly,
+            dependencies: .live(fileManager: FileManager.default)
+        )
+        return legacyProvisioningResult(result)
     }
 
     /// Ensures the RepoPrompt MCP server exists for discovery runs. Newly created entries default to
@@ -235,8 +607,8 @@ enum CodexIntegrationConfiguration {
         ) {
         case let .success(resolved):
             ensureServerForDiscovery(runtime: resolved)
-        case let .failure(failure):
-            (false, false, failure.localizedDescription)
+        case .failure:
+            (false, false, "RepoPrompt could not resolve its bundled Codex runtime.")
         }
     }
 
@@ -248,34 +620,226 @@ enum CodexIntegrationConfiguration {
         defer { fileLock.unlock() }
 
         let fm = FileManager.default
-        let configURL = configURL()
+        // Keep the merge bound to the exact runtime state that will become CODEX_HOME
+        // for the process launched immediately after this gate.
+        let configURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
 
         do {
             try runtime.prepareState(fileManager: fm)
-
-            let content: String = if fm.fileExists(atPath: configURL.path) {
-                (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
-            } else {
-                ""
-            }
-
-            let mutation = mutatedPersistentMCPConfigContent(
-                from: content,
-                defaultEnabledIfMissing: false,
-                forceEnabled: nil
-            )
-            if let conflictMessage = mutation.conflictMessage {
-                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
-            }
-            if mutation.changed {
-                try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
-            }
-            UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
-
-            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
-            print("CodexIntegrationConfiguration – Codex discovery ensure failed: \(error)")
-            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
+            return (false, false, "RepoPrompt could not prepare its isolated Codex state.")
+        }
+
+        let result = reconcilePersistentMCPConfig(
+            at: configURL,
+            externalCandidates: externalUserConfigURLs(fileManager: fm),
+            mode: .discovery,
+            dependencies: .live(fileManager: fm)
+        )
+        return legacyProvisioningResult(result)
+    }
+
+    private static func managedExternalRegionIsPreserved(
+        from original: String,
+        through updated: String,
+        degradations: [ExternalMCPDegradation]
+    ) -> Bool {
+        guard !degradations.isEmpty else { return true }
+        let originalLines = splitTOMLLines(original)
+        switch classifyManagedExternalMCPRegion(in: originalLines) {
+        case .absent:
+            return true
+        case .malformed:
+            return original == updated
+        case let .valid(originalRange):
+            let updatedLines = splitTOMLLines(updated)
+            guard case let .valid(updatedRange) = classifyManagedExternalMCPRegion(in: updatedLines) else {
+                return false
+            }
+            return Array(originalLines[originalRange]) == Array(updatedLines[updatedRange])
+        }
+    }
+
+    static func reconcilePersistentMCPConfig(
+        at managedConfigURL: URL,
+        externalCandidates: [URL],
+        mode: PersistentMCPUpdateMode,
+        dependencies: ProvisioningDependencies
+    ) -> PersistentMCPUpdateResult {
+        dependencies.diagnostics.record("provisioning attempt started")
+        if dependencies.cancellation.isCancelled() {
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: false, degradations: [])
+        }
+
+        let original: String
+        do {
+            original = try dependencies.managedStore.readUTF8(managedConfigURL) ?? ""
+        } catch {
+            dependencies.diagnostics.record("managed Codex config read failed")
+            return PersistentMCPUpdateResult(status: .failed(.managedRead), wasRepoPromptServerPresent: false, degradations: [])
+        }
+        let originalFingerprint: ConfigurationFileFingerprint?
+        do {
+            originalFingerprint = try dependencies.managedStore.fingerprint?(managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("managed Codex config fingerprint failed")
+            return PersistentMCPUpdateResult(status: .failed(.managedRead), wasRepoPromptServerPresent: false, degradations: [])
+        }
+        let originalMarkers = classifyManagedExternalMCPRegion(in: splitTOMLLines(original))
+        dependencies.diagnostics.record(
+            "managed config read; byte_count=\(original.utf8.count); marker_state=\(diagnosticMarkerState(originalMarkers))"
+        )
+        let wasPresent = mcpServerEntries(from: original).contains { $0.normalizedName == repoPromptMCPServerName }
+        if dependencies.cancellation.isCancelled() {
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: wasPresent, degradations: [])
+        }
+
+        let source: ExternalMCPSourceOutcome = if mode == .repoPromptOnly {
+            // Do not touch external source files during fresh Agent Mode bootstrap.
+            .absent
+        } else {
+            resolveExternalMCPSource(
+                candidates: externalCandidates,
+                excluding: managedConfigURL,
+                reader: dependencies.sourceReader,
+                diagnostics: dependencies.diagnostics,
+                cancellation: dependencies.cancellation
+            )
+        }
+        if dependencies.cancellation.isCancelled() {
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: wasPresent, degradations: [])
+        }
+        let merged: ExternalMCPMergeResult = if mode == .repoPromptOnly {
+            // Preserve the existing managed external region byte-for-byte. Only the
+            // RepoPromptCE entry may be added/updated below.
+            .init(content: original, changed: false, importedServerNames: [], skippedConflictingServerNames: [], degradations: [])
+        } else {
+            mergedExternalMCPServerConfigContent(from: original, sourceOutcome: source)
+        }
+        dependencies.diagnostics.record(
+            "external MCP merge completed; changed=\(merged.changed); imported_count=\(merged.importedServerNames.count); figma_present=\(merged.importedServerNames.contains("figma")); degradation_count=\(merged.degradations.count)"
+        )
+        for degradation in merged.degradations {
+            switch degradation {
+            case .sourceUnavailable:
+                dependencies.diagnostics.record("external MCP import unavailable; preserving prior valid region")
+            case .sourceChanged:
+                dependencies.diagnostics.record("external MCP source changed during inspection; preserving prior valid region")
+            case .sourceInvalid:
+                dependencies.diagnostics.record("external MCP import malformed; preserving prior valid region")
+            case let .malformedMarkers(problem):
+                dependencies.diagnostics.record("managed external MCP markers malformed: \(problem.rawValue)")
+            }
+        }
+
+        let installMode = switch mode {
+        case .install: true
+        case .discovery, .repoPromptOnly: false
+        }
+        let mutation = mutatedPersistentMCPConfigContent(
+            from: merged.content,
+            defaultEnabledIfMissing: installMode,
+            forceEnabled: installMode ? true : nil
+        )
+        if let conflict = mutation.conflictMessage {
+            dependencies.diagnostics.record("managed config policy conflict; reason=\(conflict)")
+            return PersistentMCPUpdateResult(
+                status: .failed(.policyConflict(conflict)),
+                wasRepoPromptServerPresent: mutation.wasRepoPromptServerPresent,
+                degradations: merged.degradations
+            )
+        }
+        if !managedExternalRegionIsPreserved(
+            from: original,
+            through: mutation.content,
+            degradations: merged.degradations
+        ) {
+            dependencies.diagnostics.record("managed external MCP region could not be preserved safely")
+            return PersistentMCPUpdateResult(
+                status: .failed(.unsafeManagedMarkers),
+                wasRepoPromptServerPresent: wasPresent,
+                degradations: merged.degradations
+            )
+        }
+        if dependencies.cancellation.isCancelled() {
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        guard merged.changed || mutation.changed else {
+            dependencies.diagnostics.record("managed config unchanged; no replacement required")
+            UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
+            return PersistentMCPUpdateResult(status: .unchanged, wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+
+        if let originalFingerprint {
+            do {
+                guard try dependencies.managedStore.fingerprint?(managedConfigURL) == originalFingerprint else {
+                    dependencies.diagnostics.record("managed Codex config changed before replacement")
+                    return PersistentMCPUpdateResult(status: .failed(.targetChanged), wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+                }
+            } catch {
+                dependencies.diagnostics.record("managed Codex config fingerprint failed before replacement")
+                return PersistentMCPUpdateResult(status: .failed(.targetChanged), wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+            }
+        }
+        if dependencies.cancellation.isCancelled() {
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        dependencies.diagnostics.record("managed config atomic replacement starting; byte_count=\(mutation.content.utf8.count)")
+        do {
+            try dependencies.managedStore.replaceAtomically(mutation.content, managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("managed Codex config atomic replacement failed")
+            return PersistentMCPUpdateResult(status: .failed(.managedWrite), wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        // A cancellation after rename cannot roll back a completed atomic replacement; verify
+        // its bytes first, then report cancellation so callers do not publish stale success.
+        let cancelledDuringCommit = dependencies.cancellation.isCancelled()
+        let readBack: Data
+        do {
+            readBack = try dependencies.managedStore.readBack(managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("managed Codex config read-back failed")
+            return PersistentMCPUpdateResult(status: .failed(.readBack), wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        guard readBack == Data(mutation.content.utf8) else {
+            dependencies.diagnostics.record("managed Codex config read-back mismatch")
+            return PersistentMCPUpdateResult(status: .failed(.readBackMismatch), wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        if cancelledDuringCommit {
+            dependencies.diagnostics.record("managed config replacement completed after cancellation")
+            return PersistentMCPUpdateResult(status: .cancelled, wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+        }
+        let committedNames = mcpServerEntries(fromConfigContent: mutation.content).map(\.normalizedName).sorted()
+        dependencies.diagnostics.record(
+            "managed config committed and verified; server_count=\(committedNames.count); figma_present=\(committedNames.contains("figma"))"
+        )
+        UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
+        return PersistentMCPUpdateResult(status: .updated, wasRepoPromptServerPresent: wasPresent, degradations: merged.degradations)
+    }
+
+    private static func legacyProvisioningResult(
+        _ result: PersistentMCPUpdateResult
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch result.status {
+        case .updated, .unchanged:
+            let warning = result.degradations.isEmpty
+                ? nil
+                : "RepoPrompt preserved the last safe external MCP configuration because the current import could not be validated."
+            return (true, result.wasRepoPromptServerPresent, warning)
+        case .cancelled:
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt did not update its isolated Codex config because the operation was cancelled.")
+        case let .failed(.policyConflict(message)):
+            return (false, result.wasRepoPromptServerPresent, message)
+        case .failed(.managedRead):
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt could not read its isolated Codex config.")
+        case .failed(.unsafeManagedMarkers):
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt preserved an unsafe external MCP marker layout and did not update the isolated Codex config.")
+        case .failed(.managedWrite):
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt could not atomically update its isolated Codex config.")
+        case .failed(.targetChanged):
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt did not overwrite an isolated Codex config that changed during provisioning.")
+        case .failed(.readBack), .failed(.readBackMismatch):
+            return (false, result.wasRepoPromptServerPresent, "RepoPrompt could not verify its isolated Codex config update.")
         }
     }
 
@@ -326,10 +890,16 @@ enum CodexIntegrationConfiguration {
         fileLock.lock()
         defer { fileLock.unlock() }
 
-        let fm = FileManager.default
         let configURL = configURL()
-        guard fm.fileExists(atPath: configURL.path) else { return }
-        guard let content = try? String(contentsOf: configURL, encoding: .utf8) else { return }
+        let content: String
+        do {
+            content = try String(contentsOf: configURL, encoding: .utf8)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return
+        } catch {
+            provisioningLogger.error("managed Codex config read failed while removing owned entry")
+            return
+        }
 
         var lines = splitTOMLLines(content)
         let blocks = blockRanges(in: lines, whereHeaderMatches: isRepoPromptMCPServerHeader)
@@ -345,7 +915,7 @@ enum CodexIntegrationConfiguration {
         do {
             try final.write(to: configURL, atomically: true, encoding: .utf8)
         } catch {
-            print("CodexIntegrationConfiguration – Failed to remove Codex entry: \(error)")
+            provisioningLogger.error("managed Codex config write failed while removing owned entry")
         }
     }
 
@@ -366,10 +936,13 @@ enum CodexIntegrationConfiguration {
             return true
         }
 
-        let fm = FileManager.default
         let configURL = configURL()
-        guard fm.fileExists(atPath: configURL.path) else { return false }
-        guard let content = try? String(contentsOf: configURL, encoding: .utf8) else { return false }
+        let content: String
+        do {
+            content = try String(contentsOf: configURL, encoding: .utf8)
+        } catch {
+            return false
+        }
 
         let mutation = mutatedToolTimeoutConfigContent(from: content)
         guard mutation.foundTarget else { return false }
@@ -469,6 +1042,692 @@ enum CodexIntegrationConfiguration {
         return (mutation.foundTarget, mutation.changed)
     }
 
+    /// Mirrors externally configured MCP server blocks into the managed Codex home. The source is
+    /// intentionally restricted to `[mcp_servers.*]` plus a server's immediately-associated nested
+    /// tables (for example `.env`); plugin, profile, auth, shell, and other global configuration is
+    /// not copied. OAuth credentials are never read, copied, or logged.
+    ///
+    /// `RepoPromptCE` is reserved for the app-owned endpoint. If the external config contains that
+    /// exact server name, the app-owned entry wins deterministically. A manually authored server in
+    /// the managed config likewise wins over an imported server with the same name.
+    static func mergedExternalMCPServerConfigContent(
+        from managedContent: String,
+        externalConfigContent: String
+    ) -> ExternalMCPMergeResult {
+        mergedExternalMCPServerConfigContent(
+            from: managedContent,
+            sourceOutcome: externalMCPContentIsStructurallyValid(externalConfigContent)
+                ? .valid(content: externalConfigContent, candidateIndex: 0)
+                : .invalid(candidateIndex: 0)
+        )
+    }
+
+    static func mergedExternalMCPServerConfigContent(
+        from managedContent: String,
+        sourceOutcome: ExternalMCPSourceOutcome
+    ) -> ExternalMCPMergeResult {
+        var managedLines = splitTOMLLines(managedContent)
+        let markerClassification = classifyManagedExternalMCPRegion(in: managedLines)
+        if case let .malformed(problem) = markerClassification {
+            return ExternalMCPMergeResult(
+                content: managedContent,
+                changed: false,
+                importedServerNames: [],
+                skippedConflictingServerNames: [],
+                degradations: [.malformedMarkers(problem)]
+            )
+        }
+
+        switch sourceOutcome {
+        case .unavailable:
+            return ExternalMCPMergeResult(
+                content: managedContent,
+                changed: false,
+                importedServerNames: [],
+                skippedConflictingServerNames: [],
+                degradations: [.sourceUnavailable]
+            )
+        case .changed:
+            return ExternalMCPMergeResult(
+                content: managedContent,
+                changed: false,
+                importedServerNames: [],
+                skippedConflictingServerNames: [],
+                degradations: [.sourceChanged]
+            )
+        case .invalid:
+            return ExternalMCPMergeResult(
+                content: managedContent,
+                changed: false,
+                importedServerNames: [],
+                skippedConflictingServerNames: [],
+                degradations: [.sourceInvalid]
+            )
+        case .absent:
+            if case let .valid(range) = markerClassification {
+                managedLines.removeSubrange(range)
+            }
+            let content = managedLines.joined(separator: "\n")
+            return ExternalMCPMergeResult(
+                content: content,
+                changed: content != managedContent,
+                importedServerNames: [],
+                skippedConflictingServerNames: [],
+                degradations: []
+            )
+        case let .valid(externalConfigContent, _):
+            let insertionIndex: Int
+            if case let .valid(range) = markerClassification {
+                insertionIndex = range.lowerBound
+                managedLines.removeSubrange(range)
+            } else {
+                insertionIndex = managedLines.count
+            }
+
+            let existingNames = Set(mcpServerBlocks(fromLines: managedLines).map(\.entry.normalizedName))
+            let externalBlocks = mcpServerBlocks(fromConfigContent: externalConfigContent)
+            var imports: [MCPServerBlock] = []
+            var importedNames: [String] = []
+            var skippedNames: [String] = []
+            var seenExternalNames = Set<String>()
+
+            for block in externalBlocks {
+                let name = block.entry.normalizedName
+                guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      seenExternalNames.insert(name).inserted
+                else { continue }
+                if name == repoPromptMCPServerName || existingNames.contains(name) {
+                    skippedNames.append(name)
+                    continue
+                }
+                imports.append(block)
+                importedNames.append(name)
+            }
+
+            if !imports.isEmpty {
+                let region = managedExternalMCPRegionLines(for: imports)
+                if insertionIndex < managedLines.count {
+                    managedLines.insert(contentsOf: region, at: insertionIndex)
+                } else {
+                    appendBlock(region, to: &managedLines)
+                }
+            }
+
+            let content = managedLines.joined(separator: "\n")
+            return ExternalMCPMergeResult(
+                content: content,
+                changed: content != managedContent,
+                importedServerNames: importedNames,
+                skippedConflictingServerNames: skippedNames,
+                degradations: []
+            )
+        }
+    }
+
+    /// Serializes a Settings-owned registration against the normal isolated-config merger.
+    /// The optional runtime is supplied by a process-bound caller to guarantee the exact
+    /// `CODEX_HOME` that will be spawned; Settings actions may resolve it independently.
+    static func reconcileSettingsManagedFigmaConnection(
+        definition: ExternalMCPIntegrationDefinition?,
+        runtime: CodexRuntimeAuthority.Runtime? = nil,
+        dependencies: ProvisioningDependencies = .live()
+    ) -> SettingsManagedMCPUpdateResult {
+        let resolvedRuntime: CodexRuntimeAuthority.Runtime
+        if let runtime {
+            resolvedRuntime = runtime
+        } else {
+            switch CodexRuntimeAuthority.resolveConfigured() {
+            case let .success(value): resolvedRuntime = value
+            case .failure:
+                return .init(status: .failed(.runtimePreparation), hasSettingsManagedFigma: false)
+            }
+        }
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        do {
+            try resolvedRuntime.prepareState()
+        } catch {
+            return .init(status: .failed(.runtimePreparation), hasSettingsManagedFigma: false)
+        }
+        return reconcileSettingsManagedFigmaConnection(
+            at: resolvedRuntime.statePaths.codexHome.appendingPathComponent("config.toml"),
+            definition: definition,
+            dependencies: dependencies
+        )
+    }
+
+    /// Resolves and prepares the standard isolated runtime before inspecting it. This mirrors
+    /// Settings-managed reconciliation without importing any global configuration or changing
+    /// a managed file.
+    static func inspectExistingFigmaServer(
+        runtime: CodexRuntimeAuthority.Runtime? = nil,
+        dependencies: ProvisioningDependencies = .live()
+    ) -> ExistingFigmaServerInspection {
+        let resolvedRuntime: CodexRuntimeAuthority.Runtime
+        if let runtime {
+            resolvedRuntime = runtime
+        } else {
+            switch CodexRuntimeAuthority.resolveConfigured() {
+            case let .success(value): resolvedRuntime = value
+            case .failure: return .unsafe
+            }
+        }
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        do {
+            try resolvedRuntime.prepareState()
+        } catch {
+            return .unsafe
+        }
+        return inspectExistingFigmaServer(
+            at: resolvedRuntime.statePaths.codexHome.appendingPathComponent("config.toml"),
+            dependencies: dependencies
+        )
+    }
+
+    /// Inspects only the isolated managed configuration for an existing canonical Figma
+    /// server. This is intentionally a read-only adoption gate: Settings must never create a
+    /// managed block merely to find out whether a user/imported Figma block exists.
+    static func inspectExistingFigmaServer(
+        at managedConfigURL: URL,
+        dependencies: ProvisioningDependencies
+    ) -> ExistingFigmaServerInspection {
+        guard !dependencies.cancellation.isCancelled() else { return .unsafe }
+        let content: String
+        do {
+            content = try dependencies.managedStore.readUTF8(managedConfigURL) ?? ""
+        } catch {
+            dependencies.diagnostics.record("settings-managed MCP adoption inspection failed")
+            return .unsafe
+        }
+        let lines = splitTOMLLines(content)
+        switch classifySettingsManagedMCPRegion(in: lines) {
+        case .absent:
+            break
+        case let .valid(range):
+            return settingsManagedFigmaRegionIsExact(Array(lines[range])) ? .settingsManaged : .unsafe
+        case .malformed:
+            return .unsafe
+        }
+        let entries = mcpServerBlocks(fromLines: lines).map(\.entry)
+        if let canonical = entries.first(where: { $0.identity == .canonicalFigma }) {
+            return canonical.isExplicitlyDisabled ? .canonicalExplicitlyDisabled : .canonicalImported(isEnabled: canonical.isEnabled)
+        }
+        if entries.contains(where: { $0.identity == .figmaAlias }) {
+            return .conflictingAlias
+        }
+        return .absent
+    }
+
+    /// Reconciles the one Settings-owned Figma registration in RepoPrompt's isolated Codex
+    /// configuration. It never reads global configuration and never accepts a caller-provided
+    /// URL, headers, command, arguments, or credentials. A manually/imported `figma` block is
+    /// a conflict rather than something Settings may overwrite; disconnect only removes the
+    /// byte-exact region this routine writes.
+    static func reconcileSettingsManagedFigmaConnection(
+        at managedConfigURL: URL,
+        definition: ExternalMCPIntegrationDefinition?,
+        dependencies: ProvisioningDependencies
+    ) -> SettingsManagedMCPUpdateResult {
+        if dependencies.cancellation.isCancelled() {
+            return .init(status: .cancelled, hasSettingsManagedFigma: false)
+        }
+
+        let original: String
+        do {
+            original = try dependencies.managedStore.readUTF8(managedConfigURL) ?? ""
+        } catch {
+            dependencies.diagnostics.record("settings-managed MCP config read failed")
+            return .init(status: .failed(.managedRead), hasSettingsManagedFigma: false)
+        }
+
+        let originalFingerprint: ConfigurationFileFingerprint?
+        do {
+            originalFingerprint = try dependencies.managedStore.fingerprint?(managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("settings-managed MCP config fingerprint failed")
+            return .init(status: .failed(.managedRead), hasSettingsManagedFigma: false)
+        }
+
+        var lines = splitTOMLLines(original)
+        let markerClassification = classifySettingsManagedMCPRegion(in: lines)
+        let isAdoptingImport = definition?.isSupportedDefinition == true && definition?.origin == .adoptedImport
+        let shouldRegister = definition?.isSupportedSettingsManagedDefinition == true
+        let existingOwnedRange: Range<Int>?
+        switch markerClassification {
+        case .absent:
+            existingOwnedRange = nil
+        case let .valid(range):
+            guard settingsManagedFigmaRegionIsExact(Array(lines[range])) else {
+                dependencies.diagnostics.record("settings-managed MCP region is not recognized")
+                return .init(status: .failed(.unrecognizedOwnedRegion), hasSettingsManagedFigma: false)
+            }
+            existingOwnedRange = range
+        case .malformed:
+            dependencies.diagnostics.record("settings-managed MCP markers are unsafe")
+            return .init(status: .failed(.unsafeMarkers), hasSettingsManagedFigma: false)
+        }
+
+        if dependencies.cancellation.isCancelled() {
+            return .init(status: .cancelled, hasSettingsManagedFigma: existingOwnedRange != nil)
+        }
+
+        if isAdoptingImport {
+            // Adoption records user policy only. It never copies, overwrites, or deletes an
+            // imported/user-owned server. A Settings-owned marker is a distinct identity and
+            // cannot be silently reclassified as an import.
+            guard existingOwnedRange == nil,
+                  mcpServerBlocks(fromLines: lines).contains(where: {
+                      $0.entry.identity == .canonicalFigma && $0.entry.isEnabled
+                  })
+            else {
+                dependencies.diagnostics.record("adopted MCP import was not an exact existing Figma server")
+                return .init(status: .failed(.serverNameConflict), hasSettingsManagedFigma: false)
+            }
+            return .init(status: .unchanged, hasSettingsManagedFigma: false)
+        }
+
+        if let existingOwnedRange {
+            lines.removeSubrange(existingOwnedRange)
+        }
+        if shouldRegister {
+            let hasConflictingFigma = mcpServerBlocks(fromLines: lines).contains {
+                $0.entry.identity == .canonicalFigma || $0.entry.identity == .figmaAlias
+            }
+            guard !hasConflictingFigma else {
+                dependencies.diagnostics.record("settings-managed MCP server name conflict")
+                return .init(status: .failed(.serverNameConflict), hasSettingsManagedFigma: existingOwnedRange != nil)
+            }
+            appendBlock(settingsManagedFigmaRegionLines(), to: &lines)
+        }
+
+        let updated = lines.joined(separator: "\n")
+        guard updated != original else {
+            return .init(status: .unchanged, hasSettingsManagedFigma: shouldRegister)
+        }
+        if dependencies.cancellation.isCancelled() {
+            return .init(status: .cancelled, hasSettingsManagedFigma: existingOwnedRange != nil)
+        }
+
+        if let originalFingerprint {
+            do {
+                guard try dependencies.managedStore.fingerprint?(managedConfigURL) == originalFingerprint else {
+                    dependencies.diagnostics.record("settings-managed MCP config changed before replacement")
+                    return .init(status: .failed(.targetChanged), hasSettingsManagedFigma: existingOwnedRange != nil)
+                }
+            } catch {
+                dependencies.diagnostics.record("settings-managed MCP config fingerprint failed before replacement")
+                return .init(status: .failed(.targetChanged), hasSettingsManagedFigma: existingOwnedRange != nil)
+            }
+        }
+        if dependencies.cancellation.isCancelled() {
+            return .init(status: .cancelled, hasSettingsManagedFigma: existingOwnedRange != nil)
+        }
+
+        do {
+            try dependencies.managedStore.replaceAtomically(updated, managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("settings-managed MCP config replacement failed")
+            return .init(status: .failed(.managedWrite), hasSettingsManagedFigma: existingOwnedRange != nil, recovery: .replacementMayHaveCommitted)
+        }
+        let cancelledDuringCommit = dependencies.cancellation.isCancelled()
+        let readBack: Data
+        do {
+            readBack = try dependencies.managedStore.readBack(managedConfigURL)
+        } catch {
+            dependencies.diagnostics.record("settings-managed MCP config read-back failed")
+            return .init(status: .failed(.readBack), hasSettingsManagedFigma: shouldRegister, recovery: .replacementMayHaveCommitted)
+        }
+        guard readBack == Data(updated.utf8) else {
+            dependencies.diagnostics.record("settings-managed MCP config read-back did not match")
+            return .init(status: .failed(.readBackMismatch), hasSettingsManagedFigma: shouldRegister, recovery: .replacementMayHaveCommitted)
+        }
+        if cancelledDuringCommit {
+            dependencies.diagnostics.record("settings-managed MCP replacement completed after cancellation")
+            return .init(status: .cancelled, hasSettingsManagedFigma: shouldRegister, recovery: .replacementMayHaveCommitted)
+        }
+        dependencies.diagnostics.record("settings-managed MCP configuration updated; figma_registered=\(shouldRegister)")
+        return .init(status: .updated, hasSettingsManagedFigma: shouldRegister)
+    }
+
+    private static func classifySettingsManagedMCPRegion(
+        in lines: [String]
+    ) -> ManagedExternalMCPMarkerClassification {
+        let normalized = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        let begins = normalized.indices.filter { normalized[$0] == settingsManagedMCPBeginMarker }
+        let ends = normalized.indices.filter { normalized[$0] == settingsManagedMCPEndMarker }
+        if begins.count > 1 { return .malformed(.duplicateBegin) }
+        if ends.count > 1 { return .malformed(.duplicateEnd) }
+        if begins.isEmpty, ends.isEmpty { return .absent }
+        if begins.isEmpty { return .malformed(.orphanEnd) }
+        if ends.isEmpty { return .malformed(.orphanBegin) }
+        guard let begin = begins.first, let end = ends.first, begin < end else {
+            return .malformed(.reversed)
+        }
+        let inner = Array(lines[(begin + 1) ..< end])
+        guard managedExternalMCPRegionIsStructurallyValid(inner) else {
+            return .malformed(.invalidRegion)
+        }
+        return .valid(begin ..< (end + 1))
+    }
+
+    private static func settingsManagedFigmaRegionLines() -> [String] {
+        [
+            settingsManagedMCPBeginMarker,
+            "",
+            "[mcp_servers.figma]",
+            "url = \"\(settingsManagedFigmaURL)\"",
+            "",
+            settingsManagedMCPEndMarker
+        ]
+    }
+
+    private static func settingsManagedFigmaRegionIsExact(_ lines: [String]) -> Bool {
+        let normalized = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        return normalized == settingsManagedFigmaRegionLines()
+    }
+
+    static func resolveExternalMCPSource(
+        candidates: [URL],
+        excluding managedConfigURL: URL,
+        reader: ExternalConfigSourceReader,
+        diagnostics: ProvisioningDiagnosticSink,
+        cancellation: CancellationCheckpoint
+    ) -> ExternalMCPSourceOutcome {
+        var sawUnreadableCandidate = false
+        for (index, sourceURL) in candidates.enumerated() {
+            if cancellation.isCancelled() { return .unavailable }
+            guard sourceURL.standardizedFileURL != managedConfigURL.standardizedFileURL else { continue }
+            do {
+                let fingerprintBefore = try reader.fingerprint?(sourceURL)
+                guard let content = try reader.readUTF8(sourceURL) else { continue }
+                let fingerprintAfter = try reader.fingerprint?(sourceURL)
+                if let fingerprintBefore, let fingerprintAfter, fingerprintBefore != fingerprintAfter {
+                    diagnostics.record("external MCP source candidate \(index + 1) changed during read")
+                    return .changed(candidateIndex: index)
+                }
+                guard externalMCPContentIsStructurallyValid(content) else {
+                    diagnostics.record("external MCP source candidate \(index + 1) is malformed")
+                    return .invalid(candidateIndex: index)
+                }
+                let serverNames = mcpServerEntries(fromConfigContent: content).map(\.normalizedName).sorted()
+                diagnostics.record(
+                    "selected external MCP source candidate \(index + 1); server_count=\(serverNames.count); figma_present=\(serverNames.contains("figma"))"
+                )
+                return .valid(content: content, candidateIndex: index)
+            } catch {
+                sawUnreadableCandidate = true
+                diagnostics.record("external MCP source candidate \(index + 1) is unreadable")
+            }
+        }
+        return sawUnreadableCandidate ? .unavailable : .absent
+    }
+
+    private static func isolatedMCPConfigIsStructurallyValid(_ content: String) -> Bool {
+        for line in splitTOMLLines(content) {
+            let trimmed = stripLeadingBOM(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            if trimmed.hasPrefix("[") {
+                guard parseTOMLHeader(line) != nil else { return false }
+                continue
+            }
+            // A non-assignment TOML expression cannot be safely associated with a server
+            // table. Values themselves remain Codex-owned and are not interpreted here.
+            guard parseTOMLAssignment(line) != nil else { return false }
+        }
+        return true
+    }
+
+    /// Validates the only external shape RepoPrompt will mirror: a direct remote MCP
+    /// server table containing one HTTPS URL and an optional scalar `enabled` flag.
+    /// It deliberately rejects stdio arguments, nested `.env`/headers tables, inline or
+    /// dotted assignments, token-like keys, and credential-bearing URLs. The global file is
+    /// read-only; rejecting a candidate preserves the last verified imported region instead
+    /// of silently importing secrets into RepoPrompt's isolated home.
+    private static func externalMCPContentIsStructurallyValid(_ content: String) -> Bool {
+        struct ServerValidation {
+            let name: String
+            var sawURL = false
+            var sawEnabled = false
+            var urlIsValid = false
+        }
+
+        var seenNames = Set<String>()
+        var current: ServerValidation?
+
+        func finishCurrent() -> Bool {
+            guard let current else { return true }
+            return current.sawURL && current.urlIsValid
+        }
+
+        for line in splitTOMLLines(content) {
+            let trimmed = stripLeadingBOM(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+
+            if trimmed.hasPrefix("[") {
+                guard let header = parseTOMLHeader(line), !header.isArrayTable else { return false }
+                guard finishCurrent() else { return false }
+                current = nil
+                guard header.keyPath.first?.normalized == "mcp_servers" else { continue }
+                // A nested MCP table (including `.env`, `.headers`, or a custom table) is
+                // never safe to mirror because it can carry credentials or executable data.
+                guard header.keyPath.count == 2 else { return false }
+                let name = header.keyPath[1].normalized
+                guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      seenNames.insert(name).inserted
+                else { return false }
+                current = ServerValidation(name: name)
+                continue
+            }
+
+            guard let assignment = parseTOMLAssignment(line) else { return false }
+            guard var server = current else {
+                // Dotted `mcp_servers.*` assignments can alter a server without a direct
+                // table and are therefore not a supported import form.
+                return assignment.keyPath.first?.normalized != "mcp_servers"
+            }
+            guard assignment.keyPath.count == 1 else { return false }
+            switch assignment.keyPath[0].normalized {
+            case "url":
+                guard !server.sawURL,
+                      let endpoint = parseTOMLStringValue(assignment.valueText),
+                      isSafeRemoteMCPURL(endpoint)
+                else { return false }
+                server.sawURL = true
+                server.urlIsValid = true
+            case "enabled":
+                guard !server.sawEnabled,
+                      parseTOMLBooleanValue(assignment.valueText) != nil
+                else { return false }
+                server.sawEnabled = true
+            default:
+                // This rejects `command`, `args`, `headers`, `token`, `api_key`, and every
+                // other unsupported value rather than attempting heuristic redaction.
+                return false
+            }
+            current = server
+        }
+        return finishCurrent()
+    }
+
+    private static func isSafeRemoteMCPURL(_ value: String) -> Bool {
+        guard let components = URLComponents(string: value),
+              components.scheme?.lowercased() == "https",
+              components.host?.isEmpty == false,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil
+        else { return false }
+        return true
+    }
+
+    private static func mcpServerBlocks(fromConfigContent content: String) -> [MCPServerBlock] {
+        mcpServerBlocks(fromLines: splitTOMLLines(content))
+    }
+
+    private static func mcpServerBlocks(fromLines lines: [String]) -> [MCPServerBlock] {
+        var blockIndexByNormalizedName: [String: Int] = [:]
+        var blocks: [MCPServerBlock] = []
+        var index = 0
+
+        while index < lines.count {
+            guard let serverName = mcpServerName(fromHeaderLine: lines[index]) else {
+                index += 1
+                continue
+            }
+            guard !serverName.normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                index += 1
+                continue
+            }
+
+            let directBlockEnd = nextHeaderIndex(after: index + 1, in: lines)
+            var groupEnd = directBlockEnd
+            while groupEnd < lines.count,
+                  let nestedName = nestedMCPServerName(fromHeaderLine: lines[groupEnd]),
+                  nestedName.normalized == serverName.normalized
+            {
+                groupEnd = nextHeaderIndex(after: groupEnd + 1, in: lines)
+            }
+
+            defer { index = groupEnd }
+
+            let enablement = enablementState(
+                forServerBlockStartingAt: index,
+                endingAt: directBlockEnd,
+                in: lines
+            )
+            let entry = ServerEntry(
+                rawName: serverName.raw,
+                normalizedName: serverName.normalized,
+                cliPathComponent: cliPathComponent(forNormalizedServerName: serverName.normalized),
+                isEnabled: enablement.isEnabled,
+                isExplicitlyDisabled: enablement.isExplicitlyDisabled,
+                identity: mcpServerIdentity(
+                    for: serverName,
+                    directLines: Array(lines[index ..< directBlockEnd])
+                )
+            )
+            let block = MCPServerBlock(entry: entry, lines: Array(lines[index ..< groupEnd]))
+            if let existingIndex = blockIndexByNormalizedName[serverName.normalized] {
+                if entry.identity == .canonicalFigma,
+                   blocks[existingIndex].entry.identity != .canonicalFigma
+                {
+                    blocks[existingIndex] = block
+                }
+            } else {
+                blockIndexByNormalizedName[serverName.normalized] = blocks.count
+                blocks.append(block)
+            }
+        }
+
+        return blocks
+    }
+
+    /// Codex defaults an MCP server to enabled when the scalar is omitted. Malformed or duplicate
+    /// values are resolved fail-closed: any invalid/false assignment keeps the server disabled.
+    private static func mcpServerIdentity(
+        for serverName: TOMLKeyComponent,
+        directLines: [String]
+    ) -> MCPServerIdentity {
+        guard serverName.normalized.lowercased() == settingsManagedFigmaServerName else {
+            return .other
+        }
+        guard serverName.normalized == settingsManagedFigmaServerName else {
+            return .figmaAlias
+        }
+        let urls = directLines.compactMap { line -> String? in
+            guard let assignment = parseTOMLAssignment(line), assignment.isSingleKey("url") else { return nil }
+            return parseTOMLStringValue(assignment.valueText)
+        }
+        return urls.contains(where: isCanonicalFigmaMCPURL) ? .canonicalFigma : .figmaAlias
+    }
+
+    private static func isCanonicalFigmaMCPURL(_ value: String) -> Bool {
+        guard let components = URLComponents(string: value),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "mcp.figma.com",
+              components.port == nil,
+              components.user == nil,
+              components.password == nil,
+              components.path == "/mcp",
+              components.query == nil,
+              components.fragment == nil
+        else { return false }
+        return true
+    }
+
+    private static func enablementState(
+        forServerBlockStartingAt start: Int,
+        endingAt end: Int,
+        in lines: [String]
+    ) -> (isEnabled: Bool, isExplicitlyDisabled: Bool) {
+        var sawEnabledAssignment = false
+        var enabled = true
+        guard start + 1 < end else { return (true, false) }
+        for index in (start + 1) ..< end {
+            guard let assignment = parseTOMLAssignment(lines[index]), assignment.isSingleKey("enabled") else {
+                continue
+            }
+            guard !sawEnabledAssignment else {
+                return (false, true)
+            }
+            sawEnabledAssignment = true
+            guard let value = parseTOMLBooleanValue(assignment.valueText) else {
+                return (false, true)
+            }
+            enabled = value
+        }
+        return sawEnabledAssignment ? (enabled, !enabled) : (true, false)
+    }
+
+    private static func diagnosticMarkerState(
+        _ classification: ManagedExternalMCPMarkerClassification
+    ) -> String {
+        switch classification {
+        case .absent: "absent"
+        case .valid: "valid"
+        case let .malformed(problem): "malformed_\(problem.rawValue)"
+        }
+    }
+
+    static func classifyManagedExternalMCPRegion(
+        in lines: [String]
+    ) -> ManagedExternalMCPMarkerClassification {
+        let normalized = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        let begins = normalized.indices.filter { normalized[$0] == managedExternalMCPBeginMarker }
+        let ends = normalized.indices.filter { normalized[$0] == managedExternalMCPEndMarker }
+        if begins.count > 1 { return .malformed(.duplicateBegin) }
+        if ends.count > 1 { return .malformed(.duplicateEnd) }
+        if begins.isEmpty, ends.isEmpty { return .absent }
+        if begins.isEmpty { return .malformed(.orphanEnd) }
+        if ends.isEmpty { return .malformed(.orphanBegin) }
+        guard let begin = begins.first, let end = ends.first, begin < end else {
+            return .malformed(.reversed)
+        }
+        let inner = Array(lines[(begin + 1) ..< end])
+        guard managedExternalMCPRegionIsStructurallyValid(inner) else {
+            return .malformed(.invalidRegion)
+        }
+        return .valid(begin ..< (end + 1))
+    }
+
+    private static func managedExternalMCPRegionIsStructurallyValid(_ lines: [String]) -> Bool {
+        let content = lines.joined(separator: "\n")
+        return externalMCPContentIsStructurallyValid(content) && !mcpServerBlocks(fromLines: lines).isEmpty
+    }
+
+    private static func managedExternalMCPRegionLines(for blocks: [MCPServerBlock]) -> [String] {
+        var region = [managedExternalMCPBeginMarker]
+        for block in blocks {
+            if region.last?.isEmpty == false { region.append("") }
+            region.append(contentsOf: block.lines)
+        }
+        if region.last?.isEmpty == false { region.append("") }
+        region.append(managedExternalMCPEndMarker)
+        return region
+    }
+
     private static func splitTOMLLines(_ content: String) -> [String] {
         guard !content.isEmpty else { return [] }
         return content.components(separatedBy: "\n")
@@ -543,6 +1802,12 @@ enum CodexIntegrationConfiguration {
     private static func mcpServerName(fromHeaderLine line: String) -> TOMLKeyComponent? {
         guard let header = parseTOMLHeader(line), !header.isArrayTable else { return nil }
         guard header.keyPath.count == 2, header.keyPath[0].normalized == "mcp_servers" else { return nil }
+        return header.keyPath[1]
+    }
+
+    private static func nestedMCPServerName(fromHeaderLine line: String) -> TOMLKeyComponent? {
+        guard let header = parseTOMLHeader(line), !header.isArrayTable else { return nil }
+        guard header.keyPath.count > 2, header.keyPath[0].normalized == "mcp_servers" else { return nil }
         return header.keyPath[1]
     }
 

@@ -1028,7 +1028,10 @@ import XCTest
 
         func testRealManageSelectionDrainTimeoutSettlesDuringGraceAndKeepsQueuedCallUsable() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
-                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
                 let clock = MCPExportWatchdogManualClock()
                 let gate = MCPExecutionIgnoringCancellationGate()
                 let recorder = MCPExecutionTraceRecorder()
@@ -1045,15 +1048,6 @@ import XCTest
                 do {
                     let clientName = "real-manage-selection-watchdog-\(UUID().uuidString)"
                     let runID = UUID()
-                    await manager.installClientConnectionPolicy(
-                        for: clientName,
-                        windowID: fixture.contextA.window.windowID,
-                        restrictedTools: [],
-                        tabID: fixture.contextA.tabID,
-                        runID: runID,
-                        additionalTools: [],
-                        purpose: .agentModeRun
-                    )
                     let createdEndpoint = try await PersistentMCPTestEndpoint.make(
                         label: "real-manage-selection-watchdog",
                         networkManager: manager,
@@ -1064,6 +1058,13 @@ import XCTest
                         ]
                     )
                     endpoint = createdEndpoint
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: createdEndpoint.connectionID,
+                        identity: .verified(
+                            processID: Int(getpid()),
+                            fingerprint: "test:verified:real-manage-selection-watchdog"
+                        )
+                    )
                     try await fixture.registerDomainWorkspace(fixture.contextA)
                     try await Self.activateWorkspace(for: fixture.contextA)
                     let bindResponse = try await createdEndpoint.callTool(
@@ -1090,9 +1091,15 @@ import XCTest
                         purpose: .agentModeRun,
                         windowID: fixture.contextA.window.windowID
                     )
-                    let registration = try await AppDomainRuntimeComposition.shared.runtime
-                        .routingCoordinator.currentRegistration(connectionID: createdEndpoint.connectionID)
-                    let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                    let routingCoordinator = AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                    let registrationResult = await routingCoordinator.registerConnection(
+                        connectionID: createdEndpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    let registration = try XCTUnwrap(registrationResult.snapshot.connections.first {
+                        $0.registration.connectionID == createdEndpoint.connectionID
+                    }?.registration)
+                    let routingOutcome = await routingCoordinator.bind(
                         connection: registration,
                         binding: .runScoped(
                             runID: runID,
@@ -1192,7 +1199,10 @@ import XCTest
 
         func testReadAutoSelectionThenImmediateManageSelectionAddAndGetPreservesCanonicalOwnership() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
-                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
                 let gate = MCPExecutionIgnoringCancellationGate()
                 let server = fixture.contextA.window.mcpServer
                 let store = fixture.contextA.window.workspaceFileContextStore
@@ -1211,15 +1221,6 @@ import XCTest
                 do {
                     let clientName = "selection-ownership-\(UUID().uuidString)"
                     let runID = UUID()
-                    await manager.installClientConnectionPolicy(
-                        for: clientName,
-                        windowID: fixture.contextA.window.windowID,
-                        restrictedTools: [],
-                        tabID: fixture.contextA.tabID,
-                        runID: runID,
-                        additionalTools: [],
-                        purpose: .agentModeRun
-                    )
                     let createdEndpoint = try await PersistentMCPTestEndpoint.make(
                         label: "selection-ownership",
                         networkManager: manager,
@@ -1230,6 +1231,13 @@ import XCTest
                         ]
                     )
                     endpoint = createdEndpoint
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: createdEndpoint.connectionID,
+                        identity: .verified(
+                            processID: Int(getpid()),
+                            fingerprint: "test:verified:selection-ownership"
+                        )
+                    )
                     try await fixture.registerDomainWorkspace(fixture.contextA)
                     try await Self.activateWorkspace(for: fixture.contextA)
                     let bindResponse = try await createdEndpoint.callTool(
@@ -1237,6 +1245,18 @@ import XCTest
                         arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
                     )
                     XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
+                    let authority = try XCTUnwrap(
+                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
+                    )
+                    try server.bindTabForConnection(
+                        connectionID: createdEndpoint.connectionID,
+                        clientName: clientName,
+                        tabID: fixture.contextA.tabID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        windowID: fixture.contextA.window.windowID,
+                        runID: runID,
+                        frozenFileToolAuthority: authority
+                    )
                     await manager.setRunPurpose(.agentModeRun, for: createdEndpoint.connectionID)
                     await manager.debugSeedConnectionRunRouting(
                         connectionID: createdEndpoint.connectionID,
@@ -1244,9 +1264,15 @@ import XCTest
                         purpose: .agentModeRun,
                         windowID: fixture.contextA.window.windowID
                     )
-                    let registration = try await AppDomainRuntimeComposition.shared.runtime
-                        .routingCoordinator.currentRegistration(connectionID: createdEndpoint.connectionID)
-                    let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                    let routingCoordinator = AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                    let registrationResult = await routingCoordinator.registerConnection(
+                        connectionID: createdEndpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    let registration = try XCTUnwrap(registrationResult.snapshot.connections.first {
+                        $0.registration.connectionID == createdEndpoint.connectionID
+                    }?.registration)
+                    let routingOutcome = await routingCoordinator.bind(
                         connection: registration,
                         binding: .runScoped(
                             runID: runID,
@@ -3733,14 +3759,14 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let windowA = if let domainRuntime {
-                WindowState(domainRuntime: domainRuntime)
+                WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: domainRuntime)
             } else {
-                WindowState()
+                WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             }
             let windowB = if let domainRuntime {
-                WindowState(domainRuntime: domainRuntime)
+                WindowState(externalMCPComposition: FigmaMCPTestGraph.make(), domainRuntime: domainRuntime)
             } else {
-                WindowState()
+                WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             }
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)

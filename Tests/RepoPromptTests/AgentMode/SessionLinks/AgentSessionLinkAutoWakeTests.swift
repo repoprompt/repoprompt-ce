@@ -4579,6 +4579,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     private func makeFixture(catalogReady: Bool = true) throws -> Fixture {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

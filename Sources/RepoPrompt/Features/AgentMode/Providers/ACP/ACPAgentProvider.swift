@@ -202,6 +202,19 @@ struct ACPLaunchConfiguration: Equatable {
     }
 }
 
+struct ACPRemoteMCPServerConfiguration: Equatable, Hashable {
+    let name: String
+    let url: String
+
+    var acpJSONObject: [String: Any] {
+        [
+            "type": "http",
+            "name": name,
+            "url": url
+        ]
+    }
+}
+
 struct ACPSessionConfiguration: Equatable {
     enum Mode: Equatable {
         case new
@@ -211,6 +224,19 @@ struct ACPSessionConfiguration: Equatable {
     let mode: Mode
     let workingDirectory: String
     let mcpServers: [RepoPromptMCPServerConfiguration]
+    let externalMCPServers: [ACPRemoteMCPServerConfiguration]
+
+    init(
+        mode: Mode,
+        workingDirectory: String,
+        mcpServers: [RepoPromptMCPServerConfiguration],
+        externalMCPServers: [ACPRemoteMCPServerConfiguration] = []
+    ) {
+        self.mode = mode
+        self.workingDirectory = workingDirectory
+        self.mcpServers = mcpServers
+        self.externalMCPServers = externalMCPServers
+    }
 }
 
 enum NormalizedAgentRuntimeEvent {
@@ -314,6 +340,10 @@ protocol ACPDirectSessionModelProvider: Sendable {
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
+    /// Provider-neutral Figma lease retained by the provider until its process/session has
+    /// actually terminated. The runner revokes it after provider teardown.
+    var externalMCPBindingLease: ExternalMCPRuntimeBindingLease? { get }
+
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration
     func makeSessionConfiguration(
@@ -350,6 +380,10 @@ protocol ACPAgentProvider: Sendable {
 }
 
 extension ACPAgentProvider {
+    var externalMCPBindingLease: ExternalMCPRuntimeBindingLease? {
+        nil
+    }
+
     func recognizesUnmatchedResponseID(_: String) -> Bool {
         false
     }

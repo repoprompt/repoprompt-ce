@@ -123,7 +123,7 @@ struct RepoPromptSwiftUIApp: App {
         WindowGroup(id: "main") {
             // IMPORTANT: Each time a new SwiftUI window/scene is created,
             // we instantiate a fresh WindowContentView (and thus a new WindowState)
-            WindowContentView()
+            WindowContentView(externalMCPComposition: appDelegate.externalMCPComposition)
                 .environmentObject(versionManager)
                 .environmentObject(appDelegate.sparkleManager)
                 .environmentObject(windowStatesManager)

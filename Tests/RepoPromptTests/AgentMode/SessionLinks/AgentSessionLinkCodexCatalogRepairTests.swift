@@ -614,6 +614,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
         let tabID = UUID()
         let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in controller },

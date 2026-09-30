@@ -80,6 +80,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         manager.activeWorkspace = workspace
 
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

@@ -550,7 +550,7 @@ import XCTest
         @MainActor
         func testBindSerializesHeldHydrationAsRetryableAuthorityFailure() async throws {
             let root = try makeTemporaryRoot()
-            let targetWindow = WindowState()
+            let targetWindow = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             await targetWindow.workspaceManager.awaitInitialized()
             let contextID = UUID()
             let workspace = WorkspaceModel(
@@ -756,7 +756,7 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
-            let window = WindowState()
+            let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
             await window.workspaceManager.awaitInitialized()
             let contextID = UUID()
             let workspace = WorkspaceModel(
@@ -843,6 +843,13 @@ import XCTest
                 connection: connectionManager,
                 pendingClientID: clientName
             )
+            await networkManager.debugSetDomainPeerIdentityForTesting(
+                connectionID: connectionID,
+                identity: .verified(
+                    processID: Int(getpid()),
+                    fingerprint: "test:verified:bind-context-file-authority"
+                )
+            )
             _ = await networkManager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
 
             do {
@@ -858,6 +865,7 @@ import XCTest
             } catch {
                 await clientTransport.disconnect()
                 await connectionManager.stop()
+                await networkManager.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
                 await networkManager.debugRemoveConnection(connectionID)
                 if !wasNetworkManagerRunning {
                     await networkManager.stop()
@@ -916,6 +924,7 @@ import XCTest
             let networkManager = ServerNetworkManager.shared
             await client.disconnect()
             await connectionManager.stop()
+            await networkManager.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
             await networkManager.debugRemoveConnection(connectionID)
             if !wasNetworkManagerRunning {
                 await networkManager.stop()

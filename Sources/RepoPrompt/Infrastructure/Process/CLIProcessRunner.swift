@@ -250,13 +250,22 @@ final class CLIProcessRunner {
         timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy? = nil,
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
-        cancelChildOnTaskCancellation: Bool = false
+        cancelChildOnTaskCancellation: Bool = false,
+        onProcessStarted: (@Sendable () -> Void)? = nil
     ) async throws -> Result {
         try await gate.withPermit { [self] in
             let environment = await resolvedEnvironment(
                 additionalEnvironment: additionalEnvironment,
                 additionalRemovedKeys: additionalRemovedKeys
             )
+            // Restricted launch profiles must already carry a validated absolute executable.
+            if config.requiresAbsoluteExecutable,
+               !config.command.hasPrefix("/")
+               || !Self.isRunnableExecutable(config.command)
+               || config.shellLookupMode != .disabled
+            {
+                throw CLIProcessRunnerError.commandNotFound(config.command)
+            }
             // Prefer a previously successful absolute path for this command.
             let resolvedCommand: String = await {
                 if let cached = await ResolvedCommandCache.shared.get(for: config.command),
@@ -345,6 +354,13 @@ final class CLIProcessRunner {
                 log("Failed to launch \(resolvedCommand): \(error)")
                 throw error
             }
+            onProcessStarted?()
+            // If cancellation won the race immediately after spawn, request termination before
+            // installing the asynchronous wait handler below. The handler remains responsible
+            // for the normal cancellation path and reaping.
+            if Task.isCancelled {
+                terminateChild(spawned, sendSigterm: true)
+            }
             // Use AsyncScope.withCleanup to ensure cleanup completes before gate is released
             return try await AsyncScope.withCleanup {
                 await registry.add(spawned)
@@ -362,7 +378,13 @@ final class CLIProcessRunner {
                     let chunkSize = 64 * 1024
                     while true {
                         guard let chunk = try? spawned.stdout.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stdoutData.append(chunk)
+                        if !config.discardOutput {
+                            if config.captureStdoutTailBytes > 0 {
+                                appendTail(&stdoutData, chunk: chunk, limit: config.captureStdoutTailBytes)
+                            } else {
+                                stdoutData.append(chunk)
+                            }
+                        }
                     }
                 }
 
@@ -372,7 +394,13 @@ final class CLIProcessRunner {
                     let chunkSize = 64 * 1024
                     while true {
                         guard let chunk = try? spawned.stderr.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stderrData.append(chunk)
+                        if !config.discardOutput {
+                            if config.captureStderrTailBytes > 0 {
+                                appendTail(&stderrData, chunk: chunk, limit: config.captureStderrTailBytes)
+                            } else {
+                                stderrData.append(chunk)
+                            }
+                        }
                     }
                 }
 
@@ -422,18 +450,29 @@ final class CLIProcessRunner {
                 let status: Int32
                 let timedOut: Bool
                 do {
-                    let termination: (Int32, Bool) = if cancelChildOnTaskCancellation {
-                        try await withTaskCancellationHandler {
-                            let result = try await waitTask.value
-                            try Task.checkCancellation()
-                            return result
-                        } onCancel: {
+                    let termination: (Int32, Bool)
+                    if cancelChildOnTaskCancellation {
+                        let requestCancellation = {
                             spawned.stdin?.closeFile()
                             terminateChild(spawned, sendSigterm: true)
                             waitTask.cancel()
                         }
+                        termination = try await withTaskCancellationHandler {
+                            // Cancellation can win immediately after spawn, before the
+                            // handler is installed. Explicitly request cleanup in that
+                            // already-cancelled case so the detached waiter performs the
+                            // full group termination and root reap.
+                            if Task.isCancelled {
+                                requestCancellation()
+                            }
+                            let result = try await waitTask.value
+                            try Task.checkCancellation()
+                            return result
+                        } onCancel: {
+                            requestCancellation()
+                        }
                     } else {
-                        try await waitTask.value
+                        termination = try await waitTask.value
                     }
                     (status, timedOut) = termination
                 } catch {
@@ -490,6 +529,14 @@ final class CLIProcessRunner {
 
         // Cancellation can happen while we were building environment; check again.
         try await cancelEarlyReleasingGate(phase: "after env/compose")
+        if config.requiresAbsoluteExecutable,
+           !config.command.hasPrefix("/")
+           || !Self.isRunnableExecutable(config.command)
+           || config.shellLookupMode != .disabled
+        {
+            await gate.release()
+            throw CLIProcessRunnerError.commandNotFound(config.command)
+        }
         let resolvedCommand: String = await {
             if let cached = await ResolvedCommandCache.shared.get(for: config.command),
                Self.isRunnableExecutable(cached)
@@ -599,6 +646,7 @@ final class CLIProcessRunner {
         await onProcessStarted?(spawned.pid)
 
         let collector = config.logCollector
+        let discardOutput = config.discardOutput
 
         return AsyncThrowingStream { continuation in
             ProcessDiagnostics.log("🎬 [STREAM] Stream started for pid=\(spawned.pid)")
@@ -621,9 +669,11 @@ final class CLIProcessRunner {
                 let chunkSize = 64 * 1024
                 while true {
                     guard let chunk = try? spawned.stdout.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                    appendTail(&stdoutTail, chunk: chunk, limit: stdoutTailLimit)
-                    if case .terminated = continuation.yield(.stdout(chunk)) {
-                        break
+                    if !discardOutput {
+                        appendTail(&stdoutTail, chunk: chunk, limit: stdoutTailLimit)
+                        if case .terminated = continuation.yield(.stdout(chunk)) {
+                            break
+                        }
                     }
                 }
             }
@@ -635,9 +685,11 @@ final class CLIProcessRunner {
                 let chunkSize = 64 * 1024
                 while true {
                     guard let chunk = try? spawned.stderr.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                    appendTail(&stderrTail, chunk: chunk, limit: stderrTailLimit)
-                    if case .terminated = continuation.yield(.stderr(chunk)) {
-                        break
+                    if !discardOutput {
+                        appendTail(&stderrTail, chunk: chunk, limit: stderrTailLimit)
+                        if case .terminated = continuation.yield(.stderr(chunk)) {
+                            break
+                        }
                     }
                 }
             }
@@ -853,7 +905,7 @@ final class CLIProcessRunner {
         }
         let result = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
-                purpose: .cliRunner,
+                purpose: config.launchPurpose,
                 overrides: overrides,
                 additionalRemovedKeys: additionalRemovedKeys,
                 enableDebugLogging: config.enableDebugLogging

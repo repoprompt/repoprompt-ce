@@ -37,6 +37,8 @@ enum GlobalSettingsPersistenceBlockReason: Equatable {
     case incompatibleSchema
     /// The on-disk file is unreadable or malformed and remains preserved for explicit recovery.
     case corruptUnrecoverable
+    /// External MCP settings are malformed and remain blocked until explicit recovery.
+    case invalidExternalMCPSettings(GlobalSettingsExternalMCPInvalidCategory)
     /// The settings file could not be written, for example due to permissions or disk space.
     case saveFailed
     /// Another current process is completing a settings transaction; retry is nonblocking.
@@ -196,15 +198,26 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 throw GlobalSettingsFileStoreError.unsupportedFutureSchema(onDiskVersion)
             case .incompatibleSchema:
                 throw GlobalSettingsFileStoreError.incompatibleSchema
-            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed,
-                 .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
+            case .corruptUnrecoverable, .invalidExternalMCPSettings(_), .saveFailed,
+                 .automaticSchemaNormalizationFailed, .writerBusy, .changedOnDisk,
+                 .missingOnDisk, .loadFailed:
                 assertionFailure("Unexpected settings preservation reason during header load: \(reason)")
                 throw GlobalSettingsFileStoreError.incompatibleSchema
             }
         }
         let document: GlobalSettingsDocument
         do {
-            document = try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
+            try Self.validateRawExternalMCPSettings(data: data)
+            let decoded = try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
+            try Self.validateExternalMCPContentSchema(header: header, document: decoded)
+            document = decoded
+        } catch let error as ExternalMCPIntegrationSettingsDecodingError {
+            // External MCP definitions are security-sensitive policy. Preserve malformed
+            // settings unchanged and require the user to choose recovery rather than
+            // silently repairing connection policy.
+            preservingUnbackedCorruptDocument = true
+            blockReason = .invalidExternalMCPSettings(error.category)
+            throw GlobalSettingsFileStoreError.externalMCPConnectionSettingsInvalid
         } catch {
             if Self.shouldPreserveFailedFalseV4Decode(data: data, header: header) {
                 preservingFailedAutomaticNormalization = true
@@ -309,18 +322,22 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     private func performCompatibleImportLocked() -> Bool {
         guard blockReason != .automaticSchemaNormalizationFailed else { return false }
         guard fileManager.fileExists(atPath: fileURL.path) else { return false }
+        let originalBlockReason = blockReason
+        let wasPreservingUnsupportedFutureDocument = preservingUnsupportedFutureDocument
+        let wasPreservingUnbackedCorruptDocument = preservingUnbackedCorruptDocument
         let importedDocument: GlobalSettingsDocument
         do {
             let data = try Data(contentsOf: fileURL)
             let header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
-            guard Self.preservationBlockReason(for: header) == .incompatibleSchema else { return false }
-            let lineage = header.schemaLineage?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard lineage != GlobalSettingsDocument.schemaLineage
-                || !GlobalSettingsDocument.rejectedExperimentalSchemaVersions.contains(header.schemaVersion)
-            else {
-                return false
+            let headerReason = Self.preservationBlockReason(for: header)
+            let hasInvalidExternalMCPBlock = if case .invalidExternalMCPSettings = blockReason {
+                true
+            } else {
+                false
             }
-            importedDocument = try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
+            guard headerReason == .incompatibleSchema || hasInvalidExternalMCPBlock else { return false }
+            let sanitizedData = try Self.removingExternalMCPSettings(from: data)
+            importedDocument = try Self.decoder.decode(GlobalSettingsDocument.self, from: sanitizedData)
         } catch {
             print("⚠️ Failed to decode compatible global settings import at \(fileURL.path): \(error)")
             return false
@@ -335,6 +352,8 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             copySettings: importedDocument.copySettings,
             chatSettings: importedDocument.chatSettings,
             agentModelsSettings: importedDocument.agentModelsSettings,
+            externalMCPConnections: importedDocument.externalMCPConnections ?? [],
+            externalMCPAccessByWorkspaceID: [:],
             globalDefaults: importedDocument.globalDefaults,
             scalarPreferences: importedDocument.scalarPreferences
         )
@@ -349,9 +368,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         } catch {
             // The backup is a copy. Failed atomic replacement leaves the original
             // primary and its observed generation available for another explicit import.
-            preservingUnsupportedFutureDocument = true
+            preservingUnsupportedFutureDocument = wasPreservingUnsupportedFutureDocument
+            preservingUnbackedCorruptDocument = wasPreservingUnbackedCorruptDocument
             requiresReload = true
-            blockReason = .incompatibleSchema
+            blockReason = originalBlockReason
             print("⚠️ Failed to import compatible global settings JSON at \(fileURL.path): \(error)")
             return false
         }
@@ -428,6 +448,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         }
         try ensureSettingsDirectoryExists()
         var documentToWrite = document
+        if let externalMCPConnections = documentToWrite.externalMCPConnections {
+            let retainedConnections = externalMCPConnections.filter(\.isPersistableAppWideState)
+            documentToWrite.externalMCPConnections = retainedConnections.isEmpty ? nil : retainedConnections
+        }
         documentToWrite.schemaVersion = documentToWrite.requiredSchemaVersion
         documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
         documentToWrite.updatedAt = now()
@@ -661,6 +685,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 onto: &rawRoot
             )
         }
+        for key in GlobalSettingsDocument.knownTopLevelPersistenceKeys where knownRoot[key] == nil {
+            rawRoot.removeValue(forKey: key)
+        }
+        rawRoot.removeValue(forKey: "externalMCPAccessByWorkspaceID")
 
         rawRoot["schemaVersion"] = knownRoot["schemaVersion"]
         rawRoot["schemaLineage"] = knownRoot["schemaLineage"]
@@ -831,6 +859,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             throw GlobalSettingsFileStoreError.unsupportedFutureSchemaPreserved
         }
         guard !preservingUnbackedCorruptDocument else {
+            if case .invalidExternalMCPSettings = blockReason {
+                throw GlobalSettingsFileStoreError.externalMCPConnectionSettingsInvalid
+            }
             if blockReason != .saveFailed {
                 blockReason = .corruptUnrecoverable
             }
@@ -846,10 +877,24 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             case .incompatibleSchema:
                 print("⚠️ Global settings JSON was written by a different or unrecognized RepoPrompt settings schema; preserving file and skipping save.")
                 throw GlobalSettingsFileStoreError.incompatibleSchemaPreserved
-            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed,
-                 .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
+            case .corruptUnrecoverable, .invalidExternalMCPSettings(_), .saveFailed,
+                 .automaticSchemaNormalizationFailed, .writerBusy, .changedOnDisk,
+                 .missingOnDisk, .loadFailed:
                 assertionFailure("Unexpected settings preservation reason during save: \(reason)")
                 throw GlobalSettingsFileStoreError.incompatibleSchemaPreserved
+            }
+        }
+        if let data = try? Data(contentsOf: fileURL) {
+            do {
+                try Self.validateRawExternalMCPSettings(data: data)
+            } catch let error as ExternalMCPIntegrationSettingsDecodingError {
+                preservingUnbackedCorruptDocument = true
+                blockReason = .invalidExternalMCPSettings(error.category)
+                throw GlobalSettingsFileStoreError.externalMCPConnectionSettingsInvalid
+            } catch {
+                preservingUnbackedCorruptDocument = true
+                blockReason = .invalidExternalMCPSettings(.wrongDefinitionType)
+                throw GlobalSettingsFileStoreError.externalMCPConnectionSettingsInvalid
             }
         }
     }
@@ -1069,6 +1114,97 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         return Self.preservationBlockReason(for: header)
     }
 
+    private func hasInvalidExternalMCPContentOnDisk() -> Bool {
+        guard fileManager.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: fileURL),
+              let header = try? Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data),
+              Self.preservationBlockReason(for: header) == nil
+        else {
+            return false
+        }
+        do {
+            let document = try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
+            try Self.validateExternalMCPContentSchema(header: header, document: document)
+            return false
+        } catch is ExternalMCPIntegrationSettingsDecodingError {
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func removingExternalMCPSettings(from data: Data) throws -> Data {
+        guard var root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ExternalMCPIntegrationSettingsDecodingError.wrongDefinitionType
+        }
+        root.removeValue(forKey: "externalMCPConnections")
+        root.removeValue(forKey: "externalMCPAccessByWorkspaceID")
+        return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+    }
+
+    private static func validateRawExternalMCPSettings(data: Data) throws {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        guard let rawExternal = root["externalMCPConnections"] else { return }
+        if rawExternal is NSNull { return }
+        guard let definitions = rawExternal as? [[String: Any]] else {
+            throw ExternalMCPIntegrationSettingsDecodingError.wrongContainerType
+        }
+        var providers = Set<String>()
+        let allowedKeys: Set = [
+            "provider", "serverName", "origin", "repoPromptActivation", "autoConnect", "agentModeAccessDefault"
+        ]
+        for definition in definitions {
+            guard Set(definition.keys).isSubset(of: allowedKeys) else {
+                throw ExternalMCPIntegrationSettingsDecodingError.unknownDefinitionField
+            }
+            guard let provider = definition["provider"] as? String,
+                  let serverName = definition["serverName"] as? String,
+                  let origin = definition["origin"] as? String
+            else { throw ExternalMCPIntegrationSettingsDecodingError.wrongDefinitionType }
+            guard provider == ExternalMCPIntegrationProvider.figma.rawValue,
+                  serverName == "figma",
+                  origin == ExternalMCPIntegrationOrigin.settingsManaged.rawValue
+                  || origin == ExternalMCPIntegrationOrigin.adoptedImport.rawValue
+            else { throw ExternalMCPIntegrationSettingsDecodingError.unsupportedDefinition }
+            guard providers.insert(provider).inserted else {
+                throw ExternalMCPIntegrationSettingsDecodingError.duplicateProvider
+            }
+            let activation: ExternalMCPIntegrationActivation
+            if let rawActivation = definition["repoPromptActivation"] {
+                guard let rawActivation = rawActivation as? String,
+                      let decodedActivation = ExternalMCPIntegrationActivation(rawValue: rawActivation)
+                else { throw ExternalMCPIntegrationSettingsDecodingError.invalidActivation }
+                activation = decodedActivation
+            } else {
+                activation = .enabled
+            }
+            guard origin == ExternalMCPIntegrationOrigin.settingsManaged.rawValue || activation == .enabled else {
+                throw ExternalMCPIntegrationSettingsDecodingError.unsupportedDefinition
+            }
+        }
+    }
+
+    private static func validateExternalMCPContentSchema(
+        header: GlobalSettingsDocumentHeader,
+        document: GlobalSettingsDocument
+    ) throws {
+        let hasExternalMCPContent = document.externalMCPConnections?.isEmpty == false
+        // The first MCP integration build wrote the already-known Figma definition under
+        // schema v4. Accept that same-lineage representation and let the next save upgrade
+        // it to the content-derived v5/v6 schema; reject older declarations that cannot have
+        // been written by the MCP integration migration.
+        guard hasExternalMCPContent,
+              header.schemaVersion < document.requiredSchemaVersion,
+              header.schemaVersion < GlobalSettingsDocument.workspaceAgentModelsSchemaVersion
+        else {
+            return
+        }
+        throw ExternalMCPIntegrationSettingsDecodingError.schemaVersionTooOld(
+            declaredVersion: header.schemaVersion,
+            requiredVersion: document.requiredSchemaVersion
+        )
+    }
+
     static func shouldPreserveWithoutLoading(
         schemaVersion: Int,
         schemaLineage: String?,
@@ -1135,6 +1271,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         case unsupportedFutureSchemaPreserved
         case incompatibleSchemaPreserved
         case corruptDocumentPreserved
+        case externalMCPConnectionSettingsInvalid
         case automaticSchemaNormalizationFailed
         case automaticSchemaNormalizationPreserved
         case startupMigrationRetryRequired

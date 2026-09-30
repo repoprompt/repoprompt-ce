@@ -2937,6 +2937,7 @@ import XCTest
             let originalTab = fixture.leftTab
             let originalTabCount = fixture.workspaceA.composeTabs.count
             let agentModeVM = AgentModeViewModel(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 testWorkspacePath: storageRoot.path,
                 codexControllerFactory: { _, _, _, _, _, _ in
                     AgentAdmissionNoopCodexController()
@@ -3197,6 +3198,7 @@ import XCTest
             fixture.manager.activeWorkspace = fixture.workspaceA
             fixture.prompt.loadComposeTabsFromWorkspace(fixture.workspaceA)
             let agentModeVM = AgentModeViewModel(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 testWorkspacePath: storageRoot.path,
                 codexControllerFactory: { _, _, _, _, _, _ in
                     AgentAdmissionNoopCodexController()
@@ -3418,6 +3420,7 @@ import XCTest
             fixture.prompt.loadComposeTabsFromWorkspace(fixture.workspaceA)
             let baselineTabIDs = fixture.workspaceA.composeTabs.map(\.id)
             let agentModeVM = AgentModeViewModel(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 testWorkspacePath: storageRoot.path,
                 codexControllerFactory: { _, _, _, _, _, _ in
                     AgentAdmissionNoopCodexController()
@@ -3579,6 +3582,7 @@ import XCTest
             let reconstructedSessionID = UUID()
             let restoredTabID = UUID()
             let agentModeVM = AgentModeViewModel(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 testWorkspacePath: storageRoot.path,
                 codexControllerFactory: { _, _, _, _, _, _ in
                     AgentAdmissionNoopCodexController()
@@ -3780,6 +3784,7 @@ import XCTest
             indexEntries: [UUID: AgentSessionIndexEntry] = [:]
         ) -> AgentModeViewModel {
             let viewModel = AgentModeViewModel(
+                externalMCPComposition: FigmaMCPTestGraph.make(),
                 testWorkspacePath: storageRoot.path,
                 codexControllerFactory: { _, _, _, _, _, _ in
                     AgentAdmissionNoopCodexController()

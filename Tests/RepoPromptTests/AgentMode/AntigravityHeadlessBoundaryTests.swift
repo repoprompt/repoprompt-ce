@@ -119,8 +119,13 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
         XCTAssertTrue(detail.contains("Agent Models settings"), file: file, line: line)
     }
 
+    @MainActor
     func testHeadlessFactoryFailsClosedInsteadOfFallingBackToAnotherProvider() async {
-        let provider = AgentRuntimeProviderService.shared.makeProvider(for: .antigravity, modelString: "gemini-placeholder")
+        let provider = AgentRuntimeProviderService.shared.makeProvider(
+            for: .antigravity,
+            modelString: "gemini-placeholder",
+            runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority()
+        )
         XCTAssertTrue(provider is UnsupportedHeadlessAgentProvider)
         XCTAssertFalse(provider is CodexExecAgentProvider)
         XCTAssertFalse(provider is GrokBuildACPHeadlessAgentProvider)

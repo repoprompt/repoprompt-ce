@@ -501,6 +501,7 @@ extension AgentComposerSubmissionAttemptTests {
         )
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)])
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Routing transaction test must not start Codex")
             },

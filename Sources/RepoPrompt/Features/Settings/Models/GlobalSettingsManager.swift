@@ -354,6 +354,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
+    /// Durable app-wide external MCP registrations. They intentionally contain no endpoint,
+    /// credentials, OAuth material, headers, or runtime state. Settings-managed disabled cleanup
+    /// tombstones are retained; disabled adopted imports are not valid persisted registrations.
+    @Published private(set) var externalMCPIntegrations: [ExternalMCPIntegrationDefinition] = []
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     @Published private(set) var nonGitCodeMapsEnabled: Bool = false
     @Published private(set) var modelRouterSettingsRevision: UInt64 = 0
@@ -505,6 +509,93 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         if commit {
             save()
         }
+    }
+
+    // MARK: - External MCP Integrations
+
+    func externalMCPIntegration(for provider: ExternalMCPIntegrationProvider) -> ExternalMCPIntegrationDefinition? {
+        externalMCPIntegrations.first { $0.provider == provider }
+    }
+
+    func externalMCPIntegration(for integrationID: ExternalMCPIntegrationID) -> ExternalMCPIntegrationDefinition? {
+        externalMCPIntegrations.first { $0.integrationID == integrationID }
+    }
+
+    @discardableResult
+    func setExternalMCPIntegration(_ definition: ExternalMCPIntegrationDefinition) -> Bool {
+        guard definition.isPersistableAppWideState else { return false }
+        let previous = externalMCPIntegrations
+        externalMCPIntegrations.removeAll { $0.provider == definition.provider }
+        externalMCPIntegrations.append(definition)
+        externalMCPIntegrations.sort { $0.provider.rawValue < $1.provider.rawValue }
+        guard save() else {
+            // Settings policy must be transactional: a failed durable save must not leave
+            // this process granting access that a second Settings window cannot observe.
+            externalMCPIntegrations = previous
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    func removeExternalMCPIntegration(for integrationID: ExternalMCPIntegrationID) -> Bool {
+        guard let definition = externalMCPIntegration(for: integrationID) else { return true }
+        return removeExternalMCPIntegration(for: definition.provider)
+    }
+
+    @discardableResult
+    func removeExternalMCPIntegration(for provider: ExternalMCPIntegrationProvider) -> Bool {
+        let previous = externalMCPIntegrations
+        externalMCPIntegrations.removeAll { $0.provider == provider }
+        guard externalMCPIntegrations != previous else { return true }
+        guard save() else {
+            externalMCPIntegrations = previous
+            return false
+        }
+        return true
+    }
+
+    /// Compatibility APIs for UI code compiled during the migration. Workspace policy is retired:
+    /// reads always inherit and writes are accepted as no-ops without touching persistence.
+    func externalMCPWorkspaceAccessPolicy(
+        for _: ExternalMCPIntegrationProvider,
+        workspaceID _: UUID?
+    ) -> ExternalMCPAgentAccessPolicy {
+        .inherit
+    }
+
+    @discardableResult
+    func setExternalMCPWorkspaceAccessPolicy(
+        _: ExternalMCPAgentAccessPolicy,
+        for _: ExternalMCPIntegrationProvider,
+        workspaceID _: UUID
+    ) -> Bool {
+        true
+    }
+
+    func resolvedFigmaMCPAgentAccess(
+        runtimeAvailability: ExternalMCPRuntimeAvailability
+    ) -> ExternalMCPAgentAccessResolution {
+        resolveExternalMCPAgentAccess(
+            definition: externalMCPIntegration(for: .figma),
+            runtimeAvailability: runtimeAvailability
+        )
+    }
+
+    func resolvedExternalMCPAgentAccess(
+        for provider: ExternalMCPIntegrationProvider,
+        workspaceID: UUID?,
+        runtimeAvailability: ExternalMCPRuntimeAvailability,
+        sessionPolicy: ExternalMCPAgentSessionPolicy,
+        windowOverride: ExternalMCPAgentAccessPolicy? = nil
+    ) -> ExternalMCPAgentAccessResolution {
+        resolveExternalMCPAgentAccess(
+            definition: externalMCPIntegration(for: provider),
+            runtimeAvailability: runtimeAvailability,
+            sessionPolicy: sessionPolicy,
+            windowOverride: windowOverride,
+            workspaceOverride: .inherit
+        )
     }
 
     // MARK: - Scoped Agent Models Settings
@@ -2684,6 +2775,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         )
         chatSettings = migratedContextBuilderState.chatSettings
         agentModelsSettingsByWorkspaceID = document.agentModelsSettings
+        externalMCPIntegrations = (document.externalMCPConnections ?? []).filter(\.isPersistableAppWideState)
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = migratedContextBuilderState.scalarPreferences
         let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
@@ -2787,6 +2879,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             )
             chatSettings = migratedContextBuilderState.chatSettings
             agentModelsSettingsByWorkspaceID = document.agentModelsSettings
+            externalMCPIntegrations = (document.externalMCPConnections ?? []).filter(\.isPersistableAppWideState)
             globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = migratedContextBuilderState.scalarPreferences
             let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
@@ -3110,6 +3203,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             copySettings: copySettings,
             chatSettings: chatSettings,
             agentModelsSettings: agentModelsSettingsByWorkspaceID,
+            externalMCPConnections: externalMCPIntegrations,
+            externalMCPAccessByWorkspaceID: [:],
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences
         )

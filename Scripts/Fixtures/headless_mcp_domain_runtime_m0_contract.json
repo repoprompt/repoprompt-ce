@@ -348,7 +348,7 @@
     "presenter_loss": "default_deny"
   },
   "main_actor": {
-    "mcp_local_declaration_count": 44,
+    "mcp_local_declaration_count": 45,
     "mcp_local_declaration_sites": [
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
@@ -408,6 +408,11 @@
         "presentation_role": "snapshot_projection_and_default_bootstrap_command_client",
         "mutable_domain_authority": false,
         "executable_tool_hop": false
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/External/ExternalMCPAdapterRegistry.swift",
+        "kind": "protocol",
+        "symbol": "ExternalMCPIntegrationSettingsStore"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPExternalEventsMonitor.swift",

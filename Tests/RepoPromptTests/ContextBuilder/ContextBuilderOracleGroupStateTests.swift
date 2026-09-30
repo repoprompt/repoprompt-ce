@@ -258,7 +258,8 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -883,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory
@@ -392,7 +393,8 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -884,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
 

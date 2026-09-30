@@ -13,7 +13,8 @@ final class OracleGroupProjectionRecoveryTests: XCTestCase {
             let composition = WindowStateCompositionFactory.make(
                 windowID: partial ? -2885 : -2884,
                 deferredInitialAgentSystemWorkspaceRefresh: true,
-                sharedMCPService: MCPService()
+                sharedMCPService: MCPService(),
+                externalMCPComposition: FigmaMCPTestGraph.make()
             )
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             await composition.workspaceManager.awaitInitialized()
@@ -166,7 +167,8 @@ final class OracleGroupProjectionRecoveryTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -2886,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         defer { composition.workspaceManager.prepareForWindowClose() }

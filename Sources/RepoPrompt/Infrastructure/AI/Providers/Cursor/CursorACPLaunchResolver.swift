@@ -82,6 +82,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     ) async throws -> CLIProcessRunner.Result
     typealias NowProvider = @Sendable () -> TimeInterval
     typealias DeadlineWaiter = @Sendable (_ deadline: TimeInterval) async -> Void
+    typealias TrustedShellPathProvider = @Sendable (_ environment: [String: String]) -> String?
 
     private enum ProbeProducerOutcome: @unchecked Sendable {
         case success(CLIProcessRunner.Result)
@@ -329,6 +330,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
 
     private let environmentProvider: EnvironmentProvider
     private let supplementalPathProvider: SupplementalPathProvider
+    private let trustedShellPathProvider: TrustedShellPathProvider
     private let probeRunner: ProbeRunner
     private let nowProvider: NowProvider
     private let deadlineWaiter: DeadlineWaiter
@@ -343,6 +345,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     private init(
         launchEnvironmentProvider: @escaping EnvironmentProvider,
         supplementalPathProvider: @escaping SupplementalPathProvider,
+        trustedShellPathProvider: @escaping TrustedShellPathProvider,
         probeRunner: @escaping ProbeRunner,
         nowProvider: @escaping NowProvider,
         deadlineWaiter: @escaping DeadlineWaiter,
@@ -351,6 +354,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     ) {
         environmentProvider = launchEnvironmentProvider
         self.supplementalPathProvider = supplementalPathProvider
+        self.trustedShellPathProvider = trustedShellPathProvider
         self.probeRunner = probeRunner
         self.nowProvider = nowProvider
         self.deadlineWaiter = deadlineWaiter
@@ -375,6 +379,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             supplementalPathProvider: {
                 CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults($0)
             },
+            trustedShellPathProvider: { _ in nil },
             probeRunner: { launch, config, timeout, timeoutCleanupPolicy in
                 try await CursorACPLaunchResolver.runProbe(
                     launch: launch,
@@ -412,6 +417,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
                 await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
             },
             supplementalPathProvider: supplementalPathProvider,
+            trustedShellPathProvider: { $0["SHELL"] },
             probeRunner: probeRunner,
             nowProvider: nowProvider,
             deadlineWaiter: deadlineWaiter,
@@ -440,6 +446,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         self.init(
             launchEnvironmentProvider: launchEnvironmentProvider,
             supplementalPathProvider: supplementalPathProvider,
+            trustedShellPathProvider: { _ in nil },
             probeRunner: probeRunner,
             nowProvider: nowProvider,
             deadlineWaiter: deadlineWaiter,
@@ -463,6 +470,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
                     await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
                 },
                 supplementalPathProvider: supplementalPathProvider,
+                trustedShellPathProvider: { $0["SHELL"] },
                 probeRunner: probeRunner,
                 nowProvider: nowProvider,
                 deadlineWaiter: deadlineWaiter,
@@ -850,7 +858,8 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
                 environment: environment,
                 additionalPaths: additionalPathHints,
                 preferredBasenames: [launchCandidate.command],
-                shellLookupMode: .fallbackOnly
+                shellLookupMode: .fallbackOnly,
+                trustedShellPath: trustedShellPathProvider(environment)
             ),
             entrypoint: launchCandidate
         )

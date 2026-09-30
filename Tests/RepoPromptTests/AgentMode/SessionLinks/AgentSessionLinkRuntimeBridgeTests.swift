@@ -650,6 +650,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 92,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -838,6 +839,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 94,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -998,6 +1000,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testACPApprovalWithoutOneTimeAllowWithholdsOnlyAcceptFromObserver() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 98,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -1083,6 +1086,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testManagedRespondAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 96,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -4299,6 +4303,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testIdleStopImmediatelyWithdrawsQueuedInboundSend() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 92,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
@@ -6212,7 +6217,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(externalMCPComposition: FigmaMCPTestGraph.make())
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let cleanup: @MainActor () async -> Void = {

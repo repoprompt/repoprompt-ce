@@ -55,7 +55,8 @@ enum CommandPathResolver {
         additionalPaths: [String],
         logger: ((String) -> Void)? = nil,
         preferredBasenames: [String]? = nil,
-        shellLookupMode: ShellLookupMode = .preferShell
+        shellLookupMode: ShellLookupMode = .preferShell,
+        trustedShellPath: String? = nil
     ) -> String {
         let expanded = expandPath(command, environment: environment)
         // Honor explicit paths only when they already point to a runnable executable file.
@@ -70,7 +71,8 @@ enum CommandPathResolver {
                environment: environment,
                additionalPaths: additionalPaths,
                logger: logger,
-               preferredBasenames: preferredBasenames
+               preferredBasenames: preferredBasenames,
+               trustedShellPath: trustedShellPath
            )
         {
             return shellResolved
@@ -87,7 +89,8 @@ enum CommandPathResolver {
                environment: environment,
                additionalPaths: additionalPaths,
                logger: logger,
-               preferredBasenames: preferredBasenames
+               preferredBasenames: preferredBasenames,
+               trustedShellPath: trustedShellPath
            )
         {
             return shellResolved
@@ -169,12 +172,14 @@ enum CommandPathResolver {
         environment: [String: String],
         additionalPaths: [String],
         logger: ((String) -> Void)?,
-        preferredBasenames: [String]?
+        preferredBasenames: [String]?,
+        trustedShellPath: String?
     ) -> String? {
         guard let shellResult = lookupViaInteractiveShell(
             expanded,
             environment: environment,
-            preferredBasenames: preferredBasenames
+            preferredBasenames: preferredBasenames,
+            trustedShellPath: trustedShellPath
         ) else { return nil }
         let shellPath = shellResult.path
         let isAliasTarget = shellResult.isAliasTarget
@@ -183,6 +188,14 @@ enum CommandPathResolver {
         if shellPath.contains("/") {
             logger?("Interactive shell resolved \(expanded) to \(shellPath)")
             commandPathResolverLog("Command '\(originalCommand)' -> '\(shellPath)' (via shell)")
+            return shellPath
+        }
+
+        // A shell may report a builtin using the bare command name. Preserve that
+        // result instead of replacing it with a same-named executable from PATH.
+        if !shellPath.contains("/"), shellPath == expanded, !isAliasTarget {
+            logger?("Interactive shell resolved builtin \(expanded)")
+            commandPathResolverLog("Command '\(originalCommand)' -> '\(shellPath)' (shell builtin)")
             return shellPath
         }
 
@@ -233,38 +246,35 @@ enum CommandPathResolver {
     private static func lookupViaInteractiveShell(
         _ command: String,
         environment: [String: String],
-        preferredBasenames: [String]?
+        preferredBasenames: [String]?,
+        trustedShellPath: String?
     ) -> (path: String, isAliasTarget: Bool)? {
-        let shellPath = environment["SHELL"] ?? userLoginShell()
-        guard let shellPath else { return nil }
-        let escapedCommand = command.replacingOccurrences(of: "\"", with: "\\\"")
+        // Never execute an inherited SHELL value: it is environment-controlled and may
+        // point at an arbitrary executable. The account's login shell is the production source;
+        // dependency-injected callers may provide an explicit trusted test shell.
+        guard let shellPath = trustedShellPath ?? userLoginShell() else { return nil }
         let sentinelBegin = "__RP_BEGIN__"
         let sentinelEnd = "__RP_END__"
         let expectedBasenames = Set((preferredBasenames ?? [command]).filter { !$0.isEmpty })
 
-        // Prefer quoted (robust in real shells), but also include a safe, unquoted fallback.
-        // Some lightweight/fake shells (like our test rig) pattern-match on the query text
-        // and expect `command -v foo` without quotes.
-        var queries: [String] = [
-            "printf '%s\\n' '\(sentinelBegin)'; command -v \"\(escapedCommand)\" 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'",
-            "printf '%s\\n' '\(sentinelBegin)'; which -a \"\(escapedCommand)\" 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'"
+        // Pass the command as a positional argument rather than interpolating it into the
+        // shell program. This prevents command substitutions and other shell syntax in an
+        // untrusted command name from being executed.
+        let queries = [
+            "printf '%s\\n' '\(sentinelBegin)'; command -v \"$1\" 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'",
+            "printf '%s\\n' '\(sentinelBegin)'; which -a \"$1\" 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'"
         ]
-        if isSafeUnquotedCommandName(command) {
-            queries.append("printf '%s\\n' '\(sentinelBegin)'; command -v \(command) 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'")
-            queries.append("printf '%s\\n' '\(sentinelBegin)'; which -a \(command) 2>/dev/null; printf '%s\\n' '\(sentinelEnd)'")
-        }
 
         for query in queries {
             let (status, stdoutData, _) = runShellQuery(
                 shellPath: shellPath,
-                arguments: ["-l", "-i", "-c", query],
+                arguments: ["-l", "-i", "-c", query, "CommandPathResolver", command],
                 environment: environment
             )
             guard status == 0, let output = String(data: stdoutData, encoding: .utf8) else { continue }
 
             let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
             var betweenSentinels = false
-            var fallbackCandidate: (String, Bool)?
             for rawLine in lines {
                 let line = String(rawLine)
                 if line == sentinelBegin { betweenSentinels = true
@@ -280,31 +290,17 @@ enum CommandPathResolver {
                 let isPathLike = expanded.contains("/") || expanded.hasPrefix("~")
                 let isPreferred = expectedBasenames.isEmpty || basenameMatches((expanded as NSString).lastPathComponent, expected: expectedBasenames)
 
-                let shouldAcceptImmediately: Bool
-                if candidate.isAliasTarget || isPathLike || isPreferred {
-                    shouldAcceptImmediately = true
-                } else {
-                    if fallbackCandidate == nil {
-                        fallbackCandidate = (expanded, candidate.isAliasTarget)
-                    }
-                    shouldAcceptImmediately = false
+                // Accept only an alias, an expected command name, or an existing
+                // executable path. This prevents lookup diagnostics from becoming
+                // fabricated paths after tokenization.
+                guard candidate.isAliasTarget || isPreferred || (isPathLike && isExecutableRegularFile(expanded)) else {
+                    continue
                 }
 
-                if shouldAcceptImmediately {
-                    if isExecutableRegularFile(expanded) { return (expanded, candidate.isAliasTarget) }
-                    return (expanded, candidate.isAliasTarget)
-                }
-            }
-            if let fallbackCandidate {
-                return fallbackCandidate
+                return (expanded, candidate.isAliasTarget)
             }
         }
         return nil
-    }
-
-    private static func isSafeUnquotedCommandName(_ s: String) -> Bool {
-        // Typical POSIX command names; avoid whitespace and shell metacharacters.
-        s.range(of: #"^[A-Za-z0-9._+-]+$"#, options: .regularExpression) != nil
     }
 
     /// Spawn a shell command and drain stdout/stderr concurrently to avoid pipe back-pressure deadlocks.
@@ -398,6 +394,13 @@ enum CommandPathResolver {
     static func sanitizedExecutableOutput(_ rawLine: String, originalCommand: String, preferredBasenames: [String]? = nil) -> (path: String, isAliasTarget: Bool)? {
         var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !line.isEmpty else { return nil }
+
+        // `which` writes lookup diagnostics to stdout on some shells. Never parse
+        // those diagnostics as executable paths or positional command fragments.
+        let lowercasedLine = line.lowercased()
+        guard !lowercasedLine.hasSuffix(" not found"),
+              !lowercasedLine.contains("shell built-in command")
+        else { return nil }
 
         var payload = line[...]
         var isAliasTarget = false
@@ -527,7 +530,6 @@ enum CommandPathResolver {
             if isEnvAssignment(token) { continue }
             if token == "is" || token == "=" { continue }
             if token.hasPrefix("$") { continue } // $@, $*, $1, etc.
-            if !isAliasTarget, token == originalCommand { continue }
             filtered.append(token)
         }
         guard !filtered.isEmpty else { return nil }

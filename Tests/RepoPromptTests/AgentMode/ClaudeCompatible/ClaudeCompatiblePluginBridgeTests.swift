@@ -31,6 +31,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertTrue(AgentModel.modelsForAgent(.claudeCode).contains(.claudeOpus55))
     }
 
+    @MainActor
     func testBridgeRuntimeSmokeMapsPluginIDsDiscoveryRuntimeAndHeadlessAdapters() throws {
         let cases: [(AgentProviderKind, String)] = [
             (.claudeCode, "claude-code"),
@@ -45,7 +46,8 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
 
             let provider = AgentRuntimeProviderService.shared.makeProvider(
                 for: agentKind,
-                modelString: "sonnet"
+                modelString: "sonnet",
+                runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority()
             )
             let adapter = try XCTUnwrap(provider as? ClaudeCompatibleHeadlessProviderAdapter)
             XCTAssertEqual(adapter.runtimeConfig.pluginID.rawValue, expectedPluginID)

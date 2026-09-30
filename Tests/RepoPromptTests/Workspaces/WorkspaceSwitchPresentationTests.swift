@@ -123,7 +123,8 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
         return WindowStateCompositionFactory.make(
             windowID: -1000 - Int.random(in: 1 ... 99),
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
     }
 }

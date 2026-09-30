@@ -327,6 +327,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let authRecovery = MonitorStubCodexAuthRecovery()
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             codexControllerFactory: { _, _, _, _, _, _ in controller },
@@ -1566,6 +1567,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         manager.activeWorkspace = workspace
 
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

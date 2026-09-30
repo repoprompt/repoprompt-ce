@@ -25,11 +25,11 @@ private func strictAdditionalOracleModelRaws(_ raws: [String], codingPath: [Codi
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
 /// workspace-scoped Agent Models profiles. Schema v5 fences the Context Builder
 /// behavior group from pre-Context-Builder typed writers. Schema v7 adds the Oracle
-/// roster. Schema v8 adds OpenCode-style ACP parameter pins to Agent Models profiles.
-/// Schema v9 adds the optional app-global model-router policy group. Schema v10
-/// adds global primary/subagent scope policy and custom router guidance.
-/// Scalar fields stay optional so missing JSON fields fall back through the
-/// typed GlobalSettingsStore accessors without losing current default behavior.
+/// roster. Schema v8 adds OpenCode-style ACP parameter pins and app-wide external MCP
+/// registrations. Schema v9 adds the model-router policy group and external MCP cleanup
+/// tombstones. Schema v10 adds global primary/subagent scope policy and custom router guidance.
+/// Scalar fields stay optional so missing JSON fields fall back through the typed
+/// GlobalSettingsStore accessors without losing current default behavior.
 struct GlobalSettingsDocument: Codable {
     /// Fixed feature-version constants are permanent compatibility boundaries. Add a new
     /// constant for each schema-requiring feature; never infer an existing feature's minimum
@@ -47,6 +47,12 @@ struct GlobalSettingsDocument: Codable {
     static let modelRouterSchemaVersion = 9
     static let scopedModelRouterSchemaVersion = 10
     static let rejectedExperimentalSchemaVersions = 6 ... 6
+    /// Schema v8 adds optional, nonsecret app-wide external MCP connection registrations.
+    /// Empty documents retain their earlier content-derived schema version for rollback compatibility.
+    static let externalMCPConnectionsSchemaVersion = 8
+    /// Schema v9 adds a disabled Settings-managed cleanup tombstone. Enabled registrations
+    /// remain schema-v8 content so older builds retain rollback compatibility for active connections.
+    static let externalMCPConnectionActivationSchemaVersion = 9
     static let currentSchemaVersion = 10
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
@@ -65,6 +71,12 @@ struct GlobalSettingsDocument: Codable {
     var copySettingsByWorkspaceID: [String: CopyGlobalSettings]
     var chatSettingsByWorkspaceID: [String: ChatGlobalSettings]
     var agentModelsSettingsByWorkspaceID: [String: WorkspaceAgentModelsSettings]?
+    /// App-scoped, nonsecret external MCP connection definitions. OAuth and other
+    /// credential material deliberately never belongs in this document.
+    var externalMCPConnections: [ExternalMCPIntegrationDefinition]?
+    /// Decode-only compatibility storage for the retired workspace access policy. New documents
+    /// always leave this nil, and decoded legacy content is discarded before it can affect runtime.
+    var externalMCPAccessByWorkspaceID: [String: ExternalMCPWorkspaceAccessOverrides]?
     var globalDefaults: GlobalDefaults
     var scalarPreferences: GlobalScalarPreferences?
 
@@ -74,6 +86,8 @@ struct GlobalSettingsDocument: Codable {
         copySettings: [UUID: CopyGlobalSettings] = [:],
         chatSettings: [UUID: ChatGlobalSettings] = [:],
         agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] = [:],
+        externalMCPConnections: [ExternalMCPIntegrationDefinition] = [],
+        externalMCPAccessByWorkspaceID: [UUID: ExternalMCPWorkspaceAccessOverrides] = [:],
         globalDefaults: GlobalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
         scalarPreferences: GlobalScalarPreferences? = nil
     ) {
@@ -85,6 +99,10 @@ struct GlobalSettingsDocument: Codable {
         agentModelsSettingsByWorkspaceID = agentModelsSettings.isEmpty
             ? nil
             : Self.encodeUUIDKeyedDictionary(agentModelsSettings)
+        let retainedConnections = externalMCPConnections.filter(\.isPersistableAppWideState)
+        self.externalMCPConnections = retainedConnections.isEmpty ? nil : retainedConnections
+        // Retired Figma workspace policy is intentionally never persisted.
+        self.externalMCPAccessByWorkspaceID = nil
         self.globalDefaults = globalDefaults
         self.scalarPreferences = scalarPreferences
     }
@@ -99,6 +117,48 @@ struct GlobalSettingsDocument: Codable {
 
     var agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] {
         Self.decodeUUIDKeyedDictionary(agentModelsSettingsByWorkspaceID ?? [:])
+    }
+
+    var externalMCPWorkspaceAccess: [UUID: ExternalMCPWorkspaceAccessOverrides] {
+        [:]
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case schemaVersion
+        case schemaLineage
+        case updatedAt
+        case copySettingsByWorkspaceID
+        case chatSettingsByWorkspaceID
+        case agentModelsSettingsByWorkspaceID
+        case externalMCPConnections
+        case externalMCPAccessByWorkspaceID
+        case globalDefaults
+        case scalarPreferences
+    }
+
+    /// Top-level keys owned by this schema. File-store preservation may retain only keys outside
+    /// this set when the newly encoded document omits an optional known field.
+    static let knownTopLevelPersistenceKeys = Set(CodingKeys.allCases.map(\.stringValue))
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        schemaLineage = try container.decodeIfPresent(String.self, forKey: .schemaLineage)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        copySettingsByWorkspaceID = try container.decodeIfPresent([String: CopyGlobalSettings].self, forKey: .copySettingsByWorkspaceID) ?? [:]
+        chatSettingsByWorkspaceID = try container.decodeIfPresent([String: ChatGlobalSettings].self, forKey: .chatSettingsByWorkspaceID) ?? [:]
+        agentModelsSettingsByWorkspaceID = try container.decodeIfPresent([String: WorkspaceAgentModelsSettings].self, forKey: .agentModelsSettingsByWorkspaceID)
+        let decodedConnections = try container.decodeIfPresent([ExternalMCPIntegrationDefinition].self, forKey: .externalMCPConnections) ?? []
+        guard Set(decodedConnections.map(\.provider)).count == decodedConnections.count else {
+            throw ExternalMCPIntegrationSettingsDecodingError.duplicateProvider
+        }
+        let retainedConnections = decodedConnections.filter(\.isPersistableAppWideState)
+        externalMCPConnections = retainedConnections.isEmpty ? nil : retainedConnections
+        // Decode compatibility is provided by accepting this known key without interpreting its
+        // value. Workspace policy can no longer block loading or influence Figma availability.
+        externalMCPAccessByWorkspaceID = nil
+        globalDefaults = try container.decodeIfPresent(GlobalDefaults.self, forKey: .globalDefaults) ?? GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
+        scalarPreferences = try container.decodeIfPresent(GlobalScalarPreferences.self, forKey: .scalarPreferences)
     }
 
     /// Lowest CE schema version that can faithfully represent this document's content.
@@ -120,6 +180,12 @@ struct GlobalSettingsDocument: Codable {
         }
         if hasGlobalOracleRoster || hasWorkspaceOracleRoster {
             requiredVersion = max(requiredVersion, Self.oracleRosterSchemaVersion)
+        }
+        if externalMCPConnections?.isEmpty == false {
+            requiredVersion = max(requiredVersion, Self.externalMCPConnectionsSchemaVersion)
+        }
+        if externalMCPConnections?.contains(where: \.isCleanupTombstone) == true {
+            requiredVersion = max(requiredVersion, Self.externalMCPConnectionActivationSchemaVersion)
         }
         let hasGlobalParameterPins = globalDefaults.mcpAgentRoleModelParameters?.isEmpty == false
             || globalDefaults.contextBuilderModelParametersByAgent?.isEmpty == false
@@ -146,6 +212,8 @@ struct GlobalSettingsDocument: Codable {
         copySettings: [UUID: CopyGlobalSettings],
         chatSettings: [UUID: ChatGlobalSettings],
         agentModelsSettings: [UUID: WorkspaceAgentModelsSettings],
+        externalMCPConnections: [ExternalMCPIntegrationDefinition] = [],
+        externalMCPAccessByWorkspaceID: [UUID: ExternalMCPWorkspaceAccessOverrides] = [:],
         globalDefaults: GlobalDefaults,
         scalarPreferences: GlobalScalarPreferences? = nil,
         updatedAt: Date = Date()
@@ -156,6 +224,8 @@ struct GlobalSettingsDocument: Codable {
             copySettings: copySettings,
             chatSettings: chatSettings,
             agentModelsSettings: agentModelsSettings,
+            externalMCPConnections: externalMCPConnections,
+            externalMCPAccessByWorkspaceID: [:],
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences ?? self.scalarPreferences
         )
@@ -178,6 +248,352 @@ struct GlobalSettingsDocument: Codable {
         }
         return winners.mapValues(\.value)
     }
+}
+
+// MARK: - External MCP Connection Settings
+
+/// Typed decode failures for external MCP settings must preserve the current document and
+/// surface the existing Settings recovery UI instead of silently repairing connection policy.
+enum ExternalMCPIntegrationSettingsDecodingError: Error, Equatable {
+    case wrongContainerType
+    case wrongDefinitionType
+    case unknownDefinitionField
+    case invalidActivation
+    case unsupportedDefinition
+    case duplicateProvider
+    case unsupportedWorkspaceOverride
+    case schemaVersionTooOld(declaredVersion: Int, requiredVersion: Int)
+
+    var category: GlobalSettingsExternalMCPInvalidCategory {
+        switch self {
+        case .wrongContainerType: .wrongContainerType
+        case .wrongDefinitionType: .wrongDefinitionType
+        case .unknownDefinitionField: .unknownDefinitionField
+        case .invalidActivation: .invalidActivation
+        case .unsupportedDefinition: .unsupportedDefinition
+        case .duplicateProvider: .duplicateProvider
+        case .unsupportedWorkspaceOverride: .unsupportedWorkspaceOverride
+        case .schemaVersionTooOld: .schemaVersionTooOld
+        }
+    }
+}
+
+enum GlobalSettingsExternalMCPInvalidCategory: String, Equatable {
+    case wrongContainerType
+    case wrongDefinitionType
+    case unknownDefinitionField
+    case invalidActivation
+    case unsupportedDefinition
+    case unsupportedWorkspaceOverride
+    case duplicateProvider
+    case schemaVersionTooOld
+}
+
+/// Providers which RepoPrompt can configure as Codex-managed external MCP connections.
+/// The initial schema intentionally supports only Figma; adding a provider requires an
+/// explicit model and validation review rather than accepting arbitrary remote endpoints.
+enum ExternalMCPIntegrationProvider: String, Codable, CaseIterable, Equatable, Hashable {
+    case figma
+}
+
+/// Durable origin of an external MCP definition.
+///
+/// Settings-managed registrations are created and owned by RepoPrompt. An adopted import
+/// records a user-confirmed, pre-existing Figma server identity without claiming ownership
+/// of the external Codex configuration that supplied it. Both origins remain nonsecret.
+enum ExternalMCPIntegrationOrigin: String, Codable, Equatable {
+    case settingsManaged
+    case adoptedImport
+}
+
+/// Whether RepoPrompt may operate a retained external MCP connection. `.disabled` is reserved
+/// for a Settings-managed cleanup tombstone after explicit sign-out has already revoked access.
+enum ExternalMCPIntegrationActivation: String, Codable, CaseIterable, Equatable {
+    case enabled
+    case disabled
+}
+
+/// Legacy decode/UI compatibility for the retired Figma access policy. These values no longer
+/// participate in runtime resolution and are never written into a Figma registration.
+enum ExternalMCPAgentAccessPolicy: String, Codable, CaseIterable, Equatable {
+    case inherit
+    case allow
+    case deny
+}
+
+/// Nonsecret, app-scoped definition for a supported external MCP connection. The fixed
+/// endpoint, OAuth session, headers, arguments, token material, and runtime fingerprint
+/// remain in the Codex integration layer and are deliberately absent from JSON settings.
+struct ExternalMCPIntegrationDefinition: Codable, Equatable, Identifiable {
+    let provider: ExternalMCPIntegrationProvider
+    let serverName: String
+    let origin: ExternalMCPIntegrationOrigin
+    var repoPromptActivation: ExternalMCPIntegrationActivation
+
+    /// Compatibility projections for UI code compiled during the migration. An enabled app-wide
+    /// registration always reconnects and is always available to Agent Mode; assignments are ignored.
+    var autoConnect: Bool {
+        get { repoPromptActivation == .enabled }
+        set {}
+    }
+
+    var agentModeAccessDefault: ExternalMCPAgentAccessPolicy {
+        get { repoPromptActivation == .enabled ? .allow : .deny }
+        set {}
+    }
+
+    var id: ExternalMCPIntegrationProvider {
+        provider
+    }
+
+    /// Whether this definition has the fixed supported Figma identity.
+    var isSupportedDefinition: Bool {
+        Self.isSupported(provider: provider, serverName: serverName, origin: origin)
+    }
+
+    /// Enabled supported Figma registrations and Settings-managed cleanup tombstones are
+    /// persisted. A disabled adopted import is not a valid dormant policy.
+    var isPersistableAppWideState: Bool {
+        isSupportedDefinition && (repoPromptActivation == .enabled || isCleanupTombstone)
+    }
+
+    /// Identifies a legacy disabled marker so callers can clear stale in-memory values too.
+    var isCleanupTombstone: Bool {
+        origin == .settingsManaged && repoPromptActivation == .disabled
+    }
+
+    /// Retained for callers that need to decide whether RepoPrompt may manage its own
+    /// registration. Adopted imports must not be treated as Settings-owned configuration.
+    var isSupportedSettingsManagedDefinition: Bool {
+        origin == .settingsManaged && isSupportedDefinition
+    }
+
+    init(
+        provider: ExternalMCPIntegrationProvider,
+        serverName: String,
+        origin: ExternalMCPIntegrationOrigin = .settingsManaged,
+        autoConnect: Bool = false,
+        agentModeAccessDefault: ExternalMCPAgentAccessPolicy = .deny,
+        repoPromptActivation: ExternalMCPIntegrationActivation = .enabled
+    ) {
+        precondition(
+            Self.isSupported(provider: provider, serverName: serverName, origin: origin),
+            "External MCP connection definitions must use a supported Figma identity and origin"
+        )
+        self.provider = provider
+        self.serverName = serverName
+        self.origin = origin
+        self.repoPromptActivation = repoPromptActivation
+    }
+
+    static func figma(
+        autoConnect: Bool = false,
+        agentModeAccessDefault: ExternalMCPAgentAccessPolicy = .deny,
+        repoPromptActivation: ExternalMCPIntegrationActivation = .enabled
+    ) -> ExternalMCPIntegrationDefinition {
+        ExternalMCPIntegrationDefinition(
+            provider: .figma,
+            serverName: "figma",
+            origin: .settingsManaged,
+            autoConnect: autoConnect,
+            agentModeAccessDefault: agentModeAccessDefault,
+            repoPromptActivation: repoPromptActivation
+        )
+    }
+
+    /// User-initiated adoption of the existing canonical Figma import. `serverName` is
+    /// deliberately persisted as the stable runtime identity; endpoints, OAuth state, and
+    /// configuration provenance remain outside Settings JSON.
+    static func adoptedFigmaImport(
+        autoConnect: Bool = false,
+        agentModeAccessDefault: ExternalMCPAgentAccessPolicy = .deny,
+        repoPromptActivation: ExternalMCPIntegrationActivation = .enabled
+    ) -> ExternalMCPIntegrationDefinition {
+        ExternalMCPIntegrationDefinition(
+            provider: .figma,
+            serverName: "figma",
+            origin: .adoptedImport,
+            autoConnect: autoConnect,
+            agentModeAccessDefault: agentModeAccessDefault,
+            repoPromptActivation: repoPromptActivation
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case serverName
+        case origin
+        case autoConnect
+        case agentModeAccessDefault
+        case repoPromptActivation
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let provider = try container.decode(ExternalMCPIntegrationProvider.self, forKey: .provider)
+        let serverName = try container.decode(String.self, forKey: .serverName)
+        let origin = try container.decode(ExternalMCPIntegrationOrigin.self, forKey: .origin)
+        // Retired auto-connect and access-policy keys are deliberately not decoded. This makes
+        // legacy values harmless even when they contain types or enum cases current code does not know.
+        let repoPromptActivation: ExternalMCPIntegrationActivation
+        do {
+            repoPromptActivation = try container.decodeIfPresent(
+                ExternalMCPIntegrationActivation.self,
+                forKey: .repoPromptActivation
+            ) ?? .enabled
+        } catch {
+            throw ExternalMCPIntegrationSettingsDecodingError.unsupportedDefinition
+        }
+
+        guard Self.isSupported(provider: provider, serverName: serverName, origin: origin) else {
+            throw ExternalMCPIntegrationSettingsDecodingError.unsupportedDefinition
+        }
+        guard origin == .settingsManaged || repoPromptActivation == .enabled else {
+            throw ExternalMCPIntegrationSettingsDecodingError.unsupportedDefinition
+        }
+        self.init(
+            provider: provider,
+            serverName: serverName,
+            origin: origin,
+            repoPromptActivation: repoPromptActivation
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(serverName, forKey: .serverName)
+        try container.encode(origin, forKey: .origin)
+        if repoPromptActivation != .enabled {
+            try container.encode(repoPromptActivation, forKey: .repoPromptActivation)
+        }
+    }
+
+    private static func isSupported(
+        provider: ExternalMCPIntegrationProvider,
+        serverName: String,
+        origin: ExternalMCPIntegrationOrigin
+    ) -> Bool {
+        provider == .figma
+            && serverName == "figma"
+            && (origin == .settingsManaged || origin == .adoptedImport)
+    }
+}
+
+/// Decode-only compatibility model for the retired workspace policy. Global settings discard
+/// these values on load and never encode them again.
+struct ExternalMCPWorkspaceAccessOverrides: Codable, Equatable {
+    private var accessByServerName: [String: ExternalMCPAgentAccessPolicy]
+
+    init(accessByServerName: [String: ExternalMCPAgentAccessPolicy] = [:]) {
+        self.accessByServerName = Self.validated(accessByServerName)
+    }
+
+    func policy(for provider: ExternalMCPIntegrationProvider) -> ExternalMCPAgentAccessPolicy {
+        accessByServerName[Self.serverName(for: provider)] ?? .inherit
+    }
+
+    mutating func setPolicy(
+        _ policy: ExternalMCPAgentAccessPolicy,
+        for provider: ExternalMCPIntegrationProvider
+    ) {
+        accessByServerName[Self.serverName(for: provider)] = policy
+    }
+
+    var isEmpty: Bool {
+        accessByServerName.isEmpty
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accessByServerName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let values = try container.decodeIfPresent([String: ExternalMCPAgentAccessPolicy].self, forKey: .accessByServerName) ?? [:]
+        guard values.keys.allSatisfy({ $0 == "figma" }) else {
+            throw ExternalMCPIntegrationSettingsDecodingError.unsupportedWorkspaceOverride
+        }
+        accessByServerName = values
+    }
+
+    private static func validated(
+        _ values: [String: ExternalMCPAgentAccessPolicy]
+    ) -> [String: ExternalMCPAgentAccessPolicy] {
+        values.reduce(into: [:]) { result, entry in
+            guard entry.key == "figma" else { return }
+            result[entry.key] = entry.value
+        }
+    }
+
+    private static func serverName(for provider: ExternalMCPIntegrationProvider) -> String {
+        switch provider {
+        case .figma:
+            "figma"
+        }
+    }
+}
+
+/// Inputs supplied by the runtime before settings policy can grant Agent Mode access.
+enum ExternalMCPRuntimeAvailability: Equatable {
+    case available
+    case unavailable
+    case disabled
+    case externallyExplicitlyDisabled
+}
+
+/// Legacy call-site compatibility. Figma availability no longer varies by session hierarchy.
+enum ExternalMCPAgentSessionPolicy: Equatable {
+    case normal
+    case safeManagedChild
+    case headless
+}
+
+enum ExternalMCPAgentAccessSource: Equatable {
+    case unavailable
+    case runtimeDisabled
+    case externalExplicitDisable
+    case connectionDisabled
+    case safeManagedChild
+    case headless
+    case windowOverride
+    case workspaceOverride
+    case appDefault
+}
+
+struct ExternalMCPAgentAccessResolution: Equatable {
+    let isAllowed: Bool
+    let source: ExternalMCPAgentAccessSource
+}
+
+/// Resolves only the fixed, read-only Figma integration. Generic third-party MCP policy remains
+/// in the Codex runtime and is deliberately not represented by this Figma-specific model.
+func resolveExternalMCPAgentAccess(
+    definition: ExternalMCPIntegrationDefinition?,
+    runtimeAvailability: ExternalMCPRuntimeAvailability,
+    sessionPolicy _: ExternalMCPAgentSessionPolicy = .normal,
+    windowOverride _: ExternalMCPAgentAccessPolicy? = nil,
+    workspaceOverride _: ExternalMCPAgentAccessPolicy = .inherit
+) -> ExternalMCPAgentAccessResolution {
+    guard let definition,
+          definition.provider == .figma
+    else {
+        return .init(isAllowed: false, source: .unavailable)
+    }
+    switch runtimeAvailability {
+    case .available:
+        break
+    case .unavailable:
+        return .init(isAllowed: false, source: .unavailable)
+    case .disabled:
+        return .init(isAllowed: false, source: .runtimeDisabled)
+    case .externallyExplicitlyDisabled:
+        return .init(isAllowed: false, source: .externalExplicitDisable)
+    }
+    guard definition.repoPromptActivation == .enabled else {
+        return .init(isAllowed: false, source: .connectionDisabled)
+    }
+    return .init(isAllowed: true, source: .appDefault)
 }
 
 // MARK: - Scoped Agent Models Settings

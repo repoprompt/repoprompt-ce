@@ -483,6 +483,7 @@ final class ContextBuilderGlobalBehaviorSettingsTests: XCTestCase {
             windowID: -602,
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             settingsStore: store
         )
         await composition.workspaceManager.awaitInitialized()

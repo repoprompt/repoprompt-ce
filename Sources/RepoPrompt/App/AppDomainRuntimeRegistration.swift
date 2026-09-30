@@ -4,6 +4,27 @@ import RepoPromptDomainRuntime
 
 private let appDomainRegistrationLog = Logger(label: "com.repoprompt.mcp.domain-registration")
 
+extension MCPDomainRuntime {
+    /// Converts app-owned tools into the bindings published by the domain registry.
+    /// Long-running work is wrapped first so protected mutation remains the outer
+    /// policy boundary, matching the normal and atomic registration paths.
+    nonisolated func prepareAppDomainBindings(
+        tools: [Tool],
+        interactionAdapter: DomainLongRunningInteractionAdapter?
+    ) throws -> [MCPDomainToolBinding] {
+        try tools.map { tool in
+            let domainBinding = try tool.domainBinding()
+            let longRunningBinding = longRunningToolProvider.wrapping(
+                domainBinding,
+                interactionAdapter: domainBinding.definition.name == MCPWindowToolName.askUser
+                    ? interactionAdapter
+                    : nil
+            )
+            return protectedMutationProvider.protectedBinding(longRunningBinding)
+        }
+    }
+}
+
 /// App composition operations over the runtime-owned catalog registry.
 extension AppDomainRuntimeComposition {
     @MainActor
@@ -51,17 +72,10 @@ extension AppDomainRuntimeComposition {
         #endif
         let bindings: [MCPDomainToolBinding]
         do {
-            let domainRuntime = runtime
-            bindings = try tools.map {
-                let domainBinding = try $0.domainBinding()
-                let longRunningBinding = domainRuntime.longRunningToolProvider.wrapping(
-                    domainBinding,
-                    interactionAdapter: domainBinding.definition.name == MCPWindowToolName.askUser
-                        ? interactionAdapter
-                        : nil
-                )
-                return try domainRuntime.protectedMutationProvider.protectedBinding(longRunningBinding)
-            }
+            bindings = try runtime.prepareAppDomainBindings(
+                tools: tools,
+                interactionAdapter: interactionAdapter
+            )
         } catch {
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(

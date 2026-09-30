@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -49,6 +50,33 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             runtime.redactedDiagnosticSummary.contains("version=\(CodexRuntimeAuthority.bundledVersion)")
         )
         XCTAssertFalse(runtime.redactedDiagnosticSummary.contains(temporaryDirectory.path))
+    }
+
+    func testPrepareStateRejectsSymlinkedIsolatedDirectory() throws {
+        let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
+        let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        _ = try makePackage(in: resources, target: "aarch64-apple-darwin")
+        let runtime = try CodexRuntimeAuthority.resolve(
+            resourcesURL: resources,
+            architectureTarget: "aarch64-apple-darwin",
+            applicationSupportURL: support
+        ).get()
+        try FileManager.default.createDirectory(
+            at: runtime.statePaths.codexHome.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let redirected = temporaryDirectory.appendingPathComponent("redirected-codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: redirected, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: runtime.statePaths.codexHome, withDestinationURL: redirected)
+
+        XCTAssertThrowsError(try runtime.prepareState())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: runtime.statePaths.sqliteHome.path))
+    }
+
+    func testManagedDirectoryOwnershipRejectsForeignOrMissingOwner() {
+        XCTAssertTrue(CodexRuntimeAuthority.Runtime.test_isManagedDirectoryOwnedByCurrentUser(getuid()))
+        XCTAssertFalse(CodexRuntimeAuthority.Runtime.test_isManagedDirectoryOwnedByCurrentUser(getuid() &+ 1))
+        XCTAssertFalse(CodexRuntimeAuthority.Runtime.test_isManagedDirectoryOwnedByCurrentUser(nil))
     }
 
     func testRuntimePrepareStateProjectsGlobalInstructionsIntoManagedCodexHome() throws {

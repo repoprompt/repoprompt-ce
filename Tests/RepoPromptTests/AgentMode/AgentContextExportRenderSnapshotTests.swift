@@ -89,6 +89,7 @@ final class AgentContextExportRenderSnapshotTests: XCTestCase {
 
     private func makeAgentModeViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: -990,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in

@@ -22,23 +22,73 @@ final class CommandPathResolverShellLookupModeTests: XCTestCase {
         )
     }
 
-    func testPreferShellPreservesShellFirstResolution() throws {
-        let fixture = try makeResolverFixture(prefix: "resolver-prefer-shell")
+    func testPreferShellDoesNotExecuteInheritedShell() throws {
+        // Keep the command name out of the host login shell's PATH so this test remains isolated.
+        let command = "repoprompt-test-codex-\(UUID().uuidString.lowercased())"
+        let fixture = try makeResolverFixture(prefix: "resolver-prefer-shell", command: command)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
         let resolved = CommandPathResolver.resolve(
-            "codex",
+            command,
             environment: fixture.environment,
             additionalPaths: [],
-            preferredBasenames: ["codex"],
+            preferredBasenames: [command],
             shellLookupMode: .preferShell
         )
 
-        XCTAssertEqual(resolved, fixture.shellExecutable.path)
-        XCTAssertTrue(
+        XCTAssertEqual(resolved, fixture.pathExecutable.path)
+        XCTAssertFalse(
             FileManager.default.fileExists(atPath: fixture.shellInvocationMarker.path),
-            "preferShell should query the shell before PATH search"
+            "preferShell must not execute an inherited SHELL value"
         )
+    }
+
+    func testPreferShellUsesTrustedLoginShellBeforePathSearch() throws {
+        let fixture = try makeResolverFixture(prefix: "resolver-trusted-login-shell", command: "cd")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let resolved = CommandPathResolver.resolve(
+            "cd",
+            environment: fixture.environment,
+            additionalPaths: [],
+            preferredBasenames: ["cd"],
+            shellLookupMode: .preferShell
+        )
+
+        XCTAssertEqual(resolved, "cd", "preferShell should preserve the login shell builtin resolution")
+        XCTAssertNotEqual(resolved, fixture.pathExecutable.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.shellInvocationMarker.path))
+    }
+
+    func testShellLookupDoesNotInterpretPositionalCommandSyntax() throws {
+        let fixture = try makeResolverFixture(prefix: "resolver-command-injection")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let marker = fixture.root.appendingPathComponent("command-injected").path
+        let commands = [
+            "codex`touch \(marker)`",
+            "codex; touch \(marker)",
+            "codex\n touch \(marker)",
+            "-codex touch \(marker)"
+        ]
+
+        for command in commands {
+            let resolved = CommandPathResolver.resolve(
+                command,
+                environment: fixture.environment,
+                additionalPaths: [],
+                preferredBasenames: [command],
+                shellLookupMode: .preferShell
+            )
+
+            XCTAssertEqual(resolved, command)
+        }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("command-injected").path),
+            "positional command arguments must not be interpreted as shell source"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.shellInvocationMarker.path))
     }
 
     private struct ResolverFixture {
@@ -49,7 +99,7 @@ final class CommandPathResolverShellLookupModeTests: XCTestCase {
         let environment: [String: String]
     }
 
-    private func makeResolverFixture(prefix: String) throws -> ResolverFixture {
+    private func makeResolverFixture(prefix: String, command: String = "codex") throws -> ResolverFixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptTests-")
             .appendingPathComponent(prefix + "-" + UUID().uuidString, isDirectory: true)
@@ -58,8 +108,8 @@ final class CommandPathResolverShellLookupModeTests: XCTestCase {
         try FileManager.default.createDirectory(at: pathBin, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: shellBin, withIntermediateDirectories: true)
 
-        let pathExecutable = pathBin.appendingPathComponent("codex")
-        let shellExecutable = shellBin.appendingPathComponent("codex")
+        let pathExecutable = pathBin.appendingPathComponent(command)
+        let shellExecutable = shellBin.appendingPathComponent(command)
         let shellInvocationMarker = root.appendingPathComponent("shell-was-invoked")
         let fakeShell = root.appendingPathComponent("fake-shell")
 

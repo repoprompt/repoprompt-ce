@@ -729,6 +729,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         manager.activeWorkspace = workspace
 
         let viewModel = AgentModeViewModel(
+            externalMCPComposition: FigmaMCPTestGraph.make(),
             testWindowID: 1,
             testWorkspacePath: directory.path,
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },

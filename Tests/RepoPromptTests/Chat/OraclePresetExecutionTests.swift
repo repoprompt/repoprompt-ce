@@ -10,7 +10,8 @@ final class OraclePresetExecutionTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9321,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory
@@ -217,7 +218,8 @@ final class OraclePresetExecutionTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9324,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory
@@ -367,7 +369,8 @@ final class OraclePresetExecutionTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9322,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory
@@ -612,7 +615,8 @@ final class OraclePresetExecutionTests: XCTestCase {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9323,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: MCPService()
+            sharedMCPService: MCPService(),
+            externalMCPComposition: FigmaMCPTestGraph.make()
         )
         await composition.workspaceManager.awaitInitialized()
         let root = FileManager.default.temporaryDirectory

@@ -10,6 +10,68 @@ struct AgentContextUsage: Codable, Equatable {
     var totalTotalTokens: Int?
 }
 
+@MainActor
+private final class FigmaMCPAgentBindingTracker {
+    struct Identity: Hashable {
+        let tabID: UUID
+        let runID: UUID
+        let controllerBindingID: UUID
+    }
+
+    struct RunKey: Hashable {
+        let tabID: UUID
+        let runID: UUID
+    }
+
+    private var boundIdentities = Set<Identity>()
+    private var externalLeasesByIdentity: [Identity: ExternalMCPRuntimeBindingLease] = [:]
+
+    func record(tabID: UUID, runID: UUID, controllerBindingID: UUID, isAllowed: Bool) {
+        let identity = Identity(tabID: tabID, runID: runID, controllerBindingID: controllerBindingID)
+        if isAllowed {
+            boundIdentities.insert(identity)
+        } else {
+            boundIdentities.remove(identity)
+            externalLeasesByIdentity.removeValue(forKey: identity)
+        }
+    }
+
+    func recordExternalMCPBinding(
+        tabID: UUID,
+        runID: UUID,
+        lease: ExternalMCPRuntimeBindingLease
+    ) {
+        let identity = Identity(tabID: tabID, runID: runID, controllerBindingID: lease.bindingID)
+        boundIdentities.insert(identity)
+        externalLeasesByIdentity[identity] = lease
+    }
+
+    func retire(_ identity: Identity) {
+        boundIdentities.remove(identity)
+        externalLeasesByIdentity.removeValue(forKey: identity)
+    }
+
+    func retireAll(forRunID runID: UUID) {
+        boundIdentities = boundIdentities.filter { $0.runID != runID }
+        externalLeasesByIdentity = externalLeasesByIdentity.filter { $0.key.runID != runID }
+    }
+
+    func contains(_ identity: Identity) -> Bool {
+        boundIdentities.contains(identity)
+    }
+
+    func takeAllBoundBindings() -> (identities: Set<Identity>, externalLeasesByRun: [RunKey: [ExternalMCPRuntimeBindingLease]]) {
+        let identities = boundIdentities
+        var externalLeasesByRun: [RunKey: [ExternalMCPRuntimeBindingLease]] = [:]
+        for (identity, lease) in externalLeasesByIdentity {
+            externalLeasesByRun[RunKey(tabID: identity.tabID, runID: identity.runID), default: []].append(lease)
+        }
+        boundIdentities.removeAll()
+        externalLeasesByIdentity.removeAll()
+        return (identities, externalLeasesByRun)
+    }
+}
+
 // MARK: - Agent Mode View Model
 
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
@@ -49,6 +111,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
     typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
+    typealias ACPProviderFactoryWithExternalMCP = (_ runID: UUID, _ runRequest: ACPRunRequest) async throws -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
         _ clientName: String,
@@ -721,8 +784,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// picker tests never touch a live ACP process.
     private let openCodeModelParameterStreamProvider: (String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>
     private let skillCatalog: AgentSkillCatalog
+    private let figmaSettingsStore: GlobalSettingsStore?
+    private let figmaMCPIntegrationCoordinator: FigmaMCPIntegrationCoordinator
+    private let externalMCPComposition: AppExternalMCPComposition
+    private let figmaBindingTracker: FigmaMCPAgentBindingTracker
     private let headlessProviderFactory: HeadlessProviderFactory
     private let acpProviderFactory: ACPProviderFactory
+    private let acpProviderFactoryWithExternalMCP: ACPProviderFactoryWithExternalMCP?
     private let acpControllerFactory: ACPControllerFactory
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let mcpServerEnabler: MCPServerEnabler
@@ -1234,6 +1302,44 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_installLiveSession(_ session: TabSession) {
             sessions[session.tabID] = session
+        }
+
+        func test_recordFigmaEnabledBinding(
+            tabID: UUID,
+            controllerBindingID: UUID? = nil,
+            isAllowed: Bool = true
+        ) {
+            guard let runID = sessions[tabID]?.runID else { return }
+            figmaBindingTracker.record(
+                tabID: tabID,
+                runID: runID,
+                controllerBindingID: controllerBindingID ?? tabID,
+                isAllowed: isAllowed
+            )
+        }
+
+        func test_retireFigmaBinding(
+            tabID: UUID,
+            runID: UUID,
+            controllerBindingID: UUID
+        ) {
+            figmaBindingTracker.retire(
+                .init(tabID: tabID, runID: runID, controllerBindingID: controllerBindingID)
+            )
+        }
+
+        func test_hasFigmaBinding(
+            tabID: UUID,
+            runID: UUID,
+            controllerBindingID: UUID
+        ) -> Bool {
+            figmaBindingTracker.contains(
+                .init(tabID: tabID, runID: runID, controllerBindingID: controllerBindingID)
+            )
+        }
+
+        func test_revokeFigmaBoundAgentSessions() {
+            revokeFigmaBoundAgentSessions()
         }
 
         func test_installPersistentSessionBinding(
@@ -2198,6 +2304,72 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         persistLastUsedModelIfNeeded(agent: agent, modelRaw: preferredModelRaw)
     }
 
+    private static func makeProviderWithExternalMCPBinding(
+        runID: UUID,
+        runRequest: ACPRunRequest,
+        settingsManager: WindowSettingsManager?,
+        externalMCPComposition: AppExternalMCPComposition
+    ) async throws -> (any ACPAgentProvider)? {
+        guard let provider = try await ACPAgentProviderFactory.makeProvider(
+            for: runRequest.agentKind,
+            modelString: runRequest.modelString
+        ) else {
+            return nil
+        }
+        // Family identity does not opt a provider into Figma binding. Keep the existing ACP
+        // eligibility boundary explicit; Devin and Antigravity remain fail-closed.
+        guard [.openCode, .cursor, .grokBuild].contains(runRequest.agentKind) else {
+            return provider
+        }
+        let runtimeProvider = runRequest.agentKind.externalMCPRuntimeProvider
+        // External MCP is opt-in from the app-owned settings definition. Provider-owned config
+        // alone must never activate Figma for an ACP session.
+        guard let definition = settingsManager?.globalSettingsStore.externalMCPIntegration(for: .figma),
+              definition.repoPromptActivation == .enabled
+        else {
+            return provider
+        }
+        // ACP launch resolvers discover and cache the provider executable during support
+        // preflight. Run that normal provider check before asking for a launch configuration;
+        // otherwise the neutral external-MCP probe fails closed before the provider has had a
+        // chance to resolve its installed CLI path.
+        let support = try await provider.support(for: runRequest)
+        guard support == .supported else {
+            return provider
+        }
+        let launch = try provider.makeLaunchConfiguration(for: runRequest)
+        let executableIdentity = launch.expectedExecutableIdentity?.canonicalPath ?? launch.command
+        let context = ExternalMCPProviderRuntimeContext(
+            identity: .init(
+                provider: runtimeProvider,
+                runtimeKind: .acp,
+                executableIdentity: executableIdentity
+            ),
+            sessionClass: .topLevel,
+            sessionID: runID,
+            isolation: .ceIsolated,
+            configPath: runRequest.workspacePath,
+            processOwner: "RepoPrompt Agent Mode"
+        )
+        let access = await externalMCPComposition.prepareRuntimeAccess(
+            in: context,
+            integration: definition
+        )
+        // The probe provider may have created provider-owned temporary launch artifacts (for
+        // example Cursor's RepoPrompt MCP approval file). It is never the provider that runs the
+        // session, so release those artifacts before returning either the original or bound
+        // provider. The actual provider instance will recreate only what its launch requires.
+        await provider.cleanupLaunchArtifacts(for: launch)
+        guard let lease = access.lease else {
+            return provider
+        }
+        return try await ACPAgentProviderFactory.makeProvider(
+            for: runRequest.agentKind,
+            modelString: runRequest.modelString,
+            externalMCPBindingLease: lease
+        )
+    }
+
     private nonisolated static func shouldAdoptDiscoveredPreferredModel(
         for agent: AgentProviderKind
     ) -> Bool {
@@ -2217,10 +2389,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
-        modelString: String?
+        modelString: String?,
+        runtimeAvailability: FigmaMCPRuntimeAvailabilityAuthority
     ) -> HeadlessAgentProvider {
         assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
-        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
+        return AgentRuntimeProviderService.shared.makeProvider(
+            for: agent,
+            modelString: modelString,
+            runtimeAvailability: runtimeAvailability
+        )
     }
 
     private nonisolated static func defaultConnectionPolicyInstaller(
@@ -2330,17 +2507,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     init(
+        externalMCPComposition: AppExternalMCPComposition,
         windowID: Int,
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
         oracleViewModel: OracleViewModel? = nil,
+        settingsManager: WindowSettingsManager? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) {
+        let figmaMCPIntegrationCoordinator = externalMCPComposition.figmaCoordinator
+        self.externalMCPComposition = externalMCPComposition
         self.windowID = windowID
         self.promptManager = promptManager
         workspaceFileContextStore = promptManager.workspaceFileContextStore
@@ -2351,6 +2532,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.modelRouterSettingsStore = modelRouterSettingsStore
         self.modelRouterRuntime = modelRouterRuntime
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
+        figmaSettingsStore = settingsManager?.globalSettingsStore
+        self.figmaMCPIntegrationCoordinator = figmaMCPIntegrationCoordinator
+        let figmaBindingTracker = FigmaMCPAgentBindingTracker()
+        self.figmaBindingTracker = figmaBindingTracker
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
         }
@@ -2371,7 +2556,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let providerBindingService = AgentModeProviderBindingService()
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
-            let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
+            let controllerBindingID = UUID()
+            // Keep bootstrap at the process boundary as well as the controller gate. The process
+            // must see the merged isolated CODEX_HOME configuration before Codex discovers MCP
+            // servers; relying solely on the controller gate let a fresh top-level session retain
+            // an older, RepoPrompt-only config.
+            let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: true)
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
@@ -2382,7 +2572,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
-                computerUseEnabledProvider: { computerUseEnabled }
+                computerUseEnabledProvider: { computerUseEnabled },
+                figmaMCPAccessProvider: {
+                    let configuredAvailability = CodexNativeSessionController.externalMCPRuntimeAvailability(
+                        for: MCPIntegrationHelper.codexMCPServerEntries()
+                    )
+                    let resolution = settingsManager.map {
+                        figmaMCPIntegrationCoordinator.runtimeAvailability.resolvedAgentAccess(
+                            settingsStore: $0.globalSettingsStore,
+                            configuredAvailability: configuredAvailability
+                        )
+                    } ?? .init(isAllowed: false, source: .unavailable)
+                    figmaBindingTracker.record(
+                        tabID: tabID,
+                        runID: runID,
+                        controllerBindingID: controllerBindingID,
+                        isAllowed: resolution.isAllowed
+                    )
+                    return resolution
+                },
+                figmaMCPBindingRetirementHandler: {
+                    figmaBindingTracker.retire(
+                        .init(tabID: tabID, runID: runID, controllerBindingID: controllerBindingID)
+                    )
+                }
             )
             return CodexNativeSessionController(
                 client: client,
@@ -2395,9 +2608,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint
             )
         }
-        headlessProviderFactory = Self.defaultHeadlessProviderFactory
+        let runtimeAvailability = externalMCPComposition.figmaCoordinator.runtimeAvailabilityAuthority
+        headlessProviderFactory = { agent, modelString in
+            Self.defaultHeadlessProviderFactory(
+                agent: agent,
+                modelString: modelString,
+                runtimeAvailability: runtimeAvailability
+            )
+        }
         acpProviderFactory = { agent, modelString in
             try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+        }
+        acpProviderFactoryWithExternalMCP = { runID, runRequest in
+            try await Self.makeProviderWithExternalMCPBinding(
+                runID: runID,
+                runRequest: runRequest,
+                settingsManager: settingsManager,
+                externalMCPComposition: externalMCPComposition
+            )
         }
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -2520,6 +2748,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         refreshAvailableAgents()
 
+        // Populate the isolated runtime home before Agent Mode can create a Codex process.
+        // This is deliberately an eager bootstrap (in addition to the process-bound guard):
+        // top-level sessions must not depend on a later controller lifecycle callback for MCP
+        // discovery configuration.
+        let codexMCPBootstrap = CodexIntegrationConfiguration.ensureRepoPromptServerForDiscovery()
+        if let issue = codexMCPBootstrap.errorMessage {
+            let outcome = codexMCPBootstrap.success ? "degraded" : "failed"
+            print("AgentModeViewModel – Codex MCP bootstrap \(outcome): \(issue)")
+        }
+
         // Restore last-used agent and model so new sessions default to the user's previous choice.
         restoreLastUsedAgentSelectionIfNeeded()
 
@@ -2546,6 +2784,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         init(
+            externalMCPComposition: AppExternalMCPComposition,
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
@@ -2556,12 +2795,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactory: @escaping CodexControllerFactory,
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
-            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
-                AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
-            },
+            headlessProviderFactory: HeadlessProviderFactory? = nil,
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
                 try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
             },
+            acpProviderFactoryWithExternalMCP: ACPProviderFactoryWithExternalMCP? = nil,
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest)
             },
@@ -2619,6 +2857,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
+            figmaSettingsStore = nil
+            self.externalMCPComposition = externalMCPComposition
+            figmaMCPIntegrationCoordinator = externalMCPComposition.figmaCoordinator
+            figmaBindingTracker = FigmaMCPAgentBindingTracker()
             attachmentWorkspaceDirectoryProvider = {
                 if let testWorkspaceDirectory {
                     return testWorkspaceDirectory
@@ -2639,8 +2881,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
-            self.headlessProviderFactory = headlessProviderFactory
+            let runtimeAvailability = externalMCPComposition.figmaCoordinator.runtimeAvailabilityAuthority
+            self.headlessProviderFactory = headlessProviderFactory ?? { agent, modelString in
+                Self.defaultHeadlessProviderFactory(
+                    agent: agent,
+                    modelString: modelString,
+                    runtimeAvailability: runtimeAvailability
+                )
+            }
             self.acpProviderFactory = acpProviderFactory
+            self.acpProviderFactoryWithExternalMCP = acpProviderFactoryWithExternalMCP
             self.acpControllerFactory = acpControllerFactory
             self.connectionPolicyInstaller = connectionPolicyInstaller
             self.mcpServerEnabler = mcpServerEnabler
@@ -3022,10 +3272,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makeRunService() -> AgentModeRunService {
-        let dependencies = AgentModeRunService.Dependencies(
+        var dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
+            acpProviderFactoryWithExternalMCP: acpProviderFactoryWithExternalMCP,
             acpControllerFactory: acpControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             expectedPIDPolicyArmer: { spec in
@@ -3071,6 +3322,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
+        dependencies.retireFigmaMCPBindingForRun = { [weak self] runID in
+            self?.figmaBindingTracker.retireAll(forRunID: runID)
+        }
+        dependencies.recordExternalMCPBindingForRun = { [weak self] tabID, runID, lease in
+            guard lease.integrationID == ExternalMCPIntegrationDefinition.figma().integrationID else { return }
+            self?.figmaBindingTracker.recordExternalMCPBinding(
+                tabID: tabID,
+                runID: runID,
+                lease: lease
+            )
+        }
         let hooks = AgentModeRunService.Hooks(
             usage: .init(
                 estimateRuntimeTokens: { text in
@@ -3481,6 +3743,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
         installAgentSessionLifecycleProjectionAuthority()
+
+        // Every durable registration change rebuilds later Codex bindings. Explicit disconnect
+        // additionally broadcasts a revocation that interrupts only sessions which actually
+        // received a Figma-enabled thread binding.
+        figmaSettingsStore?.$externalMCPIntegrations
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(
+            for: FigmaMCPRuntimeAvailabilityAuthority.explicitRevocationNotification
+        )
+        .sink { [weak self] notification in
+            let revision = notification.userInfo?["revision"] as? UInt64
+            self?.revokeFigmaBoundAgentSessions(revocationRevision: revision)
+        }
+        .store(in: &cancellables)
 
         // Observe post-storage tab changes. This notification does not replay the current value;
         // setAgentModeActive(true) remains the explicit activation bootstrap.
@@ -4339,6 +4622,49 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             windowID: windowID,
             reason: "Cancelled because window is closing"
         )
+    }
+
+    /// Explicit Figma disconnect must revoke already-running Figma-capable turns rather than
+    /// merely reconnecting them later. Sessions which never received a Figma-enabled binding are
+    /// deliberately left untouched.
+    private func revokeFigmaBoundAgentSessions(revocationRevision: UInt64? = nil) {
+        let bindings = figmaBindingTracker.takeAllBoundBindings()
+        let identities = bindings.identities
+        let externalLeasesByRun = bindings.externalLeasesByRun
+        let barrier = figmaMCPIntegrationCoordinator.runtimeAvailability.explicitRevocationBarrier
+        let runTargets = Dictionary(grouping: identities) { identity in
+            FigmaMCPAgentBindingTracker.RunKey(tabID: identity.tabID, runID: identity.runID)
+        }
+
+        for (runKey, _) in runTargets {
+            let tabID = runKey.tabID
+            let runID = runKey.runID
+            let participant = revocationRevision.map { barrier.registerParticipant(for: $0) }
+            let leases = externalLeasesByRun[runKey] ?? []
+            // Grouping controller bindings by run gives one cancellation and one barrier
+            // participant, while the expected-run fence protects a same-tab replacement.
+            Task { @MainActor [weak self, weak session = sessions[tabID]] in
+                defer {
+                    if let participant {
+                        barrier.complete(participant)
+                    }
+                }
+                for lease in leases {
+                    _ = await lease.revoke()
+                }
+                guard let self,
+                      let session,
+                      sessions[tabID] === session,
+                      session.runID == runID,
+                      session.runState.isActive
+                else { return }
+                await cancelAgentRun(
+                    tabID: tabID,
+                    expectedRunID: runID,
+                    completion: .terminalTeardownCompleted
+                )
+            }
+        }
     }
 
     func stopCodexSessionsForManagedLogout() async {
@@ -19936,12 +20262,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Callers that destroy provider-owned infrastructure can explicitly await terminal teardown.
     func cancelAgentRun(
         tabID: UUID,
+        expectedRunID: UUID? = nil,
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
-        guard let session = sessions[tabID] else { return }
+        guard let session = sessions[tabID],
+              expectedRunID == nil || session.runID == expectedRunID
+        else { return }
         retireTimedOutManagedStopIfEligible(session)
-        await runService.cancelRun(tabID: tabID, session: session, completion: completion, origin: origin)
+        cancelPendingInstruction(for: session)
+        await runService.cancelRun(
+            tabID: tabID,
+            session: session,
+            expectedRunID: expectedRunID,
+            completion: completion,
+            origin: origin
+        )
     }
 
     /// Releases a managed-Stop gate whose cleanup never started, or whose started teardown
