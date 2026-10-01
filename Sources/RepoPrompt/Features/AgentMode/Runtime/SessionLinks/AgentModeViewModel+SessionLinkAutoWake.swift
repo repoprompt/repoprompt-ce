@@ -55,7 +55,7 @@ struct AgentSessionLinkAutoWakeAttempt {
 
     /// Periodic admission has no queue evidence. Notification admission always supplies it.
     var queue: QueueEvidence?
-    /// Producer fence captured at reservation, before the reevaluation task is created.
+    /// Periodic producer fence captured at reservation. Notification wakes capture at preparation.
     var stopFence: AgentRunStartStopFence?
     var queueEpoch: UUID? {
         queue?.epoch
@@ -426,8 +426,7 @@ extension AgentModeViewModel {
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .scheduled,
-            task: nil,
-            stopFence: AgentRunStartStopFence(session: session)
+            task: nil
         )
         session.oversight.pendingAutoWake = attempt
         agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
@@ -618,13 +617,16 @@ extension AgentModeViewModel {
                 return
             }
 
-            agentSessionLinkPrepareAutoWakeDispatch(wakeID: wakeID, endpoint: endpoint)
+            guard let startOptions = agentSessionLinkPrepareAutoWakeDispatch(wakeID: wakeID, endpoint: endpoint) else {
+                abandonAgentSessionLinkPromptClaim(reservedClaim)
+                return
+            }
             switch route {
             case .idleFollowUp:
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: .laneUpdate(wakeID: wakeID, stopFence: attempt.stopFence)
+                    directStartOptions: startOptions
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until
@@ -1061,18 +1063,26 @@ extension AgentModeViewModel {
         agentSessionLinkSettleAmbiguousAutoWake(attempt, session: session)
     }
 
-    private func agentSessionLinkPrepareAutoWakeDispatch(
+    /// A notification may wait through an internal cancellation (such as changing execution location).
+    /// Fence its actual producer, not that earlier reservation. Explicit Stop retracts pre-preparation
+    /// attempts; once preparation starts, this fence is immutable across every provider suspension.
+    func agentSessionLinkPrepareAutoWakeDispatch(
         wakeID: UUID,
         endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
+    ) -> AgentDirectRunStartOptions? {
         guard let session = sessions[endpoint.tabID],
               var attempt = session.oversight.pendingAutoWake,
-              attempt.wakeID == wakeID
-        else { return }
+              attempt.wakeID == wakeID,
+              attempt.observerEndpoint == endpoint,
+              !attempt.isPeriodic,
+              attempt.phase == .scheduled || attempt.phase == .awaitingSettlement
+        else { return nil }
+        let stopFence = AgentRunStartStopFence(session: session)
         attempt.phase = .preparingDispatch
         attempt.attemptedFingerprint = nil
         attempt.physicalOutcome = .notAttempted
         session.oversight.pendingAutoWake = attempt
+        return .laneUpdate(wakeID: wakeID, stopFence: stopFence)
     }
 
     func agentSessionLinkAwaitPhysicalDispatchSettlement(

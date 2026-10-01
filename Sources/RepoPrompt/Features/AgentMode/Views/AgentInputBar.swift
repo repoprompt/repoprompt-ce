@@ -921,6 +921,16 @@ struct AgentComposerView: View, Equatable {
                 actions.selectAgentModel(agent, "")
             }]
         }
+        if agent == .devin {
+            return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in
+                guard group.rendersAsSubmenu else {
+                    return group.entries.map { inputBarModelMenuItem(agent: agent, model: $0.option) }
+                }
+                return [.submenu(group.displayName, items: group.entries.map {
+                    inputBarModelMenuItem(agent: agent, model: $0.option, title: $0.effortDisplayName)
+                })]
+            }
+        }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }

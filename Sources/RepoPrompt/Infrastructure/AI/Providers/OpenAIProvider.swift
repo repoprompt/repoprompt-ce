@@ -88,6 +88,9 @@ class OpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
         // Fallback: Let the API handle it by not setting a token limit.
@@ -127,6 +130,9 @@ class OpenAIProvider: AIProvider {
              .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             return true
         default:
@@ -746,6 +752,22 @@ class OpenAIProvider: AIProvider {
         case .gpt54High: return (.gpt54, "high")
         case .gpt54Low: return (.gpt54, "low")
         case .gpt54: return (.gpt54, "medium")
+        // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
+        case .gpt61SolMax: return (.gpt61Sol, "max")
+        case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
+        case .gpt61SolHigh: return (.gpt61Sol, "high")
+        case .gpt61SolLow: return (.gpt61Sol, "low")
+        case .gpt61Sol: return (.gpt61Sol, "medium")
+        case .gpt6AstraMax: return (.gpt6Astra, "max")
+        case .gpt6AstraXHigh: return (.gpt6Astra, "xhigh")
+        case .gpt6AstraHigh: return (.gpt6Astra, "high")
+        case .gpt6AstraLow: return (.gpt6Astra, "low")
+        case .gpt6Astra: return (.gpt6Astra, "medium")
+        case .gpt6LunaXHigh: return (.gpt6Luna, "xhigh")
+        case .gpt6LunaHigh: return (.gpt6Luna, "high")
+        case .gpt6LunaLow: return (.gpt6Luna, "low")
+        case .gpt6Luna: return (.gpt6Luna, "medium")
+        case .gpt6Sol: return (.gpt6Sol, "medium")
         // ── gpt5-codex-max family (Responses API) ──
         case .gpt5CodexXHigh: return (.gpt5CodexMed, "xhigh")
         case .gpt5CodexHigh: return (.gpt5CodexMed, "high")

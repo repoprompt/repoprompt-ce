@@ -6346,8 +6346,12 @@ extension ToolOutputFormatter {
                     // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
-                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
-                    let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
+                    // Devin effort IDs are grouped by their catalog family, not by suffix parsing.
+                    let devinEntry = agentPrefix == "devin:" ? DevinModelCatalog.current.entry(matching: afterColon) : nil
+                    let groupingEffort = devinEntry.map { $0.thinking?.choiceRaw }
+                        ?? agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    let base = devinEntry.map { $0.thinking == nil ? afterColon : $0.familyID }
+                        ?? agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
                     if let groupingEffort, seen.contains(familyKey) {
@@ -6360,7 +6364,7 @@ extension ToolOutputFormatter {
                     } else if let groupingEffort, !seen.contains(familyKey) {
                         // New family with efforts
                         seen.insert(familyKey)
-                        let baseName = agentListFamilyDisplayName(
+                        let baseName = devinEntry?.familyDisplayName ?? agentListFamilyDisplayName(
                             modelName,
                             modelID: afterColon,
                             groupingEffort: groupingEffort

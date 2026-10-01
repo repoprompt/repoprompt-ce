@@ -361,7 +361,10 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return CursorAIModelCatalog.options
         }
-        if agentKind == .antigravity || agentKind == .devin {
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entries.map(\.option)
+        }
+        if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
         }
         if agentKind == .grokBuild {
@@ -421,7 +424,10 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .antigravity || agentKind == .devin {
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: normalized) != nil
+        }
+        if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
@@ -476,6 +482,13 @@ enum AgentModelCatalog {
                 return known.displayName
             }
             return raw
+        }
+
+        // The encoded effort is part of a Devin model's identity, so it is never dropped.
+        if agentKind == .devin,
+           let entry = DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: effectiveRaw)
+        {
+            return entry.option.displayName
         }
 
         if agentKind.usesClaudeTooling {
@@ -1880,16 +1893,16 @@ enum AgentModelCatalog {
         availability: AvailabilityContext
     ) -> [SelectionCandidate] {
         let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability)
-            ?? AgentModel.gpt56LunaLow.rawValue
+            ?? AgentModel.gpt6LunaLow.rawValue
         let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
-            ?? AgentModel.gpt56SolMedium.rawValue
+            ?? AgentModel.gpt61SolMedium.rawValue
         let solHigh = preferredCodexFamilyModelRaw("sol", effort: .high, availability: availability)
-            ?? AgentModel.gpt56SolHigh.rawValue
+            ?? AgentModel.gpt61SolHigh.rawValue
         return switch kind {
         case .explore:
             [
                 SelectionCandidate(agent: .codexExec, modelRaw: lunaLow),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt61SolLow.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: ClaudeModelSpecifier.encodedRaw(baseModelRaw: AgentModel.claudeSonnet.rawValue, effort: .high)),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeHaiku.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeHaiku.rawValue),

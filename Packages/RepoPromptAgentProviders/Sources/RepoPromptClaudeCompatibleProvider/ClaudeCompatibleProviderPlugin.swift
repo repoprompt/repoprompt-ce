@@ -237,6 +237,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let fableRaw = "fable"
     private static let fable51Raw = "claude-fable-5-1"
     private static let fable5Raw = "claude-fable-5"
+    private static let mythos51Raw = "claude-mythos-5-1"
     private static let opus1mRaw = "opus[1m]"
     private static let opus55Raw = "claude-opus-5-5"
     private static let opus5Raw = "claude-opus-5"
@@ -244,6 +245,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
+    private static let sonnet55Raw = "claude-sonnet-5-5"
     private static let sonnet5Raw = "claude-sonnet-5"
     private static let sonnet46Raw = "claude-sonnet-4-6"
     private static let sonnet45Raw = "claude-sonnet-4-5"
@@ -266,6 +268,12 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: fable5Raw,
             displayName: "Fable 5",
             description: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: mythos51Raw,
+            displayName: "Mythos 5.1 (Restricted)",
+            description: "Pinned Claude Mythos 5.1 with 1M context. Restricted-access tier; only works for entitled accounts and is never used as a default.",
             supportsXHigh: true
         ),
         StaticModel(
@@ -321,6 +329,12 @@ public enum ClaudeCompatibleModelCatalog {
             displayName: "Sonnet Latest",
             description: "Balanced speed and capability. Good for general coding, analysis, and everyday work.",
             supportsXHigh: false
+        ),
+        StaticModel(
+            rawValue: sonnet55Raw,
+            displayName: "Sonnet 5.5",
+            description: "Pinned Claude Sonnet 5.5 with 1M context and adaptive thinking. Balanced speed and capability for everyday engineering.",
+            supportsXHigh: true
         ),
         StaticModel(
             rawValue: sonnet5Raw,

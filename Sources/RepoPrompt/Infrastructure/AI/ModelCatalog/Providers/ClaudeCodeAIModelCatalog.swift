@@ -26,6 +26,8 @@ enum ClaudeCodeAIModelCatalog {
         ModelDefinition(runtimeModelRaw: "fable", displayName: "Fable Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5-1", displayName: "Fable 5.1", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        // Restricted-access tier; listed for entitled accounts but never used as a default.
+        ModelDefinition(runtimeModelRaw: "claude-mythos-5-1", displayName: "Mythos 5.1 (Restricted)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-5-5", displayName: "Opus 5.5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
@@ -36,6 +38,7 @@ enum ClaudeCodeAIModelCatalog {
         ModelDefinition(runtimeModelRaw: "claude-opus-4-5-20251101", displayName: "Opus 4.5", supportedEfforts: []),
         ModelDefinition(runtimeModelRaw: "sonnet[1m]", displayName: "Sonnet Latest (1M)", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "sonnet", displayName: "Sonnet Latest", supportedEfforts: [.low, .medium, .high]),
+        ModelDefinition(runtimeModelRaw: "claude-sonnet-5-5", displayName: "Sonnet 5.5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-5", displayName: "Sonnet 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-6", displayName: "Sonnet 4.6", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-5-20250929", displayName: "Sonnet 4.5", supportedEfforts: []),

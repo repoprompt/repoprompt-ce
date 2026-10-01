@@ -111,6 +111,8 @@ struct ACPModelParameterSelection: Codable, Hashable {
         activeBaseModelRaw: String,
         from selections: [Self]
     ) -> [Self] {
+        // Devin effort is encoded in the model ID; a stored pin must never override it.
+        guard providerID != .devin else { return [] }
         let activeIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
             activeBaseModelRaw,
             providerID: providerID

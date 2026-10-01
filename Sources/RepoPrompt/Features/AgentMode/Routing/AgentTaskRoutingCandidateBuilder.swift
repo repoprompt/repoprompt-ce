@@ -199,7 +199,7 @@ struct AgentTaskRoutingCandidateBuilder {
         ),
         .init(
             provider: .codexExec,
-            baseModelAliases: ["gpt-6-sol", "gpt-5.6-sol", "gpt-5.6"],
+            baseModelAliases: ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6"],
             modelClass: "gpt-sol",
             preferredCodexFamily: "sol",
             rubric: "Judge Sol as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
@@ -218,7 +218,7 @@ struct AgentTaskRoutingCandidateBuilder {
         ),
         .init(
             provider: .claudeCode,
-            baseModelAliases: ["claude-sonnet-5", "sonnet"],
+            baseModelAliases: ["claude-sonnet-5-5", "claude-sonnet-5", "sonnet"],
             modelClass: "claude-sonnet",
             rubric: "Judge Sonnet as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier."
         ),

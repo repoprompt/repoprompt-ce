@@ -54,9 +54,9 @@ struct AutoEffortTurnFeedback: Equatable {
 /// Conservative exact-model admission. The provider's live effort catalog supplies the choices;
 /// a model name alone never authorizes an effort that the active runtime does not advertise.
 enum AutoEffortModelPolicy {
-    private static let codexModels: Set<String> = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+    private static let codexModels: Set<String> = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
     private static let claudeModels: Set<String> = [
-        "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
+        "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
     ]
 
     /// Custom workflow templates are user-authored and may contain private content. The

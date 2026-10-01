@@ -234,10 +234,12 @@ final class AgentCodexModelRegistry {
 
     private func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
         let keys = Set(options.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
+        // Mirrors CodexAIModelCatalog: GPT-6.1 Sol and GPT-6 Luna back the role defaults.
         let requiredKeyGroups: [[String]] = [
-            ["gpt-5.6-sol-low", "gpt-5.6-low"],
-            ["gpt-5.6-sol-medium", "gpt-5.6-medium"],
-            ["gpt-5.6-sol-high", "gpt-5.6-high"],
+            ["gpt-6.1-sol-low"],
+            ["gpt-6.1-sol-medium"],
+            ["gpt-6.1-sol-high"],
+            ["gpt-6-luna-low"],
             ["gpt-5.3-codex"]
         ]
         return requiredKeyGroups.contains { group in

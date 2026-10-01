@@ -165,6 +165,13 @@ enum ContextBuilderReviewTargetResolution: Equatable {
         guard case let .available(target) = self else { return nil }
         return target
     }
+
+    /// Without an elected target, nested Git calls must name `repo_root`/`repo_key` and may not
+    /// publish artifacts. Shared by the Git admission policy and the discovery prompt so the
+    /// prompt never instructs calls the policy refuses.
+    var restrictsGitToExplicitReadOnly: Bool {
+        availableTarget == nil
+    }
 }
 
 struct ContextBuilderReviewTargetInput {

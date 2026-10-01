@@ -4,19 +4,31 @@ struct DevinACPAgentProvider: ACPAgentProvider {
     private let config: DevinAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: DevinACPLaunchResolver
+    private let isolateForeignMCPImports: Bool
 
     init(
         config: DevinAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver()
+        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver(),
+        isolateForeignMCPImports: Bool = false
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.isolateForeignMCPImports = isolateForeignMCPImports
     }
 
     var providerID: ACPProviderID {
         .devin
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        input.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "thought_level"
+            ? .thinking : nil
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
@@ -42,7 +54,8 @@ struct DevinACPAgentProvider: ACPAgentProvider {
             mcpServers: config.includeRepoPromptMCPServer
                 ? .mergeRepoPrompt(repoPromptMCPConfiguration)
                 : .disableAll,
-            sourceEnvironment: resolvedLaunch.environment
+            sourceEnvironment: resolvedLaunch.environment,
+            isolateForeignMCPImports: isolateForeignMCPImports
         )
         return ACPLaunchConfiguration(
             providerID: providerID,

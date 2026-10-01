@@ -146,6 +146,8 @@ struct AIModelDropdown: View {
                         items: group.models.map(aiModelMenuItem)
                     )
                 }
+            } else if provider == .devin {
+                aiModelDevinMenuItems(for: models)
             } else if provider == .openCode {
                 AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)
@@ -156,6 +158,26 @@ struct AIModelDropdown: View {
                 models.map(aiModelMenuItem)
             }
             return [.submenu(AIProviderType.displayName(for: provider), items: providerItems)]
+        }
+    }
+
+    /// Devin family → effort submenus, in the catalog's advertised effort order.
+    private func aiModelDevinMenuItems(for models: [AIModel]) -> [StableMenuItem] {
+        let catalog = DevinModelCatalog.current
+        let modelsByRaw = Dictionary(models.map { ($0.modelName.lowercased(), $0) }) { first, _ in first }
+        let catalogOptions = catalog.entries.map(\.option).filter { modelsByRaw[$0.rawValue.lowercased()] != nil }
+        let unknownOptions = models.filter { catalog.entry(matching: $0.modelName) == nil }.map {
+            AgentModelOption(rawValue: $0.modelName, displayName: $0.displayName, description: nil, isDefault: false)
+        }
+        return catalog.menuGroups(for: catalogOptions + unknownOptions).flatMap { group -> [StableMenuItem] in
+            let items = group.entries.compactMap { entry -> StableMenuItem? in
+                guard let model = modelsByRaw[entry.option.rawValue.lowercased()] else { return nil }
+                guard group.rendersAsSubmenu, let effort = entry.effortDisplayName else { return aiModelMenuItem(model) }
+                return .action(effort, isSelected: model.rawValue == destination.currentRawValue) {
+                    destination.apply(model.rawValue)
+                }
+            }
+            return group.rendersAsSubmenu ? [.submenu(group.displayName, items: items)] : items
         }
     }
 

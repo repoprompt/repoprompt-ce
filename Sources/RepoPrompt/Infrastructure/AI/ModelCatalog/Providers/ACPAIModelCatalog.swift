@@ -378,7 +378,7 @@ enum ACPAIModelCatalog {
     }
 
     static func devinModelOptionsFromStore() -> [AgentModelOption] {
-        AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.options ?? []
+        DevinModelCatalog.current.entries.map(\.option)
     }
 
     static func devinModelsFromStore() -> [AIModel] {

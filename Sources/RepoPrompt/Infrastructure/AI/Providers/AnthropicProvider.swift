@@ -104,6 +104,12 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly {
+            // Adaptive thinking consumes output tokens; leave room for reasoning plus the answer.
+            overrideMaxTokens = Self.adaptiveStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
 
         // Use your existing helper functions
@@ -111,8 +117,8 @@ class AnthropicProvider: AIProvider {
         let messages = createMessages(for: aiMessage)
 
         var temperature: Double? = 0
-        // Skip temperature setting for thinking models
-        if isThinkingMode {
+        // Skip temperature setting for thinking models; Claude 5.x rejects sampling parameters.
+        if isThinkingMode || adaptiveThinkingOnly {
             temperature = nil
         }
         // Apply user-defined temperature if override is enabled (for non-thinking models)
@@ -128,7 +134,7 @@ class AnthropicProvider: AIProvider {
             system: systemParameter,
             stream: true,
             temperature: temperature,
-            thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
+            thinking: isThinkingMode && !adaptiveThinkingOnly ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
         )
 
         let stream = try await service.streamMessage(parameters)
@@ -269,8 +275,31 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly, maxTokens == nil {
+            overrideMaxTokens = Self.adaptiveNonStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget)
+        return try await completeMessage(
+            aiMessage,
+            model: anthropicModel,
+            maxTokens: overrideMaxTokens,
+            isThinkingMode: isThinkingMode && !adaptiveThinkingOnly,
+            thinkingBudget: thinkingBudget
+        )
+    }
+
+    static let adaptiveStreamingMaxTokens = 64000
+    static let adaptiveNonStreamingMaxTokens = 16000
+
+    /// Claude 5.x-generation models (Sonnet 5/5.5, Opus 5/5.5, Fable, Mythos) accept only adaptive
+    /// thinking: `thinking.budget_tokens` and sampling parameters such as `temperature` return 400.
+    /// Omitting `thinking` runs adaptive thinking at the model's default effort.
+    static func usesAdaptiveThinkingOnly(_ modelName: String) -> Bool {
+        let normalized = modelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefixes = ["claude-fable-", "claude-mythos-", "claude-opus-5", "claude-sonnet-5"]
+        return prefixes.contains { normalized.hasPrefix($0) }
     }
 
     private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {

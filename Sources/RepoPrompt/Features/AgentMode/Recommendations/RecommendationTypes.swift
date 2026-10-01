@@ -340,7 +340,7 @@ enum BestPracticeProfiles {
         strengths: [
             "Fast, economical default for explore and repeated discovery",
             "1.05M-token context for large codebase mapping",
-            "Lower usage burn than GPT-6 Sol",
+            "Lower usage burn than GPT-6.1 Sol",
             "Uses Codex CLI's live advertised model catalog"
         ]
     )
@@ -348,13 +348,13 @@ enum BestPracticeProfiles {
     static let bestPlanning = UseCase(
         id: "bestPlanning",
         title: "Best Planning",
-        modelLabel: "GPT-6 Sol",
+        modelLabel: "GPT-6.1 Sol",
         accessLabel: "ChatGPT Pro export / OpenAI API",
-        modelString: "gpt-6-sol",
+        modelString: "gpt-6.1-sol",
         agentKind: nil,
         agentModel: nil,
         strengths: [
-            "Use ChatGPT Pro's current GPT-6 Sol export/planning mode without forcing a RepoPrompt effort suffix",
+            "Use ChatGPT Pro's current GPT-6.1 Sol export/planning mode without forcing a RepoPrompt effort suffix",
             "Can reason about entire codebases at once",
             "Produces clear, actionable architectural specifications",
             "Catches edge cases and implications other models miss"
@@ -364,11 +364,11 @@ enum BestPracticeProfiles {
     static let bestInAppPlanningReview = UseCase(
         id: "bestInAppPlanningReview",
         title: "Best In‑App Planning/Review",
-        modelLabel: "GPT-6 Sol High",
+        modelLabel: "GPT-6.1 Sol High",
         accessLabel: "Codex CLI",
-        modelString: AIModel.codexCustom(name: "gpt-6-sol-high").rawValue,
+        modelString: AIModel.codexCustom(name: "gpt-6.1-sol-high").rawValue,
         agentKind: .codexExec,
-        agentModel: .gpt6SolHigh,
+        agentModel: .gpt61SolHigh,
         strengths: [
             "Strong reasoning without extended wait times",
             "Won't exhaust weekly usage limits quickly",
@@ -388,7 +388,7 @@ enum BestPracticeProfiles {
         strengths: [
             "Strong codebase understanding with a 1.05M-token context window",
             "Efficient file exploration and selection",
-            "Lower usage burn than GPT-6 Sol",
+            "Lower usage burn than GPT-6.1 Sol",
             "Practical default for repeated discovery runs"
         ]
     )
@@ -410,7 +410,7 @@ enum BestPracticeProfiles {
     """
 
     static let gpt5HighStrengths = """
-    GPT-6 Luna Low and GPT-6 Sol Medium/High via Codex CLI provide a practical cost-quality ladder. \
+    GPT-6 Luna Low and GPT-6.1 Sol Medium/High via Codex CLI provide a practical cost-quality ladder. \
     Luna Low is recommended for explore and discovery; Sol Medium is recommended for Engineer/default implementation; Sol High is recommended for Oracle, review, and pair agents. \
     Extended efforts are available for exceptional tasks but can exhaust usage limits quickly; keep them explicit.
     """
@@ -423,10 +423,10 @@ enum BestPracticeProfiles {
     // MARK: Explanatory Text
 
     static let codexVsOpenAIExplanation = """
-    GPT-6 Sol and Luna are available through Codex CLI's live model catalog and the OpenAI Responses API. Agent-role defaults use Codex CLI; direct API configurations should use OpenAI model IDs.
+    GPT-6.1 Sol and GPT-6 Luna are available through Codex CLI's live model catalog and the OpenAI Responses API. Agent-role defaults use Codex CLI; direct API configurations should use OpenAI model IDs.
 
     Use GPT‑6 Luna Low via Codex CLI for Context Builder discovery and explore, \
-    GPT‑6 Sol Medium for Engineer/default implementation, and GPT‑6 Sol High for Oracle, review, and pair-agent work. Use effort-neutral GPT‑6 Sol for ChatGPT Pro export/planning.
+    GPT‑6.1 Sol Medium for Engineer/default implementation, and GPT‑6.1 Sol High for Oracle, review, and pair-agent work. Use effort-neutral GPT‑6.1 Sol for ChatGPT Pro export/planning.
     """
 
     static let contextBuilderRationale = "Codex with GPT-6 Luna Low provides the best Context Builder/discovery default – a large context window with practical usage burn."
@@ -434,7 +434,7 @@ enum BestPracticeProfiles {
     static let contextWindowNote = """
     You can use xhigh for context building, but context windows are finite, \
     and reasoning takes space. Prefer GPT-6 Luna Low for prompt and context building, \
-    then let GPT-6 Sol High reason in full when needed.
+    then let GPT-6.1 Sol High reason in full when needed.
     """
 
     static let codexHarnessNote = """

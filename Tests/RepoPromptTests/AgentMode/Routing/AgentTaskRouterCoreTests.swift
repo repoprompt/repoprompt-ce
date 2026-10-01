@@ -703,6 +703,43 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-luna-low", agentKind: .codexExec), .gpt6LunaLow)
     }
 
+    func testRoutingPrefersGPT61SolAndSonnet55WhenAdvertised() throws {
+        let codexOptions = Self.advertisedCodexOptions + [
+            Self.modelOption("gpt-6.1-sol-medium", "GPT-6.1 Sol Medium"),
+            Self.modelOption("gpt-6.1-sol-high", "GPT-6.1 Sol High")
+        ]
+        let claudeOptions = Self.advertisedClaudeOptions + [
+            Self.modelOption("claude-sonnet-5-5", "Claude Sonnet 5.5")
+        ]
+        let candidates = try candidateBuilder(codexOptions: codexOptions, claudeOptions: claudeOptions).build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: .init(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+        )
+
+        let solCandidate = try XCTUnwrap(candidates.first {
+            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel?.hasSuffix("-sol") == true
+        })
+        XCTAssertEqual(CodexModelSpecifier(raw: solCandidate.target.modelRaw).baseModel, "gpt-6.1-sol")
+        XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("GPT-6.1 Sol"))
+        XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(solCandidate.descriptor.targetDescription.contains("No verified API list price"))
+
+        let sonnetCandidate = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-sonnet" })
+        XCTAssertEqual(ClaudeModelSpecifier(raw: sonnetCandidate.target.modelRaw).baseModel, "claude-sonnet-5-5")
+        XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("Claude Sonnet 5.5"))
+        XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(sonnetCandidate.descriptor.targetDescription.contains("No verified API list price"))
+
+        XCTAssertEqual(
+            AutoEffortModelPolicy.codexEfforts(modelRaw: "gpt-6.1-sol-high", advertised: [.low, .medium, .high, .xhigh, .max, .ultra]),
+            ["low", "medium", "high", "xhigh", "max"]
+        )
+        XCTAssertEqual(
+            AutoEffortModelPolicy.claudeEfforts(modelRaw: "claude-sonnet-5-5:high", advertised: [.low, .medium, .high, .xhigh, .max]),
+            ["low", "medium", "high", "xhigh", "max"]
+        )
+    }
+
     func testApprovedCodexFamilySelectionTracksNewestAdvertisedVersionOnly() throws {
         let options = [
             AgentModelOption(rawValue: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol High", description: nil, isDefault: false),

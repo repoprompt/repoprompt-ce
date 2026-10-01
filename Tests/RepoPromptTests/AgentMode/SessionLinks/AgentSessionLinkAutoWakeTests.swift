@@ -1439,6 +1439,78 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    func testParkedAttentionWakePreparesAfterExecutionLocationCancellation() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .running
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [attention]
+        )
+        try await AsyncTestWait.waitUntil("the attention wake to park behind the active run") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement }
+        }
+        let parked = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        // Exercise the production preparation seam without launching a provider after settlement.
+        parked.task?.cancel()
+        let reservationFence = AgentRunStartStopFence(session: fixture.session)
+        fixture.session.isChangingExecutionLocation = true
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .executionLocationChange, origin: .internalLifecycle
+        )
+        fixture.session.runState = .idle
+        let runID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertTrue(fixture.session.clearRunID(ifCurrent: runID))
+        fixture.session.isChangingExecutionLocation = false
+
+        XCTAssertFalse(reservationFence.permitsStart(of: fixture.session))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, parked.wakeID)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), parked.observerEndpoint)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .autoWake(wakeID: parked.wakeID)
+        ))
+        XCTAssertEqual(try XCTUnwrap(claim.passive).receipt.deliveredAttentionOccurrences, [attention.occurrence])
+        let options = try XCTUnwrap(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
+        let dispatchFence = try XCTUnwrap(options.stopFence)
+        XCTAssertEqual(options.laneUpdateWakeID, parked.wakeID)
+        XCTAssertTrue(dispatchFence.permitsStart(of: fixture.session))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .preparingDispatch)
+
+        // A cancellation after preparation must still invalidate the producer, never re-stamp it.
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .executionLocationChange, origin: .internalLifecycle
+        )
+        XCTAssertFalse(dispatchFence.permitsStart(of: fixture.session))
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
+    }
+
+    func testExplicitStopCannotPrepareAParkedAttentionWake() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .running
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [Self.attentionRequest(0)]
+        )
+        try await AsyncTestWait.waitUntil("the attention wake to park before Stop") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement }
+        }
+        let parked = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .userStop, origin: .explicitStop
+        )
+        fixture.session.runState = .idle
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
+    }
+
     func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
         for phase: AgentSessionLinkAutoWakeAttempt.Phase in [
             .scheduled, .awaitingSettlement, .preparingDispatch,

@@ -485,10 +485,13 @@ enum CodexAIModelCatalog {
 
     private static func shouldBackfillRecommendedModels(_ models: [AIModel]) -> Bool {
         let identities = Set(models.compactMap { codexOptionIdentity(for: $0) })
+        // GPT-6.1 Sol is the recommended default (Codex CLI 0.159.0+). Older live catalogs are
+        // backfilled with the static recommended entries so role defaults stay selectable.
         let requiredIdentityGroups: [[String]] = [
-            ["gpt-5.6-sol-low"],
-            ["gpt-5.6-sol-medium"],
-            ["gpt-5.6-sol-high"],
+            ["gpt-6.1-sol-low"],
+            ["gpt-6.1-sol-medium"],
+            ["gpt-6.1-sol-high"],
+            ["gpt-6-luna-low"],
             ["gpt-5.3-codex", "gpt-5.3-codex-medium"]
         ]
         return requiredIdentityGroups.contains { group in
