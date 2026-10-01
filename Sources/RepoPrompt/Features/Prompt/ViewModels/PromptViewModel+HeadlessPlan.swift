@@ -113,7 +113,7 @@ extension PromptViewModel {
         let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
         // Oracle-bound headless prompts (Context Builder) must not silently omit selected files.
         let requiresSelectedFileContent = oraclePromptConfiguration != nil
-        if requiresSelectedFileContent {
+        if requiresSelectedFileContent, headlessConfig.includeFiles {
             try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
                 selection: snapshot.selection,
                 lookupContext: lookupContext,

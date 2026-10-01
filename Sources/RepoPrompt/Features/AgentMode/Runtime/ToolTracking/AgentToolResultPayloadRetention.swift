@@ -58,8 +58,11 @@ enum AgentToolResultPayloadRetention {
     ) -> Bool {
         guard incomingIsError != true, !isThin(existing), !isProgress(existing) else { return false }
         if isThin(incoming) || isProgress(incoming) || terminalMarkerStatus(incoming) != nil { return true }
-        guard requireObjectReplacement else { return false }
-        return isJSONObject(existing) && !isJSONObject(incoming)
+        guard requireObjectReplacement, let object = jsonObject(existing) else { return false }
+        guard let incomingObject = jsonObject(incoming) else { return true }
+        // A content-bearing provider lifecycle echo is still not an authoritative
+        // RepoPrompt result. Keep it from regressing an already-delivered native result.
+        return !isLifecycleStatus(object["status"]) && isLifecycleStatus(incomingObject["status"])
     }
 
     static func isThin(_ payload: String?) -> Bool {
@@ -70,6 +73,13 @@ enum AgentToolResultPayloadRetention {
         case "{}", "[]", "null", "\"\"":
             return true
         default:
+            // ACP serializes decoded collections with pretty printing, including
+            // interior newlines in empty objects and arrays.
+            guard trimmed.first == "{" || trimmed.first == "[",
+                  let value = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))
+            else { return false }
+            if let object = value as? [String: Any] { return object.isEmpty }
+            if let array = value as? [Any] { return array.isEmpty }
             return false
         }
     }
@@ -87,10 +97,6 @@ enum AgentToolResultPayloadRetention {
               status == "completed" || status == "failed"
         else { return nil }
         return status
-    }
-
-    static func isJSONObject(_ payload: String?) -> Bool {
-        jsonObject(payload) != nil
     }
 
     private static func isLifecycleStatus(_ value: Any?) -> Bool {

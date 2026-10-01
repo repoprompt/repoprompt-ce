@@ -8,7 +8,6 @@ import RepoPromptDomainRuntime
 /// agent's job and lives in its answer.
 struct OracleLaneCoverage: Equatable {
     struct IncompleteLane: Equatable {
-        let label: String
         let model: String
         let reason: String
     }
@@ -18,15 +17,17 @@ struct OracleLaneCoverage: Equatable {
     let incompleteLanes: [IncompleteLane]
 
     /// Returns nil for single-lane results so their cards stay unchanged.
-    init?(lanes: [ToolResultDTOs.ChatSendDTO.OracleLaneDTO]?) {
-        guard let lanes, lanes.count > 1 else { return nil }
+    init?(lanes: [ToolResultDTOs.ChatSendDTO.OracleLaneDTO]?, oracleCount: Int?) {
+        guard let lanes, oracleCount == lanes.count, lanes.count > 1 else { return nil }
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
+        guard ordered.enumerated().allSatisfy({ offset, lane in
+            lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+        }) else { return nil }
         let completed = OracleLaneResultStatus.completed.rawValue
         totalCount = ordered.count
         completedCount = ordered.count { $0.status == completed }
         incompleteLanes = ordered.filter { $0.status != completed }.map { lane in
             IncompleteLane(
-                label: OracleRosterContract.displayLabel(laneIndex: lane.laneIndex),
                 model: Self.shortModelName(lane.executionProfile?.modelID ?? lane.modelID),
                 reason: Self.reason(status: lane.status, error: lane.error)
             )
@@ -45,14 +46,6 @@ struct OracleLaneCoverage: Equatable {
             if incompleteLanes.count > 1 {
                 text += " +\(incompleteLanes.count - 1)"
             }
-        }
-        return text
-    }
-
-    var accessibilityText: String {
-        var text = "\(completedCount) of \(totalCount) Oracle lanes completed"
-        for lane in incompleteLanes {
-            text += "; \(lane.label), \(lane.model), \(lane.reason)"
         }
         return text
     }

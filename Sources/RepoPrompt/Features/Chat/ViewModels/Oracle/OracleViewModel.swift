@@ -3315,9 +3315,7 @@ class OracleViewModel: ObservableObject {
                         gitBaseOverride: gitBaseOverride,
                         selectionOverride: selectionOverride,
                         lookupContextOverride: lookupContextOverride,
-                        reviewGitContextOverride: reviewGitContextOverride,
-                        // Oracle prompts must never silently omit explicitly selected files.
-                        selectedFileContentPolicy: oraclePromptConfiguration == nil ? .bestEffort : .required
+                        reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
                 guard await shouldContinueStreaming() else {

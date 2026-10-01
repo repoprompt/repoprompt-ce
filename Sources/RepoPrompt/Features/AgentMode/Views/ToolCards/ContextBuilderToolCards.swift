@@ -669,7 +669,7 @@ func contextBuilderOracleLaneCoverage(
     case .review: dto.review
     case .plan: dto.plan
     }
-    return OracleLaneCoverage(lanes: reply?.oracleResults)
+    return OracleLaneCoverage(lanes: reply?.oracleResults, oracleCount: reply?.oracleCount)
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {

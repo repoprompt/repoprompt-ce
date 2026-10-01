@@ -1,13 +1,5 @@
 import Foundation
-
-/// How prompt packaging treats explicitly selected full/slice files it cannot resolve or read.
-enum PromptSelectedFileContentPolicy: Equatable {
-    /// Interactive packaging: unresolved or unreadable selections are skipped silently.
-    case bestEffort
-    /// Oracle packaging: await applied workspace ingress for the explicit selection, then fail
-    /// closed instead of sending a prompt that is missing explicitly selected file contents.
-    case required
-}
+import RepoPromptFoundation
 
 /// Raised when an Oracle prompt would omit explicitly selected full/slice file contents.
 struct PromptSelectedFileContentUnavailableError: LocalizedError, Equatable {
@@ -50,8 +42,7 @@ enum PromptSelectedFileContentRequirement {
     static func awaitAppliedIngress(
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
-        store: WorkspaceFileContextStore,
-        timeout: Duration = ingressWaitTimeout
+        store: WorkspaceFileContextStore
     ) async throws {
         let paths = explicitContentPaths(in: lookupContext.physicalizeSelection(selection))
         guard !paths.isEmpty else { return }
@@ -59,7 +50,7 @@ enum PromptSelectedFileContentRequirement {
             _ = try await store.awaitAppliedIngressForExplicitRequests(
                 userPaths: paths,
                 fallbackScope: lookupContext.rootScope.excludingWorkspaceGitData,
-                timeout: timeout
+                timeout: ingressWaitTimeout
             )
         } catch is WorkspaceAppliedIngressWaitError {
             // Bounded wait expired; resolution below still fails closed for unresolved paths.

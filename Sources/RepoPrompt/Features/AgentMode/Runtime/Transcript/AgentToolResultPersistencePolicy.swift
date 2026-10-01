@@ -2193,13 +2193,19 @@ enum AgentToolResultPersistencePolicy {
     static func oracleGroupDigest(from rawObject: [String: Any]?) -> [String: Any]? {
         guard let rawObject,
               let rawLanes = rawObject["oracle_results"] as? [[String: Any]],
+              let oracleCount = intValue(rawObject, keys: ["oracle_count"]),
+              oracleCount == rawLanes.count,
               rawLanes.count > 1,
               rawLanes.count <= 8
         else { return nil }
         var lanes: [[String: Any]] = []
+        var seenIndices = Set<Int>()
         for rawLane in rawLanes {
             guard let laneIndex = intValue(rawLane, keys: ["lane_index"]),
+                  (0 ..< oracleCount).contains(laneIndex),
+                  seenIndices.insert(laneIndex).inserted,
                   let role = smallStringValue(rawLane, keys: ["role"]),
+                  role == (laneIndex == 0 ? "primary" : "additional"),
                   let chatID = smallStringValue(rawLane, keys: ["chat_id"]),
                   let modelID = smallStringValue(rawLane, keys: ["model_id"]),
                   let status = smallStringValue(rawLane, keys: ["status"])
@@ -2229,7 +2235,7 @@ enum AgentToolResultPersistencePolicy {
             lanes.append(lane)
         }
         var digest: [String: Any] = [
-            "oracle_count": intValue(rawObject, keys: ["oracle_count"]) ?? lanes.count,
+            "oracle_count": oracleCount,
             "oracle_results": lanes
         ]
         if let groupID = smallStringValue(rawObject, keys: ["oracle_group_id"]) {
