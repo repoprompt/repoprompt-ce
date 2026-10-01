@@ -63,8 +63,8 @@ extension AgentModeViewModel {
 
     private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
         guard let providerID = selectedAgent.acpProviderID else { return [] }
-        // Pure projection over the held demand-scoped observation (OpenCode) or the static
-        // catalogue (Cursor). Never launch discovery from here. While the OpenCode observation
+        // Pure projection over the held demand-scoped observation (OpenCode) or the
+        // runtime Cursor snapshot (falling back to the release catalog). Never launch discovery here. While the OpenCode observation
         // is loading/failed/has no usable parameters, this yields no parameter set, so the
         // effort control is omitted while model selection, permissions, and submission stay
         // usable. Every returned choice renders, including a one-option menu.

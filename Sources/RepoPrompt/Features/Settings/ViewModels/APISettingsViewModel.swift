@@ -358,6 +358,9 @@ public class APISettingsViewModel: ObservableObject {
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
+    private var cursorModelsRefreshTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringCursorModels = false
+    @Published private(set) var cursorModelDiscoveryMessage: String?
     private var grokBuildModelsTask: Task<Void, Never>?
     private var devinModelsTask: Task<Void, Never>?
     @Published private(set) var isDiscoveringDevinModels = false
@@ -1031,6 +1034,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
+    private let cursorModelPollingService: CursorACPModelPollingService
     private let codexModelPollingService: CodexModelPollingService
     private let codexManagedAuthRecovery: any CodexManagedAuthRecovering
     private let codexSessionFence: CodexManagedSessionFence
@@ -1044,6 +1048,7 @@ public class APISettingsViewModel: ObservableObject {
         keyManager: KeyManager,
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
+        cursorModelPollingService: CursorACPModelPollingService = .shared,
         codexManagedAuthRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
         codexSessionFence: CodexManagedSessionFence = .shared,
         codexExecutablePreflight: @escaping @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution = { collector in
@@ -1055,6 +1060,7 @@ public class APISettingsViewModel: ObservableObject {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
         self.codexModelPollingService = codexModelPollingService
+        self.cursorModelPollingService = cursorModelPollingService
         self.codexManagedAuthRecovery = codexManagedAuthRecovery
         self.codexSessionFence = codexSessionFence
         self.codexExecutablePreflight = codexExecutablePreflight
@@ -1097,8 +1103,7 @@ public class APISettingsViewModel: ObservableObject {
         stopCodexModelsSubscription()
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
-        cursorModelsTask?.cancel()
-        cursorModelsTask = nil
+        stopCursorModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -1120,6 +1125,7 @@ public class APISettingsViewModel: ObservableObject {
         groqModelsTask?.cancel()
         codexModelsTask?.cancel()
         openCodeModelsTask?.cancel()
+        cursorModelsRefreshTask?.cancel()
         cursorModelsTask?.cancel()
         openRouterModelsTask?.cancel()
         customModelsTask?.cancel()
@@ -1358,12 +1364,12 @@ public class APISettingsViewModel: ObservableObject {
 
     private func probeCachedCursorConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        if let latest = await CursorACPModelPollingService.shared.latestSnapshot(),
+        if let latest = await cursorModelPollingService.latestSnapshot(),
            latest.isLiveDiscovery
         {
             return true
         }
-        return await CursorACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        return await cursorModelPollingService.refreshNow(workspacePath: nil)
     }
 
     private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
@@ -1444,8 +1450,7 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask = nil
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
-        cursorModelsTask?.cancel()
-        cursorModelsTask = nil
+        stopCursorModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -3630,6 +3635,29 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Cursor CLI / ACP
 
+    #if DEBUG
+        func test_waitForCursorModelRefresh() async {
+            await cursorModelsRefreshTask?.value
+        }
+    #endif
+
+    func refreshCursorModels() {
+        guard !hasPreparedForWindowClose, isCursorConnected, cursorModelsRefreshTask == nil else { return }
+        isDiscoveringCursorModels = true
+        cursorModelDiscoveryMessage = nil
+        cursorModelsRefreshTask = Task { [weak self] in
+            let result = await cursorModelPollingService.refreshCatalog(workspacePath: nil)
+            guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringCursorModels = false
+            cursorModelsRefreshTask = nil
+            if let message = result.errorMessage {
+                cursorModelDiscoveryMessage = "\(message) Try Refresh Models again."
+            } else if let count = result.advertisedCount {
+                cursorModelDiscoveryMessage = "\(count) models advertised."
+            }
+        }
+    }
+
     func testCursorConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
         collector.append("Cursor Agent CLI connection test started")
@@ -3641,7 +3669,7 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Starting Cursor ACP model discovery preflight")
 
         do {
-            let snapshot = try await CursorACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let snapshot = try await cursorModelPollingService.discoverOnce(workspacePath: nil)
             let cursorOptions = AgentModelCatalog.options(
                 for: .cursor,
                 availability: AgentModelCatalog.AvailabilityContext(cursorAvailable: true, zaiConfigured: false)
@@ -3763,7 +3791,7 @@ public class APISettingsViewModel: ObservableObject {
         guard !hasPreparedForWindowClose else { return }
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in
-            let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            let stream = await cursorModelPollingService.subscribe(workspacePath: workspacePath)
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
@@ -3782,6 +3810,10 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func stopCursorModelsSubscription(clearModels: Bool = false) {
+        cursorModelsRefreshTask?.cancel()
+        cursorModelsRefreshTask = nil
+        isDiscoveringCursorModels = false
+        cursorModelDiscoveryMessage = nil
         cursorModelsTask?.cancel()
         cursorModelsTask = nil
         if clearModels {
