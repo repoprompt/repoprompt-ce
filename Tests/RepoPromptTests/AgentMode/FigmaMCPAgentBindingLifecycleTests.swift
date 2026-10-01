@@ -68,7 +68,10 @@ final class FigmaMCPAgentBindingLifecycleTests: XCTestCase {
         viewModel.test_recordFigmaEnabledBinding(tabID: tabID, controllerBindingID: UUID())
 
         viewModel.test_revokeFigmaBoundAgentSessions()
-        try await waitUntil { !session.runState.isActive }
+        // Terminal publication can precede controller retirement; observe both outcomes.
+        try await waitUntil(timeoutNanoseconds: 5_000_000_000) {
+            !session.runState.isActive && recorder.shutdownCount() == 1
+        }
 
         XCTAssertEqual(recorder.shutdownCount(), 1)
     }
