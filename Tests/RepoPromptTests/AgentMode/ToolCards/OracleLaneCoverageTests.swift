@@ -43,6 +43,21 @@ final class OracleLaneCoverageTests: XCTestCase {
         XCTAssertEqual(failed.incompleteLanes.map(\.reason), ["cancelled", "empty response", "failed"])
     }
 
+    func testCompletedContextBuilderOutcomeDoesNotOverstateLaneSuccess() throws {
+        let complete = try XCTUnwrap(OracleLaneCoverage(lanes: [lane(0, "a", "completed"), lane(1, "b", "completed")]))
+        let partial = try XCTUnwrap(OracleLaneCoverage(lanes: [lane(0, "a", "completed"), lane(1, "b", "failed")]))
+        let failed = try XCTUnwrap(OracleLaneCoverage(lanes: [lane(0, "a", "failed"), lane(1, "b", "cancelled")]))
+        for label in ["success", "completed"] {
+            XCTAssertEqual(contextBuilderCompletedOutcomeLabel(label, coverage: complete, toolIsError: false), label)
+            XCTAssertEqual(contextBuilderCompletedOutcomeLabel(label, coverage: partial, toolIsError: false), "partial success")
+            XCTAssertEqual(contextBuilderCompletedOutcomeLabel(label, coverage: failed, toolIsError: false), "Oracle incomplete")
+            XCTAssertEqual(contextBuilderCompletedOutcomeLabel(label, coverage: partial, toolIsError: true), "error")
+        }
+        for label in ["error", "failed", "cancelled", "partial"] {
+            XCTAssertEqual(contextBuilderCompletedOutcomeLabel(label, coverage: partial, toolIsError: false), label)
+        }
+    }
+
     func testPersistedContextBuilderReviewKeepsLaneDigestWithoutResponses() throws {
         let raw: [String: Any] = [
             "context_id": "CA9D86FB-FDA0-482A-8F46-6910C089E853",
@@ -80,6 +95,32 @@ final class OracleLaneCoverageTests: XCTestCase {
         let coverage = try XCTUnwrap(contextBuilderOracleLaneCoverage(for: dto))
         XCTAssertEqual(coverage.summaryText, "1/2 lanes · claude-opus-5 timed out")
         XCTAssertEqual(contextBuilderOracleLaneSummaries(for: dto).map(\.status), ["done", "failed"])
+
+        let reloadedSummary = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(
+            for: AgentChatItem(kind: .toolResult, text: summary.resultJSON, toolName: "context_builder", toolResultJSON: summary.resultJSON, toolIsError: false)
+        ))
+        let reloadedDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: reloadedSummary.resultJSON))
+        XCTAssertEqual(contextBuilderOracleLaneCoverage(for: reloadedDTO)?.summaryText, coverage.summaryText)
+
+        let item = AgentChatItem(kind: .toolResult, text: jsonString(raw), toolName: "context_builder", toolResultJSON: jsonString(raw), toolIsError: false)
+        let execution = try XCTUnwrap(AgentTranscriptToolNormalizer.toolExecution(for: item))
+        let activity = AgentTranscriptActivity(from: item, toolExecution: execution)
+        var transcript = AgentTranscript(turns: [AgentTranscriptTurn(
+            responseSpans: [AgentTranscriptProviderResponseSpan(lifecycle: .completed, startedAt: item.timestamp, completedAt: item.timestamp, activities: [activity])],
+            startedAt: item.timestamp,
+            completedAt: item.timestamp
+        )], nextSequenceIndex: 1)
+        for pass in 1 ... 2 {
+            let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript).transcript
+            let encoded = try JSONEncoder().encode(persisted)
+            let decoded = try JSONDecoder().decode(AgentTranscript.self, from: encoded)
+            let restored = AgentTranscriptPolicyPipeline.runtimeTranscript(decoded)
+            let row = try XCTUnwrap((restored.projection.workingRows + restored.projection.archivedRows).first { $0.id == item.id })
+            let restoredDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: row.toolResultJSON))
+            XCTAssertEqual(contextBuilderOracleLaneCoverage(for: restoredDTO)?.summaryText, coverage.summaryText, "round trip \(pass)")
+            XCTAssertFalse(row.toolResultJSON?.contains("finding finding") == true)
+            transcript = restored.transcript
+        }
     }
 
     func testPersistedAskOracleKeepsLaneDigest() throws {
