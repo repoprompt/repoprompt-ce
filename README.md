@@ -136,10 +136,11 @@ is unchanged and does not use the generated workspace.
   worktrees and `.worktreeinclude` local file copying.
 - **MCP server and CLI integration**: Connect external MCP-compatible tools and
   CLI agents to RepoPrompt CE's repository context and agent harness.
-  - **External MCP connections**: Configure the Codex-managed Figma MCP connection
-    for top-level Agent Mode from **Settings → MCP → MCP Integrations**. See
-  [`docs/figma-mcp.md`](docs/figma-mcp.md) for connection ownership, access
-  policy, imports, disconnect, and safe troubleshooting.
+  - **External MCP connections**: Manage provider-aware Figma connections from
+    **Settings → MCP Integrations → Figma**. Codex supports gated runtime access
+    for eligible top-level Agent Mode sessions; other providers have distinct
+    Settings capabilities. See [`docs/figma-mcp.md`](docs/figma-mcp.md) for usage,
+    provider support, credential ownership, and runtime boundaries.
 - **Multi-root workspaces**: Work across related repositories, packages, and
   documentation folders in one workspace.
 - **Reviewable handoffs**: Inspect and refine selected context before sending it
