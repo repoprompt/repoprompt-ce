@@ -242,6 +242,10 @@ enum ACPDefaultSessionUpdateNormalizer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         if status == "completed" || status == "failed" {
+            // Some agents (Devin) finish with no output after streaming results in
+            // in-progress updates; keep the terminal status instead of an empty payload.
+            let outputJSON = outputJSON.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                ?? ACPRuntimeEventParsing.serializeJSON(["status": status ?? "completed"])
             return [
                 .stream(
                     AIStreamResult(
