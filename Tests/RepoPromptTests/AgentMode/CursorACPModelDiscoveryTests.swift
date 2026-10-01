@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
