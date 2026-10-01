@@ -194,19 +194,25 @@ struct ContextBuilderResultCard: View {
     }
 
     private var summary: String {
-        if isActiveResultCard {
-            return contextBuilderCardSubtitle(
+        let label = isActiveResultCard
+            ? contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 fallbackStatus: dto?.status,
                 phase: phase
             )
-        }
-        return contextBuilderFinalStatusLabel(dto?.status)
+            : contextBuilderFinalStatusLabel(dto?.status)
+        guard phase == .completed, let laneCoverage else { return label }
+        return label.isEmpty ? laneCoverage.summaryText : "\(label) · \(laneCoverage.summaryText)"
+    }
+
+    private var laneCoverage: OracleLaneCoverage? {
+        contextBuilderOracleLaneCoverage(for: dto)
     }
 
     private var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true { return .failure }
+        if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure
@@ -650,6 +656,19 @@ func contextBuilderOracleLaneSummaries(
             status: lane.status == OracleLaneResultStatus.completed.rawValue ? "done" : lane.status
         )
     }
+}
+
+func contextBuilderOracleLaneCoverage(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> OracleLaneCoverage? {
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return nil }
+    let reply = switch branch {
+    case .review: dto.review
+    case .plan: dto.plan
+    }
+    return OracleLaneCoverage(lanes: reply?.oracleResults)
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {

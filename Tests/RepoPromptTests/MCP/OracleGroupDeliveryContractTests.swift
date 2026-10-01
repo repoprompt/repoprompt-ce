@@ -25,6 +25,11 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         XCTAssertTrue(text.contains("Read every lane through the end-of-group marker (`End of Oracle group: 3 lanes above.`)"), text)
         XCTAssertTrue(text.contains("read-only `oracle_chat_log` with that lane's chat ID"), text)
         XCTAssertTrue(text.contains("Do not start a follow-up just to retrieve prior text."), text)
+        XCTAssertTrue(text.contains(
+            "- Make the reconciliation visible to the user: begin your answer with `**Oracle reconciliation**`, "
+                + "state how many lanes completed and name any that did not"
+        ), text)
+        XCTAssertTrue(text.contains("whether you accepted, rejected, or left it unresolved."), text)
         XCTAssertTrue(text.hasSuffix("""
         Lanes (3):
         - Oracle — `model-a` — Completed — chat ID `chat-0`
