@@ -17,6 +17,10 @@ public final class WorkspaceApprovalManager: ObservableObject {
     public static let shared = WorkspaceApprovalManager()
 
     @Published public private(set) var pendingRequest: WorkspaceApprovalRequest?
+    /// Window that should present `pendingRequest`, or `nil` to present app-wide.
+    /// Resolved once at presentation time so a request targeting a window that is
+    /// no longer live still reaches a window that can answer it.
+    @Published public private(set) var presentedTargetWindowID: Int?
     @Published public var isApprovalOverlayVisible: Bool = false
     @Published public private(set) var settings: WorkspaceApprovalSettings
 
@@ -63,6 +67,9 @@ public final class WorkspaceApprovalManager: ObservableObject {
         ))
         switch result {
         case let .approved(alwaysAllow):
+            if alwaysAllow {
+                addAutoApproval(clientID: request.clientID, operation: request.operation)
+            }
             return .approved(alwaysAllow: alwaysAllow)
         case .timeout:
             return .timeout
@@ -78,12 +85,18 @@ public final class WorkspaceApprovalManager: ObservableObject {
         Task { await broker.cancel(requestID: requestID) }
     }
 
-    public func resolveApproval(allow: Bool, alwaysAllow: Bool = false) {
-        guard let request = pendingRequest else { return }
-        if allow, alwaysAllow {
-            addAutoApproval(clientID: request.clientID, operation: request.operation)
-        }
-        let requestID = request.id
+    public func resolveApproval(
+        requestID: UUID,
+        respondingWindowID: Int,
+        allow: Bool,
+        alwaysAllow: Bool = false
+    ) {
+        guard pendingRequest?.id == requestID,
+              WorkspaceApprovalPresentationPolicy.shouldPresent(
+                  targetWindowID: presentedTargetWindowID,
+                  inWindowID: respondingWindowID
+              )
+        else { return }
         clearPresentedRequestIfMatching(requestID)
         Task {
             await broker.resolve(
@@ -105,6 +118,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
         requestsByID.removeAll()
         outstandingRequestIDs.removeAll()
         pendingRequest = nil
+        presentedTargetWindowID = nil
         isApprovalOverlayVisible = false
         guard !ids.isEmpty else { return }
         Task { await broker.cancel(requestIDs: ids) }
@@ -189,6 +203,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
     private func presentDomainApproval(_ request: DomainMutationApprovalRequest) -> Bool {
         guard let appRequest = requestsByID[request.id] else { return false }
         pendingRequest = appRequest
+        presentedTargetWindowID = livePresentationTarget(for: appRequest.windowID)
         isApprovalOverlayVisible = true
         bringWindowToFront(windowID: appRequest.windowID)
         if !NSApp.isActive {
@@ -204,6 +219,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
     private func clearPresentedRequestIfMatching(_ requestID: UUID) {
         guard pendingRequest?.id == requestID else { return }
         pendingRequest = nil
+        presentedTargetWindowID = nil
         isApprovalOverlayVisible = false
     }
 
@@ -229,6 +245,15 @@ public final class WorkspaceApprovalManager: ObservableObject {
         UserDefaults.standard.set(data, forKey: Self.settingsKey)
     }
 
+    /// A targeted request is only scoped to its window while that window is live.
+    /// Otherwise it falls back to app-wide presentation rather than waiting for the
+    /// broker deadline with no overlay anywhere.
+    private func livePresentationTarget(for windowID: Int?) -> Int? {
+        guard let windowID else { return nil }
+        let isLive = WindowStatesManager.shared.allWindows.contains { $0.windowID == windowID }
+        return isLive ? windowID : nil
+    }
+
     private func bringWindowToFront(windowID: Int?) {
         if let windowID,
            let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
@@ -236,6 +261,9 @@ public final class WorkspaceApprovalManager: ObservableObject {
         {
             if !NSApp.isActive {
                 NSApp.activate(ignoringOtherApps: true)
+            }
+            if nsWindow.isMiniaturized {
+                nsWindow.deminiaturize(nil)
             }
             nsWindow.makeKeyAndOrderFront(nil)
         } else if !NSApp.isActive {
