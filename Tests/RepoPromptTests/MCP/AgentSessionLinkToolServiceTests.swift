@@ -870,6 +870,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             "workspace": .string(workspace.name)
         ]
 
+        let originalWorkspaceName = workspace.name
         let first = try await Self.executeObject(fixture.service, args: args)
         let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex {
             $0.id == workspace.id
@@ -877,6 +878,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         fixture.window.workspaceManager.workspaces[workspaceIndex].name = "Renamed after creation"
         let replay = try await Self.executeObject(fixture.service, args: args)
         XCTAssertEqual(first["result"], .string("created"))
+        XCTAssertEqual(first["workspace"], .string(originalWorkspaceName))
+        XCTAssertEqual(replay["workspace"], first["workspace"])
         XCTAssertEqual(replay["session_id"], first["session_id"])
         XCTAssertEqual(replay["duplicate"], .bool(true))
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
@@ -885,6 +888,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         conflictArgs["session_name"] = .string("Different lane")
         let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
         XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
+        XCTAssertNil(conflict["workspace"])
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
 
         AgentAdvertisedModelCatalog.shared.record([
@@ -903,6 +907,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         explicit["model_id"] = .string("claudeCode:explicit-model:high")
         let pinned = try await Self.executeObject(fixture.service, args: explicit)
         XCTAssertEqual(pinned["result"], .string("created"))
+        XCTAssertEqual(pinned["workspace"], .string("Renamed after creation"))
         XCTAssertEqual(fixture.host.lastLaneSelection?.agentRaw, "claudeCode")
         XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, "explicit-model:high")
         XCTAssertEqual(fixture.host.lastLaneSelection?.reasoningEffortRaw, "high")
@@ -913,6 +918,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let unavailable = try await Self.executeObject(fixture.service, args: explicit)
         XCTAssertEqual(unavailable["result"], .string("model_unavailable"))
         XCTAssertEqual(fixture.host.laneCreationCount, 2)
+        XCTAssertNil(unavailable["workspace"])
+
+        var implicit = args
+        implicit.removeValue(forKey: "workspace")
+        implicit["idempotency_key"] = .string("caller-workspace")
+        let defaulted = try await Self.executeObject(fixture.service, args: implicit)
+        XCTAssertEqual(defaulted["result"], .string("created"))
+        XCTAssertEqual(defaulted["workspace"], .string("Renamed after creation"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 3)
     }
 
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
@@ -995,10 +1009,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let sessionID = UUID()
         let receipt = AgentSessionLaneCreateReceipt(
             result: .creationIncomplete, sessionID: sessionID, sessionName: "Retained lane",
-            linked: false, reason: .addFailed, firstTask: .none, laneCount: 1
+            linked: false, reason: .addFailed, firstTask: .none, laneCount: 1, workspaceName: "Original destination"
         )
         let rendered = AgentSessionLaneMCPToolService.render(receipt).objectValue
         XCTAssertEqual(rendered?["session_id"]?.stringValue, sessionID.uuidString)
+        XCTAssertEqual(rendered?["workspace"]?.stringValue, "Original destination")
         XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains("ordinary add") == true)
         XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains(sessionID.uuidString) == true)
     }

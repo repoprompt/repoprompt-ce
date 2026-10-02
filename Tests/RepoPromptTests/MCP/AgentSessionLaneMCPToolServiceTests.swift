@@ -15,7 +15,8 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
             reason: nil,
             firstTask: .queued,
             laneCount: 3,
-            duplicate: true
+            duplicate: true,
+            workspaceName: "Café \"QA\""
         )
         let payload = AgentSessionLaneMCPToolService.render(receipt).objectValue
         XCTAssertEqual(payload?["result"]?.stringValue, "created")
@@ -24,6 +25,7 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(payload?["lanes"]?.stringValue, "3/8")
         XCTAssertEqual(payload?["duplicate"], .bool(true))
         XCTAssertNil(payload?["link_reason"])
+        XCTAssertEqual(payload?["workspace"]?.stringValue, "Café \"QA\"")
 
         let refused = AgentSessionLaneMCPToolService.render(
             AgentSessionLaneCreateReceipt.refused(.laneLimitReached, laneCount: 8)
@@ -31,6 +33,11 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(refused?["result"]?.stringValue, "lane_limit_reached")
         XCTAssertEqual(refused?["lanes"]?.stringValue, "8/8")
         XCTAssertNil(refused?["session_id"])
+        for reason in [AgentSessionLaneCreateReceipt.Reason.denied, .modelUnavailable, .laneLimitReached] {
+            var receipt = AgentSessionLaneCreateReceipt.refused(reason, laneCount: 8)
+            receipt.workspaceName = "Must not leak"
+            XCTAssertNil(AgentSessionLaneMCPToolService.render(receipt).objectValue?["workspace"])
+        }
     }
 
     func testRetirementReceiptsRemainNonDestructiveAndExplainPartialOutcome() {

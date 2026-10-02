@@ -648,7 +648,7 @@ struct AgentSessionLinkMCPToolService {
             resolveDestination: {
                 AgentSessionLaneMCPToolService.resolveDestination(
                     workspaceSelector: workspaceSelector, callerWindow: callerWindow
-                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID, workspaceName: $0.workspaceName) }
             }
         )
         if receipt.reason == .denied { throw Self.unavailableError }

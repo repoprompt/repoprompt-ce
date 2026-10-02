@@ -83,6 +83,7 @@ enum AgentSessionLaneMCPToolService {
         }
         if let sessionID = receipt.sessionID { fields["session_id"] = .string(sessionID.uuidString) }
         if let sessionName = receipt.sessionName { fields["session_name"] = .string(sessionName) }
+        if let workspaceName = receipt.workspaceName { fields["workspace"] = .string(workspaceName) }
         if !receipt.linked, let reason = receipt.reason {
             fields["link_reason"] = .string(reason.rawValue)
         }
