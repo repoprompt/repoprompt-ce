@@ -19548,10 +19548,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 {
                     var updated = session.items[index]
                     updated.kind = .toolResult
-                    updated.toolResultJSON = outputJSON
                     updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                    updated.toolIsError = result.toolIsError
-                    updated.text = outputJSON
+                    if let payload = AgentToolResultPayloadRetention.resolvedPayload(
+                        existing: updated.toolResultJSON,
+                        incoming: outputJSON,
+                        incomingIsError: result.toolIsError
+                    ) {
+                        updated.toolResultJSON = payload
+                        updated.toolIsError = result.toolIsError
+                        updated.text = payload
+                    }
                     session.replaceItem(at: index, with: updated)
                 } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
                     var updated = session.items[index]

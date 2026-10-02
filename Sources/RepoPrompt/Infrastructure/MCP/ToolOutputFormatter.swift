@@ -4569,6 +4569,19 @@ extension ToolOutputFormatter {
                 errorMessage: lane.error?.message
             )
         })
+        if let preamble = OracleGroupDeliveryContract.preamble(lanes: payload.lanes.map { lane in
+            OracleGroupDeliveryContract.Lane(
+                laneIndex: lane.laneIndex,
+                modelID: lane.modelID,
+                chatID: lane.chatID,
+                status: lane.status.rawValue,
+                response: lane.response,
+                partialResponse: lane.partialResponse
+            )
+        }) {
+            lines.append("")
+            lines.append(preamble)
+        }
         let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
         if !laneMarkdown.isEmpty {
             lines.append("")
@@ -4580,7 +4593,13 @@ extension ToolOutputFormatter {
                 lines.append("Warning [\(warning.code)]: \(warning.message)")
             }
         }
-        return lines.joined(separator: "\n")
+        if let endMarker = OracleGroupDeliveryContract.endMarker(laneCount: ordered.count) {
+            lines.append("")
+            lines.append(endMarker)
+        }
+        // MCP clients may concatenate adjacent text blocks with no separator;
+        // end with a line break so the end marker stays on its own line.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
