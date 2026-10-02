@@ -136,9 +136,10 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         DevinIntegrationConfiguration.cleanupReportingFailures(artifact: artifact)
     }
 
-    func shouldEmitStderrLine(_ line: String) -> Bool {
-        let suppressedPattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+(?:INFO\s+|WARN\s+(?:message_forest:\s+MessageChain tree duplication:|windsurf_api_client::remote_config:\s+remote config revalidation failed,\s+keeping last-good value:))"#
-        return line.range(of: suppressedPattern, options: .regularExpression) == nil
+    func shouldEmitStderrLine(_: String) -> Bool {
+        // Process stderr is diagnostic output, not ACP model content. The controller
+        // retains it for diagnostics and includes it when the process fails.
+        false
     }
 
     func normalizeError(_ error: Error) -> Error {
