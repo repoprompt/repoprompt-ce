@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -55,6 +56,109 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("cursor/list_available_models"))
             XCTAssertTrue(error.localizedDescription.contains("timed out"))
         }
+    }
+
+    func testRefreshReportsAdvertisedCountAndRuntimeParametersReachResolver() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let workspace = try makeTestDirectory(name: "CursorRefreshTests")
+        let provider = try CursorDiscoveryFakeProvider(commandPath: makeServerScript(in: workspace).path)
+        let service = CursorACPModelPollingService(client: CursorACPControllerModelDiscoveryClient(
+            providerFactory: { _, _ in provider }
+        ))
+        let result = await service.refreshCatalog(workspacePath: workspace.path)
+        XCTAssertTrue(result.isReady)
+        XCTAssertEqual(result.advertisedCount, 3)
+        XCTAssertNil(result.errorMessage)
+        let parameters = try XCTUnwrap(ACPModelParameterResolver.parameterSet(
+            providerID: .cursor, selectedModelRaw: "Grok 4.6"
+        ))
+        let effort = try XCTUnwrap(parameters.definition(kind: .thinking))
+        XCTAssertEqual(effort.configID, "effort")
+        XCTAssertEqual(effort.choices.map(\.rawValue), ["low", "high"])
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "claude-opus-4-5"))
+        await service.shutdown()
+    }
+
+    func testLegacyModelOnlyCacheRetainsOfflineParameterFallback() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let legacy = #"{"providerID":"cursor","currentModelRaw":"grok-4.6","options":[{"rawValue":"grok-4.6","displayName":"Grok 4.6","isPlaceholderDefault":false,"isProviderDefault":false,"supportedReasoningEfforts":[]}]}"#
+        let record = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: Data(legacy.utf8))
+        let snapshot = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        XCTAssertFalse(snapshot.hasModelParameterMetadata)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
+        AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .cursor)
+        await AgentACPModelRegistry.shared.test_warmStandardStore()
+        let effort = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "grok-4.6")?.definition(kind: .thinking)
+        XCTAssertEqual(effort?.choices.map(\.rawValue), ["low", "medium", "high", "xhigh"])
+        XCTAssertEqual(effort?.currentValueRaw, "high")
+    }
+
+    func testCompleteEmptyCatalogDoesNotInventParameters() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let options = [AgentModelOption(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false)]
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(.init(options: options, currentModelRaw: "grok-4.6"), for: .cursor)
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "grok-4.6"))
+        let record = try XCTUnwrap(ACPDynamicModelStore.canonicalProviderRecord(
+            from: .init(options: options, currentModelRaw: "grok-4.6"), providerID: .cursor
+        ))
+        let restored = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        XCTAssertTrue(restored.hasModelParameterMetadata)
+        XCTAssertTrue(restored.modelParameterSets.isEmpty)
+    }
+
+    func testFailedRefreshKeepsSnapshotAndCanRetry() async {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let snapshot = ACPDiscoveredSessionModels(
+            options: [.init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false)], currentModelRaw: "grok-4.6"
+        )
+        let client = RetryingCursorDiscoveryClient(snapshot: snapshot)
+        let service = CursorACPModelPollingService(client: client)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
+        let failed = await service.refreshCatalog(workspacePath: nil)
+        XCTAssertFalse(failed.isReady)
+        XCTAssertNil(failed.advertisedCount)
+        XCTAssertNotNil(failed.errorMessage)
+        XCTAssertEqual(AgentACPModelRegistry.shared.currentSnapshot(for: .cursor)?.options.map(\.rawValue), ["grok-4.6"])
+        let retried = await service.refreshCatalog(workspacePath: nil)
+        XCTAssertTrue(retried.isReady)
+        XCTAssertEqual(retried.advertisedCount, 1)
+        XCTAssertNil(retried.errorMessage)
+        await service.shutdown()
+    }
+
+    @MainActor
+    func testRefreshUIReportsFailureThenRetryAndClearsStateOnSignOut() async {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let client = RetryingCursorDiscoveryClient(snapshot: .init(
+            options: [.init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false)], currentModelRaw: "grok-4.6"
+        ))
+        let service = CursorACPModelPollingService(client: client)
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let viewModel = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager), keyManager: keyManager,
+            loadStoredDataOnInit: false, cursorModelPollingService: service
+        )
+        viewModel.isCursorConnected = true
+        viewModel.refreshCursorModels()
+        XCTAssertTrue(viewModel.isDiscoveringCursorModels)
+        await viewModel.test_waitForCursorModelRefresh()
+        XCTAssertFalse(viewModel.isDiscoveringCursorModels)
+        XCTAssertTrue(viewModel.cursorModelDiscoveryMessage?.contains("Try Refresh Models again") == true)
+        viewModel.refreshCursorModels()
+        await viewModel.test_waitForCursorModelRefresh()
+        XCTAssertFalse(viewModel.isDiscoveringCursorModels)
+        XCTAssertEqual(viewModel.cursorModelDiscoveryMessage, "1 models advertised.")
+        viewModel.refreshCursorModels()
+        viewModel.disconnectCursor()
+        XCTAssertFalse(viewModel.isDiscoveringCursorModels)
+        XCTAssertNil(viewModel.cursorModelDiscoveryMessage)
+        await service.shutdown()
+        viewModel.prepareForWindowClose()
     }
 
     private func makeServerScript(in directory: URL) throws -> URL {
@@ -146,6 +250,21 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
         return scriptURL
+    }
+}
+
+private actor RetryingCursorDiscoveryClient: CursorACPModelDiscoveryClient {
+    let snapshot: ACPDiscoveredSessionModels
+    private var calls = 0
+
+    init(snapshot: ACPDiscoveredSessionModels) {
+        self.snapshot = snapshot
+    }
+
+    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+        calls += 1
+        if calls == 1 { throw AIProviderError.invalidConfiguration(detail: "Discovery unavailable") }
+        return snapshot
     }
 }
 

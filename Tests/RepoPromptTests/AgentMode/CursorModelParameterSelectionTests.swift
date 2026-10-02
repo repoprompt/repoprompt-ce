@@ -432,6 +432,15 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(prompt.contextBuilderAgent, .cursor)
         XCTAssertEqual(prompt.contextBuilderAgentModelRaw, "grok-4.6")
 
+        let advertisedPin = ACPModelParameterSelection(
+            providerID: .cursor, baseModelRaw: "grok-4.6", kind: .thinking,
+            configID: "Cursor.Runtime-Effort", valueRaw: "RuntimeHigh"
+        )
+        prompt.setContextBuilderModelParameter(
+            [advertisedPin], expectedProviderID: .cursor, expectedModelRaw: "grok-4.6", expectedScope: .global
+        )
+        XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelParametersByAgent?[cursorAgentRaw], [advertisedPin])
+
         var newerProfile = store.globalAgentModelsProfile()
         newerProfile = newerProfile.replacingContextBuilderModel("composer-2.5", for: cursorAgentRaw)
         store.setGlobalAgentModelsProfile(

@@ -9,7 +9,7 @@ enum ACPModelParameterProbeContext: Equatable {
     case unavailable
 }
 
-/// Owns the demand-scoped discovery lifetime for one OpenCode effort chip and renders
+/// Owns discovery observation for an OpenCode or Cursor effort chip and renders
 /// `ACPModelParameterPinChip`. It owns *nothing else*: saved state and write authority stay with
 /// the host, which supplies the saved pin, the probe context, and a guarded write closure.
 ///
@@ -30,6 +30,17 @@ struct ACPModelParameterProbeView: View {
     let onSelect: (_ configID: String, _ valueRaw: String?) -> Void
 
     @State private var snapshot: OpenCodeACPModelParameterSnapshot?
+    @State private var cursorRegistryRevision = 0
+
+    private struct CursorObservationIdentity: Equatable {
+        let providerID: ACPProviderID
+        let modelRaw: String
+        let context: ACPModelParameterProbeContext
+    }
+
+    private var cursorObservationIdentity: CursorObservationIdentity {
+        .init(providerID: providerID, modelRaw: modelRaw, context: probeContext)
+    }
 
     init(
         modelRaw: String,
@@ -67,6 +78,13 @@ struct ACPModelParameterProbeView: View {
     }
 
     private var definition: ACPModelParameterDefinition? {
+        if providerID == .cursor {
+            guard case .resolved = probeContext else { return nil }
+            _ = cursorRegistryRevision
+            return ACPModelParameterResolver.parameterSet(
+                providerID: .cursor, selectedModelRaw: modelRaw
+            )?.definition(kind: .thinking)
+        }
         guard let snapshot, snapshot.key == probeKey,
               case let .available(parameterSet) = snapshot.state
         else { return nil }
@@ -84,6 +102,18 @@ struct ACPModelParameterProbeView: View {
             // wrapping nil content does not fire, while this zero-size host does.
             Color.clear
                 .frame(width: 0, height: 0)
+                .task(id: cursorObservationIdentity) {
+                    if providerID == .cursor {
+                        guard case .resolved = probeContext,
+                              !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        else { return }
+                        let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: nil)
+                        for await _ in stream {
+                            guard !Task.isCancelled else { return }
+                            cursorRegistryRevision &+= 1
+                        }
+                    }
+                }
                 .task(id: probeKey) {
                     snapshot = nil
                     guard let probeKey, let probedModelRaw else { return }

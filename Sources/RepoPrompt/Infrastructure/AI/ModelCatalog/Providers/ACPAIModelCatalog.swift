@@ -28,7 +28,7 @@ struct ACPDynamicProviderRecord: Codable, Hashable {
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
         options: [ACPDynamicModelRecord],
-        modelParameterSets: [ACPModelParameterSet] = []
+        modelParameterSets: [ACPModelParameterSet]? = []
     ) {
         self.providerID = providerID
         self.currentModelRaw = currentModelRaw
@@ -105,7 +105,8 @@ enum ACPDynamicModelStore {
             currentModelRaw: normalizedCurrentModelRaw(snapshot.currentModelRaw, options: options),
             currentEffortRaw: snapshot.currentEffortRaw,
             options: options,
-            modelParameterSets: canonicalParameterSets(snapshot.modelParameterSets, options: options)
+            modelParameterSets: snapshot.hasModelParameterMetadata
+                ? canonicalParameterSets(snapshot.modelParameterSets, options: options) : nil
         )
     }
 
@@ -117,7 +118,8 @@ enum ACPDynamicModelStore {
             options: options,
             currentModelRaw: currentModelRaw,
             currentEffortRaw: record.currentEffortRaw,
-            modelParameterSets: canonicalParameterSets(record.modelParameterSets ?? [], options: record.options)
+            modelParameterSets: canonicalParameterSets(record.modelParameterSets ?? [], options: record.options),
+            hasModelParameterMetadata: record.modelParameterSets != nil
         )
     }
 

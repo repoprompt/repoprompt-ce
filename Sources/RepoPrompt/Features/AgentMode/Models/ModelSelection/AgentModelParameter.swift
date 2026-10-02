@@ -220,15 +220,24 @@ enum ACPModelParameterResolver {
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+               snapshot.hasModelParameterMetadata
+            {
+                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor)
+                return snapshot.modelParameterSets.first {
+                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .cursor) == identity
+                }
+            }
+            // Preserve offline controls until discovery has supplied an authoritative snapshot.
+            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            openCodeParameterSet(
+            return openCodeParameterSet(
                 selectedModelRaw: selectedModelRaw,
                 workspacePath: workspacePath,
                 observation: openCodeParameters
             )
         default:
-            nil
+            return nil
         }
     }
 
