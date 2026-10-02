@@ -17,7 +17,8 @@ extension AgentModeViewModel {
     /// overload for any caller that captured the request earlier (cards, notifications).
     func submitApprovalDecision(tabID: UUID, decision: AgentApprovalDecision) {
         guard let session = sessions[tabID],
-              let request = session.pendingApproval
+              let request = session.pendingApproval,
+              decision != .accept || request.supportsPlainApprove
         else {
             return
         }

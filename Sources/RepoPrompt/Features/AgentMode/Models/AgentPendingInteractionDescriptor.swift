@@ -29,6 +29,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
     /// Primary content: the command, question, prompt, or path. Never truncated here.
     let detail: String?
     let approvalKind: AgentApprovalKind?
+    let supportsPlainApprove: Bool
     /// Exact command an approval would authorize (approvals only).
     let command: String?
     /// Provider tool name when the approval names one (Claude `can_use_tool`), e.g. `Bash`.
@@ -47,6 +48,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         title: String,
         detail: String?,
         approvalKind: AgentApprovalKind? = nil,
+        supportsPlainApprove: Bool = true,
         command: String? = nil,
         toolName: String? = nil,
         questionID: String? = nil,
@@ -61,6 +63,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         self.title = title
         self.detail = detail
         self.approvalKind = approvalKind
+        self.supportsPlainApprove = supportsPlainApprove
         self.command = command
         self.toolName = toolName
         self.questionID = questionID
@@ -75,6 +78,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
             title: title,
             detail: detail,
             approvalKind: approvalKind,
+            supportsPlainApprove: supportsPlainApprove,
             command: command,
             toolName: toolName,
             questionID: questionID,
@@ -93,6 +97,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         title: String,
         detail: String?,
         approvalKind: AgentApprovalKind?,
+        supportsPlainApprove: Bool = true,
         command: String?,
         toolName: String?,
         questionID: String?,
@@ -103,7 +108,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         isSecret: Bool
     ) -> String {
         let separator = "\u{1F}"
-        let fields: [String] = [
+        var fields: [String] = [
             "v1",
             kind.rawValue,
             id.uuidString,
@@ -119,6 +124,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
             allowsCustom ? "1" : "0",
             isSecret ? "1" : "0"
         ]
+        if !supportsPlainApprove { fields.append("plain-approve-unavailable") }
         let digest = SHA256.hash(data: Data(fields.joined(separator: separator).utf8))
         return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
@@ -165,6 +171,7 @@ extension AgentPendingInteractionDescriptor {
                 title: approval.title,
                 detail: command ?? nonEmpty(approval.reason) ?? nonEmpty(approval.grantRoot),
                 approvalKind: approval.kind,
+                supportsPlainApprove: approval.supportsPlainApprove,
                 command: command,
                 toolName: toolName
             )
