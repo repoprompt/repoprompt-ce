@@ -5,6 +5,19 @@ import XCTest
 
 @MainActor
 final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
+    /// Cursor membership and selectors come from its discovery snapshot; publish one so MCP
+    /// admission and parameter staging have a catalogue to validate against.
+    override func setUp() {
+        super.setUp()
+        CursorDiscoveredCatalogTestSupport.reset()
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
+    }
+
+    override func tearDown() {
+        CursorDiscoveredCatalogTestSupport.reset()
+        super.tearDown()
+    }
+
     func testFixtureRootsUseUniqueUUIDPaths() throws {
         let first = try makeFixture()
         defer { first.cleanup() }
@@ -718,13 +731,51 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
     }
 
-    func testAgentManageListCreateAndResumeUseReleaseCatalogMetadata() async throws {
+    func testAgentManageListCreateAndResumeUseDiscoveredCatalogMetadata() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let window = try await makeWindow(name: "Cursor MCP", root: fixture.root)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
+        // The window's ordinary CLI availability flags are in-memory test state. Disable all
+        // other recommendation candidates, including compatible backends, so list_agents cannot
+        // hide a missing Cursor role behind a Claude/Codex/OpenCode recommendation.
+        let api = window.apiSettingsViewModel
+        api.isClaudeCodeConnected = false
+        api.isCodexConnected = false
+        api.isOpenCodeConnected = false
+        api.isGrokBuildConnected = false
+        api.compatibleBackendSecretPresence = [:]
+        let roleAvailability = api.agentModeAvailabilityContext
+        XCTAssertTrue(roleAvailability.cursorAvailable)
+        XCTAssertFalse(roleAvailability.claudeCodeAvailable)
+        XCTAssertFalse(roleAvailability.codexAvailable)
+        XCTAssertFalse(roleAvailability.openCodeAvailable)
+        XCTAssertFalse(roleAvailability.grokBuildAvailable)
+        XCTAssertFalse(roleAvailability.zaiConfigured)
+        XCTAssertFalse(roleAvailability.kimiConfigured)
+        XCTAssertFalse(roleAvailability.customClaudeCompatibleConfigured)
+        CursorDiscoveredCatalogTestSupport.reset()
         let service = makeManageService(window: window)
+        let autoID = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.cursor.rawValue,
+            modelRaw: AgentModel.cursorAuto.rawValue
+        ).rawValue
+        for rolesOnly in [false, true] {
+            let roleList = try await service.execute(args: [
+                "op": .string("list_agents"),
+                "roles_only": .bool(rolesOnly)
+            ])
+            let labels = try XCTUnwrap(roleList.objectValue?["task_labels"]?.arrayValue)
+            for role in ["engineer", "pair", "design"] {
+                let row = try XCTUnwrap(labels.first { $0.objectValue?["label"]?.stringValue == role }?.objectValue)
+                XCTAssertEqual(row["recommended_model_id"]?.stringValue, autoID, role)
+                XCTAssertNotNil(row["model_id"]?.stringValue, role)
+            }
+            if rolesOnly { XCTAssertNil(roleList.objectValue?["agents"]) }
+        }
+
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
         let listed = try await service.execute(args: ["op": .string("list_agents")])
         XCTAssertEqual(
             listedParameterConfigIDs(listed, modelRaw: "grok-4.6"),

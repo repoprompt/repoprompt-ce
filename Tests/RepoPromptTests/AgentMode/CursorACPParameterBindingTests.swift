@@ -228,6 +228,11 @@ final class CursorACPParameterBindingTests: XCTestCase {
     }
 
     func testUntouchedCursorCatalogFallbackPreservesLiveEffortThroughPromptDispatch() async throws {
+        // The displayed CE-side default comes from Cursor's advertised catalogue, so publish one:
+        // its `grok-4.6` effort default is `high` while this session's live current is `medium`.
+        CursorDiscoveredCatalogTestSupport.reset()
+        defer { CursorDiscoveredCatalogTestSupport.reset() }
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
         XCTAssertEqual(
             ACPModelParameterResolver.resolve(
                 providerID: .cursor,

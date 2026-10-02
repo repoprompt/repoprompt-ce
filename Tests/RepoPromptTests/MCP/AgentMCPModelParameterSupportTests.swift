@@ -4,6 +4,19 @@ import MCP
 import XCTest
 
 final class AgentMCPModelParameterSupportTests: XCTestCase {
+    /// Cursor's selectors are advertised per model by discovery, so the Cursor cases below run
+    /// against a published catalogue rather than a compiled model table.
+    override func setUp() {
+        super.setUp()
+        CursorDiscoveredCatalogTestSupport.reset()
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
+    }
+
+    override func tearDown() {
+        CursorDiscoveredCatalogTestSupport.reset()
+        super.tearDown()
+    }
+
     func testCursorDefinitionsPreserveExactWireIdentifiersAndChoices() {
         let definitions = AgentMCPModelParameterSupport.definitions(agent: .cursor, modelRaw: "grok-4.6")
 

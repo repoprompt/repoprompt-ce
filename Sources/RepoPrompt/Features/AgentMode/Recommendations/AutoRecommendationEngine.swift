@@ -429,6 +429,16 @@ final class AutoRecommendationEngine {
         {
             return true
         }
+        // Cursor membership comes from an asynchronously warmed discovery snapshot, so restoration
+        // cannot treat "not currently advertised" as "never chosen": before discovery warms, or
+        // after a failed refresh, replacing the saved model with a recommendation would silently
+        // discard the user's Context Builder choice. Availability is enforced later, at admission
+        // and execution, with an actionable error.
+        if agent == .cursor,
+           !rawModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
+        }
         return AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: availability)
     }
 

@@ -18,6 +18,7 @@ enum AgentMCPSelectionResolver {
         _ role: AgentModelCatalog.TaskLabelKind,
         _ availability: AgentModelCatalog.AvailabilityContext
     ) -> AgentModelCatalog.NormalizedAgentSelection?
+    typealias CursorCatalogRefresh = @MainActor (_ workspacePath: String?) async -> Void
 
     struct ResolvedSelection {
         let agentRaw: String?
@@ -53,13 +54,19 @@ enum AgentMCPSelectionResolver {
         availability: AgentModelCatalog.AvailabilityContext = .current,
         workspaceID: UUID? = nil,
         roleSelectionProvider: RoleSelectionProvider? = nil,
-        surface: AgentModelCatalog.AgentSelectionSurface = .general
-    ) throws -> ResolvedSelection {
+        surface: AgentModelCatalog.AgentSelectionSurface = .general,
+        workspacePath: String? = nil,
+        cursorCatalogRefresh: CursorCatalogRefresh? = nil
+    ) async throws -> ResolvedSelection {
         let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else {
             // No explicit model_id — use default global role if provided
             if let defaultKind = defaultTaskLabel,
-               let resolved = try resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface)
+               let resolved = try await resolveRoleSelection(
+                   defaultKind, availability: availability, workspaceID: workspaceID,
+                   roleSelectionProvider: roleSelectionProvider, surface: surface,
+                   workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+               )
             {
                 return ResolvedSelection(
                     agentRaw: resolved.selection.agent.rawValue,
@@ -80,7 +87,11 @@ enum AgentMCPSelectionResolver {
         if !trimmed.contains(":") {
             let lowered = trimmed.lowercased()
             if let entry = AgentModelCatalog.taskLabels.first(where: { $0.label == lowered }) {
-                guard let resolved = try resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface) else {
+                guard let resolved = try await resolveRoleSelection(
+                    entry.kind, availability: availability, workspaceID: workspaceID,
+                    roleSelectionProvider: roleSelectionProvider, surface: surface,
+                    workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+                ) else {
                     throw MCPError.invalidParams("No available agent/model for task label '\(trimmed)'.")
                 }
                 return ResolvedSelection(
@@ -121,6 +132,13 @@ enum AgentMCPSelectionResolver {
             )
         }
 
+        if agent == .cursor {
+            try await refreshMissingCursorCatalogIfNeeded(
+                modelRaw: parsed.modelRaw, availability: availability,
+                workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+            )
+        }
+
         // Codex is intentionally permissive for dynamic/stale model IDs
         if agent != .codexExec {
             guard AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability) else {
@@ -144,14 +162,20 @@ enum AgentMCPSelectionResolver {
         availability: AgentModelCatalog.AvailabilityContext,
         workspaceID: UUID?,
         roleSelectionProvider: RoleSelectionProvider?,
-        surface: AgentModelCatalog.AgentSelectionSurface
-    ) throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection])? {
+        surface: AgentModelCatalog.AgentSelectionSurface,
+        workspacePath: String?,
+        cursorCatalogRefresh: CursorCatalogRefresh?
+    ) async throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection])? {
         if let providerSelection = roleSelectionProvider?(role, availability) {
             guard surface.allows(providerSelection.agent) else {
                 throw MCPError.invalidParams(
                     "Agent '\(providerSelection.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
+            try await requireAdvertisedCursorRoleModel(
+                providerSelection, role: role, availability: availability,
+                workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+            )
             return (providerSelection, [])
         }
         if let resolution = MCPAgentRoleDefaultsService.effectiveSelection(
@@ -164,6 +188,10 @@ enum AgentMCPSelectionResolver {
                     "Agent '\(resolution.effective.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
+            try await requireAdvertisedCursorRoleModel(
+                resolution.effective, role: role, availability: availability,
+                workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+            )
             return (resolution.effective, resolution.modelParameters)
         }
         guard let fallback = AgentModelCatalog.resolveTaskLabelKind(role, availability: availability) else {
@@ -175,5 +203,62 @@ enum AgentMCPSelectionResolver {
             )
         }
         return (fallback, [])
+    }
+
+    /// A role's stored Cursor model is preserved through restoration and refresh rather than being
+    /// swapped for the recommendation (`MCPAgentRoleDefaultsService`), so admission is where an
+    /// unadvertised one must fail. If there is no saved catalogue, discover once before admission;
+    /// then reject any model that is still unadvertised before creating a session or starting a run.
+    /// Cursor Auto is exempt: it is CE's provider-chosen default and carries no advertised identity.
+    @MainActor
+    private static func requireAdvertisedCursorRoleModel(
+        _ selection: AgentModelCatalog.NormalizedAgentSelection,
+        role: AgentModelCatalog.TaskLabelKind,
+        availability: AgentModelCatalog.AvailabilityContext,
+        workspacePath: String?,
+        cursorCatalogRefresh: CursorCatalogRefresh?
+    ) async throws {
+        guard selection.agent == .cursor else { return }
+        let modelRaw = selection.modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelRaw.isEmpty,
+              CursorAIModelCatalog.canonicalIdentity(modelRaw) != AgentModel.cursorAuto.rawValue
+        else {
+            return
+        }
+        try await refreshMissingCursorCatalogIfNeeded(
+            modelRaw: modelRaw, availability: availability,
+            workspacePath: workspacePath, cursorCatalogRefresh: cursorCatalogRefresh
+        )
+        guard !CursorAIModelCatalog.contains(modelRaw: modelRaw) else { return }
+        throw MCPError.invalidParams(
+            "Role '\(role.rawValue)' is set to Cursor model '\(modelRaw)', which is not in Cursor's last known model catalog. Refresh Cursor models with Test Connection, or choose Cursor Auto or another model for this role in Agent Models settings."
+        )
+    }
+
+    @MainActor
+    private static func refreshMissingCursorCatalogIfNeeded(
+        modelRaw: String,
+        availability: AgentModelCatalog.AvailabilityContext,
+        workspacePath: String?,
+        cursorCatalogRefresh: CursorCatalogRefresh?
+    ) async throws {
+        guard AgentModelCatalog.isAgentAvailable(.cursor, availability: availability),
+              !modelRaw.isEmpty,
+              CursorAIModelCatalog.canonicalIdentity(modelRaw) != AgentModel.cursorAuto.rawValue
+        else { return }
+
+        let registry = AgentACPModelRegistry.shared
+        guard registry.resolvedSnapshot(for: .cursor) == nil else { return }
+        await registry.warmStandardStoreIfNeeded()
+        guard registry.resolvedSnapshot(for: .cursor) == nil else { return }
+
+        if let cursorCatalogRefresh {
+            await cursorCatalogRefresh(workspacePath)
+        } else {
+            _ = await CursorACPModelPollingService.shared.refreshNow(workspacePath: workspacePath)
+        }
+        // refreshNow can report success without receiving a model list. The existing membership
+        // check remains authoritative, including after an unsuccessful or empty discovery.
+        try Task.checkCancellation()
     }
 }
