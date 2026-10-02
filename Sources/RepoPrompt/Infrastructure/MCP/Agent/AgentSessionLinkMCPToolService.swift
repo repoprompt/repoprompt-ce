@@ -86,6 +86,7 @@ struct AgentSessionLinkMCPToolService {
             _ operation: @escaping HeartbeatOperation
         ) async throws -> Value
 
+    var captureWaitInput: () -> DomainAgentSessionLinkWaitInput? = { AgentSessionLinkWaitCallOrigin.current }
     var bridge: AgentSessionLinkRuntimeBridge = .shared
 
     // MARK: - Entry point
@@ -766,12 +767,16 @@ struct AgentSessionLinkMCPToolService {
     // MARK: - wait
 
     private func executeWait(args: [String: Value]) async throws -> Value {
+        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
+            ?? Self.defaultWaitTimeoutSeconds
+        let capturedInput = captureWaitInput()
         let observerEndpoint = try await resolveCallerEndpointIdentity()
+        // Rehydration may resolve an endpoint unavailable at capture time. Preserve upstream wait
+        // admission, without borrowing another endpoint's local-input cancellation generation.
+        let observerInput = capturedInput.flatMap { $0.endpoint == observerEndpoint ? $0 : nil }
         let metadata = await captureRequestMetadata()
         let request = try Self.parseTargets(args)
         let predicate = try Self.parsePredicate(args["until"])
-        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout_seconds"])
-            ?? Self.defaultWaitTimeoutSeconds
         let cursorsBySessionID = try Self.parseWaitCursors(args, request: request)
 
         let targets = try await authorizeAll(
@@ -800,8 +805,23 @@ struct AgentSessionLinkMCPToolService {
             let waitResult = await bridge.wait(
                 requests: waitRequests,
                 until: predicate,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                observerInput: observerInput
             )
+            if waitResult.interruptedByLocalInput {
+                let pendingSends = await bridge.pendingSendProjections(for: leases)
+                // Keep the survivor proof as the last suspension before rendering.
+                let survivors = await bridge.terminalWaitSurvivingStates(leases: leases)
+                let rendered = AgentSessionLinkResponseRenderer.waitValue(
+                    .init(outcome: .cancelled, targets: survivors, interruptedByLocalInput: true),
+                    pendingSends: pendingSends,
+                    isSingle: isSingle
+                )
+                let survivingIDs = Set(survivors.map(\.sessionID))
+                return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(
+                    leases.map(\.target.sessionID).filter { !survivingIDs.contains($0) }, to: rendered
+                )
+            }
             // A terminal outcome is the authority's answer to a lost lease or runtime. Do not
             // replace it with a generic prompt-inspection denial or disclose a prompt from the
             // invalidated batch. Refresh surviving siblings' cursors and pending-send metadata.
@@ -2275,6 +2295,9 @@ enum AgentSessionLinkResponseRenderer {
         ]
         if let detail = waitDetail(result.outcome) {
             payload["detail"] = .string(detail)
+        }
+        if result.interruptedByLocalInput {
+            payload["_meta"] = .object(["wake_reason": .string("local_user_input")])
         }
         if isSingle {
             if let state = result.targets.first {

@@ -140,6 +140,7 @@ package actor DomainAgentSessionLinkAuthority {
     private struct Waiter {
         let id: UUID
         let observerSessionID: UUID
+        let observerInput: DomainAgentSessionLinkWaitInput?
         let predicate: DomainAgentSessionLinkWaitPredicate
         let registrations: [WaitRegistration]
         let continuation: CheckedContinuation<DomainAgentSessionLinkWaitResult, Never>
@@ -200,6 +201,7 @@ package actor DomainAgentSessionLinkAuthority {
     private var recentRevocationNoticeOrder: [DomainAgentSessionLinkEndpointIdentity] = []
 
     private var waiters: [UUID: Waiter] = [:]
+    private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
     private var sendLedger: [SendLedgerKey: SendLedgerEntry] = [:]
     private var sendLedgerOrder: [SendLedgerKey] = []
     private var subscribers: [UUID: AsyncStream<DomainAgentSessionLinkChangeEvent>.Continuation] = [:]
@@ -1025,6 +1027,32 @@ package actor DomainAgentSessionLinkAuthority {
 
     // MARK: - Wait
 
+    /// Input supersedes only observational waits captured before it, never mutations or providers.
+    package func acceptLocalInput(_ input: DomainAgentSessionLinkWaitInput) {
+        let generation = max(localInputGenerations[input.endpoint, default: 0], input.generation)
+        localInputGenerations[input.endpoint] = generation
+        let ids = waiters.values.filter {
+            $0.observerInput?.endpoint == input.endpoint
+                && ($0.observerInput?.generation ?? generation) < generation
+        }.map(\.id)
+        for id in ids {
+            resumeWaiter(id, outcome: .cancelled, includeTargets: false, interruptedByLocalInput: true)
+        }
+    }
+
+    /// Lifecycle-only cleanup: an active grant or newer input keeps its generation fence.
+    package func forgetLocalInput(_ input: DomainAgentSessionLinkWaitInput) -> Bool {
+        guard localInputGenerations[input.endpoint] == input.generation,
+              !hasActiveOutboundLink(observerEndpoint: input.endpoint) else { return false }
+        localInputGenerations.removeValue(forKey: input.endpoint)
+        return true
+    }
+
+    private func wasInterrupted(_ input: DomainAgentSessionLinkWaitInput?) -> Bool {
+        guard let input else { return false }
+        return input.generation < localInputGenerations[input.endpoint, default: 0]
+    }
+
     /// Bounded, event-driven waiting. Never busy-polls and never runs a timer between events.
     ///
     /// Collection authorization is all-or-nothing, and the waiter slot on every included link is
@@ -1032,7 +1060,8 @@ package actor DomainAgentSessionLinkAuthority {
     package func wait(
         requests: [DomainAgentSessionLinkWaitRequest],
         until predicate: DomainAgentSessionLinkWaitPredicate = .change,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        observerInput: DomainAgentSessionLinkWaitInput? = nil
     ) async -> DomainAgentSessionLinkWaitResult {
         guard !isDraining, !isShutDown else {
             return DomainAgentSessionLinkWaitResult(outcome: .shuttingDown, targets: [])
@@ -1060,6 +1089,9 @@ package actor DomainAgentSessionLinkAuthority {
                     outcome: .linkUnavailable(sessionID: request.lease.target.sessionID),
                     targets: []
                 )
+            }
+            if let observerInput, request.lease.observer != observerInput.endpoint {
+                return DomainAgentSessionLinkWaitResult(outcome: .invalidRequest, targets: [])
             }
         }
 
@@ -1098,6 +1130,11 @@ package actor DomainAgentSessionLinkAuthority {
             ))
         }
 
+        if wasInterrupted(observerInput) {
+            return DomainAgentSessionLinkWaitResult(
+                outcome: .cancelled, targets: [], interruptedByLocalInput: true
+            )
+        }
         // 3. Immediate resolution in request order.
         if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
             return waitResult(outcome: outcome, registrations: registrations)
@@ -1144,6 +1181,12 @@ package actor DomainAgentSessionLinkAuthority {
                         return
                     }
                 }
+                if wasInterrupted(observerInput) {
+                    continuation.resume(returning: DomainAgentSessionLinkWaitResult(
+                        outcome: .cancelled, targets: [], interruptedByLocalInput: true
+                    ))
+                    return
+                }
                 if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
                     continuation.resume(returning: waitResult(outcome: outcome, registrations: registrations))
                     return
@@ -1161,6 +1204,7 @@ package actor DomainAgentSessionLinkAuthority {
                 waiters[waiterID] = Waiter(
                     id: waiterID,
                     observerSessionID: observerSessionID,
+                    observerInput: observerInput,
                     predicate: predicate,
                     registrations: registrations,
                     continuation: continuation,
@@ -1285,7 +1329,8 @@ package actor DomainAgentSessionLinkAuthority {
     private func resumeWaiter(
         _ waiterID: UUID,
         outcome: DomainAgentSessionLinkWaitOutcome,
-        includeTargets: Bool
+        includeTargets: Bool,
+        interruptedByLocalInput: Bool = false
     ) {
         guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
         for registration in waiter.registrations
@@ -1296,7 +1341,9 @@ package actor DomainAgentSessionLinkAuthority {
         waiter.timeoutTask?.cancel()
         let result = includeTargets
             ? waitResult(outcome: outcome, registrations: waiter.registrations)
-            : DomainAgentSessionLinkWaitResult(outcome: outcome, targets: [])
+            : DomainAgentSessionLinkWaitResult(
+                outcome: outcome, targets: [], interruptedByLocalInput: interruptedByLocalInput
+            )
         waiter.continuation.resume(returning: result)
     }
 
@@ -1903,6 +1950,7 @@ package actor DomainAgentSessionLinkAuthority {
             resumeWaiter(waiterID, outcome: .shuttingDown, includeTargets: false)
         }
         isShutDown = true
+        localInputGenerations.removeAll()
         links.removeAll()
         pendingReservations.removeAll()
         targets.removeAll()

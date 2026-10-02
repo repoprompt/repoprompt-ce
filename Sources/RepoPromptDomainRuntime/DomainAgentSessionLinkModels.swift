@@ -790,16 +790,30 @@ package enum DomainAgentSessionLinkWaitOutcome: Equatable, Sendable {
     }
 }
 
+/// Captured before request routing suspends; local input advances only this exact endpoint.
+package struct DomainAgentSessionLinkWaitInput: Equatable, Sendable {
+    package let endpoint: DomainAgentSessionLinkEndpointIdentity
+    package let generation: UInt64
+
+    package init(endpoint: DomainAgentSessionLinkEndpointIdentity, generation: UInt64) {
+        self.endpoint = endpoint
+        self.generation = generation
+    }
+}
+
 package struct DomainAgentSessionLinkWaitResult: Equatable, Sendable {
     package let outcome: DomainAgentSessionLinkWaitOutcome
     /// Successor cursors for every authorized target, in request order.
     package let targets: [DomainAgentSessionLinkTargetState]
+    package let interruptedByLocalInput: Bool
     package init(
         outcome: DomainAgentSessionLinkWaitOutcome,
-        targets: [DomainAgentSessionLinkTargetState]
+        targets: [DomainAgentSessionLinkTargetState],
+        interruptedByLocalInput: Bool = false
     ) {
         self.outcome = outcome
         self.targets = targets
+        self.interruptedByLocalInput = interruptedByLocalInput
     }
 }
 

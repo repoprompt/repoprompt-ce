@@ -20,6 +20,20 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
     }
 
+    func testEffectiveHeadlessCatalogAdvertisesStartDeadlineExactlyOnce() throws {
+        let run = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentRun))
+        let sentence = "Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+        XCTAssertEqual(run.description.components(separatedBy: sentence).count - 1, 1)
+    }
+
+    func testAgentRunStartDescriptionCanonicalizationIsIdempotent() throws {
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentRun))
+        let once = MCPDomainCanonicalToolDefinitions.test_canonicalizeGlobalSemantics(current)
+        let twice = MCPDomainCanonicalToolDefinitions.test_canonicalizeGlobalSemantics(once)
+        XCTAssertEqual(once, current)
+        XCTAssertEqual(twice, current)
+    }
+
     func testCanonicalAgentControlWaitDescriptionsUseConfiguredSubagentWaitPhrase() throws {
         let phrase = MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase
         for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentExplore] {

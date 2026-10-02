@@ -7284,6 +7284,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let activeSendRunAttemptID = wasRunAlreadyActive ? session.activeRunAttemptID : nil
         let shouldDrainActiveAgentRunWaits = fallbackContext?.origin.isMCP != true
         if let activeSendRunID, shouldDrainActiveAgentRunWaits {
+            do {
+                try await session.awaitObserverWaitRelease(
+                    runID: activeSendRunID, runAttemptID: activeSendRunAttemptID
+                )
+            } catch {
+                viewModel?.finalizeAttachmentsForTurn(
+                    for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
+                )
+                return .cancelled
+            }
             let normalizedDraftText = fallbackContext?.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
             let steeringMessage = normalizedDraftText?.isEmpty == false ? normalizedDraftText : nil
             let drained = await activeAgentRunWaitDrain(

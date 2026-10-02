@@ -509,6 +509,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] ACP flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 } catch {
@@ -1053,6 +1054,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {

@@ -730,6 +730,25 @@ final class AgentTabSession: ObservableObject {
         activeRunOwnership?.attemptID
     }
 
+    /// Acceptance installs this before provider branching. It only forwards an observational wake.
+    var observerWaitRelease: (runID: UUID?, attemptID: UUID?, task: Task<Void, Never>)?
+
+    func awaitObserverWaitRelease(runID: UUID, runAttemptID: UUID?) async throws {
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+        while let release = observerWaitRelease,
+              release.runID == runID, release.attemptID == runAttemptID
+        {
+            await release.task.value
+            try Task.checkCancellation()
+            guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+            // Input accepted during this suspension installs a newer forwarding barrier.
+            if observerWaitRelease?.task == release.task { break }
+        }
+        try Task.checkCancellation()
+        guard self.runID == runID, activeRunAttemptID == runAttemptID else { throw CancellationError() }
+    }
+
     var activeRunLiveness: AgentRunLivenessSnapshot? {
         runLifecycle.liveness
     }

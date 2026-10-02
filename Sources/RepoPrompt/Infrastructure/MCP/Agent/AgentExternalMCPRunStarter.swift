@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 enum AgentExternalMCPRunStarter {
@@ -149,16 +150,19 @@ enum AgentExternalMCPRunStarter {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
-        try await agentModeVM.mcpActivateControlContext(
-            forTabID: target.tabID,
-            sessionID: sessionID,
-            originatingConnectionID: metadata.connectionID,
-            taskLabelKind: taskLabelKind,
-            startPending: true
-        )
-
-        // All failures after activation must clean up MCP control context and session store.
+        let startScope = MCPAgentRunStartExecutionScope.current
+        var ownedContext: AgentModeViewModel.AgentMCPControlContext?
         do {
+            try startScope?.checkAdmission()
+            ownedContext = try await agentModeVM.mcpActivateControlContext(
+                forTabID: target.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: metadata.connectionID,
+                taskLabelKind: taskLabelKind,
+                startPending: true
+            )
+
+            try startScope?.checkAdmission()
             if let oracleReviewSource {
                 try agentModeVM.mcpStageAgentRunOracleReviewSource(
                     oracleReviewSource,
@@ -167,12 +171,15 @@ enum AgentExternalMCPRunStarter {
                     expectedParentSessionID: expectedParentSessionID
                 )
             }
+            try startScope?.checkAdmission()
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: agentRaw,
                 modelRaw: resolvedModel,
-                reasoningEffortRaw: resolvedEffort
+                reasoningEffortRaw: resolvedEffort,
+                expectedControlContext: ownedContext
             )
+            try startScope?.checkAdmission()
             switch bindingDisposition {
             case .preserveCallerBinding:
                 #if DEBUG
@@ -197,15 +204,21 @@ enum AgentExternalMCPRunStarter {
                 throw MCPError.internalError("Failed to resolve target agent session.")
             }
 
-            let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
-                try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+            try startScope?.checkAdmission()
+            try agentModeVM.requireMCPControlOwnership(sessionID: sessionID, expectedContext: ownedContext)
+            let delivery: AgentModeViewModel.MCPInstructionDispatch
+            if let dispatchInstruction {
+                try startScope?.beginDispatch()
+                delivery = try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+                startScope?.recordDispatch(accepted: true)
             } else {
-                try await agentModeVM.mcpDispatchInstruction(
+                delivery = try await agentModeVM.mcpDispatchInstruction(
                     sessionID: sessionID,
                     text: message,
                     allowStartingRun: true,
                     workflow: workflow,
-                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+                    expectedControlContext: ownedContext
                 )
             }
 
@@ -219,10 +232,14 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
-            await agentModeVM.mcpDeactivateControlContext(
-                sessionID: sessionID,
-                cleanupSessionStore: true
-            )
+            try? startScope?.enterReturn()
+            if startScope?.allowsFailureCleanup != false {
+                if let ownedContext {
+                    _ = await agentModeVM.mcpDeactivateOwnedControlContext(
+                        sessionID: sessionID, expectedContext: ownedContext
+                    )
+                }
+            }
             throw error
         }
     }

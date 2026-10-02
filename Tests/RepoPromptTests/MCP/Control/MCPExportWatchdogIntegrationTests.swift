@@ -11,6 +11,315 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPExportWatchdogIntegrationTests: XCTestCase {
+        func testStartExpiryDuringSourceBindingAwaitCannotRebindAfterTimeout() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let server = fixture.contextA.window.mcpServer
+                let clock = MCPExportWatchdogManualClock()
+                let preserveGate = MCPExecutionIgnoringCancellationGate()
+                let finished = MCPExecutionOneShotSignal<Void>()
+                let sessionID = UUID()
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                server.test_shouldPreserveAgentRunSourceBinding = { _, _ in
+                    await preserveGate.enterAndWait()
+                    return false
+                }
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun) {
+                    defer { finished.signal(()) }
+                    let scope = try XCTUnwrap(MCPAgentRunStartExecutionScope.current)
+                    try scope.recordTarget(sessionID: sessionID, tabID: fixture.contextA.tabID, created: true)
+                    try scope.beginDispatch()
+                    scope.recordDispatch(accepted: true)
+                    await MainActor.run {
+                        // Remove after routing, so a manager's preparatory auto-bind cannot
+                        // be mistaken for the forbidden post-timeout bind under test.
+                        server.removeTabContext(
+                            forConnectionID: endpoint.connectionID,
+                            clientName: endpoint.clientName,
+                            windowID: nil,
+                            runID: nil
+                        )
+                        XCTAssertEqual(server.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
+                    }
+                    try await server.bindCurrentRequestToTabIfPossible(
+                        tabID: fixture.contextA.tabID,
+                        metadata: .init(
+                            connectionID: endpoint.connectionID,
+                            clientName: endpoint.clientName,
+                            windowID: fixture.contextA.window.windowID
+                        )
+                    )
+                    return .object([:])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let task = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                            "op": "start", "message": "Fixture instruction", "detach": true, "_rawJSON": true
+                        ])
+                    }
+                    try await preserveGate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(expected: .seconds(150))
+                    try await clock.advanceSleeper(expected: .seconds(150))
+                    try await clock.waitForSleeper(expected: .seconds(5))
+                    try await clock.advanceSleeper(expected: .seconds(5))
+                    let payload = try await Self.toolResultObject(task.value)
+                    let meta = try XCTUnwrap(payload["_meta"] as? [String: Any])
+                    let start = try XCTUnwrap(meta["start"] as? [String: Any])
+                    XCTAssertEqual(start["session_id"] as? String, sessionID.uuidString)
+                    XCTAssertEqual(start["dispatch_state"] as? String, "accepted")
+                    XCTAssertEqual(start["settlement"] as? String, "pending")
+                    XCTAssertTrue((start["recovery"] as? String ?? "").contains("do not resend start"))
+                    await preserveGate.release()
+                    await finished.wait()
+                    XCTAssertEqual(server.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
+                    server.test_shouldPreserveAgentRunSourceBinding = nil
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await preserveGate.release()
+                    server.test_shouldPreserveAgentRunSourceBinding = nil
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testSourceBindingAwaitWithoutStartScopeRetainsExistingBindingBehavior() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let server = fixture.contextA.window.mcpServer
+                let clock = MCPExportWatchdogManualClock()
+                server.test_shouldPreserveAgentRunSourceBinding = { _, _ in
+                    try? await clock.advanceWithoutSleepers(by: .seconds(150))
+                    return false
+                }
+                do {
+                    try await Self.activateWorkspace(for: fixture.contextA)
+                    XCTAssertNil(MCPAgentRunStartExecutionScope.current)
+                    try await server.bindCurrentRequestToTabIfPossible(
+                        tabID: fixture.contextA.tabID,
+                        metadata: .init(
+                            connectionID: endpoint.connectionID,
+                            clientName: endpoint.clientName,
+                            windowID: fixture.contextA.window.windowID
+                        )
+                    )
+                    XCTAssertEqual(
+                        server.connectionBindingSnapshot(forConnection: endpoint.connectionID).tabID,
+                        fixture.contextA.tabID
+                    )
+                    server.test_shouldPreserveAgentRunSourceBinding = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    server.test_shouldPreserveAgentRunSourceBinding = nil
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testEarlyStartManagerFailureEntersReturnBeforeProgressCleanup() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let clock = MCPExportWatchdogManualClock()
+                let gate = MCPExecutionIgnoringCancellationGate()
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: { _ in
+                        try? await clock.advanceWithoutWakingSleepers(by: .seconds(10))
+                        return true
+                    }, beforeFinish: {
+                        let scope = MCPAgentRunStartExecutionScope.current
+                        XCTAssertEqual(scope?.phase, .returning)
+                        XCTAssertEqual(scope?.deadline.instant, .seconds(35))
+                        await gate.enterAndWait()
+                    })
+                    let task = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                            "op": "start", "message": "Fixture instruction", "detach": true, "_rawJSON": true
+                        ])
+                    }
+                    try await gate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(expected: .seconds(25))
+                    try await clock.advanceSleeper(expected: .seconds(25))
+                    try await clock.waitForSleeper(expected: .seconds(5))
+                    try await clock.advanceSleeper(expected: .seconds(5))
+                    let payload = try await Self.toolResultObject(task.value)
+                    XCTAssertEqual(payload["code"] as? String, "tool_execution_deadline_exceeded")
+                    await gate.release()
+                    XCTAssertNil(payload["session_id"])
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: nil, beforeFinish: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await gate.release()
+                    await manager.debugSetEarlyStartFinalizationForTesting(limiterUnavailable: nil, beforeFinish: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testMissingStartHandlerReturnsBeforeBlockedCompletionObservers() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let clock = MCPExportWatchdogManualClock()
+                let gate = MCPExecutionIgnoringCancellationGate()
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    await manager.debugSetMissingStartFinalizationForTesting(missing: {
+                        try? await clock.advanceWithoutWakingSleepers(by: .seconds(10))
+                        return true
+                    }, beforeObservers: {
+                        let scope = MCPAgentRunStartExecutionScope.current
+                        XCTAssertEqual(scope?.phase, .returning)
+                        XCTAssertEqual(scope?.deadline.instant, .seconds(35))
+                        await gate.enterAndWait()
+                    })
+                    let task = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                            "op": "start", "message": "Fixture instruction", "detach": true, "_rawJSON": true
+                        ])
+                    }
+                    try await gate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(expected: .seconds(25))
+                    try await clock.advanceSleeper(expected: .seconds(25))
+                    try await clock.waitForSleeper(expected: .seconds(5))
+                    try await clock.advanceSleeper(expected: .seconds(5))
+                    let payload = try await Self.toolResultObject(task.value)
+                    XCTAssertEqual(payload["code"] as? String, "tool_execution_deadline_exceeded")
+                    await gate.release()
+                    XCTAssertNil(payload["session_id"])
+                    await manager.debugSetMissingStartFinalizationForTesting(missing: nil, beforeObservers: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await gate.release()
+                    await manager.debugSetMissingStartFinalizationForTesting(missing: nil, beforeObservers: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testNormalizedStartClassificationOwnsScopeWithoutAffectingOtherOperations() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun) {
+                    .object(["has_start_scope": .bool(MCPAgentRunStartExecutionScope.current != nil)])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let start: [String: Any] = ["op": "  StArT  ", "message": "Fixture instruction", "detach": true, "_rawJSON": true]
+                    let json = try String(decoding: JSONSerialization.data(withJSONObject: start), as: UTF8.self)
+                    var cases: [([String: Any], Bool)] = [
+                        (start, true), (["args": start], true),
+                        (["args": json], true), (["agent_run": start], true),
+                        (["agent_run": start, MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey: [
+                            "connection_id": endpoint.connectionID.uuidString,
+                            "connection_generation": "1", "request_id": "annotated-start"
+                        ]], true)
+                    ]
+                    for op in ["wait", "poll", "steer", "not_an_operation"] {
+                        cases.append((["op": op, "_rawJSON": true], false))
+                    }
+                    cases.append((["_rawJSON": true], false))
+                    for (arguments, expected) in cases {
+                        let payload = try await Self.toolResultObject(endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: arguments))
+                        XCTAssertEqual(payload["has_start_scope"] as? Bool, expected, "Unexpected classification for \(arguments.keys.sorted())")
+                    }
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAgentRunDetachedStartReturnsCommitAwareRecoveryWithoutClosingTransport() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let clock = MCPExportWatchdogManualClock()
+                let gate = MCPExecutionIgnoringCancellationGate()
+                let sessionID = UUID(), tabID = UUID()
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun) {
+                    let scope = try XCTUnwrap(MCPAgentRunStartExecutionScope.current)
+                    try scope.recordTarget(sessionID: sessionID, tabID: tabID, created: true)
+                    try scope.beginDispatch()
+                    scope.recordDispatch(accepted: true)
+                    await gate.enterAndWait()
+                    try scope.checkAdmission()
+                    return .object(["session_id": .string(sessionID.uuidString)])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let task = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.agentRun, arguments: [
+                            "op": "start", "message": "Fixture instruction", "detach": true, "_rawJSON": true
+                        ])
+                    }
+                    try await gate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(expected: .seconds(150))
+                    try await clock.advanceSleeper(expected: .seconds(150))
+                    try await clock.waitForSleeper(expected: .seconds(5))
+                    try await clock.advanceSleeper(expected: .seconds(5))
+                    let payload = try await Self.toolResultObject(task.value)
+                    XCTAssertEqual(payload["code"] as? String, "tool_execution_deadline_exceeded")
+                    let metadata = try XCTUnwrap(payload["_meta"] as? [String: Any])
+                    let start = try XCTUnwrap(metadata["start"] as? [String: Any])
+                    XCTAssertEqual(start["session_id"] as? String, sessionID.uuidString)
+                    XCTAssertEqual(start["dispatch_state"] as? String, "accepted")
+                    XCTAssertEqual(start["settlement"] as? String, "pending")
+                    XCTAssertNil(payload["status"])
+                    let terminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
+                    XCTAssertFalse(terminal)
+                    await gate.release()
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    _ = try await endpoint.callTool(name: MCPWindowToolName.readFile, arguments: ["path": fixture.contextA.fileURL.path])
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await gate.release()
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentRun, operation: nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testLifecycleDiagnosticsNormalReturnIdleEOFAndImmediateReconnect() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(

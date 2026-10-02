@@ -1658,6 +1658,10 @@ actor ServerNetworkManager {
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
+        private var debugForceResolvedToolMissingForTesting: (@Sendable () async -> Bool)?
+        private var debugBeforeToolNotFoundObserversForTesting: (@Sendable () async -> Void)?
+        private var debugForceConnectionLimiterUnavailableForTesting: (@Sendable (UUID) async -> Bool)?
+        private var debugBeforeFinishRequestProgressForTesting: (@Sendable () async -> Void)?
         private var debugAfterConnectionCallLimiterResolutionForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallPermitAcquiredForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallLimiterRejectionForTesting: (@Sendable (UUID) async -> Void)?
@@ -10315,6 +10319,21 @@ actor ServerNetworkManager {
                 debugAfterBootstrapPolicyReadinessForTesting = handler
             }
 
+            func debugSetMissingStartFinalizationForTesting(
+                missing: (@Sendable () async -> Bool)?, beforeObservers: (@Sendable () async -> Void)?
+            ) {
+                debugForceResolvedToolMissingForTesting = missing
+                debugBeforeToolNotFoundObserversForTesting = beforeObservers
+            }
+
+            func debugSetEarlyStartFinalizationForTesting(
+                limiterUnavailable: (@Sendable (UUID) async -> Bool)?,
+                beforeFinish: (@Sendable () async -> Void)?
+            ) {
+                debugForceConnectionLimiterUnavailableForTesting = limiterUnavailable
+                debugBeforeFinishRequestProgressForTesting = beforeFinish
+            }
+
             func debugSetAfterConnectionCallLimiterResolutionForTesting(
                 _ handler: (@Sendable (UUID) async -> Void)?
             ) {
@@ -12330,7 +12349,7 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        await server.withMethodHandler(CallTool.self) { [weak self] params in
+        let requestBody: @Sendable (CallTool.Parameters) async -> CallTool.Result = { [weak self] params in
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -12431,7 +12450,8 @@ actor ServerNetworkManager {
                     appInvocationID: inheritedRequestIdentity?.appInvocationID,
                     requestOrdinal: inheritedRequestIdentity?.requestOrdinal
                 )
-                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID
+                    ?? requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
                     connectionID: requestIdentity.connectionID,
@@ -12458,7 +12478,7 @@ actor ServerNetworkManager {
                     ))
                 }
             #else
-                let invocationID = UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = nil
                 let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             #endif
@@ -12746,6 +12766,7 @@ actor ServerNetworkManager {
                     // reveals nothing beyond "you have no oversight authority".
                     return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
+                    try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
                             "toolName": toolName,
@@ -12881,6 +12902,10 @@ actor ServerNetworkManager {
                 nil
             }
             func finishRequestProgress(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await debugBeforeFinishRequestProgressForTesting?()
+                #endif
                 if let capturedProgressState {
                     await domainHost.finishRequestProgress(capturedProgressState)
                 }
@@ -12926,12 +12951,17 @@ actor ServerNetworkManager {
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
             }
-            let limiterResolution = await EditFlowPerf.measure(
+            var limiterResolution = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterResolution,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
                 await self.connectionCallLimiterResolution(for: connectionID)
             }
+            #if DEBUG
+                if await debugForceConnectionLimiterUnavailableForTesting?(connectionID) == true {
+                    limiterResolution = nil
+                }
+            #endif
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")
@@ -12944,6 +12974,7 @@ actor ServerNetworkManager {
                 )
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                 guard promptExportMutationObservation?.snapshot()?.state == .applied else {
                     return await finishRequestProgress(result)
                 }
@@ -13671,7 +13702,7 @@ actor ServerNetworkManager {
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
                                     if contract.cleanupDisposition == .detachAndSettle,
-                                       toolName != MCPWindowToolName.fileActions
+                                       [MCPWindowToolName.getCodeStructure, MCPWindowToolName.readFile, MCPWindowToolName.getFileTree].contains(toolName)
                                     {
                                         guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
@@ -13951,6 +13982,20 @@ actor ServerNetworkManager {
                                         )
                                     }
 
+                                    if let startScope = MCPAgentRunStartExecutionScope.current,
+                                       startScope.connectionID == connectionID,
+                                       startScope.invocationID == invocationID
+                                    {
+                                        do {
+                                            let value = try await tracedOperation(nil)
+                                            await recordSynchronousSettlement(.success)
+                                            return value
+                                        } catch {
+                                            try? startScope.enterReturn()
+                                            await recordSynchronousSettlement(MCPToolExecutionCancelledError.matches(error) ? .cancellation : .error)
+                                            throw error
+                                        }
+                                    }
                                     switch contract {
                                     case let .bounded(deadline, cancellationGrace, _):
                                         do {
@@ -14462,6 +14507,9 @@ actor ServerNetworkManager {
                                         scope: registrationScope
                                     )
                                 }
+                                #if DEBUG
+                                    if await self.debugForceResolvedToolMissingForTesting?() == true { resolvedTool = nil }
+                                #endif
                                 if let resolvedTool {
                                     let toolDef = resolvedTool.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
@@ -14903,6 +14951,10 @@ actor ServerNetworkManager {
                                 }
 
                                 EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
+                                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                                #if DEBUG
+                                    await self.debugBeforeToolNotFoundObserversForTesting?()
+                                #endif
                                 endPermitPreDispatchEnvelopeIfNeeded()
                                 releaseResourceAdmissionLeases(outcome: "tool_not_found")
                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -14956,6 +15008,43 @@ actor ServerNetworkManager {
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
             return await finalizeToolResult(result)
+        }
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
+            guard let self else {
+                return CallTool.Result(content: [.text(text: "Server unavailable", annotations: nil, _meta: nil)], isError: true)
+            }
+            let canonicalName = Self.canonicalToolName(for: params.name)
+            var startRoutingArguments = params.arguments ?? [:]
+            startRoutingArguments.removeValue(forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey)
+            let startArguments = canonicalName == MCPWindowToolName.agentRun
+                ? MCPToolArgsNormalizer.normalize(
+                    params: startRoutingArguments, originalToolName: params.name, canonicalToolName: canonicalName
+                ).payload
+                : params.arguments ?? [:]
+            guard MCPToolExecutionContractCatalog.isAgentRunStartCall(
+                toolName: canonicalName, arguments: startArguments
+            ) else {
+                return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
+            }
+            let environment = await toolExecutionWatchdogEnvironment
+            let scope = MCPAgentRunStartExecutionScope(connectionID: connectionID, environment: environment)
+            return await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                do {
+                    return try await MCPToolExecutionWatchdog.execute(
+                        deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
+                        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                        cleanupDisposition: .detachAndSettle,
+                        startScope: scope, environment: environment,
+                        operation: { await requestBody(params) }
+                    )
+                } catch {
+                    // Deadline-to-return is memory-only: no routing, snapshots, or host cleanup.
+                    let code = MCPToolExecutionCancelledError.matches(error)
+                        ? "tool_execution_cancelled" : "tool_execution_deadline_exceeded"
+                    let value = scope.timeoutValue(code: code, message: "Start request did not settle within its setup/return envelope; inspect its existing identity before recovery.")
+                    return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+                }
+            }
         }
     }
 

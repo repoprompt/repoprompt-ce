@@ -230,6 +230,14 @@ fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
 
+Accepted local composer input advances
+an in-memory generation for the exact observer endpoint and cancels its older waits, including
+requests delayed between routing and admission. New-generation waits may park in the same run.
+Authority release precedes Claude/ACP's MCP-idle gate and Codex's steering drain. This affects
+neither managed/cross-session input nor mutations or child providers. A route snapshot just after
+the input bump may still park. Cancellation uses the
+existing result with metadata-only `wake_reason: local_user_input` and re-fenced survivor rows.
+
 Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
 elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
 and one-time option labels verbatim. Restricted links never receive a prompt body; a single prompt
@@ -838,3 +846,19 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Bounded start requests and child lifetime
+
+`agent_run start` supervises setup for 150 seconds, including detached and zero-timeout
+starts. An attached start begins its caller-selected wait only after wait registration;
+return processing has 25 seconds, never beyond that wait's fixed deadline plus 25 seconds.
+The existing watchdog allows at most five further seconds for request settlement, then
+detaches noncooperative work. It does not stop a submitted child.
+
+Cancellation closes the invocation's in-memory mutation admission before cancelling its
+operation task. Owners record reserved session/worktree identity and submitted dispatch
+before suspended acknowledgement. Timeout recovery in `_meta.start` reports known identity,
+phase, dispatch certainty and settlement without awaiting another snapshot or host cleanup.
+Inspect that existing identity; never blindly repeat `start` after a timeout. Accepted or
+uncertain submission is not discarded/deactivated by start failure. Standalone wait/poll,
+steer, filesystem leases and transport cancellation retain their existing contracts.

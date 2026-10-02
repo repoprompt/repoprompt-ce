@@ -55,6 +55,11 @@ public struct MCPToolCallDeadlineEnvelope: Codable, Equatable, Sendable {
 /// RepoPrompt CE-owned timeout policy for MCP execution, delivery, and caller-driven defaults.
 /// Caller-supplied timeout values remain dynamic; these constants only define CE defaults and guards.
 public enum MCPTimeoutPolicy {
+    public static let agentRunStartSetupDeadlineSeconds = 150
+    public static let agentRunStartReturnDeadlineSeconds = 25
+    public static let agentRunStartSetupDeadline: Duration = .seconds(agentRunStartSetupDeadlineSeconds)
+    public static let agentRunStartReturnDeadline: Duration = .seconds(agentRunStartReturnDeadlineSeconds)
+
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
 

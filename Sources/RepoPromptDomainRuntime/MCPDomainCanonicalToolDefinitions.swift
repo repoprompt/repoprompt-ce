@@ -1280,10 +1280,16 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
+            let oldStartDescription = "Pass `detach: true` to return immediately."
+            let currentStartDescription = oldStartDescription
+                + " Start: setup ≤150s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
+            let startDescription = description.contains(currentStartDescription)
+                ? description
+                : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description,
+                    description: startDescription,
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault
@@ -1853,7 +1859,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             Pass `op` plus fields for that operation.
             list: cursor?, max_items?
             poll: exactly one of session_id/session_ids
-            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds?
+            wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.
             read: session_id, cursor?, from?, max_items?, max_output_bytes?
             send: session_id, message, idempotency_key; workflow_id|workflow_name?; delivery?; replace_pending?
             cancel_pending_send: session_id, idempotency_key
@@ -2627,6 +2633,12 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
         applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
+    }
+
+    package static func test_canonicalizeGlobalSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeGlobalSemantics(definition)
     }
 
     package static func test_canonicalizeAgentControlWaitSemantics(

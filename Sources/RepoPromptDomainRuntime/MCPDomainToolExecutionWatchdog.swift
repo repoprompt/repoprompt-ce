@@ -94,7 +94,8 @@ package enum MCPToolExecutionWatchdog {
 
     private enum Event<T>: @unchecked Sendable {
         case operationCompleted(ResultBox<T>)
-        case deadlineExpired
+        case deadlineExpired(revision: UInt64)
+        case startPhaseRevised(MCPAgentRunStartExecutionScope.Deadline)
         case cleanupGraceExpired
     }
 
@@ -255,6 +256,7 @@ package enum MCPToolExecutionWatchdog {
         cleanupNotAfter: Duration? = nil,
         cleanupDisposition: MCPToolExecutionCleanupDisposition = .forceDisconnect,
         settlementSlot: MCPCodeStructureSettlementRegistry.Slot? = nil,
+        startScope: MCPAgentRunStartExecutionScope? = nil,
         environment: MCPToolExecutionWatchdogEnvironment = .continuous(),
         onEvent: @escaping @Sendable (MCPToolExecutionWatchdogEvent) async -> Void = { _ in },
         onSynchronousSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
@@ -272,7 +274,7 @@ package enum MCPToolExecutionWatchdog {
         let deliveredCompletionMailbox = settlementSlot == nil ? nil : DeliveredCompletionMailbox<T>()
 
         func completedBeforeDeadline(_ box: ResultBox<T>) -> Bool {
-            box.completionTime < deadlineInstant
+            box.completionTime < (startScope?.deadline.instant ?? deadlineInstant)
         }
 
         @Sendable func settlement(for box: ResultBox<T>) -> MCPToolExecutionSettlement {
@@ -284,70 +286,93 @@ package enum MCPToolExecutionWatchdog {
             }
         }
 
-        let operationTask = Task {
-            let result: Result<T, Error>
-            do {
-                result = try await .success(operation())
-            } catch {
-                result = .failure(error)
-            }
-            // A caller may begin work before watchdog installation; its recorded completion
-            // instant remains authoritative even when Task.value is observed later.
-            let completionTime = operationCompletionInstant() ?? environment.now()
-            let box = ResultBox(result: result, completionTime: completionTime)
-            if let settlementSlot {
-                let operationSettlement = settlement(for: box)
-                switch settlementSlot.recordCompletion(operationSettlement) {
-                case .deliver:
-                    deliveredCompletionMailbox?.store(box)
-                    await environment.eventDidProduce(.operationCompleted)
-                    continuation.yield(.operationCompleted(box))
-                case .deferred:
-                    break
-                case .settleDetached:
-                    await onDetachedSettlement(operationSettlement)
-                case .settleAbandoned:
-                    await onAbandonedSettlement(operationSettlement)
-                case .settleForceDisconnected:
-                    await onForceDisconnectedSettlement(operationSettlement)
-                case .ignored:
-                    break
-                }
-            } else if let operationState {
-                switch operationState.recordCompletion(box) {
-                case .deliver:
-                    await environment.eventDidProduce(.operationCompleted)
-                    continuation.yield(.operationCompleted(box))
-                case .deferred:
-                    break
-                case .settleDetached:
-                    await onDetachedSettlement(settlement(for: box))
-                case .settleAbandoned:
-                    await onAbandonedSettlement(settlement(for: box))
-                case .settleForceDisconnected:
-                    await onForceDisconnectedSettlement(settlement(for: box))
-                }
-            }
+        if startScope != nil, Task.isCancelled {
+            startScope?.close()
+            throw CancellationError()
         }
-        tasks.append(operationTask)
-
-        let deadlineTask = Task {
-            do {
-                try await environment.sleep(deadline)
-                guard !Task.isCancelled else { return }
-                await environment.eventDidProduce(.deadlineExpired)
-                continuation.yield(.deadlineExpired)
-            } catch {
-                // Cancellation is the normal completion path when the operation wins.
-            }
-        }
-        tasks.append(deadlineTask)
-
         return try await withTaskCancellationHandler {
+            // Install the update channel before launch; a phase can change synchronously on entry.
+            startScope?.installDeadlineObserver { continuation.yield(.startPhaseRevised($0)) }
+            defer { startScope?.clearDeadlineObserver() }
+            let operationTask = Task {
+                let result: Result<T, Error>
+                do {
+                    if let startScope { try startScope.checkAdmission() }
+                    result = try await .success(operation())
+                } catch {
+                    result = .failure(error)
+                }
+                // A caller may begin work before watchdog installation; its recorded completion
+                // instant remains authoritative even when Task.value is observed later.
+                let completionTime = operationCompletionInstant() ?? environment.now()
+                let box = ResultBox(result: result, completionTime: completionTime)
+                startScope?.settle()
+                if let settlementSlot {
+                    let operationSettlement = settlement(for: box)
+                    switch settlementSlot.recordCompletion(operationSettlement) {
+                    case .deliver:
+                        deliveredCompletionMailbox?.store(box)
+                        await environment.eventDidProduce(.operationCompleted)
+                        continuation.yield(.operationCompleted(box))
+                    case .deferred:
+                        break
+                    case .settleDetached:
+                        await onDetachedSettlement(operationSettlement)
+                    case .settleAbandoned:
+                        await onAbandonedSettlement(operationSettlement)
+                    case .settleForceDisconnected:
+                        await onForceDisconnectedSettlement(operationSettlement)
+                    case .ignored:
+                        break
+                    }
+                } else if let operationState {
+                    switch operationState.recordCompletion(box) {
+                    case .deliver:
+                        await environment.eventDidProduce(.operationCompleted)
+                        continuation.yield(.operationCompleted(box))
+                    case .deferred:
+                        break
+                    case .settleDetached:
+                        await onDetachedSettlement(settlement(for: box))
+                    case .settleAbandoned:
+                        await onAbandonedSettlement(settlement(for: box))
+                    case .settleForceDisconnected:
+                        await onForceDisconnectedSettlement(settlement(for: box))
+                    }
+                }
+            }
+            tasks.append(operationTask)
+
+            @Sendable func scheduleDeadline(_ instant: Duration, revision: UInt64) -> Task<Void, Never> {
+                let task = Task {
+                    do {
+                        try await environment.sleep(max(.zero, instant - environment.now()))
+                        guard !Task.isCancelled else { return }
+                        await environment.eventDidProduce(.deadlineExpired)
+                        continuation.yield(.deadlineExpired(revision: revision))
+                    } catch {
+                        // Replacement and completion cancel the old timer.
+                    }
+                }
+                tasks.append(task)
+                return task
+            }
+            let initialDeadline = startScope?.deadline
+            var scheduledDeadline = initialDeadline ?? .init(revision: 0, instant: deadlineInstant)
+            var deadlineTask = scheduleDeadline(scheduledDeadline.instant, revision: scheduledDeadline.revision)
+
             var iterator = stream.makeAsyncIterator()
             var deadlineDidExpire = false
 
             while let event = await iterator.next() {
+                if case let .startPhaseRevised(update) = event {
+                    guard !deadlineDidExpire, let startScope,
+                          startScope.deadline == update, scheduledDeadline != update else { continue }
+                    scheduledDeadline = update
+                    deadlineTask.cancel()
+                    deadlineTask = scheduleDeadline(update.instant, revision: update.revision)
+                    continue
+                }
                 let schedulingPoint: MCPToolExecutionWatchdogSchedulingPoint = switch event {
                 case .operationCompleted:
                     .operationCompleted
@@ -355,6 +380,8 @@ package enum MCPToolExecutionWatchdog {
                     .deadlineExpired
                 case .cleanupGraceExpired:
                     .cleanupGraceExpired
+                case .startPhaseRevised:
+                    preconditionFailure("Phase revisions are handled before scheduling hooks")
                 }
                 await environment.beforeEventConsumption(schedulingPoint)
                 try Task.checkCancellation()
@@ -394,7 +421,8 @@ package enum MCPToolExecutionWatchdog {
                         settlement: operationSettlement
                     )
 
-                case .deadlineExpired:
+                case let .deadlineExpired(revision):
+                    if let startScope, !startScope.expire(revision: revision) { continue }
                     let completed = deliveredCompletionMailbox?.take()
                         ?? operationState?.takeDeliveredCompletion()
                     if let completed {
@@ -421,17 +449,22 @@ package enum MCPToolExecutionWatchdog {
                     operationTask.cancel()
                     await environment.beforeCleanupGraceTaskRegistration()
                     let cancellationStart = environment.now()
-                    let outerRemainingGrace = cleanupNotAfter.map {
+                    let graceLimit = startScope.map { $0.deadline.instant + cancellationGrace } ?? cleanupNotAfter
+                    let outerRemainingGrace = graceLimit.map {
                         max(.zero, $0 - cancellationStart)
                     }
                     let effectiveCancellationGrace = outerRemainingGrace.map {
                         min(cancellationGrace, $0)
                     } ?? cancellationGrace
                     let graceWasCapped = effectiveCancellationGrace < cancellationGrace
+                    let graceDeadline = cancellationStart + effectiveCancellationGrace
                     let graceTask: Task<Void, Never>? = if effectiveCancellationGrace > .zero {
                         Task {
                             do {
-                                try await environment.sleep(effectiveCancellationGrace)
+                                let remaining = startScope == nil
+                                    ? effectiveCancellationGrace
+                                    : max(.zero, graceDeadline - environment.now())
+                                try await environment.sleep(remaining)
                                 guard !Task.isCancelled else { return }
                                 await environment.eventDidProduce(.cleanupGraceExpired)
                                 continuation.yield(.cleanupGraceExpired)
@@ -454,6 +487,9 @@ package enum MCPToolExecutionWatchdog {
                         await environment.eventDidProduce(.cleanupGraceExpired)
                         continuation.yield(.cleanupGraceExpired)
                     }
+
+                case .startPhaseRevised:
+                    preconditionFailure("Phase revisions are handled before settlement")
 
                 case .cleanupGraceExpired:
                     guard deadlineDidExpire else { continue }
@@ -542,6 +578,8 @@ package enum MCPToolExecutionWatchdog {
             tasks.cancelAll()
             throw CancellationError()
         } onCancel: {
+            // Close mutation admission synchronously, before cancelling any operation task.
+            startScope?.close()
             Task {
                 await onEvent(.cancellationRequested(origin: .requestCancellation))
             }

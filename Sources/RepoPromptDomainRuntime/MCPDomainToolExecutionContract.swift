@@ -139,6 +139,11 @@ package enum MCPToolExecutionContractCatalog {
         return result
     }()
 
+    package static func isAgentRunStartCall(toolName: String, arguments: [String: Value]) -> Bool {
+        toolName == MCPWindowToolName.agentRun && arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "start"
+    }
+
     package static func contract(for toolName: String) -> MCPToolExecutionContract? {
         contracts[toolName]
     }
@@ -148,6 +153,13 @@ package enum MCPToolExecutionContractCatalog {
         arguments: [String: Value]
     ) -> MCPToolExecutionContract? {
         guard let baseContract = contract(for: toolName) else { return nil }
+        if isAgentRunStartCall(toolName: toolName, arguments: arguments) {
+            return .bounded(
+                deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
         if [MCPWindowToolName.prompt, MCPWindowToolName.workspaceContext].contains(toolName),
            MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments) == .export
         {
