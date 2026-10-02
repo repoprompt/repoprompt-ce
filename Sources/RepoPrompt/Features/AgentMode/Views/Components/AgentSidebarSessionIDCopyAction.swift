@@ -3,12 +3,12 @@ import AppKit
 /// Sidebar row action that copies a persistent Agent Mode session UUID to the clipboard.
 ///
 /// Owns optional-UUID enablement and exact single-write clipboard semantics for the
-/// `Copy session ID` command in active, sub-agent, and archived sidebar row context menus.
+/// `Copy Session ID` command in active, sub-agent, and archived sidebar row context menus.
 @MainActor
 struct AgentSidebarSessionIDCopyAction {
     typealias ClipboardWriter = @MainActor (String) -> Void
 
-    static let menuTitle = "Copy session ID"
+    static let menuTitle = "Copy Session ID"
 
     private let sessionID: UUID?
     private let clipboardWriter: ClipboardWriter

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 // MARK: - Agent Tab Session

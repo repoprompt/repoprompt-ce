@@ -847,6 +847,7 @@ extension AgentModeViewModel {
         mutation(&updated)
         guard updated != monitorPillPropsByEndpoint else { return }
         monitorPillPropsByEndpoint = updated
+        agentSessionLinkReconcileOversightColourSlots()
         syncStatusPillsUIStateIfMonitorStale()
         NotificationCenter.default.post(
             name: .agentSessionLinkOverseerProjectionDidChange,
@@ -875,6 +876,63 @@ extension AgentModeViewModel {
         return agentSessionLinkIsOverseer(tabID: tabID, expectedSessionID: sessionID)
     }
 
+    /// Reconciles the palette allocator with the overseers present in the published projections.
+    /// Runs inside the sole storage-mutation boundary so every change notification already observes
+    /// a settled slot map. A row's overseer appears either in its own inbound rows or, when only the
+    /// overseer's row is projected here, through that row's outbound list.
+    private func agentSessionLinkReconcileOversightColourSlots() {
+        var firstLinkCreatedAt: [UUID: Date] = [:]
+        func consider(_ overseerSessionID: UUID, createdAt: Date) {
+            if let existing = firstLinkCreatedAt[overseerSessionID], existing <= createdAt {
+                return
+            }
+            firstLinkCreatedAt[overseerSessionID] = createdAt
+        }
+        for props in monitorPillPropsByEndpoint.values {
+            for row in props.inbound {
+                consider(row.observerSessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
+            }
+            if let sessionID = props.endpoint?.sessionID ?? props.sessionID {
+                for row in props.outbound {
+                    consider(sessionID, createdAt: row.linkCreatedAt ?? .distantFuture)
+                }
+            }
+        }
+        agentOversightColourAllocator.reconcile(activeOverseerFirstLinkDates: firstLinkCreatedAt)
+    }
+
+    /// The row's oversight roles for the Fb mark model: its own palette slot when it oversees,
+    /// plus its overseers in link-creation order. Everything comes from the published projection
+    /// and the in-memory allocator — no disk reads, no authority hop.
+    func agentSidebarOversightRole(
+        tabID: UUID,
+        expectedSessionID: UUID
+    ) -> AgentSessionOversightRole {
+        guard let endpoint = agentSidebarOversightTargetEndpoint(
+            tabID: tabID,
+            expectedSessionID: expectedSessionID
+        ),
+            let props = monitorPillPropsByEndpoint[endpoint],
+            props.endpoint == endpoint
+        else {
+            return .none
+        }
+        let allocator = agentOversightColourAllocator
+        return AgentSessionOversightRole.make(
+            inbound: props.inbound.map {
+                .init(
+                    observerSessionID: $0.observerSessionID,
+                    displayName: $0.displayName,
+                    linkID: $0.linkID,
+                    linkCreatedAt: $0.linkCreatedAt
+                )
+            },
+            outbound: props.outbound.map { .init(displayName: $0.displayName) },
+            ownSessionID: props.sessionID ?? expectedSessionID,
+            slot: { allocator.slot(for: $0) }
+        )
+    }
+
     /// Current target-centric oversight choices for one exact active sidebar row.
     ///
     /// The tab and session checks reject stale sidebar snapshots, while the two endpoint checks keep
@@ -895,7 +953,12 @@ extension AgentModeViewModel {
         else {
             return nil
         }
-        return menu
+        // The stored projection carries lifecycle-only eligibility; overlay the shared
+        // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
+        return menu.withObserverIneligibleReason(
+            agentSessionLinkPersistencePresentation.addBlockerMessage
+                ?? menu.observerIneligibleReason
+        )
     }
 
     /// Exact current endpoint behind one active sidebar row, independent of whether its target menu
@@ -946,6 +1009,69 @@ extension AgentModeViewModel {
             .alreadyInRequestedState
         case let .failed(message):
             .failed(message: message)
+        }
+    }
+
+    /// Inverse-direction add for the sidebar's "Oversee" menu: the row
+    /// rendered by the sidebar is the *observer*. Uses the general exact-endpoint Add so the row
+    /// may acquire its first outbound link — the sidebar's existing-overseer precondition does
+    /// not apply to this direction.
+    func addAgentOversightLink(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentSidebarOversightActionOutcome {
+        switch await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint
+        ) {
+        case .added:
+            .changed
+        case .alreadyLinked:
+            .alreadyInRequestedState
+        case let .failed(failure):
+            .failed(message: failure.uiMessage)
+        case let .rejected(message):
+            .failed(message: message)
+        }
+    }
+
+    /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
+    /// overseer for this row). The bridge enforces the Oversee-by rule: the pasted session must
+    /// already hold an outbound link.
+    func resolveSidebarOverseerCandidate(
+        rawSessionID: String,
+        excludingTargetSessionID: UUID
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
+        await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(
+            rawSessionID: rawSessionID,
+            excludingTargetSessionID: excludingTargetSessionID
+        )
+    }
+
+    /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective
+    /// target for this row-as-observer). Reuses the composer pill's resolver, except that an
+    /// already-linked pair resolves to `.alreadyLinked` — the sheet closes silently rather than
+    /// showing the "You're already overseeing this session." error.
+    func resolveSidebarTargetCandidate(
+        rawSessionID: String,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
+        let existingTargetIDs = Set(
+            monitorPillPropsByEndpoint[observerEndpoint]?.outbound.map(\.targetSessionID) ?? []
+        )
+        switch AgentSessionLinkRuntimeBridge.shared
+            .resolveTargetCandidate(
+                observerSessionID: observerEndpoint.sessionID,
+                rawTargetSessionID: rawSessionID,
+                existingOutboundTargetIDs: existingTargetIDs
+            )
+        {
+        case let .success(candidate):
+            return .success(.candidate(candidate))
+        case .failure(.alreadyMonitoring):
+            return .success(.alreadyLinked)
+        case let .failure(failure):
+            return .failure(AgentOversightResolutionMessage(message: failure.uiMessage))
         }
     }
 

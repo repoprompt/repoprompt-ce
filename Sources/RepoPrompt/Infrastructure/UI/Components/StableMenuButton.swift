@@ -76,6 +76,11 @@ struct StableMenuItem {
     let isSelected: Bool
     let imageSystemName: String?
     let style: StableMenuItemStyle
+    /// Optional VoiceOver overrides forwarded to the produced `NSMenuItem`: the label
+    /// replaces the spoken title, the value carries counts/state, and the hint is help.
+    let accessibilityLabel: String?
+    let accessibilityValue: String?
+    let accessibilityHint: String?
 
     private init(
         title: String,
@@ -83,7 +88,10 @@ struct StableMenuItem {
         isEnabled: Bool = true,
         isSelected: Bool = false,
         imageSystemName: String? = nil,
-        style: StableMenuItemStyle = .normal
+        style: StableMenuItemStyle = .normal,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        accessibilityHint: String? = nil
     ) {
         self.title = title
         self.kind = kind
@@ -91,6 +99,9 @@ struct StableMenuItem {
         self.isSelected = isSelected
         self.imageSystemName = imageSystemName
         self.style = style
+        self.accessibilityLabel = accessibilityLabel
+        self.accessibilityValue = accessibilityValue
+        self.accessibilityHint = accessibilityHint
     }
 
     static func action(
@@ -99,6 +110,9 @@ struct StableMenuItem {
         isSelected: Bool = false,
         imageSystemName: String? = nil,
         style: StableMenuItemStyle = .normal,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        accessibilityHint: String? = nil,
         _ action: @escaping () -> Void
     ) -> StableMenuItem {
         StableMenuItem(
@@ -107,7 +121,10 @@ struct StableMenuItem {
             isEnabled: isEnabled,
             isSelected: isSelected,
             imageSystemName: imageSystemName,
-            style: style
+            style: style,
+            accessibilityLabel: accessibilityLabel,
+            accessibilityValue: accessibilityValue,
+            accessibilityHint: accessibilityHint
         )
     }
 
@@ -115,9 +132,20 @@ struct StableMenuItem {
         _ title: String,
         imageSystemName: String? = nil,
         style: StableMenuItemStyle = .normal,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        accessibilityHint: String? = nil,
         items: [StableMenuItem]
     ) -> StableMenuItem {
-        StableMenuItem(title: title, kind: .submenu(items), imageSystemName: imageSystemName, style: style)
+        StableMenuItem(
+            title: title,
+            kind: .submenu(items),
+            imageSystemName: imageSystemName,
+            style: style,
+            accessibilityLabel: accessibilityLabel,
+            accessibilityValue: accessibilityValue,
+            accessibilityHint: accessibilityHint
+        )
     }
 
     static func header(_ title: String) -> StableMenuItem {
@@ -141,6 +169,7 @@ struct StableMenuItem {
             item.isEnabled = false
             configureImage(on: item)
             configureTitle(on: item, fontPreset: fontPreset)
+            configureAccessibility(on: item)
             return item
         case let .action(action):
             let item = NSMenuItem(title: title, action: #selector(StableMenuActionBox.invoke), keyEquivalent: "")
@@ -151,6 +180,7 @@ struct StableMenuItem {
             item.state = isSelected ? .on : .off
             configureImage(on: item)
             configureTitle(on: item, fontPreset: fontPreset)
+            configureAccessibility(on: item)
             return item
         case let .submenu(childItems):
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -159,7 +189,20 @@ struct StableMenuItem {
             item.submenu = NSMenu.stableMenu(from: childItems, fontPreset: fontPreset)
             configureImage(on: item)
             configureTitle(on: item, fontPreset: fontPreset)
+            configureAccessibility(on: item)
             return item
+        }
+    }
+
+    private func configureAccessibility(on item: NSMenuItem) {
+        if let accessibilityLabel {
+            item.setAccessibilityLabel(accessibilityLabel)
+        }
+        if let accessibilityValue {
+            item.setAccessibilityValue(accessibilityValue)
+        }
+        if let accessibilityHint {
+            item.setAccessibilityHelp(accessibilityHint)
         }
     }
 

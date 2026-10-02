@@ -122,8 +122,8 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             targetSessionID: fixture.endpoint.sessionID,
             targetDisplayName: "Target",
             observerOptions: [AgentSidebarOversightMenuProps.ObserverOption(
-                observerEndpoint: availableEndpoint,
-                observerSessionID: availableEndpoint.sessionID,
+                peerEndpoint: availableEndpoint,
+                peerSessionID: availableEndpoint.sessionID,
                 displayName: "Observer",
                 providerDisplayName: "Codex CLI",
                 menuLabel: "Observer",

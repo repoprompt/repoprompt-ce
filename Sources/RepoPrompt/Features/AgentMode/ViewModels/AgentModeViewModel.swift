@@ -599,6 +599,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
 
+    /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
+    /// projection mutation boundary so a row re-rendered by the oversight-change notification
+    /// always reads a settled map. Stores slots only; roles stay live via the projections.
+    let agentOversightColourAllocator = AgentOversightColourAllocator()
+
     /// Latest process-wide durable-oversight level, broadcast by the bridge.
     ///
     /// Stored per window rather than read on demand so a link-free tab — which never receives an

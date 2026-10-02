@@ -1429,9 +1429,52 @@ struct AgentMonitorPopoverView: View {
         let raw = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
         isWorking = true
         Task {
-            let outcome = await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+            // Re-resolve at submit so the confirmation dialog and the Add both name the same
+            // exact endpoint — the preview captured earlier may have been superseded by a
+            // rebind while the user was deciding.
+            let resolved = AgentSessionLinkRuntimeBridge.shared.resolveTargetCandidate(
                 observerSessionID: observerSessionID,
-                rawTargetSessionID: raw
+                rawTargetSessionID: raw,
+                existingOutboundTargetIDs: Set(props.outbound.map(\.targetSessionID))
+            )
+            guard case let .success(candidate) = resolved else {
+                isWorking = false
+                if case let .failure(failure) = resolved {
+                    preview = nil
+                    // Already linked in this direction is done — clear the field with no
+                    // error and no dialog, matching the sidebar Session-ID sheets.
+                    if failure == .alreadyMonitoring {
+                        identifierText = ""
+                        validationMessage = nil
+                    } else {
+                        validationMessage = failure.uiMessage
+                    }
+                }
+                return
+            }
+            guard let observerEndpoint = props.endpoint else {
+                isWorking = false
+                preview = nil
+                validationMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+                return
+            }
+            // Shared UI confirmation gate — the same dialog the sidebar Session-ID and menu
+            // paths present. Undo (performUndo) intentionally does not pass through here.
+            let observerName = AgentSessionLinkRuntimeBridge.shared
+                .liveCandidateDisplayName(for: observerEndpoint)
+                ?? AgentMonitorSessionIDFormatter.short(observerEndpoint.sessionID)
+            let confirmed = await AgentOversightLinkConfirmation.confirm(
+                observerLabel: observerName,
+                targetLabel: candidate.resolvedDisplayName,
+                windowID: observerEndpoint.windowID
+            )
+            guard confirmed else {
+                isWorking = false
+                return
+            }
+            let outcome = await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: candidate.domainEndpoint
             )
             isWorking = false
             if let message = outcome.failureMessage {

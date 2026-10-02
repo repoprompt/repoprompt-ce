@@ -4,38 +4,30 @@ import SwiftUI
 
 // MARK: - Agent Session Row
 
-enum AgentSessionCreatorBadgeCopy {
-    static let iconName = "rectangle.connected.to.line.below"
+/// Code-level UX switch (deliberately not a user setting, repurposed from the overseer-only
+/// variant): `false` lets every role mark open the unified oversight menu on click; `true`
+/// renders all marks passive — tooltip only. Flip to compare workflows.
+@MainActor
+var agentOversightRoleMarksArePassive = false
 
-    static func tooltip(for creatorLabel: String) -> String {
-        "Created by \(creatorLabel)"
-    }
-}
-
-private struct AgentSessionCreatorBadge: View {
-    let creatorLabel: String
-    let onOpen: () -> Void
-
-    var body: some View {
-        let tooltip = AgentSessionCreatorBadgeCopy.tooltip(for: creatorLabel)
-        Button(action: onOpen) {
-            Image(systemName: AgentSessionCreatorBadgeCopy.iconName)
-                .font(.system(size: 11))
-                .foregroundStyle(.orange)
-                .frame(width: 16, height: 16)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .hoverTooltip(tooltip)
-        .accessibilityLabel(tooltip)
-    }
+/// The mark opens the unified oversight menu unless the passive switch above is on.
+@MainActor
+func agentSessionRowOversightMarkIsInteractive(role _: AgentSessionOversightRole) -> Bool {
+    !agentOversightRoleMarksArePassive
 }
 
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
-    var isOverseer = false
-    var createdByLabel: String?
+    /// Fb mark model: the row's own group slot when it oversees, plus its overseers in
+    /// link-creation order. Drives the inline eye mark; `.none` renders nothing.
+    var oversightRole = AgentSessionOversightRole.none
+    /// Overseer-creator provenance for the tooltip's `Created by:` segment. Live links still own
+    /// the mark's colour; this never paints a separate origin mark.
+    var creatorSessionID: UUID?
+    var creatorDisplayName: String?
+    /// Revalidates and navigates to the lane's creator for the `Open creator "{name}"` item.
+    /// The label itself comes from the shared menu model.
     var onOpenCreator: (() -> Void)?
     let isPinned: Bool
     let isMCPControlled: Bool
@@ -83,6 +75,10 @@ struct AgentSessionRow: View {
     /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
     /// A frozen props value would make an available observer actionable after it closed or rebound.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
+    /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
+    /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
+    /// and Oversee submenus containing only this disabled reason.
+    var sidebarOversightUnavailableReason: String?
     /// Resolves the row's current exact target even when lifecycle eligibility makes its menu nil.
     /// This fences feedback from a system menu that stayed open across an in-place rebind.
     var resolveSidebarOversightTargetEndpoint:
@@ -98,6 +94,24 @@ struct AgentSessionRow: View {
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkReference
     ) async -> AgentSidebarOversightActionOutcome)?
+    /// General exact-endpoint Add for the inverse direction (this row as observer). Unlike
+    /// `onAddSidebarOversight` it may create the row's *first* outbound link.
+    var onAddOutboundOversight: (@MainActor (
+        DomainAgentSessionLinkEndpointIdentity,
+        DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentSidebarOversightActionOutcome)?
+    /// Read-only pasted-ID resolution for the row's Session-ID sheets. Inbound resolves the
+    /// prospective overseer (existing-overseer rule); outbound resolves the prospective target.
+    var resolveOverseerSessionIDCandidate: (@MainActor (
+        String
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
+    var resolveTargetSessionIDCandidate: (@MainActor (
+        String
+    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
+    /// Navigates to a linked peer's exact route (the `Open "{name}"` menu items).
+    /// Jump target for a linked session row item — the caller (sidebar) owns routing so the row
+    /// never references App-layer deep-link types directly.
+    var onOpenLinkedSession: (@MainActor (DomainAgentSessionLinkEndpointIdentity) -> Void)?
     let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
 
     @State private var isHovered = false
@@ -123,6 +137,23 @@ struct AgentSessionRow: View {
     @State private var showRenameAlert = false
     @State private var showDeleteConfirmation = false
     @State private var renameText = ""
+    /// Presented Session-ID sheet request, carrying the direction and the exact row endpoint
+    /// captured when the menu item was chosen.
+    @State private var oversightSessionIDSheet: OversightIDSheetRequest?
+
+    private struct OversightIDSheetRequest: Identifiable {
+        enum Direction {
+            /// The pasted ID names the prospective overseer of this row.
+            case chooseOverseer
+            /// The pasted ID names the prospective target for this row.
+            case chooseTarget
+        }
+
+        let direction: Direction
+        let rowEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let rowDisplayName: String
+        let id = UUID()
+    }
 
     // MARK: - Context Menu Snapshot
 
@@ -140,6 +171,9 @@ struct AgentSessionRow: View {
         /// depends on this list, so resolving it live while the menu is open reintroduces the
         /// removed-item measurement crash.
         var sidebarOversightMenu: AgentSidebarOversightMenuProps?
+        /// Frozen alongside the menu for the same reason — an ID gaining a session mid-menu
+        /// must not swap a disabled pair for a live section while the menu is open.
+        var sidebarOversightUnavailableReason: String?
     }
 
     @State private var menuSnapshot = ContextMenuSnapshot(
@@ -148,19 +182,32 @@ struct AgentSessionRow: View {
         hasAttentionRunState: false,
         hasOnStash: false,
         hasOnDismissAttention: false,
-        sidebarOversightMenu: nil
+        sidebarOversightMenu: nil,
+        sidebarOversightUnavailableReason: nil
     )
 
     /// The oversight menu as it should appear, or nil when the section must not be offered.
     /// Evaluated at hover so the context menu's item count cannot change while it is open.
+    ///
+    /// Ineligible or empty directions render a greyed reason inside the menu rather than hiding
+    /// it, so a non-nil projection is always presentable when the action callbacks exist.
     private var presentableSidebarOversightMenu: AgentSidebarOversightMenuProps? {
         guard allowsDirectMutations,
               let menu = resolveSidebarOversightMenu?(),
-              !menu.isEmpty,
               onAddSidebarOversight != nil,
               onStopSidebarOversight != nil
         else { return nil }
         return menu
+    }
+
+    /// An ID-less row (a fresh chat before the first send) still lists both Oversee submenus in
+    /// its context menu — enabled labels containing only the disabled reason — so the feature is
+    /// discoverable without minting a session ID early. Suppressed while direct mutations are
+    /// off (multi-select, bulk action in flight) — those modes hide the oversight section.
+    var showsDisabledOversightContextSubmenus: Bool {
+        allowsDirectMutations
+            && sidebarOversightUnavailableReason != nil
+            && presentableSidebarOversightMenu == nil
     }
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -200,8 +247,8 @@ struct AgentSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
-    private var overseerBadgeFontSize: CGFloat {
-        fontPreset.scaledClamped(9, min: 9, max: 12)
+    private var oversightMarkFontSize: CGFloat {
+        fontPreset.scaledClamped(10, min: 9, max: 12)
     }
 
     private var chipHorizontalPadding: CGFloat {
@@ -240,11 +287,8 @@ struct AgentSessionRow: View {
     }
 
     private var copySessionIDActionLabel: String {
-        "Copy Session ID"
+        AgentOversightUICopy.copySessionIDTitle
     }
-
-    private static let sidebarOversightManagementHelp = "Manage who oversees this Agent session."
-    private static let staleAvailableOverseerMessage = "That Agent session is no longer available as an overseer."
 
     private var copySessionIDIconColor: Color {
         if showsCopiedFeedback { return .green }
@@ -267,89 +311,334 @@ struct AgentSessionRow: View {
     private func sidebarOversightMenuAccessibilityValue(
         _ menu: AgentSidebarOversightMenuProps
     ) -> String {
-        let linked = menu.linkedObservers.count
-        let available = menu.availableObservers.count
-        return "\(linked) current overseer\(linked == 1 ? "" : "s"); "
-            + "\(available) eligible Agent session\(available == 1 ? "" : "s")"
+        AgentOversightUICopy.overseeByMenuAccessibilityValue(
+            overseenByCount: menu.linkedObservers.count,
+            availableCount: menu.availableObservers.count
+        )
     }
 
-    /// Builds the oversight items from the supplied value rather than resolving them live, so the
-    /// context menu can pass a snapshot frozen at hover and keep its item count stable while open.
+    private func sidebarOversightInverseMenuAccessibilityValue(
+        _ menu: AgentSidebarOversightMenuProps
+    ) -> String {
+        AgentOversightUICopy.overseeMenuAccessibilityValue(
+            overseeingCount: menu.linkedTargets.count,
+            availableCount: menu.availableTargets.count
+        )
+    }
+
+    /// The single oversight menu, feeding the row's context menu — the mark click and
+    /// no-role hover affordance present the same item tree through the native
+    /// `StableMenuButton` (`sidebarOversightMenuItems`) instead, so a sidebar
+    /// invalidation cannot repopulate their open NSMenu mid-browse. This builder reads
+    /// the supplied value rather than resolving live so the context menu can pass a
+    /// snapshot frozen at hover and keep its item count stable while open.
+    ///
+    /// Shape (approved 2026-10-01): `Overseeing:`/`Overseen by:` jump lists over the linked
+    /// rows, then the `Oversee new ▸`/`Oversee by ▸` candidate submenus, then `Unlink ▸`.
+    /// The `Manage session oversight` header appears only on rows with no link sections.
+    @ViewBuilder
     private func sidebarOversightMenuContent(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
-        Group {
-            if menu.isEmpty {
-                Button("No eligible agents") {}
+        let hasLinkedSections = !menu.linkedTargets.isEmpty || !menu.linkedObservers.isEmpty
+        let hasTopSections = hasLinkedSections || menu.showsCreatedBySection
+
+        if !hasTopSections {
+            Button(AgentOversightUICopy.oversightMenuHeader) {}
+                .disabled(true)
+        }
+
+        if !menu.linkedTargets.isEmpty {
+            Button(AgentOversightUICopy.overseeingSectionLabel) {}
+                .disabled(true)
+            ForEach(menu.linkedTargets) { option in
+                sidebarOversightJumpItem(option)
+            }
+        }
+        if !menu.linkedObservers.isEmpty {
+            Button(
+                menu.creatorIsSoleOverseer
+                    ? AgentOversightUICopy.createdAndOverseenBySectionLabel
+                    : AgentOversightUICopy.overseenBySectionLabel
+            ) {}
+                .disabled(true)
+            ForEach(menu.linkedObservers) { option in
+                sidebarOversightJumpItem(option)
+            }
+        }
+        if menu.showsCreatedBySection, let creatorLabel = menu.createdByLabel {
+            Button(AgentOversightUICopy.createdBySectionLabel) {}
+                .disabled(true)
+            Button {
+                onOpenCreator?()
+            } label: {
+                Label(creatorLabel, systemImage: AgentOversightUICopy.jumpItemIcon)
+            }
+            .accessibilityHint(AgentOversightUICopy.openHint(creatorLabel))
+        }
+
+        if hasTopSections {
+            Divider()
+        }
+
+        Menu {
+            if let reason = menu.observerIneligibleReason {
+                Button(reason) {}
+                    .disabled(true)
+            }
+            if menu.availableTargets.isEmpty, menu.observerIneligibleReason == nil {
+                Button(AgentOversightUICopy.noSessionsToOversee) {}
                     .disabled(true)
             } else {
-                if !menu.linkedObservers.isEmpty {
-                    Section("Overseen by") {
-                        ForEach(menu.linkedObservers) { option in
-                            if case let .linked(reference, _) = option.relationship {
-                                let key = AgentSidebarOversightActionKey.unlink(
-                                    observerEndpoint: option.observerEndpoint,
-                                    targetEndpoint: menu.targetEndpoint,
-                                    reference: reference
-                                )
-                                let label = AgentSidebarOversightMenuCopy.stopTitle(
-                                    observerMenuLabel: option.menuLabel
-                                )
-                                Button(role: .destructive) {
-                                    stopSidebarOversight(option, menu: menu, reference: reference)
-                                } label: {
-                                    Label(
-                                        label,
-                                        systemImage: sidebarOversightBusyKeys.contains(key)
-                                            ? "hourglass"
-                                            : "minus.circle"
-                                    )
-                                }
-                                .disabled(sidebarOversightBusyKeys.contains(key))
-                                .accessibilityLabel(
-                                    AgentSidebarOversightMenuCopy.stopAccessibilityLabel(
-                                        observerMenuLabel: option.menuLabel,
-                                        targetDisplayName: menu.targetDisplayName
-                                    )
-                                )
-                                .accessibilityHint(option.fullIdentityDescription)
-                                .accessibilityValue(
-                                    sidebarOversightBusyKeys.contains(key) ? "In progress" : ""
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if !menu.availableObservers.isEmpty {
-                    Section("Oversee by…") {
-                        ForEach(menu.availableObservers) { option in
-                            let key = AgentSidebarOversightActionKey.add(
-                                observerEndpoint: option.observerEndpoint,
-                                targetEndpoint: menu.targetEndpoint
-                            )
-                            Button {
-                                addSidebarOversight(option, menu: menu)
-                            } label: {
-                                Label(
-                                    option.menuLabel,
-                                    systemImage: sidebarOversightBusyKeys.contains(key)
-                                        ? "hourglass"
-                                        : "plus.circle"
-                                )
-                            }
-                            .disabled(sidebarOversightBusyKeys.contains(key))
-                            .accessibilityLabel(
-                                "Add \(option.menuLabel) as an overseer of \(menu.targetDisplayName)"
-                            )
-                            .accessibilityHint(option.fullIdentityDescription)
-                            .accessibilityValue(
-                                sidebarOversightBusyKeys.contains(key) ? "In progress" : ""
-                            )
-                        }
-                    }
+                ForEach(menu.availableTargets) { option in
+                    sidebarOversightOutboundItem(option, menu: menu)
                 }
             }
+            Divider()
+            Button(AgentOversightUICopy.sessionIDMenuItem) {
+                presentOversightSessionIDSheet(.chooseTarget, menu: menu)
+            }
+            .disabled(menu.observerIneligibleReason != nil)
+        } label: {
+            Text(AgentOversightUICopy.overseeNewTitle)
+        }
+        .accessibilityLabel(AgentOversightUICopy.overseeNewTitle)
+        .accessibilityValue(sidebarOversightInverseMenuAccessibilityValue(menu))
+
+        Menu {
+            if let reason = menu.targetIneligibleReason {
+                Button(reason) {}
+                    .disabled(true)
+            }
+            if menu.availableObservers.isEmpty, menu.targetIneligibleReason == nil {
+                Button(AgentOversightUICopy.noEligibleOverseers) {}
+                    .disabled(true)
+            } else {
+                ForEach(menu.availableObservers) { option in
+                    sidebarOversightInboundItem(option, menu: menu)
+                }
+            }
+            Divider()
+            Button(AgentOversightUICopy.sessionIDMenuItem) {
+                presentOversightSessionIDSheet(.chooseOverseer, menu: menu)
+            }
+            .disabled(menu.targetIneligibleReason != nil)
+        } label: {
+            Text(AgentOversightUICopy.overseeByTitle)
+        }
+        .accessibilityLabel(AgentOversightUICopy.overseeByTitle)
+        .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+
+        if hasLinkedSections {
+            Divider()
+            Menu {
+                if !menu.linkedTargets.isEmpty {
+                    Button(AgentOversightUICopy.overseeingSectionLabel) {}
+                        .disabled(true)
+                    ForEach(menu.linkedTargets) { option in
+                        sidebarOversightUnlinkOutboundItem(option, menu: menu)
+                    }
+                }
+                if !menu.linkedObservers.isEmpty {
+                    Button(AgentOversightUICopy.overseenBySectionLabel) {}
+                        .disabled(true)
+                    ForEach(menu.linkedObservers) { option in
+                        sidebarOversightUnlinkInboundItem(option, menu: menu)
+                    }
+                }
+            } label: {
+                Text(AgentOversightUICopy.unlinkTitle)
+            }
+            .accessibilityLabel(AgentOversightUICopy.unlinkTitle)
+            .accessibilityValue(
+                AgentOversightUICopy.unlinkMenuAccessibilityValue(
+                    linkCount: menu.linkedTargets.count + menu.linkedObservers.count
+                )
+            )
+        }
+    }
+
+    /// Resolves the live props and builds the item tree once per menu activation —
+    /// `StableMenuButton` evaluates `items:` on click inside AppKit's main-thread action
+    /// dispatch, so `assumeIsolated` matches the resolver's `@MainActor` contract without a
+    /// Task hop. `allowsDirectMutations` repeats the render-time mount gate: it closes the
+    /// small window where a click lands between a mode flip and the re-render that removes
+    /// the trigger; the action handlers then revalidate exact endpoints as before.
+    private func sidebarOversightStableMenuItems() -> [StableMenuItem] {
+        MainActor.assumeIsolated {
+            guard allowsDirectMutations, let menu = resolveSidebarOversightMenu?() else { return [] }
+            return sidebarOversightMenuItems(menu)
+        }
+    }
+
+    private func sidebarOversightMenuItems(
+        _ menu: AgentSidebarOversightMenuProps
+    ) -> [StableMenuItem] {
+        Self.sidebarOversightMenuItems(
+            menu,
+            busyKeys: sidebarOversightBusyKeys,
+            actions: AgentSidebarOversightMenuActions(
+                openLinkedSession: { openLinkedSession($0) },
+                openCreator: onOpenCreator,
+                addInbound: { addSidebarOversight($0, menu: menu) },
+                addOutbound: { addOutboundOversight($0, menu: menu) },
+                unlink: { observerEndpoint, targetEndpoint, reference in
+                    stopSidebarOversightLink(
+                        observerEndpoint: observerEndpoint,
+                        targetEndpoint: targetEndpoint,
+                        reference: reference
+                    )
+                },
+                presentChooseTargetSheet: {
+                    presentOversightSessionIDSheet(.chooseTarget, menu: menu)
+                },
+                presentChooseOverseerSheet: {
+                    presentOversightSessionIDSheet(.chooseOverseer, menu: menu)
+                }
+            )
+        )
+    }
+
+    /// One jump item under a linked section — the peer's display label plus the link arrow;
+    /// selecting it opens that session across windows.
+    private func sidebarOversightJumpItem(
+        _ option: AgentSidebarOversightMenuProps.PeerOption
+    ) -> some View {
+        Button {
+            openLinkedSession(option.peerEndpoint)
+        } label: {
+            Label(option.menuLabel, systemImage: AgentOversightUICopy.jumpItemIcon)
+        }
+        .accessibilityHint(AgentOversightUICopy.openHint(option.menuLabel))
+    }
+
+    /// One candidate row in the Oversee-by submenu. Selecting links after the shared
+    /// confirmation — candidates only; linked overseers live under `Unlink ▸`.
+    private func sidebarOversightInboundItem(
+        _ option: AgentSidebarOversightMenuProps.ObserverOption,
+        menu: AgentSidebarOversightMenuProps
+    ) -> some View {
+        let key = AgentSidebarOversightActionKey.add(
+            observerEndpoint: option.peerEndpoint,
+            targetEndpoint: menu.targetEndpoint
+        )
+        let busy = sidebarOversightBusyKeys.contains(key)
+        return Button {
+            addSidebarOversight(option, menu: menu)
+        } label: {
+            inboundItemLabel(option, busy: busy)
+        }
+        .disabled(busy)
+        .accessibilityLabel(option.menuLabel)
+        .accessibilityHint(option.fullIdentityDescription)
+        .accessibilityValue(busy ? "In progress" : "")
+    }
+
+    /// One candidate row in the Oversee-new submenu — sessions this row could start
+    /// overseeing. Same contract as the inbound item.
+    private func sidebarOversightOutboundItem(
+        _ option: AgentSidebarOversightMenuProps.TargetOption,
+        menu: AgentSidebarOversightMenuProps
+    ) -> some View {
+        let key = AgentSidebarOversightActionKey.add(
+            observerEndpoint: menu.targetEndpoint,
+            targetEndpoint: option.peerEndpoint
+        )
+        let busy = sidebarOversightBusyKeys.contains(key)
+        return Button {
+            addOutboundOversight(option, menu: menu)
+        } label: {
+            outboundItemLabel(option, busy: busy)
+        }
+        .disabled(busy || menu.observerIneligibleReason != nil)
+        .accessibilityLabel(option.menuLabel)
+        .accessibilityHint(option.fullIdentityDescription)
+        .accessibilityValue(busy ? "In progress" : "")
+    }
+
+    /// One linked-overseer row inside Unlink ▸ — unlink immediately, no confirmation.
+    private func sidebarOversightUnlinkInboundItem(
+        _ option: AgentSidebarOversightMenuProps.ObserverOption,
+        menu: AgentSidebarOversightMenuProps
+    ) -> some View {
+        guard case let .linked(reference, _) = option.relationship else {
+            return AnyView(EmptyView())
+        }
+        let key = AgentSidebarOversightActionKey.unlink(
+            observerEndpoint: option.peerEndpoint,
+            targetEndpoint: menu.targetEndpoint,
+            reference: reference
+        )
+        let busy = sidebarOversightBusyKeys.contains(key)
+        return AnyView(
+            Button {
+                stopSidebarOversightLink(
+                    observerEndpoint: option.peerEndpoint,
+                    targetEndpoint: menu.targetEndpoint,
+                    reference: reference
+                )
+            } label: {
+                inboundItemLabel(option, busy: busy)
+            }
+            .disabled(busy)
+            .accessibilityLabel(AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel))
+            .accessibilityHint(option.fullIdentityDescription)
+            .accessibilityValue(busy ? "In progress" : "")
+        )
+    }
+
+    /// One linked-target row inside Unlink ▸ — unlink immediately, no confirmation.
+    private func sidebarOversightUnlinkOutboundItem(
+        _ option: AgentSidebarOversightMenuProps.TargetOption,
+        menu: AgentSidebarOversightMenuProps
+    ) -> some View {
+        guard case let .linked(reference, _) = option.relationship else {
+            return AnyView(EmptyView())
+        }
+        let key = AgentSidebarOversightActionKey.unlink(
+            observerEndpoint: menu.targetEndpoint,
+            targetEndpoint: option.peerEndpoint,
+            reference: reference
+        )
+        let busy = sidebarOversightBusyKeys.contains(key)
+        return AnyView(
+            Button {
+                stopSidebarOversightLink(
+                    observerEndpoint: menu.targetEndpoint,
+                    targetEndpoint: option.peerEndpoint,
+                    reference: reference
+                )
+            } label: {
+                outboundItemLabel(option, busy: busy)
+            }
+            .disabled(busy)
+            .accessibilityLabel(AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel))
+            .accessibilityHint(option.fullIdentityDescription)
+            .accessibilityValue(busy ? "In progress" : "")
+        )
+    }
+
+    @ViewBuilder
+    private func inboundItemLabel(
+        _ option: AgentSidebarOversightMenuProps.ObserverOption,
+        busy: Bool
+    ) -> some View {
+        if busy {
+            Label(option.menuLabel, systemImage: "hourglass")
+        } else {
+            Text(option.menuLabel)
+        }
+    }
+
+    @ViewBuilder
+    private func outboundItemLabel(
+        _ option: AgentSidebarOversightMenuProps.TargetOption,
+        busy: Bool
+    ) -> some View {
+        if busy {
+            Label(option.menuLabel, systemImage: "hourglass")
+        } else {
+            Text(option.menuLabel)
         }
     }
 
@@ -358,20 +647,20 @@ struct AgentSessionRow: View {
         menu: AgentSidebarOversightMenuProps
     ) {
         let key = AgentSidebarOversightActionKey.add(
-            observerEndpoint: option.observerEndpoint,
+            observerEndpoint: option.peerEndpoint,
             targetEndpoint: menu.targetEndpoint
         )
         guard let revision = beginSidebarOversightAction(key) else { return }
         guard let current = resolveSidebarOversightMenu?(),
               current.targetEndpoint == menu.targetEndpoint,
               current.availableObservers.contains(where: {
-                  $0.observerEndpoint == option.observerEndpoint
+                  $0.peerEndpoint == option.peerEndpoint
               }),
               let onAddSidebarOversight
         else {
             sidebarOversightBusyKeys.remove(key)
             setSynchronousSidebarOversightFailure(
-                Self.staleAvailableOverseerMessage,
+                AgentOversightUICopy.staleSelectionMessage,
                 revision: revision,
                 targetEndpoint: menu.targetEndpoint
             )
@@ -381,8 +670,19 @@ struct AgentSessionRow: View {
         // Deliberately unstructured: dismissing the system menu or losing hover must not cancel an
         // authority transaction that already started.
         Task { @MainActor in
+            // Shared UI confirmation gate. The dialog captures these exact endpoints; the bridge
+            // revalidates them again on acceptance inside the durable Add transaction.
+            let confirmed = await AgentOversightLinkConfirmation.confirm(
+                observerLabel: option.displayName,
+                targetLabel: menu.targetDisplayName,
+                windowID: menu.targetEndpoint.windowID
+            )
+            guard confirmed else {
+                sidebarOversightBusyKeys.remove(key)
+                return
+            }
             let outcome = await onAddSidebarOversight(
-                option.observerEndpoint,
+                option.peerEndpoint,
                 menu.targetEndpoint
             )
             guard sidebarOversightBusyKeys.remove(key) != nil else { return }
@@ -394,34 +694,50 @@ struct AgentSessionRow: View {
         }
     }
 
-    private func stopSidebarOversight(
-        _ option: AgentSidebarOversightMenuProps.ObserverOption,
-        menu: AgentSidebarOversightMenuProps,
-        reference: DomainAgentSessionLinkReference
+    /// Inverse-direction Add: this row becomes the observer of the chosen target. Uses the general
+    /// exact-endpoint Add so a row can acquire its *first* outbound link — the inbound menu's
+    /// existing-overseer precondition does not apply to this direction.
+    private func addOutboundOversight(
+        _ option: AgentSidebarOversightMenuProps.TargetOption,
+        menu: AgentSidebarOversightMenuProps
     ) {
-        let key = AgentSidebarOversightActionKey.unlink(
-            observerEndpoint: option.observerEndpoint,
-            targetEndpoint: menu.targetEndpoint,
-            reference: reference
+        let key = AgentSidebarOversightActionKey.add(
+            observerEndpoint: menu.targetEndpoint,
+            targetEndpoint: option.peerEndpoint
         )
         guard let revision = beginSidebarOversightAction(key) else { return }
-        guard let onStopSidebarOversight else {
+        guard let current = resolveSidebarOversightMenu?(),
+              current.targetEndpoint == menu.targetEndpoint,
+              current.observerIneligibleReason == nil,
+              current.availableTargets.contains(where: {
+                  $0.peerEndpoint == option.peerEndpoint
+              }),
+              let onAddOutboundOversight
+        else {
             sidebarOversightBusyKeys.remove(key)
-            setSidebarOversightFailure(
-                "That oversight relationship is no longer active.",
+            setSynchronousSidebarOversightFailure(
+                AgentOversightUICopy.staleSelectionMessage,
                 revision: revision,
                 targetEndpoint: menu.targetEndpoint
             )
             return
         }
 
-        // Stop intentionally does not re-resolve the observer option. Its captured authority reference
-        // is the proof that lets a target unlink an observer whose live candidate has disappeared.
+        // Deliberately unstructured: dismissing the system menu or losing hover must not cancel an
+        // authority transaction that already started.
         Task { @MainActor in
-            let outcome = await onStopSidebarOversight(
-                option.observerEndpoint,
+            let confirmed = await AgentOversightLinkConfirmation.confirm(
+                observerLabel: menu.targetDisplayName,
+                targetLabel: option.displayName,
+                windowID: menu.targetEndpoint.windowID
+            )
+            guard confirmed else {
+                sidebarOversightBusyKeys.remove(key)
+                return
+            }
+            let outcome = await onAddOutboundOversight(
                 menu.targetEndpoint,
-                reference
+                option.peerEndpoint
             )
             guard sidebarOversightBusyKeys.remove(key) != nil else { return }
             finishSidebarOversightAction(
@@ -429,6 +745,158 @@ struct AgentSessionRow: View {
                 revision: revision,
                 targetEndpoint: menu.targetEndpoint
             )
+        }
+    }
+
+    /// Unlinks one generation-qualified relationship in either direction. The row endpoint used for
+    /// feedback fencing is always `menu.targetEndpoint` — the row this view renders.
+    private func stopSidebarOversightLink(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        reference: DomainAgentSessionLinkReference
+    ) {
+        let key = AgentSidebarOversightActionKey.unlink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            reference: reference
+        )
+        let rowEndpoint = resolveSidebarOversightTargetEndpoint?() ?? targetEndpoint
+        guard let revision = beginSidebarOversightAction(key) else { return }
+        guard let onStopSidebarOversight else {
+            sidebarOversightBusyKeys.remove(key)
+            setSidebarOversightFailure(
+                "That oversight relationship is no longer active.",
+                revision: revision,
+                targetEndpoint: rowEndpoint
+            )
+            return
+        }
+
+        // Stop intentionally does not re-resolve the peer option. Its captured authority reference
+        // is the proof that lets a row unlink a peer whose live candidate has disappeared.
+        Task { @MainActor in
+            let outcome = await onStopSidebarOversight(
+                observerEndpoint,
+                targetEndpoint,
+                reference
+            )
+            guard sidebarOversightBusyKeys.remove(key) != nil else { return }
+            finishSidebarOversightAction(
+                outcome,
+                revision: revision,
+                targetEndpoint: rowEndpoint
+            )
+        }
+    }
+
+    private func openLinkedSession(_ peerEndpoint: DomainAgentSessionLinkEndpointIdentity) {
+        onOpenLinkedSession?(peerEndpoint)
+    }
+
+    // MARK: - Session-ID sheets
+
+    private func presentOversightSessionIDSheet(
+        _ direction: OversightIDSheetRequest.Direction,
+        menu: AgentSidebarOversightMenuProps
+    ) {
+        oversightSessionIDSheet = OversightIDSheetRequest(
+            direction: direction,
+            rowEndpoint: menu.targetEndpoint,
+            rowDisplayName: menu.targetDisplayName
+        )
+    }
+
+    @ViewBuilder
+    private func oversightSessionIDSheetView(
+        for request: OversightIDSheetRequest
+    ) -> some View {
+        switch request.direction {
+        case .chooseOverseer:
+            AgentOversightSessionIDSheet(
+                title: AgentOversightUICopy.inboundSessionIDSheetTitle(
+                    session: request.rowDisplayName
+                ),
+                fieldAccessibilityLabel: AgentOversightUICopy
+                    .overseerSessionIDFieldAccessibilityLabel,
+                submitLabel: AgentOversightUICopy.addOverseerButton,
+                resolve: { raw in
+                    guard let resolveOverseerSessionIDCandidate else {
+                        return .failure(AgentOversightResolutionMessage(
+                            message: AgentOversightUICopy.oversightUnavailableMessage
+                        ))
+                    }
+                    return await resolveOverseerSessionIDCandidate(raw)
+                },
+                submit: { peer in
+                    await submitOversightSessionID(peer, direction: .chooseOverseer, request: request)
+                },
+                onDismiss: { oversightSessionIDSheet = nil }
+            )
+        case .chooseTarget:
+            AgentOversightSessionIDSheet(
+                title: AgentOversightUICopy.sessionIDSheetTitle(
+                    observer: request.rowDisplayName
+                ),
+                fieldAccessibilityLabel: AgentOversightUICopy.sessionIDFieldAccessibilityLabel,
+                submitLabel: AgentOversightUICopy.overseeSessionButton,
+                resolve: { raw in
+                    guard let resolveTargetSessionIDCandidate else {
+                        return .failure(AgentOversightResolutionMessage(
+                            message: AgentOversightUICopy.oversightUnavailableMessage
+                        ))
+                    }
+                    return await resolveTargetSessionIDCandidate(raw)
+                },
+                submit: { peer in
+                    await submitOversightSessionID(peer, direction: .chooseTarget, request: request)
+                },
+                onDismiss: { oversightSessionIDSheet = nil }
+            )
+        }
+    }
+
+    /// Confirms and submits a Session-ID-sheet link. The exact row endpoint captured when the menu
+    /// item was chosen is revalidated here — if the row rebound while the sheet or dialog was open,
+    /// the request fails instead of retargeting a replacement incarnation.
+    private func submitOversightSessionID(
+        _ peer: AgentOversightSessionIDSheet.ResolvedPeer,
+        direction: OversightIDSheetRequest.Direction,
+        request: OversightIDSheetRequest
+    ) async -> AgentOversightSessionIDSubmitOutcome {
+        guard resolveSidebarOversightTargetEndpoint?() == request.rowEndpoint else {
+            return .failed(AgentOversightUICopy.staleSelectionMessage)
+        }
+        let confirmed: Bool
+        let outcome: AgentSidebarOversightActionOutcome
+        switch direction {
+        case .chooseOverseer:
+            confirmed = await AgentOversightLinkConfirmation.confirm(
+                observerLabel: peer.displayName,
+                targetLabel: request.rowDisplayName,
+                windowID: request.rowEndpoint.windowID
+            )
+            guard confirmed else { return .cancelled }
+            guard let onAddSidebarOversight else {
+                return .failed(AgentOversightUICopy.staleSelectionMessage)
+            }
+            outcome = await onAddSidebarOversight(peer.endpoint, request.rowEndpoint)
+        case .chooseTarget:
+            confirmed = await AgentOversightLinkConfirmation.confirm(
+                observerLabel: request.rowDisplayName,
+                targetLabel: peer.displayName,
+                windowID: request.rowEndpoint.windowID
+            )
+            guard confirmed else { return .cancelled }
+            guard let onAddOutboundOversight else {
+                return .failed(AgentOversightUICopy.staleSelectionMessage)
+            }
+            outcome = await onAddOutboundOversight(request.rowEndpoint, peer.endpoint)
+        }
+        switch outcome {
+        case .changed, .alreadyInRequestedState:
+            return .succeeded
+        case let .failed(message):
+            return .failed(message)
         }
     }
 
@@ -536,13 +1004,11 @@ struct AgentSessionRow: View {
         isInteractionEnabled && !showsSelectionPresentation
     }
 
-    private static let overseerHelp = "Overseer — this session is overseeing one or more Agent sessions."
-    private static let overseerAccessibilityValue = "Overseer; this session is overseeing one or more Agent sessions."
-
     private var rowAccessibilityValue: String {
         var parts = [isSelected ? "Selected" : "Not selected"]
-        if isOverseer {
-            parts.append(Self.overseerAccessibilityValue)
+        // VoiceOver reads the same combined line the mark shows on hover.
+        if oversightRole.hasMark {
+            parts.append(oversightMarkTooltip())
         }
         if let sidebarOversightFailureMessage {
             parts.append("Oversight action failed: \(sidebarOversightFailureMessage)")
@@ -581,13 +1047,18 @@ struct AgentSessionRow: View {
         _ = onSelectionGesture(.toggle)
     }
 
+    /// Grey hover affordance on rows with no persistent oversight mark. It opens the same
+    /// Oversee-by lane menu the overseen/provenance mark opens — through the retained AppKit
+    /// menu, so an `isHovered` flip or a sidebar invalidation while browsing cannot tear it
+    /// down mid-tracking.
     private func sidebarOversightHoverMenu(
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
-        Menu {
-            sidebarOversightMenuContent(menu)
-        } label: {
-            Image(systemName: "eye")
+        StableMenuButton(
+            items: sidebarOversightStableMenuItems,
+            triggerStyle: .plain
+        ) {
+            Image(systemName: AgentOversightUICopy.manageOversightIcon)
                 .font(.system(size: 11))
                 .foregroundColor(
                     isSidebarOversightMenuHovered || !sidebarOversightBusyKeys.isEmpty
@@ -595,27 +1066,132 @@ struct AgentSessionRow: View {
                         : .secondary
                 )
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
         .fixedSize()
         .onHover { isSidebarOversightMenuHovered = $0 }
-        .hoverTooltip(Self.sidebarOversightManagementHelp)
-        .accessibilityLabel(Self.sidebarOversightManagementHelp)
+        .hoverTooltip(AgentOversightUICopy.manageOversightTooltip)
+        .accessibilityLabel(AgentOversightUICopy.manageOversightTooltip)
         .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
-        .accessibilityHint("Choose exact Agent sessions that oversee this session.")
+        .accessibilityHint("Manage which exact Agent sessions oversee or are overseen by this session.")
     }
 
-    private func sidebarOversightContextMenu(
-        _ menu: AgentSidebarOversightMenuProps
-    ) -> some View {
-        Menu {
-            sidebarOversightMenuContent(menu)
-        } label: {
-            Label(Self.sidebarOversightManagementHelp, systemImage: "eye")
+    /// The two Oversee submenus for an ID-less row: the labels stay enabled so the reason is
+    /// discoverable, while the only item inside each is the disabled explanation. Titles match
+    /// the unified menu's candidate submenus.
+    private func sidebarOversightUnavailableContextMenu(reason: String) -> some View {
+        Group {
+            Menu {
+                Button(reason) {}
+                    .disabled(true)
+            } label: {
+                Label(
+                    AgentOversightUICopy.overseeNewTitle,
+                    systemImage: AgentOversightUICopy.manageOversightIcon
+                )
+            }
+            .accessibilityLabel(AgentOversightUICopy.overseeNewTitle)
+            .accessibilityValue(reason)
+
+            Menu {
+                Button(reason) {}
+                    .disabled(true)
+            } label: {
+                Label(
+                    AgentOversightUICopy.overseeByTitle,
+                    systemImage: AgentOversightUICopy.manageOversightIcon
+                )
+            }
+            .accessibilityLabel(AgentOversightUICopy.overseeByTitle)
+            .accessibilityValue(reason)
         }
-        .accessibilityLabel(Self.sidebarOversightManagementHelp)
-        .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
-        .accessibilityHint("Choose exact Agent sessions that oversee this session.")
+    }
+
+    // MARK: - Oversight role mark (Fb iconography)
+
+    /// The mark's combined tooltip/VoiceOver line — `Overseeing: … · Overseen by: … · Created
+    /// by: …`, segments omitted when empty. Only called for rows carrying a role, so at least one
+    /// segment is always present; provenance joins the same line rather than painting its own mark.
+    private func oversightMarkTooltip() -> String {
+        let creatorIsSoleOverseer = oversightRole.overseers.count == 1
+            && oversightRole.overseers.first?.sessionID == creatorSessionID
+        return AgentOversightUICopy.oversightMarkTooltip(
+            overseeingNames: oversightRole.overseeingNames,
+            overseenByNames: oversightRole.overseers.map(\.displayName),
+            creator: creatorDisplayName,
+            creatorIsSoleOverseer: creatorIsSoleOverseer
+        )
+    }
+
+    /// The always-visible role mark, drawn inline just before the title. One mark per row:
+    /// `eye.fill` in the row's own group colour when it oversees, `eye` in its first overseer's
+    /// group colour when it is overseen, and a two-tone `eye.circle.fill` when both apply. Several
+    /// overseers keep the first overseer's colour (link-creation order) plus a count superscript.
+    /// When mutations are allowed, clicking opens the Oversee-by lane menu — the same menu model
+    /// as the hover affordance and the context submenu. Otherwise it stays a passive state marker
+    /// so it can never offer a mutation the row forbids.
+    @ViewBuilder
+    private func oversightMark(
+        menu: AgentSidebarOversightMenuProps?,
+        tooltip: String,
+        interactive: Bool
+    ) -> some View {
+        if interactive, let menu {
+            // A menu label image template-renders, which would flatten the palette
+            // colours (and the two-tone/count colours) to the control tint — and to white on
+            // selected rows. The coloured glyph therefore stays ordinary content underneath a
+            // clear-label StableMenuButton that owns the same hit target; the glyph itself
+            // never hit-tests. The AppKit menu also survives the SwiftUI invalidations that
+            // repopulated — and dismissed — the live SwiftUI Menu mid-browse.
+            oversightMarkGlyph
+                .accessibilityHidden(true)
+                .overlay {
+                    StableMenuButton(
+                        items: sidebarOversightStableMenuItems,
+                        triggerStyle: .plain
+                    ) {
+                        Color.clear
+                    }
+                    .accessibilityLabel(tooltip)
+                    .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+                }
+                .fixedSize()
+        } else {
+            // No hover tooltip: the combined line is the mark's VoiceOver label only — the
+            // click menu's sections carry the same information for sighted users.
+            oversightMarkGlyph
+                .fixedSize()
+                .accessibilityLabel(tooltip)
+        }
+    }
+
+    @ViewBuilder
+    private var oversightMarkGlyph: some View {
+        let ownColor = oversightRole.ownOverseerSlot.map { AgentOversightPalette.color(for: $0) }
+        let overseerColor = oversightRole.overseers.first
+            .map { AgentOversightPalette.color(for: $0.slot) }
+        HStack(spacing: 1) {
+            switch (ownColor, overseerColor) {
+            case let (.some(own), .some(overseer)):
+                // Both roles: the eye keeps this row's own group colour, the ring its overseer's.
+                Image(systemName: AgentOversightUICopy.dualRoleMarkIcon)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(own, overseer)
+            case let (.some(own), .none):
+                Image(systemName: AgentOversightUICopy.overseerMarkIcon)
+                    .foregroundStyle(own)
+            case let (.none, .some(overseer)):
+                Image(systemName: AgentOversightUICopy.overseenMarkIcon)
+                    .foregroundStyle(overseer)
+            case (.none, .none):
+                EmptyView()
+            }
+            if oversightRole.overseers.count > 1 {
+                Text("\(oversightRole.overseers.count)")
+                    .font(.system(size: 7, weight: .bold))
+                    .baselineOffset(4)
+                    .foregroundStyle(overseerColor ?? .secondary)
+            }
+        }
+        .font(.system(size: oversightMarkFontSize, weight: .semibold))
     }
 
     @ViewBuilder
@@ -678,21 +1254,24 @@ struct AgentSessionRow: View {
             // Session name
             VStack(alignment: .leading, spacing: titleVStackSpacing) {
                 HStack(spacing: titlePinSpacing) {
+                    // The oversight role mark sits inline just before the title text; the status
+                    // plate keeps carrying the dot/chevron run state ahead of it.
+                    if oversightRole.hasMark {
+                        oversightMark(
+                            menu: sidebarOversightMenu,
+                            tooltip: oversightMarkTooltip(),
+                            interactive: allowsDirectMutations
+                                && onAddSidebarOversight != nil
+                                && onStopSidebarOversight != nil
+                                && agentSessionRowOversightMarkIsInteractive(role: oversightRole)
+                        )
+                    }
+
                     Text(title)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: isActive ? .semibold : .regular))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .layoutPriority(0)
-
-                    if isOverseer {
-                        overseerBadge
-                    }
-
-                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
-                        AgentSessionCreatorBadge(creatorLabel: creatorLabel) {
-                            onOpenCreator?()
-                        }
-                    }
 
                     if isPinned {
                         Image(systemName: "pin.fill")
@@ -730,11 +1309,12 @@ struct AgentSessionRow: View {
                     .accessibilityLabel(dismissAttentionActionLabel)
                 }
 
-                // Three distinct eye surfaces may coexist: the toolbar dashboard action, the
-                // permanent purple filled observer-role badge, and this neutral outlined target menu.
+                // The grey hover affordance appears only on rows with no role mark. Once the
+                // mark is persistent it already opens the same lane menu, so the affordance
+                // stays hidden on those rows.
                 if allowsDirectMutations,
                    let sidebarOversightMenu,
-                   !sidebarOversightMenu.isEmpty,
+                   !oversightRole.hasMark,
                    onAddSidebarOversight != nil,
                    onStopSidebarOversight != nil
                 {
@@ -817,7 +1397,10 @@ struct AgentSessionRow: View {
         .contentShape(Rectangle())
         .contextMenu {
             if let sidebarOversightMenu = menuSnapshot.sidebarOversightMenu {
-                sidebarOversightContextMenu(sidebarOversightMenu)
+                sidebarOversightMenuContent(sidebarOversightMenu)
+                Divider()
+            } else if let reason = menuSnapshot.sidebarOversightUnavailableReason {
+                sidebarOversightUnavailableContextMenu(reason: reason)
                 Divider()
             }
 
@@ -865,7 +1448,10 @@ struct AgentSessionRow: View {
                     hasAttentionRunState: attentionRunState != nil,
                     hasOnStash: onStash != nil,
                     hasOnDismissAttention: onDismissAttention != nil,
-                    sidebarOversightMenu: presentableSidebarOversightMenu
+                    sidebarOversightMenu: presentableSidebarOversightMenu,
+                    sidebarOversightUnavailableReason: showsDisabledOversightContextSubmenus
+                        ? sidebarOversightUnavailableReason
+                        : nil
                 )
             }
         }
@@ -923,21 +1509,15 @@ struct AgentSessionRow: View {
                 }
             )
         }
+        .sheet(item: $oversightSessionIDSheet) { request in
+            oversightSessionIDSheetView(for: request)
+        }
         .onChange(of: isInteractionEnabled) { _, isEnabled in
             guard !isEnabled else { return }
             showDeleteConfirmation = false
             showRenameAlert = false
+            oversightSessionIDSheet = nil
         }
-    }
-
-    private var overseerBadge: some View {
-        Image(systemName: "eye.fill")
-            .font(.system(size: overseerBadgeFontSize, weight: .semibold))
-            .foregroundStyle(Color(nsColor: .systemPurple))
-            .fixedSize()
-            .layoutPriority(1)
-            .hoverTooltip(Self.overseerHelp)
-            .accessibilityHidden(true)
     }
 
     /// True when this row should advertise that it was opened by an
@@ -1320,230 +1900,6 @@ struct AgentSessionRow: View {
             "Waiting for your input"
         }
         return unseen ? base + " — select or dismiss to clear" : base
-    }
-}
-
-struct AgentStashedSessionRow: View {
-    let stashed: StashedTab
-    var createdByLabel: String?
-    var onOpenCreator: (() -> Void)?
-    var isSelected = false
-    var showsSelectionPresentation = false
-    var isInteractionEnabled = true
-    var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
-    let onRestore: () -> Void
-    let onDelete: () -> Void
-    let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
-
-    @State private var isHovered = false
-    @State private var isRestoreHovered = false
-    @State private var isDeleteHovered = false
-
-    // MARK: - Context Menu Snapshot
-
-    /// Snapshot of conditions controlling context menu item visibility, captured
-    /// on hover to prevent NSRangeException from AppKit measuring stale item counts.
-    private struct ContextMenuSnapshot {
-        var isInteractionEnabled: Bool
-        var showsSelectionPresentation: Bool
-    }
-
-    @State private var menuSnapshot = ContextMenuSnapshot(
-        isInteractionEnabled: true,
-        showsSelectionPresentation: false
-    )
-
-    @ObservedObject private var fontScale = FontScaleManager.shared
-    private var fontPreset: FontScalePreset {
-        fontScale.preset
-    }
-
-    private var rowMinHeight: CGFloat {
-        fontPreset.scaledClamped(30, min: 30, max: 40)
-    }
-
-    private var rowHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(10, max: 14)
-    }
-
-    private var rowVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(6, max: 8)
-    }
-
-    private var rowCornerRadius: CGFloat {
-        fontPreset.scaledClamped(16, max: 20)
-    }
-
-    private var rowSpacing: CGFloat {
-        fontPreset.scaledClamped(8, max: 11)
-    }
-
-    private var titlePinSpacing: CGFloat {
-        fontPreset.scaledClamped(6, max: 8)
-    }
-
-    private var titleVStackSpacing: CGFloat {
-        fontPreset.scaledClamped(2, max: 3)
-    }
-
-    private var leadingIconSize: CGFloat {
-        fontPreset.scaledClamped(12, max: 15)
-    }
-
-    private var pinIconSize: CGFloat {
-        fontPreset.scaledClamped(10, max: 13)
-    }
-
-    private var allowsDirectMutations: Bool {
-        isInteractionEnabled && !showsSelectionPresentation
-    }
-
-    private var restoreActionLabel: String {
-        "Restore tab"
-    }
-
-    private var deleteActionLabel: String {
-        "Delete stashed tab"
-    }
-
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
-    private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onRestore()
-        }
-    }
-
-    private func toggleSelection() {
-        guard isInteractionEnabled else { return }
-        _ = onSelectionGesture(.toggle)
-    }
-
-    var body: some View {
-        HStack(spacing: rowSpacing) {
-            if showsSelectionPresentation {
-                Button(action: toggleSelection) {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                        .padding(6)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .padding(-6) // Keep the row layout unchanged around the larger hit target.
-                .disabled(!isInteractionEnabled)
-                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
-                .accessibilityValue(isSelected ? "Selected" : "Not selected")
-            }
-
-            Image(systemName: "tray.and.arrow.down")
-                .font(.system(size: leadingIconSize))
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: titleVStackSpacing) {
-                HStack(spacing: titlePinSpacing) {
-                    Text(stashed.tab.name)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    if let createdByLabel {
-                        AgentSessionCreatorBadge(creatorLabel: createdByLabel) {
-                            onOpenCreator?()
-                        }
-                    }
-                    if stashed.tab.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: pinIconSize))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            Spacer()
-
-            if let commandProgressKind {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 16, height: 16)
-                    .allowsHitTesting(false)
-                    .accessibilityLabel(commandProgressKind.rowProgressAccessibilityLabel)
-            } else if isHovered, allowsDirectMutations {
-                Button(action: onRestore) {
-                    Image(systemName: "tray.and.arrow.up")
-                        .font(.system(size: 11))
-                        .foregroundColor(isRestoreHovered ? .accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isRestoreHovered = $0 }
-                .hoverTooltip(restoreActionLabel)
-
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundColor(isDeleteHovered ? .red : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isDeleteHovered = $0 }
-                .hoverTooltip(deleteActionLabel)
-            }
-        }
-        .padding(.horizontal, rowHorizontalPadding)
-        .padding(.vertical, rowVerticalPadding)
-        .frame(maxWidth: .infinity, minHeight: rowMinHeight, alignment: .leading)
-        .background(
-            Group {
-                if isSelected {
-                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.18))
-                } else if isHovered {
-                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
-                        .stroke(Color(NSColor.systemGray).opacity(0.4), lineWidth: 1)
-                }
-            }
-        )
-        .contentShape(Rectangle())
-        .contextMenu {
-            if !menuSnapshot.showsSelectionPresentation {
-                if menuSnapshot.isInteractionEnabled {
-                    Button("Select chat", action: toggleSelection)
-                    Divider()
-                    Button(restoreActionLabel, action: onRestore)
-                }
-                Button(AgentSidebarSessionIDCopyAction.menuTitle) {
-                    sessionIDCopyAction.perform()
-                }
-                .disabled(!sessionIDCopyAction.isEnabled)
-                if menuSnapshot.isInteractionEnabled {
-                    Divider()
-                    Button(deleteActionLabel, role: .destructive, action: onDelete)
-                }
-            }
-        }
-        .onHover { hovered in
-            isHovered = hovered
-            if hovered {
-                menuSnapshot = ContextMenuSnapshot(
-                    isInteractionEnabled: isInteractionEnabled,
-                    showsSelectionPresentation: showsSelectionPresentation
-                )
-            }
-        }
-        .onTapGesture(perform: handleRowTap)
-        .focusable()
-        .onKeyPress(.space) {
-            toggleSelection()
-            return .handled
-        }
-        .accessibilityLabel("\(stashed.tab.name), archived session")
-        .accessibilityValue(isSelected ? "Selected" : "Not selected")
-        .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
     }
 }
 

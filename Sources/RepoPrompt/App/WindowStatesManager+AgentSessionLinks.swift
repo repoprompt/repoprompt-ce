@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -16,6 +17,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             )
         }
         return candidates
+    }
+
+    func agentSessionLinkSheetWindow(windowID: Int) -> NSWindow? {
+        allWindows.first(where: { $0.windowID == windowID })?.nsWindow
     }
 
     func agentSessionLinkObservationSnapshot(

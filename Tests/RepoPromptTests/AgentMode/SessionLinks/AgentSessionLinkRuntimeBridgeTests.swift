@@ -2029,7 +2029,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(menu.availableObservers.map(\.observerEndpoint), [availableObserver.domainEndpoint])
         XCTAssertTrue(menu.linkedObservers.allSatisfy { option in
-            guard case .linked(_, observerCurrentlyEligible: true) = option.relationship else {
+            guard case .linked(_, peerCurrentlyEligible: true) = option.relationship else {
                 return false
             }
             return true
@@ -2082,7 +2082,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.host.publishedPropsByEndpoint[fixture.target.domainEndpoint]?.sidebarOversightMenu
         )
         XCTAssertEqual(menu.linkedObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
-        guard case .linked(_, observerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
+        guard case .linked(_, peerCurrentlyEligible: false) = menu.linkedObservers.first?.relationship else {
             return XCTFail("the unavailable linked observer must remain visible for unlink")
         }
         XCTAssertEqual(
