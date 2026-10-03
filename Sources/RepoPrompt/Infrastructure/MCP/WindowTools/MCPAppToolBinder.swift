@@ -1,7 +1,7 @@
-import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 enum MCPToolFreshnessPolicy {
     case none
@@ -45,7 +45,7 @@ final class MCPAppToolBinder {
             isEnabledByDefault: isEnabledByDefault,
             returnsValue: { [weak self] args in
                 guard let self else {
-                    throw MCPError.internalError("Window tool runtime deallocated while executing \(name)")
+                    throw MCPError.internalError("Window tool runtime deallocated while executing \(MCPDomainSelfToolCallContext.displayName(for: name))")
                 }
                 return try await executeTool(name, freshnessPolicy, args, implementation)
             }

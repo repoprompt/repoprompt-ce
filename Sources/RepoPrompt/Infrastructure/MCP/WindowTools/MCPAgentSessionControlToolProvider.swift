@@ -28,7 +28,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     private func agentSelfTool() -> Tool {
         guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf) else {
-            preconditionFailure("Missing canonical agent_self definition")
+            preconditionFailure("Missing canonical self_compact definition")
         }
         return runtime.tool(
             name: MCPWindowToolName.agentSelf,
@@ -40,7 +40,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             ),
             inputSchema: .object(
                 properties: [
-                    "op": .string(description: "Required operation: context or compact.", enum: ["context", "compact"]),
+                    "op": .string(description: "Required op: context or compact.", enum: ["context", "compact"]),
                     "note": .string(description: "[compact] Verbatim continuation note, at most 8,192 UTF-8 bytes."),
                     "idempotency_key": .string(description: "[compact] Required identical-retry key, at most 200 UTF-8 bytes.")
                 ],

@@ -2,10 +2,241 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class BindContextRoutingAuthorityTests: XCTestCase {
     #if DEBUG
+        @MainActor
+        func testLegacySelfPolicyAndServiceRefusalsUseRequestedName() async throws {
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Self Compatibility", root: "/tmp/repoprompt-self-compatibility", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: ["op": .string("context")])
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), "Tool '\(name)' is only available during discovery or agent mode runs.")
+            }
+            await ServerNetworkManager.shared.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: ["self_compact"]
+            )
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: [
+                    "op": .string("context"), "_rawJSON": .bool(true)
+                ])
+                let error = MCPError.invalidParams("\(name) is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access.")
+                let expected = ServerNetworkManager.toolErrorResult(rawJSON: true, message: "Error: \(error)")
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+            }
+        }
+
+        @MainActor
+        func testLegacySelfLifecycleErrorsUseRequestedNameWithoutChangingCanonicalIdentity() async throws {
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Self Lifecycle Compatibility", root: "/tmp/repoprompt-self-lifecycle", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact", operation: nil)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            await ServerNetworkManager.shared.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: ["self_compact"]
+            )
+            // The pre-rename 39840d3b4 catch rendered these same typed errors directly.
+            let errors: [(String) -> MCPDomainHostError] = [
+                { .unknownTool($0) },
+                { .scopeUnavailable(toolName: $0, scope: .window(id: window.windowID)) },
+                { .staleRegistration(toolName: $0) }
+            ]
+            for makeError in errors {
+                let canonicalError = makeError("self_compact")
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact") {
+                    throw canonicalError
+                }
+                for name in ["agent_self", "self_compact"] {
+                    for rawJSON in [false, true] {
+                        let result = try await connection.client.callTool(name: name, arguments: [
+                            "op": .string("context"), "_rawJSON": .bool(rawJSON)
+                        ])
+                        let expected = ServerNetworkManager.toolErrorResult(rawJSON: rawJSON, message: "Error: \(makeError(name))")
+                        XCTAssertEqual(result.isError, true)
+                        XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+                    }
+                }
+            }
+            await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: "self_compact") {
+                throw MCPToolExecutionDispatchError.missingContract(toolName: "self_compact")
+            }
+            for name in ["agent_self", "self_compact"] {
+                let result = try await connection.client.callTool(name: name, arguments: [
+                    "op": .string("context"), "_rawJSON": .bool(true)
+                ])
+                let expected = ServerNetworkManager.executionContractToolErrorResult(
+                    rawJSON: true, code: "tool_execution_contract_missing",
+                    message: "No declared execution contract exists for MCP tool '\(name)'."
+                )
+                XCTAssertEqual(result.isError, true)
+                XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+            }
+        }
+
+        @MainActor
+        func testRetiredSelfBinderMatchesPreRenameErrorsAtTransportBoundary() async throws {
+            /// At 39840d3b4 this same binder reported its registered name, agent_self.
+            /// Keep a legacy-named reference binder alongside the renamed production binder.
+            func retiredTool(named name: String) throws -> RepoPromptApp.Tool {
+                let binder = MCPAppToolBinder(windowID: 1178) { _, _, _, _ in
+                    XCTFail("A retired binder must never enter the provider")
+                    return .null
+                }
+                let binding = MCPDomainToolBinding(definition: MCPDomainToolDefinition(
+                    name: name, description: "retired self binder", inputSchema: .object([:])
+                )) { _ in .null }
+                return try RepoPromptApp.Tool(domainBinding: binding, runtime: binder)
+            }
+            let legacyReference = try retiredTool(named: "agent_self")
+            let renamedTool = try retiredTool(named: MCPWindowToolName.agentSelf)
+            let legacyError: Error
+            do {
+                _ = try await legacyReference([:])
+                return XCTFail("Expected the pre-rename binder's deallocation refusal")
+            } catch {
+                legacyError = error
+            }
+            XCTAssertEqual(
+                String(describing: legacyError),
+                String(describing: MCPError.internalError("Window tool runtime deallocated while executing agent_self"))
+            )
+
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Retired Self Binder", root: "/tmp/repoprompt-retired-self-binder", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentSelf, operation: nil)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            await ServerNetworkManager.shared.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: [MCPWindowToolName.agentSelf]
+            )
+            await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentSelf) {
+                try await renamedTool([:])
+            }
+            for name in ["agent_self", "self_compact"] {
+                for rawJSON in [false, true] {
+                    let result = try await connection.client.callTool(name: name, arguments: [
+                        "op": .string("context"), "_rawJSON": .bool(rawJSON)
+                    ])
+                    let error = name == "agent_self"
+                        ? legacyError
+                        : MCPError.internalError("Window tool runtime deallocated while executing self_compact")
+                    let expected = ServerNetworkManager.toolErrorResult(rawJSON: rawJSON, message: "Error: \(error)")
+                    XCTAssertEqual(result.isError, true)
+                    XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+                }
+            }
+        }
+
+        @MainActor
+        func testSelfStructuredErrorsMatchPreRenameFieldsWithoutChangingObserverIdentity() async throws {
+            let window = try await makeWindow(activeWorkspace: workspace(
+                name: "Self Structured Compatibility", root: "/tmp/repoprompt-self-structured", contextID: UUID()
+            ))
+            _ = installWindows([window])
+            let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+                await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentSelf, operation: nil)
+            }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+            let manager = ServerNetworkManager.shared
+            let runID = UUID()
+            await manager.debugSeedConnectionRunRouting(
+                connectionID: connection.connectionID, runID: runID, windowID: window.windowID
+            )
+            await manager.debugSetAdditionalTools(
+                for: connection.connectionID, additionalTools: [MCPWindowToolName.agentSelf]
+            )
+            let probe = SelfErrorObserverProbe()
+            let token = await manager.registerToolEventObserver(for: runID, observer: .init(
+                onCalled: { _, _, _ in },
+                onCompleted: { _, name, _, json, isError in
+                    await probe.record(name: name, json: json, isError: isError)
+                }
+            ))
+            addTeardownBlock { await manager.unregisterToolEventObserver(for: runID, token: token) }
+
+            // Reference payloads use the same generic/contract renderers as 39840d3b4,
+            // when toolName and the typed host error were both agent_self.
+            for failure in ["host", "contract", "admission"] {
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentSelf) {
+                    switch failure {
+                    case "host": throw MCPDomainHostError.staleRegistration(toolName: MCPWindowToolName.agentSelf)
+                    case "contract": throw MCPToolExecutionDispatchError.missingContract(toolName: MCPWindowToolName.agentSelf)
+                    default: throw MCPToolExecutionWatchdogError.admissionEnvelopeExpired
+                    }
+                }
+                for name in ["agent_self", "self_compact"] {
+                    let result = try await connection.client.callTool(name: name, arguments: [
+                        "op": .string("context"), "operation_id": .string("self-compatibility"), "_rawJSON": .bool(true)
+                    ])
+                    XCTAssertEqual(result.isError, true)
+                    if failure == "admission" {
+                        let message = "Tool '\(name)' could not enter its provider while preserving the export execution envelope."
+                        let metadata: [String: Value] = [
+                            "retryable": .bool(true), "mutation_state": .string("not_applied"),
+                            "operation_id": .string("self-compatibility"), "tool": .string(name),
+                            "cancellation_origin": .string("server_export_envelope"), "settlement": .string("admission_timeout")
+                        ]
+                        let expected = ServerNetworkManager.executionContractToolErrorResult(
+                            rawJSON: true, code: "tool_execution_admission_timeout", message: message, metadata: metadata
+                        )
+                        XCTAssertEqual(toolText(result), toolText((content: expected.content, isError: expected.isError)))
+                        // Admission never entered a provider, so it must not publish a completion.
+                        let observations = await probe.take()
+                        XCTAssertTrue(observations.isEmpty)
+                    } else {
+                        let observations = await probe.take()
+                        XCTAssertEqual(observations.count, 1)
+                        let observation = try XCTUnwrap(observations.first)
+                        XCTAssertEqual(observation.name, MCPWindowToolName.agentSelf)
+                        XCTAssertTrue(observation.isError)
+                        let expected: Value = failure == "host"
+                            ? .object([
+                                "error": .string(MCPDomainHostError.staleRegistration(toolName: name).localizedDescription),
+                                "tool": .string(name)
+                            ])
+                            : .object([
+                                "code": .string("tool_execution_contract_missing"),
+                                "error": .string("No declared execution contract exists for MCP tool '\(name)'."),
+                                "tool": .string(name)
+                            ])
+                        XCTAssertEqual(observation.json, ToolOutputFormatter.rawJSONString(expected))
+                    }
+                }
+            }
+        }
+
         @MainActor
         func testExplicitBindThenContextIDRoutedToolUsesSameCompositeContext() async throws {
             let rootURL = FileManager.default.temporaryDirectory
@@ -322,6 +553,25 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
 }
 
 #if DEBUG
+    private actor SelfErrorObserverProbe {
+        struct Observation {
+            let name: String
+            let json: String
+            let isError: Bool
+        }
+
+        private var observations: [Observation] = []
+
+        func record(name: String, json: String, isError: Bool) {
+            observations.append(Observation(name: name, json: json, isError: isError))
+        }
+
+        func take() -> [Observation] {
+            defer { observations.removeAll() }
+            return observations
+        }
+    }
+
     private struct ProductionMCPConnection {
         let client: Client
         let connectionID: UUID

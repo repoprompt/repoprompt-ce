@@ -1132,7 +1132,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "op": .object([
                     "type": .string("string"),
                     "enum": .array([.string("context"), .string("compact")]),
-                    "description": .string("Required operation; no default or alias.")
+                    "description": .string("Required op; no default or alias.")
                 ]),
                 "note": .object([
                     "type": .string("string"),

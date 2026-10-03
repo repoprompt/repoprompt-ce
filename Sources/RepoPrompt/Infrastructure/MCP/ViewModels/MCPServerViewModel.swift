@@ -1425,14 +1425,14 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self] name, freshnessPolicy, args, implementation in
         guard let self else {
-            throw MCPError.internalError("Window deallocated while executing \(name)")
+            throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName(for: name))")
         }
         return try await runTool(
             name, freshnessPolicy: freshnessPolicy,
             modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
         ) { [weak self] in
             guard let self else {
-                throw MCPError.internalError("Window deallocated during \(name)")
+                throw MCPError.internalError("Window deallocated during \(MCPDomainSelfToolCallContext.displayName(for: name))")
             }
             return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID), args)
         }
@@ -1490,7 +1490,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         executeAgentSelf: { [weak self] args in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while executing agent_self")
+                throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName)")
             }
             return try await agentSelfToolService.execute(args: args)
         },
@@ -1504,11 +1504,11 @@ final class MCPServerViewModel: ObservableObject {
         },
         requireAgentModeConnection: { toolName in
             guard let connectionID = ServerNetworkManager.currentConnectionID else {
-                throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
+                throw MCPError.invalidParams("\(MCPDomainSelfToolCallContext.displayName(for: toolName)) requires an active MCP connection")
             }
             let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
             guard purpose == .agentModeRun else {
-                throw MCPError.invalidParams("\(toolName) is only available during agent mode runs")
+                throw MCPError.invalidParams("\(MCPDomainSelfToolCallContext.displayName(for: toolName)) is only available during agent mode runs")
             }
             return connectionID
         },
@@ -2098,7 +2098,7 @@ final class MCPServerViewModel: ObservableObject {
     private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
         resolveContext: { [weak self] toolName, requirement in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
+                throw MCPError.internalError("Window deallocated while resolving \(MCPDomainSelfToolCallContext.displayName(for: toolName)) context")
             }
             return try await resolveDomainReadContext(
                 toolName: toolName,
@@ -2123,7 +2123,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
             guard let self else {
-                throw MCPError.internalError("Window deallocated while executing \(toolName)")
+                throw MCPError.internalError("Window deallocated while executing \(MCPDomainSelfToolCallContext.displayName(for: toolName))")
             }
             let appContext = await domainReadAppExecutionContext(for: context)
             let executionServer: MCPServerViewModel
@@ -2184,7 +2184,7 @@ final class MCPServerViewModel: ObservableObject {
                     sideEffects: sideEffects
                 )
             default:
-                throw MCPError.internalError("Unsupported domain read tool: \(toolName)")
+                throw MCPError.internalError("Unsupported domain read tool: \(MCPDomainSelfToolCallContext.displayName(for: toolName))")
             }
         },
         sideEffects: domainReadSideEffectCoordinator

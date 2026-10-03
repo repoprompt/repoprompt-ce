@@ -48,6 +48,22 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         let snapshot = await runtime.toolRegistry.snapshot()
         XCTAssertEqual(snapshot.fingerprintsByToolName.count, 29)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
+        XCTAssertTrue(snapshot.toolNames.contains("self_compact"))
+        XCTAssertFalse(snapshot.toolNames.contains("agent_self"))
+        for requestedName in ["agent_self", "self_compact"] {
+            let candidate = await runtime.toolRegistry.resolve(
+                toolName: MCPDomainToolCatalog.canonicalCallName(for: requestedName), scope: .standalone(id: scopeID)
+            )
+            let binding = try XCTUnwrap(candidate).binding
+            do {
+                _ = try await MCPDomainSelfToolCallContext.withRequestedName(requestedName) {
+                    try await binding(["op": .string("context")])
+                }
+                XCTFail("Standalone self calls must still fail closed")
+            } catch let error as MCPError {
+                XCTAssertEqual(error, .invalidParams("\(requestedName) is not available for this session."))
+            }
+        }
 
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,

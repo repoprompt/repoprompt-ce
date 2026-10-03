@@ -3495,19 +3495,19 @@ extension MCPServerViewModel {
             return agentModeRoutingRecoveryMessage(toolName: toolName)
         case .discoverRun:
             // Discovery connections cannot call bind_context; never suggest it.
-            return "No tab context is bound for \(toolName) in this Context Builder discovery run. " +
+            return "No tab context is bound for \(MCPDomainSelfToolCallContext.displayName(for: toolName)) in this Context Builder discovery run. " +
                 "Retry the tool call once. If it fails again, stop and report that the RepoPrompt connection lost its Context Builder routing."
         case .unknown, nil:
             break
         }
-        return "No tab context is bound for \(toolName). To resolve:\n" +
+        return "No tab context is bound for \(MCPDomainSelfToolCallContext.displayName(for: toolName)). To resolve:\n" +
             "• Call 'bind_context' with op='list' to see available windows and context_id values\n" +
             "• Call 'bind_context' with op='bind' and a context_id to bind this connection to a tab context\n" +
             "• Or pass a matching explicit tab context hint for this tool call"
     }
 
     private nonisolated static func agentModeRoutingRecoveryMessage(toolName: String) -> String {
-        "RepoPrompt could not route \(toolName) to the active Agent Mode run. " +
+        "RepoPrompt could not route \(MCPDomainSelfToolCallContext.displayName(for: toolName)) to the active Agent Mode run. " +
             "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
     }
 
@@ -3609,7 +3609,7 @@ extension MCPServerViewModel {
                         conflicts.append("window_id hint=\(windowID), bound=\(bound.windowID)")
                     }
                     throw MCPError.invalidParams(
-                        "Explicit tab context hint for \(toolName) conflicts with this connection's authoritative " +
+                        "Explicit tab context hint for \(MCPDomainSelfToolCallContext.displayName(for: toolName)) conflicts with this connection's authoritative " +
                             "tab-context binding: \(conflicts.joined(separator: "; ")); clear or intentionally rebind " +
                             "the connection before targeting a different tab context."
                     )
@@ -3642,7 +3642,7 @@ extension MCPServerViewModel {
            )
         {
             if let explicitHint, !Self.hint(explicitHint, matches: handedOver) {
-                throw MCPError.invalidParams("Explicit tab context hint for \(toolName) conflicts with the active run-scoped tab context. Hint tab: \(explicitHint.tabID); run tab: \(handedOver.tabID).")
+                throw MCPError.invalidParams("Explicit tab context hint for \(MCPDomainSelfToolCallContext.displayName(for: toolName)) conflicts with the active run-scoped tab context. Hint tab: \(explicitHint.tabID); run tab: \(handedOver.tabID).")
             }
             return .tabContextSnapshot(handedOver, source: .runHandover)
         }
@@ -3682,7 +3682,7 @@ extension MCPServerViewModel {
     @MainActor
     private func contextForCurrentRequest(toolName: String) async throws -> (UUID, TabContextSnapshot) {
         guard let connectionID = await service.currentRequestConnectionID() else {
-            throw MCPError.invalidParams("No active connection for \(toolName)")
+            throw MCPError.invalidParams("No active connection for \(MCPDomainSelfToolCallContext.displayName(for: toolName))")
         }
 
         let metadata = await RequestMetadata(

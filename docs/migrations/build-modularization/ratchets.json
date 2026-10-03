@@ -1,5 +1,5 @@
 {
-  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. Explicitly approved creation/activation repair requires a minimal +88-line allowance after current-main integration, setting the app-line ceiling to 651794 with unchanged 2000-line headroom.",
+  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. Explicitly approved creation/activation repair requires a minimal +88-line allowance after current-main integration, setting the app-line ceiling to 651794 with unchanged 2000-line headroom. Explicitly approved hidden agent_self compatibility adds exactly +25 to the app-line baseline, setting the final ceiling to 651819; existing headroom and all other metrics are unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 94,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 649794,
+    "app_target_swift_lines": 649819,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,

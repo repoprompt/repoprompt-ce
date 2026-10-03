@@ -32,7 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
-    package static let agentSelf = "agent_self"
+    package static let agentSelf = "self_compact"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -231,7 +231,51 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
     }
 }
 
+/// Transport-owned compatibility context; never an argument or an authority grant.
+package enum MCPDomainSelfToolCallContext {
+    @TaskLocal package static var isLegacyAlias = false
+
+    package static var displayName: String {
+        isLegacyAlias ? MCPDomainToolCatalog.legacyAgentSelfName : MCPWindowToolName.agentSelf
+    }
+
+    package static func displayName(for toolName: String) -> String {
+        isLegacyAlias && toolName == MCPWindowToolName.agentSelf ? MCPDomainToolCatalog.legacyAgentSelfName : toolName
+    }
+
+    /// Project typed lifecycle failures only at the response boundary; routing errors retain canonical identity.
+    package static func errorForPresentation(_ error: Error) -> Error {
+        guard isLegacyAlias else { return error }
+        return switch error {
+        case let MCPDomainHostError.unknownTool(name):
+            MCPDomainHostError.unknownTool(displayName(for: name))
+        case let MCPDomainHostError.scopeUnavailable(name, scope):
+            MCPDomainHostError.scopeUnavailable(toolName: displayName(for: name), scope: scope)
+        case let MCPDomainHostError.staleRegistration(name):
+            MCPDomainHostError.staleRegistration(toolName: displayName(for: name))
+        case let MCPToolExecutionDispatchError.missingContract(name):
+            MCPToolExecutionDispatchError.missingContract(toolName: displayName(for: name))
+        default: error
+        }
+    }
+
+    package static func withRequestedName<T>(
+        _ name: String,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await $isLegacyAlias.withValue(name == MCPDomainToolCatalog.legacyAgentSelfName, operation: operation)
+    }
+}
+
 package enum MCPDomainToolCatalog {
+    // Hidden backwards-compatibility support only; agent_self will be deprecated.
+    package static let legacyAgentSelfName = "agent_self"
+
+    package static func canonicalCallName(for name: String) -> String {
+        // Resolve before policy/admission, never by adding an advertised catalog entry.
+        name == legacyAgentSelfName ? MCPWindowToolName.agentSelf : name
+    }
+
     package static let entries: [MCPDomainToolCatalogEntry] = [
         .init(name: MCPGlobalToolName.appSettings, scope: .application, capability: .appSettings, admissionClass: .exclusive, operationPolicy: .init(
             operations: ["list", "get", "set", "options"],
