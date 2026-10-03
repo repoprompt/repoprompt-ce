@@ -171,6 +171,197 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
         XCTAssertNil(BootstrapSocketOwnership.identity(atPath: debugURL.path))
     }
 
+    #if DEBUG
+        func testReadyHandshakeSettlesWhileEarlierPeerIsHeldInPhysicalRead() async throws {
+            let socketURL = temporaryDirectory.appendingPathComponent("isolated.sock")
+            let server = BootstrapSocketServer(socketURL: socketURL)
+            let fixture = BootstrapHandshakeIsolationFixture()
+            await server.debugSetHandshakeReadHooks(
+                observer: { fixture.observe($0, phase: $1) },
+                beforePoll: { fixture.holdFirstPoll($0) }
+            )
+            try await server.start { _, _, identity, clientName in
+                XCTAssertEqual(identity.claimedPID, Int(getpid()))
+                XCTAssertEqual(clientName, "RepoPrompt CLI (Interactive)")
+                return .accept(
+                    publishTransferredFD: { fixture.publish($0) },
+                    postAccept: { fixture.postAccepted.fulfill() }
+                )
+            }
+
+            var firstPeer: Int32 = -1
+            var secondPeer: Int32 = -1
+            do {
+                firstPeer = try Self.connectBootstrapPeer(to: socketURL)
+                await fulfillment(of: [fixture.firstPollEntered], timeout: 10)
+                secondPeer = try Self.connectBootstrapPeer(to: socketURL)
+                try Self.sendInteractiveBootstrapRequest(to: secondPeer)
+                await fulfillment(of: [fixture.secondReadQueued], timeout: 10)
+
+                // The first peer cannot progress until cleanup explicitly opens its gate.
+                // This is a dependency oracle, not a wall-clock latency requirement.
+                await fulfillment(of: [fixture.postAccepted], timeout: 10)
+                XCTAssertTrue(fixture.isFirstPollHeld)
+                XCTAssertEqual(fixture.transferredCount, 1)
+                if fixture.transferredCount == 1 {
+                    let frame = try Self.readBootstrapResponseFrame(from: secondPeer)
+                    let response = try JSONDecoder().decode(MCPBootstrapResponse.self, from: frame)
+                    XCTAssertEqual(response.type, "accepted")
+                }
+            } catch {
+                await Self.cleanUpBootstrapIsolation(server: server, fixture: fixture, peers: [firstPeer, secondPeer])
+                throw error
+            }
+            await Self.cleanUpBootstrapIsolation(server: server, fixture: fixture, peers: [firstPeer, secondPeer])
+            let diagnostics = await server.diagnostics()
+            XCTAssertEqual(diagnostics.inFlightHandshakes, 0)
+            XCTAssertFalse(diagnostics.isRunning)
+        }
+
+        func testStopAbortsHeldAdmissionWithoutTransferringOrStartingMCP() async throws {
+            let socketURL = temporaryDirectory.appendingPathComponent("stop-admission.sock")
+            let server = BootstrapSocketServer(socketURL: socketURL)
+            let admissionGate = CancellationSettlementGate()
+            let admissionEntered = XCTestExpectation(description: "physical peer completed read and entered admission")
+            let aborted = XCTestExpectation(description: "retired listener aborts reserved acceptance")
+            let settled = XCTestExpectation(description: "retired handshake returns after abort")
+            let receipt = BootstrapAdmissionStopReceipt()
+            await server.debugSetHandshakeReadHooks(observer: { _, phase in
+                if phase == .settled {
+                    settled.fulfill()
+                }
+            })
+            try await server.start { _, _, _, _ in
+                admissionEntered.fulfill()
+                await admissionGate.wait()
+                return .accept(
+                    publishTransferredFD: { _ in receipt.recordTransfer() },
+                    postAccept: { receipt.recordPostAccept() },
+                    onAcceptAborted: {
+                        receipt.recordAbort()
+                        aborted.fulfill()
+                    }
+                )
+            }
+            var peer: Int32 = -1
+            do {
+                peer = try Self.connectBootstrapPeer(to: socketURL)
+                try Self.sendInteractiveBootstrapRequest(to: peer)
+                await fulfillment(of: [admissionEntered], timeout: 10)
+                await server.stop()
+                var byte: UInt8 = 0
+                XCTAssertEqual(Darwin.recv(peer, &byte, 1, Int32(MSG_DONTWAIT)), 0)
+                await admissionGate.release()
+                await fulfillment(of: [aborted, settled], timeout: 10)
+                let snapshot = receipt.snapshot()
+                XCTAssertEqual(snapshot.transfers, 0)
+                XCTAssertEqual(snapshot.postAccepts, 0)
+                XCTAssertEqual(snapshot.aborts, 1)
+                let diagnostics = await server.diagnostics()
+                XCTAssertEqual(diagnostics.inFlightHandshakes, 0)
+                XCTAssertFalse(diagnostics.isRunning)
+            } catch {
+                await admissionGate.release()
+                await server.stop()
+                if peer >= 0 {
+                    Darwin.close(peer)
+                }
+                throw error
+            }
+            Darwin.close(peer)
+        }
+
+        func testHandshakeLeaseCannotRecycleDescriptorBeforeInitiatingShutdown() throws {
+            let result = try BootstrapSocketServer.debugExerciseHandshakeIOLeaseReleaseRacingShutdown()
+            XCTAssertTrue(result.remainedOpenUntilInitiatingShutdown)
+            XCTAssertTrue(result.closedAfterShutdownFinished)
+            XCTAssertTrue(result.peerObservedEOF)
+        }
+
+        private static func sendInteractiveBootstrapRequest(to fd: Int32) throws {
+            let request = MCPBootstrapRequest(
+                sessionToken: UUID().uuidString,
+                clientPid: Int(getpid()),
+                clientName: "RepoPrompt CLI (Interactive)",
+                protocolVersion: MCPBootstrapProtocol.currentVersion
+            )
+            var payload = try JSONEncoder().encode(request)
+            payload.append(UInt8(ascii: "\n"))
+            let sent = payload.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+            XCTAssertEqual(sent, payload.count)
+        }
+
+        /// Same poll/read/newline accumulation as the owning file's sentinel reader,
+        /// bounded by one existing bootstrap budget rather than one budget per read.
+        private static func readBootstrapResponseFrame(from fd: Int32) throws -> Data {
+            let deadline = Date().addingTimeInterval(MCPBootstrapTiming.initialResponseTimeout)
+            var buffer = Data()
+            var bytes = [UInt8](repeating: 0, count: 1024)
+            while true {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw POSIXError(.ETIMEDOUT) }
+                var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                guard poll(&event, 1, Int32((remaining * 1000).rounded(.up))) > 0 else {
+                    throw POSIXError(.ETIMEDOUT)
+                }
+                let count = Darwin.read(fd, &bytes, bytes.count)
+                guard count > 0 else { throw POSIXError(.EIO) }
+                buffer.append(contentsOf: bytes.prefix(count))
+                guard buffer.count <= 8192 else { throw POSIXError(.EOVERFLOW) }
+                if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    return Data(buffer[..<newline])
+                }
+            }
+        }
+
+        private static func cleanUpBootstrapIsolation(
+            server: BootstrapSocketServer,
+            fixture: BootstrapHandshakeIsolationFixture,
+            peers: [Int32]
+        ) async {
+            for fd in peers where fd >= 0 {
+                _ = Darwin.shutdown(fd, SHUT_RDWR)
+            }
+            // Release the test hook BEFORE stop: the physical FD lease must be able to exit.
+            fixture.releaseFirstPoll()
+            await server.stop()
+            fixture.closeTransferredDescriptors()
+            for fd in peers where fd >= 0 {
+                Darwin.close(fd)
+            }
+        }
+
+        private static func connectBootstrapPeer(to url: URL) throws -> Int32 {
+            let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { throw POSIXError(.ENFILE) }
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            let pathBytes = url.path.utf8CString
+            guard pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+                Darwin.close(fd)
+                throw POSIXError(.ENAMETOOLONG)
+            }
+            withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { destination in
+                    for (index, byte) in pathBytes.enumerated() {
+                        destination[index] = byte
+                    }
+                }
+            }
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            guard result == 0 else {
+                let code = errno
+                Darwin.close(fd)
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            }
+            return fd
+        }
+    #endif
+
     private func bindSocket(at url: URL, listening: Bool) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(.ENFILE) }
@@ -209,6 +400,112 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
     }
 }
 
+#if DEBUG
+    private final class BootstrapAdmissionStopReceipt: @unchecked Sendable {
+        private let lock = NSLock()
+        private var transfers = 0
+        private var postAccepts = 0
+        private var aborts = 0
+
+        func recordTransfer() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            transfers += 1
+            return false
+        }
+
+        func recordPostAccept() {
+            lock.lock()
+            defer { lock.unlock() }
+            postAccepts += 1
+        }
+
+        func recordAbort() {
+            lock.lock()
+            defer { lock.unlock() }
+            aborts += 1
+        }
+
+        func snapshot() -> (transfers: Int, postAccepts: Int, aborts: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (transfers, postAccepts, aborts)
+        }
+    }
+
+    private final class BootstrapHandshakeIsolationFixture: @unchecked Sendable {
+        let firstPollEntered = XCTestExpectation(description: "first physical peer holds a poll lease")
+        let secondReadQueued = XCTestExpectation(description: "second physical peer read is queued")
+        let postAccepted = XCTestExpectation(description: "ready second peer receives acceptance and transfers")
+        private let lock = NSLock()
+        private let firstPollRelease = DispatchSemaphore(value: 0)
+        private var acceptedIDs: [UUID] = []
+        private var firstPollHeld = false
+        private var transferredDescriptors: [Int32] = []
+
+        var isFirstPollHeld: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return firstPollHeld
+        }
+
+        var transferredCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return transferredDescriptors.count
+        }
+
+        func observe(_ id: UUID, phase: BootstrapSocketServer.DebugHandshakeReadPhase) {
+            lock.lock()
+            if case .accepted = phase {
+                acceptedIDs.append(id)
+            }
+            let isSecondQueued = phase == .queued && acceptedIDs.count == 2 && acceptedIDs[1] == id
+            lock.unlock()
+            if isSecondQueued {
+                secondReadQueued.fulfill()
+            }
+        }
+
+        func holdFirstPoll(_ id: UUID) {
+            lock.lock()
+            let isFirst = acceptedIDs.first == id
+            if isFirst {
+                firstPollHeld = true
+            }
+            lock.unlock()
+            guard isFirst else { return }
+            firstPollEntered.fulfill()
+            firstPollRelease.wait()
+            lock.lock()
+            firstPollHeld = false
+            lock.unlock()
+        }
+
+        func releaseFirstPoll() {
+            firstPollRelease.signal()
+        }
+
+        func publish(_ fd: Int32) -> Bool {
+            lock.lock()
+            transferredDescriptors.append(fd)
+            lock.unlock()
+            return true
+        }
+
+        func closeTransferredDescriptors() {
+            lock.lock()
+            let descriptors = transferredDescriptors
+            transferredDescriptors.removeAll()
+            lock.unlock()
+            for fd in descriptors {
+                _ = Darwin.shutdown(fd, SHUT_RDWR)
+                Darwin.close(fd)
+            }
+        }
+    }
+#endif
+
 final class UnixSocketMCPTransportCancellationTests: XCTestCase {
     func testPinnedSDKNormalReturnAfterCancellationDoesNotReachWire() async throws {
         try await assertPinnedSDKCancellation(customError: false)
@@ -244,7 +541,9 @@ final class UnixSocketMCPTransportCancellationTests: XCTestCase {
             return try await withTaskCancellationHandler {
                 entered.fulfill()
                 await held.wait()
-                if customError { throw CancelledByClient() }
+                if customError {
+                    throw CancelledByClient()
+                }
                 return .init(content: [.text("late-cancelled-result")])
             } onCancel: {
                 cancelled.fulfill()
@@ -333,7 +632,9 @@ final class UnixSocketMCPTransportCancellationTests: XCTestCase {
                 buffer.removeSubrange(...newline)
                 frames.append(frame)
                 let ids = JSONRPCBridgeFrameInspector.inspectPermissively(frame, direction: .serverToClient).compactMap(\.id)
-                if ids.contains(.number(99)) { return frames }
+                if ids.contains(.number(99)) {
+                    return frames
+                }
             }
         }
     }
@@ -345,7 +646,9 @@ private actor CancellationSettlementGate {
     private var released = false
     private var waiter: CheckedContinuation<Void, Never>?
     func wait() async {
-        if released { return }
+        if released {
+            return
+        }
         await withCheckedContinuation { waiter = $0 }
     }
 
