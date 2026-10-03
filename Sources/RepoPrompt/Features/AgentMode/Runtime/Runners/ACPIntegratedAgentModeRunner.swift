@@ -2250,25 +2250,6 @@ final class ACPIntegratedAgentModeRunner {
             || isKnownProviderPlaceholder(item, tabID: tabID)
     }
 
-    private func shouldUpdateExistingToolResult(
-        _ item: AgentChatItem,
-        storedToolName: String,
-        argsJSON: String?,
-        tabID: UUID
-    ) -> Bool {
-        guard item.kind == .toolResult else { return false }
-        if hasExactToolInvocationSignature(item, storedToolName: storedToolName, argsJSON: argsJSON) {
-            return true
-        }
-        switch AgentTranscriptToolNormalizer.status(for: item) {
-        case .pending, .running:
-            return hasSameNormalizedToolName(item.toolName, storedToolName)
-                || isKnownProviderPlaceholder(item, tabID: tabID)
-        case .success, .warning, .failed, .cancelled, .unknown:
-            return false
-        }
-    }
-
     private func hasExactToolInvocationSignature(
         _ item: AgentChatItem,
         storedToolName: String,
