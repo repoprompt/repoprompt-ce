@@ -1207,9 +1207,12 @@ exposed three app test hosts bypassing startup notification-bridge installation;
 explicit fixture adapters repaired delivery without weakening any assertions.
 
 Disk-writer injection preserves independent selection keys when incoming records
-are nil, and normalization writeback uses the manager's injected writer. Regression
-coverage pins both contracts. No timeout widening, retry sleeps, authorization
-weakening or assertion removal was used to repair failures.
+are nil; the owning contract regression exercises this behavior. Source review
+confirms normalization writeback forwards the manager's injected writer, but no
+committed integration regression directly injects a non-default manager writer.
+That routing contract remains a coverage gap, not a claimed executed test. No
+timeout widening, retry sleeps, authorization weakening or assertion removal was
+used to repair failures.
 
 The four gated metrics tighten to 16 files over 5,000 lines, 47 over 2,000,
 326 app-testable imports and 89 app static shared declarations. App line count
@@ -1219,4 +1222,21 @@ count growth (59 to 64) is disclosed, not silently baselined upward.
 **NOT_RUN:** debug packaging, visible-app lifecycle, live CE MCP acceptance and
 paid provider calls. No timing benchmark is claimed; conductor execution/queue
 and global-wait accounting are available in the ticket logs. Exact-head hosted
-checks and fresh milestone Astra review remain publication gates.
+checks and fresh milestone Astra review remain acceptance gates.
+
+### Independent milestone review
+
+Read-only Astra XHigh review of exact `2467154530eb0b31f2d196dde1f1dfcc3647cee5`
+found no demonstrated B1–B4 behavior, security or authority regression. It confirmed
+preserved read cancellation/permit ownership, authenticated seed-plan readers,
+raw artifact provenance/OID/byte-count/digest/CAS guards, and settings startup/event
+boundaries. Review report: `/tmp/pr5-astra-246715453-review.md` (local artifact,
+not a hosted check or new test execution).
+
+Its P3 evidence finding is corrected above: injected manager normalization routing
+is source-reviewed, not directly covered by a committed injection regression.
+Direct app raw-source-adapter mismatch coverage is also an explicit gap; owning
+container corruption/hostile-file tests validate a different layer. Duplicate pure
+delta coalescing in the app and FileSystem is a non-blocking future divergence risk,
+not a demonstrated current algorithm mismatch. The historical final-materialization
+failure remains unattributed; broad GREEN is not causal proof of its disposition.
