@@ -65,6 +65,139 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "account/rateLimits/read",
+      "alwaysSent": [],
+      "responseSchema": "v2/GetAccountRateLimitsResponse.json",
+      "consumedResponse": [
+        {
+          "path": "accountId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.limitId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.limitName",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.planType",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.rateLimitReachedType",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.spendControlReached",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary.usedPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.primary.windowDurationMins",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary.resetsAt",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary.usedPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.secondary.windowDurationMins",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary.resetsAt",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.credits",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.credits.hasCredits",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.credits.unlimited",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.credits.balance",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.individualLimit",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.individualLimit.limit",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.used",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.remainingPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.resetsAt",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimitsByLimitId",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "model/list",
       "alwaysSent": [
         "limit"
@@ -808,6 +941,127 @@
           "path": "error",
           "presence": "optional",
           "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "account/rateLimits/updated",
+      "consumedParams": [
+        {
+          "path": "rateLimits",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.limitId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.limitName",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.planType",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.rateLimitReachedType",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.spendControlReached",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary.usedPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.primary.windowDurationMins",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.primary.resetsAt",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary.usedPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.secondary.windowDurationMins",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.secondary.resetsAt",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.credits",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.credits.hasCredits",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.credits.unlimited",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.credits.balance",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.individualLimit",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "rateLimits.individualLimit.limit",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.used",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.remainingPercent",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "rateLimits.individualLimit.resetsAt",
+          "presence": "conditional",
+          "nullable": false
         }
       ]
     },
