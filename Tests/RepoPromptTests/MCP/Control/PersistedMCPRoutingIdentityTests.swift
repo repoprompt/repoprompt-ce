@@ -64,7 +64,9 @@
                     to: workspaceB
                 )
             )
-            liveB.workspaceInstanceNumber = liveBInstanceNumber
+            liveB.setWorkspaceInstanceAssignment(
+                WorkspaceInstanceAssignment(workspaceID: workspaceB.id, number: liveBInstanceNumber)
+            )
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
                     workspaceID: workspaceB.id,
@@ -117,7 +119,9 @@
                     to: workspaceA
                 )
             )
-            restoredA.workspaceInstanceNumber = restoredAInstanceNumber
+            restoredA.setWorkspaceInstanceAssignment(
+                WorkspaceInstanceAssignment(workspaceID: workspaceA.id, number: restoredAInstanceNumber)
+            )
             XCTAssertEqual(restoredAInstanceNumber, persistedWorkspaceInstanceNumber)
             let restoredAToolsEnabled = await restoredA.mcpServer.setWindowToolsEnabled(true)
             XCTAssertTrue(restoredAToolsEnabled)
@@ -148,6 +152,210 @@
                 retainedAfterRestore.lastWorkspaceInstanceNumber,
                 restoredAInstanceNumber
             )
+        }
+
+        /// #1112: a registered window's real switch is held after the target ID is published and
+        /// before its listener assigns the number. Live capture and MCP route recording made there
+        /// pair the target with nil, never the outgoing number, then record the assigned number.
+        @MainActor
+        func testLiveCaptureAndRouteRecordQualifyInstanceNumberAcrossAssignmentGap() async throws {
+            // Already normalized: route records are stored under `MCPClientIdentity.storageKey`.
+            let clientName = "issue1112-routing-gap-tests"
+            // Real manager persistence writes windowSessions.json; refuse to run outside the sandbox.
+            _ = try WorkspaceTestProcessSandbox.validate()
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            let previousSession = try? Data(contentsOf: sessionURL)
+            addTeardownBlock {
+                if let previousSession {
+                    try? previousSession.write(to: sessionURL, options: .atomic)
+                } else {
+                    try? FileManager.default.removeItem(at: sessionURL)
+                }
+            }
+            let sessionKey = "issue-1112-gap-\(UUID().uuidString)"
+            let rootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("issue-1112-gap-\(UUID().uuidString)", isDirectory: true)
+            for name in ["outgoing", "target"] {
+                try FileManager.default.createDirectory(
+                    at: rootURL.appendingPathComponent(name), withIntermediateDirectories: true
+                )
+            }
+            let outgoing = workspace(name: "Outgoing", root: rootURL.appendingPathComponent("outgoing").path)
+            let target = workspace(name: "Target", root: rootURL.appendingPathComponent("target").path)
+            let manager = ServerNetworkManager.shared
+            let previousWindows = WindowStatesManager.shared.allWindows
+            addTeardownBlock { @MainActor in
+                await manager.debugRestorePersistedRoutingFixtureForTesting()
+                WindowStatesManager.shared.allWindows = previousWindows
+                try? FileManager.default.removeItem(at: rootURL)
+            }
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            WindowStatesManager.shared.allWindows = []
+            // Exact numbering: Outgoing=3 (two earlier instances), Target=1; restored afterwards.
+            let previousAllocator = WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting()
+            addTeardownBlock { @MainActor in
+                WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting(previousAllocator)
+            }
+            for _ in 1 ... 2 {
+                WindowStatesManager.shared.recordWorkspaceSwitch(
+                    forWindowID: WindowState.reserveWindowIDForTesting(),
+                    to: outgoing
+                )
+            }
+            let window = try await makeWindow(activeWorkspace: outgoing)
+            addTeardownBlock { @MainActor in
+                window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            WindowStatesManager.shared.registerWindowState(window)
+            let outgoingNumber = try XCTUnwrap(window.workspaceInstanceNumber(for: outgoing.id))
+            XCTAssertEqual(outgoingNumber, 3)
+            let connection = try await makeProductionMCPConnection(
+                networkManager: manager,
+                clientName: clientName,
+                sessionToken: sessionKey
+            )
+            addTeardownBlock { await connection.cleanup() }
+            let outgoingIdentity = await recordedIdentity(window, connection, clientName: clientName)
+            XCTAssertEqual(outgoingIdentity.entry?.workspaceInstanceNumber, outgoingNumber)
+            XCTAssertEqual(outgoingIdentity.record?.lastWorkspaceInstanceNumber, outgoingNumber)
+
+            // Stable target affinities: one paired with the number this window carries into the gap,
+            // one with the target's own settled number.
+            let staleClient = "issue1112-stale-pair"
+            let staleKey = "issue-1112-stale-\(UUID().uuidString)"
+            let settledClient = "issue1112-settled-pair"
+            let settledKey = "issue-1112-settled-\(UUID().uuidString)"
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [
+                routingRecord(
+                    clientName: staleClient,
+                    sessionKey: staleKey,
+                    windowID: window.windowID + 10000,
+                    workspaceID: target.id,
+                    instanceNumber: outgoingNumber
+                ),
+                routingRecord(
+                    clientName: settledClient,
+                    sessionKey: settledKey,
+                    windowID: window.windowID + 10001,
+                    workspaceID: target.id,
+                    instanceNumber: 1
+                )
+            ])
+
+            window.workspaceManager.workspaces.append(target)
+            var gapIdentity: (entry: WindowSessionEntry?, record: MCPRoutingState.ClientRecord?)?
+            var gapWindowObject: [String: Any]?
+            var gapStaleRoute: Int?
+            var gapSettledRoute: Int?
+            window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { [self] id in
+                guard id == target.id else { return }
+                XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+                gapIdentity = await recordedIdentity(window, connection, clientName: clientName)
+                gapWindowObject = await debugWindowObject(window, connection, clientName: clientName)
+                gapStaleRoute = await manager.debugPreferredWindowIDForTesting(clientName: staleClient, sessionKey: staleKey)
+                gapSettledRoute = await manager.debugPreferredWindowIDForTesting(
+                    clientName: settledClient,
+                    sessionKey: settledKey
+                )
+            }
+            _ = await window.workspaceManager.switchWorkspace(
+                to: target,
+                saveState: false,
+                reason: "persistedMCPRoutingIdentityGapTest"
+            )
+            let gap = try XCTUnwrap(gapIdentity)
+            XCTAssertEqual(gap.entry?.workspaceID, target.id)
+            XCTAssertNil(gap.entry?.workspaceInstanceNumber, "persisted entry")
+            XCTAssertEqual(gap.record?.lastWorkspaceID, target.id)
+            XCTAssertNotNil(gap.record)
+            XCTAssertNil(gap.record?.lastWorkspaceInstanceNumber, "routing record")
+            XCTAssertEqual(gapWindowObject?["workspace_id"] as? String, target.id.uuidString)
+            XCTAssertTrue(gapWindowObject?["workspace_instance_number"] is NSNull, "\(String(describing: gapWindowObject))")
+            XCTAssertNil(gapStaleRoute, "the gap window must not satisfy a target pair carrying the outgoing number")
+            XCTAssertNil(gapSettledRoute, "the gap window has no target number yet")
+
+            let targetNumber = try XCTUnwrap(window.workspaceInstanceNumber(for: target.id))
+            XCTAssertEqual(targetNumber, 1)
+            let settled = await recordedIdentity(window, connection, clientName: clientName)
+            XCTAssertEqual(settled.entry?.workspaceID, target.id)
+            XCTAssertEqual(settled.entry?.workspaceInstanceNumber, targetNumber)
+            XCTAssertEqual(settled.record?.lastWorkspaceID, target.id)
+            XCTAssertEqual(settled.record?.lastWorkspaceInstanceNumber, targetNumber)
+            let settledWindowObject = await debugWindowObject(window, connection, clientName: clientName)
+            XCTAssertEqual(settledWindowObject?["workspace_instance_number"] as? Int, targetNumber)
+            let settledRoute = await manager.debugPreferredWindowIDForTesting(
+                clientName: settledClient,
+                sessionKey: settledKey
+            )
+            XCTAssertEqual(settledRoute, window.windowID)
+            let settledStaleRoute = await manager.debugPreferredWindowIDForTesting(
+                clientName: staleClient,
+                sessionKey: staleKey
+            )
+            XCTAssertNil(settledStaleRoute)
+
+            // Restoring the persisted entries seeds the outgoing number but nothing for the target,
+            // whose gap entry carried nil rather than the outgoing number.
+            let restored = try WindowSessionSnapshot(
+                version: 4,
+                windows: [XCTUnwrap(outgoingIdentity.entry), XCTUnwrap(gap.entry)]
+            )
+            let liveAllocator = WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting()
+            WindowStatesManager.shared.preseedInstanceNumberStateForTesting(from: restored)
+            let restoredTarget = WindowStatesManager.shared.recordWorkspaceSwitch(
+                forWindowID: WindowState.reserveWindowIDForTesting(),
+                to: target
+            )
+            let restoredOutgoing = WindowStatesManager.shared.recordWorkspaceSwitch(
+                forWindowID: WindowState.reserveWindowIDForTesting(),
+                to: outgoing
+            )
+            WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting(liveAllocator)
+            XCTAssertEqual(restoredTarget, 1)
+            XCTAssertEqual(restoredOutgoing, 3)
+        }
+
+        /// The diagnostics routing snapshot's object for `window`.
+        @MainActor
+        private func debugWindowObject(
+            _ window: WindowState,
+            _ connection: Issue862ProductionMCPConnection,
+            clientName: String
+        ) async -> [String: Any]? {
+            let payload = await ServerNetworkManager.shared.debugRoutingSnapshotPayload(
+                currentConnectionID: connection.connectionID,
+                requestedConnectionID: nil,
+                clientNameFilter: clientName,
+                includeRecords: false,
+                includeWindows: true
+            )
+            return (payload["windows"] as? [[String: Any]])?.first { $0["window_id"] as? Int == window.windowID }
+        }
+
+        /// The entry the manager persists for `window` (decoded from windowSessions.json after a real
+        /// `persistWindowSessionImmediately`) and the MCP route record written for it right now.
+        @MainActor
+        private func recordedIdentity(
+            _ window: WindowState,
+            _ connection: Issue862ProductionMCPConnection,
+            clientName: String
+        ) async -> (entry: WindowSessionEntry?, record: MCPRoutingState.ClientRecord?) {
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            try? FileManager.default.removeItem(at: sessionURL)
+            await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "issue1112RoutingGapTest")
+            let entry = (try? Data(contentsOf: sessionURL))
+                .flatMap { try? JSONDecoder().decode(WindowSessionSnapshot.self, from: $0) }?
+                .windows.first
+            let payload = await ServerNetworkManager.shared.debugSeedRoutingAffinityPayload(
+                connectionID: connection.connectionID,
+                windowID: window.windowID
+            )
+            XCTAssertEqual(payload["persisted"] as? Bool, true, "\(payload)")
+            let records = await ServerNetworkManager.shared.debugRoutingRecordsForTesting(clientName: clientName)
+            return (entry, records.first)
         }
 
         func testReusedNumericWindowIDDoesNotRouteWorkspaceAToLiveWorkspaceB() async {

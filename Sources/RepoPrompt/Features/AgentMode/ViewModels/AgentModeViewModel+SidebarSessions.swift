@@ -108,16 +108,6 @@ extension AgentModeViewModel {
         )
     }
 
-    private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
-        let frozenOrder = ownerValidatedSidebarRestoreFrozenOrderByTabID
-        guard !ownerValidatedSessionListCacheReady, !frozenOrder.isEmpty else { return false }
-        return tabs.allSatisfy { frozenOrder[$0.id] != nil }
-    }
-
-    private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        ownerValidatedSidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
-    }
-
     func preferredSidebarEntry(for tabID: UUID, tabName: String? = nil) -> AgentSessionIndexEntry? {
         AgentModeSidebarSessionBuilder.preferredSidebarEntry(
             for: tabID,
@@ -396,13 +386,6 @@ extension AgentModeViewModel {
         return sortedTabs
     }
 
-    private func prefixedPinnedTabs(_ tabs: [ComposeTabState]) -> [ComposeTabState] {
-        let pinned = tabs.filter(\.isPinned)
-        guard !pinned.isEmpty else { return tabs }
-        let unpinned = tabs.filter { !$0.isPinned }
-        return pinned + unpinned
-    }
-
     private func makeSessionSidebarStashedTabSignatures(
         for stashedTabs: [StashedTab]
     ) -> [AgentSessionSidebarStashedTabSignature] {
@@ -443,16 +426,27 @@ extension AgentModeViewModel {
         workspaceID: UUID?,
         includeComposeTabsWithoutAgentSessions: Bool
     ) -> [SidebarSession] {
+        let restorePresentation = sidebarRestorePresentationKey
         let cacheKey = SidebarSessionRowsCacheKey(
             workspaceID: workspaceID,
             rowContentRevision: ui.sessionSidebar.snapshot.rowContentRevision,
-            tabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: tabs)
+            tabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: tabs),
+            restorePresentation: restorePresentation
         )
         let cachedRows = includeComposeTabsWithoutAgentSessions
             ? agentChatsSidebarRowsCache
             : sidebarSessionRowsCache
         if let cachedRows, cachedRows.key == cacheKey {
             return cachedRows.rows
+        }
+        // Owner pending (§5.3): no outgoing rows and no target rows until the owner installs.
+        guard !restorePresentation.isOwnerPending else {
+            if includeComposeTabsWithoutAgentSessions {
+                agentChatsSidebarRowsCache = (cacheKey, [])
+            } else {
+                sidebarSessionRowsCache = (cacheKey, [])
+            }
+            return []
         }
 
         let currentIndex = ownerValidatedSessionIndex
@@ -493,8 +487,7 @@ extension AgentModeViewModel {
             authoritativeSessionIDByTabID: authoritativeSessionIDByTabID,
             sessionIndex: currentIndex,
             sessionListSortDates: ownerValidatedSessionListSortDates,
-            sessionListCacheReady: ownerValidatedSessionListCacheReady,
-            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
+            restoreBaseline: ownerValidatedSidebarRestoreBaseline,
             mcpControlledTabIDs: mcpControlledTabIDs,
             perfRecorder: perfRecorder
         ).build()
@@ -586,7 +579,8 @@ extension AgentModeViewModel {
             composeTabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: composeTabs),
             stashedTabSignatures: makeSessionSidebarStashedTabSignatures(for: stashedTabs),
             archivedSessionsExpanded: archivedSessionsExpanded,
-            showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
+            showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions,
+            restorePresentation: sidebarRestorePresentationKey
         )
         if let cached = sidebarListProjectionCache, cached.key == key {
             return cached.projection
@@ -620,8 +614,9 @@ extension AgentModeViewModel {
             currentTabID: currentTabID,
             visibleSessionCount: effectiveVisibleSessionCount
         )
+        // Owner pending exposes no archived rows, headings or navigation targets either (§5.3).
         let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
-            stashedTabs,
+            key.restorePresentation.isOwnerPending ? [] : stashedTabs,
             searchText: sidebarSnapshot.searchText,
             prepareSortedRows: archivedSessionsExpanded
         )
@@ -637,6 +632,7 @@ extension AgentModeViewModel {
         assert(Set(renderedSelectionOrder).count == renderedSelectionOrder.count)
         let projection = SidebarListProjection(
             workspaceID: workspaceID,
+            isOwnerPending: key.restorePresentation.isOwnerPending,
             filteredSessions: filteredSessions,
             pagedSessions: pagedSessions,
             effectiveVisibleSessionCount: effectiveVisibleSessionCount,
@@ -804,6 +800,20 @@ extension AgentModeViewModel {
         return result
     }
 
+    /// Stored collapsed keys plus currently eligible default-collapse keys not yet handled (§5.6). The
+    /// first released projection is therefore already collapsed; the view's later seeding task only
+    /// persists the handled set and cannot move rows, paging or sections.
+    func effectiveCollapsedSidebarThreadKeys(
+        in rows: [SidebarSession],
+        searchText: String
+    ) -> Set<AgentSidebarThreadKey> {
+        let snapshot = ui.sessionSidebar.snapshot
+        let pendingDefaults = defaultCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
+            .filter { !snapshot.defaultCollapsedThreadKeysHandled.contains($0) }
+        guard !pendingDefaults.isEmpty else { return snapshot.collapsedThreadKeys }
+        return snapshot.collapsedThreadKeys.union(pendingDefaults)
+    }
+
     private func sidebarRowsApplyingThreadCollapse(
         _ rows: [SidebarSession],
         currentTabID: UUID?,
@@ -815,7 +825,7 @@ extension AgentModeViewModel {
         #endif
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
-        let collapsedThreadKeys = ui.sessionSidebar.snapshot.collapsedThreadKeys
+        let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
         guard !rows.isEmpty else {
             #if DEBUG
                 perfRecorder.durationEvent(
@@ -1025,6 +1035,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: hiddenThreadDescendantCount,
             hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
             threadActivityDate: threadActivityDate,
+            restorationDateBucket: row.restorationDateBucket,
             searchFieldSource: row.searchFieldSource
         )
     }
@@ -1212,45 +1223,6 @@ extension AgentModeViewModel {
         let offset = forward ? 1 : -1
         let nextRootOrdinal = (currentRootOrdinal + offset + rootIndices.count) % rootIndices.count
         return rows[rootIndices[nextRootOrdinal]].tabID
-    }
-
-    /// Deterministic ordering for the Agent Mode tab sidebar fallback.
-    func sortTabsForSessionSidebar(_ tabs: [ComposeTabState]) -> [ComposeTabState] {
-        let sortDates = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, sessionListSortDate(for: $0.id)) })
-        let originalOrder = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($1.id, $0) })
-        let useFrozenRestoreOrder = shouldFreezeSidebarOrdering(for: tabs)
-        let baseSortedTabs = tabs.sorted { lhs, rhs in
-            let lhsIndex = originalOrder[lhs.id] ?? .max
-            let rhsIndex = originalOrder[rhs.id] ?? .max
-            if useFrozenRestoreOrder {
-                let lhsFrozenIndex = frozenSidebarOrderIndex(for: lhs.id, fallback: lhsIndex)
-                let rhsFrozenIndex = frozenSidebarOrderIndex(for: rhs.id, fallback: rhsIndex)
-                if lhsFrozenIndex != rhsFrozenIndex {
-                    return lhsFrozenIndex < rhsFrozenIndex
-                }
-            }
-
-            let lhsDate = sortDates[lhs.id] ?? nil
-            let rhsDate = sortDates[rhs.id] ?? nil
-            switch (lhsDate, rhsDate) {
-            case let (lhsDate?, rhsDate?):
-                if lhsDate != rhsDate {
-                    return lhsDate > rhsDate
-                }
-            case (.some, .none):
-                return true
-            case (.none, .some):
-                return false
-            case (.none, .none):
-                break
-            }
-
-            if lhsIndex != rhsIndex {
-                return lhsIndex < rhsIndex
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-        return prefixedPinnedTabs(baseSortedTabs)
     }
 
     func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {

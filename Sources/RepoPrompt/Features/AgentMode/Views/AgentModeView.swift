@@ -1555,10 +1555,6 @@ struct AgentModeChatDetailView: View {
         transcriptPresentation.isCompressedHistoryRevealed && canRevealCompressedHistory
     }
 
-    private var hasTranscriptContent: Bool {
-        !transcriptPresentation.visibleRows.isEmpty || transcriptPresentation.archivedHistoryState.hasArchivedHistory
-    }
-
     private var dynamicSummaryLockTargetTurnID: UUID? {
         transcriptPresentation.metadata.dynamicSummaryLockTargetTurnID
     }
@@ -2384,7 +2380,7 @@ struct AgentModeChatDetailView: View {
             .frame(
                 maxWidth: .infinity,
                 minHeight: viewportHeight,
-                alignment: hasTranscriptContent ? .topLeading : .center
+                alignment: transcriptSnapshot.panePresentation == .transcript ? .topLeading : .center
             )
         #if DEBUG
             .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
@@ -2406,10 +2402,27 @@ struct AgentModeChatDetailView: View {
         if shouldShowStreamingHistoryIndicator {
             streamingHistoryIndicator
         }
-        if !hasTranscriptContent {
-            emptyStateView
-        } else {
+        switch transcriptSnapshot.panePresentation {
+        case .transcript:
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
+        case .welcome:
+            emptyStateView
+        case .restoring:
+            restoringPaneView
+        case let .unavailable(reason, retry):
+            unavailablePaneView(reason: reason, retry: retry)
+        case .runningOrWaiting:
+            // The existing run indicator and interaction cards below present current run facts; show
+            // fallback copy only when neither is visible.
+            if let fallback = AgentTranscriptPanePresentation.runningOrWaitingFallback(
+                isWaitingForInput: isRunWaitingForInput,
+                isRunIndicatorVisible: shouldShowRunningIndicator,
+                isInteractionCardVisible: hasVisibleRunInteractionCard
+            ) {
+                Text(fallback)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
         }
         runningIndicatorSlot
         if let request = runInteractionSnapshot.pendingCodexHookReview {
@@ -3315,6 +3328,26 @@ struct AgentModeChatDetailView: View {
 
     private var shouldShowRunningIndicator: Bool {
         runInteractionSnapshot.isAgentBusy && runInteractionSnapshot.runState == .running
+    }
+
+    private var isRunWaitingForInput: Bool {
+        switch runInteractionSnapshot.runState {
+        case .waitingForUser, .waitingForQuestion, .waitingForApproval: true
+        default: false
+        }
+    }
+
+    /// Mirrors the interaction-card chain in `messageRowsContent`.
+    private var hasVisibleRunInteractionCard: Bool {
+        let snapshot = runInteractionSnapshot
+        return snapshot.pendingCodexHookReview != nil
+            || snapshot.pendingApplyEditsReview != nil
+            || snapshot.pendingWorktreeMergeReview != nil
+            || snapshot.pendingApproval != nil
+            || snapshot.pendingMCPElicitationRequest != nil
+            || snapshot.pendingUserInputRequest != nil
+            || snapshot.pendingAskUser != nil
+            || snapshot.activeWorktreeMergeConflict != nil
     }
 
     private var runningIndicatorSlot: some View {
@@ -5940,6 +5973,34 @@ struct AgentModeChatDetailView: View {
                 description: "Ask for changes like \"change the oracle model\" or \"switch to dark mode\" — the agent can update RepoPrompt's settings without leaving the chat."
             )
         ]
+    }
+
+    private var restoringPaneView: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Restoring conversation…")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func unavailablePaneView(
+        reason: AgentTranscriptPanePresentation.UnavailableReason,
+        retry: AgentTranscriptRetryTarget?
+    ) -> some View {
+        VStack(spacing: 10) {
+            Text(reason.message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            if let retry {
+                Button("Retry") {
+                    _ = agentModeVM.retryTranscriptRestoration(retry)
+                }
+            }
+        }
     }
 
     private var emptyStateView: some View {

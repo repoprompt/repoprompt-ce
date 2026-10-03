@@ -1005,3 +1005,19 @@ then passed all 36 cases, including the timed-out case. The final full
 2 skipped, 0 failures, plus the other test products; 11m 6s execution.
 These timings are post-move observations only, not a before/after performance
 claim.
+
+## #1112 restoration-presentation test ownership exception — 2026-10-02
+
+Atila approved one increase of `tests_testable_import_app_files`, from 333 to
+334, for exactly
+`Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift`.
+It owns the classifier, persisted-restoration lifecycle, and snapshot-publication
+suites for one cohesive restoration-presentation contract. The nearest existing
+transcript-policy tests own repaint/remount behavior; appending the new contract
+there solely to satisfy the file count would harm ownership and navigation.
+Existing title and sidebar suites remain in their owning test files.
+
+This exception does not raise the app-source line baseline or its 2,000-line
+headroom, change other ratchets, or authorize wider production visibility.
+The approval was relayed by Atila's delegated #1112 overseer during implementation.
+Guardrails must still pass on the integrated change.

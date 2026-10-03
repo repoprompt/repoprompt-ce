@@ -605,6 +605,7 @@ extension AgentSessionDataService {
                         loadDurationMS = restorePerfRecorder.elapsedMS(since: loadStartMS)
                     }
                     logPrepare(outcome: "missingSession")
+                    try await runAfterHydrationPrepareHookForTesting(sessionID: request.sessionID)
                 #endif
                 return nil
             }
@@ -704,6 +705,7 @@ extension AgentSessionDataService {
                     needsReloadMigrationSave: needsReloadMigrationSave,
                     frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
                 )
+                try await runAfterHydrationPrepareHookForTesting(sessionID: request.sessionID)
             #endif
             return AgentSessionHydrationPayload(
                 sessionID: request.sessionID,

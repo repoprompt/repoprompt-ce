@@ -536,9 +536,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionIndexStore.sessionIndexOwner
     }
 
-    /// Frozen sidebar restore order. Owned by `sessionIndexStore`.
-    var sidebarRestoreFrozenOrderByTabID: [UUID: Int] {
-        sessionIndexStore.sidebarRestoreFrozenOrderByTabID
+    /// Sidebar restoration baseline. Owned by `sessionIndexStore`.
+    var sidebarRestoreBaseline: AgentSidebarRestoreBaseline? {
+        sessionIndexStore.sidebarRestoreBaseline
     }
 
     static let sessionSidebarPageSize = 15
@@ -938,6 +938,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// revisions when sidebar-visible content has not changed. Nil before the
     /// first forced refresh so the initial request always publishes.
     var lastSidebarContentFingerprint: AgentSessionSidebarContentFingerprint?
+    /// Last owner-pending state propagated from the pane publication point to the sidebar.
+    var lastPublishedSidebarOwnerPending = false
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
@@ -960,6 +962,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
+        private var test_suppressesAgentSessionPersistenceOverride: Bool?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
         var test_sidebarSessionRowsBuildCount = 0
@@ -983,6 +986,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         private var test_afterProvisionalExistingTabBindingInstalled: (@MainActor () async -> Void)?
         private var test_afterDurableExplicitTabSessionBinding: (@MainActor () async -> Void)?
         var test_afterMCPControlActivation: (@MainActor (TabSession) async -> Void)?
+        /// Passive: runs synchronously in the real switch listener right after it queues the existing
+        /// `handleWorkspaceSwitch` task for `owner`.
+        var test_afterWorkspaceSwitchAdoptionQueued: (@MainActor (SessionIndexOwner) -> Void)?
+        /// Passive: runs synchronously when that queued adoption task finishes, on every exit.
+        var test_afterWorkspaceSwitchAdoptionCompleted: (@MainActor (SessionIndexOwner) -> Void)?
+        /// Passive: runs synchronously when `onTabChanged`'s spawned activation task finishes, on every exit.
+        var test_afterTabActivationContinuation: (@MainActor (UUID, Int) -> Void)?
         var test_beforeMCPSelectionCommit: (@MainActor () async -> Void)?
         private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) async -> Void)?
         private var test_beforeAutomaticMCPSessionTargetDiscardRetry: (@MainActor () async -> Void)?
@@ -1154,6 +1164,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        /// Installs the real production observers for a fixture-attached prompt manager.
+        func test_setupObservers() {
+            setupObservers()
+        }
+
+        /// Fixture input for launch-configured persistence suppression; reset to nil after teardown drains.
+        func test_setSuppressesAgentSessionPersistence(_ value: Bool?) {
+            test_suppressesAgentSessionPersistenceOverride = value
+        }
+
+        /// Passive observation of the activation generation a tab change actually used.
+        var test_sessionActivationGeneration: Int {
+            sessionActivationGeneration
         }
 
         func test_setWorkspaceSwitchInFlight(_ isInFlight: Bool) {
@@ -1365,6 +1390,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             shouldAcceptSidebarIndexEntry(entry)
         }
 
+        /// Delivers the real index-batch resume synchronously (models a batch already queued ahead of
+        /// the activation continuation's first turn).
+        func test_resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: Set<UUID>) -> Bool {
+            resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: updatedTabIDs)
+        }
+
         func test_setSidebarIndexBuilders(
             prioritized: @escaping SidebarPrioritizedIndexBuilder,
             stream: @escaping SidebarIndexStreamBuilder
@@ -1390,7 +1421,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_waitForSessionListCacheRefresh() async {
-            while let task = sessionListCacheTask {
+            // Await each distinct refresh task actually published. A stale-owner completion keeps its
+            // finished handle, so stop once the current handle has already been awaited.
+            var awaited: Task<Void, Never>?
+            while let task = sessionListCacheTask, task != awaited {
+                awaited = task
                 await task.value
                 await Task.yield()
             }
@@ -1451,8 +1486,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ownerValidatedSessionListCacheReady
         }
 
-        var test_ownerValidatedSidebarRestoreFrozenOrderCount: Int {
-            ownerValidatedSidebarRestoreFrozenOrderByTabID.count
+        var test_ownerValidatedSidebarRestoreBaseline: AgentSidebarRestoreBaseline? {
+            ownerValidatedSidebarRestoreBaseline
+        }
+
+        var test_ownerValidatedSidebarRestoreJoin: AgentSidebarRestoreJoin? {
+            sessionIndexStore.ownerValidatedSidebarRestoreJoin
         }
 
         func test_installSessionIndexSnapshot(
@@ -3538,14 +3577,56 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             promptManager?.removeComposeTabsDidRemoveListener(token)
         }
 
+        // Early pane invalidation (§4.5): record each emitted active workspace ID (delivered in willSet)
+        // and resynchronize; never installs an owner or starts a load.
+        workspaceManager?.$activeWorkspaceID
+            .sink { [weak self] emittedWorkspaceID in
+                guard let self else { return }
+                emittedActiveWorkspace = .init(
+                    workspaceID: emittedWorkspaceID,
+                    duringSwitch: workspaceManager?.isSwitchingWorkspace == true,
+                    switchOperationID: workspaceManager?.activeWorkspaceSwitch?.operationID
+                )
+                if !isActiveUISyncSuppressed {
+                    syncTranscriptUIState()
+                }
+            }
+            .store(in: &cancellables)
+        // Switch start/finish re-evaluates awaiting targets (emitted value; the flag is not re-read).
+        workspaceManager?.$activeWorkspaceSwitch
+            .sink { [weak self] activity in
+                guard let self else { return }
+                activeSwitchOperationID = activity?.operationID
+                if !isActiveUISyncSuppressed {
+                    syncTranscriptUIState()
+                }
+                if activity == nil {
+                    // A deferral declined while the switch held the owner non-current settles now.
+                    settleDeclinedSystemDeferralJoin()
+                    // Re-evaluate again after the manager finishes the switch operation (§3/§4.5).
+                    Task { @MainActor [weak self] in
+                        guard let self, !isActiveUISyncSuppressed else { return }
+                        syncTranscriptUIState()
+                    }
+                }
+            }
+            .store(in: &cancellables)
+
         // Observe workspace changes
         listeners.addToken(
             workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
                 guard let self else { return }
                 let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
+                queuedWorkspaceSwitchOwner = owner
                 Task { @MainActor in
+                    #if DEBUG
+                        defer { self.test_afterWorkspaceSwitchAdoptionCompleted?(owner) }
+                    #endif
                     await self.handleWorkspaceSwitch(workspace, owner: owner)
                 }
+                #if DEBUG
+                    test_afterWorkspaceSwitchAdoptionQueued?(owner)
+                #endif
             }
         ) { [weak workspaceManager] token in
             workspaceManager?.removeWorkspaceDidSwitchListener(token)
@@ -4256,6 +4337,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               let workspace = workspaceManager?.activeWorkspace,
               workspace.isSystemWorkspace
         else {
+            settleDeclinedSystemDeferralJoin()
             return
         }
         guard let owner = sessionIndexOwner,
@@ -4265,6 +4347,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         sessionIndexStore.setSessionListCacheReady(false, for: owner)
         refreshSessionListCache(for: workspace, owner: owner)
+    }
+
+    /// A cleared System deferral that starts no refresh must not leave a join pending on it (§5.5):
+    /// a scheduled switch/adoption replaces the owner, Agent Mode off retains deferred-inactive, and
+    /// otherwise the abandoned deferral settles with the existing skip policy (empty base, ready).
+    private func settleDeclinedSystemDeferralJoin() {
+        // An in-flight switch is not relied on to settle it: an aborted switch keeps this owner, and a
+        // completed one installs a successor that discards this join anyway.
+        guard initialSystemWorkspaceSessionListRefreshDeferralReason == nil,
+              let owner = currentPaneOwner,
+              let join = sessionIndexStore.ownerValidatedSidebarRestoreJoin,
+              join.index == .deferred(.initialSystemDeferral)
+        else { return }
+        if !isAgentModeActive {
+            sessionIndexStore.deferSidebarRestoreIndex(.agentModeInactive, owner: owner)
+            return
+        }
+        sessionIndexStore.recordSidebarRestoreIndexTerminal(
+            generation: nil,
+            owner: owner,
+            outcome: .skipped,
+            entries: [:],
+            ready: true
+        )
     }
 
     func toggleContextComposerIfActive() {
@@ -4291,7 +4397,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             claudeCoordinator.stop()
             stopOpenCodeModelsSubscription()
             stopCursorModelsSubscription()
-            cancelSessionIndexRefresh(releaseFrozenOrder: true)
+            let cancelledOwner = activeSessionIndexRefreshToken?.owner
+            cancelSessionIndexRefresh()
+            // Not a terminal cancellation: keep the baseline/join deferred-inactive until the same owner
+            // reactivates or tears down; the selected side settles not-presented (§5.5).
+            if let owner = cancelledOwner ?? currentPaneOwner {
+                sessionIndexStore.deferSidebarRestoreIndex(.agentModeInactive, owner: owner)
+                // Selected hydration is intentionally deferred; never force a load for sidebar release.
+                recordSidebarRestoreSelected(.settled(.notPresented), owner: owner)
+            }
             return
         }
         lastProcessedTabID = nil
@@ -4339,6 +4453,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func prepareForWindowClose() async {
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
@@ -4347,7 +4462,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
         workspaceSwitchProvider.cancelAllBackgroundCleanup()
-        cancelSessionIndexRefresh(releaseFrozenOrder: true)
+        cancelSessionIndexRefresh()
+        // Teardown drops the ephemeral restoration join/baseline; nothing publishes into a successor.
+        sessionIndexStore.abandonSidebarRestore(owner: nil)
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
@@ -4357,6 +4474,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
         }
+        // Window teardown drops ephemeral presentation state; late producers find no current attempt.
+        transcriptPresentationRecordsByTabID.removeAll()
+        persistedLoadAttemptByTabID.removeAll()
+        persistedLoadProducerByTabID.removeAll()
+        liveActivationContinuation = nil
+        activeTranscriptPresentationScope = nil
         codexCoordinator.stop()
         claudeCoordinator.stop()
         await applyEditsApprovalStore.cleanupWindowScopes(
@@ -4449,8 +4572,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // MARK: - Tab Management
 
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
+        // An actual duplicate of the complete target with live work joins it; it never advances the
+        // generation and abandons that work's continuation (§4.5).
+        if let tabID, isDuplicateActivationOfLiveTarget(tabID) {
+            return
+        }
         sessionActivationGeneration &+= 1
         let activationGeneration = sessionActivationGeneration
+        noteSidebarRestoreSelection(tabID)
         let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
         // Opening a session is the canonical "I've seen it" interaction —
         // clear any unseen-run-state badge the sidebar had queued for it.
@@ -4509,16 +4638,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
 
+        // Newer local content left by a cancelled load owns the scope: re-present it and never
+        // automatically retry disk over it (§4.3/§4.5).
+        if retainsCancelledLocalDrift(session) {
+            workspaceSwitchInFlight = false
+            activeSessionLoadInProgressTabID = nil
+            publishRetainedLocalProjection(session, refresh: false)
+            return
+        }
+
         activeSessionLoadInProgressTabID = tabID
         publishLoadingTranscriptPresentation(tabID: tabID)
         applySessionToBindings(session)
+        liveActivationContinuation = (tabID, activationGeneration)
         Task { [weak self] in
             guard let self else { return }
+            defer {
+                if liveActivationContinuation?.tabID == tabID,
+                   liveActivationContinuation?.generation == activationGeneration
+                {
+                    liveActivationContinuation = nil
+                }
+            }
+            #if DEBUG
+                defer { test_afterTabActivationContinuation?(tabID, activationGeneration) }
+            #endif
             await loadSessionFromDisk(for: session)
             guard sessionActivationGeneration == activationGeneration else { return }
             guard currentTabID == tabID else { return }
             guard sessions[tabID] === session else { return }
             workspaceSwitchInFlight = false
+            // A cancelled load whose newer local content owns the scope keeps that projection instead
+            // of the strict loading frame (§4.3).
+            if retainsCancelledLocalDrift(session) {
+                activeSessionLoadInProgressTabID = nil
+                publishRetainedLocalProjection(session, refresh: false)
+                return
+            }
             applySessionToBindings(session)
             activeSessionLoadInProgressTabID = nil
             if session.selectedAgent == .codexExec, session.runState.isActive {
@@ -4604,9 +4760,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         newSession.onSourceItemsChanged = { [weak self] session, mutation in
             guard let self else { return }
-            if mutation.touchesUserItem {
-                invalidateSidebarRestoreOrdering()
-            }
+            // `.structural`/`.replaceAll` can be non-user replacements, so source mutations never
+            // release the restoration baseline (§5.4); covered rows keep their captured position.
             // Source items are the canonical mutable session data. Schedule
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
@@ -4639,7 +4794,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func persistRunStateTransitionIfNeeded(for session: TabSession) {
-        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else { return }
+        guard !suppressesAgentSessionPersistence else { return }
         guard session.hasLoadedPersistedState else { return }
         guard !isRestoringState else { return }
         switch session.runState {
@@ -4884,6 +5039,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
         seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
         sessions[tabID] = newSession
+        // Creation provenance (§4.2): materializing an explicit existing binding starts saved; deliberately
+        // creating an unbound session starts fresh. Only for a real current scope; never mints an owner.
+        if let scope = transcriptPresentationScope(for: newSession) {
+            transcriptPresentationRecordsByTabID[tabID] = explicitSessionID == nil
+                ? .init(scope: scope, origin: .fresh, phase: .settledLocal)
+                : .init(scope: scope, origin: .saved, phase: .notStarted)
+            if tabID == currentTabID, !isActiveUISyncSuppressed {
+                syncTranscriptUIState()
+            }
+        }
         ensureApplyEditsApprovalSessionSync(for: newSession)
         return newSession
     }
@@ -4948,6 +5113,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func markSessionAsFreshlyCreated(_ session: TabSession) {
         cancelPersistedLoad(for: session)
+        // Fresh provenance is established by this creation transaction itself (§4.2). Only the live
+        // session object may touch its tab's ephemeral records; a stale object never does.
+        let isLiveSession = sessions[session.tabID] === session
+        if isLiveSession {
+            persistedLoadAttemptByTabID.removeValue(forKey: session.tabID)
+            if let scope = transcriptPresentationScope(for: session) {
+                transcriptPresentationRecordsByTabID[session.tabID] = .init(scope: scope, origin: .fresh, phase: .settledLocal)
+            } else {
+                transcriptPresentationRecordsByTabID.removeValue(forKey: session.tabID)
+            }
+        }
+        defer {
+            if isLiveSession { syncTranscriptUIState() }
+        }
         session.hasLoadedPersistedState = true
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
@@ -5084,15 +5263,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let workspace = currentWorkspaceSnapshot(for: token.owner)
             ?? activeSessionIndexRefreshWorkspace
-        cancelSessionIndexRefresh(releaseFrozenOrder: false, owner: token.owner)
+        cancelSessionIndexRefresh()
         sessionIndexStore.setSessionListCacheReady(false, for: token.owner)
         guard let workspace,
               workspace.id == token.owner.workspaceID,
               sessionIndexStore.isOwnerCurrent(token.owner)
         else {
-            sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
+            // Mismatched owner/workspace abandons the old transaction (§5.5).
+            sessionIndexStore.abandonSidebarRestore(owner: token.owner)
             return
         }
+        // Same-owner restart is a replacement: the join transfers to the new token.
         refreshSessionListCache(for: workspace, owner: token.owner)
     }
 
@@ -5158,6 +5339,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
         }
         session.installPersistentSessionBinding(binding)
+        // The previous incarnation's presentation evidence never describes the new scope (§4.1/§4.2).
+        if sessions[session.tabID] === session {
+            transcriptPresentationRecordsByTabID.removeValue(forKey: session.tabID)
+            persistedLoadAttemptByTabID.removeValue(forKey: session.tabID)
+            if !isActiveUISyncSuppressed {
+                syncTranscriptUIState()
+            }
+        }
         handleSidebarRefreshBindingMutation(
             tabID: session.tabID,
             sessionID: sessionID
@@ -5246,11 +5435,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return existing
         }
         let created = UUID()
-        return installPersistentSessionBindingUpdatingInferredWorkspace(
-            sessionID: created,
-            on: session,
-            invalidateAsyncWork: true
-        )?.sessionID
+        // First-binding allocation preserves an explicitly established fresh origin of this live scope
+        // (§4.2); it never infers freshness from absence. One non-suspending transaction, one sync.
+        let isFreshBeforeAllocation: Bool = {
+            guard sessions[session.tabID] === session,
+                  let scope = transcriptPresentationScope(for: session),
+                  let record = transcriptPresentationRecordsByTabID[session.tabID]
+            else { return false }
+            return record.scope == scope && record.origin == .fresh
+        }()
+        let binding = withActiveUISyncSuppressed {
+            let binding = installPersistentSessionBindingUpdatingInferredWorkspace(
+                sessionID: created,
+                on: session,
+                invalidateAsyncWork: true
+            )
+            if isFreshBeforeAllocation, binding?.sessionID == created, sessions[session.tabID] === session,
+               let scope = transcriptPresentationScope(for: session)
+            {
+                transcriptPresentationRecordsByTabID[session.tabID] = .init(scope: scope, origin: .fresh, phase: .settledLocal)
+            }
+            return binding
+        }
+        syncTranscriptUIState()
+        return binding?.sessionID
     }
 
     private func makePersistentBindingResolutionSnapshot() -> PersistentBindingResolutionSnapshot {
@@ -5537,7 +5745,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return binding
     }
 
-    private func loadSessionFromDisk(for session: TabSession) async {
+    private func loadSessionFromDisk(
+        for session: TabSession,
+        admittedAttempt: AgentPersistedLoadAttempt? = nil
+    ) async {
         #if DEBUG
             let loadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let debugTabID = session.tabID
@@ -5571,26 +5782,74 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             return
         }
-        let startRevision = session.sourceItemsRevision
-        let expectedBinding = session.persistentSessionBindingIdentity
-        let expectedSessionID = expectedBinding?.sessionID
-        let hydrationToken = expectedSessionID.map {
-            PersistedHydrationCommitToken(
-                transition: session.persistentBindingTransitionToken(),
-                requestedSessionID: $0
-            )
+        // The current attempt's cancelled producer is still unwinding and will settle its own scope;
+        // never mint an automatic successor for the same scope meanwhile (§4.3/§4.5).
+        if isCurrentAttemptProducerUnwinding(session) {
+            #if DEBUG
+                logLoadTask(outcome: "currentAttemptUnwinding")
+            #endif
+            return
         }
-        let persistedLoadTask = Task { [weak self] in
+        // A fully current cancelled saved outcome is retried only explicitly (§4.3); automatic loaders
+        // never reload it, and never overwrite newer local content.
+        if admittedAttempt == nil, isCurrentCancelledSavedOutcome(session) {
+            #if DEBUG
+                logLoadTask(outcome: "currentCancelledOutcome")
+            #endif
+            return
+        }
+        let startRevision: Int
+        let hydrationToken: PersistedHydrationCommitToken?
+        let loadAttempt: AgentPersistedLoadAttempt?
+        if let admittedAttempt {
+            // Explicit Retry pre-admitted this attempt; adopt it (never mint twice) while still current.
+            guard persistedLoadAttemptByTabID[session.tabID] == admittedAttempt,
+                  case let .loading(recordAttempt)? = transcriptPresentationRecordsByTabID[session.tabID]?.phase,
+                  recordAttempt == admittedAttempt,
+                  admittedAttempt.scope == transcriptPresentationScope(for: session),
+                  let commitToken = admittedAttempt.commitToken
+            else { return }
+            startRevision = admittedAttempt.sourceItemsRevision
+            hydrationToken = commitToken
+            loadAttempt = admittedAttempt
+        } else {
+            startRevision = session.sourceItemsRevision
+            hydrationToken = session.persistentSessionBindingIdentity.map {
+                PersistedHydrationCommitToken(
+                    transition: session.persistentBindingTransitionToken(),
+                    requestedSessionID: $0.sessionID
+                )
+            }
+            loadAttempt = hydrationToken.flatMap {
+                admitSavedLoadAttempt(for: session, commitToken: $0, sourceItemsRevision: startRevision)
+            }
+        }
+        let expectedSessionID = hydrationToken?.requestedSessionID
+        let persistedLoadTask = Task { [weak self, loadAttempt] in
             guard let self else { return }
             await performPersistedSessionLoad(
                 for: session,
                 hydrationToken: hydrationToken,
-                startRevision: startRevision
+                startRevision: startRevision,
+                attempt: loadAttempt
             )
         }
         session.persistedLoadTask = persistedLoadTask
+        if let loadAttempt,
+           sessions[session.tabID] === session,
+           persistedLoadAttemptByTabID[session.tabID] == loadAttempt,
+           loadAttempt.scope == transcriptPresentationScope(for: session)
+        {
+            persistedLoadProducerByTabID[session.tabID] = .init(attempt: loadAttempt, task: persistedLoadTask)
+        }
         defer {
-            session.persistedLoadTask = nil
+            // Attempt-owned cleanup: never clear a successor's task or producer entry (§4.3).
+            if session.persistedLoadTask == persistedLoadTask {
+                session.persistedLoadTask = nil
+            }
+            if persistedLoadProducerByTabID[session.tabID]?.task == persistedLoadTask {
+                persistedLoadProducerByTabID.removeValue(forKey: session.tabID)
+            }
         }
         Self.logCodexDebug(
             "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil")"
@@ -5599,6 +5858,493 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             logLoadTask(outcome: "createdTaskComplete")
         #endif
+    }
+
+    // MARK: - Transcript restoration presentation (§4.1)
+
+    /// Presentation-only lifecycle records, validated by full scope on every read.
+    private(set) var transcriptPresentationRecordsByTabID: [UUID: AgentSessionPresentationRecord] = [:]
+    /// The latest admitted persisted-load attempt per tab.
+    private(set) var persistedLoadAttemptByTabID: [UUID: AgentPersistedLoadAttempt] = [:]
+
+    /// Observation of the existing loader task paired with the attempt admitted alongside it.
+    private struct PersistedLoadProducer {
+        let attempt: AgentPersistedLoadAttempt
+        let task: Task<Void, Never>
+    }
+
+    private var persistedLoadProducerByTabID: [UUID: PersistedLoadProducer] = [:]
+
+    /// The presentation scope whose committed projection `activeTranscriptPresentation` currently
+    /// holds; attached at each publish boundary, never re-derived from the selected session (§4.1).
+    private var activeTranscriptPresentationScope: AgentSessionPresentationScope?
+
+    /// The presentation holds committed content of a scope other than `target`'s.
+    func activeTranscriptContentScopeMismatches(_ target: AgentTranscriptPaneTarget) -> Bool {
+        guard let contentScope = activeTranscriptPresentationScope else { return false }
+        return contentScope != target.scope
+    }
+
+    /// The most recent active workspace ID emission observed from the workspace manager.
+    private struct ActiveWorkspaceEmission {
+        let workspaceID: UUID?
+        /// Emitted while the manager was switching workspaces.
+        let duringSwitch: Bool
+        /// The workspace switch operation the ID was emitted inside, if any.
+        let switchOperationID: UUID?
+    }
+
+    /// The workspace switch operation currently in flight, as last emitted by the manager.
+    private var activeSwitchOperationID: UUID?
+
+    /// An emitted workspace still expects owner adoption: its own switch is in flight, or a real
+    /// listener queued adoption for it.
+    private func expectsOwnerAdoption(_ emission: ActiveWorkspaceEmission) -> Bool {
+        if emission.duringSwitch, let operationID = emission.switchOperationID, operationID == activeSwitchOperationID {
+            return true
+        }
+        return hasPendingOwnerAdoption(forWorkspaceID: emission.workspaceID)
+    }
+
+    /// Whether `workspaceID`'s model has a selected tab with an explicit saved binding.
+    private func workspaceHasSelectedSavedBinding(_ workspaceID: UUID) -> Bool {
+        guard let workspace = workspaceManager?.workspace(withID: workspaceID),
+              let selectedTabID = workspace.activeComposeTabID
+        else { return false }
+        return workspace.composeTabs.first { $0.id == selectedTabID }?.activeAgentSessionID != nil
+    }
+
+    private var emittedActiveWorkspace: ActiveWorkspaceEmission?
+
+    /// The existing activation task spawned by `onTabChanged` that has not finished (observation only).
+    private var liveActivationContinuation: (tabID: UUID, generation: Int)?
+
+    /// The requested tab already has a current live activation continuation whose live loader task owns
+    /// an attempt admitted for the complete current scope (owner, tab, object, binding incarnation,
+    /// transition). Such a re-entry joins that work instead of abandoning it.
+    private func isDuplicateActivationOfLiveTarget(_ tabID: UUID) -> Bool {
+        guard isAgentModeActive,
+              let continuation = liveActivationContinuation,
+              continuation.tabID == tabID,
+              continuation.generation == sessionActivationGeneration,
+              let session = sessions[tabID]
+        else { return false }
+        // The current continuation has not taken its first turn yet: it will start this target's load,
+        // so a resume queued ahead of it joins rather than abandoning it (§4.5).
+        guard session.persistedLoadTask != nil || session.hasLoadedPersistedState
+            || persistedLoadProducerByTabID[tabID] != nil
+        else { return true }
+        guard let liveTask = session.persistedLoadTask,
+              let producer = persistedLoadProducerByTabID[tabID],
+              producer.task == liveTask,
+              !liveTask.isCancelled,
+              persistedLoadAttemptByTabID[tabID] == producer.attempt
+        else { return false }
+        return producer.attempt.scope == transcriptPresentationScope(for: session)
+    }
+
+    /// The current attempt's own producer was cancelled for this same live scope and has not
+    /// finished unwinding.
+    private func isCurrentAttemptProducerUnwinding(_ session: TabSession) -> Bool {
+        guard let producer = persistedLoadProducerByTabID[session.tabID],
+              producer.task.isCancelled,
+              sessions[session.tabID] === session,
+              persistedLoadAttemptByTabID[session.tabID] == producer.attempt,
+              let record = transcriptPresentationRecordsByTabID[session.tabID],
+              record.scope == producer.attempt.scope,
+              case let .loading(recordAttempt) = record.phase,
+              recordAttempt == producer.attempt
+        else { return false }
+        return producer.attempt.scope == transcriptPresentationScope(for: session)
+    }
+
+    /// Same current attempt (owner, session object, binding incarnation, transition) and only the
+    /// source revision moved. Disk application stays fenced by the strict transition check.
+    private func isSourceRevisionOnlyDrift(
+        _ token: PersistentBindingTransitionToken,
+        session: TabSession,
+        attempt: AgentPersistedLoadAttempt?
+    ) -> Bool {
+        guard let attempt,
+              token.tabID == session.tabID,
+              sessions[token.tabID] === session,
+              persistedLoadAttemptByTabID[session.tabID] == attempt,
+              attempt.scope == transcriptPresentationScope(for: session),
+              ObjectIdentifier(session) == token.sessionIdentity,
+              session.persistentSessionBindingIdentity == token.binding,
+              session.bindingTransitionGeneration == token.transitionGeneration
+        else { return false }
+        return session.sourceItemsRevision != token.sourceItemsRevision
+    }
+
+    /// Existing source-superseded producer outcome: keep local items, record the existing proof and
+    /// latch, build/synchronize the current local projection, then settle presentation.
+    private func completeSourceSupersededLoad(_ session: TabSession, attempt: AgentPersistedLoadAttempt?) {
+        session.recordRestorationTerminal(.sourceRevisionSuperseded)
+        session.hasLoadedPersistedState = true
+        if session.tabID == currentTabID {
+            applySessionToBindings(session)
+        }
+        settlePersistedLoadAttempt(attempt, exit: .sourceRevisionSuperseded)
+    }
+
+    /// Explicit Retry of an unavailable saved restoration (§4.6). Admits a replacement attempt for
+    /// the existing loader atomically; never rebinds, clears, writes, or starts a provider.
+    func retryTranscriptRestoration(_ target: AgentTranscriptRetryTarget) -> AgentTranscriptRetryResult {
+        guard let tabID = target.target.tabID,
+              tabID == currentTabID,
+              let session = sessions[tabID],
+              // The full current pane target: owner kind, tab, activation generation and scope.
+              target.target == transcriptPaneInput(tabID: tabID, session: session).target,
+              let scope = transcriptPresentationScope(for: session),
+              let record = transcriptPresentationRecordsByTabID[tabID],
+              record.scope == scope,
+              record.origin == .saved,
+              let current = persistedLoadAttemptByTabID[tabID]
+        else { return .stale }
+        // Safety is revalidated before any deduplication or admission.
+        guard session.sourceItemsRevision == target.sourceItemsRevision,
+              !suppressesAgentSessionPersistence,
+              session.items.isEmpty,
+              session.archivedTranscriptSnapshot.blocks.isEmpty,
+              !session.runState.isActive,
+              !session.hasBindingBlockingInteraction,
+              let binding = session.persistentSessionBindingIdentity
+        else { return .notRetryable }
+        switch record.phase {
+        case let .loading(attempt) where attempt == current && attempt.retriedAttemptID == target.attemptID:
+            return .alreadyLoading
+        case let .settled(attempt, exit) where attempt == current && attempt.attemptID == target.attemptID:
+            guard exit == .missingPayload || exit == .loadFailed || exit == .cancelled else { return .notRetryable }
+        default:
+            return .stale
+        }
+        // Reset only the compatibility completion latch this admitted load needs.
+        session.hasLoadedPersistedState = false
+        let commitToken = PersistedHydrationCommitToken(
+            transition: session.persistentBindingTransitionToken(),
+            requestedSessionID: binding.sessionID
+        )
+        guard let replacement = admitSavedLoadAttempt(
+            for: session,
+            commitToken: commitToken,
+            sourceItemsRevision: session.sourceItemsRevision,
+            retriedAttemptID: target.attemptID
+        ) else { return .stale }
+        Task { [weak self] in
+            await self?.loadSessionFromDisk(for: session, admittedAttempt: replacement)
+        }
+        return .started
+    }
+
+    /// Admits a saved persisted-load attempt for the live session's current scope (§4.1/§4.3).
+    private func admitSavedLoadAttempt(
+        for session: TabSession,
+        commitToken: PersistedHydrationCommitToken,
+        sourceItemsRevision: Int,
+        retriedAttemptID: UUID? = nil
+    ) -> AgentPersistedLoadAttempt? {
+        guard sessions[session.tabID] === session, let scope = transcriptPresentationScope(for: session) else {
+            return nil
+        }
+        let attempt = AgentPersistedLoadAttempt(
+            scope: scope,
+            attemptID: UUID(),
+            sourceItemsRevision: sourceItemsRevision,
+            commitToken: commitToken,
+            retriedAttemptID: retriedAttemptID
+        )
+        persistedLoadAttemptByTabID[session.tabID] = attempt
+        transcriptPresentationRecordsByTabID[session.tabID] = .init(scope: scope, origin: .saved, phase: .loading(attempt))
+        syncTranscriptUIState()
+        return attempt
+    }
+
+    /// The live session's current saved attempt settled cancelled for its full current scope.
+    private func currentCancelledSavedAttempt(_ session: TabSession) -> AgentPersistedLoadAttempt? {
+        guard sessions[session.tabID] === session,
+              !session.hasLoadedPersistedState,
+              let record = transcriptPresentationRecordsByTabID[session.tabID],
+              record.origin == .saved,
+              case let .settled(attempt, .cancelled) = record.phase,
+              persistedLoadAttemptByTabID[session.tabID] == attempt,
+              record.scope == attempt.scope,
+              attempt.scope == transcriptPresentationScope(for: session)
+        else { return nil }
+        return attempt
+    }
+
+    private func isCurrentCancelledSavedOutcome(_ session: TabSession) -> Bool {
+        currentCancelledSavedAttempt(session) != nil
+    }
+
+    /// A cancelled saved load whose current scope has newer local source: local items own it.
+    private func retainsCancelledLocalDrift(_ session: TabSession) -> Bool {
+        guard let attempt = currentCancelledSavedAttempt(session) else { return false }
+        return session.sourceItemsRevision != attempt.sourceItemsRevision
+    }
+
+    /// Publishes the current local projection for a retained cancelled-drift scope, without latching
+    /// completion, recording proof or marking the binding hydrated. Revalidates synchronously right
+    /// before publication.
+    @discardableResult
+    private func publishRetainedLocalProjection(_ session: TabSession, refresh: Bool) -> Bool {
+        guard session.tabID == currentTabID,
+              retainsCancelledLocalDrift(session),
+              canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
+        else { return false }
+        if refresh {
+            refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+        }
+        guard retainsCancelledLocalDrift(session) else { return false }
+        return publishTranscriptPresentation(from: session)
+    }
+
+    /// Cancelled current attempt whose source changed: project current local items without latching
+    /// completion, recording proof or marking the binding hydrated, then settle `.cancelled`.
+    private func synchronizeCancelledLocalProjection(_ session: TabSession, attempt: AgentPersistedLoadAttempt?) {
+        if session.tabID == currentTabID,
+           canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
+        {
+            refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+            if let attempt, attempt.scope == transcriptPresentationScope(for: session) {
+                _ = publishTranscriptPresentation(from: session)
+            }
+        }
+        settlePersistedLoadAttempt(attempt, exit: .cancelled)
+    }
+
+    /// Records a terminal exit for `attempt` only while it is still the tab's current attempt and its
+    /// scope still describes the live session.
+    private func settlePersistedLoadAttempt(_ attempt: AgentPersistedLoadAttempt?, exit: AgentPersistedLoadExit) {
+        guard let attempt, persistedLoadAttemptByTabID[attempt.scope.tabID] == attempt,
+              let record = transcriptPresentationRecordsByTabID[attempt.scope.tabID],
+              record.scope == attempt.scope,
+              let liveSession = sessions[attempt.scope.tabID],
+              transcriptPresentationScope(for: liveSession) == attempt.scope
+        else { return }
+        transcriptPresentationRecordsByTabID[attempt.scope.tabID] = .init(
+            scope: record.scope,
+            origin: record.origin,
+            phase: .settled(attempt, exit)
+        )
+        syncTranscriptUIState()
+    }
+
+    /// Launch-configured session-persistence suppression; production reads the launch configuration.
+    private var suppressesAgentSessionPersistence: Bool {
+        #if DEBUG
+            if let test_suppressesAgentSessionPersistenceOverride {
+                return test_suppressesAgentSessionPersistenceOverride
+            }
+        #endif
+        return AppLaunchConfiguration.current.suppressesAgentSessionPersistence
+    }
+
+    /// Selected-tab restoration settlement for the sidebar baseline join (§5.5), from the same records
+    /// and exits the pane classifies.
+    func selectedRestorationSettlement() -> AgentSelectedRestorationSettlement {
+        let input = transcriptPaneInput(tabID: currentTabID, session: activeSession)
+        if case .owner = input.target.owner, input.target.tabID == nil {
+            return .settled(.noSelection)
+        }
+        if case .settledUnowned = input.target.owner {
+            return .settled(.workspaceUnavailable)
+        }
+        if let record = input.record, record.scope == input.target.scope, record.origin == .fresh {
+            return .settled(.fresh)
+        }
+        guard !input.isDiscoveryPending, case .owner = input.target.owner, let scope = input.target.scope else {
+            return .pending
+        }
+        guard let record = input.record, record.scope == scope else {
+            // Completed discovery with no saved binding and no load record: nothing to restore.
+            return scope.binding == nil && input.record == nil ? .settled(.unbound) : .pending
+        }
+        let projectionCommitted = input.content?.scope == scope
+        switch record.phase {
+        case .settledLocal:
+            // Local state owns the scope; settle after its projection is reclassified.
+            return projectionCommitted ? .settled(.localStateReclassified) : .pending
+        case let .settled(attempt, exit) where attempt.attemptID == input.currentAttemptID:
+            switch exit {
+            case .missingPayload: return .settled(.missing)
+            case .loadFailed: return .settled(.loadFailed)
+            case .cancelled: return .settled(.interrupted)
+            case .persistenceSuppressed: return .settled(.persistenceSuppressed)
+            case .workspaceUnavailable: return .settled(.workspaceUnavailable)
+            case .payloadApplied:
+                // Settled only once this scope's projection committed: the published content carries
+                // this exact scope (independent of display precedence).
+                return projectionCommitted ? .settled(.payloadApplied) : .pending
+            case .sourceRevisionSuperseded:
+                // Source supersession settles after the current local projection, not the discarded result.
+                return projectionCommitted ? .settled(.localStateReclassified) : .pending
+            }
+        default:
+            return .pending
+        }
+    }
+
+    /// Drives the sidebar join's selected side from the same pane facts (§5.5). Follows only the
+    /// initially selected restoration; explicit selection changes are settled by `onTabChanged`.
+    func synchronizeSidebarRestoreSelectedSide() {
+        // Inactive at installation is not a settlement: launch can install the owner before the Agent
+        // view activates, and the selected restoration then proceeds on activation. Only an explicit
+        // deactivation during the transaction settles not-presented (`setAgentModeActive(false)`).
+        guard isAgentModeActive,
+              let owner = currentPaneOwner,
+              let join = sessionIndexStore.ownerValidatedSidebarRestoreJoin,
+              !join.selected.isSettled
+        else { return }
+        let side: AgentSidebarRestoreJoin.SelectedSide = if currentTabID != join.initialTabID {
+            // During the switch the selection lags owner installation; afterwards a different
+            // selection is an explicit change and settles the initial barrier.
+            workspaceManager?.isSwitchingWorkspace == true ? .discovering : .settled(.selectionChanged)
+        } else if let boundID = activeSession?.activeAgentSessionID, boundID != join.initialBindingID,
+                  join.initialBindingID != nil || agentSessionLinkDiscoveryState.isComplete
+        {
+            // Same-tab rebind. Only a binding arriving while an initially unbound target's discovery
+            // is still pending is discovery (waits for its attempt); index entries never bind.
+            .settled(.bindingChanged)
+        } else {
+            switch selectedRestorationSettlement() {
+            case let .settled(reason): .settled(.restoration(reason))
+            case .pending: agentSessionLinkDiscoveryState.isComplete ? .waiting : .discovering
+            }
+        }
+        recordSidebarRestoreSelected(side, owner: owner)
+    }
+
+    /// An explicit selection of another tab settles the initial barrier as selection-changed; the new
+    /// target's pane restores independently and startup freezing is not extended.
+    func noteSidebarRestoreSelection(_ tabID: UUID?) {
+        guard let owner = currentPaneOwner,
+              let join = sessionIndexStore.ownerValidatedSidebarRestoreJoin,
+              !join.selected.isSettled,
+              tabID != join.initialTabID,
+              workspaceManager?.isSwitchingWorkspace != true
+        else { return }
+        recordSidebarRestoreSelected(.settled(.selectionChanged), owner: owner)
+    }
+
+    private func recordSidebarRestoreSelected(_ side: AgentSidebarRestoreJoin.SelectedSide, owner: SessionIndexOwner) {
+        #if DEBUG
+            let before = sessionIndexStore.ownerValidatedSidebarRestoreJoin?.selected
+        #endif
+        sessionIndexStore.recordSidebarRestoreSelected(side, owner: owner)
+        #if DEBUG
+            if before != side, before?.isSettled == false {
+                restorePerfRecorder.event(
+                    "sidebarRestore.selectedSide",
+                    fields: [
+                        "windowID": "\(windowID)",
+                        "activationEpoch": "\(owner.activationEpoch)",
+                        "side": String(describing: side),
+                        "released": "\(sessionIndexStore.sidebarRestoreBaseline == nil)"
+                    ]
+                )
+            }
+        #endif
+    }
+
+    /// Read-only fact for title/sidebar consumers: a real switch listener queued owner adoption for
+    /// `workspaceID` that has not been installed yet. Presentation qualification, never owner authority.
+    func hasPendingOwnerAdoption(forWorkspaceID workspaceID: UUID?) -> Bool {
+        guard let queued = queuedWorkspaceSwitchOwner,
+              queued.workspaceID == workspaceID,
+              sessionIndexStore.latestSessionIndexOwner == queued,
+              sessionIndexStore.sessionIndexOwner != queued
+        else { return false }
+        return activeWorkspaceIDForSessionIndexOwnership == workspaceID
+    }
+
+    /// Owner minted by the real switch listener whose existing adoption task has not finished.
+    private var queuedWorkspaceSwitchOwner: SessionIndexOwner?
+
+    private func clearQueuedWorkspaceSwitchOwner(_ owner: SessionIndexOwner) {
+        guard queuedWorkspaceSwitchOwner == owner else { return }
+        queuedWorkspaceSwitchOwner = nil
+        // Settling the queued adoption can settle an awaiting target; publish it (§4.5).
+        if !isActiveUISyncSuppressed {
+            syncTranscriptUIState()
+        }
+    }
+
+    /// Installed session-index owner that is still current (excludes a same-workspace old epoch).
+    var currentPaneOwner: SessionIndexOwner? {
+        guard let owner = sessionIndexOwner, sessionIndexStore.isOwnerCurrent(owner) else { return nil }
+        return owner
+    }
+
+    func transcriptPresentationScope(for session: TabSession) -> AgentSessionPresentationScope? {
+        guard let owner = currentPaneOwner else { return nil }
+        return AgentSessionPresentationScope(
+            owner: owner,
+            tabID: session.tabID,
+            sessionIdentity: ObjectIdentifier(session),
+            binding: session.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    /// Owner qualification shared by the pane target and the sidebar's owner-pending projection.
+    func transcriptPaneTargetOwner() -> AgentTranscriptPaneTarget.Owner {
+        let emitted = emittedActiveWorkspace
+        return if let owner = currentPaneOwner,
+                  emitted == nil || emitted?.workspaceID == owner.workspaceID
+        {
+            .owner(owner)
+        } else if let emitted, let workspaceID = emitted.workspaceID, !expectsOwnerAdoption(emitted) {
+            // Settled with no owner adoption pending (authority-only, finished or bailed switch).
+            .settledUnowned(workspaceID: workspaceID, hasSelectedSavedBinding: workspaceHasSelectedSavedBinding(workspaceID))
+        } else if let workspaceID = emitted.map(\.workspaceID) ?? workspaceManager?.activeWorkspaceID {
+            .awaitingOwner(workspaceID: workspaceID)
+        } else {
+            .noWorkspace
+        }
+    }
+
+    func transcriptPaneInput(tabID: UUID?, session: TabSession?) -> AgentTranscriptPanePresentation.Input {
+        let paneOwner = transcriptPaneTargetOwner()
+        // Only the resolved installed owner authorizes session evidence (scope, content, run, record);
+        // awaiting-owner, settled-unowned and no-workspace targets carry none (§4.5).
+        let authorizedOwner: SessionIndexOwner? = if case let .owner(owner) = paneOwner { owner } else { nil }
+        let scope = authorizedOwner.flatMap { owner in
+            session.flatMap(transcriptPresentationScope(for:)).flatMap { $0.owner == owner ? $0 : nil }
+        }
+        let targetWorkspaceID: UUID? = switch paneOwner {
+        case let .owner(owner): owner.workspaceID
+        case let .awaitingOwner(workspaceID): workspaceID
+        case .noWorkspace: nil
+        case let .settledUnowned(workspaceID, _): workspaceID
+        }
+        let discovery = agentSessionLinkDiscoveryState
+        let isDiscoveryPending = targetWorkspaceID != nil
+            && !discovery.isComplete
+            && discovery.epoch.workspaceID == targetWorkspaceID
+        let presentation = scopedActiveTranscriptPresentation(for: tabID)
+        let content = scope.flatMap { _ -> AgentTranscriptPaneContentFacts? in
+            guard presentation.tabID == tabID, let contentScope = activeTranscriptPresentationScope else { return nil }
+            return AgentTranscriptPaneContentFacts(
+                scope: contentScope,
+                hasUsableContent: !presentation.visibleRows.isEmpty || !presentation.workingRows.isEmpty,
+                hasArchivedHistory: !(session?.archivedTranscriptSnapshot.blocks.isEmpty ?? true)
+            )
+        }
+        return AgentTranscriptPanePresentation.Input(
+            target: AgentTranscriptPaneTarget(
+                owner: paneOwner,
+                tabID: tabID,
+                sessionActivationGeneration: sessionActivationGeneration,
+                scope: scope
+            ),
+            content: content,
+            liveRunScope: session.flatMap { $0.runState.isActive || $0.hasBindingBlockingInteraction ? scope : nil },
+            isDiscoveryPending: isDiscoveryPending,
+            currentAttemptID: authorizedOwner == nil ? nil : tabID.flatMap { persistedLoadAttemptByTabID[$0]?.attemptID },
+            record: authorizedOwner == nil ? nil : tabID.flatMap { transcriptPresentationRecordsByTabID[$0] }
+        )
     }
 
     private func isActivationTargetedPersistedHydration(for session: TabSession) -> Bool {
@@ -5625,7 +6371,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func performPersistedSessionLoad(
         for session: TabSession,
         hydrationToken: PersistedHydrationCommitToken?,
-        startRevision: Int
+        startRevision: Int,
+        attempt: AgentPersistedLoadAttempt? = nil
     ) async {
         let expectedSessionID = hydrationToken?.requestedSessionID
         #if DEBUG
@@ -5650,8 +6397,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 restorePerfRecorder.event("agentSessionHydration.perform", fields: fields)
             }
         #endif
-        if AppLaunchConfiguration.current.suppressesAgentSessionPersistence {
+        if suppressesAgentSessionPersistence {
             session.hasLoadedPersistedState = true
+            settlePersistedLoadAttempt(attempt, exit: .persistenceSuppressed)
             #if DEBUG
                 logPerform(outcome: "suppressedPersistence")
             #endif
@@ -5691,8 +6439,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             let preparedPayload = try await dataService.preparePersistedHydration(request)
             guard persistentBindingTransitionIsCurrent(hydrationToken.transition) else {
+                // A revision-only change on the same current attempt is the real source-superseded
+                // outcome (§4.3), not an obsolete owner; every other mismatch stays a silent drop.
+                if isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) {
+                    // Cancellation is checked before any latch/proof: a cancelled attempt only
+                    // reclassifies from the current local projection.
+                    if Task.isCancelled {
+                        synchronizeCancelledLocalProjection(session, attempt: attempt)
+                        #if DEBUG
+                            logPerform(outcome: "cancelledWithSourceDrift", currentRevision: session.sourceItemsRevision)
+                        #endif
+                        return
+                    }
+                    completeSourceSupersededLoad(session, attempt: attempt)
+                    #if DEBUG
+                        logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
+                    #endif
+                    return
+                }
                 #if DEBUG
                     logPerform(outcome: "staleAfterPrepare")
+                #endif
+                return
+            }
+            // Cancellation is interpreted before a nil payload: a cancelled attempt is never
+            // "missing", records no proof and does not newly latch completion (§4.3).
+            guard !Task.isCancelled else {
+                Self.logCodexDebug("[AgentModeVM][PersistedLoad] cancelled before hydrate tab=\(session.tabID)")
+                settlePersistedLoadAttempt(attempt, exit: .cancelled)
+                #if DEBUG
+                    logPerform(outcome: "cancelledBeforeHydrate")
                 #endif
                 return
             }
@@ -5707,6 +6483,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // "a payload actually loaded".
                 session.recordRestorationTerminal(.missingPayload)
                 session.hasLoadedPersistedState = true
+                settlePersistedLoadAttempt(attempt, exit: .missingPayload)
                 #if DEBUG
                     logPerform(outcome: "noPayload")
                 #endif
@@ -5717,13 +6494,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
                 }
             #endif
-            guard !Task.isCancelled else {
-                Self.logCodexDebug("[AgentModeVM][PersistedLoad] cancelled before hydrate tab=\(session.tabID)")
-                #if DEBUG
-                    logPerform(outcome: "cancelledBeforeHydrate")
-                #endif
-                return
-            }
             guard sessions[session.tabID] === session else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] skip stale owner tab=\(session.tabID)")
                 #if DEBUG
@@ -5754,8 +6524,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.logCodexDebug(
                     "[AgentModeVM][PersistedLoad] skip superseded hydrate tab=\(session.tabID) startRevision=\(startRevision) currentRevision=\(session.sourceItemsRevision)"
                 )
-                session.recordRestorationTerminal(.sourceRevisionSuperseded)
-                session.hasLoadedPersistedState = true
+                completeSourceSupersededLoad(session, attempt: attempt)
                 #if DEBUG
                     logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
                 #endif
@@ -5771,6 +6540,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 #endif
                 return
             }
+            settlePersistedLoadAttempt(attempt, exit: .payloadApplied)
             #if DEBUG
                 if let applyStartMS {
                     applyDurationMS = restorePerfRecorder.elapsedMS(since: applyStartMS)
@@ -5782,10 +6552,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if persistentBindingTransitionIsCurrent(hydrationToken.transition) {
                 // Cancellation is not a hydration failure: a successor binding owns the retry and
                 // must not inherit a terminal proof from the task it superseded.
-                if !(error is CancellationError), !Task.isCancelled {
+                if error is CancellationError || Task.isCancelled {
+                    // Cancellation is not a failure and does not newly latch completion (§4.3).
+                    settlePersistedLoadAttempt(attempt, exit: .cancelled)
+                } else {
                     session.recordRestorationTerminal(.loadFailed)
+                    session.hasLoadedPersistedState = true
+                    settlePersistedLoadAttempt(attempt, exit: .loadFailed)
                 }
-                session.hasLoadedPersistedState = true
+            } else if isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) {
+                // Revision-only drift on the current attempt: the discarded disk result cannot settle it,
+                // but the current local projection does (no latch, proof or overwrite), so neither the
+                // pane nor the sidebar join is stranded in loading (§4.3/§5.5).
+                synchronizeCancelledLocalProjection(session, attempt: attempt)
             }
             #if DEBUG
                 if let prepareStartMS, prepareDurationMS == nil {
@@ -6195,9 +6974,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             transition: session.persistentBindingTransitionToken(),
             requestedSessionID: binding.sessionID
         )
+        let routeAttempt = admitSavedLoadAttempt(
+            for: session,
+            commitToken: hydrationToken,
+            sourceItemsRevision: session.sourceItemsRevision
+        )
         guard await applyPersistedHydration(payload, to: session, token: hydrationToken) else {
             return .sessionNotFound
         }
+        settlePersistedLoadAttempt(routeAttempt, exit: .payloadApplied)
         let hydrated = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
         return hydrated.activeAgentSessionID == sessionID && hydrated.hasLoadedPersistedState ? .ready : .sessionNotFound
     }
@@ -11560,7 +12345,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && currentSnapshot.visibleRows.isEmpty
             && currentSnapshot.workingRows.isEmpty
             && currentSnapshot.archivedHistoryState == .empty
-        guard !isDuplicateLoadingSnapshot else { return }
+        // A loading frame is no scope's committed projection (§4.1).
+        let hadContentScope = activeTranscriptPresentationScope != nil
+        activeTranscriptPresentationScope = nil
+        guard !isDuplicateLoadingSnapshot else {
+            if hadContentScope, !isActiveUISyncSuppressed {
+                syncTranscriptUIState()
+            }
+            return
+        }
 
         activeTranscriptPresentation = loadingTranscriptPresentationSnapshot(
             tabID: tabID,
@@ -11580,10 +12373,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Canonical ownership predicate for synchronizing a session's derived transcript.
     ///
     /// Unlike active presentation ownership, this intentionally permits background sessions.
-    private func canSynchronizeDerivedTranscript(for session: TabSession) -> Bool {
+    /// `requiringLoadedPersistedState: false` is reserved for the cancelled current-source-drift
+    /// local projection (§4.3); every other caller keeps the strict default.
+    private func canSynchronizeDerivedTranscript(
+        for session: TabSession,
+        requiringLoadedPersistedState: Bool = true
+    ) -> Bool {
         guard sessions[session.tabID] === session,
               !session.bindingTransitionInProgress,
-              session.hasLoadedPersistedState
+              session.hasLoadedPersistedState || !requiringLoadedPersistedState
         else {
             return false
         }
@@ -11709,6 +12507,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let nextRevision = (contentChanged || forceRevision)
             ? currentSnapshot.revision &+ 1
             : currentSnapshot.revision
+        activeTranscriptPresentationScope = sessions[session.tabID] === session ? transcriptPresentationScope(for: session) : nil
         activeTranscriptPresentation = transcriptPresentationSnapshot(
             from: session,
             revision: nextRevision
@@ -11823,6 +12622,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func republishTranscriptPresentationForRunStateChangeIfNeeded(_ session: TabSession) {
+        // Run facts are pane status even before the transcript is publishable (§4.4 row 3).
+        if session.tabID == currentTabID, sessions[session.tabID] === session {
+            syncTranscriptUIState()
+        }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         if currentTabID == session.tabID {
             updateBindingsFromSession(session)
@@ -11971,6 +12774,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isRestoringState = true
             defer { isRestoringState = false }
 
+            activeTranscriptPresentationScope = nil
             activeTranscriptPresentation = .init(
                 revision: activeTranscriptPresentation.revision &+ 1
             )
@@ -13135,6 +13939,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 publishSignpost,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
             )
+        } else if publishActivePresentation {
+            // Retained cancelled-drift scope: publish this already-built local projection (§4.3).
+            publishRetainedLocalProjection(session, refresh: false)
         }
     }
 
@@ -14082,15 +14889,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionIndexStore.sidebarAutoArchiveOwner(workspaceID: workspaceID)
     }
 
-    var ownerValidatedSidebarRestoreFrozenOrderByTabID: [UUID: Int] {
-        sessionIndexStore.ownerValidatedSidebarRestoreFrozenOrderByTabID
+    var ownerValidatedSidebarRestoreBaseline: AgentSidebarRestoreBaseline? {
+        sessionIndexStore.ownerValidatedSidebarRestoreBaseline
     }
 
-    private func cancelSessionIndexRefresh(
-        releaseFrozenOrder: Bool,
-        owner: SessionIndexOwner? = nil
-    ) {
-        let refreshOwner = owner ?? activeSessionIndexRefreshToken?.owner
+    /// Active switch/queued adoption has not installed its owner: the pane's awaiting-owner target.
+    var isSidebarOwnerPending: Bool {
+        if case .awaitingOwner = transcriptPaneTargetOwner() { true } else { false }
+    }
+
+    /// Positional restoration inputs every sidebar cache and fingerprint keys on (§5.6).
+    var sidebarRestorePresentationKey: SidebarRestorePresentationKey {
+        let baseline = ownerValidatedSidebarRestoreBaseline
+        return SidebarRestorePresentationKey(
+            baselineOwner: baseline?.owner,
+            baselineRevision: baseline?.revision,
+            isOwnerPending: isSidebarOwnerPending
+        )
+    }
+
+    private func cancelSessionIndexRefresh() {
         if let token = activeSessionIndexRefreshToken,
            sessionIndexStore.isOwnerCurrent(token.owner)
         {
@@ -14106,9 +14924,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        if releaseFrozenOrder, let refreshOwner {
-            sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: refreshOwner)
-        }
     }
 
     private func installSessionIndexOwner(
@@ -14116,9 +14931,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspace: WorkspaceModel?
     ) {
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
-        cancelSessionIndexRefresh(releaseFrozenOrder: false)
+        cancelSessionIndexRefresh()
         sessionIndexStore.installOwner(owner, workspace: workspace)
         lastSidebarContentFingerprint = nil
+        #if DEBUG
+            if let baseline = sessionIndexStore.sidebarRestoreBaseline, baseline.owner == owner {
+                restorePerfRecorder.event(
+                    "sidebarRestore.baselineCaptured",
+                    fields: [
+                        "windowID": "\(windowID)",
+                        "workspaceID": restorePerfRecorder.shortID(owner.workspaceID),
+                        "activationEpoch": "\(owner.activationEpoch)",
+                        "revision": "\(baseline.revision)",
+                        "coveredTabs": "\(baseline.entries.count)"
+                    ]
+                )
+            }
+        #endif
     }
 
     private func publishSessionIndexReplacement(
@@ -14302,11 +15131,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ workspace: WorkspaceModel?,
         owner: SessionIndexOwner
     ) async {
+        // This queued adoption ends here (installed, superseded or bailed); never clears a successor's.
+        defer { clearQueuedWorkspaceSwitchOwner(owner) }
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
         ui.sessionSidebar.invalidateSelectionForWorkspaceChange()
         sessionSidebarArchivedVisibleSessionCount = Self.sessionSidebarArchivedPageSize
         lastKnownWorkspaceSnapshot = workspace
         installSessionIndexOwner(owner, workspace: workspace)
+        clearQueuedWorkspaceSwitchOwner(owner)
         guard sessionIndexStore.isOwnerCurrent(owner) else { return }
         // One discovery level per activation that actually takes ownership. Opened *after* the
         // ownership guard, and before any suspension point, so an activation that bails without a
@@ -14390,6 +15222,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         sessions.removeAll()
+        // Owner discard drops the discarded sessions' ephemeral presentation state (§4.1).
+        transcriptPresentationRecordsByTabID.removeAll()
+        persistedLoadAttemptByTabID.removeAll()
+        persistedLoadProducerByTabID.removeAll()
+        activeTranscriptPresentationScope = nil
         lastProcessedTabID = nil
         if workspace == nil {
             workspaceSwitchInFlight = false
@@ -14459,7 +15296,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "windowID": "\(windowID)",
                     "workspaceID": restorePerfRecorder.shortID(workspace.id),
                     "activeTabID": restorePerfRecorder.shortID(workspace.activeComposeTabID),
-                    "frozenOrderTabs": "\(sidebarRestoreFrozenOrderByTabID.count)"
+                    "baselineTabs": "\(sidebarRestoreBaseline?.entries.count ?? 0)"
                 ]
             )
         #endif
@@ -14519,10 +15356,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activeTabIDs = Set(workspace.composeTabs.map(\.id))
         return workspace.composeTabs + workspace.stashedTabs.map(\.tab)
             .filter { !activeTabIDs.contains($0.id) }
-    }
-
-    private func invalidateSidebarRestoreOrdering() {
-        sessionIndexStore.invalidateSidebarRestoreOrdering()
     }
 
     nonisolated static func shouldSkipSessionListCacheRefresh(
@@ -14586,7 +15419,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "persistedTabs": "\(persistedTabs.count)",
                     "validTabs": "\(validTabIDs.count)",
                     "boundSessions": "\(boundSessionIDByTabID.count)",
-                    "frozenOrderTabs": "\(ownerValidatedSidebarRestoreFrozenOrderByTabID.count)",
+                    "baselineTabs": "\(ownerValidatedSidebarRestoreBaseline?.entries.count ?? 0)",
                     "hasPrioritizedTab": "\(prioritizedTabID != nil)",
                     "prioritizedTabID": restorePerfRecorder.shortID(prioritizedTabID),
                     "isSystemWorkspace": "\(workspace.isSystemWorkspace)",
@@ -14595,10 +15428,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         #endif
 
-        cancelSessionIndexRefresh(releaseFrozenOrder: false, owner: owner)
+        cancelSessionIndexRefresh()
         sessionListCacheGeneration &+= 1
         let token = SessionIndexRefreshToken(owner: owner, generation: sessionListCacheGeneration)
         activeSessionIndexRefreshToken = token
+        // Pending, deferred or replaced index sides transfer to this token without release (§5.5).
+        sessionIndexStore.beginSidebarRestoreIndex(generation: token.generation, owner: owner)
         activeSessionIndexRefreshWorkspace = workspace
         activeSessionIndexRefreshValidTabIDs = validTabIDs
         activeSessionIndexRefreshBoundSessionIDByTabID = boundSessionIDByTabID
@@ -14748,15 +15583,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeSessionIndexRefreshBaselineEntries.removeAll()
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
-        publishSessionIndexReplacement([:], token: token)
+        let joinIsActive = sessionIndexStore.ownerValidatedSidebarRestoreJoin != nil
+        if joinIsActive {
+            // Deliberate launch deferral, not a terminal skip: the scheduled real refresh adopts the
+            // join; a declined deferral settles it explicitly (§5.5).
+            sessionIndexStore.deferSidebarRestoreIndex(.initialSystemDeferral, owner: token.owner)
+        } else {
+            publishSessionIndexReplacement([:], token: token)
+        }
         sessionListCacheTask = nil
         activeSessionIndexRefreshToken = nil
         activeSessionIndexRefreshWorkspace = nil
         activeSessionIndexRefreshValidTabIDs.removeAll()
         activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
-        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
+        if !joinIsActive {
+            sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
+        }
         #if DEBUG
             restorePerfRecorder.log(
                 "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
@@ -14898,13 +15741,51 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
+    /// Terminal index outcome for the current token: staged into an active restoration join (released
+    /// once the selected side settles), otherwise published directly as an ordinary metadata refresh.
+    private func finishSessionIndexRefresh(
+        token: SessionIndexRefreshToken,
+        entries: [UUID: AgentSessionIndexEntry],
+        outcome: AgentSidebarRestoreJoin.IndexOutcome,
+        ready: Bool
+    ) {
+        let staged = sessionIndexStore.recordSidebarRestoreIndexTerminal(
+            generation: token.generation,
+            owner: token.owner,
+            outcome: outcome,
+            entries: entries,
+            ready: ready
+        )
+        #if DEBUG
+            restorePerfRecorder.event(
+                "sidebarRestore.indexTerminal",
+                fields: [
+                    "windowID": "\(windowID)",
+                    "activationEpoch": "\(token.owner.activationEpoch)",
+                    "generation": "\(token.generation)",
+                    "outcome": String(describing: outcome),
+                    "staged": "\(staged)",
+                    "released": "\(sessionIndexStore.sidebarRestoreBaseline == nil)"
+                ]
+            )
+        #endif
+        guard !staged else { return }
+        publishSessionIndexReplacement(entries, token: token)
+        sessionIndexStore.setSessionListCacheReady(ready, for: token.owner)
+    }
+
     private func applySidebarIndexCompletion(token: SessionIndexRefreshToken) {
         guard activeSessionIndexRefreshToken == token,
               sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return
         }
-        publishSessionIndexReplacement(activeSessionIndexRefreshFullEntries, token: token)
+        finishSessionIndexRefresh(
+            token: token,
+            entries: activeSessionIndexRefreshFullEntries,
+            outcome: .success,
+            ready: true
+        )
         sessionListCacheTask = nil
         activeSessionIndexRefreshToken = nil
         activeSessionIndexRefreshWorkspace = nil
@@ -14914,8 +15795,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
-        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
     }
 
     private func applySidebarIndexFailure(token: SessionIndexRefreshToken) {
@@ -14924,7 +15803,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return
         }
-        publishSessionIndexReplacement(activeSessionIndexRefreshBaselineEntries, token: token)
+        // Existing conservative rollback: partial reads never imply authoritative deletion.
+        finishSessionIndexRefresh(
+            token: token,
+            entries: activeSessionIndexRefreshBaselineEntries,
+            outcome: .failed,
+            ready: false
+        )
         sessionListCacheTask = nil
         activeSessionIndexRefreshToken = nil
         activeSessionIndexRefreshWorkspace = nil
@@ -14934,8 +15819,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        sessionIndexStore.setSessionListCacheReady(false, for: token.owner)
-        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
     }
 
     private func notePrioritizedActiveSessionRestoreStatus(
@@ -15107,6 +15990,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                sessions[tabID] === capturedSession
             {
                 sessions.removeValue(forKey: tabID)
+                // Tab removal drops that tab's ephemeral presentation state (§4.1).
+                transcriptPresentationRecordsByTabID.removeValue(forKey: tabID)
+                persistedLoadAttemptByTabID.removeValue(forKey: tabID)
+                persistedLoadProducerByTabID.removeValue(forKey: tabID)
             }
         }
         // Drop any sidebar attention / observed run-state for tabs that are
@@ -15314,7 +16201,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func scheduleSave(for tabID: UUID) {
-        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else { return }
+        guard !suppressesAgentSessionPersistence else { return }
         guard let session = sessions[tabID] else { return }
         session.saveRequestGeneration &+= 1
         #if DEBUG
@@ -15386,7 +16273,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
             perfRecorder.increment("save.session.invoked", tabID: tabID)
         #endif
-        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence
+        guard !suppressesAgentSessionPersistence
             || bypassesAgentSessionPersistenceSuppressionForTesting
         else {
             #if DEBUG
@@ -15813,7 +16700,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func persistCurrentSession() {
-        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else { return }
+        guard !suppressesAgentSessionPersistence else { return }
         guard let tabID = currentTabID else { return }
         Task {
             await flushSave(for: tabID)
@@ -21377,7 +22264,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
         session.isDirty = true
-        invalidateSidebarRestoreOrdering()
         sessionIndexStore.removeSortDate(forTabID: tabID)
 
         // Detach before clearing the provider session ID so async cleanup cannot
@@ -21465,11 +22351,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if let session = sessions[tabID] {
             if session.activeAgentSessionID == nil {
-                _ = installPersistentSessionBindingUpdatingInferredWorkspace(
+                let attached = installPersistentSessionBindingUpdatingInferredWorkspace(
                     sessionID: sessionID,
                     on: session,
                     invalidateAsyncWork: true
                 )
+                // An attached saved conversation on an empty, idle session is restored by the existing
+                // qualified loader (now if current, else on selection); its file is renamed on disk, never
+                // overwritten by the unhydrated placeholder (§4.2/§4.3). Local content or a run stays local.
+                if attached?.sessionID == sessionID, session.items.isEmpty,
+                   session.transcript.turns.isEmpty, !session.runState.isActive,
+                   let workspace = workspaceManager?.activeWorkspace
+                {
+                    session.hasLoadedPersistedState = false
+                    Task { [dataService] in try? await dataService.renameAgentSession(id: sessionID, to: validatedName, for: workspace) }
+                    if tabID == currentTabID {
+                        lastProcessedTabID = nil
+                        onTabChanged(tabID)
+                    }
+                    return
+                }
             }
             session.isDirty = true
             scheduleSave(for: tabID)
@@ -21891,7 +22792,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let session = session(for: createdTab.id)
         markSessionAsFreshlyCreated(session)
-        invalidateSidebarRestoreOrdering()
+        // The new row is admitted to the baseline (appended within its pin group) on the next sidebar
+        // synchronization and selected immediately; existing rows keep their positions (§5.4).
         if currentTabID == createdTab.id {
             updateBindingsFromSession(session)
         }
@@ -22306,12 +23208,18 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
         return workspaceManager != nil
     }
 
-    func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int] {
-        var orderByTabID: [UUID: Int] = [:]
-        for (index, tab) in persistedSidebarTabs(for: workspace).enumerated() where orderByTabID[tab.id] == nil {
-            orderByTabID[tab.id] = index
-        }
-        return orderByTabID
+    func makeSidebarRestoreBaseline(
+        for workspace: WorkspaceModel,
+        owner: SessionIndexOwner,
+        now: Date,
+        calendar: Calendar
+    ) -> AgentSidebarRestoreBaseline {
+        AgentModeSidebarSessionBuilder.makeRestoreBaseline(
+            for: persistedSidebarTabs(for: workspace),
+            owner: owner,
+            now: now,
+            calendar: calendar
+        )
     }
 
     func sessionIndexStore(
@@ -22326,6 +23234,19 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
             syncSidebarUIState(refresh: true, reason: .sortDates)
         case .sessionList:
             syncSidebarUIState(refresh: true, reason: .sessionList)
+        case .restoreProjection:
+            #if DEBUG
+                restorePerfRecorder.event(
+                    "sidebarRestore.projectionChanged",
+                    fields: [
+                        "windowID": "\(windowID)",
+                        "baselineReleased": "\(store.sidebarRestoreBaseline == nil)",
+                        "ready": "\(store.sessionListCacheReady)"
+                    ]
+                )
+            #endif
+            rebuildAgentSessionLinkSubagentCensus()
+            syncSidebarUIState(refresh: true, reason: .restoreProjection)
         }
     }
 }

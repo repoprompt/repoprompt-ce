@@ -7,6 +7,9 @@ enum SessionIndexStateChangeReason {
     case sessionIndex
     case sortDates
     case sessionList
+    /// Coalesced restoration release or baseline-only change (§5.6): exactly one notification after the
+    /// final index, dates, readiness and baseline removal are installed together.
+    case restoreProjection
 }
 
 /// Delegate protocol for `AgentWorkspaceSessionIndexStore`. The view model
@@ -31,9 +34,14 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
     /// `lastKnownWorkspaceSnapshot`.
     var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool { get }
 
-    /// Builds the frozen sidebar restore order for a workspace. Mirrors
-    /// `AgentModeViewModel.makeSidebarRestoreFrozenOrder(for:)`.
-    func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int]
+    /// Captures the metadata-only sidebar restoration baseline for `workspace` (§5.3). Mirrors
+    /// `AgentModeViewModel.makeSidebarRestoreBaseline(for:owner:now:calendar:)`.
+    func makeSidebarRestoreBaseline(
+        for workspace: WorkspaceModel,
+        owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner,
+        now: Date,
+        calendar: Calendar
+    ) -> AgentSidebarRestoreBaseline
 
     /// Called when `sessionIndex`, `sessionListSortDates`, or
     /// `sessionListCacheReady` changes. The delegate dispatches to
@@ -106,16 +114,19 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     private(set) var sessionIndexOwner: SessionIndexOwner?
     private(set) var sessionListSortDatesOwner: SessionIndexOwner?
     private(set) var sessionListCacheReadyOwner: SessionIndexOwner?
-    private(set) var sidebarRestoreFrozenOrderOwner: SessionIndexOwner?
 
     // MARK: - Local overlay (optimistic upserts/removals before refresh completes)
 
     private(set) var sessionIndexLocalUpserts: [UUID: AgentSessionIndexEntry] = [:]
     private(set) var sessionIndexLocalRemovals: Set<UUID> = []
 
-    // MARK: - Frozen sidebar restore order
+    // MARK: - Sidebar restoration baseline and join (§5.2)
 
-    private(set) var sidebarRestoreFrozenOrderByTabID: [UUID: Int] = [:]
+    /// Positional baseline for the installed owner's restoration; nil once released or abandoned.
+    private(set) var sidebarRestoreBaseline: AgentSidebarRestoreBaseline?
+    /// Index/selected join gating the baseline's single release.
+    private(set) var sidebarRestoreJoin: AgentSidebarRestoreJoin?
+    private var sidebarRestoreBaselineRevision: UInt64 = 0
 
     // MARK: - Workspace switch / owner creation
 
@@ -195,13 +206,19 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
         return sessionListCacheReady
     }
 
-    var ownerValidatedSidebarRestoreFrozenOrderByTabID: [UUID: Int] {
-        guard let owner = sidebarRestoreFrozenOrderOwner,
-              isOwnerCurrent(owner)
+    var ownerValidatedSidebarRestoreBaseline: AgentSidebarRestoreBaseline? {
+        guard let baseline = sidebarRestoreBaseline,
+              isOwnerCurrent(baseline.owner)
         else {
-            return [:]
+            return nil
         }
-        return sidebarRestoreFrozenOrderByTabID
+        return baseline
+    }
+
+    /// The current owner's unreleased join, if any.
+    var ownerValidatedSidebarRestoreJoin: AgentSidebarRestoreJoin? {
+        guard let join = sidebarRestoreJoin, ownerValidatedSidebarRestoreBaseline != nil else { return nil }
+        return join
     }
 
     func sidebarAutoArchiveOwner(workspaceID: UUID) -> SessionIndexOwner? {
@@ -217,11 +234,16 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
 
     // MARK: - Mutation
 
-    /// Installs a new owner, clearing all data and overlay state. The caller
-    /// (the view model) is responsible for calling
-    /// `cancelSessionIndexRefresh(releaseFrozenOrder: false)` before this and
+    /// Installs a new owner, clearing all data and overlay state, and captures its restoration
+    /// baseline/join together with the cleared index before one delegate notification (§5.3). The caller
+    /// (the view model) is responsible for calling `cancelSessionIndexRefresh()` before this and
     /// resetting `lastSidebarContentFingerprint` after.
-    func installOwner(_ owner: SessionIndexOwner, workspace: WorkspaceModel?) {
+    func installOwner(
+        _ owner: SessionIndexOwner,
+        workspace: WorkspaceModel?,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) {
         suppressDelegateNotifications = true
         defer {
             suppressDelegateNotifications = false
@@ -235,24 +257,145 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
         sessionIndex.removeAll()
         sessionListSortDates.removeAll()
         sessionListCacheReady = false
-        if let workspace {
-            sidebarRestoreFrozenOrderByTabID = delegate?.makeSidebarRestoreFrozenOrder(for: workspace) ?? [:]
-            sidebarRestoreFrozenOrderOwner = owner
+        if let workspace, var baseline = delegate?.makeSidebarRestoreBaseline(
+            for: workspace,
+            owner: owner,
+            now: now,
+            calendar: calendar
+        ) {
+            sidebarRestoreBaselineRevision &+= 1
+            baseline.revision = sidebarRestoreBaselineRevision
+            sidebarRestoreBaseline = baseline
+            let selectedTabID = workspace.activeComposeTabID
+            sidebarRestoreJoin = AgentSidebarRestoreJoin(
+                initialTabID: selectedTabID,
+                initialBindingID: selectedTabID.flatMap { tabID in
+                    workspace.composeTabs.first { $0.id == tabID }?.activeAgentSessionID
+                },
+                index: .pending(generation: nil),
+                // No selection has nothing to restore: settle immediately (§5.5).
+                selected: selectedTabID == nil ? .settled(.restoration(.noSelection)) : .discovering
+            )
         } else {
-            sidebarRestoreFrozenOrderByTabID.removeAll()
-            sidebarRestoreFrozenOrderOwner = nil
+            sidebarRestoreBaseline = nil
+            sidebarRestoreJoin = nil
         }
     }
 
-    func releaseSidebarRestoreFrozenOrder(for owner: SessionIndexOwner) {
-        guard sidebarRestoreFrozenOrderOwner == owner else { return }
-        sidebarRestoreFrozenOrderByTabID.removeAll()
-        sidebarRestoreFrozenOrderOwner = nil
+    // MARK: - Restoration join operations (all owner/token checked)
+
+    private func currentJoin(for owner: SessionIndexOwner) -> AgentSidebarRestoreJoin? {
+        guard let join = sidebarRestoreJoin,
+              sidebarRestoreBaseline?.owner == owner,
+              isOwnerCurrent(owner)
+        else { return nil }
+        return join
     }
 
-    func invalidateSidebarRestoreOrdering() {
-        sidebarRestoreFrozenOrderByTabID.removeAll()
-        sidebarRestoreFrozenOrderOwner = nil
+    /// The owner's refresh with `generation` started; a pending, deferred or staged-but-unreleased
+    /// index side transfers to it without releasing the baseline. No-op after release.
+    func beginSidebarRestoreIndex(generation: UInt64, owner: SessionIndexOwner) {
+        guard currentJoin(for: owner) != nil else { return }
+        sidebarRestoreJoin?.index = .pending(generation: generation)
+    }
+
+    /// Index work stopped without a terminal outcome (Agent Mode inactive, deferred System launch). A
+    /// staged-but-unreleased terminal projection is discarded too: deactivation is never a release, and
+    /// the same owner's replacement refresh restages it on reactivation (§5.5).
+    func deferSidebarRestoreIndex(_ reason: AgentSidebarRestoreJoin.DeferralReason, owner: SessionIndexOwner) {
+        guard currentJoin(for: owner) != nil else { return }
+        sidebarRestoreJoin?.index = .deferred(reason)
+    }
+
+    /// Stages the owner's terminal index projection. Returns true when the active join absorbed it
+    /// (the caller must not publish entries/readiness itself); false when no join is active.
+    @discardableResult
+    func recordSidebarRestoreIndexTerminal(
+        generation: UInt64?,
+        owner: SessionIndexOwner,
+        outcome: AgentSidebarRestoreJoin.IndexOutcome,
+        entries: [UUID: AgentSessionIndexEntry],
+        ready: Bool
+    ) -> Bool {
+        guard let join = currentJoin(for: owner) else { return false }
+        switch join.index {
+        case let .pending(pendingGeneration):
+            // A replacement refresh owns the transaction; a stale token cannot stage it.
+            if let pendingGeneration, pendingGeneration != generation { return true }
+        case .deferred:
+            break
+        case .terminal:
+            // Duplicate terminal callbacks are idempotent.
+            return true
+        }
+        sidebarRestoreJoin?.index = .terminal(generation: generation, outcome: outcome, entries: entries, ready: ready)
+        releaseSidebarRestoreIfSettled()
+        return true
+    }
+
+    /// Records the initially selected restoration's progress; once settled it never re-arms.
+    func recordSidebarRestoreSelected(_ side: AgentSidebarRestoreJoin.SelectedSide, owner: SessionIndexOwner) {
+        guard let join = currentJoin(for: owner),
+              !join.selected.isSettled,
+              join.selected != side
+        else { return }
+        sidebarRestoreJoin?.selected = side
+        releaseSidebarRestoreIfSettled()
+    }
+
+    /// Admits rows the baseline does not cover (new chats, late tabs) in the given order, appending
+    /// ordinals without renumbering. Called on the VM synchronization path before row publication;
+    /// it never notifies, but advances the baseline revision consumers fingerprint.
+    @discardableResult
+    func admitSidebarRestoreCoverage(_ tabs: [ComposeTabState]) -> Bool {
+        guard var baseline = ownerValidatedSidebarRestoreBaseline,
+              tabs.contains(where: { baseline.entries[$0.id] == nil })
+        else { return false }
+        guard baseline.admit(tabs) else { return false }
+        sidebarRestoreBaselineRevision &+= 1
+        baseline.revision = sidebarRestoreBaselineRevision
+        sidebarRestoreBaseline = baseline
+        return true
+    }
+
+    /// Drops the restoration transaction for `owner` (nil: any) without publishing into a successor:
+    /// teardown, mismatched restart or owner abandonment. Baseline removal notifies once.
+    func abandonSidebarRestore(owner: SessionIndexOwner?) {
+        guard sidebarRestoreBaseline != nil || sidebarRestoreJoin != nil else { return }
+        if let owner, sidebarRestoreBaseline?.owner != owner { return }
+        let hadBaseline = sidebarRestoreBaseline != nil
+        sidebarRestoreBaseline = nil
+        sidebarRestoreJoin = nil
+        guard hadBaseline, !suppressDelegateNotifications else { return }
+        delegate?.sessionIndexStore(self, didChangeStateWithReason: .restoreProjection)
+    }
+
+    /// One non-suspending release once both sides are terminal (§5.6): revalidate the owner, apply the
+    /// latest local overlay to the staged entries, install index, dates, readiness and baseline
+    /// removal under suppression, then notify exactly once.
+    private func releaseSidebarRestoreIfSettled() {
+        guard let join = sidebarRestoreJoin,
+              join.isReleasable,
+              let owner = sidebarRestoreBaseline?.owner,
+              isOwnerCurrent(owner),
+              case let .terminal(_, _, entries, ready) = join.index
+        else { return }
+        do {
+            let wasSuppressed = suppressDelegateNotifications
+            suppressDelegateNotifications = true
+            defer { suppressDelegateNotifications = wasSuppressed }
+            let final = sessionIndexEntriesApplyingLocalOverlay(to: entries)
+            if sessionIndex != final {
+                sessionIndex = final
+            }
+            rebuildSessionSortDatesFromIndex()
+            sessionListCacheReadyOwner = owner
+            sessionListCacheReady = ready
+            sidebarRestoreBaseline = nil
+            sidebarRestoreJoin = nil
+        }
+        guard !suppressDelegateNotifications else { return }
+        delegate?.sessionIndexStore(self, didChangeStateWithReason: .restoreProjection)
     }
 
     func setSessionListCacheReady(_ ready: Bool, for owner: SessionIndexOwner) {

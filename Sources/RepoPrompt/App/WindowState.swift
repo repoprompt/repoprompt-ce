@@ -73,6 +73,27 @@ enum WindowTitleFormatter {
     }
 }
 
+/// Sticky instance number qualified by the workspace it was allocated for.
+struct WorkspaceInstanceAssignment: Equatable {
+    let workspaceID: UUID
+    let number: Int
+}
+
+/// One complete window-title resolution: workspace label, decorated tab and rendered title together.
+struct CoherentWindowTitlePresentation: Equatable {
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let workspaceDisplayName: String
+    let renderedTitle: String
+
+    static let appDefault = CoherentWindowTitlePresentation(
+        workspaceID: nil,
+        tabID: nil,
+        workspaceDisplayName: WindowTitleFormatter.defaultTitle,
+        renderedTitle: WindowTitleFormatter.defaultTitle
+    )
+}
+
 enum PendingInteractionSurface {
     case contextualQuestion
     case agentQuestion
@@ -282,26 +303,39 @@ class WindowState: ObservableObject {
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
-    /// The sticky instance number assigned for this window's current workspace (monotonically increasing per workspace).
-    /// Nil when no workspace is active yet.
-    @Published var workspaceInstanceNumber: Int? = nil
+    /// The sticky instance number assigned for this window's workspace, qualified by that workspace.
+    /// Installed only by `setWorkspaceInstanceAssignment(_:)`; never allocated here.
+    @Published private(set) var workspaceInstanceAssignment: WorkspaceInstanceAssignment?
 
-    /// Convenience: the workspace name with an instance suffix " (N)" when N ≥ 2,
-    /// except for the default/system workspace which always shows the app name.
+    /// The instance number for the current workspace; nil while the assignment belongs to another.
+    var workspaceInstanceNumber: Int? {
+        workspaceManager.activeWorkspaceID.flatMap { workspaceInstanceNumber(for: $0) }
+    }
+
+    /// The instance number only when it was assigned for `workspaceID`, for explicit identity pairs.
+    func workspaceInstanceNumber(for workspaceID: UUID) -> Int? {
+        guard let assignment = workspaceInstanceAssignment, assignment.workspaceID == workspaceID else { return nil }
+        return assignment.number
+    }
+
+    /// Installs a qualified assignment for the current workspace, or nil for an unload/termination
+    /// result. An assignment for a workspace this window no longer shows is stale and is rejected.
+    func setWorkspaceInstanceAssignment(_ assignment: WorkspaceInstanceAssignment?) {
+        if let assignment {
+            guard assignment.workspaceID == workspaceManager.activeWorkspaceID else { return }
+        } else {
+            guard workspaceManager.activeWorkspaceID == nil
+                || (windowStatesManager ?? WindowStatesManager.shared).isTerminating
+            else { return }
+        }
+        workspaceInstanceAssignment = assignment
+        requestWindowTitleUpdate(reason: .workspaceChanged)
+    }
+
+    /// The workspace label of the installed (published) title: the name with " (N)" for N ≥ 2, the
+    /// app name for System, retained while a switch is still assigning.
     var workspaceDisplayName: String {
-        guard let ws = workspaceManager.activeWorkspace else {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        if ws.isSystemWorkspace {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        let base = ws.name
-        if let n = workspaceInstanceNumber, n >= 2 {
-            return "\(base) (\(n))"
-        }
-        return base
+        coherentTitlePresentation.workspaceDisplayName
     }
 
     /// Source of truth for the SwiftUI scene title (window title and native tab name).
@@ -309,64 +343,74 @@ class WindowState: ObservableObject {
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
 
-    // Undecorated cache used only to survive transient activeWorkspace == nil. Exact role decoration
-    // is reapplied from current projection truth on every resolution, so a retired role cannot remain
-    // stuck in the cached title.
-    private var lastKnownResolvedBaseTitle: String = WindowTitleFormatter.defaultTitle
+    /// The last complete title resolution. Retained, never partially updated, while the active
+    /// workspace model is unresolved or a real switch has not yet assigned the target's number.
+    private var coherentTitlePresentation = CoherentWindowTitlePresentation.appDefault
     private var lastAppliedWindowTitle: String?
+    /// Workspace ID published by a real switch, with the switching flag and that switch's operation as
+    /// observed at publication, not at the deferred title hop, so authority-only adoption or a later
+    /// switch that has not yet published is never mistaken for the pending switch of this ID.
+    private var titleSwitchPublication: (workspaceID: UUID, wasSwitching: Bool, operationID: UUID?)?
 
-    private func resolvedWindowTitle() -> String {
-        let baseTitle = resolvedBaseWindowTitle()
-        let isOverseer = promptManager.activeComposeTabID.map {
-            agentModeViewModel.agentSessionLinkIsOverseer(tabID: $0)
+    private func noteActiveWorkspacePublishedForTitle(_ workspaceID: UUID?) {
+        let wasSwitching = workspaceManager.isSwitchingWorkspace
+        if let workspaceID, wasSwitching {
+            titleSwitchPublication = (workspaceID, wasSwitching, workspaceManager.activeWorkspaceSwitch?.operationID)
+        } else if workspaceID != titleSwitchPublication?.workspaceID {
+            titleSwitchPublication = nil
+        }
+        requestWindowTitleUpdate(reason: .workspaceChanged)
+    }
+
+    private func resolveCoherentTitlePresentation() -> CoherentWindowTitlePresentation {
+        guard let workspaceID = workspaceManager.activeWorkspaceID else { return .appDefault }
+        guard let workspace = workspaceManager.activeWorkspace else { return coherentTitlePresentation }
+        let switchInFlight = titleSwitchPublication.map { publication in
+            publication.wasSwitching
+                && publication.workspaceID == workspaceID
+                && publication.operationID != nil
+                && workspaceManager.activeWorkspaceSwitch?.operationID == publication.operationID
         } ?? false
-        return WindowTitleFormatter.applyingOverseerPrefix(
-            to: baseTitle,
-            isOverseer: isOverseer
+        let number = workspaceInstanceNumber(for: workspaceID)
+        let selectedTabID = promptManager.activeComposeTabID
+        // Membership comes from this workspace directly; a global tab-name lookup cannot establish it.
+        let selectedTab = selectedTabID.flatMap { tabID in workspace.composeTabs.first { $0.id == tabID } }
+        let adoptionPending = agentModeViewModel.hasPendingOwnerAdoption(forWorkspaceID: workspaceID)
+        if switchInFlight || adoptionPending, number == nil || (selectedTabID != nil && selectedTab == nil) {
+            return coherentTitlePresentation
+        }
+
+        let label = if workspace.isSystemWorkspace {
+            WindowTitleFormatter.defaultTitle
+        } else if let number, number >= 2 {
+            "\(workspace.name) (\(number))"
+        } else {
+            workspace.name
+        }
+        let baseTitle = WindowTitleFormatter.compose(
+            workspaceTitle: label,
+            agentSessionTitle: workspace.isSystemWorkspace
+                ? nil
+                : selectedTab.map { AgentSessionRestoreSupport.normalizedSessionTitle($0.name) },
+            duplicateWorkspaceTitle: workspace.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : workspace.name
+        )
+        // Role facts count only from the runtime currently owning this workspace.
+        let isOverseer = selectedTab.map { tab in
+            agentModeViewModel.currentPaneOwner?.workspaceID == workspaceID
+                && agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tab.id)?.workspaceID == workspaceID
+                && agentModeViewModel.agentSessionLinkIsOverseer(tabID: tab.id)
+        } ?? false
+        return CoherentWindowTitlePresentation(
+            workspaceID: workspaceID,
+            tabID: selectedTab?.id,
+            workspaceDisplayName: label,
+            renderedTitle: WindowTitleFormatter.applyingOverseerPrefix(to: baseTitle, isOverseer: isOverseer)
         )
     }
 
-    private func resolvedBaseWindowTitle() -> String {
-        guard let ws = workspaceManager.activeWorkspace else {
-            // If we expect a workspace but it is temporarily unresolved, do not stomp to default.
-            if workspaceManager.activeWorkspaceID != nil {
-                return lastKnownResolvedBaseTitle
-            }
-
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        let workspaceTitle = resolvedWorkspaceWindowTitle(for: ws)
-        let resolvedTitle = WindowTitleFormatter.compose(
-            workspaceTitle: workspaceTitle,
-            agentSessionTitle: resolvedAgentSessionTitleForWindowTitle(activeWorkspace: ws),
-            duplicateWorkspaceTitle: ws.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : ws.name
-        )
-        lastKnownResolvedBaseTitle = resolvedTitle
-        return resolvedTitle
-    }
-
-    private func resolvedWorkspaceWindowTitle(for workspace: WorkspaceModel) -> String {
-        if workspace.isSystemWorkspace {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        let base = workspace.name
-        if let n = workspaceInstanceNumber, n >= 2 {
-            return "\(base) (\(n))"
-        }
-        return base
-    }
-
-    private func resolvedAgentSessionTitleForWindowTitle(activeWorkspace: WorkspaceModel) -> String? {
-        guard !activeWorkspace.isSystemWorkspace,
-              promptManager.activeComposeTabID != nil
-        else {
-            return nil
-        }
-
-        let rawTitle = promptManager.activeComposeTabID.flatMap { workspaceManager.composeTabName(with: $0) }
-        return AgentSessionRestoreSupport.normalizedSessionTitle(rawTitle)
+    /// Chat options may act only for the workspace and decorated tab the installed title shows.
+    private func titlePresentationAdmits(workspaceID: UUID, tabID: UUID) -> Bool {
+        coherentTitlePresentation.workspaceID == workspaceID && coherentTitlePresentation.tabID == tabID
     }
 
     enum WindowTitleUpdateReason {
@@ -463,6 +507,14 @@ class WindowState: ObservableObject {
 
     /// Lazily scheduled task to coalesce window title updates outside of mutation scopes.
     private var pendingWindowTitleUpdateTask: Task<Void, Never>?
+    #if DEBUG
+        /// Passive checkpoint after each deferred title resolution, including deduplicated ones.
+        private var windowTitleResolutionDidCompleteHandlerForTesting: (@MainActor () -> Void)?
+
+        func setWindowTitleResolutionDidCompleteHandlerForTesting(_ handler: (@MainActor () -> Void)?) {
+            windowTitleResolutionDidCompleteHandlerForTesting = handler
+        }
+    #endif
     /// Lazily scheduled task to coalesce focus updates outside of mutation scopes.
     private var pendingFocusUpdateTask: Task<Void, Never>?
     /// Lazily scheduled task to coalesce focus side-effects outside of mutation scopes.
@@ -726,6 +778,30 @@ class WindowState: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // Title transition facts are read at publication, separately from the restore witness
+        // above: whether this ID arrived inside a real switch. A switch ending (successfully,
+        // recovered, or cancelled) requests reevaluation after the switching flag clears.
+        workspaceManager.$activeWorkspaceID
+            .sink { [weak self] workspaceID in
+                self?.noteActiveWorkspacePublishedForTitle(workspaceID)
+            }
+            .store(in: &cancellables)
+        workspaceManager.$activeWorkspaceSwitch
+            .filter { $0 == nil }
+            .sink { [weak self] _ in
+                self?.requestWindowTitleUpdate(reason: .workspaceChanged)
+            }
+            .store(in: &cancellables)
+        // A queued owner adoption ends when the pane publishes its installed target (awaiting owner →
+        // owner); reevaluate a title retained for it. Stable targets do not retrigger on content.
+        agentModeViewModel.ui.transcript.$snapshot
+            .map(\.paneTarget)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.requestWindowTitleUpdate(reason: .workspaceChanged)
+            }
+            .store(in: &cancellables)
+
         // Keep the window title in sync when this window's active compose tab changes,
         // so the Agent session portion of the title does not go stale.
         NotificationCenter.default.publisher(for: .activeComposeTabChanged)
@@ -958,11 +1034,14 @@ class WindowState: ObservableObject {
     /// Safe to call from WindowAccessor notifications; doesn't mutate SwiftUI state.
     private func reassertWindowTitle() {
         guard !shouldSuppressObservationSideEffects else { return }
-        applyWindowTitleIfNeeded(resolvedWindowTitle())
+        applyCoherentWindowTitle()
     }
 
+    /// Installs one complete resolution and reasserts the same string to SwiftUI and AppKit.
     @MainActor
-    private func applyWindowTitleIfNeeded(_ title: String) {
+    private func applyCoherentWindowTitle() {
+        coherentTitlePresentation = resolveCoherentTitlePresentation()
+        let title = coherentTitlePresentation.renderedTitle
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
@@ -1080,7 +1159,8 @@ class WindowState: ObservableObject {
               let tabID = promptManager.activeComposeTabID,
               agentModeViewModel.currentTabID == tabID,
               let tab = workspace.composeTabs.first(where: { $0.id == tabID }),
-              let agentSessionID = agentModeViewModel.explicitActiveSessionID(for: tabID)
+              let agentSessionID = agentModeViewModel.explicitActiveSessionID(for: tabID),
+              titlePresentationAdmits(workspaceID: workspace.id, tabID: tabID)
         else {
             return nil
         }
@@ -1097,7 +1177,8 @@ class WindowState: ObservableObject {
         guard target.windowID == windowID,
               let workspace = workspaceManager.activeWorkspace,
               workspace.id == target.workspaceID,
-              workspace.composeTabs.contains(where: { $0.id == target.tabID })
+              workspace.composeTabs.contains(where: { $0.id == target.tabID }),
+              titlePresentationAdmits(workspaceID: target.workspaceID, tabID: target.tabID)
         else {
             return false
         }
@@ -1180,7 +1261,10 @@ class WindowState: ObservableObject {
             pasteboard.setString(value, forType: .string)
         }
     ) -> Bool {
-        guard !isClosing, target.windowID == windowID else { return false }
+        guard !isClosing,
+              target.windowID == windowID,
+              titlePresentationAdmits(workspaceID: target.workspaceID, tabID: target.tabID)
+        else { return false }
         let copied = agentModeViewModel.copyAgentSessionID(
             target: target,
             isWindowClosing: isClosing,
@@ -1423,9 +1507,10 @@ class WindowState: ObservableObject {
         guard !shouldSuppressObservationSideEffects else { return }
         pendingWindowTitleUpdateTask?.cancel()
         pendingWindowTitleUpdateTask = Task { [weak self] in
-            guard let self else { return }
-            // Ensure this cannot run re-entrantly during a layout/constraints pass.
+            // Ensure this cannot run re-entrantly during a layout/constraints pass. Resolve `self`
+            // only after the hop: a deferred title update must never keep a closing window alive.
             await Task.yield()
+            guard let self else { return }
             guard !shouldSuppressObservationSideEffects else { return }
             performWindowTitleUpdateIfWorkspaceAvailable()
         }
@@ -1433,7 +1518,10 @@ class WindowState: ObservableObject {
 
     @MainActor
     private func performWindowTitleUpdateIfWorkspaceAvailable() {
-        applyWindowTitleIfNeeded(resolvedWindowTitle())
+        applyCoherentWindowTitle()
+        #if DEBUG
+            windowTitleResolutionDidCompleteHandlerForTesting?()
+        #endif
     }
 
     // ------------------------------------------------------------------
@@ -1619,7 +1707,7 @@ class WindowState: ObservableObject {
                 isEphemeral: workspace.isEphemeral,
                 primaryRepoPath: primaryPath,
                 lastFocused: isCurrentlyFocused,
-                workspaceInstanceNumber: workspaceInstanceNumber
+                workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
             )
             return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
         }

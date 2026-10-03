@@ -12,8 +12,8 @@ struct AgentModeSidebarSessionBuilder {
     let authoritativeSessionIDByTabID: [UUID: UUID]
     let sessionIndex: [UUID: AgentSessionIndexEntry]
     let sessionListSortDates: [UUID: Date]
-    let sessionListCacheReady: Bool
-    let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
+    /// Owner-validated restoration baseline; while present it alone positions rows and headings (§5.4).
+    let restoreBaseline: AgentSidebarRestoreBaseline?
     let mcpControlledTabIDs: Set<UUID>
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
 
@@ -25,7 +25,6 @@ struct AgentModeSidebarSessionBuilder {
         let sortDateByTabID: [UUID: Date]
         let resolvedSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
-        let useFrozenRestoreOrder: Bool
     }
 
     func build() -> [SidebarSession] {
@@ -76,6 +75,36 @@ struct AgentModeSidebarSessionBuilder {
         entry.itemCount > 0 || entry.lastUserMessageAt != nil || entry.hasUnknownConversationContent
     }
 
+    /// Captures a restoration baseline from persisted metadata only (§5.3): the existing pin and
+    /// recency comparator over `persistedTabs` (first occurrence wins) with no sessions or index, so
+    /// installation never reproduces raw array order. Includes persisted tabs that are not visible.
+    static func makeRestoreBaseline(
+        for persistedTabs: [ComposeTabState],
+        owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner,
+        now: Date,
+        calendar: Calendar
+    ) -> AgentSidebarRestoreBaseline {
+        var seen = Set<UUID>()
+        let tabs = persistedTabs.filter { seen.insert($0.id).inserted }
+        let tabByID = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0) })
+        let ordered = AgentModeSidebarSessionBuilder(
+            allTabs: tabs,
+            rowTabs: tabs,
+            sessions: [:],
+            authoritativeSessionIDByTabID: [:],
+            sessionIndex: [:],
+            sessionListSortDates: [:],
+            restoreBaseline: nil,
+            mcpControlledTabIDs: []
+        ).build()
+        return AgentSidebarRestoreBaseline(
+            owner: owner,
+            capturedAt: now,
+            calendar: calendar,
+            orderedTabs: ordered.compactMap { tabByID[$0.tabID] }
+        )
+    }
+
     private func makeBuildContext() -> BuildContext {
         var tabByID: [UUID: ComposeTabState] = [:]
         for tab in allTabs where tabByID[tab.id] == nil {
@@ -123,11 +152,7 @@ struct AgentModeSidebarSessionBuilder {
             }),
             sortDateByTabID: sortDateByTabID,
             resolvedSessionIDByTabID: resolvedSessionIDByTabID,
-            bestEntryByTabID: bestEntryByTabID,
-            useFrozenRestoreOrder: shouldFreezeSidebarOrdering(
-                for: rowTabs,
-                resolvedSessionIDByTabID: resolvedSessionIDByTabID
-            )
+            bestEntryByTabID: bestEntryByTabID
         )
     }
 
@@ -172,16 +197,6 @@ struct AgentModeSidebarSessionBuilder {
             sortDateByTabID[tab.id] = sortDate
         }
         return sortDateByTabID
-    }
-
-    private func shouldFreezeSidebarOrdering(
-        for tabs: [ComposeTabState],
-        resolvedSessionIDByTabID: [UUID: UUID]
-    ) -> Bool {
-        guard !sessionListCacheReady, !sidebarRestoreFrozenOrderByTabID.isEmpty else { return false }
-        let sessionBackedTabs = tabs.filter { resolvedSessionIDByTabID[$0.id] != nil }
-        guard !sessionBackedTabs.isEmpty else { return false }
-        return sessionBackedTabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
     }
 
     private func sidebarEntryMap(
@@ -440,12 +455,12 @@ struct AgentModeSidebarSessionBuilder {
             if let manualOrder = manualPinnedOrderComparison(lhs, rhs, pinnedOrderByTabID: context.pinnedOrderByTabID) {
                 return manualOrder
             }
-            if context.useFrozenRestoreOrder {
-                let lhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[lhs.tabID]
-                let rhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[rhs.tabID]
-                switch (lhsFrozenIndex, rhsFrozenIndex) {
-                case let (.some(lhsIndex), .some(rhsIndex)) where lhsIndex != rhsIndex:
-                    return lhsIndex < rhsIndex
+            if let restoreBaseline {
+                // Baseline ordinal within equivalent pin-order peers; uncovered rows follow covered
+                // peers and fall back deterministically, so one missing entry never disables stability.
+                switch (restoreBaseline.entries[lhs.tabID], restoreBaseline.entries[rhs.tabID]) {
+                case let (.some(lhsEntry), .some(rhsEntry)) where lhsEntry.ordinal != rhsEntry.ordinal:
+                    return lhsEntry.ordinal < rhsEntry.ordinal
                 case (.some, .none):
                     return true
                 case (.none, .some):
@@ -643,10 +658,14 @@ struct AgentModeSidebarSessionBuilder {
         from baseSortedSessions: [SidebarSession],
         context: BuildContext
     ) -> [SidebarSession] {
-        if context.useFrozenRestoreOrder {
-            return sidebarSessionsPreservingFlatOrder(
-                prefixedPinnedSidebarSessions(baseSortedSessions)
-            )
+        if let restoreBaseline {
+            // Flat restore layout: parent metadata is retained but children are neither attached nor
+            // collapsed until release; captured buckets decide headings (§5.4).
+            return prefixedPinnedSidebarSessions(baseSortedSessions).map { session in
+                let bucket = restoreBaseline.entries[session.tabID]?.bucket
+                    ?? restoreBaseline.bucket(for: context.tabByID[session.tabID]?.lastModified ?? session.activityDate)
+                return row(session, depth: 0, restorationDateBucket: bucket)
+            }
         }
         if baseSortedSessions.contains(where: { $0.parentSessionID != nil }) {
             return threadedSidebarSessions(
@@ -833,7 +852,11 @@ struct AgentModeSidebarSessionBuilder {
         return result
     }
 
-    private func row(_ session: SidebarSession, depth: Int) -> SidebarSession {
+    private func row(
+        _ session: SidebarSession,
+        depth: Int,
+        restorationDateBucket: AgentSidebarDateSectionBucket? = nil
+    ) -> SidebarSession {
         SidebarSession(
             id: session.id,
             tabID: session.tabID,
@@ -849,6 +872,7 @@ struct AgentModeSidebarSessionBuilder {
             isMCPControlled: session.isMCPControlled,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
+            restorationDateBucket: restorationDateBucket ?? session.restorationDateBucket,
             searchFieldSource: session.searchFieldSource
         )
     }
