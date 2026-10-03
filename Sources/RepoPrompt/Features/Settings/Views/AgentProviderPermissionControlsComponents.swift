@@ -228,6 +228,13 @@ struct CodexProviderToolsRuntimeSection: View {
 
             ProviderRuntimeSubsection(title: "Optional Codex Features") {
                 ProviderRuntimeToggleRow(
+                    title: "Computer Use",
+                    description: "Off by default. Lets a directly started Codex session request access to the screen and control other apps after your session consent. The Codex Computer Use companion needs macOS Screen Recording and Accessibility permissions.",
+                    isOn: tools.computerUseEnabled,
+                    onChange: { onApplyMutation(.computerUse(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
                     title: "Apps",
                     description: "Allow Codex to use connected apps.",
                     isOn: tools.appsEnabled,

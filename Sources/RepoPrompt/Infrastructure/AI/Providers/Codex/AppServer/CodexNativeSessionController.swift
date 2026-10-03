@@ -4732,19 +4732,8 @@ final class CodexNativeSessionController {
         case .authTokensRefresh:
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
-            if Self.isRepoPromptMCPElicitationRequest(params: params) {
-                await respondToServerRequest(
-                    id: request.id,
-                    result: [
-                        "action": "accept",
-                        "content": [String: Any](),
-                        "_meta": [String: Any]()
-                    ]
-                )
-                return
-            }
-            if let autoAcceptResult = await computerUseMCPElicitationAutoAcceptResult(params: params) {
-                await respondToServerRequest(id: request.id, result: autoAcceptResult)
+            if let automaticResult = Self.automaticMCPElicitationResult(params: params) {
+                await respondToServerRequest(id: request.id, result: automaticResult)
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
@@ -4885,50 +4874,22 @@ final class CodexNativeSessionController {
         }
     }
 
+    /// Only RepoPrompt's own permission bridge is auto-answered. Computer Use always reaches
+    /// the ordinary elicitation UI, regardless of Codex approval or sandbox settings.
+    static func automaticMCPElicitationResult(params: [String: Any]) -> [String: Any]? {
+        guard isRepoPromptMCPElicitationRequest(params: params) else { return nil }
+        return [
+            "action": "accept",
+            "content": [String: Any](),
+            "_meta": [String: Any]()
+        ]
+    }
+
     private static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
         MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
             requestToolName: nil,
             requestPayload: params
         ) != nil
-    }
-
-    private func computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
-        let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
-        guard computerUseEnabled,
-              options.approvalPolicyProvider() == .never,
-              options.sandboxModeProvider() == .dangerFullAccess,
-              Self.isComputerUseMCPElicitationRequest(params: params)
-        else {
-            return nil
-        }
-        return [
-            "action": "accept",
-            "content": [String: Any](),
-            "_meta": [
-                "repoPromptAutoAccepted": true,
-                "reason": "explicit_computer_use_full_access"
-            ]
-        ]
-    }
-
-    private static func isComputerUseMCPElicitationRequest(params: [String: Any]) -> Bool {
-        let serverCandidates = [
-            "server",
-            "serverName",
-            "server_name",
-            "mcpServer",
-            "mcp_server",
-            "mcpServerName",
-            "mcp_server_name"
-        ]
-        guard let serverName = firstString(in: params, keys: serverCandidates)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !serverName.isEmpty
-        else {
-            return false
-        }
-        return serverName == computerUseMCPServerName
     }
 
     static func parseMCPElicitationRequest(
@@ -9155,6 +9116,26 @@ final class CodexNativeSessionController {
         )
     }
 
+    /// Uses OpenAI's installed companion without importing the user's Codex home.
+    /// An unavailable companion leaves Computer Use disabled for this session.
+    static func computerUseClientPath(fileManager: FileManager = .default) -> String? {
+        let applications = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        let suffix = "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+        for directory in applications {
+            for appName in ["ChatGPT.app", "Codex.app"] {
+                let path = directory.appendingPathComponent(appName, isDirectory: true)
+                    .appendingPathComponent(suffix).path
+                if fileManager.isExecutableFile(atPath: path) {
+                    return path
+                }
+            }
+        }
+        return nil
+    }
+
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
@@ -9162,7 +9143,8 @@ final class CodexNativeSessionController {
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        computerUseClientPath: String? = computerUseClientPath()
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
@@ -9174,12 +9156,13 @@ final class CodexNativeSessionController {
             webSearchRequestEnabled: preferences.searchToolEnabled,
             modelReasoningSummary: modelReasoningSummary
         )
+        let computerUseClient = computerUseEnabled ? computerUseClientPath : nil
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled,
+                computerUseEnabled: computerUseClient != nil,
                 capabilities: capabilities
             )
         )
@@ -9187,10 +9170,20 @@ final class CodexNativeSessionController {
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            computerUseEnabled: computerUseClient != nil
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
+        }
+        // The session decision is authoritative over any saved server preference.
+        if let computerUseClient {
+            overrides["mcp_servers.computer-use.command"] = computerUseClient
+            overrides["mcp_servers.computer-use.args"] = ["mcp"]
+            overrides["mcp_servers.computer-use.enabled"] = true
+        } else if serverEntries.contains(where: {
+            $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
+        }) {
+            overrides["mcp_servers.computer-use.enabled"] = false
         }
         overrides["features.code_mode.direct_only_tool_namespaces"] = ["mcp__RepoPromptCE"]
         return overrides
@@ -9211,6 +9204,10 @@ final class CodexNativeSessionController {
            })
         {
             effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        } else {
+            effectiveEnabledNames = Set(effectiveEnabledNames.filter {
+                $0.caseInsensitiveCompare(Self.computerUseMCPServerName) != .orderedSame
+            })
         }
         return CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,

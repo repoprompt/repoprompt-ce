@@ -6477,11 +6477,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let wantsMemories = CodexMemories.isEnabled
         let wantsCapabilities = codexCapabilitiesForLaunch(session.isMCPRelated)
-        let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
-        if !codexComputerUseFeatureEnabled {
+        let canUseComputer = await viewModel?.codexComputerUseIsEligible(session) == true
+            && viewModel?.codexComputerUseClientPathProvider() != nil
+        if !canUseComputer {
             session.pendingCodexComputerUseActivation = nil
         }
-        var wantsComputerUse = session.wantsCodexComputerUseForNextTurn && codexComputerUseFeatureEnabled
+        var wantsComputerUse = session.wantsCodexComputerUseForNextTurn && canUseComputer
         var desiredFeatureState = AgentTabSession.CodexControllerFeatureState(
             computerUseEnabled: wantsComputerUse,
             goalSupportEnabled: wantsGoalSupport,
@@ -6566,12 +6567,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             let refreshedTaskLabelKind = session.mcpControlContext?.taskLabelKind
             let refreshedPermissionProfile = session.permissionProfile
-            let refreshedComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
-            if !refreshedComputerUseFeatureEnabled {
+            let refreshedCanUseComputer = await viewModel?.codexComputerUseIsEligible(session) == true
+                && viewModel?.codexComputerUseClientPathProvider() != nil
+            if !refreshedCanUseComputer {
                 session.pendingCodexComputerUseActivation = nil
             }
             let refreshedWantsComputerUse = session.wantsCodexComputerUseForNextTurn
-                && refreshedComputerUseFeatureEnabled
+                && refreshedCanUseComputer
             let refreshedFeatureState = AgentTabSession.CodexControllerFeatureState(
                 computerUseEnabled: refreshedWantsComputerUse,
                 goalSupportEnabled: CodexGoalSupport.isEnabled,
@@ -9041,7 +9043,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 // fallback-ownership guard already refuses to abandon it. A successor that was stale
                 // or permanently rejected leaves no queue behind — gating on its mere presence would
                 // strand the cycle on a session that has nothing left to re-drive it.
-                settleCodexComputerUseActivationAfterTurn(session, reason: reason)
                 codexRepairSessionLinkCatalogIfQuiescent(for: session)
                 if session.codexController != nil {
                     scheduleCodexIdleShutdownIfNeeded(for: session, reason: reason)
@@ -9058,21 +9059,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private func settleCodexComputerUseActivationAfterTurn(
-        _ session: AgentTabSession,
-        reason: String
-    ) {
-        let hadActivation = session.pendingCodexComputerUseActivation != nil
-        session.pendingCodexComputerUseActivation = nil
-        guard session.codexControllerFeatureState?.computerUseEnabled == true else { return }
+    func disarmComputerUse(session: AgentTabSession) {
+        guard !session.runState.isActive,
+              session.codexControllerFeatureState?.computerUseEnabled == true
+        else { return }
         _ = invalidateCodexControllerForReconnect(
             session: session,
             expectedController: session.codexController,
-            source: "computer-use-turn-finished-\(reason)"
+            source: "computer-use-disarmed"
         )
-        if hadActivation {
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        }
     }
 
     private func codexEventScopeMatches(
@@ -11760,7 +11755,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // captured by the caller in the same main-actor region).
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         clearCodexNativeToolLiveness(session)
-        settleCodexComputerUseActivationAfterTurn(session, reason: "user-cancel")
         if let controller {
             retireCodexController(
                 controller,

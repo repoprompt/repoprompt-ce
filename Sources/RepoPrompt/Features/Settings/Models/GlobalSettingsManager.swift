@@ -1400,6 +1400,20 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
     }
 
+    func codexComputerUseEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexComputerUseEnabled == true
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let previous = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        if previous != codexComputerUseEnabled() {
+            NotificationCenter.default.post(name: .codexComputerUseAvailabilityDidChange, object: nil)
+        }
+    }
+
     func codexGoalSupportEnabled() -> Bool {
         CodexGoalSupport.isEnabled(persistedValue: scalarPreferences.agentMode?.codexGoalSupportEnabled)
     }

@@ -672,6 +672,41 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
+    func testComputerUseArmingFenceRefusesLinkAddInEitherDirection() async {
+        let fixture = makeFixture()
+        XCTAssertTrue(fixture.bridge.beginComputerUseArming(sessionID: fixture.observer.sessionID))
+        guard case .rejected = await addLink(fixture) else { return XCTFail("Add crossed arming fence") }
+        fixture.bridge.endComputerUseArming(sessionID: fixture.observer.sessionID)
+
+        XCTAssertTrue(fixture.bridge.beginComputerUseArming(sessionID: fixture.target.sessionID))
+        guard case .rejected = await addLink(fixture) else { return XCTFail("Target Add crossed arming fence") }
+        fixture.bridge.endComputerUseArming(sessionID: fixture.target.sessionID)
+        let links = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        XCTAssertTrue(links.items.isEmpty)
+    }
+
+    func testComputerUseArmingFenceRefusesInFlightLinkAdd() async {
+        let fixture = makeFixture()
+        let inserted = expectation(description: "Add reached durable insertion")
+        let completed = expectation(description: "Add completed")
+        var release: CheckedContinuation<Void, Never>?
+        fixture.bridge.test_afterAddInsertionBeforeEstablishment = { _ in
+            inserted.fulfill()
+            await withCheckedContinuation { release = $0 }
+        }
+        Task { @MainActor in
+            _ = await addLink(fixture)
+            completed.fulfill()
+        }
+        await fulfillment(of: [inserted], timeout: 3)
+        XCTAssertFalse(fixture.bridge.beginComputerUseArming(sessionID: fixture.observer.sessionID))
+        XCTAssertFalse(fixture.bridge.beginComputerUseArming(sessionID: fixture.target.sessionID))
+        release?.resume()
+        await fulfillment(of: [completed], timeout: 3)
+        XCTAssertTrue(fixture.bridge.beginComputerUseArming(sessionID: fixture.observer.sessionID))
+        fixture.bridge.endComputerUseArming(sessionID: fixture.observer.sessionID)
+    }
+
     /// Reads the live link reference from the authority rather than assuming generation numbering.
     private func linkReference(
         _ fixture: Fixture,

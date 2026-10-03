@@ -1082,6 +1082,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// establishment, and compensation. This is distinct from the retirement lane so Stop can still
     /// settle an in-flight establishment without deadlocking its rollback.
     private var pairEstablishmentBarriers: [AgentSessionOversightIntent: PairEstablishmentLane] = [:]
+    /// MainActor admission fence: a Computer Use arm cannot race an Add already past candidate lookup.
+    private var linkEstablishmentsBySessionID: [UUID: Int] = [:]
+    private var computerUseArmingSessionIDs: Set<UUID> = []
     private var bookkeepingByReference: [DomainAgentSessionLinkReference: ReferenceBookkeeping] = [:]
     /// Process-memory, observer-local unread baselines. Never persisted and never agent-visible.
     private var monitorSeenByReference: [DomainAgentSessionLinkReference: MonitorSeenRecord] = [:]
@@ -2240,6 +2243,39 @@ final class AgentSessionLinkRuntimeBridge {
 
     // MARK: - Add
 
+    /// Claim the gap between the live-link read and recording human Computer Use consent.
+    /// The caller must end the claim synchronously after it commits or refuses the arm.
+    func beginComputerUseArming(sessionID: UUID) -> Bool {
+        guard linkEstablishmentsBySessionID[sessionID, default: 0] == 0,
+              computerUseArmingSessionIDs.insert(sessionID).inserted
+        else { return false }
+        return true
+    }
+
+    func endComputerUseArming(sessionID: UUID) {
+        computerUseArmingSessionIDs.remove(sessionID)
+    }
+
+    private func beginLinkEstablishment(_ pair: AgentSessionOversightIntent) -> Bool {
+        let ids = Set([pair.observerSessionID, pair.targetSessionID])
+        guard ids.isDisjoint(with: computerUseArmingSessionIDs) else { return false }
+        for id in ids {
+            linkEstablishmentsBySessionID[id, default: 0] += 1
+        }
+        return true
+    }
+
+    private func endLinkEstablishment(_ pair: AgentSessionOversightIntent) {
+        for id in Set([pair.observerSessionID, pair.targetSessionID]) {
+            let remaining = linkEstablishmentsBySessionID[id, default: 0] - 1
+            if remaining > 0 {
+                linkEstablishmentsBySessionID[id] = remaining
+            } else {
+                linkEstablishmentsBySessionID.removeValue(forKey: id)
+            }
+        }
+    }
+
     /// Durable-intent transaction around one user-authorized Add.
     ///
     /// Ordering is the contract: persistence commits *before* the reservation, so a reported Add
@@ -2320,6 +2356,10 @@ final class AgentSessionLinkRuntimeBridge {
         requiresExistingDirectLink: Bool = false,
         proof: AgentSessionOversightRestorationProof? = nil
     ) async -> AgentMonitorAddOutcome {
+        guard beginLinkEstablishment(pair) else {
+            return .rejected(message: "Disarm Computer Use before linking this session.")
+        }
+        defer { endLinkEstablishment(pair) }
         let expectedEndpoints = AddEndpointExpectations(
             observer: expectedObserverEndpoint,
             target: expectedTargetEndpoint,
@@ -7523,6 +7563,10 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
         assertedAt generation: UInt64?,
         proof: AgentSessionOversightRestorationProof?
     ) async -> EstablishmentResult {
+        guard beginLinkEstablishment(pair) else {
+            return EstablishmentResult(outcome: .rejected(message: "Disarm Computer Use before linking this session."))
+        }
+        defer { endLinkEstablishment(pair) }
         guard !isFrozenForTermination else {
             return EstablishmentResult(
                 outcome: .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)

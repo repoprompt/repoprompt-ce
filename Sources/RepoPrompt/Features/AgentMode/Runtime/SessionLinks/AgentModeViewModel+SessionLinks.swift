@@ -246,7 +246,11 @@ extension AgentModeViewModel {
         isWindowClosing: Bool,
         includeLocation: Bool
     ) -> AgentSessionLinkEndpointCandidate? {
-        guard let sessionID = identity.sessionID else { return nil }
+        // An armed computer-control session is not linkable; linking can resume after Disarm.
+        guard let sessionID = identity.sessionID,
+              session.pendingCodexComputerUseActivation == nil,
+              !(session.runState.isActive && session.codexControllerFeatureState?.computerUseEnabled == true)
+        else { return nil }
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: identity.workspaceID,

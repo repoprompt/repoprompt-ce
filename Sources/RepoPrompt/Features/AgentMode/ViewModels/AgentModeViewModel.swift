@@ -634,6 +634,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// same session UUID is refused the previous incarnation's inventory rather than inheriting it.
     var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] = [:]
 
+    /// Injectable in fake-backed tests; production resolves only OpenAI's installed companion.
+    var codexComputerUseClientPathProvider: () -> String? = {
+        CodexNativeSessionController.computerUseClientPath()
+    }
+
+    var codexComputerUseEnabledProvider: () -> Bool = {
+        CodexComputerUseWorkflow.isEnabled
+    }
+
     /// Latest server-observed MCP catalog projection for each exact observer incarnation.
     var agentSessionLinkRunCatalogProjectionByEndpoint:
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
@@ -2547,6 +2556,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restoreLastUsedAgentSelectionIfNeeded()
 
         setupObservers()
+        NotificationCenter.default.publisher(for: .codexComputerUseAvailabilityDidChange)
+            .sink { [weak self] _ in
+                guard let self, !CodexComputerUseWorkflow.isEnabled else { return }
+                for tabID in sessions.keys where codexComputerUseIsArmed(tabID: tabID) {
+                    disarmCodexComputerUse(tabID: tabID)
+                }
+            }
+            .store(in: &cancellables)
         modelRouterRuntime?.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.handleModelRouterRuntimeChanged() }
@@ -16132,6 +16149,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
             sourceSnapshot.applySessionSettings(to: destinationSession)
+            if sourceSession.wantsCodexComputerUseForNextTurn {
+                let transferred = await transferCodexComputerUseActivation(
+                    from: sourceSession, to: destinationSession
+                )
+                guard transferred else {
+                    await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
+                    return .blocked(message: "Computer Use could not be enabled for this new session. Try again after its link state settles.")
+                }
+            }
             if !pendingState.isEmpty {
                 installPendingUserTurnState(pendingState, on: destinationSession)
             }
@@ -16522,6 +16548,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if CodexComputerUseWorkflow.explicitRequestArguments(in: trimmedText) != nil,
+           session.pendingCodexComputerUseActivation == nil
+        {
+            return .blocked(message: "Allow Computer Use in this session before sending /computer-use.")
+        }
         let attachmentsToSend = session.pendingImageAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
@@ -17251,12 +17282,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             bubbleText = "Sent \(attachmentsToSend.count) image\(attachmentsToSend.count == 1 ? "" : "s")"
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
-        }
-        if nativePreparedTurn?.shouldEnableCodexComputerUse == true {
-            session.pendingCodexComputerUseActivation = CodexComputerUseActivation(
-                id: UUID(),
-                createdAt: Date()
-            )
         }
         let stagedCodexComputerUseActivationID = session.pendingCodexComputerUseActivation?.id
 

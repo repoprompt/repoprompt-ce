@@ -16,6 +16,9 @@ struct AgentComposerActions {
     let loadDraft: (_ tabID: UUID) -> AgentComposerDraftSnapshot
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
+    let computerUseIsArmed: (_ tabID: UUID) -> Bool
+    let armComputerUse: (_ target: AgentComposerSubmitTarget) async -> String?
+    let disarmComputerUse: (_ tabID: UUID) -> Void
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let cancelRouting: (_ tabID: UUID) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
@@ -118,6 +121,11 @@ struct AgentInputBar: View {
             executeSubmit: { claim, text in
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
             },
+            computerUseIsArmed: { tabID in agentModeVM.codexComputerUseIsArmed(tabID: tabID) },
+            armComputerUse: { target in
+                await agentModeVM.armCodexComputerUse(tabID: target.tabID, expectedTarget: target)
+            },
+            disarmComputerUse: { tabID in agentModeVM.disarmCodexComputerUse(tabID: tabID) },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
@@ -172,16 +180,25 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar.statusPills")
         #endif
-        AgentStatusPillsRow(
-            agentModeVM: agentModeVM,
-            statusPillsUI: statusPillsUI,
-            openContextDrawerFiles: openContextDrawerFiles,
-            oracleViewModel: oracleViewModel,
-            promptManager: promptManager,
-            selectionCoordinator: selectionCoordinator,
-            runtimeVM: runtimeVM,
-            windowID: windowID
-        )
+        HStack(spacing: 8) {
+            AgentStatusPillsRow(
+                agentModeVM: agentModeVM,
+                statusPillsUI: statusPillsUI,
+                openContextDrawerFiles: openContextDrawerFiles,
+                oracleViewModel: oracleViewModel,
+                promptManager: promptManager,
+                selectionCoordinator: selectionCoordinator,
+                runtimeVM: runtimeVM,
+                windowID: windowID
+            )
+            if let currentTabID, agentModeVM.codexComputerUseIsArmed(tabID: currentTabID) {
+                Button("Computer Use armed · Disarm") {
+                    agentModeVM.disarmCodexComputerUse(tabID: currentTabID)
+                }
+                .buttonStyle(.bordered)
+                .hoverTooltip("Disarm this session's screen and app control")
+            }
+        }
         .padding(.horizontal, 28)
     }
 }
@@ -274,6 +291,9 @@ struct AgentComposerView: View, Equatable {
     @State private var isSyncingDraftFromSession: Bool = false
     @State private var isImageDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
+    @State private var showingComputerUseConsent = false
+    @State private var computerUseConsentTarget: AgentComposerSubmitTarget?
+    @State private var computerUseConsentDraft: String?
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
     @State private var steeringUnsupportedMessage: String? = nil
@@ -563,6 +583,51 @@ struct AgentComposerView: View, Equatable {
         }
         .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
         .overlay(imageDropOutline)
+        .alert("Allow Computer Use in this session?", isPresented: $showingComputerUseConsent) {
+            Button("Allow") {
+                guard let target = computerUseConsentTarget,
+                      let draft = computerUseConsentDraft,
+                      currentTabID == target.tabID,
+                      computerUseTargetIsCurrent(target),
+                      localInputText == draft
+                else {
+                    clearComputerUseConsent()
+                    return
+                }
+                clearComputerUseConsent()
+                Task { @MainActor in
+                    if let refusal = await actions.armComputerUse(target) {
+                        showSteeringUnsupportedNotice(refusal)
+                    } else if currentTabID == target.tabID,
+                              computerUseTargetIsCurrent(target),
+                              localInputText == draft
+                    {
+                        sendMessage()
+                    } else {
+                        actions.disarmComputerUse(target.tabID)
+                    }
+                }
+            }
+            Button("Send without Computer Use") {
+                guard let target = computerUseConsentTarget,
+                      let draft = computerUseConsentDraft,
+                      let arguments = CodexComputerUseWorkflow.explicitRequestArguments(in: draft),
+                      !arguments.isEmpty,
+                      currentTabID == target.tabID,
+                      computerUseTargetIsCurrent(target),
+                      localInputText == draft
+                else {
+                    clearComputerUseConsent()
+                    return
+                }
+                clearComputerUseConsent()
+                setLocalInputText(arguments, isExternalUpdate: true)
+                sendMessage()
+            }
+            Button("Cancel", role: .cancel) { clearComputerUseConsent() }
+        } message: {
+            Text("Codex may read your screen and control other apps. macOS will ask for the companion's Screen Recording and Accessibility permissions.")
+        }
     }
 
     // MARK: - Transient Submit Guidance
@@ -1558,6 +1623,19 @@ struct AgentComposerView: View, Equatable {
 
     // MARK: - Actions
 
+    private func clearComputerUseConsent() {
+        computerUseConsentTarget = nil
+        computerUseConsentDraft = nil
+    }
+
+    private func computerUseTargetIsCurrent(_ expected: AgentComposerSubmitTarget) -> Bool {
+        guard let current = renderedSubmitTarget else { return false }
+        return current.tabID == expected.tabID
+            && current.expectedSourceTabSessionIdentity == expected.expectedSourceTabSessionIdentity
+            && current.expectedPersistentBindingIdentity == expected.expectedPersistentBindingIdentity
+            && current.expectedBindingTransitionGeneration == expected.expectedBindingTransitionGeneration
+    }
+
     private func sendMessage() {
         guard !submissionLatch.isLatched(for: currentTabID) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
@@ -1577,6 +1655,15 @@ struct AgentComposerView: View, Equatable {
         guard let submitTarget = renderedSubmitTarget else {
             logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+            return
+        }
+        if globalSettings.codexComputerUseEnabled(),
+           CodexComputerUseWorkflow.explicitRequestArguments(in: trimmed) != nil,
+           !actions.computerUseIsArmed(submitTarget.tabID)
+        {
+            computerUseConsentTarget = submitTarget
+            computerUseConsentDraft = rawDraftSnapshot
+            showingComputerUseConsent = true
             return
         }
         guard let attempt = submissionLatch.begin(
