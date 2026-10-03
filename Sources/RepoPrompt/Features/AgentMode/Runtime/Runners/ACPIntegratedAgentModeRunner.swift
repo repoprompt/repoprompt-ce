@@ -1980,10 +1980,17 @@ final class ACPIntegratedAgentModeRunner {
                 updated.toolInvocationID = resolvedInvocationID
             }
             updated.toolName = storedToolName
-            updated.toolResultJSON = resultJSON
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-            updated.toolIsError = isError
-            updated.text = resultJSON
+            if let payload = AgentToolResultPayloadRetention.resolvedPayload(
+                existing: updated.toolResultJSON,
+                incoming: resultJSON,
+                incomingIsError: isError,
+                requireObjectReplacement: true
+            ) {
+                updated.toolResultJSON = payload
+                updated.toolIsError = isError
+                updated.text = payload
+            }
             if !hadResult, hasNonEmptyPayload(resultJSON) {
                 toolTrackingHooks.addToolOutputTokens(resultJSON, session)
             }
@@ -2153,14 +2160,11 @@ final class ACPIntegratedAgentModeRunner {
                 indexedIndices: session.indexedToolItemIndices(invocationID: invocationID),
                 session: session,
                 where: {
+                    // An exact invocation ID identifies the same call even when a
+                    // provider re-sends its completion with different or missing
+                    // args (Devin over ACP), so it must not become a second card.
                     $0.kind == .toolResult
                         && $0.toolInvocationID == invocationID
-                        && self.shouldUpdateExistingToolResult(
-                            $0,
-                            storedToolName: storedToolName,
-                            argsJSON: argsJSON,
-                            tabID: session.tabID
-                        )
                 }
             )
             inspectedItemCount += resultCandidates.inspectedItemCount
@@ -2604,10 +2608,17 @@ final class ACPIntegratedAgentModeRunner {
                 updated.kind = .toolResult
                 updated.toolName = storedToolName
                 updated.toolInvocationID = updated.toolInvocationID ?? result.invocationID
-                updated.toolResultJSON = result.resultJSON
                 updated.toolArgsJSON = result.argsJSON ?? updated.toolArgsJSON
-                updated.toolIsError = result.isError
-                updated.text = result.resultJSON
+                if let payload = AgentToolResultPayloadRetention.resolvedPayload(
+                    existing: updated.toolResultJSON,
+                    incoming: result.resultJSON,
+                    incomingIsError: result.isError,
+                    requireObjectReplacement: true
+                ) {
+                    updated.toolResultJSON = payload
+                    updated.toolIsError = result.isError
+                    updated.text = payload
+                }
                 if !hadResult, hasNonEmptyPayload(result.resultJSON) {
                     toolTrackingHooks.addToolOutputTokens(result.resultJSON, session)
                 }
