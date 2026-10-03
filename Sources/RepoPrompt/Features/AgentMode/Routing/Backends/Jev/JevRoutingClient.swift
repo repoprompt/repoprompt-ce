@@ -70,6 +70,15 @@ protocol JevRoutingClientProtocol: Sendable {
 
 struct JevRoutingClient: JevRoutingClientProtocol {
     static let baseURL = URL(string: "https://api.typesafe.ai")!
+    /// Vercel AI Gateway exposes the same TypeSafe wire API under `/typesafe`.
+    static let gatewayBaseURL = URL(string: "https://ai-gateway.vercel.sh/typesafe")!
+    static let gatewayModel = "typesafe-ai/jev"
+    static let gatewayKeyPrefix = "vck_"
+
+    /// AI Gateway keys (`vck_…`) route through Vercel; every other key goes straight to TypeSafe.
+    static func usesGateway(apiKey: String) -> Bool {
+        apiKey.hasPrefix(gatewayKeyPrefix)
+    }
     static let outerDeadline: Duration = .seconds(5)
 
     private let transport: any JevHTTPTransport
@@ -97,9 +106,17 @@ struct JevRoutingClient: JevRoutingClientProtocol {
         apiKey: String,
         timeout: Duration = Self.outerDeadline
     ) async throws -> JevRoutingWireResponse {
-        let body = try encoder.encode(wireRequest)
+        let gateway = Self.usesGateway(apiKey: apiKey)
+        let sent = gateway
+            ? JevRoutingWireRequest(model: Self.gatewayModel, state: wireRequest.state, questions: wireRequest.questions)
+            : wireRequest
+        let body = try encoder.encode(sent)
         let request = try makeRequest(path: "/v1/systemone", method: "POST", apiKey: apiKey, body: body, timeout: timeout)
-        return try await perform(request, timeout: timeout, as: JevRoutingWireResponse.self)
+        let response = try await perform(request, timeout: timeout, as: JevRoutingWireResponse.self)
+        // The gateway names the evaluator by its gateway id; map it back to the pinned model
+        // so the response interpreter's evaluator check stays strict.
+        guard gateway, response.model == Self.gatewayModel else { return response }
+        return JevRoutingWireResponse(model: wireRequest.model, answers: response.answers, usage: response.usage)
     }
 
     private func makeRequest(
@@ -109,7 +126,8 @@ struct JevRoutingClient: JevRoutingClientProtocol {
         body: Data?,
         timeout: Duration
     ) throws -> URLRequest {
-        guard let url = URL(string: path, relativeTo: Self.baseURL) else { throw JevRoutingClientError.invalidResponse }
+        let base = Self.usesGateway(apiKey: apiKey) ? Self.gatewayBaseURL : Self.baseURL
+        guard let url = URL(string: base.absoluteString + path) else { throw JevRoutingClientError.invalidResponse }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = method
         request.httpBody = body

@@ -198,7 +198,9 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     static func isSupportedModelName(_ name: String) -> Bool {
-        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // AI Gateway lists the evaluator as `typesafe-ai/jev`.
+        if normalized.hasPrefix("typesafe-ai/") { normalized.removeFirst("typesafe-ai/".count) }
         return normalized == "jev" || normalized == "jev-latest" || normalized.hasPrefix("jev-")
     }
 
@@ -257,7 +259,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
         case let .saved(_, supportedModel):
             .succeeded("Key verified. \(supportedModel) is available and routing is ready.")
         case .missingKey:
-            .missingSecret("Enter a TypeSafe API key.")
+            .missingSecret("Enter a TypeSafe or Vercel AI Gateway API key.")
         case .superseded:
             .superseded("Validation was cancelled or superseded.")
         case let .failed(message):

@@ -139,6 +139,16 @@ final class JevRouterCredentialServiceTests: XCTestCase {
             return XCTFail("Late success must not republish validated readiness")
         }
     }
+
+    func testSupportedModelNameAcceptsGatewayPrefixedNames() {
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("jev"))
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("jev-latest"))
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("jev-1.13.0"))
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("typesafe-ai/jev"))
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("typesafe-ai/jev-latest"))
+        XCTAssertTrue(JevRouterCredentialService.isSupportedModelName("typesafe-ai/jev-1.13.0"))
+        XCTAssertFalse(JevRouterCredentialService.isSupportedModelName("anthropic/claude-3-5-sonnet"))
+    }
 }
 
 private extension AsyncStream where Element == AgentTaskRouterBackendReadiness {

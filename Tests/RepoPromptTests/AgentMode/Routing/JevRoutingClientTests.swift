@@ -113,6 +113,39 @@ final class JevRoutingClientTests: XCTestCase {
             }
         }
     }
+
+    func testGatewayKeyUsesGatewayBaseURLAndRewritesModel() async throws {
+        let body = #"{"model":"typesafe-ai/jev","answers":{"route":{"type":"choice","choice":"opaque-a","probabilities":{"opaque-a":0.6,"opaque-b":0.4},"confidence":0.8}},"usage":{"input_tokens":4,"output_tokens":1}}"#
+        let transport = RecordingJevTransport(status: 200, body: body)
+        let wire = JevRoutingWireRequest(
+            model: JevRouterCredentialService.pinnedModel,
+            state: "task",
+            questions: ["route": .init(
+                type: "choice",
+                instructions: "Choose one supplied task-handling rubric.",
+                criteria: ["opaque-a": "Explore", "opaque-b": "Engineer"]
+            )]
+        )
+        let response = try await JevRoutingClient(transport: transport).judge(request: wire, apiKey: "vck_gateway_test_key", timeout: .seconds(5))
+        let request = try XCTUnwrap(transport.lastRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://ai-gateway.vercel.sh/typesafe/v1/systemone")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer vck_gateway_test_key")
+
+        let encoded = try XCTUnwrap(request.httpBody)
+        let decoded = try JSONDecoder().decode(DecodedJevWireRequest.self, from: encoded)
+        XCTAssertEqual(decoded.model, JevRoutingClient.gatewayModel)
+        XCTAssertEqual(response.model, JevRouterCredentialService.pinnedModel)
+    }
+
+    func testGatewayKeyUsesGatewayBaseURLForModelValidation() async throws {
+        let transport = RecordingJevTransport(status: 200, body: #"{"models":[{"name":"typesafe-ai/jev"}]}"#)
+        let response = try await JevRoutingClient(transport: transport).listModels(apiKey: "vck_gateway_test_key", timeout: .seconds(5))
+        XCTAssertEqual(response.models.map(\.name), ["typesafe-ai/jev"])
+        let request = try XCTUnwrap(transport.lastRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://ai-gateway.vercel.sh/typesafe/v1/models")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer vck_gateway_test_key")
+    }
 }
 
 /// Decodable mirror of the encode-only wire request, so the test can assert the transmitted batch
