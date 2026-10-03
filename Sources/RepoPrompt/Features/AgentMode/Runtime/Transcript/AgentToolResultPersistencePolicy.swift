@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct AgentSanitizedToolResult: Equatable {
     let text: String
@@ -2233,10 +2234,13 @@ enum AgentToolResultPersistencePolicy {
                let code = smallStringValue(rawError, keys: ["code"])
             {
                 let message = trimmedStorageString(stringValue(rawError, keys: ["message"])) ?? code
-                lane["error"] = [
-                    "code": code,
-                    "message": message.count <= 96 ? message : String(message.prefix(95)) + "…"
-                ]
+                var boundedMessage = message.count <= 96 ? message : String(message.prefix(95)) + "…"
+                if OracleLaneError.indicatesTimeout(code: code, message: message),
+                   !OracleLaneError.indicatesTimeout(code: code, message: boundedMessage)
+                {
+                    boundedMessage = "Timed out: " + String(message.prefix(84)) + "…"
+                }
+                lane["error"] = ["code": code, "message": boundedMessage]
             }
             lanes.append(lane)
         }

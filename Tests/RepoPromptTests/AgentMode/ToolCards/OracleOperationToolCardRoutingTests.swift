@@ -612,6 +612,53 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
 }
 
 final class OracleLaneCoverageTests: XCTestCase {
+    func testTimeoutReasonBeyondDigestCutoffSurvivesRepeatedSummary() throws {
+        for timedOut in [false, true] {
+            let reply = try canonicalGroupPayload(completedCount: 1, errorMessage: String(repeating: "x", count: 96) + (timedOut ? " request timed out" : " provider refused"))
+            var item = AgentChatItem(kind: .toolResult, text: "", toolName: "ask_oracle", toolResultJSON: jsonString(reply), toolIsError: false)
+            for pass in 0 ... 2 {
+                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON))
+                let coverage = try XCTUnwrap(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
+                XCTAssertEqual(coverage.incompleteLanes.map(\.reason), [timedOut ? "timed out" : "failed"], "pass \(pass)")
+                if pass > 0 {
+                    XCTAssertEqual(dto.oracleResults?.last?.error?.code, "provider_error")
+                    XCTAssertLessThanOrEqual(dto.oracleResults?.last?.error?.message.count ?? Int.max, 96)
+                }
+                if pass < 2 {
+                    item.toolResultJSON = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item)).resultJSON
+                }
+            }
+        }
+    }
+
+    private func canonicalGroupPayload(
+        completedCount: Int, laneCount: Int = 2, oversized: Bool = false, errorMessage: String = "Request timed out"
+    ) throws -> [String: Any] {
+        let lanes = try (0 ..< laneCount).map { index in
+            let model = oversized ? "model-\(index)-" + String(repeating: "m", count: 48) : "model-\(index)"
+            return try OracleLaneResult(
+                laneIndex: index, chatID: "fixture-chat-\(index)", providerID: "custom", modelID: model,
+                status: index < completedCount ? .completed : .failed,
+                executionProfile: OracleExecutionProfile(providerID: "custom", modelID: model),
+                response: index < completedCount ? "RESPONSE_BODY-\(index)" : nil,
+                error: index < completedCount ? nil : OracleLaneError(
+                    code: "provider_error", message: oversized ? String(repeating: "e", count: 96) : errorMessage,
+                    partialResponse: "PARTIAL_RESPONSE_BODY-\(index)"
+                )
+            )
+        }
+        let group = try OracleGroupResult(
+            groupID: OracleGroupID(rawValue: UUID()),
+            status: completedCount == laneCount ? .completed : completedCount == 0 ? .failed : .partialFailure,
+            oracleResults: lanes
+        )
+        var reply = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(OracleGroupMCPCodec.groupFields(group))) as? [String: Any])
+        reply["chat_id"] = group.primary.chatID
+        reply["mode"] = "review"
+        reply["response"] = group.primary.response
+        return reply
+    }
+
     func testCoverageIsSilentForSingleLaneResults() {
         XCTAssertNil(OracleLaneCoverage(lanes: nil, oracleCount: nil))
         XCTAssertNil(OracleLaneCoverage(lanes: [lane(0, "gpt-6.1-sol", "completed")], oracleCount: 1))

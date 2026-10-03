@@ -67,8 +67,7 @@ struct OracleLaneCoverage: Equatable {
         status: String,
         error: ToolResultDTOs.ChatSendDTO.OracleLaneErrorDTO?
     ) -> String {
-        let haystack = "\(error?.code ?? "") \(error?.message ?? "")".lowercased()
-        if haystack.contains("timeout") || haystack.contains("timed out") || haystack.contains("timed_out") {
+        if OracleLaneError.indicatesTimeout(code: error?.code, message: error?.message) {
             return "timed out"
         }
         if status == OracleLaneResultStatus.cancelled.rawValue || error?.code == "cancelled" {
