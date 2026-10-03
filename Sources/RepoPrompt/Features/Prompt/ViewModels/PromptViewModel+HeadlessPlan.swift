@@ -112,15 +112,28 @@ extension PromptViewModel {
 
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
+        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
+        // Oracle-bound headless prompts (Context Builder) must not silently omit selected files.
+        let requiresSelectedFileContent = oraclePromptConfiguration != nil
+        if requiresSelectedFileContent, headlessConfig.includeFiles {
+            try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                store: workspaceFileContextStore
+            )
+        }
 
         return try await withPreassembledPromptContext(
             cfg: headlessConfig,
             selection: snapshot.selection,
-            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
+            lookupContext: lookupContext,
             reviewGitContext: snapshot.reviewGitContext,
             sourceTabID: snapshot.tabID,
             finalReviewAuthorization: snapshot.finalReviewAuthorization
         ) { preAssembly in
+            if requiresSelectedFileContent {
+                try PromptSelectedFileContentRequirement.validate(preAssembly, config: headlessConfig)
+            }
             let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
                 preAssembly.entries
             )
