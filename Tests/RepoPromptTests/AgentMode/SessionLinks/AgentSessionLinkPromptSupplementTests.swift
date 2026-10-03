@@ -4316,7 +4316,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
     }
 
-    func testActiveInventoryWaitsForExactMonotonicCatalogReadiness() throws {
+    func testActiveInventoryAndClaimIdentityAreIndependentOfCatalogFreshness() throws {
         let fixture = try makeFixture(catalogReady: false)
         fixture.session.selectedAgent = .codexExec
         try publish(fixture, revision: 1, targetCount: 1)
@@ -4327,15 +4327,15 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             session: fixture.session,
             dispatchID: ordinaryDispatchID
         )
-        XCTAssertEqual(beforeReady.text, "hello")
-        XCTAssertNil(beforeReady.claim, "the inventory claim remains owed while the catalog is unready")
+        XCTAssertEqual(beforeReady.claim?.kind, .inventory)
+        XCTAssertTrue(beforeReady.text.contains(AgentSessionLinkPrompts.envelopeTag))
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPromptClaimOutcome(
                 for: fixture.session,
                 dispatchID: .autoWake(wakeID: UUID())
             ),
             .requiredLaneBatchUnavailable,
-            "a lane-only dispatch must fail closed while the catalog is unready"
+            "a lane-only dispatch still needs a required passive batch, not just membership"
         )
 
         try publishCatalogProjection(fixture, revision: 4, hasAgentSessionLink: false)
@@ -4346,12 +4346,12 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             connectionID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-0000000057A1"))
         )
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
-        XCTAssertNil(
+        XCTAssertEqual(
             fixture.viewModel.agentSessionLinkPromptClaim(
                 for: fixture.session,
                 dispatchID: ordinaryDispatchID
-            ),
-            "stale-route and out-of-order same-route readiness cannot lower the fence"
+            ), beforeReady.claim,
+            "stale-route and out-of-order discovery cannot alter a membership claim"
         )
 
         try publishCatalogProjection(fixture, revision: 5, hasAgentSessionLink: true)
@@ -4360,8 +4360,13 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             session: fixture.session,
             dispatchID: ordinaryDispatchID
         )
-        XCTAssertEqual(ready.claim?.kind, .inventory)
+        XCTAssertEqual(ready.claim, beforeReady.claim)
         XCTAssertTrue(ready.text.contains(AgentSessionLinkPrompts.envelopeTag))
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(ready.claim)
+        let afterAcceptance = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "next", session: fixture.session, dispatchID: .codexNativeSend(UUID())
+        )
+        XCTAssertNil(afterAcceptance.claim, "a tool refresh must not create duplicate delivery")
     }
 
     func testLowerRevisionForANewCurrentRunReplacesHigherOldRunProjection() throws {

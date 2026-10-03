@@ -1,12 +1,12 @@
 {
-  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. Explicitly approved creation/activation repair requires a minimal +88-line allowance after current-main integration, setting the app-line ceiling to 651794 with unchanged 2000-line headroom.",
+  "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice. Approved oversight route correction and lifecycle-fence follow-up set the app-line baseline to the exact measured 652061 with zero headroom. The follow-up adds 103 app implementation lines over the previous 651958 ceiling; the prior 2000-line headroom is removed, not increased. No other baseline is raised.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
     "tests_testable_import_app_files",
     "app_static_shared_declarations"
   ],
-  "app_target_swift_lines_headroom": 2000,
+  "app_target_swift_lines_headroom": 0,
   "tracked": [
     "app_target_swift_lines",
     "app_shared_accessor_uses",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 94,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 649794,
+    "app_target_swift_lines": 652061,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,

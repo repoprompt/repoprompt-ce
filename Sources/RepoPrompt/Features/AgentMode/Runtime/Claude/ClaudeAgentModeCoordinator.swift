@@ -73,11 +73,12 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
-        let ensureAgentSessionLinkProviderInputCatalogReady: @MainActor (
+        let qualifyAgentSessionLinkProviderInputRoute: @MainActor (
             _ session: AgentTabSession
-        ) async -> AgentModeViewModel.ProviderInputCatalogReadiness
-        let hasCurrentAgentSessionLinkProviderInputCatalogRoute: @MainActor (
-            _ session: AgentTabSession
+        ) async -> AgentModeViewModel.ProviderInputRouteReadiness
+        let hasCurrentAgentSessionLinkProviderInputRoute: @MainActor (
+            _ session: AgentTabSession,
+            _ qualification: AgentModeViewModel.ProviderInputRouteReadiness
         ) -> Bool
         let decorateAgentSessionLinkPrompt: @MainActor (
             _ text: String,
@@ -104,12 +105,13 @@ final class ClaudeAgentModeCoordinator {
             scheduleSave: @escaping @MainActor (_ session: AgentTabSession) -> Void,
             stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Void,
             prependPendingHandoff: @escaping @MainActor (_ text: String, _ session: AgentTabSession) -> String,
-            ensureAgentSessionLinkProviderInputCatalogReady: @escaping @MainActor (
+            qualifyAgentSessionLinkProviderInputRoute: @escaping @MainActor (
                 _ session: AgentTabSession
-            ) async -> AgentModeViewModel.ProviderInputCatalogReadiness = { _ in .notRequired },
-            hasCurrentAgentSessionLinkProviderInputCatalogRoute: @escaping @MainActor (
-                _ session: AgentTabSession
-            ) -> Bool = { _ in true },
+            ) async -> AgentModeViewModel.ProviderInputRouteReadiness = { _ in .notRequired },
+            hasCurrentAgentSessionLinkProviderInputRoute: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ qualification: AgentModeViewModel.ProviderInputRouteReadiness
+            ) -> Bool = { _, _ in true },
             decorateAgentSessionLinkPrompt: @escaping @MainActor (
                 _ text: String,
                 _ session: AgentTabSession,
@@ -134,8 +136,8 @@ final class ClaudeAgentModeCoordinator {
             self.scheduleSave = scheduleSave
             self.stageClaudeResumeRecoveryHandoff = stageClaudeResumeRecoveryHandoff
             self.prependPendingHandoff = prependPendingHandoff
-            self.ensureAgentSessionLinkProviderInputCatalogReady = ensureAgentSessionLinkProviderInputCatalogReady
-            self.hasCurrentAgentSessionLinkProviderInputCatalogRoute = hasCurrentAgentSessionLinkProviderInputCatalogRoute
+            self.qualifyAgentSessionLinkProviderInputRoute = qualifyAgentSessionLinkProviderInputRoute
+            self.hasCurrentAgentSessionLinkProviderInputRoute = hasCurrentAgentSessionLinkProviderInputRoute
             self.decorateAgentSessionLinkPrompt = decorateAgentSessionLinkPrompt
             self.acquireAgentSessionLinkPhysicalDispatch = acquireAgentSessionLinkPhysicalDispatch
             self.recordAgentSessionLinkPhysicalDispatchNotAttempted = recordAgentSessionLinkPhysicalDispatchNotAttempted
@@ -150,8 +152,8 @@ final class ClaudeAgentModeCoordinator {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .notRequired },
-                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in true },
+                qualifyAgentSessionLinkProviderInputRoute: { _ in .notRequired },
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in true },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
                 },
@@ -1210,10 +1212,10 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
-            // A control command carries no oversight supplement, so the catalog route that exists to
-            // protect supplement delivery is not required for it.
-            let catalogReadiness = !isMaintenance
-                ? await hostCapabilities.ensureAgentSessionLinkProviderInputCatalogReady(session)
+            // A control command carries no oversight supplement, so its ordinary native route
+            // and conversation fences suffice without the additional oversight route proof.
+            var routeReadiness = !isMaintenance
+                ? await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session)
                 : .notRequired
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(controller, for: session)
@@ -1221,16 +1223,14 @@ final class ClaudeAgentModeCoordinator {
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return .superseded
             }
-            let requiresFinalRouteFence: Bool
-            switch catalogReadiness {
-            case .notRequired:
-                requiresFinalRouteFence = false
-            case .ready:
-                requiresFinalRouteFence = true
+            let requiresFinalRouteFence = !isMaintenance
+            switch routeReadiness {
+            case .notRequired, .ready:
+                break
             case .cancelled, .superseded:
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return .superseded
-            case .unavailable, .timedOut:
+            case .unavailable:
                 if allowsCatalogRouteControllerRecovery,
                    attempt < 2,
                    await recycleClaudeControllerForCatalogRouteRecovery(
@@ -1245,7 +1245,7 @@ final class ClaudeAgentModeCoordinator {
                 }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return recordSendFailure(
-                    routeVerificationFailure(catalogReadiness == .timedOut ? "timeout" : "unavailable"),
+                    routeVerificationFailure("unavailable"),
                     session: session,
                     intent: intent
                 )
@@ -1266,7 +1266,7 @@ final class ClaudeAgentModeCoordinator {
             }
 
             if requiresFinalRouteFence,
-               !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+               !hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
             {
                 if allowsCatalogRouteControllerRecovery,
                    attempt < 2,
@@ -1413,8 +1413,14 @@ final class ClaudeAgentModeCoordinator {
                 if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
                     continue
                 }
+                if routeReadiness == .notRequired,
+                   !hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
+                {
+                    routeReadiness = await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session)
+                    guard configurationIsCurrent() else { return .superseded }
+                }
                 if requiresFinalRouteFence,
-                   !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+                   !hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
                 {
                     return recordSendFailure(
                         routeVerificationFailure("configuration-fence"),
@@ -1581,7 +1587,7 @@ final class ClaudeAgentModeCoordinator {
                 guard let configurationProof,
                       configurationIsCurrent(),
                       !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
-                      !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+                      !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
                 else {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded

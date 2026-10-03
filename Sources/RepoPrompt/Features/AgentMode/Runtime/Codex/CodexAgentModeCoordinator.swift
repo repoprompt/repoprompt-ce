@@ -3425,6 +3425,32 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // fallback dispatch, so an entry that sat in the queue while the user added or removed an oversight link
         // ships the current membership revision rather than the one that was live at enqueue time.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexFallback(queueID: head.id)
+        let dispatchAttemptID = session.activeRunAttemptID
+        let qualification = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+        // Qualification suspends. A replaced run/head/controller may not spend this old entry or
+        // terminalize its successor; the queue's exact owner handles its own cancellation.
+        guard session.codexFallbackDispatchInFlight?.id == head.id,
+              session.activeRunAttemptID == dispatchAttemptID,
+              session.runID == head.originRunID,
+              session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID,
+              session.codexControllerGeneration == head.originControllerGeneration,
+              session.codexConversationID == head.originThreadID
+        else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            return false
+        }
+        guard !Task.isCancelled,
+              head.stopFence?.permitsStart(of: session) ?? true,
+              qualification.allowsDispatch,
+              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+        else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            await failCodexFallbackDispatch(
+                session: session, entry: head,
+                message: Task.isCancelled ? nil : "Codex queued follow-up lost its exact RepoPrompt MCP route before dispatch."
+            )
+            return false
+        }
         if let captured = head.monitoringDispatchContext, captured.isPeriodic,
            session.oversight.pendingAutoWake?.wakeID != captured.dispatchID.autoWakeID
         {
@@ -5671,20 +5697,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard replayTurn.expectedTurnID == nil else {
                 return false
             }
-            let catalogReadiness = await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
-            guard catalogReadiness == .ready || catalogReadiness == .notRequired else {
+            let routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            guard routeReadiness.allowsDispatch else {
                 viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
                 return false
             }
-            let catalogRouteWasCurrent = catalogReadiness != .ready
-                || viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
+            let inputRouteWasCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
             guard session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
-                  catalogRouteWasCurrent
+                  inputRouteWasCurrent
             else {
                 viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
@@ -5705,12 +5730,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                 }
             }
-            let catalogRouteIsCurrent = catalogReadiness != .ready
-                || viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
+            let finalReadiness = if routeReadiness == .notRequired,
+                                    viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+            {
+                await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            } else {
+                routeReadiness
+            }
+            let inputRouteIsCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             guard session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
-                  catalogRouteIsCurrent
+                  inputRouteIsCurrent
             else {
                 viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
@@ -6851,8 +6882,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
                             else { return false }
                             guard let viewModel else { return false }
-                            let readiness = await viewModel.ensureProviderInputCatalogReady(for: session)
-                            guard readiness == .ready || readiness == .notRequired else { return false }
+                            let readiness = await viewModel.qualifyProviderInputRoute(for: session)
+                            guard readiness.allowsDispatch else { return false }
                             // Validate inside the lease boundary: a stale .routed outcome
                             // cannot retain an unconsumed policy for another process.
                             let routeBelongsToController = await routeOwnerValidator(
@@ -6863,6 +6894,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             )
                             return !Task.isCancelled
                                 && routeBelongsToController
+                                && viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
                                 && session.runID == runID
                                 && session.activeRunAttemptID == runAttemptIDAtEntry
                                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
@@ -7538,12 +7570,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(sendRunID)
         let expectedControllerID = ObjectIdentifier(controller)
-        let catalogReadiness: AgentModeViewModel.ProviderInputCatalogReadiness = if isSelfNote {
+        var routeReadiness: AgentModeViewModel.ProviderInputRouteReadiness = if isSelfNote {
             .notRequired
         } else {
-            await viewModel?.ensureProviderInputCatalogReady(for: session) ?? .unavailable
+            await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
         }
-        guard catalogReadiness == .ready || catalogReadiness == .notRequired else {
+        guard routeReadiness.allowsDispatch else {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
@@ -7554,18 +7586,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
             )
-            if catalogReadiness == .cancelled {
+            if routeReadiness == .cancelled {
                 return .cancelled
             }
-            let message = switch catalogReadiness {
+            let message = switch routeReadiness {
             case .superseded:
-                "Codex did not send because RepoPrompt MCP catalog readiness was superseded before provider dispatch. Your message was restored."
-            case .timedOut:
-                "Codex did not send because RepoPrompt MCP catalog readiness timed out. Your message was restored."
+                "Codex did not send because RepoPrompt MCP route qualification was superseded before provider dispatch. Your message was restored."
             case .unavailable:
-                "Codex did not send because RepoPrompt MCP catalog readiness was unavailable. Your message was restored."
+                "Codex did not send because RepoPrompt MCP route qualification was unavailable. Your message was restored."
             case .cancelled, .notRequired, .ready:
-                preconditionFailure("non-rejection catalog outcome entered rejection message path")
+                preconditionFailure("non-rejection route outcome entered rejection message path")
             }
             guard viewModel?.sessions[session.tabID] === session else {
                 return .stale(reason: message)
@@ -7574,7 +7604,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await finalizeCodexRun(
                     session,
                     turnStatus: .failed,
-                    reason: "send-catalog-not-ready",
+                    reason: "send-route-unavailable",
                     errorMessage: message,
                     notifyOnCompleted: false,
                     deleteDeferredFilesWhenFailureHasNoInFlight: false
@@ -7583,15 +7613,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return .preDispatchRejected(message: message)
         }
         #if DEBUG
-            if let afterReadiness = viewModel?.test_agentSessionLinkAfterProviderInputCatalogReadiness {
+            if let afterReadiness = viewModel?.test_agentSessionLinkAfterProviderInputRouteReadiness {
                 await afterReadiness()
             }
         #endif
-        let catalogRouteIsCurrent = catalogReadiness != .ready
-            || viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
+        if !isSelfNote, routeReadiness == .notRequired,
+           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+        {
+            routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+        }
+        let inputRouteIsCurrent = isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
         guard session.runID == sendRunID,
               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
-              catalogRouteIsCurrent
+              inputRouteIsCurrent
         else {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
@@ -7606,10 +7640,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if Task.isCancelled {
                 return .cancelled
             }
-            let message = if catalogRouteIsCurrent {
+            let message = if inputRouteIsCurrent {
                 "Codex did not send because the provider route changed before dispatch. Your message was restored."
             } else {
-                "Codex did not send because the RepoPrompt MCP catalog route changed before dispatch. Your message was restored."
+                "Codex did not send because the RepoPrompt MCP route changed before dispatch. Your message was restored."
             }
             guard viewModel?.sessions[session.tabID] === session else {
                 return .stale(reason: message)
@@ -7618,7 +7652,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await finalizeCodexRun(
                     session,
                     turnStatus: .failed,
-                    reason: catalogRouteIsCurrent ? "send-route-changed" : "send-catalog-route-changed",
+                    reason: inputRouteIsCurrent ? "send-route-changed" : "send-mcp-route-changed",
                     errorMessage: message,
                     notifyOnCompleted: false,
                     deleteDeferredFilesWhenFailureHasNoInFlight: false
@@ -7647,11 +7681,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 else { return .preDispatchRejected(message: "Continuation note scope changed before Codex dispatch.") }
                 return nil
             }
-            let catalogRouteIsCurrent = catalogReadiness != .ready
-                || self.viewModel?.agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) == true
+            // Hook review can suspend after a link-less qualification. Upgrade only when
+            // current exact membership now needs a route; never wait for tool discovery.
+            let finalReadiness = if routeReadiness == .notRequired,
+                                    self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+            {
+                await self.viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            } else {
+                routeReadiness
+            }
+            let inputRouteIsCurrent = self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             let providerRouteIsCurrent = session.runID == sendRunID
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
-            guard providerRouteIsCurrent, catalogRouteIsCurrent else {
+            guard providerRouteIsCurrent, inputRouteIsCurrent else {
                 self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: promptDispatchID
@@ -7665,10 +7707,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 if Task.isCancelled {
                     return .cancelled
                 }
-                let message = if catalogRouteIsCurrent {
+                let message = if inputRouteIsCurrent {
                     "Codex did not send because the provider route changed before dispatch. Your message was restored."
                 } else {
-                    "Codex did not send because the RepoPrompt MCP catalog route changed before dispatch. Your message was restored."
+                    "Codex did not send because the RepoPrompt MCP route changed before dispatch. Your message was restored."
                 }
                 guard self.viewModel?.sessions[session.tabID] === session else {
                     return .stale(reason: message)
@@ -7677,7 +7719,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     await self.finalizeCodexRun(
                         session,
                         turnStatus: .failed,
-                        reason: catalogRouteIsCurrent ? "send-route-changed" : "send-catalog-route-changed",
+                        reason: inputRouteIsCurrent ? "send-route-changed" : "send-mcp-route-changed",
                         errorMessage: message,
                         notifyOnCompleted: false,
                         deleteDeferredFilesWhenFailureHasNoInFlight: false
