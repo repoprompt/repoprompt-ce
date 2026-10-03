@@ -4607,7 +4607,7 @@ extension MCPServerViewModel {
             {
                 let sanitized = sanitizeTaskName(taskName)
                 if !sanitized.isEmpty {
-                    renameComposeTabIfNeeded(tabID: context.tabID, newName: sanitized)
+                    renameComposeTabIfDefault(tabID: context.tabID, newName: sanitized)
                 }
             }
         }
@@ -4683,12 +4683,10 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func renameComposeTabIfNeeded(tabID: UUID, newName: String) {
-        if let existing = promptVM.currentComposeTabs.first(where: { $0.id == tabID }),
-           existing.name == newName
-        {
-            return
-        }
+    private func renameComposeTabIfDefault(tabID: UUID, newName: String) {
+        guard let tab = workspaceManager?.composeTab(with: tabID),
+              tab.hasDefaultName,
+              tab.name != newName else { return }
         promptVM.renameComposeTab(tabID, to: newName)
     }
 

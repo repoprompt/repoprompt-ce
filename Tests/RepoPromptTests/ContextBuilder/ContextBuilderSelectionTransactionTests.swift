@@ -5,6 +5,66 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testNamedTabKeepsItsNameAfterTasknamePromptMutation() async throws {
+        for name in ["Care", "New Chat about support", "Untitled Chat about support"] {
+            let fixture = try await makeFixture(name: "named-taskname")
+            defer { fixture.cleanup() }
+            fixture.window.promptManager.renameComposeTab(fixture.tabID, to: "T17")
+            _ = try fixture.installContext(selection: .init())
+
+            // An explicit rename after discovery captured its context must win over that snapshot.
+            fixture.window.agentModeViewModel.renameSession(tabID: fixture.tabID, to: name)
+            let prompt = "<taskname=\"Support ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
+            try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+                try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
+                    $0.promptText = prompt
+                }
+            }
+
+            let storedTab = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+            XCTAssertEqual(storedTab.name, name)
+            XCTAssertEqual(storedTab.promptText, prompt)
+            XCTAssertEqual(fixture.boundContext?.promptText, prompt)
+            XCTAssertEqual(fixture.window.promptManager.currentComposeTabs.first { $0.id == fixture.tabID }?.name, name)
+            XCTAssertEqual(fixture.window.agentModeViewModel.resolvedSessionDisplayName(for: fixture.tabID), name)
+        }
+    }
+
+    func testChatPlaceholderTabGetsNamedAfterTasknamePromptMutation() async throws {
+        try await assertTasknameNamesDefaultTabs(named: ["New Chat", "Untitled Chat", "Untitled", "  new   CHAT\n"])
+    }
+
+    func testEmptyTabGetsNamedAfterTasknamePromptMutation() async throws {
+        try await assertTasknameNamesDefaultTabs(named: ["", " \n\t"])
+    }
+
+    private func assertTasknameNamesDefaultTabs(named names: [String]) async throws {
+        for name in names {
+            let fixture = try await makeFixture(name: "placeholder-taskname", tabName: name)
+            defer { fixture.cleanup() }
+            XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: fixture.identity)?.name, name)
+            _ = try fixture.installContext(selection: .init())
+            let prompt = "<taskname=\"Support   ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
+            try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+                try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
+                    $0.promptText = prompt
+                }
+            }
+
+            let expectedName = "Support ticket activity MCP plan"
+            let storedTab = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+            XCTAssertEqual(storedTab.name, expectedName, "Original title: \(String(reflecting: name))")
+            XCTAssertEqual(storedTab.promptText, prompt)
+            XCTAssertEqual(fixture.boundContext?.promptText, prompt)
+            XCTAssertEqual(fixture.window.promptManager.currentComposeTabs.first { $0.id == fixture.tabID }?.name, expectedName)
+            XCTAssertEqual(fixture.window.agentModeViewModel.resolvedSessionDisplayName(for: fixture.tabID), expectedName)
+        }
+    }
+
+    func testDefaultTabGetsNamedAfterTasknamePromptMutation() async throws {
+        try await assertTasknameNamesDefaultTabs(named: ["T17"])
+    }
+
     /// A headless client (for example Devin) may restart its stdio MCP child mid-run. The successor
     /// re-matches the settlement-retained discovery policy after the pending context was already
     /// consumed, so it must inherit the displaced connection's live run context.
@@ -291,7 +351,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.canonicalSelection, newer)
     }
 
-    private func makeFixture(name: String, domainRuntime: MCPDomainRuntime? = nil) async throws -> Fixture {
+    private func makeFixture(name: String, tabName: String? = nil, domainRuntime: MCPDomainRuntime? = nil) async throws -> Fixture {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = if let domainRuntime { WindowState(domainRuntime: domainRuntime) } else { WindowState() }
@@ -311,7 +371,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let backgroundTab = await window.promptManager.createBackgroundComposeTab(
             strategy: .blank,
-            name: "Transaction \(name)"
+            name: tabName ?? "Transaction \(name)"
         )
         let tabID = try XCTUnwrap(backgroundTab?.id)
         return Fixture(
