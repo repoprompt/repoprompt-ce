@@ -199,7 +199,7 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
         entry.beforeReap()
         var status: Int32 = 0
         while true {
-            let result = waitpid(pid, &status, mode.waitOptions)
+            let result = ProcessLauncher.childProcessRegistry.waitpid(pid, &status, mode.waitOptions)
             if result == pid {
                 complete(
                     pid: pid,
@@ -424,7 +424,7 @@ package enum ProcessTermination {
     ) async -> Bool {
         while ProcessInfo.processInfo.systemUptime < deadline {
             if !rootExited {
-                let r = waitpid(pid, &status, WNOHANG)
+                let r = ProcessLauncher.childProcessRegistry.waitpid(pid, &status, WNOHANG)
                 if r == pid {
                     rootExited = true
                 } else if r == -1, errno == EINTR {
@@ -761,7 +761,7 @@ package enum ProcessTermination {
                     return (exitStatus, false)
                 }
 
-                let r = waitpid(pid, &status, WNOHANG)
+                let r = ProcessLauncher.childProcessRegistry.waitpid(pid, &status, WNOHANG)
                 if r == pid { return (decodeWaitStatus(status), false) }
                 if r == 0 {
                     if ProcessInfo.processInfo.systemUptime >= deadline {
@@ -806,7 +806,7 @@ package enum ProcessTermination {
                 return (exitStatus, false)
             }
 
-            let r = waitpid(pid, &status, WNOHANG)
+            let r = ProcessLauncher.childProcessRegistry.waitpid(pid, &status, WNOHANG)
             if r == pid { return (decodeWaitStatus(status), false) }
             if r == 0 {
                 try? await Task.sleep(nanoseconds: currentPollNs())

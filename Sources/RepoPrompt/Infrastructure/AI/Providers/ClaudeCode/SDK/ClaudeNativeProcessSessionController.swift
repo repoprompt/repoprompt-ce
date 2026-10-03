@@ -289,7 +289,7 @@ final actor ClaudeNativeProcessSessionController {
                 signal: SIGTERM
             )
             var status: Int32 = 0
-            _ = Darwin.waitpid(pid, &status, WNOHANG)
+            _ = ProcessLauncher.childProcessRegistry.waitpid(pid, &status, WNOHANG)
             // Schedule an async reap so the child is collected even if the
             // non-blocking waitpid above did not reap it. The detached task is
             // cancellation-shielded by design — the actor is already gone.
