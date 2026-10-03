@@ -552,3 +552,263 @@ private extension NSLock {
         body()
     }
 }
+
+// MARK: - Root manifest target cache
+
+#if DEBUG
+    final class CodeMapRootManifestTargetCacheTests: XCTestCase {
+        func testWarmNoOpPublicationReusesDecodedTarget() async throws {
+            let fixture = try await makeFixture(recordCount: 128)
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            _ = try await fixture.publish()
+            let initial = await fixture.store.debugPublicationMetrics(namespace: fixture.namespace)
+            for _ in 0 ..< 20 {
+                let result = try await fixture.publish()
+                XCTAssertEqual(result, .unchanged(manifestGeneration: 1))
+            }
+            let metrics = await fixture.store.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertEqual(metrics.publicationCount, initial.publicationCount)
+            XCTAssertEqual(metrics.decodedByteVolume, initial.decodedByteVolume)
+            XCTAssertGreaterThan(metrics.inputSnapshotByteVolume, initial.inputSnapshotByteVolume)
+            let inspectionNanoseconds = metrics.loadReadDecodeDurationNanoseconds - initial.loadReadDecodeDurationNanoseconds
+            print("MANIFEST_TARGET_BENCH records=128 attempts=20 inspection_ns=\(inspectionNanoseconds)")
+        }
+
+        func testColdTargetIsDecodedOnceThenReused() async throws {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            _ = try await fixture.publish()
+            let cold = try CodeMapRootManifestStore(rootURL: fixture.root)
+            let first = try await fixture.publish(using: cold)
+            XCTAssertEqual(first, .unchanged(manifestGeneration: 1))
+            let initial = await cold.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertGreaterThan(initial.decodedByteVolume, 0)
+            let second = try await fixture.publish(using: cold)
+            XCTAssertEqual(second, .unchanged(manifestGeneration: 1))
+            let metrics = await cold.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertEqual(metrics.decodedByteVolume, initial.decodedByteVolume)
+        }
+
+        func testSameSizeReplacementDoesNotReuseStaleSnapshot() async throws {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            _ = try await fixture.publish()
+            let replacement = try CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 9,
+                lastAccessEpochSeconds: 100,
+                records: []
+            )
+            let data = try CodeMapRootManifestCodec.encode(snapshot: replacement)
+            let oldData = try Data(contentsOf: fixture.manifestURL)
+            XCTAssertEqual(data.count, oldData.count)
+            let oldDate = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: fixture.manifestURL.path)[.modificationDate])
+            // Keep the inode, length and mtime: metadata-only reuse must not accept the old contents.
+            let handle = try FileHandle(forWritingTo: fixture.manifestURL)
+            try handle.write(contentsOf: data)
+            try handle.close()
+            try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: fixture.manifestURL.path)
+            let result = try await fixture.publish()
+            XCTAssertEqual(result, .unchanged(manifestGeneration: 9))
+            let metrics = await fixture.store.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertGreaterThan(try XCTUnwrap(metrics.lastAttempt).decodedByteCount, 0)
+        }
+
+        func testCorruptWarmTargetIsNotAcceptedFromCache() async throws {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            _ = try await fixture.publish()
+            var data = try Data(contentsOf: fixture.manifestURL)
+            data[data.count - 1] ^= 1
+            let handle = try FileHandle(forWritingTo: fixture.manifestURL)
+            try handle.write(contentsOf: data)
+            try handle.close()
+            let result = try await fixture.publish()
+            XCTAssertEqual(result, .replaced(manifestGeneration: 1))
+            let decoded = try CodeMapRootManifestCodec.decode(
+                Data(contentsOf: fixture.manifestURL),
+                expectedNamespace: fixture.namespace,
+                filenameDigest: fixture.namespace.storageDigestHex
+            )
+            XCTAssertEqual(decoded.manifestGeneration, 1)
+            XCTAssertEqual(decoded.authority, fixture.authority)
+        }
+
+        func testChecksumValidMalformedTargetStillRequiresCanonicalDecode() async throws {
+            let fixture = try await makeFixture()
+            _ = try await fixture.publish()
+            var malformed = try Data(Data(contentsOf: fixture.manifestURL).dropLast(32))
+            malformed.append(0) // An extra payload byte is not a canonical manifest.
+            malformed.append(contentsOf: SHA256.hash(data: malformed))
+            XCTAssertNoThrow(try CodeMapRootManifestCodec.validatedContentChecksum(malformed))
+            try malformed.write(to: fixture.manifestURL)
+            let cold = try CodeMapRootManifestStore(rootURL: fixture.root)
+            let result = try await fixture.publish(using: cold)
+            XCTAssertEqual(result, .replaced(manifestGeneration: 1))
+            let metrics = await cold.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertEqual(try XCTUnwrap(metrics.lastAttempt).decodedByteCount, UInt64(malformed.count))
+        }
+
+        func testEvictedWarmTargetIsDecodedAgain() async throws {
+            let fixture = try await makeFixture()
+            _ = try await fixture.publish()
+            let byteCount = try UInt64(Data(contentsOf: fixture.manifestURL).count)
+            let limited = try CodeMapRootManifestStore(rootURL: fixture.root, policy: policy(cacheBytes: byteCount))
+            _ = try await fixture.publish(using: limited)
+            let secondNamespace = try CodeMapRootManifestNamespace(
+                repositoryNamespace: fixture.namespace.repositoryNamespace,
+                worktreeIdentity: "wt_" + String(repeating: "b", count: 64),
+                repositoryRelativeLoadedRootPrefix: "", objectFormat: .sha1,
+                pipelineIdentity: fixture.namespace.pipelineIdentity,
+                repositoryBindingEpoch: "repository", worktreeBindingEpoch: "worktree"
+            )
+            _ = try await limited.updateCurrentManifest(
+                namespace: secondNamespace, authority: fixture.authority, records: [], lastAccessEpochSeconds: 100
+            )
+            let retained = await limited.decodedManifestCacheEntryCountForTesting()
+            XCTAssertEqual(retained, 1)
+            let beforeFirst = await limited.debugPublicationMetrics(namespace: fixture.namespace)
+            let beforeSecond = await limited.debugPublicationMetrics(namespace: secondNamespace)
+            let first = try await fixture.publish(using: limited)
+            let second = try await limited.updateCurrentManifest(
+                namespace: secondNamespace, authority: fixture.authority, records: [], lastAccessEpochSeconds: 100
+            )
+            XCTAssertEqual(first, .unchanged(manifestGeneration: 1))
+            XCTAssertEqual(second, .unchanged(manifestGeneration: 1))
+            let afterFirst = await limited.debugPublicationMetrics(namespace: fixture.namespace)
+            let afterSecond = await limited.debugPublicationMetrics(namespace: secondNamespace)
+            XCTAssertGreaterThan(
+                afterFirst.decodedByteVolume + afterSecond.decodedByteVolume,
+                beforeFirst.decodedByteVolume + beforeSecond.decodedByteVolume
+            )
+        }
+
+        func testTargetLargerThanCacheBudgetIsDecodedWithoutRetention() async throws {
+            let fixture = try await makeFixture()
+            _ = try await fixture.publish()
+            let limited = try CodeMapRootManifestStore(rootURL: fixture.root, policy: policy(cacheBytes: 1))
+            for _ in 0 ..< 2 {
+                let result = try await fixture.publish(using: limited)
+                XCTAssertEqual(result, .unchanged(manifestGeneration: 1))
+                let metrics = await limited.debugPublicationMetrics(namespace: fixture.namespace)
+                XCTAssertGreaterThan(try XCTUnwrap(metrics.lastAttempt).decodedByteCount, 0)
+            }
+            let entries = await limited.decodedManifestCacheEntryCountForTesting()
+            let bytes = await limited.decodedManifestCacheByteCountForTesting()
+            XCTAssertEqual(entries, 0)
+            XCTAssertEqual(bytes, 0)
+        }
+
+        func testOverPolicyTargetDoesNotEnterSharedScanCache() async throws {
+            let fixture = try await makeFixture(recordCount: 2)
+            _ = try await fixture.publish()
+            let limited = try CodeMapRootManifestStore(rootURL: fixture.root, policy: policy(records: 1))
+            do {
+                _ = try await fixture.publish(using: limited)
+                XCTFail("Expected record quota rejection")
+            } catch {
+                XCTAssertEqual(error as? CodeMapRootManifestStoreError, .quotaExceeded)
+            }
+            let entries = await limited.decodedManifestCacheEntryCountForTesting()
+            XCTAssertEqual(entries, 0)
+            let accounting = try await limited.accounting()
+            XCTAssertEqual(accounting.manifestCount, 0)
+        }
+
+        private func policy(records: Int = 100_000, cacheBytes: UInt64 = 64 * 1024 * 1024) -> CodeMapRootManifestStorePolicy {
+            let defaults = CodeMapRootManifestStorePolicy.default
+            return CodeMapRootManifestStorePolicy(
+                maximumRecordCountPerManifest: records,
+                maximumManifestByteCount: defaults.maximumManifestByteCount,
+                maximumManifestCount: defaults.maximumManifestCount,
+                maximumStoreByteCount: defaults.maximumStoreByteCount,
+                maximumQuarantineCount: defaults.maximumQuarantineCount,
+                maintenanceEntryLimit: defaults.maintenanceEntryLimit,
+                maximumDecodedManifestCacheByteCount: cacheBytes
+            )
+        }
+
+        private struct Fixture {
+            let root: URL
+            let store: CodeMapRootManifestStore
+            let namespace: CodeMapRootManifestNamespace
+            let authority: CodeMapRootManifestAuthority
+            let records: [CodeMapRootManifestRecord]
+
+            var manifestURL: URL {
+                root.appendingPathComponent("CodeMapRootManifests/v1/manifests")
+                    .appendingPathComponent(namespace.shard)
+                    .appendingPathComponent(namespace.storageDigestHex)
+            }
+
+            func publish(using other: CodeMapRootManifestStore? = nil) async throws -> CodeMapRootManifestWriteResult {
+                try await (other ?? store).updateCurrentManifest(
+                    namespace: namespace, authority: authority, records: records, lastAccessEpochSeconds: 100
+                )
+            }
+        }
+
+        private func makeFixture(recordCount: Int = 0) async throws -> Fixture {
+            let base = FileManager.default.temporaryDirectory
+                .appendingPathComponent("manifest-target-cache-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: base, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]
+            )
+            let resolvedPath = try XCTUnwrap(base.path.withCString { pointer -> String? in
+                guard let resolved = realpath(pointer, nil) else { return nil }
+                defer { free(resolved) }
+                return String(cString: resolved)
+            })
+            let root = URL(fileURLWithPath: resolvedPath, isDirectory: true)
+            addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+            let pipeline = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+            let namespace = try CodeMapRootManifestNamespace(
+                repositoryNamespace: GitBlobRepositoryNamespace(rawValue: String(repeating: "ab", count: 32)),
+                worktreeIdentity: "wt_" + String(repeating: "a", count: 64),
+                repositoryRelativeLoadedRootPrefix: "",
+                objectFormat: .sha1,
+                pipelineIdentity: pipeline,
+                repositoryBindingEpoch: "repository",
+                worktreeBindingEpoch: "worktree"
+            )
+            let authority = try CodeMapRootManifestAuthority(
+                authorityGeneration: 1, repositoryBindingEpoch: "repository", worktreeBindingEpoch: "worktree",
+                layoutGeneration: "layout", indexGeneration: "index", checkoutConfigurationGeneration: "checkout",
+                attributeGeneration: "attributes", sparseGeneration: "sparse", metadataGeneration: "metadata"
+            )
+            let key = CodeMapArtifactKey(
+                rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: 1, count: 32)),
+                rawByteCount: 1, pipelineIdentity: pipeline
+            )
+            let artifacts = try CodeMapArtifactStore(rootURL: root)
+            _ = try await artifacts.insert(key: key, deterministicOutcome: .readyNoSymbols)
+            guard case let .hit(_, handle) = try await artifacts.lookup(key: key) else {
+                throw CodeMapArtifactFileStoreError.integrityCollision
+            }
+            let association = try VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
+                identity: GitBlobCodeMapLocatorIdentity(
+                    repositoryNamespace: namespace.repositoryNamespace, objectFormat: .sha1,
+                    blobOID: String(repeating: "a", count: 40), pipelineIdentity: pipeline
+                ),
+                artifactKey: key, casHandle: handle
+            )
+            let contribution = CodeMapSelectionGraphContribution(artifactKey: key, definitions: [], references: [])
+            let records = try (0 ..< recordCount).map { index in
+                try CodeMapRootManifestRecord.verifiedClean(
+                    namespace: namespace, repositoryRelativePath: String(format: "File%06d.swift", index),
+                    gitMode: .regular, association: association, contribution: contribution,
+                    authority: authority, bindingGeneration: 1
+                )
+            }
+            return try Fixture(
+                root: root,
+                store: CodeMapRootManifestStore(rootURL: root),
+                namespace: namespace,
+                authority: authority,
+                records: records
+            )
+        }
+    }
+
+#endif

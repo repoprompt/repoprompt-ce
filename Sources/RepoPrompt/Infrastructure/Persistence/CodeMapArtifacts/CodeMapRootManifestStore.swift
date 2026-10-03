@@ -1024,9 +1024,7 @@ actor CodeMapRootManifestStore {
             debugAttempt.inputSnapshotEncodedByteCount = existing.identity.map {
                 $0.size > 0 ? UInt64($0.size) : 0
             } ?? 0
-            debugAttempt.decodedByteCount = existing.snapshot == nil
-                ? 0
-                : debugAttempt.inputSnapshotEncodedByteCount
+            debugAttempt.decodedByteCount = existing.decodedByteCount
         #endif
         if let expectedSnapshot {
             guard let current = existing.snapshot,
@@ -1495,11 +1493,11 @@ actor CodeMapRootManifestStore {
         shard: ManifestDirectoryDescriptor,
         namespace: CodeMapRootManifestNamespace,
         name: String
-    ) throws -> (identity: ManifestFileIdentity?, snapshot: CodeMapRootManifestSnapshot?) {
+    ) throws -> (identity: ManifestFileIdentity?, snapshot: CodeMapRootManifestSnapshot?, decodedByteCount: UInt64) {
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
             if errno == ENOENT {
-                return (nil, nil)
+                return (nil, nil, 0)
             }
             if errno == ELOOP {
                 throw CodeMapRootManifestStoreError.insecureLeaf
@@ -1517,17 +1515,40 @@ actor CodeMapRootManifestStore {
               identity.size <= off_t(CodeMapRootManifestCodec.maximumEncodedByteCount),
               UInt64(identity.size) <= policy.maximumManifestByteCount
         else {
-            return (identity, nil)
+            return (identity, nil, 0)
         }
         let data = try Self.readExactly(descriptor, byteCount: Int(identity.size))
+        guard try Self.validatedFileIdentity(
+            descriptor,
+            parent: shard,
+            name: name,
+            expectedMode: Self.fileMode
+        ) == identity else {
+            throw CodeMapRootManifestStoreError.insecureLeaf
+        }
+        guard let checksum = try? CodeMapRootManifestCodec.validatedContentChecksum(data) else {
+            return (identity, nil, 0)
+        }
+        let location = ManifestCacheLocation(shard: namespace.shard, digest: name)
+        if let snapshot = cachedManifestSnapshot(at: location, identity: identity, checksum: checksum),
+           snapshot.namespace == namespace
+        {
+            return (identity, snapshot, 0)
+        }
         let snapshot = try? CodeMapRootManifestCodec.decodeStored(
             data,
             filenameDigest: name
         )
-        guard snapshot?.namespace == namespace else {
-            return (identity, nil)
+        guard let snapshot, snapshot.namespace == namespace else {
+            return (identity, nil, UInt64(identity.size))
         }
-        return (identity, snapshot)
+        cacheDecodedManifest(
+            at: location,
+            identity: identity,
+            snapshot: snapshot,
+            validatedContentChecksum: checksum
+        )
+        return (identity, snapshot, UInt64(identity.size))
     }
 
     private func quarantineIfCurrent(
@@ -2264,12 +2285,12 @@ actor CodeMapRootManifestStore {
                 return .insecure
             }
             let validatedContentChecksum = try CodeMapRootManifestCodec.validatedContentChecksum(data)
-            if let cached = decodedManifestCache[cacheLocation],
-               cached.identity == identity,
-               cached.validatedContentChecksum == validatedContentChecksum
-            {
-                touchDecodedManifestCacheEntry(at: cacheLocation)
-                return .valid(cached.snapshot, identity)
+            if let snapshot = cachedManifestSnapshot(
+                at: cacheLocation,
+                identity: identity,
+                checksum: validatedContentChecksum
+            ) {
+                return .valid(snapshot, identity)
             }
             let snapshot = try CodeMapRootManifestCodec.decodeStored(data, filenameDigest: name)
             guard snapshot.namespace.shard == shardName,
@@ -2297,6 +2318,20 @@ actor CodeMapRootManifestStore {
         }
     }
 
+    /// Reuse only after the caller rereads and validates the current secure file.
+    private func cachedManifestSnapshot(
+        at location: ManifestCacheLocation,
+        identity: ManifestFileIdentity,
+        checksum: Data
+    ) -> CodeMapRootManifestSnapshot? {
+        guard let cached = decodedManifestCache[location],
+              cached.identity == identity,
+              cached.validatedContentChecksum == checksum
+        else { return nil }
+        touchDecodedManifestCacheEntry(at: location)
+        return cached.snapshot
+    }
+
     private func cacheDecodedManifest(
         at location: ManifestCacheLocation,
         identity: ManifestFileIdentity,
@@ -2304,8 +2339,9 @@ actor CodeMapRootManifestStore {
         validatedContentChecksum: Data
     ) {
         guard identity.size >= 0 else { return }
-        let encodedByteCount = UInt64(identity.size)
         removeDecodedManifestCacheEntry(at: location)
+        guard snapshot.records.count <= policy.maximumRecordCountPerManifest else { return }
+        let encodedByteCount = UInt64(identity.size)
         guard encodedByteCount <= policy.maximumDecodedManifestCacheByteCount else { return }
 
         while decodedManifestCacheByteCount > policy.maximumDecodedManifestCacheByteCount - encodedByteCount {
