@@ -90,6 +90,43 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
 actor GitService {
+    private struct UntrackedStatsKey: Hashable {
+        let root: String
+        let path: String
+    }
+
+    private struct CachedUntrackedStats {
+        let fingerprint: FileContentFingerprint
+        let additions: Int?
+        let deletions: Int?
+        var lastUsed: Date
+    }
+
+    private var untrackedStatsCache: [UntrackedStatsKey: CachedUntrackedStats] = [:]
+    private let untrackedStatsCacheLimit: Int
+    #if DEBUG
+        private var untrackedStatsReadCount = 0
+        func untrackedStatsCacheSnapshotForTesting(at root: URL) -> (reads: Int, count: Int, paths: Set<String>) {
+            (untrackedStatsReadCount, untrackedStatsCache.count, Set(untrackedStatsCache.keys.filter {
+                $0.root == root.standardizedFileURL.path
+            }.map(\.path)))
+        }
+    #endif
+
+    func invalidateUntrackedStats(at root: URL) {
+        let path = root.standardizedFileURL.path
+        untrackedStatsCache = untrackedStatsCache.filter { $0.key.root != path }
+    }
+
+    private func pruneUntrackedStats(at root: URL, paths: Set<String>?) {
+        let rootPath = root.standardizedFileURL.path
+        let now = Date()
+        untrackedStatsCache = untrackedStatsCache.filter { key, value in
+            now.timeIntervalSince(value.lastUsed) < 300
+                && (key.root != rootPath || paths?.contains(key.path) != false)
+        }
+    }
+
     private static let gitProcessTimeout: Duration = .seconds(120)
     private static let gitProcessTerminationGrace: Duration = .seconds(5)
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
@@ -389,15 +426,18 @@ actor GitService {
         processTerminationGrace: Duration = GitService.gitProcessTerminationGrace,
         processSpawner: @escaping ProcessSpawner = GitService.defaultProcessSpawner,
         worktreeLayoutCacheLimit: Int = 128,
+        untrackedStatsCacheLimit: Int = 4096,
         inheritedProcessEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         precondition(worktreeLayoutCacheLimit > 0)
+        precondition(untrackedStatsCacheLimit >= 0)
         self.gitExecutableURL = gitExecutableURL
         self.processAdmissionController = processAdmissionController
         self.workspaceStateAuthority = workspaceStateAuthority
         self.processTerminationGrace = processTerminationGrace
         self.processSpawner = processSpawner
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
+        self.untrackedStatsCacheLimit = untrackedStatsCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
     }
 
@@ -3758,6 +3798,7 @@ actor GitService {
             .map { String($0) }
             .filter { !$0.isEmpty }
 
+        pruneUntrackedStats(at: repoURL, paths: Set(untrackedFiles))
         for path in untrackedFiles {
             // Only add if not already in the results (avoid duplicates)
             if !allPaths.contains(path) {
@@ -3908,6 +3949,8 @@ actor GitService {
         }
 
         if includeUntracked {
+            // A path-scoped listing cannot evict entries outside its pathspec.
+            pruneUntrackedStats(at: repoURL, paths: paths == nil ? Set(untrackedFiles) : nil)
             for path in untrackedFiles {
                 if !allPaths.contains(path) {
                     let stats = untrackedLineStats(for: path, repoURL: repoURL)
@@ -8673,10 +8716,37 @@ actor GitService {
 
     private func untrackedLineStats(for path: String, repoURL: URL) -> (additions: Int?, deletions: Int?) {
         let fileURL = repoURL.appendingPathComponent(path)
+        let key = UntrackedStatsKey(root: repoURL.standardizedFileURL.path, path: path)
+        // lstat deliberately makes symlinks uncacheable; their existing read behavior is unchanged.
+        // ctime also catches many same-size writes with restored mtime. Metadata collisions on
+        // coarse filesystems remain possible; this is a statistics cache, not content authority.
+        let fingerprint = try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)
+        if let fingerprint, var cached = untrackedStatsCache[key], cached.fingerprint == fingerprint {
+            cached.lastUsed = Date()
+            untrackedStatsCache[key] = cached
+            return (cached.additions, cached.deletions)
+        }
+        untrackedStatsCache.removeValue(forKey: key)
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
             return (nil, nil)
         }
+        #if DEBUG
+            untrackedStatsReadCount += 1
+        #endif
+        let openedFingerprint = try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)
+        var stats: (additions: Int?, deletions: Int?) = (nil, nil)
+        var cacheable = false
         defer {
+            // Never retain partial reads, non-regular files, or content changed/replaced during reading.
+            if cacheable, untrackedStatsCache.count < untrackedStatsCacheLimit,
+               let fingerprint, openedFingerprint == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)) == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)) == fingerprint
+            {
+                untrackedStatsCache[key] = CachedUntrackedStats(
+                    fingerprint: fingerprint, additions: stats.additions, deletions: stats.deletions, lastUsed: Date()
+                )
+            }
             try? handle.close()
         }
 
@@ -8686,20 +8756,28 @@ actor GitService {
         var lastByte: UInt8?
 
         while true {
-            guard let data = try? handle.read(upToCount: chunkSize),
-                  !data.isEmpty
-            else {
+            let data: Data
+            do {
+                guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                    cacheable = true
+                    break
+                }
+                data = chunk
+            } catch {
                 break
             }
             sawData = true
-            for byte in data {
-                if byte == 0 {
-                    return (nil, nil)
+            let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                for byte in bytes {
+                    if byte == 0 { return false }
+                    if byte == 0x0A { lineCount += 1 }
                 }
-                if byte == 0x0A {
-                    lineCount += 1
-                }
-                lastByte = byte
+                lastByte = bytes.last
+                return true
+            }
+            guard isText else {
+                cacheable = true
+                return stats
             }
         }
 
@@ -8708,8 +8786,8 @@ actor GitService {
                 lineCount += 1
             }
         }
-
-        return (lineCount, 0)
+        stats = (lineCount, 0)
+        return stats
     }
 
     /// Parses `git diff --numstat` output into a map of path → (additions, deletions)

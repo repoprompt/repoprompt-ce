@@ -18,6 +18,10 @@ actor GitBackend: VCSBackend {
         self.gitService = gitService
     }
 
+    func invalidateUntrackedStats(at root: URL) async {
+        await gitService.invalidateUntrackedStats(at: root)
+    }
+
     /// The environment this backend's Git subprocesses inherit.
     func gitProcessEnvironment() async -> [String: String] {
         await gitService.preparedProcessEnvironment()

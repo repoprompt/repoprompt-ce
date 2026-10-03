@@ -127,12 +127,18 @@ actor GitStatusActor {
         let previousRoots = Set(workspaceRoots)
         let currentRoots = Set(roots)
         let removedRoots = previousRoots.subtracting(currentRoots)
+        let removedRepos = Set(removedRoots.compactMap { rootInfos[$0]?.repoRootPath })
         workspaceRoots = roots
 
         rootInfos = rootInfos.filter { key, _ in currentRoots.contains(key) }
 
         for root in removedRoots {
             await vcsService.invalidateCache(for: URL(fileURLWithPath: root))
+        }
+
+        let backend = await vcsService.gitBackend()
+        for root in removedRepos {
+            await backend.invalidateUntrackedStats(at: URL(fileURLWithPath: root))
         }
 
         let rootsToDetect = roots.filter { rootInfos[$0] == nil }
@@ -175,6 +181,15 @@ actor GitStatusActor {
                 backendKind: info?.backendKind,
                 gitWorktreeContext: info?.gitWorktreeContext
             )
+        }
+    }
+
+    /// Best-effort cache release on window close; an in-flight refresh can repopulate it.
+    /// Poller teardown policy is unchanged.
+    func invalidateUntrackedStats() async {
+        let backend = await vcsService.gitBackend()
+        for root in Set(rootInfos.values.compactMap(\.repoRootPath)) {
+            await backend.invalidateUntrackedStats(at: URL(fileURLWithPath: root))
         }
     }
 
