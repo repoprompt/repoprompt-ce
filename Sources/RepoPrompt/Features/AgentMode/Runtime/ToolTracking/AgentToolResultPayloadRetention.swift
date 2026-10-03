@@ -11,8 +11,8 @@ enum AgentToolResultPayloadRetention {
     /// The payload to store, or nil to keep `existing` unchanged.
     ///
     /// With `requireObjectReplacement`, used for RepoPrompt's own MCP tools whose
-    /// results are JSON objects, an earlier JSON object result is also kept when
-    /// the incoming payload is not a JSON object (for example a bare text echo).
+    /// results are JSON objects, an earlier native result is kept over non-object
+    /// echoes. Provider lifecycle content may still finish with substantive text.
     static func resolvedPayload(
         existing: String?,
         incoming: String,
@@ -59,10 +59,10 @@ enum AgentToolResultPayloadRetention {
         guard incomingIsError != true, !isThin(existing), !isProgress(existing) else { return false }
         if isThin(incoming) || isProgress(incoming) || terminalMarkerStatus(incoming) != nil { return true }
         guard requireObjectReplacement, let object = jsonObject(existing) else { return false }
-        guard let incomingObject = jsonObject(incoming) else { return true }
+        guard let incomingObject = jsonObject(incoming) else { return !isProviderLifecycle(object) }
         // A content-bearing provider lifecycle echo is still not an authoritative
         // RepoPrompt result. Keep it from regressing an already-delivered native result.
-        return !isLifecycleStatus(object["status"]) && isLifecycleStatus(incomingObject["status"])
+        return !isProviderLifecycle(object) && isProviderLifecycle(incomingObject)
     }
 
     static func isThin(_ payload: String?) -> Bool {
@@ -97,6 +97,13 @@ enum AgentToolResultPayloadRetention {
               status == "completed" || status == "failed"
         else { return nil }
         return status
+    }
+
+    /// Only the normalizer's lifecycle envelope is replaceable by terminal text;
+    /// native results can also be running, but carry their own result fields.
+    private static func isProviderLifecycle(_ object: [String: Any]) -> Bool {
+        isLifecycleStatus(object["status"])
+            && Set(object.keys).isSubset(of: ["status", "title", "progress", "content", "rawInput", "kind", "summary_only"])
     }
 
     private static func isLifecycleStatus(_ value: Any?) -> Bool {

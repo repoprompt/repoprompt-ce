@@ -312,6 +312,56 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         XCTAssertEqual(session.items.first?.toolIsError, false)
     }
 
+    @MainActor
+    func testSubstantiveTerminalTextAndArraysReplaceProviderLifecycleOnBothRunnerPaths() throws {
+        for trackerPath in [false, true] {
+            for output: Any in ["terminal finding", [["type": "text", "text": "terminal finding"]]] {
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = harness.makeSession(agent: .devin)
+                let runner = ACPIntegratedAgentModeRunner(
+                    hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+                    toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
+                    controllerFactory: { provider, request in
+                        try ACPAgentSessionController(provider: provider, runRequest: request)
+                    }
+                )
+                func deliver(_ status: String, output: Any? = nil) throws -> AIStreamResult {
+                    var update: [String: Any] = [
+                        "sessionUpdate": "tool_call_update", "toolCallId": "terminal-text-call",
+                        "title": "ask_oracle", "status": status
+                    ]
+                    update["rawOutput"] = output
+                    if status == "running" { update["content"] = [["type": "text", "text": "working"]] }
+                    let events = ACPDefaultSessionUpdateNormalizer.normalize(update, providerID: .devin)
+                    guard case let .stream(result) = events.first else { throw NSError(domain: "Missing ACP event", code: 1) }
+                    if trackerPath {
+                        try runner.testHandleTrackerToolResult(
+                            invocationID: XCTUnwrap(result.toolInvocationID), toolName: "ask_oracle", args: nil,
+                            resultJSON: XCTUnwrap(result.toolResultJSON), isError: result.toolIsError == true, session: session
+                        )
+                    } else {
+                        XCTAssertTrue(try runner.handleToolStreamEvent(.toolResult(.init(
+                            toolName: "ask_oracle", invocationID: result.toolInvocationID, argsJSON: nil,
+                            resultJSON: XCTUnwrap(result.toolResultJSON), isError: result.toolIsError
+                        )), session: session))
+                    }
+                    return result
+                }
+                let running = try deliver("running")
+                let rowID = try XCTUnwrap(session.items.first).id
+                let terminal = try deliver("completed", output: output)
+                XCTAssertEqual(session.items.count, 1)
+                let row = try XCTUnwrap(session.items.first)
+                XCTAssertEqual(row.id, rowID)
+                XCTAssertEqual(row.toolInvocationID, running.toolInvocationID)
+                XCTAssertEqual(row.toolResultJSON, terminal.toolResultJSON, "tracker path: \(trackerPath)")
+                XCTAssertEqual(row.text, terminal.toolResultJSON)
+                XCTAssertEqual(row.toolIsError, false)
+                XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: row)?.status, .success)
+            }
+        }
+    }
+
     private let rich = #"{"review":{"chat_id":"c","oracle_results":[]},"status":"success"}"#
 
     func testEmptyLaterUpdateKeepsEarlierResult() {
@@ -388,6 +438,21 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         XCTAssertNil(render["detail_text"])
         XCTAssertNil(object["summary_text"])
         XCTAssertEqual(render["title"] as? String, "Skill")
+    }
+
+    func testNativeLifecycleObjectCannotBeErasedByProviderTextOrArray() throws {
+        let native = #"{"status":"running","context_id":"native-context"}"#
+        let events = ACPDefaultSessionUpdateNormalizer.normalize([
+            "sessionUpdate": "tool_call_update", "toolCallId": "native-lifecycle",
+            "status": "running", "content": [["type": "text", "text": "provider echo"]]
+        ], providerID: .devin)
+        guard case let .stream(result) = events.first else { return XCTFail("Missing normalized lifecycle") }
+        let runningEcho = try XCTUnwrap(result.toolResultJSON)
+        for incoming in ["terminal echo", #"[{"type":"text","text":"terminal echo"}]"#, runningEcho] {
+            XCTAssertNil(AgentToolResultPayloadRetention.resolvedPayload(
+                existing: native, incoming: incoming, incomingIsError: false, requireObjectReplacement: true
+            ))
+        }
     }
 
     func testObjectReplacementModeKeepsObjectOverText() {
