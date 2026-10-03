@@ -915,7 +915,6 @@ actor PromptContextAccountingService {
                        case .loadContent = contentPolicy,
                        content == nil
                     {
-                        missingPaths.append(file.standardizedRelativePath)
                         continue
                     }
                     let entry = ResolvedPromptFileEntry(
