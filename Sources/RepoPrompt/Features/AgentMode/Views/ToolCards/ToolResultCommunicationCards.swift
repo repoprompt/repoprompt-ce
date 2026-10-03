@@ -52,7 +52,7 @@ struct ChatSendResultCard: View {
             if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
             // Invalid lane identities suppress the fraction, not the group's known failure.
             if isOracleTool {
-                if dto.status == "partial_failure" { return .warning }
+                if dto.status == "partial_failure" || dto.status == "warning" { return .warning }
                 if dto.status == "failed" { return .failure }
             }
             if dto.response == nil || dto.response?.isEmpty == true,

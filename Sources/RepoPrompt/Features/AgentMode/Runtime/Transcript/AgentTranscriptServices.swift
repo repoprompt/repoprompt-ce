@@ -1599,6 +1599,30 @@ enum AgentTranscriptToolNormalizer {
             }
             return .unknown
         }
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send" || normalizedToolName == "context_builder" {
+            if item.toolIsError == true {
+                let nativeStatus = AgentTranscriptToolStatusSemantics.normalizedStatusWord(stringValue(resultObject, keys: ["status", "result", "outcome", "state"]))
+                return nativeStatus == "cancelled" ? .cancelled : .failed
+            }
+            if normalizedToolName == "context_builder" {
+                // The existing transcript status owns the effective operation outcome,
+                // even when optional lane detail cannot fit the persisted summary.
+                let outerStatus = AgentTranscriptToolStatusSemantics.normalizedStatusWord(stringValue(resultObject, keys: ["status"]))
+                if outerStatus == "success",
+                   let branch = ContextBuilderFollowUpBranch.select(responseType: stringValue(resultObject, keys: ["response_type", "responseType"])),
+                   let reply = resultObject?[branch.rawValue] as? [String: Any],
+                   let count = intValue(reply, keys: ["oracle_count"]), count > 1
+                {
+                    switch stringValue(reply, keys: ["status"]) {
+                    case "partial_failure": return .warning
+                    case "failed": return .failed
+                    default: break
+                    }
+                }
+            } else if stringValue(resultObject, keys: ["status"]) == "partial_failure" {
+                return .warning
+            }
+        }
         if normalizedToolName == "bash" {
             let metadata = BashToolResultParser.parseMetadata(raw: item.toolResultJSON, context: context)
             let statusWord = AgentTranscriptToolStatusSemantics.normalizedBashStatusWord(

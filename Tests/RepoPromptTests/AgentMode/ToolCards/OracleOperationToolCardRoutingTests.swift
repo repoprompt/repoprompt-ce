@@ -612,6 +612,59 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
 }
 
 final class OracleLaneCoverageTests: XCTestCase {
+    @MainActor
+    func testOversizedGroupSummariesKeepIncompleteCardOutcomeWithoutInventingCoverage() async throws {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9820, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer {
+            composition.contextBuilderAgentViewModel.prepareForWindowClose()
+            composition.workspaceManager.prepareForWindowClose()
+        }
+        addTeardownBlock { await composition.workspaceManager.awaitOwnSavesForWindowClose() }
+        let context = ContextBuilderCardContext(
+            tabID: nil, contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+            activeContextBuilderCallItemID: nil, activeContextBuilderResultItemID: nil, oracleOpenContext: nil
+        )
+        for completedCount in [1, 0] {
+            for tool in ["ask_oracle", "oracle_send", "plan", "review"] {
+                let reply = try canonicalGroupPayload(completedCount: completedCount, laneCount: 5, oversized: true)
+                let isBuilder = tool == "plan" || tool == "review"
+                let raw = isBuilder ? ["status": "success", "response_type": tool, tool: reply] : reply
+                var item = AgentChatItem(
+                    kind: .toolResult,
+                    text: "",
+                    toolName: isBuilder ? "context_builder" : tool,
+                    toolResultJSON: jsonString(raw),
+                    toolIsError: false
+                )
+                let expected: ToolCardStatus = completedCount == 0 ? .failure : .warning
+                for pass in 1 ... 2 {
+                    let summary = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item))
+                    XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+                    XCTAssertFalse(summary.resultJSON.contains("oracle_results"), "fixture must exercise budget fallback")
+                    XCTAssertFalse(summary.resultJSON.contains("RESPONSE_BODY"))
+                    item.toolResultJSON = summary.resultJSON
+                    item.text = summary.resultJSON
+                    if isBuilder {
+                        let card = ContextBuilderResultCard(item: item, context: context)
+                        XCTAssertEqual(card.status, expected, "\(tool) pass \(pass)")
+                        XCTAssertFalse(["success", "completed"].contains(card.summary), card.summary)
+                        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: item.toolResultJSON))
+                        XCTAssertNil(contextBuilderOracleLaneCoverage(for: dto))
+                        XCTAssertEqual(contextBuilderFollowUpChatID(for: dto), "fixture-chat-0")
+                    } else {
+                        XCTAssertEqual(ChatSendResultCard(item: item, oracleOpenContext: nil).status, expected, "\(tool) pass \(pass)")
+                        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON))
+                        XCTAssertNil(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
+                        XCTAssertEqual(dto.chatID, "fixture-chat-0")
+                    }
+                }
+            }
+        }
+    }
+
     func testTimeoutReasonBeyondDigestCutoffSurvivesRepeatedSummary() throws {
         for timedOut in [false, true] {
             let reply = try canonicalGroupPayload(completedCount: 1, errorMessage: String(repeating: "x", count: 96) + (timedOut ? " request timed out" : " provider refused"))
@@ -626,6 +679,121 @@ final class OracleLaneCoverageTests: XCTestCase {
                 }
                 if pass < 2 {
                     item.toolResultJSON = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item)).resultJSON
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testFreshDiskStoreAndProductionPresentationPreserveOracleOutcomeAndHandle() async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent("OracleDiskFixture-\(UUID().uuidString)")
+        let workspace = WorkspaceModel(name: "Oracle disk fixture", repoPaths: [], customStoragePath: storage)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9821, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer {
+            composition.contextBuilderAgentViewModel.prepareForWindowClose()
+            composition.workspaceManager.prepareForWindowClose()
+        }
+        addTeardownBlock { await composition.workspaceManager.awaitOwnSavesForWindowClose() }
+        let tabID = UUID()
+        let openContext = AgentOracleOpenContext(windowID: 42, workspaceID: workspace.id, tabID: tabID, chatID: "ambient-wrong-chat")
+        let context = ContextBuilderCardContext(
+            tabID: nil, contextBuilderAgentVM: composition.contextBuilderAgentViewModel,
+            activeContextBuilderCallItemID: nil, activeContextBuilderResultItemID: nil, oracleOpenContext: openContext
+        )
+        let cases: [(completed: Int, oversized: Bool, toolError: Bool)] = [
+            (2, false, false), (1, false, false), (0, false, false), (1, false, true),
+            (1, true, false), (0, true, false)
+        ]
+        for fixture in cases {
+            for tool in ["ask_oracle", "oracle_send", "plan", "review"] {
+                let reply = try canonicalGroupPayload(
+                    completedCount: fixture.completed, laneCount: fixture.oversized ? 5 : 2, oversized: fixture.oversized,
+                    errorMessage: String(repeating: "x", count: 96) + " request timed out"
+                )
+                let isBuilder = tool == "plan" || tool == "review"
+                let raw = isBuilder ? ["status": "success", "response_type": tool, tool: reply] : reply
+                let row = AgentChatItem(
+                    kind: .toolResult,
+                    text: "",
+                    toolName: isBuilder ? "context_builder" : tool,
+                    toolInvocationID: UUID(),
+                    toolResultJSON: jsonString(raw),
+                    toolIsError: fixture.toolError
+                )
+                let unfinished = AgentChatItem.toolCall(name: "file_search", invocationID: UUID(), argsJSON: #"{"pattern":"pending"}"#, sequenceIndex: 1)
+                let activities = [row, unfinished].map { AgentTranscriptActivity(from: $0, toolExecution: AgentTranscriptToolNormalizer.toolExecution(for: $0)) }
+                var saved = AgentSession(
+                    workspaceID: workspace.id, composeTabID: tabID, name: "Oracle fixture",
+                    transcript: AgentTranscript(turns: [AgentTranscriptTurn(
+                        responseSpans: [AgentTranscriptProviderResponseSpan(lifecycle: .open, startedAt: row.timestamp, activities: activities)],
+                        terminalState: .running, startedAt: row.timestamp
+                    )], nextSequenceIndex: 2), lastRunState: "running"
+                )
+                let expected: ToolCardStatus = fixture.toolError || fixture.completed == 0 ? .failure : fixture.completed == 2 && !fixture.oversized ? .success : .warning
+                for pass in 1 ... 2 {
+                    // Each awaited service call settles its exact file+metadata writes;
+                    // neither load nor presentation can fall back to the source rows.
+                    let fileURL = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+                    let data = try Data(contentsOf: fileURL)
+                    let bytes = try XCTUnwrap(String(data: data, encoding: .utf8))
+                    XCTAssertFalse(bytes.contains("RESPONSE_BODY"))
+                    let onDisk = try JSONDecoder().decode(AgentSession.self, from: data)
+                    let storedActivity = try XCTUnwrap(onDisk.transcript?.turns.flatMap(\.allActivities).first { $0.id == row.id })
+                    let storedJSON = try XCTUnwrap(storedActivity.toolExecution?.resultJSON)
+                    XCTAssertLessThanOrEqual(storedJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+                    saved = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+                    let transcript = try XCTUnwrap(saved.transcript)
+                    let presentation = AgentSessionRestoreSupport.buildTranscriptPresentation(
+                        from: transcript, sourceItems: saved.items.map { $0.toItem() }, selectedAgent: .devin,
+                        previousPerformanceSnapshot: .init(), projectionProtection: .none,
+                        isCompressedHistoryRevealed: true, isColdLoad: true
+                    )
+                    let restored = try XCTUnwrap((presentation.fullProjection.workingRows + presentation.fullProjection.archivedRows).first { $0.id == row.id })
+                    XCTAssertEqual(restored.toolInvocationID, row.toolInvocationID)
+                    XCTAssertEqual(transcript.turns.first?.terminalState, .cancelled)
+                    XCTAssertEqual(transcript.turns.flatMap(\.allActivities).first { $0.id == unfinished.id }?.toolExecution?.status, .cancelled)
+                    let dto: ToolResultDTOs.ChatSendDTO?
+                    if isBuilder {
+                        let builderDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: restored.toolResultJSON))
+                        dto = tool == "plan" ? builderDTO.plan : builderDTO.review
+                        XCTAssertEqual(contextBuilderFollowUpChatID(for: builderDTO), "fixture-chat-0")
+                        let card = ContextBuilderResultCard(item: restored, context: context)
+                        XCTAssertEqual(card.status, expected, "\(tool) \(fixture) pass \(pass)")
+                        if fixture.oversized {
+                            XCTAssertFalse(["success", "completed"].contains(card.summary), card.summary)
+                        } else {
+                            XCTAssertEqual(
+                                card.summary,
+                                ContextBuilderResultCard(item: row, context: context).summary,
+                                "fitting digest must preserve the live outcome wording"
+                            )
+                        }
+                    } else {
+                        dto = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: restored.toolResultJSON)
+                        XCTAssertEqual(ChatSendResultCard(item: restored, oracleOpenContext: openContext).status, expected, "\(tool) \(fixture) pass \(pass)")
+                        XCTAssertEqual(dto?.chatID, "fixture-chat-0")
+                        // Existing routing rejects nested chat IDs, including lane IDs.
+                        // Do not turn this outcome regression into a routing-policy change.
+                        let route = oracleToolResultPopoverUserInfo(item: restored, openContext: openContext)
+                        if fixture.oversized {
+                            XCTAssertEqual(route?["chatID"] as? String, "fixture-chat-0")
+                        } else {
+                            XCTAssertNil(route)
+                        }
+                    }
+                    let coverage = OracleLaneCoverage(lanes: dto?.oracleResults, oracleCount: dto?.oracleCount)
+                    if fixture.oversized {
+                        XCTAssertNil(coverage)
+                    } else {
+                        XCTAssertEqual(coverage?.completedCount, fixture.completed)
+                        XCTAssertEqual(coverage?.totalCount, 2)
+                        XCTAssertEqual(coverage?.incompleteLanes.map(\.model), (fixture.completed ..< 2).map { "model-\($0)" })
+                        XCTAssertEqual(coverage?.incompleteLanes.map(\.reason), Array(repeating: "timed out", count: 2 - fixture.completed))
+                    }
                 }
             }
         }
@@ -852,6 +1020,20 @@ final class OracleLaneCoverageTests: XCTestCase {
             let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON))
             XCTAssertNil(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
             XCTAssertEqual(ChatSendResultCard(item: item, oracleOpenContext: nil).status, expected)
+        }
+    }
+
+    func testExplicitCancelledOracleToolResultKeepsCancellationDuringPersistence() throws {
+        for tool in ["ask_oracle", "oracle_send", "context_builder"] {
+            let item = AgentChatItem(
+                kind: .toolResult,
+                text: "",
+                toolName: tool,
+                toolResultJSON: #"{"status":"cancelled"}"#,
+                toolIsError: true
+            )
+            XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: item), .cancelled)
+            XCTAssertEqual(try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item)).transcriptStatus, .cancelled)
         }
     }
 
