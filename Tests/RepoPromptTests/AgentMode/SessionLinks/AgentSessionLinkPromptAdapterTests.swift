@@ -1607,8 +1607,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
-            claudeControllerFactory: claudeController.map { controller in
-                { _, _, _, _ in controller }
+            // A session may recycle a pre-seeded fake when its launch metadata is absent.
+            // Never let that replacement fall through to the real provider factory.
+            claudeControllerFactory: { _, _, _, _ in
+                claudeController ?? MonitorFakeNativeController()
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }
@@ -1664,11 +1666,15 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let controller = MonitorFakeNativeController()
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 2)
-        fixture.session.claudeController = controller
         let intent = try claudeRunIntent(
             for: fixture.session,
             source: "test.claude.native.supplement"
         )
+        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+            session: fixture.session,
+            intent: intent
+        )
+        XCTAssertEqual(startup, .ready)
 
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
@@ -1702,11 +1708,15 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let controller = MonitorFakeNativeController()
         let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 1)
-        fixture.session.claudeController = controller
         let intent = try claudeRunIntent(
             for: fixture.session,
             source: "test.claude.native.revocation"
         )
+        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+            session: fixture.session,
+            intent: intent
+        )
+        XCTAssertEqual(startup, .ready)
         _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: fixture.session,
             text: "linked",
@@ -1728,6 +1738,32 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let closing = try XCTUnwrap(sent.last)
         MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(closing, userContent: "after revoke")
         XCTAssertTrue(closing.contains("status=\"ended\""))
+    }
+
+    func testClaudeNativeLosingPreseededFakeRefusesRealProviderReplacement() async throws {
+        let fake = MonitorFakeNativeController()
+        // Intentionally use the production factory to reproduce a fixture that loses its fake.
+        let coordinator = ClaudeAgentModeCoordinator(windowID: 1, workspacePathProvider: { _ in nil })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.installRunID(UUID())
+        session.claudeController = fake
+        let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
+
+        let outcome = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Losing a fake must refuse real provider launch, got \(outcome)")
+        }
+        XCTAssertTrue(message.contains("Provider process launch refused under XCTest"), message)
+        let shutdowns = await fake.shutdownCount
+        let sends = await fake.sentCount
+        XCTAssertEqual(shutdowns, 1, "Missing launch metadata must reproduce fake retirement")
+        XCTAssertEqual(sends, 0)
+        XCTAssertFalse(session.claudeController === fake)
+        await session.claudeController?.shutdown()
     }
 
     func testClaudeNativeLostCatalogRouteRecyclesControllerBeforeDispatch() async throws {

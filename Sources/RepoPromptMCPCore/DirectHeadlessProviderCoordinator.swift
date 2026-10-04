@@ -68,6 +68,7 @@ actor DirectHeadlessProviderCoordinator {
     private let context: DirectHeadlessDomainContext
     private let settingsStore: DomainDirectSettingsStore
     private let environment: [String: String]
+    private let allowsProviderProcessLaunchForTesting: Bool
     private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
     private var providerTasks: [UUID: Task<String, Error>] = [:]
@@ -79,12 +80,14 @@ actor DirectHeadlessProviderCoordinator {
         context: DirectHeadlessDomainContext,
         settingsStore: DomainDirectSettingsStore,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        beginEpoch: BeginEpoch? = nil
+        beginEpoch: BeginEpoch? = nil,
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) {
         self.runtime = runtime
         self.context = context
         self.settingsStore = settingsStore
         self.environment = environment
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         let sessionStore = runtime.agentSessionStore
         self.beginEpoch = beginEpoch ?? { registration, activationID in
             await sessionStore.beginEpoch(
@@ -141,6 +144,7 @@ actor DirectHeadlessProviderCoordinator {
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
+        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
         let descriptor = try resolveProvider(providerID)
         guard let executable = descriptor.executable else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
@@ -166,7 +170,9 @@ actor DirectHeadlessProviderCoordinator {
                 arguments: arguments,
                 input: Data(message.utf8),
                 environment: childEnvironment,
-                currentDirectory: snapshot.activeRoot
+                currentDirectory: snapshot.activeRoot,
+                isProvider: true,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
             )
             return Self.finalAssistantText(from: output)
         }

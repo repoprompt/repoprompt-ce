@@ -167,7 +167,7 @@ final class DirectHeadlessContextBuilderContractTests: XCTestCase {
             "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": directory.appendingPathComponent("profile").path,
             "REPOPROMPT_MCP_WORKING_DIRS": directory.path,
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
-        ], currentDirectory: directory)
+        ], currentDirectory: directory, allowsProviderProcessLaunchForTesting: true)
         let prepared = try await service.prepareRuntime()
         addTeardownBlock { await service.teardown(prepared) }
         _ = try await prepared.settingsStore.set(key: OracleRosterContract.primarySettingKey, value: .string("lane-0"))

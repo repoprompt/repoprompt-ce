@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
 ///
@@ -536,6 +537,11 @@ enum CodexRuntimeAuthority {
         executableURL: URL,
         environment: [String: String]
     ) -> String? {
+        do {
+            try ProviderProcessLaunchPolicy.check()
+        } catch {
+            return nil
+        }
         let process = Process()
         let output = Pipe()
         process.executableURL = executableURL

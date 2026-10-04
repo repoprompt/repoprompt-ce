@@ -331,8 +331,8 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.inheritedRichEnvironment), "inherited_rich_environment")
         XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.previousCapturedFallback), "previous_captured_fallback")
 
-        let first = try await makeClient().prepareRuntimeForLaunch()
-        let newlyPrepared = try await makeClient().prepareRuntimeForLaunch()
+        let first = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await makeClient().prepareRuntimeForLaunch() }
+        let newlyPrepared = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await makeClient().prepareRuntimeForLaunch() }
         XCTAssertEqual(first, newlyPrepared)
         XCTAssertEqual(first.executableURL, environment)
         XCTAssertEqual(first.version, .init(major: 0, minor: 156, patch: 0))
@@ -461,24 +461,24 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                 source: .capturedLoginShell
             )
         }
-        let inherited = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+        let inherited = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: shellEnvironmentProvider,
             activeSelection: .inherited,
             pendingSelection: .inherited
-        )
+        ) }
 
         XCTAssertTrue(inherited.ignoredLegacyEnvironmentOverride)
         XCTAssertNotEqual(inherited.activeResolution.resolvedCommand, legacyOverride.path)
         XCTAssertNotEqual(inherited.pendingResolution.resolvedCommand, legacyOverride.path)
         XCTAssertFalse(inherited.activeResolution.debugMessage.contains(legacyOverride.path))
 
-        let customAfterRelaunch = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+        let customAfterRelaunch = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: shellEnvironmentProvider,
             activeSelection: .inherited,
             pendingSelection: .external(path: legacyOverride.path)
-        )
+        ) }
 
         XCTAssertTrue(customAfterRelaunch.ignoredLegacyEnvironmentOverride)
         XCTAssertNotEqual(customAfterRelaunch.activeResolution.resolvedCommand, legacyOverride.path)
@@ -487,12 +487,12 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(customAfterRelaunch.pendingResolution.runtime?.source, .externalOverride)
         XCTAssertFalse(customAfterRelaunch.pendingResolution.debugMessage.contains(legacyOverride.path))
 
-        let bundledAfterRelaunch = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+        let bundledAfterRelaunch = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: shellEnvironmentProvider,
             activeSelection: .external(path: legacyOverride.path),
             pendingSelection: .bundled
-        )
+        ) }
 
         XCTAssertFalse(bundledAfterRelaunch.ignoredLegacyEnvironmentOverride)
         XCTAssertEqual(bundledAfterRelaunch.activeResolution.resolvedCommand, legacyOverride.path)
@@ -508,7 +508,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         try makeExecutable(at: codex, content: "#!/usr/bin/env node\n")
 
         let temporaryPath = temporaryDirectory.path
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+        let resolution = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { await CodexProviderHelpers.preflightCodexExecutable(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: { _, _ in
                 CLIEnvironmentSnapshot(
@@ -520,7 +520,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                 )
             },
             launchSnapshot: .init(selection: .external(path: codex.path))
-        )
+        ) }
 
         XCTAssertEqual(resolution.status, .available)
         XCTAssertEqual(resolution.resolvedCommand, codex.path)
@@ -538,18 +538,18 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         try makeExecutable(at: codex, content: "#!/usr/bin/env node\n")
         let metadataBefore = try FileManager.default.attributesOfItem(atPath: codex.path)
 
-        let first = try CodexRuntimeAuthority.resolve(
+        let first = try ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { CodexRuntimeAuthority.resolve(
             environment: ["PATH": firstBin.path],
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: codex.path
-        ).get()
-        let second = try CodexRuntimeAuthority.resolve(
+        ) }.get()
+        let second = try ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { CodexRuntimeAuthority.resolve(
             environment: ["PATH": secondBin.path],
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: codex.path
-        ).get()
+        ) }.get()
         let metadataAfter = try FileManager.default.attributesOfItem(atPath: codex.path)
 
         XCTAssertEqual(first.executableURL.path, codex.path)
@@ -577,7 +577,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: codex, withDestinationURL: shim)
 
         let temporaryPath = temporaryDirectory.path
-        let preflight = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+        let preflight = await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { await CodexProviderHelpers.preflightCodexRuntimeSettings(
             inheritedEnvironment: ["HOME": temporaryPath],
             shellEnvironmentProvider: { _, _ in
                 CLIEnvironmentSnapshot(
@@ -587,7 +587,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             },
             activeSelection: .inherited,
             pendingSelection: .inherited
-        )
+        ) }
 
         XCTAssertFalse(preflight.ignoredLegacyEnvironmentOverride)
         XCTAssertNotEqual(preflight.activeResolution.resolvedCommand, codex.path)
@@ -605,11 +605,11 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let capturedEnvironment = ["PATH": bin.path + ":/usr/bin:/bin"]
 
         func resolve(_ environment: [String: String]) -> Result<CodexRuntimeAuthority.Runtime, CodexRuntimeAuthority.Failure> {
-            CodexRuntimeAuthority.resolve(
+            ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { CodexRuntimeAuthority.resolve(
                 environment: environment,
                 applicationSupportURL: temporaryDirectory,
                 explicitExecutableOverride: codex.path
-            )
+            ) }
         }
 
         XCTAssertEqual(failure(from: resolve(absentEnvironment)), .externalOverrideVersionUnreadable(codex.path))

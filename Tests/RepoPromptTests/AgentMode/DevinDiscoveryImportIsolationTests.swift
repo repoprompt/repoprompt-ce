@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcess
 import XCTest
 
 final class DevinDiscoveryImportIsolationTests: XCTestCase {
@@ -98,7 +99,9 @@ final class DevinDiscoveryImportIsolationTests: XCTestCase {
             taskLabelKind: nil,
             launchPermissionMode: "auto"
         )
-        guard case .supported = try await provider.support(for: request) else {
+        guard case .supported = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true, operation: {
+            try await provider.support(for: request)
+        }) else {
             return XCTFail("Scripted Devin launch should be supported")
         }
         let launch = try provider.makeLaunchConfiguration(for: request)

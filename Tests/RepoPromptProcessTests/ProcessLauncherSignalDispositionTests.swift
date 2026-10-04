@@ -64,7 +64,9 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         process.terminationHandler = { _ in completion.signal() }
         try process.run()
         if completion.wait(timeout: .now() + 30) == .timedOut {
-            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
             _ = completion.wait(timeout: .now() + 5)
             throw NSError(
                 domain: "ProcessLauncherSignalDispositionTests",
@@ -78,6 +80,10 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
     }
 
     private func runSignalDispositionHelper() throws {
+        // Nested XCTest runners must retain the same provider refusal as the outer host.
+        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.check()) { error in
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+        }
         guard let markerPath = ProcessInfo.processInfo.environment[HelperEnvironment.markerPath] else {
             XCTFail("isolated SIGTERM helper marker path is missing")
             return
@@ -91,7 +97,9 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
                 var cleanupStatus: Int32 = 0
                 while true {
                     let result = Darwin.waitpid(spawned.pid, &cleanupStatus, 0)
-                    if result == spawned.pid || (result == -1 && errno != EINTR) { break }
+                    if result == spawned.pid || (result == -1 && errno != EINTR) {
+                        break
+                    }
                 }
             }
             spawned.stdin?.closeFile()
@@ -112,7 +120,9 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
                 childWasReaped = true
                 break
             }
-            if result == -1, errno == EINTR { continue }
+            if result == -1, errno == EINTR {
+                continue
+            }
             XCTFail("waitpid failed for isolated SIGTERM helper: errno=\(errno)")
             return
         }
@@ -152,7 +162,8 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
                 "IFS= read -r _; kill -TERM \"$$\"; printf '%s\\n' 'child-survived-SIGTERM'"
             ],
             environment: ProcessInfo.processInfo.environment,
-            workingDirectory: nil
+            workingDirectory: nil,
+            purpose: .tool
         )
     }
 
@@ -212,5 +223,140 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         process.standardError = output
         try process.run()
         return (process, input, output)
+    }
+}
+
+/// Exercises the real launch boundary with a harmless shell fixture, never a provider CLI.
+final class ProviderProcessLaunchPolicyTests: XCTestCase {
+    func testNonXCTestProcessIgnoresUserArgumentsAndInheritedTestEnvironment() throws {
+        let root = try makeTestDirectory()
+        let source = root.appendingPathComponent("main.swift")
+        let executable = root.appendingPathComponent("ProviderLaunchPolicyProbe")
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let policy = repository.appendingPathComponent("Sources/RepoPromptShared/ProviderProcessLaunchPolicy.swift")
+        try """
+        import Foundation
+        guard NSClassFromString("XCTestCase") == nil else {
+            print("unexpected-XCTest-host")
+            exit(3)
+        }
+        print("non-XCTest-host")
+        do {
+            try ProviderProcessLaunchPolicy.check()
+            print("provider-launch-allowed")
+        } catch {
+            print("provider-launch-refused")
+            exit(2)
+        }
+        """.write(to: source, atomically: true, encoding: .utf8)
+
+        // Compile the real policy, not a copied classifier, into a non-XCTest tool fixture.
+        // This runs inside the coordinated test job and never starts a provider CLI.
+        let compiled = try runProbe(
+            executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
+            arguments: [
+                "swiftc", "-package-name", "RepoPrompt", policy.path, source.path,
+                "-o", executable.path
+            ],
+            environment: ProcessInfo.processInfo.environment,
+            root: root
+        )
+        XCTAssertEqual(compiled.status, 0, compiled.output)
+        guard compiled.status == 0 else { return }
+
+        let cases: [(name: String, arguments: [String], environment: [String: String])] = [
+            ("user paths and text", ["--cwd", "/proj/Foo.xctest", "text .xctest/Contents/MacOS/example"], [:]),
+            ("inherited configuration", [], ["XCTestConfigurationFilePath": "/tmp/example.xctestconfiguration"]),
+            ("inherited session", [], ["XCTestSessionIdentifier": UUID().uuidString]),
+            ("combined production inputs", ["/proj/Foo.xctest", "text .xctest/example"], [
+                "XCTestConfigurationFilePath": "/tmp/example.xctestconfiguration",
+                "XCTestSessionIdentifier": UUID().uuidString,
+                "XCTestBundlePath": "/tmp/example.xctest"
+            ])
+        ]
+        for fixture in cases {
+            // Do not inherit DYLD injection or the test runner's other environment.
+            var environment = ["PATH": "/usr/bin:/bin", "HOME": root.path]
+            environment.merge(fixture.environment) { _, value in value }
+            let result = try runProbe(
+                executable: executable, arguments: fixture.arguments, environment: environment, root: root
+            )
+            XCTAssertEqual(result.status, 0, "\(fixture.name): \(result.output)")
+            XCTAssertEqual(result.output, "non-XCTest-host\nprovider-launch-allowed\n", fixture.name)
+        }
+    }
+
+    private func runProbe(
+        executable: URL, arguments: [String], environment: [String: String], root: URL
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        let log = root.appendingPathComponent("\(UUID().uuidString).log")
+        try Data().write(to: log)
+        let output = try FileHandle(forWritingTo: log)
+        defer { try? output.close() }
+        process.standardOutput = output
+        process.standardError = output
+        let completion = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completion.signal() }
+        try process.run()
+        if completion.wait(timeout: .now() + 30) == .timedOut {
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+            _ = completion.wait(timeout: .now() + 5)
+            throw NSError(
+                domain: "ProviderProcessLaunchPolicyTests", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Non-provider policy probe exceeded its deadline"]
+            )
+        }
+        return try (process.terminationStatus, String(contentsOf: log, encoding: .utf8))
+    }
+
+    func testProviderSpawnIsRefusedBeforeExecutingTheCommand() throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        XCTAssertThrowsError(try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "touch \"$1\"", "fixture", marker.path],
+            environment: [:],
+            workingDirectory: nil,
+            purpose: .provider
+        )) { error in
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testBufferedAndStreamingProvidersRefuseBeforeCommandResolution() async throws {
+        let runner = CLIProcessRunner(config: .init(command: "missing-provider-for-refusal-test"))
+        do {
+            _ = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 1)
+            XCTFail("A provider must not run without explicit XCTest opt-in")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        do {
+            _ = try await runner.runStreaming(args: [], stdin: nil, outputMode: .none, timeout: 1)
+            XCTFail("A streaming provider must not run without explicit XCTest opt-in")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+    }
+
+    func testFixtureProcessOptInDoesNotEscapeItsTaskScope() async throws {
+        let runner = CLIProcessRunner(config: .init(command: "/bin/sh", shellLookupMode: .disabled))
+        let result = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await runner.run(args: ["-c", "printf fixture-ok"], stdin: nil, outputMode: .none, timeout: 2)
+        }
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "fixture-ok")
+        XCTAssertThrowsError(try ProviderProcessLaunchPolicy.check()) { error in
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal)
+        }
     }
 }

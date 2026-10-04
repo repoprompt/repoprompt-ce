@@ -222,7 +222,8 @@ enum DirectHeadlessWorktreeRouting {
         let repositoryID = "gitrepo_\(sha256(commonDirectory.path))"
         let output = try await DirectProcess.run(
             "/usr/bin/git",
-            arguments: ["-C", root.path, "worktree", "list", "--porcelain"]
+            arguments: ["-C", root.path, "worktree", "list", "--porcelain"],
+            isProvider: false
         )
         let records = porcelainRecords(output)
         struct ResolvedRecord {
@@ -463,7 +464,7 @@ enum DirectHeadlessWorktreeRouting {
     }
 
     private static func gitURL(root: URL, arguments: [String]) async throws -> URL {
-        let raw = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
+        let raw = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments, isProvider: false)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let url = raw.hasPrefix("/")
             ? URL(fileURLWithPath: raw, isDirectory: true)
@@ -515,7 +516,8 @@ enum DirectHeadlessWorktreeRouting {
                 arguments: [
                     "-C", worktree.path.path,
                     "rev-parse", "--is-inside-work-tree"
-                ]
+                ],
+                isProvider: false
             )
         } catch {
             throw MCPError.invalidRequest(

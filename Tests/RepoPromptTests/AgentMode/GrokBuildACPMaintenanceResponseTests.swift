@@ -34,7 +34,8 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
             includeRepoPromptMCPServer: false
         )
         let controller = try ACPAgentSessionController(
-            provider: GrokBuildACPAgentProvider(config: config), runRequest: request
+            provider: GrokBuildACPAgentProvider(config: config), runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
         )
         let stream = await controller.currentEventsStream()
         do {
