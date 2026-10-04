@@ -2,23 +2,60 @@ import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
+@MainActor
 final class CursorLocalModelCatalogTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
     }
 
-    func testCatalogPublishesReleaseGatedCursorModelsInProductOrder() {
-        XCTAssertEqual(
-            CursorAIModelCatalog.options.prefix(4).map(\.rawValue),
-            ["auto", "grok-4.6", "grok-4.5", "composer-2.5"]
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        super.tearDown()
+    }
+
+    private func advertise(_ modelRaw: String, parameters: [ACPModelParameterDefinition] = []) {
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [.init(rawValue: modelRaw, displayName: modelRaw, description: nil, isDefault: false)],
+                currentModelRaw: modelRaw,
+                modelParameterSets: parameters.isEmpty ? [] : [.init(baseModelRaw: modelRaw, parameters: parameters)]
+            ), for: .cursor
         )
-        XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "grok-4.6"))
-        XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "Cursor Grok 4.6"))
-        XCTAssertFalse(CursorAIModelCatalog.contains(modelRaw: "future-cursor-model"))
     }
 
-    func testGrok46DefinesExactLocalEffortAndSpeedMetadata() throws {
+    private func effort(_ values: [String], current: String, configID: String = "effort") -> ACPModelParameterDefinition {
+        .init(
+            kind: .thinking,
+            configID: configID,
+            displayName: "Effort",
+            choices: values.map { .init(rawValue: $0, displayName: $0.capitalized) },
+            currentValueRaw: current
+        )
+    }
+
+    private func speed(current: String) -> ACPModelParameterDefinition {
+        .init(
+            kind: .speed,
+            configID: "fast",
+            displayName: "Speed",
+            choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
+            currentValueRaw: current
+        )
+    }
+
+    func testRefreshReplacesMembershipWithoutReleaseFiltering() {
+        advertise("grok-4.6")
+        XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "Cursor Grok 4.6"))
+        advertise("grok-4.7")
+        XCTAssertEqual(CursorAIModelCatalog.options.map(\.rawValue), ["grok-4.7"])
+        XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "grok-4.7"))
+        XCTAssertFalse(CursorAIModelCatalog.contains(modelRaw: "grok-4.6"))
+    }
+
+    func testGrok46PreservesAdvertisedEffortAndSpeedMetadata() throws {
+        advertise("grok-4.6", parameters: [effort(["low", "medium", "high", "xhigh"], current: "high"), speed(current: "true")])
         let parameterSet = try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: "grok-4.6"))
 
         XCTAssertEqual(parameterSet.baseModelRaw, "grok-4.6")
@@ -35,7 +72,8 @@ final class CursorLocalModelCatalogTests: XCTestCase {
         XCTAssertEqual(speed.currentValueRaw, "true")
     }
 
-    func testComposer25DefinesSpeedWithoutEffort() throws {
+    func testComposer25DoesNotAddEffortToAdvertisedSpeedOnlyMetadata() throws {
+        advertise("composer-2.5", parameters: [speed(current: "true")])
         let parameterSet = try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: "composer-2.5"))
 
         XCTAssertEqual(parameterSet.parameters.map(\.kind), [.speed])
@@ -43,6 +81,7 @@ final class CursorLocalModelCatalogTests: XCTestCase {
     }
 
     func testPersistedLegacyComposer2SelectionCanonicalizesWithoutDuplicatingPickerOption() {
+        advertise("composer-2.5")
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
 
         let normalized = AgentModelCatalog.normalizePersistedSelection(
@@ -65,7 +104,8 @@ final class CursorLocalModelCatalogTests: XCTestCase {
         )
     }
 
-    func testGrok45DefinesExactLocalEffortAndSpeedDefaults() throws {
+    func testGrok45PreservesAdvertisedEffortAndSpeedDefaults() throws {
+        advertise("grok-4.5", parameters: [effort(["low", "medium", "high"], current: "high"), speed(current: "true")])
         let parameterSet = try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: "grok-4.5"))
 
         let effort = try XCTUnwrap(parameterSet.parameters.first { $0.kind == .thinking })
@@ -77,7 +117,7 @@ final class CursorLocalModelCatalogTests: XCTestCase {
         XCTAssertEqual(speed.currentValueRaw, "true")
     }
 
-    func testReleaseCatalogPinsEffortAndSpeedCapabilitiesForParameterizedCursorModels() throws {
+    func testModelOnlyRuntimeRecordsDoNotInferHistoricalParameterChoices() {
         struct Expectation {
             let model: String
             let effortValues: [String]
@@ -108,21 +148,13 @@ final class CursorLocalModelCatalogTests: XCTestCase {
         ]
 
         for expectation in expectations {
-            let parameterSet = try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: expectation.model))
-            XCTAssertEqual(
-                parameterSet.parameters.first(where: { $0.kind == .thinking })?.choices.map(\.rawValue),
-                expectation.effortValues,
-                expectation.model
-            )
-            XCTAssertEqual(
-                parameterSet.parameters.contains(where: { $0.kind == .speed }),
-                expectation.hasSpeed,
-                expectation.model
-            )
+            advertise(expectation.model)
+            XCTAssertNil(CursorAIModelCatalog.parameterSet(for: expectation.model), expectation.model)
         }
     }
 
     func testEveryCatalogParameterDefaultIsAnAdvertisedChoice() {
+        advertise("grok-4.6", parameters: [effort(["low", "high"], current: "low"), speed(current: "false")])
         for option in CursorAIModelCatalog.options {
             guard let parameterSet = CursorAIModelCatalog.parameterSet(for: option.rawValue) else { continue }
             for definition in parameterSet.parameters {
@@ -141,6 +173,7 @@ final class CursorLocalModelCatalogTests: XCTestCase {
     }
 
     func testLiveCatalogReconciliationAcceptsExactMetadataAndReportsEffortDrift() throws {
+        advertise("gpt-5.4", parameters: [effort(["none", "low", "medium", "high", "extra-high"], current: "medium", configID: "reasoning"), speed(current: "false")])
         let exactSets = CursorAIModelCatalog.options.compactMap {
             CursorAIModelCatalog.parameterSet(for: $0.rawValue)
         }
@@ -154,7 +187,7 @@ final class CursorLocalModelCatalogTests: XCTestCase {
             currentModelRaw: "grok-4.6",
             modelParameterSets: exactSets
         )
-        XCTAssertTrue(CursorAIModelCatalog.reconciliationIssues(comparedTo: exactSnapshot).isEmpty)
+        XCTAssertFalse(CursorAIModelCatalog.reconciliationIssues(comparedTo: exactSnapshot).contains { $0.hasPrefix("gpt-5.4 ") })
 
         let gpt54 = try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: "gpt-5.4"))
         let effort = try XCTUnwrap(gpt54.definition(kind: .thinking))
@@ -180,12 +213,12 @@ final class CursorLocalModelCatalogTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            CursorAIModelCatalog.reconciliationIssues(comparedTo: driftedSnapshot),
+            CursorAIModelCatalog.reconciliationIssues(comparedTo: driftedSnapshot).filter { $0.hasPrefix("gpt-5.4 ") },
             ["gpt-5.4 Effort choices changed (local: none, low, medium, high, extra-high; live: none, low, medium, high)"]
         )
     }
 
-    func testAgentModelCatalogUsesReleaseGatedCursorOptionsAndRejectsDiscoveredUnknownModels() {
+    func testAgentModelCatalogUsesDiscoveredCursorMembershipWithoutReleaseGating() {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
         XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
@@ -206,12 +239,12 @@ final class CursorLocalModelCatalogTests: XCTestCase {
             AgentModelCatalog.options(for: .cursor, availability: availability),
             CursorAIModelCatalog.options
         )
-        XCTAssertTrue(AgentModelCatalog.isValid(
+        XCTAssertFalse(AgentModelCatalog.isValid(
             rawModel: "Cursor Grok 4.6",
             for: .cursor,
             availability: availability
         ))
-        XCTAssertFalse(AgentModelCatalog.isValid(
+        XCTAssertTrue(AgentModelCatalog.isValid(
             rawModel: "future-cursor-model",
             for: .cursor,
             availability: availability

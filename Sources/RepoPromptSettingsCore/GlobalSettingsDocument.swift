@@ -361,8 +361,11 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
                 activeBaseModelRaw: selectionID.modelRaw,
                 from: selections
             )
-            guard !matching.isEmpty else { continue }
-            coherent[key] = matching
+            guard !matching.isEmpty || (providerID == .cursor && selections.contains { $0.providerID == .cursor }) else { continue }
+            // Cursor stores per-model memory; reads and requests still filter to the active model.
+            coherent[key] = providerID == .cursor
+                ? ACPModelParameterSelection.normalized(selections.filter { $0.providerID == .cursor })
+                : matching
         }
         return coherent.isEmpty ? nil : coherent
     }
@@ -386,8 +389,11 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
                 activeBaseModelRaw: modelRaw,
                 from: selections
             )
-            guard !matching.isEmpty else { continue }
-            coherent[key] = matching
+            guard !matching.isEmpty || (providerID == .cursor && selections.contains { $0.providerID == .cursor }) else { continue }
+            // Cursor stores per-model memory; reads and requests still filter to the active model.
+            coherent[key] = providerID == .cursor
+                ? ACPModelParameterSelection.normalized(selections.filter { $0.providerID == .cursor })
+                : matching
         }
         return coherent.isEmpty ? nil : coherent
     }

@@ -8,6 +8,7 @@
 
 import Foundation
 import Logging
+import MCP
 import ServiceLifecycle
 
 /// ServiceLifecycle service that runs exec mode (non-interactive command execution).
@@ -72,6 +73,44 @@ package actor ExecMCPService: Service {
         self.session = nil
     }
 
+    #if DEBUG
+        private var startupDiagnosticHandlerForTesting: (@Sendable (String) async -> Void)?
+
+        func test_runConnectedSession(
+            _ session: InteractiveMCPClientSession,
+            startupDiagnosticHandler: @escaping @Sendable (String) async -> Void
+        ) async throws {
+            startupDiagnosticHandlerForTesting = startupDiagnosticHandler
+            defer { startupDiagnosticHandlerForTesting = nil }
+            try await runConnectedSession(session)
+        }
+    #endif
+
+    private func emitStartupDiagnostic(_ text: String) async {
+        #if DEBUG
+            if let startupDiagnosticHandlerForTesting {
+                await startupDiagnosticHandlerForTesting(text)
+                return
+            }
+        #endif
+        fputs(text, stderr)
+    }
+
+    private func reportStartupBinding(_ result: CallTool.Result, target: String) async {
+        let textBlocks = result.content.compactMap { content -> String? in
+            if case let .text(text, _, _) = content { return text }
+            return nil
+        }
+        if result.isError == true {
+            let reason = textBlocks.first ?? "bind_context returned an error"
+            await emitStartupDiagnostic("Warning: Failed to bind \(target): \(reason)\n")
+        } else if !options.quiet, !textBlocks.isEmpty {
+            // Preserve server diagnostics and the session's local-only fallback
+            // wording without inventing a successful server binding.
+            await emitStartupDiagnostic(textBlocks.joined(separator: "\n") + "\n")
+        }
+    }
+
     private func runConnectedSession(_ session: InteractiveMCPClientSession) async throws {
         // Apply explicit local routing first so explicit CLI selectors still route
         // subsequent calls if bind_context validation is unavailable or times out.
@@ -84,32 +123,25 @@ package actor ExecMCPService: Service {
             await session.setSelectedContextID(tabID)
         }
 
-        // Apply explicit bind_context-based startup routing.
+        // Binding is best-effort; report the tool result rather than treating a
+        // successful JSON-RPC response (or a local compatibility hint) as a bind.
         do {
             if let contextID = options.contextID {
-                _ = try await session.bindContextID(contextID, windowID: options.windowID)
-                if !options.quiet {
-                    fputs("Bound context \(contextID)\n", stderr)
-                }
+                let result = try await session.bindContextID(contextID, windowID: options.windowID)
+                await reportStartupBinding(result, target: contextID)
             } else if let tabID = options.tabID {
-                _ = try await session.bindTab(selector: tabID, windowID: options.windowID)
-                if !options.quiet {
-                    fputs("Bound tab \(tabID)\n", stderr)
-                }
+                let result = try await session.bindTab(selector: tabID, windowID: options.windowID)
+                await reportStartupBinding(result, target: tabID)
             } else if !options.workingDirs.isEmpty {
-                _ = try await session.bindWorkingDirs(options.workingDirs, windowID: options.windowID)
-                if !options.quiet {
-                    fputs("Bound working_dirs \(options.workingDirs.joined(separator: ", "))\n", stderr)
-                }
+                let result = try await session.bindWorkingDirs(options.workingDirs, windowID: options.windowID)
+                await reportStartupBinding(result, target: options.workingDirs.joined(separator: ", "))
             } else if let windowID = options.windowID {
-                _ = try await session.selectWindow(windowID: windowID)
-                if !options.quiet {
-                    fputs("Selected window \(windowID)\n", stderr)
-                }
+                let result = try await session.selectWindow(windowID: windowID)
+                await reportStartupBinding(result, target: String(windowID))
             }
         } catch {
             let target = options.contextID ?? options.tabID ?? options.workingDirs.first ?? options.windowID.map(String.init) ?? "startup binding"
-            fputs("Warning: Failed to bind \(target): \(error)\n", stderr)
+            await emitStartupDiagnostic("Warning: Failed to bind \(target): \(error)\n")
         }
 
         // Collect commands to run

@@ -623,7 +623,10 @@ struct MCPServerPopoverContent: View {
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: promptViewModel.cursorContextBuilderMenuItems(options: promptViewModel.contextBuilderModelOptions(for: agent)))
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: promptViewModel.contextBuilderModelOptions(for: agent),
                 selectedAgent: promptViewModel.contextBuilderAgent,

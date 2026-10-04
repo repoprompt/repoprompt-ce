@@ -146,6 +146,8 @@ struct AIModelDropdown: View {
                         items: group.models.map(aiModelMenuItem)
                     )
                 }
+            } else if provider == .cursor {
+                aiModelCursorMenuItems(for: models)
             } else if provider == .devin {
                 aiModelDevinMenuItems(for: models)
             } else if provider == .openCode {
@@ -158,6 +160,39 @@ struct AIModelDropdown: View {
                 models.map(aiModelMenuItem)
             }
             return [.submenu(AIProviderType.displayName(for: provider), items: providerItems)]
+        }
+    }
+
+    /// Cursor stores its official bracket override in the existing model-string destination.
+    func aiModelCursorMenuItems(for models: [AIModel]) -> [StableMenuItem] {
+        let expectedRaw = destination.currentRawValue
+        let expectedWorkspace = promptViewModel.currentWorkspaceID
+        let selectedName = AIModel.fromModelName(expectedRaw)?.modelName ?? ""
+        let selected = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedName)
+        return models.map { model in
+            guard let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: model.modelName)?.definition(kind: .thinking),
+                  CursorAIModelCatalog.ModelSpecifier.canEncode(definition.configID) else { return aiModelMenuItem(model) }
+            let saved = selected?.baseModelRaw == model.modelName ? selected : nil
+            let specifier = saved ?? (try? CursorAIModelCatalog.ModelSpecifier(raw: model.modelName))
+            guard let specifier else { return aiModelMenuItem(model) }
+            let apply: (String) -> Void = { raw in
+                guard destination.currentRawValue == expectedRaw,
+                      promptViewModel.currentWorkspaceID == expectedWorkspace else { return }
+                destination.apply(AIModel.cursorCustom(name: raw).rawValue)
+            }
+            var items: [StableMenuItem] = [.action("Select Model", isSelected: selectedName == model.modelName) { apply(model.modelName) }]
+            if let cleared = specifier.replacing(configID: definition.configID, valueRaw: nil) {
+                items.append(.action("Use Runtime Default", isSelected: saved != nil && !specifier.overrides.contains(where: { $0.configID == definition.configID })) { apply(cleared) })
+            }
+            items.append(contentsOf: definition.choices.compactMap { choice in
+                guard let raw = specifier.replacing(configID: definition.configID, valueRaw: choice.rawValue) else { return nil }
+                return .action(choice.displayName, isSelected: saved?.overrides.contains(where: { $0.configID == definition.configID && $0.valueRaw == choice.rawValue }) == true) {
+                    guard let current = try? CursorAIModelCatalog.ModelSpecifier(raw: raw),
+                          (try? current.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))) != nil else { return }
+                    apply(raw)
+                }
+            })
+            return .submenu(model.displayName, items: items)
         }
     }
 

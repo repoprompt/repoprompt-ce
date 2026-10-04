@@ -1618,6 +1618,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedModelRaw = rawModel
     }
 
+    func canMutateCursorComposerModel(expectedSession: TabSession?, expectedTabID: UUID?) -> Bool {
+        guard let expectedSession, let session = activeSession,
+              session === expectedSession, session.tabID == expectedTabID,
+              !session.runState.isActive, !isMCPControlled(tabID: session.tabID)
+        else { return false }
+        return canSelectAgentInCurrentChat(.cursor)
+    }
+
     func selectACPModelParameter(
         _ target: ACPModelParameterSelection,
         openCodeDiscoveryKey: OpenCodeACPModelParameterKey? = nil
@@ -1682,6 +1690,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         guard updatedSelections != session.acpModelParameterSelections else { return }
         session.acpModelParameterSelections = updatedSelections
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
+        syncComposerUIState()
+        syncRunInteractionUIState()
+    }
+
+    func clearCursorModelParameter(_ identity: ACPModelParameterIdentity) {
+        guard selectedAgent == .cursor, identity.providerID == .cursor,
+              identity.canonicalBaseModelRaw == ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor),
+              let session = activeSession, !session.runState.isActive,
+              !isMCPControlled(tabID: session.tabID)
+        else { return }
+        var clearedModel: String?
+        if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedModelRaw), !specifier.overrides.isEmpty,
+           let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: selectedModelRaw)?.definition(kind: identity.kind)
+        {
+            clearedModel = specifier.replacing(configID: definition.configID, valueRaw: nil)
+        }
+        session.recordAcceptedACPModelParameterWrite(ACPModelParameterResolver.effectiveSelections(providerID: .cursor, selectedModelRaw: selectedModelRaw, persistedSelections: session.acpModelParameterSelections).filter { $0.identity == identity })
+        let updated = session.acpModelParameterSelections.filter { $0.identity != identity }
+        guard updated != session.acpModelParameterSelections || (clearedModel != nil && clearedModel != selectedModelRaw) else { return }
+        if let clearedModel {
+            // Removing an override is not a new model selection. Preserve the same base model
+            // even if connectivity changed while this menu was open.
+            isRestoringState = true
+            selectedModelRaw = clearedModel
+            isRestoringState = false
+            session.selectedModelRaw = clearedModel
+            persistLastUsedModelIfNeeded(agent: .cursor, modelRaw: clearedModel)
+        }
+        session.acpModelParameterSelections = updated
         session.isDirty = true
         scheduleSave(for: session.tabID)
         syncComposerUIState()

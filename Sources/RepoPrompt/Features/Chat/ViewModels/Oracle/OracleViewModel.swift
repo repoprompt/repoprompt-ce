@@ -4238,18 +4238,10 @@ class OracleViewModel: ObservableObject {
         // chats it would also become the agent session's display name.
         guard !ChatSession.isPlaceholderName(trimmed) else { return }
         guard let tab = workspaceManager.composeTab(with: tabID) else { return }
-        guard isDefaultComposeTabName(tab.name) else { return }
+        guard tab.hasDefaultName else { return }
         if tab.name != trimmed {
             promptViewModel.renameComposeTab(tabID, to: trimmed)
         }
-    }
-
-    private func isDefaultComposeTabName(_ name: String) -> Bool {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 2 else { return false }
-        let prefix = trimmed.prefix(1)
-        guard prefix == "T" || prefix == "t" else { return false }
-        return Int(trimmed.dropFirst()) != nil
     }
 
     // MARK: - Finalise an AI response

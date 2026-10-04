@@ -9,6 +9,69 @@ final class CursorACPParameterBindingTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    func testPersistedCursorOracleAndChatOverrideReachesRealHeadlessACPRequests() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
+        let raw = AIModel.cursorCustom(name: "model-b[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]").rawValue
+        let saved = AgentModelsSettingsProfile(planningModelRaw: raw, additionalOracleModelRaws: [], preferredComposeModelRaw: raw, syncChatModelWithOracle: true)
+        let restored = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: JSONEncoder().encode(saved))
+        let model = try XCTUnwrap(try AIModel.fromModelName(XCTUnwrap(restored.planningModelRaw)))
+        XCTAssertEqual(restored.preferredComposeModelRaw, model.rawValue)
+        let provider = fixture.provider
+        let cli = CursorCLIProvider(headlessProviderFactory: { config, workspace in
+            CursorACPHeadlessAgentProvider(config: config, workspacePath: workspace, providerFactory: { _ in provider })
+        })
+        let stream = try await cli.streamMessage(AIMessage(systemPrompt: "", userMessage: "Verify saved effort"), model: model)
+        for try await _ in stream {}
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.map { $0.params["configId"] as? String }, ["model", "Cursor.Thought-Level", "Cursor.Fast-Mode"])
+        XCTAssertEqual(mutations.map { $0.params["value"] as? String }, ["model-b", "High", "true"])
+        let requests = recordedRequests(at: fixture.recordURL)
+        let promptIndex = try XCTUnwrap(requests.firstIndex { $0.method == "session/prompt" })
+        let effortIndex = try XCTUnwrap(requests.firstIndex { $0.params["configId"] as? String == "Cursor.Thought-Level" })
+        XCTAssertLessThan(effortIndex, promptIndex)
+    }
+
+    func testFreshCursorMetadataAcceptsNewEffortOverRetiredInheritedValueAndPreservesSpeed() async throws {
+        let fixture = try makeFixture(shape: "modern", extraEnvironment: [
+            "ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1",
+            "ACP_RETIRED_HIGH_EFFORT": "1", "ACP_INITIAL_FAST": "true"
+        ], providerID: .cursor)
+        _ = try await fixture.controller.bootstrap()
+        let fresh = await fixture.controller.currentDiscoveredSessionModels()
+        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: "model-a[Cursor.Thought-Level=High,Cursor.Fast-Mode=false]")
+        XCTAssertThrowsError(try specifier.selections(in: fresh))
+        let explicit = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: "model-a", kind: .thinking, configID: "legacy-effort-id", valueRaw: "low")
+        let inherited = try specifier.selections(in: fresh, excludingConfigIDs: [explicit.configID], supersededKinds: [explicit.kind])
+        let selections = ACPModelParameterSelection.normalized(inherited.map {
+            ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw)
+        } + [explicit])
+        let report = try await fixture.controller.applySessionModelParameterSelections(selections)
+        try report.validateNoSkippedSelections()
+        try await fixture.controller.prompt(AgentMessage(userMessage: "Use newer effort and inherited speed"))
+        await fixture.controller.shutdown()
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.map { $0.params["configId"] as? String }, ["Cursor.Thought-Level", "Cursor.Fast-Mode"])
+        XCTAssertEqual(mutations.map { $0.params["value"] as? String }, ["low", "false"])
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL).map(\.method).filter { $0 == "session/set_config_option" || $0 == "session/prompt" }, ["session/set_config_option", "session/set_config_option", "session/prompt"])
+    }
+
+    func testCursorHeadlessRejectsStaleBracketSelectorBeforePrompt() async throws {
+        let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
+        let provider = fixture.provider
+        let headless = CursorACPHeadlessAgentProvider(config: .init(modelString: "model-b[obsolete-effort=High]"), providerFactory: { _ in provider })
+        do {
+            let stream = try await headless.streamAgentMessage(AgentMessage(userMessage: "Must not submit"))
+            for try await _ in stream {}
+            XCTFail("A saved selector no longer advertised must fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("obsolete-effort"))
+        }
+        await headless.dispose()
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/prompt").isEmpty)
+    }
+
     func testCursorParameterizedModelPickerAdvertisesCapabilityAndAppliesExactIndependentValues() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
@@ -233,15 +296,12 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(recordedMutationRequests(at: fixture.recordURL).first?.params["value"] as? String, "High")
     }
 
-    func testUntouchedCursorCatalogFallbackPreservesLiveEffortThroughPromptDispatch() async throws {
-        XCTAssertEqual(
-            ACPModelParameterResolver.resolve(
-                providerID: .cursor,
-                selectedModelRaw: "grok-4.6",
-                persistedSelections: []
-            ).first(where: { $0.definition.kind == .thinking })?.selectedChoice.rawValue,
-            "high"
-        )
+    func testUnpinnedCursorWithoutMetadataPreservesLiveEffortThroughPromptDispatch() async throws {
+        XCTAssertTrue(ACPModelParameterResolver.resolve(
+            providerID: .cursor,
+            selectedModelRaw: "grok-4.6",
+            persistedSelections: []
+        ).isEmpty)
 
         let fixture = try makeFixture(
             shape: "modern",
@@ -467,6 +527,7 @@ final class CursorACPParameterBindingTests: XCTestCase {
     private struct Fixture {
         let controller: ACPAgentSessionController
         let recordURL: URL
+        let provider: CursorParameterBindingProvider
     }
 
     private struct RecordedRequest {
@@ -506,7 +567,7 @@ final class CursorACPParameterBindingTests: XCTestCase {
             )
         )
         addTeardownBlock { await controller.shutdown() }
-        return Fixture(controller: controller, recordURL: recordURL)
+        return Fixture(controller: controller, recordURL: recordURL, provider: provider)
     }
 
     private func recordedMutationRequests(at url: URL) -> [RecordedRequest] {
@@ -540,7 +601,7 @@ final class CursorACPParameterBindingTests: XCTestCase {
 
     model = "model-a"
     effort = "medium"
-    fast = "false"
+    fast = os.environ.get("ACP_INITIAL_FAST", "false")
     mode = "ask"
     effort_id = "effort" if os.environ.get("ACP_OBSERVED_EFFORT_SELECTOR") else "Cursor.Thought-Level"
     fast_id = "fast" if os.environ.get("ACP_OBSERVED_FAST_SELECTOR") else "Cursor.Fast-Mode"
@@ -554,7 +615,7 @@ final class CursorACPParameterBindingTests: XCTestCase {
         if os.environ.get("ACP_INCLUDE_MODEL"):
             result.append(selector("model", "Model", "model", model, [("model-a", "Model A"), ("model-b", "Model B")]))
         if os.environ.get("ACP_INCLUDE_PARAMETERS"):
-            result.append(selector(effort_id, "Effort", "thought_level", effort, [("medium", "Medium"), ("High", "High")]))
+            result.append(selector(effort_id, "Effort", "thought_level", effort, [("low", "Low"), ("medium", "Medium")] if os.environ.get("ACP_RETIRED_HIGH_EFFORT") else [("medium", "Medium"), ("High", "High")]))
             result.append(selector(fast_id, "Speed", "model_config", fast, [("false", "Standard"), ("true", "Fast")]))
         return result
 

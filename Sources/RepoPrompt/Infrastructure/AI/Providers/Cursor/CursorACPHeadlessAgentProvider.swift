@@ -34,15 +34,24 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         let resolvedProviderFactory = providerFactory ?? { config in
             CursorACPAgentProvider(config: config)
         }
+        let baseModel = config.modelString.map { raw in (try? CursorAIModelCatalog.ModelSpecifier(raw: raw).baseModelRaw) ?? raw }
+        let launchConfig = CursorAgentConfig(
+            commandName: config.commandSelection == .automatic ? nil : config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging, modelString: baseModel,
+            includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
+            cleanupProjectMCPApproval: config.cleanupProjectMCPApproval,
+            sessionModeID: config.sessionModeID
+        )
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "Cursor",
             makeProvider: {
-                resolvedProviderFactory(config)
+                resolvedProviderFactory(launchConfig)
             },
             makeRequest: { message, _ in
                 ACPRunRequest(
                     agentKind: .cursor,
-                    modelString: config.modelString,
+                    modelString: baseModel,
                     workspacePath: workspacePath,
                     resumeSessionID: message.resumeSessionID,
                     attachments: [],
@@ -53,7 +62,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
                 if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.setSessionModel(model)
+                    try await controller.applyCursorModelSelection(model, overrides: config.modelOverrides)
                 }
                 if let sessionMode = Self.sessionModeToApply(config: config) {
                     try await controller.setSessionMode(sessionMode)

@@ -275,6 +275,7 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     let configID: String
     let displayName: String
     let selectedValueRaw: String
+    var savedValueRaw: String?
     let selectedDisplayName: String
     let choices: [ACPModelParameterChoice]
     /// OpenCode only: the demand-scoped discovery key this control's metadata came from. The
@@ -292,7 +293,7 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     }
 
     var isSavedValueUnavailable: Bool {
-        providerID == .openCode && !choices.contains { $0.rawValue == selectedValueRaw }
+        (providerID == .openCode || providerID == .cursor) && !choices.contains { $0.rawValue == selectedValueRaw }
     }
 
     var tooltip: String {

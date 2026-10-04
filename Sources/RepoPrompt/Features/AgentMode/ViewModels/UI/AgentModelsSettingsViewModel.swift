@@ -330,26 +330,37 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// sync toggle is on, mirrors to `preferredComposeModel` in the selected
     /// global/workspace Agent Models profile.
     var oracleModelDestination: ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        return ModelDestination(
             id: "agentModels.oracle",
             getter: { [weak self] in
                 self?.profileSnapshot.planningModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
-                self?.setOracleModel(raw: rawValue)
+                guard let self else { return }
+                reloadScopedState()
+                guard !rawValue.hasPrefix("cursor_custom_") || editingScope == expectedScope else { return }
+                setOracleModel(raw: rawValue)
             }
         )
     }
 
     func additionalOracleModelDestination(at index: Int) -> ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        let expectedRaw = additionalOracleModelRaws.indices.contains(index) ? additionalOracleModelRaws[index] : nil
+        return ModelDestination(
             id: "agentModels.oracle.additional.\(index)",
             getter: { [weak self] in
                 guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
                 return additionalOracleModelRaws[index]
             },
             applier: { [weak self] rawValue in
-                self?.setAdditionalOracleModel(raw: rawValue, at: index)
+                guard let self else { return }
+                reloadScopedState()
+                if rawValue.hasPrefix("cursor_custom_") {
+                    guard editingScope == expectedScope, additionalOracleModelRaws.indices.contains(index), additionalOracleModelRaws[index] == expectedRaw else { return }
+                }
+                setAdditionalOracleModel(raw: rawValue, at: index)
             }
         )
     }
@@ -358,13 +369,17 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// and, when the sync toggle is on, mirrors to `planningModel` in the
     /// selected global/workspace Agent Models profile.
     var builtinChatModelDestination: ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        return ModelDestination(
             id: "agentModels.builtinChat",
             getter: { [weak self] in
                 self?.profileSnapshot.preferredComposeModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
-                self?.setBuiltinChatModel(raw: rawValue)
+                guard let self else { return }
+                reloadScopedState()
+                guard !rawValue.hasPrefix("cursor_custom_") || editingScope == expectedScope else { return }
+                setBuiltinChatModel(raw: rawValue)
             }
         )
     }
@@ -663,12 +678,44 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     func contextBuilderAgentModelMenuItems(windowID: Int) -> [StableMenuItem] {
         let selection = selectedContextBuilderSelection
+        let expectedScope = editingScope
         var items = AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: selection.agent,
-                selectedModelRaw: selection.modelRaw
+                selectedModelRaw: selection.modelRaw,
+                cursorSelections: contextBuilderModelParameters,
+                onSelectCursorParameter: { [weak self] option, parameter in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope, selectedContextBuilderSelection == selection else { return }
+                    let existing = profileSnapshot.contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                    settingsManager.setAgentModelsContextBuilderModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]),
+                        agentRaw: AgentProviderKind.cursor.rawValue,
+                        modelRaw: option.rawValue,
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    refresh()
+                    postShouldRefresh(reason: "agent_models.context_builder_model_parameter")
+                },
+                onClearCursorParameter: { [weak self] option, identity in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope, selectedContextBuilderSelection == selection else { return }
+                    let existing = profileSnapshot.contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                    settingsManager.setAgentModelsContextBuilderModelParameter(
+                        existing.filter { $0.identity != identity },
+                        agentRaw: AgentProviderKind.cursor.rawValue,
+                        modelRaw: option.rawValue,
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    refresh()
+                    postShouldRefresh(reason: "agent_models.context_builder_model_parameter")
+                }
             ) { [weak self] selectedAgent, selectedOption in
                 self?.setContextBuilderSelection(agent: selectedAgent, modelRaw: selectedOption.rawValue)
             }
@@ -684,14 +731,46 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        let expectedScope = editingScope
+        return AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true
+                flattenSingleCodexGroups: true,
+                cursorSelections: profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? [],
+                onSelectCursorParameter: { [weak self] option, parameter in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope,
+                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
+                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
+                    settingsManager.setAgentModelsRoleModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]),
+                        roleRawValue: resolution.role.rawValue,
+                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    postAgentRoleDefaultsChanged()
+                },
+                onClearCursorParameter: { [weak self] option, identity in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope,
+                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
+                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
+                    settingsManager.setAgentModelsRoleModelParameter(
+                        existing.filter { $0.identity != identity },
+                        roleRawValue: resolution.role.rawValue,
+                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    postAgentRoleDefaultsChanged()
+                }
             ) { [weak self] selectedAgent, selectedOption in
                 guard let self else { return }
                 let selection = AgentModelCatalog.NormalizedAgentSelection(

@@ -18,7 +18,9 @@ enum ACPModelParameterResolver {
         return resolve(
             parameterSet: parameterSet,
             providerID: providerID,
-            persistedSelections: persistedSelections
+            persistedSelections: providerID == .cursor
+                ? effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: persistedSelections)
+                : persistedSelections
         )
     }
 
@@ -36,12 +38,11 @@ enum ACPModelParameterResolver {
             let saved = persistedSelections.last { selection in
                 selection.identity == definitionIdentity
             }
-            // OpenCode must show unsupported saved intent, not a default that the next run
-            // will never use. Cursor deliberately retains its existing display fallback.
+            // Show unsupported saved intent, not a default the next run will never use.
             let savedChoice = saved.flatMap { selection in
                 definition.choice(matching: selection.valueRaw)
                     ?? (
-                        providerID == .openCode
+                        providerID == .openCode || providerID == .cursor
                             ? ACPModelParameterChoice(rawValue: selection.valueRaw, displayName: selection.valueRaw)
                             : nil
                     )
@@ -64,15 +65,28 @@ enum ACPModelParameterResolver {
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+            if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+               snapshot.hasModelParameterMetadata
+            {
+                if let exact = snapshot.modelParameterSets.first(where: { $0.baseModelRaw == selectedModelRaw }) {
+                    return exact
+                }
+                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: .cursor)
+                return snapshot.modelParameterSets.first {
+                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .cursor) == identity
+                }
+            }
+            // Legacy absence remains distinct from complete-empty metadata, but neither
+            // can supply effort choices without an advertised runtime parameter set.
+            return CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
         case .openCode:
-            openCodeParameterSet(
+            return openCodeParameterSet(
                 selectedModelRaw: selectedModelRaw,
                 workspacePath: workspacePath,
                 observation: openCodeParameters
             )
         default:
-            nil
+            return nil
         }
     }
 
@@ -110,10 +124,18 @@ enum ACPModelParameterResolver {
         selectedModelRaw: String,
         persistedSelections: [ACPModelParameterSelection]
     ) -> [ACPModelParameterSelection] {
-        ACPModelParameterSelection.selections(
+        var selections = persistedSelections
+        if providerID == .cursor,
+           let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedModelRaw),
+           let encoded = try? specifier.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor), ignoringUnavailable: true)
+        {
+            // A later explicit chip/session write supersedes the model-string's inherited pin.
+            selections = ACPModelParameterSelection.normalized(encoded.map { ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw) } + persistedSelections)
+        }
+        return ACPModelParameterSelection.selections(
             for: providerID,
             activeBaseModelRaw: selectedModelRaw,
-            from: persistedSelections
+            from: selections
         )
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
     func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
@@ -21,7 +22,10 @@ extension AgentModeViewModel {
         }()
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
         let acpControls = acpModelParameterControls(session: session)
-        let acpRunLocksModelControls = session?.runState.isActive == true && !acpControls.isEmpty
+        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
+        // not unlock a model/configuration already captured by that run.
+        let acpRunLocksModelControls = session?.runState.isActive == true
+            && (selectedAgent == .cursor || !acpControls.isEmpty)
         let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
         return AgentComposerProps(
             currentTabID: tabID,
@@ -63,8 +67,8 @@ extension AgentModeViewModel {
 
     private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
         guard let providerID = selectedAgent.acpProviderID else { return [] }
-        // Pure projection over the held demand-scoped observation (OpenCode) or the static
-        // catalogue (Cursor). Never launch discovery from here. While the OpenCode observation
+        // Pure projection over the held demand-scoped observation (OpenCode) or the
+        // runtime Cursor snapshot. Never invent choices or launch discovery here. While the OpenCode observation
         // is loading/failed/has no usable parameters, this yields no parameter set, so the
         // effort control is omitted while model selection, permissions, and submission stay
         // usable. Every returned choice renders, including a one-option menu.
@@ -99,6 +103,9 @@ extension AgentModeViewModel {
                 configID: parameter.definition.configID,
                 displayName: parameter.definition.displayName,
                 selectedValueRaw: parameter.selectedChoice.rawValue,
+                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? []).last {
+                    $0.identity == ACPModelParameterIdentity(providerID: providerID, baseModelRaw: parameter.baseModelRaw, kind: parameter.definition.kind)
+                }?.valueRaw,
                 selectedDisplayName: parameter.selectedChoice.displayName,
                 choices: parameter.definition.choices,
                 openCodeDiscoveryKey: providerID == .openCode ? openCodeModelParameterObservation?.key : nil

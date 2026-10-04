@@ -275,7 +275,10 @@ struct AgentModelsPopoverView: View {
     /// Internal so behavioral tests can invoke the same menu actions as the popover.
     func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: promptViewModel.cursorContextBuilderMenuItems(options: promptViewModel.contextBuilderModelOptions(for: agent)))
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: promptViewModel.contextBuilderModelOptions(for: agent),
                 selectedAgent: promptViewModel.contextBuilderAgent,
@@ -478,6 +481,9 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
+        let expectedScope = editingScope
+        let expected = resolution.effective
+        let pins = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
@@ -485,8 +491,32 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true
+                flattenSingleCodexGroups: true,
+                cursorSelections: pins,
+                onSelectCursorParameter: { option, parameter in
+                    guard editingScope == expectedScope,
+                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
+                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
+                    MCPAgentRoleDefaultsService.setModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]), for: resolution.role,
+                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
+                    )
+                    bumpRoleDefaults()
+                },
+                onClearCursorParameter: { option, identity in
+                    guard editingScope == expectedScope,
+                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
+                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
+                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
+                    MCPAgentRoleDefaultsService.setModelParameter(
+                        existing.filter { $0.identity != identity }, for: resolution.role,
+                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
+                    )
+                    bumpRoleDefaults()
+                }
             ) { selectedAgent, selectedOption in
+                guard editingScope == expectedScope else { return }
                 let selection = AgentModelCatalog.NormalizedAgentSelection(
                     agent: selectedAgent,
                     modelRaw: selectedOption.rawValue

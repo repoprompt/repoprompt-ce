@@ -8695,15 +8695,15 @@ actor GitService {
                 break
             }
             sawData = true
-            for byte in data {
-                if byte == 0 {
-                    return (nil, nil)
+            let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                for byte in bytes {
+                    if byte == 0 { return false }
+                    if byte == 0x0A { lineCount += 1 }
                 }
-                if byte == 0x0A {
-                    lineCount += 1
-                }
-                lastByte = byte
+                lastByte = bytes.last
+                return true
             }
+            guard isText else { return (nil, nil) }
         }
 
         if sawData {

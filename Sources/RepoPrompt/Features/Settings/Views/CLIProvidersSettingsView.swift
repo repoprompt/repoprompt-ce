@@ -2319,7 +2319,7 @@ struct CLIProvidersSettingsView: View {
                                 Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
                             }
                         }
-                        .disabled(isLoadingCursor)
+                        .disabled(isLoadingCursor || viewModel.isDiscoveringCursorModels)
                         .buttonStyle(CustomButtonStyle())
 
                         Spacer()
@@ -2329,6 +2329,26 @@ struct CLIProvidersSettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(CustomButtonStyle())
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.refreshCursorModels()
+                        } label: {
+                            if viewModel.isDiscoveringCursorModels {
+                                ProgressView().scaleEffect(0.6).frame(height: 16)
+                            } else {
+                                Label("Refresh Models", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(viewModel.isDiscoveringCursorModels || isLoadingCursor)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let message = viewModel.cursorModelDiscoveryMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
 
                     Text(cursorModelSummary)
@@ -2348,7 +2368,7 @@ struct CLIProvidersSettingsView: View {
                                 Label("Connect", systemImage: "link")
                             }
                         }
-                        .disabled(isLoadingCursor)
+                        .disabled(isLoadingCursor || viewModel.isDiscoveringCursorModels)
                         .buttonStyle(CustomButtonStyle())
 
                         if let error = viewModel.cursorError, !error.isEmpty {

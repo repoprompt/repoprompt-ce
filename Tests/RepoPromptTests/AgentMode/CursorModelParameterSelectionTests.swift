@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -9,6 +10,47 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        installCursorFixture()
+    }
+
+    private func installCursorFixture() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        // Scripted runtime metadata for picker tests; never a production/offline authority.
+        let speed = ACPModelParameterDefinition(
+            kind: .speed, configID: "fast", displayName: "Speed",
+            choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
+            currentValueRaw: "true"
+        )
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    .init(rawValue: "auto", displayName: "Auto", description: nil, isDefault: true),
+                    .init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false),
+                    .init(rawValue: "composer-2.5", displayName: "Composer 2.5", description: nil, isDefault: false)
+                ],
+                currentModelRaw: "grok-4.6",
+                modelParameterSets: [
+                    .init(baseModelRaw: "grok-4.6", parameters: [
+                        .init(
+                            kind: .thinking,
+                            configID: "effort",
+                            displayName: "Effort",
+                            choices: ["low", "medium", "high", "xhigh"].map {
+                                .init(rawValue: $0, displayName: $0 == "xhigh" ? "Extra High" : $0.capitalized)
+                            },
+                            currentValueRaw: "high"
+                        ),
+                        speed
+                    ]),
+                    .init(baseModelRaw: "composer-2.5", parameters: [speed])
+                ]
+            ), for: .cursor
+        )
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        super.tearDown()
     }
 
     func testChoiceResolutionPreservesExactWireValuesAndRejectsCaseCollisions() {
@@ -393,6 +435,37 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(current?.modelRaw, "grok-4.6")
     }
 
+    func testCursorOracleAndChatMenusPersistExactBracketChoiceAndClearOnlyEffort() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CursorChatMenu-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "CursorChatMenu.\(UUID().uuidString)"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let service = AIQueriesService(keyManager: keyManager)
+        let apiSettings = APISettingsViewModel(aiQueriesService: service, keyManager: keyManager, loadStoredDataOnInit: false)
+        apiSettings.isCursorConnected = true
+        let prompt = PromptViewModel(fileManager: WorkspaceFilesViewModel(), aiQueriesService: service, apiSettingsViewModel: apiSettings, windowID: -1010, settingsManager: store)
+        let base = AIModel.cursorCustom(name: "grok-4.6")
+        for isPlanning in [true, false] {
+            let speedOnly = AIModel.cursorCustom(name: "grok-4.6[fast=false]").rawValue
+            if isPlanning { prompt.planningModelName = speedOnly } else { prompt.preferredModel = speedOnly }
+            let destination = isPlanning ? ModelDestination.planningModel(promptVM: prompt) : .chatModel(promptVM: prompt)
+            let dropdown = AIModelDropdown(promptViewModel: prompt, showSettingsPopover: .constant(false), destination: destination)
+            let menu = NSMenu.stableMenu(from: dropdown.aiModelCursorMenuItems(for: [base]))
+            let submenu = try XCTUnwrap(menu.items.first?.submenu)
+            let effort = try XCTUnwrap(submenu.items.first { $0.title == "High" })
+            _ = try (effort.target as? NSObject)?.perform(XCTUnwrap(effort.action), with: effort)
+            let saved = isPlanning ? store.globalAgentModelsProfile().planningModelRaw : store.globalAgentModelsProfile().preferredComposeModelRaw
+            XCTAssertEqual(saved, AIModel.cursorCustom(name: "grok-4.6[fast=false,effort=high]").rawValue)
+            let refreshed = AIModelDropdown(promptViewModel: prompt, showSettingsPopover: .constant(false), destination: destination)
+            let clearMenu = NSMenu.stableMenu(from: refreshed.aiModelCursorMenuItems(for: [base]))
+            let clear = try XCTUnwrap(clearMenu.items.first?.submenu?.items.first { $0.title == "Use Runtime Default" })
+            _ = try (clear.target as? NSObject)?.perform(XCTUnwrap(clear.action), with: clear)
+            XCTAssertEqual(destination.currentRawValue, speedOnly)
+        }
+    }
+
     func testPromptViewModelContextBuilderPinRejectsStaleCrossSurfaceModelSelection() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PromptViewModelContextBuilderPinTests-\(UUID().uuidString)", isDirectory: true)
@@ -438,6 +511,15 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(prompt.contextBuilderAgent, .cursor)
         XCTAssertEqual(prompt.contextBuilderAgentModelRaw, "grok-4.6")
 
+        let advertisedPin = ACPModelParameterSelection(
+            providerID: .cursor, baseModelRaw: "grok-4.6", kind: .thinking,
+            configID: "Cursor.Runtime-Effort", valueRaw: "RuntimeHigh"
+        )
+        prompt.setContextBuilderModelParameter(
+            [advertisedPin], expectedProviderID: .cursor, expectedModelRaw: "grok-4.6", expectedScope: .global
+        )
+        XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelParametersByAgent?[cursorAgentRaw], [advertisedPin])
+
         var newerProfile = store.globalAgentModelsProfile()
         newerProfile = newerProfile.replacingContextBuilderModel("composer-2.5", for: cursorAgentRaw)
         store.setGlobalAgentModelsProfile(
@@ -455,7 +537,97 @@ final class CursorModelParameterSelectionTests: XCTestCase {
 
         let finalProfile = store.globalAgentModelsProfile()
         XCTAssertEqual(finalProfile.contextBuilderModelsByAgent?[cursorAgentRaw], "composer-2.5")
-        XCTAssertNil(finalProfile.contextBuilderModelParametersByAgent?[cursorAgentRaw])
+        XCTAssertEqual(finalProfile.contextBuilderModelParametersByAgent?[cursorAgentRaw], [advertisedPin])
+        XCTAssertTrue(finalProfile.contextBuilderModelParameterSelections(for: .cursor, modelRaw: "composer-2.5").isEmpty)
+    }
+
+    func testRetiredInheritedEffortIsReplacedBeforeFreshValidationAndSpeedSurvivesProjection() throws {
+        let fresh = ACPDiscoveredSessionModels(
+            options: CursorAIModelCatalog.options, currentModelRaw: "grok-4.6",
+            modelParameterSets: [.init(baseModelRaw: "grok-4.6", parameters: [
+                .init(kind: .thinking, configID: "effort", displayName: "Effort", choices: [.init(rawValue: "low", displayName: "Low")], currentValueRaw: "low"),
+                .init(kind: .speed, configID: "fast", displayName: "Speed", choices: [.init(rawValue: "false", displayName: "Standard")], currentValueRaw: "false")
+            ])]
+        )
+        let raw = "grok-4.6[effort=high,fast=false]"
+        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
+        XCTAssertThrowsError(try specifier.selections(in: fresh), "Unsuperseded stale intent still fails closed")
+        let inherited = try specifier.selections(in: fresh, excludingConfigIDs: ["effort"])
+        XCTAssertEqual(inherited.map(\.configID), ["fast"])
+        XCTAssertEqual(inherited.map(\.valueRaw), ["false"])
+        let semanticReplacement = try specifier.selections(in: fresh, excludingConfigIDs: ["legacy-effort-id"], supersededKinds: [.thinking])
+        XCTAssertEqual(semanticReplacement.map(\.configID), ["fast"], "Legacy explicit selectors supersede by parameter identity")
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(fresh, for: .cursor)
+        let projected = ACPModelParameterResolver.effectiveSelections(providerID: .cursor, selectedModelRaw: raw, persistedSelections: [cursorEffortSelection(valueRaw: "low")])
+        XCTAssertEqual(projected.first(where: { $0.kind == .thinking })?.valueRaw, "low")
+        XCTAssertEqual(projected.first(where: { $0.kind == .speed })?.valueRaw, "false")
+    }
+
+    func testRetainedCursorComposerAuthorityRejectsChangedSessionAndActiveRun() {
+        let viewModel = makeViewModel()
+        let a = AgentModeViewModel.TabSession(tabID: UUID())
+        let b = AgentModeViewModel.TabSession(tabID: UUID())
+        for session in [a, b] {
+            session.hasLoadedPersistedState = true
+            session.selectedAgent = .cursor
+            session.selectedModelRaw = "grok-4.6"
+            viewModel.test_installLiveSession(session)
+        }
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+        viewModel.test_setCurrentTabIDOverride(a.tabID)
+        viewModel.applySessionToBindings(a)
+        let retainedSelection = {
+            guard viewModel.canMutateCursorComposerModel(expectedSession: a, expectedTabID: a.tabID) else { return }
+            viewModel.selectACPModelParameter(self.cursorEffortSelection(valueRaw: "low"))
+        }
+        XCTAssertTrue(viewModel.canMutateCursorComposerModel(expectedSession: a, expectedTabID: a.tabID))
+        viewModel.test_setCurrentTabIDOverride(b.tabID)
+        viewModel.applySessionToBindings(b)
+        retainedSelection()
+        XCTAssertTrue(a.acpModelParameterSelections.isEmpty)
+        XCTAssertTrue(b.acpModelParameterSelections.isEmpty)
+        viewModel.test_setCurrentTabIDOverride(a.tabID)
+        viewModel.applySessionToBindings(a)
+        a.runState = .running
+        retainedSelection()
+        XCTAssertTrue(a.acpModelParameterSelections.isEmpty)
+        a.runState = .idle
+        viewModel.test_setMCPControlledTabIDs([a.tabID])
+        retainedSelection()
+        XCTAssertTrue(a.acpModelParameterSelections.isEmpty)
+        viewModel.test_setMCPControlledTabIDs([])
+        retainedSelection()
+        XCTAssertEqual(a.acpModelParameterSelections.first?.valueRaw, "low")
+        let oldProps = viewModel.makeComposerProps(tabID: a.tabID)
+        let replacement = AgentModeViewModel.TabSession(tabID: a.tabID)
+        replacement.hasLoadedPersistedState = true
+        replacement.selectedAgent = .cursor
+        replacement.selectedModelRaw = "grok-4.6"
+        viewModel.test_installLiveSession(replacement)
+        viewModel.applySessionToBindings(replacement)
+        XCTAssertFalse(viewModel.canMutateCursorComposerModel(expectedSession: a, expectedTabID: a.tabID))
+        XCTAssertNotEqual(oldProps.submitTarget?.expectedSourceTabSessionIdentity, viewModel.makeComposerProps(tabID: a.tabID).submitTarget?.expectedSourceTabSessionIdentity)
+    }
+
+    func testCursorEncodedHandoffEffortCanBeChangedAndClearedWithoutLosingSpeed() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .cursor
+        session.selectedModelRaw = "grok-4.6[fast=false,effort=low]"
+        viewModel.test_installLiveSession(session)
+        viewModel.applySessionToBindings(session)
+        XCTAssertEqual(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.first(where: { $0.kind == .thinking })?.savedValueRaw, "low")
+        viewModel.selectACPModelParameter(cursorEffortSelection(valueRaw: "high"))
+        XCTAssertEqual(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.first(where: { $0.kind == .thinking })?.savedValueRaw, "high")
+        viewModel.clearCursorModelParameter(ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: "grok-4.6", kind: .thinking))
+        XCTAssertEqual(viewModel.selectedModelRaw, "grok-4.6[fast=false]")
+        let props = viewModel.makeComposerProps(tabID: tabID)
+        XCTAssertNil(props.acpModelParameterControls.first(where: { $0.kind == .thinking })?.savedValueRaw)
+        XCTAssertEqual(props.acpModelParameterControls.first(where: { $0.kind == .speed })?.savedValueRaw, "false")
     }
 
     func testActiveCursorRunLocksParameterControlsAndRejectsDefensiveSelection() {
@@ -477,7 +649,9 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
         viewModel.selectACPModelParameter(cursorEffortSelection(valueRaw: "high"))
         XCTAssertTrue(session.acpModelParameterSelections.isEmpty)
+        XCTAssertTrue(viewModel.makeComposerProps(tabID: tabID).acpModelParameterControls.isEmpty)
 
+        installCursorFixture()
         session.runState = .idle
         viewModel.updateBindingsFromSession(session)
         XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
@@ -594,7 +768,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(controls.map(\.selectedDisplayName), ["Low"])
     }
 
-    func testComposerShowsUnsupportedOpenCodeIntentWithoutChangingCursorFallback() throws {
+    func testComposerShowsUnsupportedSavedACPIntentWithoutInventingChoices() throws {
         for agent: AgentProviderKind in [.openCode, .cursor] {
             let workspacePath = "/workspace-a"
             let viewModel = makeViewModel(workspacePath: workspacePath)
@@ -624,17 +798,12 @@ final class CursorModelParameterSelectionTests: XCTestCase {
             )
             session.acpModelParameterSelections = [saved]
             let control = try XCTUnwrap(viewModel.makeComposerProps().acpModelParameterControls.first)
-            XCTAssertEqual(control.selectedValueRaw, agent == .openCode ? saved.valueRaw : defaultControl.selectedValueRaw)
-            XCTAssertEqual(control.selectedDisplayName, agent == .openCode ? saved.valueRaw : defaultControl.selectedDisplayName)
-            XCTAssertEqual(control.isSavedValueUnavailable, agent == .openCode)
+            XCTAssertEqual(control.selectedValueRaw, saved.valueRaw)
+            XCTAssertEqual(control.selectedDisplayName, saved.valueRaw)
+            XCTAssertTrue(control.isSavedValueUnavailable)
             XCTAssertEqual(control.choices, defaultControl.choices)
-            if agent == .openCode {
-                XCTAssertTrue(control.tooltip.contains(saved.valueRaw))
-                XCTAssertEqual(control.accessibilityValue, "retired-effort, unavailable")
-            } else {
-                XCTAssertEqual(control.tooltip, defaultControl.tooltip)
-                XCTAssertEqual(control.accessibilityValue, defaultControl.accessibilityValue)
-            }
+            XCTAssertTrue(control.tooltip.contains(saved.valueRaw))
+            XCTAssertEqual(control.accessibilityValue, "retired-effort, unavailable")
             XCTAssertEqual(ACPModelParameterResolver.effectiveSelections(
                 providerID: providerID,
                 selectedModelRaw: session.selectedModelRaw,

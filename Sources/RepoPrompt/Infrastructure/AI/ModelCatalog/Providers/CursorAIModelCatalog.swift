@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptSettingsCore
 
-/// Release-gated Cursor model metadata used by Agent Mode UI and MCP surfaces.
+/// Cursor runtime membership and parameter authority, with legacy offline metadata.
 ///
 /// Cursor's CLI also publishes synthetic model variants, but expanding every
 /// effort and speed combination in the model picker does not scale. Keep the
@@ -26,7 +26,13 @@ enum CursorAIModelCatalog {
         }
     }
 
-    static let options: [AgentModelOption] = entries.map { entry in
+    static var options: [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options
+            ?? referenceOptions.filter { $0.rawValue == AgentModel.cursorAuto.rawValue }
+    }
+
+    /// Historical aliases and diagnostic comparison only, never production effort authority.
+    private static let referenceOptions: [AgentModelOption] = entries.map { entry in
         AgentModelOption(
             rawValue: entry.rawValue,
             displayName: entry.displayName,
@@ -37,18 +43,119 @@ enum CursorAIModelCatalog {
         )
     }
 
+    struct ModelSpecifier {
+        struct Override {
+            let configID: String
+            let valueRaw: String
+        }
+
+        let baseModelRaw: String
+        let overrides: [Override]
+
+        init(raw: String) throws {
+            // A real advertisement owns its exact ID, even if it contains bracket characters.
+            if CursorAIModelCatalog.options.contains(where: { $0.rawValue == raw }) || !raw.contains("[") {
+                baseModelRaw = raw
+                overrides = []
+                return
+            }
+            guard let start = raw.firstIndex(of: "["), raw.hasSuffix("]") else { throw Self.invalid(raw) }
+            baseModelRaw = String(raw[..<start])
+            let body = raw[raw.index(after: start) ..< raw.index(before: raw.endIndex)]
+            var parsed: [Override] = []
+            var ids = Set<String>()
+            for pair in body.split(separator: ",", omittingEmptySubsequences: false) {
+                let parts = pair.split(separator: "=", omittingEmptySubsequences: false)
+                guard parts.count == 2, Self.canEncode(String(parts[0])), Self.canEncode(String(parts[1])),
+                      ids.insert(String(parts[0])).inserted else { throw Self.invalid(raw) }
+                parsed.append(.init(configID: String(parts[0]), valueRaw: String(parts[1])))
+            }
+            guard !baseModelRaw.isEmpty, !baseModelRaw.contains("]"), !parsed.isEmpty else { throw Self.invalid(raw) }
+            overrides = parsed
+        }
+
+        static func canEncode(_ raw: String) -> Bool {
+            !raw.isEmpty && !raw.contains(where: { "[]=,".contains($0) || $0.isWhitespace })
+        }
+
+        static func invalid(_ raw: String) -> NSError {
+            NSError(domain: "CursorModelSelection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unsupported Cursor model selection: \(raw)"])
+        }
+
+        struct ValidatedOverride {
+            let baseModelRaw: String
+            let kind: ACPModelParameterKind
+            let configID: String
+            let valueRaw: String
+        }
+
+        func selections(in snapshot: ACPDiscoveredSessionModels?, excludingConfigIDs: Set<String> = [], supersededKinds: Set<ACPModelParameterKind> = [], ignoringUnavailable: Bool = false) throws -> [ValidatedOverride] {
+            let inherited = overrides.filter { !excludingConfigIDs.contains($0.configID) }
+            guard !inherited.isEmpty else { return [] }
+            guard let set = snapshot?.modelParameterSets.first(where: { $0.baseModelRaw == baseModelRaw }) else { throw Self.invalid(baseModelRaw) }
+            return try inherited.compactMap { override in
+                guard let definition = set.definition(configID: override.configID) else {
+                    if ignoringUnavailable { return nil }
+                    throw Self.invalid("\(override.configID)=\(override.valueRaw)")
+                }
+                if supersededKinds.contains(definition.kind) { return nil }
+                guard definition.choices.contains(where: { $0.rawValue == override.valueRaw }) else {
+                    if ignoringUnavailable { return nil }
+                    throw Self.invalid("\(override.configID)=\(override.valueRaw)")
+                }
+                return .init(
+                    baseModelRaw: set.baseModelRaw,
+                    kind: definition.kind,
+                    configID: definition.configID,
+                    valueRaw: override.valueRaw
+                )
+            }
+        }
+
+        func replacing(configID: String, valueRaw: String?) -> String? {
+            guard Self.canEncode(configID), valueRaw.map(Self.canEncode) ?? true else { return nil }
+            var values = overrides.filter { $0.configID != configID }
+            if let valueRaw { values.append(.init(configID: configID, valueRaw: valueRaw)) }
+            return values.isEmpty ? baseModelRaw : baseModelRaw + "[" + values.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ",") + "]"
+        }
+    }
+
     static func contains(modelRaw: String) -> Bool {
-        entry(matching: modelRaw) != nil
+        option(matching: modelRaw) != nil
     }
 
     static func option(matching modelRaw: String) -> AgentModelOption? {
-        guard let match = entry(matching: modelRaw) else { return nil }
-        return options.first { $0.rawValue == match.rawValue }
+        if let exact = options.first(where: { $0.rawValue == modelRaw }) { return exact }
+        if let specifier = try? ModelSpecifier(raw: modelRaw), !specifier.overrides.isEmpty,
+           let base = option(matching: specifier.baseModelRaw),
+           let selections = try? specifier.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))
+        {
+            let labels = selections.map { selection in
+                parameterSet(for: base.rawValue)?.definition(configID: selection.configID)?.choices.first(where: { $0.rawValue == selection.valueRaw })?.displayName ?? selection.valueRaw
+            }
+            return AgentModelOption(rawValue: modelRaw, displayName: base.displayName + " · " + labels.joined(separator: " · "), description: base.description, isDefault: false)
+        }
+        let requested = canonicalAlias(modelRaw)
+        let matches = options.filter {
+            canonicalAlias($0.rawValue) == requested
+                || canonicalAlias($0.displayName) == requested
+        }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     static func parameterSet(for modelRaw: String) -> ACPModelParameterSet? {
-        guard let match = entry(matching: modelRaw), !match.parameters.isEmpty else { return nil }
-        return ACPModelParameterSet(baseModelRaw: match.rawValue, parameters: match.parameters)
+        if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+           snapshot.hasModelParameterMetadata
+        {
+            guard let option = option(matching: modelRaw) else { return nil }
+            return snapshot.modelParameterSets.first { $0.baseModelRaw == option.rawValue }
+        }
+        // A model-only legacy record contains no evidence for any parameter choices.
+        return nil
+    }
+
+    static func canonicalAlias(_ raw: String) -> String {
+        entry(matching: raw)?.rawValue ?? ACPAIModelCatalog.normalizedCursorModelAlias(raw)
     }
 
     static func reconciliationIssues(comparedTo liveCatalog: ACPDiscoveredSessionModels) -> [String] {

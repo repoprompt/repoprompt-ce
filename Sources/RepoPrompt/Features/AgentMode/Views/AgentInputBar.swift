@@ -32,6 +32,8 @@ struct AgentComposerActions {
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
+    var clearCursorModelParameter: (ACPModelParameterIdentity) -> Void = { _ in }
+    var canMutateCursorModel: (_ tabID: UUID?) -> Bool = { _ in false }
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -111,7 +113,10 @@ struct AgentInputBar: View {
     }
 
     private var composerActions: AgentComposerActions {
-        AgentComposerActions(
+        // Composer props carry the source session identity in submitTarget, so replacing
+        // an idle session also invalidates the equatable view's retained actions.
+        let cursorSession = agentModeVM.activeSession
+        return AgentComposerActions(
             storeDraft: { tabID, text, sequence in
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
             },
@@ -149,6 +154,10 @@ struct AgentInputBar: View {
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
             selectACPModelParameter: { target, openCodeDiscoveryKey in
                 agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
+            },
+            clearCursorModelParameter: { agentModeVM.clearCursorModelParameter($0) },
+            canMutateCursorModel: { tabID in
+                agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
             },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
@@ -925,6 +934,40 @@ struct AgentComposerView: View, Equatable {
             return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
                 actions.selectAgentModel(agent, "")
             }]
+        }
+        if agent == .cursor {
+            return AgentModelStableMenuItems.cursorModelItems(
+                options: options,
+                selectedModelRaw: props.selectedAgent == .cursor ? ((try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) ?? props.selectedModelRaw) : "",
+                selections: props.acpModelParameterControls.filter { $0.providerID == .cursor }.compactMap {
+                    guard let savedValueRaw = $0.savedValueRaw else { return nil }
+                    return ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: $0.baseModelRaw,
+                        kind: $0.kind,
+                        configID: $0.configID,
+                        valueRaw: savedValueRaw
+                    )
+                },
+                onSelectModel: { model in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    actions.selectAgentModel(.cursor, model.rawValue)
+                },
+                onSelectParameter: { model, parameter in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.selectACPModelParameter(parameter, nil)
+                },
+                onClearParameter: { model, identity in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.clearCursorModelParameter(identity)
+                }
+            )
         }
         if agent == .devin {
             return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in

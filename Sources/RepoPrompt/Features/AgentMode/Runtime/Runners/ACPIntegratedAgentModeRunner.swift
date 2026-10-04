@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 @MainActor
 final class ACPIntegratedAgentModeRunner {
@@ -1483,9 +1484,15 @@ final class ACPIntegratedAgentModeRunner {
                     try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 },
                 {
-                    let report = try await controller.applySessionModelParameterSelections(
-                        runRequest.modelParameterSelections
-                    )
+                    var selections = runRequest.modelParameterSelections
+                    if runRequest.agentKind == .cursor, let raw = runRequest.modelString {
+                        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
+                        let explicit = ACPModelParameterSelection.selections(for: .cursor, activeBaseModelRaw: specifier.baseModelRaw, from: selections)
+                        // New explicit intent replaces inherited pins before fresh validation.
+                        let encoded = try await specifier.selections(in: controller.currentDiscoveredSessionModels(), excludingConfigIDs: Set(explicit.map(\.configID)), supersededKinds: Set(explicit.map(\.kind)))
+                        selections = ACPModelParameterSelection.normalized(encoded.map { ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw) } + selections)
+                    }
+                    let report = try await controller.applySessionModelParameterSelections(selections)
                     try report.validateNoSkippedSelections()
                 },
                 {
@@ -1544,7 +1551,7 @@ final class ACPIntegratedAgentModeRunner {
         // prompt. Force the selector RPC for OpenCode whenever selections are pending; other ACP
         // providers keep the skip. Covers fresh and continue runs (shared helper).
         try await controller.setSessionModel(
-            model,
+            runRequest.agentKind == .cursor ? CursorAIModelCatalog.ModelSpecifier(raw: model).baseModelRaw : model,
             forceRPC: runRequest.agentKind == .openCode && !runRequest.modelParameterSelections.isEmpty
         )
     }
@@ -1559,14 +1566,6 @@ final class ACPIntegratedAgentModeRunner {
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
         else {
             return nil
-        }
-        if agentKind == .cursor,
-           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
-           !CursorAIModelCatalog.contains(modelRaw: model)
-        {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
-            )
         }
         if agentKind == .grokBuild || agentKind == .antigravity,
            let providerID = agentKind.acpProviderID,

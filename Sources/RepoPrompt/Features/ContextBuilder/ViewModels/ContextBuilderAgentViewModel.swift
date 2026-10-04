@@ -1023,6 +1023,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     // MARK: - Dependencies
 
+    func cursorModelMenuItems() -> [StableMenuItem] {
+        promptManager.cursorContextBuilderMenuItems(options: modelOptions(for: .cursor), canApply: { [weak self] in self?.agentRunState.isRunning == false })
+    }
+
     private let promptManager: PromptViewModel
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let mcpServer: MCPServerViewModel

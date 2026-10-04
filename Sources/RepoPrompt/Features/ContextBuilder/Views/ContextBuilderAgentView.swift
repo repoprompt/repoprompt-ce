@@ -1271,7 +1271,10 @@ struct ContextBuilderAgentView: View {
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = viewModel.availableAgents.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: viewModel.cursorModelMenuItems())
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: viewModel.modelOptions(for: agent),
                 selectedAgent: viewModel.selectedAgent,

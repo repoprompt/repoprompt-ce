@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 enum AgentModelSelectionWarningVisuals {
@@ -90,6 +91,21 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
+        } else if agentKind == .cursor {
+            ForEach(options, id: \.rawValue) { option in
+                if let definition = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: option.rawValue)?.definition(kind: .thinking) {
+                    Menu(option.displayName) {
+                        modelOptionButton(option, title: "Use Runtime Default")
+                        ForEach(definition.choices, id: \.rawValue) { choice in
+                            if let effortOption = AgentModelCatalog.cursorEffortOption(option, configID: definition.configID, valueRaw: choice.rawValue) {
+                                modelOptionButton(effortOption, title: choice.displayName)
+                            }
+                        }
+                    }
+                } else {
+                    modelOptionButton(option)
+                }
+            }
         } else if agentKind == .devin {
             ForEach(Array(DevinModelCatalog.current.menuGroups(for: options).enumerated()), id: \.offset) { _, group in
                 if group.rendersAsSubmenu {
@@ -137,6 +153,8 @@ struct AgentModelOptionsMenuContent: View {
 
     private func modelOptionButton(_ option: AgentModelOption, title: String? = nil) -> some View {
         Button {
+            if agentKind == .cursor, !AgentModelCatalog.cursorSelectionIsAvailable(option.rawValue) { return }
+
             AgentModelCatalog.updateLastUsedEffortIfEncoded(
                 agentKind: agentKind,
                 rawModel: option.rawValue
@@ -190,6 +208,9 @@ enum AgentModelStableMenuItems {
         includePlaceholderDefault: Bool = true,
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
+        cursorSelections: [ACPModelParameterSelection] = [],
+        onSelectCursorParameter: ((AgentModelOption, ACPModelParameterSelection) -> Void)? = nil,
+        onClearCursorParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> StableMenuItem {
         StableMenuItem.submenu(
@@ -202,6 +223,9 @@ enum AgentModelStableMenuItems {
                 includePlaceholderDefault: includePlaceholderDefault,
                 flattenSingleCodexGroups: flattenSingleCodexGroups,
                 groupOpenCode: groupOpenCode,
+                cursorSelections: cursorSelections,
+                onSelectCursorParameter: onSelectCursorParameter,
+                onClearCursorParameter: onClearCursorParameter,
                 onSelect: onSelect
             )
         )
@@ -215,6 +239,9 @@ enum AgentModelStableMenuItems {
         includePlaceholderDefault: Bool = true,
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
+        cursorSelections: [ACPModelParameterSelection] = [],
+        onSelectCursorParameter: ((AgentModelOption, ACPModelParameterSelection) -> Void)? = nil,
+        onClearCursorParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> [StableMenuItem] {
         if agentKind == .codexExec {
@@ -237,6 +264,16 @@ enum AgentModelStableMenuItems {
                 selectedAgent: selectedAgent,
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
+            )
+        }
+        if agentKind == .cursor, let onSelectCursorParameter {
+            return cursorModelItems(
+                options: visibleOptions,
+                selectedModelRaw: selectedAgent == .cursor ? selectedModelRaw : "",
+                selections: cursorSelections,
+                onSelectModel: { onSelect(.cursor, $0) },
+                onSelectParameter: onSelectCursorParameter,
+                onClearParameter: onClearCursorParameter
             )
         }
         if agentKind == .devin {
@@ -278,6 +315,57 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+    }
+
+    /// Base model → advertised effort. The owner applies the model and pin together;
+    /// menu construction never synthesizes wire values or changes saved intent.
+    static func cursorModelItems(
+        options: [AgentModelOption],
+        selectedModelRaw: String,
+        selections: [ACPModelParameterSelection],
+        onSelectModel: @escaping (AgentModelOption) -> Void,
+        onSelectParameter: @escaping (AgentModelOption, ACPModelParameterSelection) -> Void,
+        onClearParameter: ((AgentModelOption, ACPModelParameterIdentity) -> Void)? = nil
+    ) -> [StableMenuItem] {
+        options.map { option in
+            guard let resolved = ACPModelParameterResolver.resolve(
+                providerID: .cursor,
+                selectedModelRaw: option.rawValue,
+                persistedSelections: selections
+            ).first(where: { $0.definition.kind == .thinking }) else {
+                return .action(option.displayName, isSelected: option.rawValue == selectedModelRaw) {
+                    onSelectModel(option)
+                }
+            }
+            let identity = ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: resolved.baseModelRaw, kind: .thinking)
+            let saved = selections.last { $0.identity == identity }
+            var items: [StableMenuItem] = [.action("Select Model", isSelected: option.rawValue == selectedModelRaw) {
+                onSelectModel(option)
+            }]
+            if let onClearParameter {
+                items.append(.action("Use Runtime Default", isSelected: option.rawValue == selectedModelRaw && saved == nil) {
+                    onClearParameter(option, identity)
+                })
+            }
+            items.append(contentsOf: resolved.definition.choices.map { choice in
+                .action(
+                    choice.displayName,
+                    isSelected: option.rawValue == selectedModelRaw && choice.rawValue == saved?.valueRaw
+                ) {
+                    guard let current = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: option.rawValue)?.definition(kind: .thinking),
+                          current.configID == resolved.definition.configID,
+                          current.choices.contains(where: { $0.rawValue == choice.rawValue }) else { return }
+                    onSelectParameter(option, ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: resolved.baseModelRaw,
+                        kind: .thinking,
+                        configID: resolved.definition.configID,
+                        valueRaw: choice.rawValue
+                    ))
+                }
+            })
+            return .submenu(option.displayName, items: items)
         }
     }
 

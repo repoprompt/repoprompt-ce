@@ -2,6 +2,16 @@ import Foundation
 import RepoPromptSettingsCore
 
 enum AgentModelCatalog {
+    static func cursorEffortOption(_ option: AgentModelOption, configID: String, valueRaw: String) -> AgentModelOption? {
+        guard let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: option.rawValue),
+              let raw = specifier.replacing(configID: configID, valueRaw: valueRaw) else { return nil }
+        return CursorAIModelCatalog.option(matching: raw)
+    }
+
+    static func cursorSelectionIsAvailable(_ raw: String) -> Bool {
+        CursorAIModelCatalog.option(matching: raw) != nil
+    }
+
     struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool

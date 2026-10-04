@@ -857,6 +857,47 @@ class PromptViewModel: ObservableObject {
 
     /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
     /// chip's saved-state input.
+    func cursorContextBuilderMenuItems(options: [AgentModelOption], canApply: @escaping () -> Bool = { true }) -> [StableMenuItem] {
+        let expectedScope = currentAgentModelsEditingScope
+        let expectedAgent = contextBuilderAgent
+        let expectedModel = contextBuilderAgentModelRaw
+        let expectedPersisted = resolvedPersistedContextBuilderSelection()
+        let pins = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+        return AgentModelStableMenuItems.cursorModelItems(
+            options: options,
+            selectedModelRaw: expectedAgent == .cursor ? expectedModel : "",
+            selections: pins,
+            onSelectModel: { [weak self] option in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                contextBuilderAgent = .cursor
+                selectContextBuilderAgentModel(rawModel: option.rawValue)
+                commitContextBuilderSettings()
+            },
+            onSelectParameter: { [weak self] option, parameter in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                let existing = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                settingsManager.setAgentModelsContextBuilderModelParameter(
+                    ACPModelParameterSelection.normalized(existing + [parameter]),
+                    agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue, scope: expectedScope
+                )
+            },
+            onClearParameter: { [weak self] option, identity in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                let existing = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                settingsManager.setAgentModelsContextBuilderModelParameter(
+                    existing.filter { $0.identity != identity },
+                    agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue, scope: expectedScope
+                )
+            }
+        )
+    }
+
     var contextBuilderThinkingParameterValueRaw: String? {
         contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
     }
