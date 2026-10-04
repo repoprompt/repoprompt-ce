@@ -13,68 +13,62 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         super.tearDown()
     }
 
-    private enum DiscoveryProbeError: Error {
-        case finished, unexpectedProviderCall
-    }
-
-    /// Stops before bootstrap: this test observes routing without launching a process.
-    private struct DiscoveryProbeProvider: ACPAgentProvider {
-        var providerID: ACPProviderID {
-            .grokBuild
-        }
-
-        func support(for _: ACPRunRequest) async -> ACPSupportResult {
-            .supported
-        }
-
-        func makeLaunchConfiguration(for _: ACPRunRequest) throws -> ACPLaunchConfiguration {
-            throw DiscoveryProbeError.unexpectedProviderCall
-        }
-
-        func makeSessionConfiguration(
-            for _: ACPRunRequest,
-            mcpServer _: RepoPromptMCPServerConfiguration
-        ) throws -> ACPSessionConfiguration {
-            throw DiscoveryProbeError.unexpectedProviderCall
-        }
-
-        func buildPromptBlocks(for _: AgentMessage, request _: ACPRunRequest) throws -> [[String: Any]] {
-            throw DiscoveryProbeError.unexpectedProviderCall
-        }
-
-        func normalizeSessionUpdate(_: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
-            []
-        }
-
-        func normalizeError(_ error: Error) -> Error {
-            error
-        }
-    }
-
-    func testControllerDiscoveryUsesNeutralDirectoryAndIsolatedPurpose() async throws {
+    func testControllerDiscoveryReusesVerifiedSessionAcrossWorkspacesInNeutralDirectory() async throws {
         let neutralPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
             .standardizedFileURL.path
+        let fixtureDirectory = try makeTestDirectory()
+        let scriptURL = try AgentSessionLinkACPServerScript.write(to: fixtureDirectory)
+        let fixtureProvider = AgentSessionLinkCapturingACPProvider(
+            providerID: .grokBuild, commandPath: scriptURL.path, environment: ["ACP_LOAD": "1"]
+        )
+        let initialRequest = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: nil,
+            workspacePath: neutralPath,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        // Keep the first real controller observable after discovery shuts down its process.
+        let firstController = try ACPAgentSessionController(
+            provider: fixtureProvider, runRequest: initialRequest, allowsProviderProcessLaunchForTesting: true
+        )
+        let resumeIDs = LifecycleRecorder()
         let client = GrokBuildACPControllerModelDiscoveryClient(
             providerFactory: { config in
                 XCTAssertEqual(config.launchPurpose, .modelDiscovery)
                 XCTAssertFalse(config.includeRepoPromptMCPServer)
-                return DiscoveryProbeProvider()
+                XCTAssertNil(config.apiKey)
+                return fixtureProvider
             },
-            controllerFactory: { _, request in
+            controllerFactory: { provider, request in
                 XCTAssertEqual(request.workspacePath, neutralPath)
-                XCTAssertNil(request.resumeSessionID)
-                throw DiscoveryProbeError.finished
+                resumeIDs.record(request.resumeSessionID ?? "<new>")
+                if resumeIDs.events.count == 1 {
+                    return firstController
+                }
+                return try ACPAgentSessionController(
+                    provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+                )
             }
         )
-        for workspacePath in [nil, "/unused/grok-project-a", "/unused/grok-project-b"] as [String?] {
-            do {
-                _ = try await client.discoverModels(workspacePath: workspacePath)
-                XCTFail("Expected the probe to stop before bootstrap")
-            } catch DiscoveryProbeError.finished {
-                // Request and provider config were checked at the real construction boundary.
-            }
+        let service = GrokBuildACPModelPollingService(client: client)
+        do {
+            _ = try await service.discoverOnce(workspacePath: "/unused/grok-project-a")
+            let identity = await firstController.currentProviderSessionIdentity()
+            XCTAssertEqual(identity.loadSessionIDConfidence, .verified)
+            let verifiedID = try XCTUnwrap(identity.loadSessionID)
+            XCTAssertFalse(verifiedID.isEmpty)
+            XCTAssertEqual(resumeIDs.events, ["<new>"])
+
+            _ = try await service.discoverOnce(workspacePath: "/unused/grok-project-b")
+            XCTAssertEqual(resumeIDs.events, ["<new>", verifiedID])
+        } catch {
+            await service.shutdown()
+            throw error
         }
+        await service.shutdown()
     }
 
     private struct StubDiscoveryClient: GrokBuildACPModelDiscoveryClient {
