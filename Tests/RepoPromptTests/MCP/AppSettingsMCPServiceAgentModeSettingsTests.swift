@@ -491,6 +491,41 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 }
                 previousAgentRaw = agent.rawValue
             }
+
+            let cursorRaw = AgentProviderKind.cursor.rawValue
+            let cursorModel = "cursor-custom[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]"
+            for (oldAgentRaw, agentRaw, expectedModel) in [
+                (cursorRaw, codexRaw, codexModel),
+                (codexRaw, cursorRaw, cursorModel)
+            ] {
+                let setAgent = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.agent"),
+                    "value": .string(agentRaw)
+                ])
+                XCTAssertEqual(setAgent.objectValue?["old_value"]?.stringValue, oldAgentRaw)
+                XCTAssertEqual(setAgent.objectValue?["new_value"]?.stringValue, agentRaw)
+                XCTAssertEqual(setAgent.objectValue?["changed"]?.boolValue, true)
+                XCTAssertEqual(setAgent.objectValue?["applied"]?.boolValue, true)
+
+                let reloaded = GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+                )
+                for currentStore in [store, reloaded] {
+                    let get = try await AppSettingsMCPService(store: currentStore).handleForTesting([
+                        "op": .string("get"),
+                        "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+                    ])
+                    let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+                    XCTAssertEqual(values["context_builder.agent"]?.stringValue, agentRaw)
+                    XCTAssertEqual(values["context_builder.model"]?.stringValue, expectedModel)
+                    let profile = currentStore.globalAgentModelsProfile()
+                    XCTAssertEqual(profile.contextBuilderAgentRaw, agentRaw)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[codexRaw], codexModel)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[cursorRaw], cursorModel)
+                }
+            }
         }
     }
 
