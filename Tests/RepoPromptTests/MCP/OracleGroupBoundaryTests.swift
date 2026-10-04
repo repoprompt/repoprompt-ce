@@ -316,6 +316,118 @@ import XCTest
             }
         }
 
+        func testGroupExportCancellationPreservesSettledLaneHandlesBeforeAndDuringExport() async throws {
+            let lanes = try [
+                OracleLaneResult(
+                    laneIndex: 0, chatID: "completed-chat", providerID: "fixture", modelID: "primary",
+                    status: .completed, response: "sum 81"
+                ),
+                OracleLaneResult(
+                    laneIndex: 1, chatID: "cancelled-chat", providerID: "fixture", modelID: "additional",
+                    status: .cancelled, error: OracleLaneError(code: "cancelled", message: "Cancelled")
+                )
+            ]
+            let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: lanes)
+            let payload = ContextBuilderOracleGroupReply(result: group).toMCPFields()
+            for cancelBeforeExport in [true, false] {
+                let fixture = makeOracleSendFixture(exportOperation: { _ in
+                    XCTAssertFalse(cancelBeforeExport, "A cancelled request must not begin exporting")
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    throw CancellationError()
+                })
+                defer { fixture.cleanup() }
+                let request = OracleExportRequest(
+                    sourceTool: "ask_oracle", mode: "chat",
+                    message: "Read only fixture.txt. Write a 400-word essay about the fixture values, then give the sum.",
+                    chatID: "completed-chat", response: nil, groupResult: group
+                )
+                let task = Task {
+                    if cancelBeforeExport { withUnsafeCurrentTask { $0?.cancel() } }
+                    return try await fixture.service.exportSettledOracleResponse(payload, request: request)
+                }
+                let reply = try await task.value
+                XCTAssertEqual(reply["oracle_group_id"], payload["oracle_group_id"])
+                XCTAssertEqual(reply["status"], .string("partial_failure"))
+                XCTAssertEqual(reply["oracle_results"], payload["oracle_results"])
+                XCTAssertNotNil(reply["oracle_export_error"])
+                XCTAssertNil(reply["oracle_export_path"])
+            }
+        }
+
+        func testOrdinaryExportFailurePreservesSettledGroupedAndSingleRepliesOnBlockingPaths() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("oracle-export-fixture-\(UUID())", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let group = try OracleGroupResult(
+                groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure,
+                oracleResults: [
+                    OracleLaneResult(
+                        laneIndex: 0, chatID: "primary-chat", providerID: "fixture", modelID: "primary",
+                        status: .completed, response: "Primary answer"
+                    ),
+                    OracleLaneResult(
+                        laneIndex: 1, chatID: "additional-chat", providerID: "fixture", modelID: "additional",
+                        status: .failed, error: OracleLaneError(code: "provider_error", message: "Additional failed", partialResponse: "Partial answer")
+                    )
+                ]
+            )
+            var grouped = OracleGroupMCPCodec.groupFields(group)
+            grouped["chat_id"] = .string(group.primary.chatID)
+            grouped["response"] = .string("Primary answer")
+            let single: [String: Value] = ["chat_id": .string("single-chat"), "response": .string("Single answer")]
+            for payload in [grouped, single] {
+                let fixture = makeOracleSendFixture(stopAfterRoute: false, exportOperation: { request in
+                    XCTAssertEqual(request.chatID, payload["chat_id"]?.stringValue)
+                    throw NSError(domain: "OracleExportFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "Private export diagnostic"])
+                }, settledReply: payload)
+                defer { fixture.cleanup() }
+                await fixture.window.workspaceManager.awaitInitialized()
+                let workspace = try WorkspaceModel(
+                    id: XCTUnwrap(fixture.context.workspaceID), name: "Oracle export fixture",
+                    repoPaths: [root.path], ephemeralFlag: true
+                )
+                fixture.window.workspaceManager.workspaces = [workspace]
+                fixture.window.workspaceManager.activeWorkspace = workspace
+                let args: [String: Value] = ["message": .string("fixture"), "new_chat": .bool(true), "export_response": .bool(true)]
+                let reply: Value
+                do {
+                    reply = try await fixture.service.executeOracleSend(args: args, invocationContext: fixture.invocationContext)
+                } catch {
+                    XCTFail("Optional export failure discarded settled reply: \(error)")
+                    XCTAssertEqual(fixture.sendRecorder.calls.count, 1)
+                    continue
+                }
+                var fields = try XCTUnwrap(reply.objectValue)
+                guard let notice = fields.removeValue(forKey: "oracle_export_error")?.stringValue else {
+                    XCTFail("Export failure erased the settled payload: \(reply)")
+                    XCTAssertEqual(fixture.sendRecorder.calls.count, 1)
+                    continue
+                }
+                XCTAssertTrue(notice.contains("returned chat IDs"))
+                XCTAssertFalse(notice.contains("Private export diagnostic"))
+                XCTAssertNil(fields["oracle_export_path"])
+                XCTAssertNil(fields["oracle_export_instruction"])
+                XCTAssertEqual(fields, payload)
+                XCTAssertEqual(fixture.sendRecorder.calls.count, 1, "Recovery must not rerun paid work")
+            }
+        }
+
+        func testNonGroupExportCancellationStillThrows() async {
+            let fixture = makeOracleSendFixture(exportOperation: { _ in throw CancellationError() })
+            defer { fixture.cleanup() }
+            do {
+                _ = try await fixture.service.exportSettledOracleResponse(
+                    ["chat_id": .string("single-chat")],
+                    request: OracleExportRequest(sourceTool: "ask_oracle", mode: "chat", message: "fixture", chatID: "single-chat", response: nil)
+                )
+                XCTFail("Expected ordinary non-group cancellation")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
+
         private func assertStopsAfterRoute(
             _ fixture: OracleSendBoundaryFixture,
             args: [String: Value]
@@ -332,7 +444,9 @@ import XCTest
         private func makeOracleSendFixture(
             stopAfterRoute: Bool = true,
             connectionID: UUID? = nil,
-            livePurpose: MCPRunPurpose = .unknown
+            livePurpose: MCPRunPurpose = .unknown,
+            exportOperation: MCPOracleToolService.ExportOracleResponse? = nil,
+            settledReply: [String: Value]? = nil
         ) -> OracleSendBoundaryFixture {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -383,15 +497,16 @@ import XCTest
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
                 sendChat: { args, _, _ in
                     sendRecorder.record(args)
-                    return [
+                    return settledReply ?? [
                         "chat_id": .string("selected-chat"),
                         "response": .string("response")
                     ]
                 },
-                exportOracleResponse: { _ in throw OracleBoundaryTestStop.unexpectedExport }
+                exportOracleResponse: exportOperation ?? { _ in throw OracleBoundaryTestStop.unexpectedExport }
             )
             return OracleSendBoundaryFixture(
                 window: window,
+                context: snapshot,
                 service: service,
                 invocationContext: .trustedLocal(toolName: "oracle_send", metadata: metadata),
                 rebindRecorder: recorder,
@@ -558,6 +673,7 @@ import XCTest
     @MainActor
     private struct OracleSendBoundaryFixture {
         let window: WindowState
+        let context: MCPTabContextSnapshot
         let service: MCPOracleToolService
         let invocationContext: ToolInvocationContext
         let rebindRecorder: OracleRebindRecorder
@@ -1052,5 +1168,46 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
 
     private func joinedText(_ blocks: [MCP.Tool.Content]) -> String {
         texts(blocks).joined(separator: "\n")
+    }
+}
+
+final class MCPToolHeartbeatTests: XCTestCase {
+    func testCancellationPreservesSettledPartialOperationResult() async throws {
+        let entered = expectation(description: "operation entered")
+        let task = Task {
+            try await MCPToolHeartbeat.run(interval: .milliseconds(1), heartbeat: {}) {
+                entered.fulfill()
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                    XCTFail("Expected cancellation")
+                } catch is CancellationError {
+                    // Oracle settles its completed and cancelled lanes before returning.
+                }
+                return "partial_failure"
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        task.cancel()
+        let result = try await task.value
+        XCTAssertEqual(result, "partial_failure")
+    }
+
+    func testCancellationStillPropagatesWhenOperationThrows() async throws {
+        let entered = expectation(description: "operation entered")
+        let task = Task {
+            try await MCPToolHeartbeat.run(interval: .milliseconds(1), heartbeat: {}) {
+                entered.fulfill()
+                try await Task.sleep(for: .seconds(60))
+                return "unexpected"
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Operation cancellation must not be suppressed")
+        } catch is CancellationError {
+            // Expected.
+        }
     }
 }

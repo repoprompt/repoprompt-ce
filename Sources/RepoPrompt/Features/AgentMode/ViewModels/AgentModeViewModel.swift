@@ -20907,6 +20907,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    func oracleToolSettlementCallbacks(tabID: UUID, sessionID: UUID?, runID: UUID?, invocationID: UUID, toolName: String) -> OracleToolSettlementCallbacks? {
+        guard let session = sessions[tabID], let sessionID, let runID,
+              session.activeAgentSessionID == sessionID, session.runID == runID else { return nil }
+        return runService.oracleToolSettlementCallbacks(session: session, invocationID: invocationID, toolName: toolName, isOwnerCurrent: { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return sessions[tabID] === session
+        })
+    }
+
     /// Cancel all active MCP tool executions for a given runID.
     @discardableResult
     func cancelActiveToolsForRun(runID: UUID, reason: String? = nil) -> Int {

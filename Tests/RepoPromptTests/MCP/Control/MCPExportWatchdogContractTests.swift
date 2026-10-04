@@ -1351,6 +1351,16 @@ import XCTest
             }
         }
 
+        func testOracleSendDefaultDeadlineDoesNotAbandonPaidLanes() async {
+            let session = makeUnconnectedSession()
+            let defaultTimeout = await session.test_resolvedToolCallTimeout(toolName: "oracle_send")
+            XCTAssertNil(defaultTimeout)
+            let finiteTimeout = await session.test_resolvedToolCallTimeout(.seconds(90), toolName: "oracle_send")
+            XCTAssertEqual(finiteTimeout, 90)
+            let unboundedTimeout = await session.test_resolvedToolCallTimeout(.none, toolName: "oracle_send")
+            XCTAssertNil(unboundedTimeout)
+        }
+
         func testPromptContextExportsRetain300SecondClientDeadline() async {
             let session = makeUnconnectedSession()
             let cases: [(toolName: String, operation: String)] = [

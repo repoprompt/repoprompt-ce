@@ -181,7 +181,7 @@ struct MCPOracleToolService {
         }
 
         let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
-        let tabContext: OracleViewModel.OracleSendTabContext
+        var tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
             tabContext = try await oracleSendTabContext(
                 from: virtualContext,
@@ -247,6 +247,10 @@ struct MCPOracleToolService {
             )
         }
 
+        if let invocationID = invocationContext.metadata.invocationID {
+            tabContext.toolSettlement = targetWindow.agentModeViewModel.oracleToolSettlementCallbacks(tabID: tabID, sessionID: owner.agentSessionID, runID: owner.runID, invocationID: invocationID, toolName: askOracleToolName)
+        }
+
         let exportDestination: OracleExportDestination? = if exportResponse {
             try MCPServerViewModel.makeOracleExportDestination(
                 workspace: targetWindow.workspaceManager.activeWorkspace,
@@ -273,18 +277,19 @@ struct MCPOracleToolService {
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
 
         let capturedChatArgs = chatArgs
+        let capturedTabContext = tabContext
         var result = try await withHeartbeat(
             connectionID,
             askOracleToolName,
             "waiting",
             "Waiting for Oracle response..."
         ) {
-            try await sendChat(capturedChatArgs, promptVM, tabContext)
+            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
         }
 
         if exportResponse {
             let groupResult = try Self.decodeOracleGroupResultForExport(result)
-            let export = try await exportOracleResponse(OracleExportRequest(
+            result = try await exportSettledOracleResponse(result, request: OracleExportRequest(
                 sourceTool: askOracleToolName,
                 mode: modeRaw,
                 message: message,
@@ -293,8 +298,6 @@ struct MCPOracleToolService {
                 groupResult: groupResult,
                 destination: exportDestination
             ))
-            result["oracle_export_path"] = .string(export.path)
-            result["oracle_export_instruction"] = .string(export.instruction)
         }
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
@@ -374,6 +377,11 @@ struct MCPOracleToolService {
             )
         }
 
+        if runPurpose == .agentModeRun, let targetWindow, let invocationID = metadata.invocationID {
+            let settlement = targetWindow.agentModeViewModel.oracleToolSettlementCallbacks(tabID: context.tabID, sessionID: tabContext?.agentModeSessionID, runID: tabContext?.agentModeRunID, invocationID: invocationID, toolName: oracleSendToolName)
+            tabContext?.toolSettlement = settlement
+        }
+
         let exportDestination: OracleExportDestination? = if exportResponse, let targetWindow {
             try MCPServerViewModel.makeOracleExportDestination(
                 workspace: targetWindow.workspaceManager.activeWorkspace,
@@ -404,7 +412,7 @@ struct MCPOracleToolService {
         if exportResponse {
             let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let normalizedChatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let export = try await exportOracleResponse(OracleExportRequest(
+            result = try await exportSettledOracleResponse(result, request: OracleExportRequest(
                 sourceTool: oracleSendToolName,
                 mode: modeRaw,
                 message: message,
@@ -413,8 +421,6 @@ struct MCPOracleToolService {
                 groupResult: groupResult,
                 destination: exportDestination
             ))
-            result["oracle_export_path"] = .string(export.path)
-            result["oracle_export_instruction"] = .string(export.instruction)
         }
 
         await sendStageProgress(connectionID, oracleSendToolName, "complete", "Oracle complete")
@@ -422,6 +428,36 @@ struct MCPOracleToolService {
     }
 
     // MARK: - Shared helpers
+
+    /// Optional export failures must not discard an already-settled Oracle response.
+    /// Non-group cancellation retains its request-owned cancellation contract.
+    func exportSettledOracleResponse(
+        _ reply: [String: Value], request: OracleExportRequest
+    ) async throws -> [String: Value] {
+        var result = reply
+        let cancellationNotice = Value.string(
+            "Oracle export cancelled; output may remain. Recover the settled result using the returned lane chat IDs."
+        )
+        if Task.isCancelled, request.groupResult != nil {
+            result["oracle_export_error"] = cancellationNotice
+            return result
+        }
+        do {
+            let export = try await exportOracleResponse(request)
+            result["oracle_export_path"] = .string(export.path)
+            result["oracle_export_instruction"] = .string(export.instruction)
+        } catch is CancellationError {
+            guard request.groupResult != nil else { throw CancellationError() }
+            result["oracle_export_error"] = cancellationNotice
+        } catch {
+            // Export may have written output before failing. Keep response truth and
+            // recovery handles without exposing arbitrary exporter error details.
+            result["oracle_export_error"] = .string(
+                "Oracle export failed; output may remain. Recover the settled result using the returned chat IDs."
+            )
+        }
+        return result
+    }
 
     static func decodeOracleGroupResultForExport(_ result: [String: Value]) throws -> OracleGroupResult? {
         guard result["oracle_group_id"] != nil else { return nil }

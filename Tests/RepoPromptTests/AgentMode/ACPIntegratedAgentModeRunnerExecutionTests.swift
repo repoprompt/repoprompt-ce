@@ -1,7 +1,332 @@
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
+
+@MainActor
+final class ACPToolObservationCorrelationTests: XCTestCase {
+    private var currentOwner: AgentTabSession?
+    private var accountedOutputs: [String?] = []
+
+    func testHealthyOracleSettlementCountsOutputOnceAndPreservesTheRealMCPEnvelope() async throws {
+        let noOp = AgentToolTrackingHooks.noOp
+        let hooks = AgentToolTrackingHooks(
+            flushPendingAssistantDelta: noOp.flushPendingAssistantDelta, endActiveAssistantSegment: noOp.endActiveAssistantSegment,
+            endActiveReasoningSegment: noOp.endActiveReasoningSegment, sealAssistantBoundary: noOp.sealAssistantBoundary,
+            requestUIRefresh: noOp.requestUIRefresh, scheduleSave: noOp.scheduleSave, addToolInputTokens: noOp.addToolInputTokens,
+            addToolOutputTokens: { [weak self] payload, _ in self?.accountedOutputs.append(payload) }
+        )
+        let (harness, session, runner) = fixture(toolTrackingHooks: hooks)
+        _ = harness
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.installRunID(UUID())
+        session.runState = .running
+        session.beginRunAttempt(source: "healthy-oracle")
+        let tracker = UUID()
+        runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "ask_oracle", args: ["new_chat": .bool(true)], session: session)
+        let rowID = try XCTUnwrap(session.items.first?.id)
+        let callbacks = try XCTUnwrap(runner.oracleToolSettlementCallbacks(session: session, invocationID: tracker, toolName: "ask_oracle", isOwnerCurrent: { true }))
+        let result = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .completed, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "87"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .completed, response: "87")
+        ])
+        let turn = OracleTurnID(rawValue: UUID())
+        await callbacks.prepared(result.groupID, turn)
+        callbacks.settled(result, turn)
+        var fields = OracleGroupMCPCodec.groupFields(result)
+        fields["chat_id"] = .string(result.primary.chatID)
+        fields["mode"] = .string("review")
+        fields["oracle_export_path"] = .string("/fixture/export.md")
+        let realPayload = ToolOutputFormatter.rawJSONString(.object(fields))
+        runner.testHandleTrackerToolResult(invocationID: tracker, toolName: "ask_oracle", args: nil, resultJSON: realPayload, isError: false, session: session)
+        XCTAssertEqual(session.items.map(\.id), [rowID])
+        XCTAssertEqual(session.items.first?.toolResultJSON, realPayload)
+        XCTAssertEqual(accountedOutputs.count, 1, "Settlement and ordinary MCP delivery share first-result accounting")
+        XCTAssertTrue(accountedOutputs.compactMap(\.self).first?.contains("87") == true)
+        let absent = try XCTUnwrap(runner.oracleToolSettlementCallbacks(session: session, invocationID: UUID(), toolName: "ask_oracle", isOwnerCurrent: { true }))
+        await absent.prepared(result.groupID, turn)
+        absent.settled(result, turn)
+        XCTAssertEqual(session.items.map(\.id), [rowID], "Missing prepared row must not synthesize a transcript invocation")
+        XCTAssertEqual(accountedOutputs.count, 1)
+    }
+
+    func testCanonicalOracleSettlementReconcilesCapturedRowAfterCancellationAndRejectsSuccessors() async throws {
+        let (harness, session, runner) = fixture()
+        let runID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.installRunID(runID)
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "oracle-cancel-reconciliation")
+        let tracker = UUID()
+        try deliver("owned-oracle", status: "pending", title: "ask_oracle", runner: runner, session: session)
+        runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "ask_oracle", args: ["new_chat": .bool(true)], session: session)
+        let rowID = try XCTUnwrap(session.items.first?.id)
+        currentOwner = session
+        let callbacks = try XCTUnwrap(runner.oracleToolSettlementCallbacks(session: session, invocationID: tracker, toolName: "ask_oracle", isOwnerCurrent: { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return currentOwner === session
+        }))
+        let group = OracleGroupID(rawValue: UUID())
+        let turn = OracleTurnID(rawValue: UUID())
+        await callbacks.prepared(group, turn)
+        try deliver("owned-oracle", status: "failed", runner: runner, session: session)
+        runner.testRetireToolCorrelation(tabID: session.tabID)
+        _ = await AgentRunTerminalCommitBarrier().commit(.init(
+            binding: harness.hooks.bindTerminalSession(session), ownership: ownership, expectedRunID: runID,
+            terminalState: .cancelled, source: "oracle-cancel", completion: .terminalTeardownCompleted, attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            prepareProviderState: { session.clearRunID(ifCurrent: runID)
+                return nil
+            }
+        ))
+        let result = try OracleGroupResult(groupID: group, status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "87"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .cancelled, error: .init(code: "cancelled", message: "Owner cancelled"))
+        ])
+        let failedPayload = session.items.first?.toolResultJSON
+        try callbacks.settled(OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: result.status, oracleResults: result.oracleResults), turn)
+        XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Wrong group has no row authority")
+        callbacks.settled(result, OracleTurnID(rawValue: UUID()))
+        XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Wrong turn has no row authority")
+        currentOwner = nil
+        callbacks.settled(result, turn)
+        XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Replaced tab owner fences the old settlement")
+        currentOwner = session
+        callbacks.settled(result, turn)
+        XCTAssertEqual(session.items.map(\.id), [rowID])
+        XCTAssertTrue(session.items.first?.toolArgsJSON?.contains("new_chat") == true)
+        XCTAssertEqual(session.items.first?.toolIsError, true)
+        let execution = try XCTUnwrap(AgentTranscriptToolNormalizer.toolExecution(for: session.items[0]))
+        XCTAssertEqual(execution.status, .warning)
+        XCTAssertTrue(execution.resultJSON?.contains(group.rawValue.uuidString) == true)
+        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: execution.resultJSON))
+        let coverage = try XCTUnwrap(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
+        XCTAssertEqual(coverage.completedCount, 1)
+        XCTAssertEqual(coverage.totalCount, 2)
+        let settledPayload = session.items.first?.toolResultJSON
+        session.installRunID(UUID())
+        let changed = try OracleGroupResult(groupID: group, status: .completed, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "changed"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .completed, response: "changed")
+        ])
+        callbacks.settled(changed, turn)
+        XCTAssertEqual(session.items.first?.toolResultJSON, settledPayload, "Installing a successor run ID already fences the old settlement")
+        session.beginRunAttempt(source: "successor")
+        callbacks.settled(changed, turn)
+        XCTAssertEqual(session.items.first?.toolResultJSON, settledPayload, "A successor attempt fences the old settlement")
+    }
+
+    func testAbortedProviderTerminalPreservesSettledOracleCoverageOnTheSameRow() throws {
+        let (harness, session, runner) = fixture()
+        _ = harness
+        let tracker = UUID()
+        let args: [String: Value] = ["new_chat": .bool(true)]
+        runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "ask_oracle", args: args, session: session)
+        let rowID = try XCTUnwrap(session.items.first?.id)
+        let group = try OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: .partialFailure, oracleResults: [
+            OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "87"),
+            OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .cancelled, error: .init(code: "cancelled", message: "Owner cancelled"))
+        ])
+        let settled = ToolOutputFormatter.rawJSONString(.object(OracleGroupMCPCodec.groupFields(group)))
+        runner.testHandleTrackerToolResult(invocationID: tracker, toolName: "ask_oracle", args: args, resultJSON: settled, isError: false, session: session)
+        try deliver("cancelled-oracle", status: "pending", title: "ask_oracle", runner: runner, session: session)
+        try deliver("cancelled-oracle", status: "failed", runner: runner, session: session)
+        XCTAssertEqual(session.items.map(\.id), [rowID])
+        XCTAssertEqual(session.items.first?.toolResultJSON, settled)
+        XCTAssertEqual(session.items.first?.toolIsError, true, "The provider abort remains transport truth, independently of canonical lane coverage")
+        XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: session.items[0])?.status, .warning)
+    }
+
+    func testLateEmptyProviderStartsPairDistinctCompletedTrackerCallsAndSurviveDiskRestore() async throws {
+        let (harness, session, runner) = fixture()
+        _ = harness
+        let trackers = [UUID(), UUID()]
+        for id in trackers {
+            runner.testHandleTrackerToolCall(invocationID: id, toolName: "get_file_tree", args: ["type": .string("roots")], session: session)
+        }
+        XCTAssertEqual(session.items.count, 2, "Identical calls with distinct tracker IDs are distinct invocations")
+        guard session.items.count == 2 else { return }
+        let rowIDs = session.items.map(\.id)
+        let outputs = [#"{"roots":["first"]}"#, #"{"roots":["second"]}"#]
+        for (index, id) in trackers.enumerated() {
+            runner.testHandleTrackerToolResult(invocationID: id, toolName: "get_file_tree", args: ["type": .string("roots")], resultJSON: outputs[index], isError: false, session: session)
+        }
+        let providerIDs = ["toolu_e0c16e4f4d4bea2981b8d6ea5fac4ba2", "toolu_2403d22501fbf23b8ccbcffae9ad0c90"]
+        for (index, id) in providerIDs.enumerated() {
+            try deliver(id, status: "pending", input: index == 0 ? nil : [:], title: "get_file_tree", runner: runner, session: session)
+            try deliver(id, status: "pending", title: "get_file_tree", runner: runner, session: session)
+            try deliver(id, status: "completed", runner: runner, session: session)
+            // Repeated tracker completion must still resolve its retained provider alias.
+            runner.testHandleTrackerToolResult(invocationID: trackers[index], toolName: "get_file_tree", args: ["type": .string("roots")], resultJSON: outputs[index], isError: false, session: session)
+        }
+        XCTAssertEqual(session.items.map(\.id), rowIDs)
+        XCTAssertEqual(session.items.map(\.toolResultJSON), outputs.map(Optional.some))
+        XCTAssertEqual(session.items.map(\.toolInvocationID), providerIDs.map { Optional(ACPRuntimeEventParsing.stableInvocationUUID(rawValue: $0)) })
+        for row in session.items {
+            XCTAssertTrue(row.toolArgsJSON?.contains("roots") == true)
+            XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: row)?.status, .success)
+        }
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent("ACPIdentityFixture-\(UUID().uuidString)")
+        let workspace = WorkspaceModel(name: "ACP identity fixture", repoPaths: [], customStoragePath: storage)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let activities = session.items.map { AgentTranscriptActivity(from: $0, toolExecution: AgentTranscriptToolNormalizer.toolExecution(for: $0)) }
+        let saved = AgentSession(workspaceID: workspace.id, composeTabID: session.tabID, name: "Identity fixture", transcript: AgentTranscript(turns: [AgentTranscriptTurn(responseSpans: [AgentTranscriptProviderResponseSpan(lifecycle: .open, startedAt: session.items[0].timestamp, activities: activities)], terminalState: .completed, startedAt: session.items[0].timestamp)], nextSequenceIndex: 2), lastRunState: "completed")
+        let file = try await AgentSessionDataService().saveAgentSession(saved, for: workspace)
+        let loaded = try await AgentSessionDataService().loadAgentSession(from: file)
+        let restored = try XCTUnwrap(loaded.transcript).turns.flatMap(\.allActivities)
+        XCTAssertEqual(restored.map(\.id), rowIDs)
+        XCTAssertEqual(restored.compactMap { $0.toolExecution?.status }, [.success, .success])
+    }
+
+    func testProviderFirstEmptyInputsPairNilAndEmptyTrackerArguments() throws {
+        for args: [String: Value]? in [nil, [:]] {
+            let (harness, session, runner) = fixture()
+            _ = harness
+            try deliver("empty-tracker-input", status: "pending", title: "get_file_tree", runner: runner, session: session)
+            let rowID = session.items.first?.id
+            let tracker = UUID()
+            runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "get_file_tree", args: args, session: session)
+            runner.testHandleTrackerToolResult(invocationID: tracker, toolName: "get_file_tree", args: args, resultJSON: #"{"roots":[]}"#, isError: false, session: session)
+            XCTAssertEqual(session.items.count, 1)
+            XCTAssertEqual(session.items.first?.id, rowID)
+            XCTAssertEqual(session.items.first?.toolInvocationID, ACPRuntimeEventParsing.stableInvocationUUID(rawValue: "empty-tracker-input"))
+            XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: session.items[0])?.status, .success)
+        }
+    }
+
+    func testSubstantiveDelayedProviderStartChoosesOlderCompletedTrackerBeforeNewerPendingCall() throws {
+        let (harness, session, runner) = fixture()
+        _ = harness
+        let trackers = [UUID(), UUID()]
+        runner.testHandleTrackerToolCall(invocationID: trackers[0], toolName: "get_file_tree", args: ["type": .string("roots")], session: session)
+        runner.testHandleTrackerToolResult(invocationID: trackers[0], toolName: "get_file_tree", args: ["type": .string("roots")], resultJSON: #"{"roots":["older"]}"#, isError: false, session: session)
+        runner.testHandleTrackerToolCall(invocationID: trackers[1], toolName: "get_file_tree", args: ["type": .string("roots")], session: session)
+        try deliver("older-provider", status: "pending", input: ["type": "roots"], title: "get_file_tree", runner: runner, session: session)
+        XCTAssertEqual(session.items[0].toolInvocationID, ACPRuntimeEventParsing.stableInvocationUUID(rawValue: "older-provider"))
+        XCTAssertEqual(session.items[1].toolInvocationID, trackers[1])
+        try deliver("newer-provider", status: "pending", input: ["type": "roots"], title: "get_file_tree", runner: runner, session: session)
+        XCTAssertEqual(session.items[1].toolInvocationID, ACPRuntimeEventParsing.stableInvocationUUID(rawValue: "newer-provider"))
+        XCTAssertEqual(session.items.count, 2)
+        XCTAssertEqual(session.items[0].toolResultJSON, #"{"roots":["older"]}"#)
+        XCTAssertEqual(session.items[1].kind, .toolCall)
+    }
+
+    func testProviderOnlyEmptyAndSubstantiveCallsStayDistinctAndSparseTerminalsComplete() throws {
+        let (harness, session, runner) = fixture()
+        _ = harness
+        for id in ["empty-one", "empty-two"] {
+            try deliver(id, status: "pending", input: [:], title: "get_file_tree", runner: runner, session: session)
+        }
+        try deliver("substantive", status: "pending", input: ["pattern": "needle"], title: "file_search", runner: runner, session: session)
+        XCTAssertEqual(session.items.count, 3)
+        XCTAssertTrue(session.items.allSatisfy { $0.kind == .toolCall })
+        for id in ["empty-one", "empty-two", "substantive"] {
+            try deliver(id, status: "completed", output: "provider output", runner: runner, session: session)
+        }
+        XCTAssertEqual(session.items.count, 3)
+        XCTAssertTrue(session.items.allSatisfy { AgentTranscriptToolNormalizer.toolExecution(for: $0)?.status == .success })
+        XCTAssertTrue(session.items.last?.toolArgsJSON?.contains("needle") == true)
+    }
+
+    func testOriginalFourteenProviderIdentitiesProduceFourteenRowsAfterDelayedStarts() throws {
+        // Identity/name sequence from the live final-provider-tool-parts artifact.
+        // Timing is deliberately adversarial; it is not a recovered wire trace.
+        let observed: [(String, String)] = [
+            ("get_file_tree", "call_00_dfkm60wtt9gsej0lq98orrbs"),
+            ("workspace_context", "call_00_rrc1t1u4v7p40r0kfv436yz6"),
+            ("manage_selection", "call_00_ekm56elkyc7mhb51dj7mozof"),
+            ("get_file_tree", "call_00_qnax9q0ibhs9k2785znhjl9k"),
+            ("get_file_tree", "call_00_rbz0dq2g6qnet6xli4cj9uzk"),
+            ("get_file_tree", "call_01_z17kai67qwt7pjmh0v7uhpem"),
+            ("get_file_tree", "call_00_3zk6wpg4sz1nywy8du6u2ee3"),
+            ("manage_selection", "call_00_6f6okzdi0af2yl5hz72ke5r0"),
+            ("workspace_context", "call_00_a27b4nvd35llmxxepp8ihyeb"),
+            ("ask_oracle", "call_00_o7oet33e3fi74ktm0e2eik5p"),
+            ("get_file_tree", "call_00_b7tzgbk6kayfgennjejoy665"),
+            ("workspace_context", "call_01_1k7as6o1ayuqo5skf4eft4sr"),
+            ("ask_oracle", "call_00_ldswv0w1v1nsismwud42zv90"),
+            ("ask_oracle", "call_00_ufi9qzlohfqmglar2eryj4zn")
+        ]
+        let (harness, session, runner) = fixture()
+        _ = harness
+        for (index, entry) in observed.enumerated() {
+            let tracker = UUID()
+            let args: [String: Value] = entry.0 == "get_file_tree" ? ["type": .string("roots")] : ["fixture_index": .int(index)]
+            runner.testHandleTrackerToolCall(invocationID: tracker, toolName: entry.0, args: args, session: session)
+            runner.testHandleTrackerToolResult(invocationID: tracker, toolName: entry.0, args: args, resultJSON: #"{"fixture_result":true}"#, isError: index == 3, session: session)
+        }
+        let rowIDs = session.items.map(\.id)
+        for entry in observed {
+            try deliver(entry.1, status: "pending", title: entry.0, runner: runner, session: session)
+            try deliver(entry.1, status: "completed", runner: runner, session: session)
+        }
+        XCTAssertEqual(session.items.count, 14, "Delayed provider observations must not create six phantom rows")
+        XCTAssertEqual(session.items.map(\.id), rowIDs)
+        XCTAssertEqual(session.items.map(\.toolInvocationID), observed.map { Optional(ACPRuntimeEventParsing.stableInvocationUUID(rawValue: $0.1)) })
+        XCTAssertTrue(session.items.allSatisfy { $0.kind == .toolResult })
+        XCTAssertEqual(AgentTranscriptToolNormalizer.toolExecution(for: session.items[3])?.status, .failed)
+    }
+
+    func testMultipleProviderFirstPlaceholdersPairDistinctTrackers() throws {
+        for terminalBeforeTracker in [false, true] {
+            let (harness, session, runner) = fixture()
+            _ = harness
+            for id in ["first-placeholder", "second-placeholder"] {
+                try deliver(id, status: "pending", title: "get_file_tree", runner: runner, session: session)
+                if terminalBeforeTracker {
+                    try deliver(id, status: "completed", runner: runner, session: session)
+                }
+            }
+            let rowIDs = session.items.map(\.id)
+            for _ in 0 ..< 2 {
+                let tracker = UUID()
+                runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "get_file_tree", args: ["type": .string("roots")], session: session)
+                runner.testHandleTrackerToolResult(invocationID: tracker, toolName: "get_file_tree", args: ["type": .string("roots")], resultJSON: #"{"roots":[]}"#, isError: false, session: session)
+            }
+            XCTAssertEqual(session.items.map(\.id), rowIDs)
+            XCTAssertEqual(session.items.count, 2)
+            XCTAssertTrue(session.items.allSatisfy { AgentTranscriptToolNormalizer.toolExecution(for: $0)?.status == .success })
+        }
+    }
+
+    func testProviderFirstPlaceholderPairsOnlyOneTrackerWithIdenticalArguments() throws {
+        let (harness, session, runner) = fixture()
+        _ = harness
+        try deliver("provider-first", status: "pending", title: "get_file_tree", runner: runner, session: session)
+        let firstRow = session.items.first?.id
+        let trackers = [UUID(), UUID()]
+        for id in trackers {
+            runner.testHandleTrackerToolCall(invocationID: id, toolName: "get_file_tree", args: ["type": .string("roots")], session: session)
+        }
+        XCTAssertEqual(session.items.count, 2)
+        XCTAssertEqual(session.items.first?.id, firstRow)
+        try deliver("provider-second", status: "pending", title: "get_file_tree", runner: runner, session: session)
+        for id in trackers {
+            runner.testHandleTrackerToolResult(invocationID: id, toolName: "get_file_tree", args: ["type": .string("roots")], resultJSON: #"{"roots":[]}"#, isError: false, session: session)
+        }
+        XCTAssertEqual(session.items.count, 2)
+        XCTAssertTrue(session.items.allSatisfy { AgentTranscriptToolNormalizer.toolExecution(for: $0)?.status == .success })
+    }
+
+    private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
+        return (harness, harness.makeSession(agent: .devin), runner)
+    }
+
+    private func deliver(_ id: String, status: String, input: [String: Any]? = nil, output: Any? = nil, title: String? = nil, runner: ACPIntegratedAgentModeRunner, session: AgentTabSession) throws {
+        var update: [String: Any] = ["sessionUpdate": status == "pending" ? "tool_call" : "tool_call_update", "toolCallId": id, "status": status]
+        update["rawInput"] = input
+        update["rawOutput"] = output
+        update["title"] = title
+        let events = ACPDefaultSessionUpdateNormalizer.normalize(update, providerID: .openCode)
+        guard case let .stream(result) = events.first else { return XCTFail("Missing normalized event") }
+        let event = try XCTUnwrap(AgentToolStreamEvent.from(result))
+        XCTAssertTrue(runner.handleToolStreamEvent(event, session: session), "Known sparse terminal must remain observable")
+    }
+}
 
 @MainActor
 final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
@@ -417,6 +742,39 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testDetachedAgentRunSnapshotSurvivesProviderTerminalEchoOnBothRunnerPaths() {
+        let snapshot = #"{"status":"running","session_id":"detached-child","context_id":"child-context"}"#
+        for trackerPath in [false, true] {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = harness.makeSession(agent: .devin)
+            let runner = ACPIntegratedAgentModeRunner(
+                hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+                toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
+                controllerFactory: { provider, request in
+                    try ACPAgentSessionController(provider: provider, runRequest: request)
+                }
+            )
+            let invocationID = UUID()
+            for result in [snapshot, #"{"status":"completed"}"#] {
+                if trackerPath {
+                    runner.testHandleTrackerToolResult(
+                        invocationID: invocationID, toolName: "agent_run", args: ["op": .string("start")],
+                        resultJSON: result, isError: false, session: session
+                    )
+                } else {
+                    XCTAssertTrue(runner.handleToolStreamEvent(.toolResult(.init(
+                        toolName: "agent_run", invocationID: invocationID, argsJSON: #"{"op":"start"}"#,
+                        resultJSON: result, isError: false
+                    )), session: session))
+                }
+            }
+            XCTAssertEqual(session.items.count, 1)
+            XCTAssertEqual(session.items.first?.toolResultJSON, snapshot, "tracker path: \(trackerPath)")
+            XCTAssertEqual(session.items.first?.text, snapshot)
+        }
+    }
+
     func testPrettyPrintedDevinSkillLifecycleCompletes() {
         let running = "{\n  \"status\" : \"running\"\n}"
         let completed = "{\n  \"status\" : \"completed\"\n}"
@@ -438,6 +796,11 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         XCTAssertNil(render["detail_text"])
         XCTAssertNil(object["summary_text"])
         XCTAssertEqual(render["title"] as? String, "Skill")
+        // Compaction cannot transfer ownership of native MCP status to the provider.
+        XCTAssertNil(AgentToolResultPayloadRetention.resolvedPayload(
+            existing: summary, incoming: #"{"status":"completed"}"#, incomingIsError: false,
+            requireObjectReplacement: true
+        ))
     }
 
     func testNativeLifecycleObjectCannotBeErasedByProviderTextOrArray() throws {

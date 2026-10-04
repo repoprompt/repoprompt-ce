@@ -1084,32 +1084,24 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             return try await operation()
         }
 
-        let heartbeatTask = Task {
-            do {
-                while !Task.isCancelled {
-                    try await Task.sleep(for: interval)
-                    try Task.checkCancellation()
-                    let heartbeat: (stage: String, message: String) = if let timeline {
-                        await timeline.heartbeat(
-                            fallbackStage: stage,
-                            fallbackMessage: message
-                        )
-                    } else {
-                        (stage, message)
-                    }
-                    await execution.sendHeartbeatProgress(
-                        connectionID,
-                        tool,
-                        heartbeat.stage,
-                        heartbeat.message
-                    )
-                }
-            } catch {
-                // Cancellation is the expected completion path.
+        return try await MCPToolHeartbeat.run(interval: interval) {
+            let heartbeat: (stage: String, message: String) = if let timeline {
+                await timeline.heartbeat(
+                    fallbackStage: stage,
+                    fallbackMessage: message
+                )
+            } else {
+                (stage, message)
             }
+            await execution.sendHeartbeatProgress(
+                connectionID,
+                tool,
+                heartbeat.stage,
+                heartbeat.message
+            )
+        } operation: {
+            try await operation()
         }
-        defer { heartbeatTask.cancel() }
-        return try await operation()
     }
 
     private static func withTimelinePhaseCompletion<T: Sendable>(

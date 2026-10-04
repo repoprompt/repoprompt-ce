@@ -3,6 +3,11 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
+struct OracleToolSettlementCallbacks {
+    let prepared: @MainActor @Sendable (_ groupID: OracleGroupID, _ turnID: OracleTurnID) async -> Void
+    let settled: @MainActor @Sendable (_ result: OracleGroupResult, _ turnID: OracleTurnID) -> Void
+}
+
 struct AppOracleGroupExecutionCallbacks {
     let prepared: @MainActor @Sendable (
         _ groupID: OracleGroupID,
@@ -404,6 +409,7 @@ extension OracleViewModel {
                 )
                 if let turn = document.turns.last {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
+                    await tabContext?.toolSettlement?.prepared(document.group.id, turn.id)
                 }
             },
             executeLane: { [weak self] invocation in
@@ -479,6 +485,9 @@ extension OracleViewModel {
                 )
             }
             recordOracleGroupPresentation(completion.terminalDocument)
+            if let turn = completion.terminalDocument.turns.last {
+                tabContext?.toolSettlement?.settled(completion.result, turn.id)
+            }
             return completion
         } catch {
             await finishOracleGroupPresentation(invocationID: invocationID)

@@ -86,6 +86,12 @@ or `ACPAgentSessionController`, or scope a launch/probe with
 to the configured instance or task, not a process-global environment switch. Mark a process
 `.tool` only for genuinely non-provider tooling, such as Git worktree operations.
 
+## Oracle settled-response recovery
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed `ask_oracle` / `oracle_send` with `export_response:true`; `make dev-test FILTER=OracleGroupBoundaryTests` | Optional export failure retains the settled answer and chat IDs with a safe `oracle_export_error`; no automatic paid replay | Pre-settlement validation/send failures still throw. Recover through returned chat IDs. The deterministic fixture is not live filesystem proof. |
+
 ## Oracle image delivery
 
 Feature map (app-backed only):

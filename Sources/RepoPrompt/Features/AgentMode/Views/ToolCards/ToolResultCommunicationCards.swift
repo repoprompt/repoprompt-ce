@@ -46,15 +46,16 @@ struct ChatSendResultCard: View {
     }
 
     var status: ToolCardStatus {
+        if isOracleTool, dto?.status == "partial_failure" { return .warning }
         if item.toolIsError == true { return .failure }
         if let dto {
             if let errors = dto.errors, !errors.isEmpty { return .failure }
+            // A failed primary determines the canonical group outcome even when
+            // additional lanes completed. Coverage still supplies the subtitle.
+            if isOracleTool, dto.status == "failed" { return .failure }
             if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
-            // Invalid lane identities suppress the fraction, not the group's known failure.
-            if isOracleTool {
-                if dto.status == "partial_failure" || dto.status == "warning" { return .warning }
-                if dto.status == "failed" { return .failure }
-            }
+            // Invalid lane identities suppress the fraction, not the group's known warning.
+            if isOracleTool, dto.status == "partial_failure" || dto.status == "warning" { return .warning }
             if dto.response == nil || dto.response?.isEmpty == true,
                let diffs = dto.diffs,
                !diffs.isEmpty

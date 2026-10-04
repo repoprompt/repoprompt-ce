@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Decides what a later result update for an already-tracked tool call stores.
 ///
@@ -22,7 +23,8 @@ enum AgentToolResultPayloadRetention {
         if incomingIsError != true,
            let terminalStatus = terminalMarkerStatus(incoming),
            var object = jsonObject(existing),
-           isLifecycleStatus(object["status"])
+           isProviderLifecycle(object)
+           || (!requireObjectReplacement && isProviderLifecycleSummary(object))
         {
             object["status"] = terminalStatus
             // A presentation summary may already carry the lifecycle word; the card
@@ -56,6 +58,13 @@ enum AgentToolResultPayloadRetention {
         incomingIsError: Bool?,
         requireObjectReplacement: Bool = false
     ) -> Bool {
+        // A provider abort is transport truth, not a replacement for settled native lane coverage.
+        if requireObjectReplacement, jsonObject(existing)?["oracle_group_id"] != nil,
+           let data = existing?.data(using: .utf8), (try? JSONDecoder().decode(OracleGroupResult.self, from: data)) != nil,
+           incoming?.data(using: .utf8).flatMap({ try? JSONDecoder().decode(OracleGroupResult.self, from: $0) }) == nil
+        {
+            return true
+        }
         guard incomingIsError != true, !isThin(existing), !isProgress(existing) else { return false }
         if isThin(incoming) || isProgress(incoming) || terminalMarkerStatus(incoming) != nil { return true }
         guard requireObjectReplacement, let object = jsonObject(existing) else { return false }
@@ -104,6 +113,14 @@ enum AgentToolResultPayloadRetention {
     private static func isProviderLifecycle(_ object: [String: Any]) -> Bool {
         isLifecycleStatus(object["status"])
             && Set(object.keys).isSubset(of: ["status", "title", "progress", "content", "rawInput", "kind", "summary_only"])
+    }
+
+    /// Non-MCP lifecycle envelopes can be compacted before a terminal echo arrives.
+    /// Native MCP summaries still belong to the tool, not the provider's call status.
+    private static func isProviderLifecycleSummary(_ object: [String: Any]) -> Bool {
+        isLifecycleStatus(object["status"])
+            && object["summary_only"] as? Bool == true
+            && Set(object.keys).isSubset(of: ["status", "summary_only", "summary_text", "render_summary"])
     }
 
     private static func isLifecycleStatus(_ value: Any?) -> Bool {

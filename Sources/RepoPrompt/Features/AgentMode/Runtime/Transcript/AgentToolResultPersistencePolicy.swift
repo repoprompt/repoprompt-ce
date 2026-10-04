@@ -2308,6 +2308,10 @@ enum AgentToolResultPersistencePolicy {
         if let summaryText = oracleChatSummaryText(from: object) {
             object["summary_text"] = summaryText
         }
+        if stringValue(rawObject, keys: ["status"]) == "partial_failure" {
+            // Keep the canonical incomplete group outcome even if lane detail exceeds the budget.
+            object["status"] = "partial_failure"
+        }
         if let digest = oracleGroupDigest(from: rawObject) {
             var withDigest = object
             withDigest["oracle_count"] = digest["oracle_count"]

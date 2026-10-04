@@ -1600,6 +1600,10 @@ enum AgentTranscriptToolNormalizer {
             return .unknown
         }
         if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send" || normalizedToolName == "context_builder" {
+            // A settled group can have completed lanes even when its transport reports an error.
+            if normalizedToolName != "context_builder", stringValue(resultObject, keys: ["status"]) == "partial_failure" {
+                return .warning
+            }
             if item.toolIsError == true {
                 let nativeStatus = AgentTranscriptToolStatusSemantics.normalizedStatusWord(stringValue(resultObject, keys: ["status", "result", "outcome", "state"]))
                 return nativeStatus == "cancelled" ? .cancelled : .failed
@@ -1619,8 +1623,6 @@ enum AgentTranscriptToolNormalizer {
                     default: break
                     }
                 }
-            } else if stringValue(resultObject, keys: ["status"]) == "partial_failure" {
-                return .warning
             }
         }
         if normalizedToolName == "bash" {

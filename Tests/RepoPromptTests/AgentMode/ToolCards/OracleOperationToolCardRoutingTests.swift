@@ -613,6 +613,31 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
 
 final class OracleLaneCoverageTests: XCTestCase {
     @MainActor
+    func testCancelledPartialGroupRetainsCanonicalOutcomeAndLaneCoverage() throws {
+        var payload = try canonicalGroupPayload(completedCount: 1)
+        var lanes = try XCTUnwrap(payload["oracle_results"] as? [[String: Any]])
+        lanes[1]["status"] = "cancelled"
+        lanes[1]["error"] = ["code": "cancelled", "message": "Cancelled"]
+        payload["oracle_results"] = lanes
+        var row = AgentChatItem(
+            kind: .toolResult, text: "", toolName: "ask_oracle",
+            toolResultJSON: jsonString(payload), toolIsError: true
+        )
+        for _ in 0 ... 2 {
+            XCTAssertEqual(AgentTranscriptToolNormalizer.status(for: row), .warning)
+            let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: row.toolResultJSON))
+            XCTAssertEqual(dto.status, "partial_failure")
+            XCTAssertEqual(dto.oracleGroupID, payload["oracle_group_id"] as? String)
+            let coverage = try XCTUnwrap(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
+            XCTAssertEqual(coverage.completedCount, 1)
+            XCTAssertEqual(coverage.totalCount, 2)
+            XCTAssertEqual(coverage.incompleteLanes.map(\.reason), ["cancelled"])
+            XCTAssertEqual(ChatSendResultCard(item: row, oracleOpenContext: nil).status, .warning)
+            row.toolResultJSON = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: row)).resultJSON
+        }
+    }
+
+    @MainActor
     func testOversizedGroupSummariesKeepIncompleteCardOutcomeWithoutInventingCoverage() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9820, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
@@ -733,7 +758,7 @@ final class OracleLaneCoverageTests: XCTestCase {
                         terminalState: .running, startedAt: row.timestamp
                     )], nextSequenceIndex: 2), lastRunState: "running"
                 )
-                let expected: ToolCardStatus = fixture.toolError || fixture.completed == 0 ? .failure : fixture.completed == 2 && !fixture.oversized ? .success : .warning
+                let expected: ToolCardStatus = (fixture.toolError && isBuilder) || fixture.completed == 0 ? .failure : fixture.completed == 2 && !fixture.oversized ? .success : .warning
                 for pass in 1 ... 2 {
                     // Each awaited service call settles its exact file+metadata writes;
                     // neither load nor presentation can fall back to the source rows.
@@ -784,6 +809,9 @@ final class OracleLaneCoverageTests: XCTestCase {
                         } else {
                             XCTAssertNil(route)
                         }
+                    }
+                    if !isBuilder, fixture.completed == 1 {
+                        XCTAssertEqual(dto?.status, "partial_failure", "canonical group outcome must survive persistence")
                     }
                     let coverage = OracleLaneCoverage(lanes: dto?.oracleResults, oracleCount: dto?.oracleCount)
                     if fixture.oversized {
@@ -848,6 +876,35 @@ final class OracleLaneCoverageTests: XCTestCase {
         XCTAssertEqual(coverage.summaryText, "1/2 lanes · claude-opus-5 timed out")
         XCTAssertEqual(coverage.cardStatus, .warning)
         XCTAssertFalse(coverage.summaryText.lowercased().contains("reconcil"))
+    }
+
+    @MainActor
+    func testFailedPrimaryRemainsFailedWithCompletedAdditionalLaneCoverage() throws {
+        let group = try OracleGroupResult(
+            groupID: OracleGroupID(rawValue: UUID()), status: .failed,
+            oracleResults: [
+                OracleLaneResult(
+                    laneIndex: 0, chatID: "failed-primary", providerID: "fixture", modelID: "primary",
+                    status: .failed, error: OracleLaneError(code: "provider_error", message: "Primary failed")
+                ),
+                OracleLaneResult(
+                    laneIndex: 1, chatID: "completed-additional", providerID: "fixture", modelID: "additional",
+                    status: .completed, response: "Additional answer"
+                )
+            ]
+        )
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(OracleGroupMCPCodec.groupFields(group))) as? [String: Any])
+        for tool in ["ask_oracle", "oracle_send"] {
+            var row = AgentChatItem(kind: .toolResult, text: "", toolName: tool, toolResultJSON: jsonString(payload), toolIsError: false)
+            for pass in 0 ... 2 {
+                XCTAssertEqual(ChatSendResultCard(item: row, oracleOpenContext: nil).status, .failure, "\(tool), pass \(pass)")
+                let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: row.toolResultJSON))
+                XCTAssertEqual(dto.status, "failed")
+                let coverage = try XCTUnwrap(OracleLaneCoverage(lanes: dto.oracleResults, oracleCount: dto.oracleCount))
+                XCTAssertEqual(coverage.summaryText, "1/2 lanes · primary failed")
+                row.toolResultJSON = try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: row)).resultJSON
+            }
+        }
     }
 
     func testCompleteAndFullyFailedGroups() throws {
