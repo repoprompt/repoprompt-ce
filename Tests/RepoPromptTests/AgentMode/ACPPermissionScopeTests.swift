@@ -86,7 +86,8 @@ final class ACPPermissionScopeTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
         let controller = try ACPAgentSessionController(
-            provider: ScriptedScopeProvider(providerID: providerID, executable: executable.path), runRequest: request
+            provider: ScriptedScopeProvider(providerID: providerID, executable: executable.path), runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
