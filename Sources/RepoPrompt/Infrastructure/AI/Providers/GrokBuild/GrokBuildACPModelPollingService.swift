@@ -4,33 +4,21 @@ protocol GrokBuildACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?
 }
 
-/// Discovery client that reuses one verified Grok session per standardized workspace so
+/// Discovery client that reuses one verified Grok session in a neutral directory so
 /// 5-minute polling does not accumulate persistent sessions under `~/.grok/sessions`.
 /// `session/load` returns fresh `models` metadata on grok 1.0.3, so load-based discovery
 /// observes remote catalog changes.
 actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ config: GrokBuildAgentConfig) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
     private let controllerFactory: ControllerFactory
-    private var retainedSessionIDByWorkspaceKey: [String: String] = [:]
+    private var retainedSessionID: String?
 
     init(
-        providerFactory: @escaping ProviderFactory = { agent, modelString in
-            if agent == .grokBuild {
-                // Discovery sessions never inject the RepoPrompt MCP server — polling every
-                // 300s must not spawn tool servers for nothing.
-                return try await GrokBuildACPAgentProvider(
-                    config: GrokBuildAgentConfig(
-                        enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-                        modelString: modelString,
-                        includeRepoPromptMCPServer: false,
-                        apiKey: KeyManager().getAPIKey(for: .grok)
-                    )
-                )
-            }
-            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+        providerFactory: @escaping ProviderFactory = { config in
+            GrokBuildACPAgentProvider(config: config)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -40,18 +28,25 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         self.controllerFactory = controllerFactory
     }
 
-    func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
-        let workspaceKey = Self.discoveryWorkspaceKey(for: workspacePath)
-        let retainedSessionID = retainedSessionIDByWorkspaceKey[workspaceKey]
+    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+        // Catalog discovery does not need the user's project. Keep project .mcp.json and
+        // project-local Cursor imports out of polling, without changing HOME/GROK_HOME.
         let request = ACPRunRequest(
             agentKind: .grokBuild,
             modelString: nil,
-            workspacePath: workspacePath ?? Self.stableDiscoveryWorkspacePath(),
+            workspacePath: Self.stableDiscoveryWorkspacePath(),
             resumeSessionID: retainedSessionID,
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = try await providerFactory(.grokBuild, nil) else { return nil }
+        // Polling every 300s must not spawn tool servers for nothing.
+        let config = try await GrokBuildAgentConfig(
+            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+            includeRepoPromptMCPServer: false,
+            apiKey: KeyManager().getAPIKey(for: .grok),
+            launchPurpose: .modelDiscovery
+        )
+        guard let provider = try await providerFactory(config) else { return nil }
         let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
@@ -62,7 +57,7 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            await retainVerifiedIdentity(controller.currentProviderSessionIdentity(), workspaceKey: workspaceKey)
+            await retainVerifiedIdentity(controller.currentProviderSessionIdentity())
             let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild)
             await controller.shutdown()
             return snapshot
@@ -72,7 +67,7 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         }
     }
 
-    private func retainVerifiedIdentity(_ identity: ACPProviderSessionIdentity, workspaceKey: String) {
+    private func retainVerifiedIdentity(_ identity: ACPProviderSessionIdentity) {
         // Only verified load IDs may be retained; a candidate ID would defeat the
         // controller's load→new recovery contract.
         guard identity.loadSessionIDConfidence == .verified,
@@ -83,17 +78,10 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         }
         // On a load→new recovery the verified identity is the fresh session, so this
         // assignment also replaces an invalidated retained ID.
-        retainedSessionIDByWorkspaceKey[workspaceKey] = loadID
+        retainedSessionID = loadID
     }
 
-    private static func discoveryWorkspaceKey(for workspacePath: String?) -> String {
-        guard let trimmed = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return stableDiscoveryWorkspacePath()
-        }
-        return URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL.path
-    }
-
-    /// One stable provider-specific directory key for nil-workspace discovery so repeated
+    /// One stable provider-specific directory for discovery so repeated
     /// polls reuse the same retained session instead of leaking `~/.grok/sessions` entries.
     private static func stableDiscoveryWorkspacePath() -> String {
         let url = FileManager.default.temporaryDirectory

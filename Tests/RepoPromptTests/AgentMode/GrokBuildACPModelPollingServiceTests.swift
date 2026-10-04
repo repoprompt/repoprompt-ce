@@ -13,6 +13,71 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         super.tearDown()
     }
 
+    private enum DiscoveryProbeError: Error {
+        case finished, unexpectedProviderCall
+    }
+
+    /// Stops before bootstrap: this test observes routing without launching a process.
+    private struct DiscoveryProbeProvider: ACPAgentProvider {
+        var providerID: ACPProviderID {
+            .grokBuild
+        }
+
+        func support(for _: ACPRunRequest) async -> ACPSupportResult {
+            .supported
+        }
+
+        func makeLaunchConfiguration(for _: ACPRunRequest) throws -> ACPLaunchConfiguration {
+            throw DiscoveryProbeError.unexpectedProviderCall
+        }
+
+        func makeSessionConfiguration(
+            for _: ACPRunRequest,
+            mcpServer _: RepoPromptMCPServerConfiguration
+        ) throws -> ACPSessionConfiguration {
+            throw DiscoveryProbeError.unexpectedProviderCall
+        }
+
+        func buildPromptBlocks(for _: AgentMessage, request _: ACPRunRequest) throws -> [[String: Any]] {
+            throw DiscoveryProbeError.unexpectedProviderCall
+        }
+
+        func normalizeSessionUpdate(_: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
+            []
+        }
+
+        func normalizeError(_ error: Error) -> Error {
+            error
+        }
+    }
+
+    func testControllerDiscoveryUsesNeutralDirectoryAndIsolatedPurpose() async throws {
+        let project = try makeTestDirectory(name: "GrokDiscoveryProject")
+        let neutralPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
+            .standardizedFileURL.path
+        let client = GrokBuildACPControllerModelDiscoveryClient(
+            providerFactory: { config in
+                XCTAssertEqual(config.launchPurpose, .modelDiscovery)
+                XCTAssertFalse(config.includeRepoPromptMCPServer)
+                return DiscoveryProbeProvider()
+            },
+            controllerFactory: { _, request in
+                XCTAssertEqual(request.workspacePath, neutralPath)
+                XCTAssertNil(request.resumeSessionID)
+                throw DiscoveryProbeError.finished
+            }
+        )
+        for workspacePath in [nil, project.path, project.appendingPathComponent("other-project").path] as [String?] {
+            do {
+                _ = try await client.discoverModels(workspacePath: workspacePath)
+                XCTFail("Expected the probe to stop before bootstrap")
+            } catch DiscoveryProbeError.finished {
+                // Request and provider config were checked at the real construction boundary.
+            }
+        }
+    }
+
     private struct StubDiscoveryClient: GrokBuildACPModelDiscoveryClient {
         let models: ACPDiscoveredSessionModels?
         let failure: (any Error)?

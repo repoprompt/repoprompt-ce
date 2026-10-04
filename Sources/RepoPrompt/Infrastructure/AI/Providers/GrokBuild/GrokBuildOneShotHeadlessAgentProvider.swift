@@ -193,7 +193,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
 
     /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
     static func launchEnvironment(apiKey: String?) -> [String: String] {
-        var environment: [String: String] = [:]
+        var environment = GrokBuildLaunchPurpose.oneShot.environmentOverrides
         if let apiKey, !apiKey.isEmpty {
             environment["XAI_API_KEY"] = apiKey
         }

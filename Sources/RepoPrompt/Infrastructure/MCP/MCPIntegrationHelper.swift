@@ -172,15 +172,17 @@ enum MCPIntegrationHelper {
     }
 
     private static func stripExplicitRepoPromptPrefix(from rawName: String) -> (normalized: String, explicit: Bool) {
-        let server = repoPromptMCPServerName.lowercased()
-        let explicitPrefixes = [
-            "mcp__\(server)__",
-            "mcp_\(server)__",
-            "\(server)__",
-            "\(server)_"
-        ]
-        for prefix in explicitPrefixes where rawName.hasPrefix(prefix) {
-            return (String(rawName.dropFirst(prefix.count)), true)
+        for name in [repoPromptMCPServerName, RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName] {
+            let server = name.lowercased()
+            let explicitPrefixes = [
+                "mcp__\(server)__",
+                "mcp_\(server)__",
+                "\(server)__",
+                "\(server)_"
+            ]
+            for prefix in explicitPrefixes where rawName.hasPrefix(prefix) {
+                return (String(rawName.dropFirst(prefix.count)), true)
+            }
         }
         return (rawName, false)
     }

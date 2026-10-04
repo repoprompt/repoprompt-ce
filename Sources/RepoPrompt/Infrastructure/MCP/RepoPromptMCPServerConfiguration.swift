@@ -14,6 +14,9 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
     }
 
     static let defaultServerName = "RepoPromptCE"
+    /// Stable Grok-only name avoids the common imported `RepoPromptCE` collision: Grok
+    /// drops client servers matching disabled Claude/Cursor imports, even on session/load.
+    static let grokBuildRuntimeServerName = "RepoPromptCEGrokRuntime"
 
     let name: String
     let command: String

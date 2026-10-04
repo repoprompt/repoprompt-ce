@@ -1321,6 +1321,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(acp.contains("`\(server)-agent_session_link`"))
         XCTAssertTrue(acp.contains("`agent_session_link (\(server))`"))
         XCTAssertTrue(acp.contains("`mcp__\(server)__agent_session_link`"))
+        XCTAssertTrue(acp.contains("`RepoPromptCEGrokRuntime__agent_session_link`"))
 
         let claude = AgentSessionLinkPrompts.render(
             kind: .inventory,

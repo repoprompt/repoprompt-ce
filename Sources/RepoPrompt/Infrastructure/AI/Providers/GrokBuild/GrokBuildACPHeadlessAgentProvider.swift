@@ -30,6 +30,16 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
             )
         }
     ) {
+        let config = GrokBuildAgentConfig(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging,
+            modelString: config.modelString,
+            includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
+            alwaysApproveTools: config.alwaysApproveTools,
+            apiKey: config.apiKey,
+            launchPurpose: .contextBuilder
+        )
         self.config = config
         let resolvedProviderFactory = providerFactory ?? { config in
             // Resolve the stored Grok key here (async) — `AgentRuntimeProviderService.makeProvider`
@@ -42,7 +52,8 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
                     modelString: config.modelString,
                     includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
                     alwaysApproveTools: config.alwaysApproveTools,
-                    apiKey: KeyManager().getAPIKey(for: .grok)
+                    apiKey: KeyManager().getAPIKey(for: .grok),
+                    launchPurpose: config.launchPurpose
                 )
             )
         }
