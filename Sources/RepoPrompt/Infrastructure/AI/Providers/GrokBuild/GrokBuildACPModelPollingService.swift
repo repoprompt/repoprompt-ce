@@ -18,7 +18,20 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
 
     init(
         providerFactory: @escaping ProviderFactory = { config in
-            GrokBuildACPAgentProvider(config: config)
+            // Keep credential lookup inside the default factory so injected factories
+            // can observe discovery routing without touching secure storage.
+            try await GrokBuildACPAgentProvider(
+                config: GrokBuildAgentConfig(
+                    commandName: config.commandName,
+                    additionalPathHints: config.additionalPathHints,
+                    enableDebugLogging: config.enableDebugLogging,
+                    modelString: config.modelString,
+                    includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
+                    alwaysApproveTools: config.alwaysApproveTools,
+                    apiKey: KeyManager().getAPIKey(for: .grok),
+                    launchPurpose: config.launchPurpose
+                )
+            )
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -40,10 +53,9 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
             taskLabelKind: nil
         )
         // Polling every 300s must not spawn tool servers for nothing.
-        let config = try await GrokBuildAgentConfig(
+        let config = GrokBuildAgentConfig(
             enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
             includeRepoPromptMCPServer: false,
-            apiKey: KeyManager().getAPIKey(for: .grok),
             launchPurpose: .modelDiscovery
         )
         guard let provider = try await providerFactory(config) else { return nil }

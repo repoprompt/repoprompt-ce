@@ -52,7 +52,6 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testControllerDiscoveryUsesNeutralDirectoryAndIsolatedPurpose() async throws {
-        let project = try makeTestDirectory(name: "GrokDiscoveryProject")
         let neutralPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
             .standardizedFileURL.path
@@ -68,7 +67,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
                 throw DiscoveryProbeError.finished
             }
         )
-        for workspacePath in [nil, project.path, project.appendingPathComponent("other-project").path] as [String?] {
+        for workspacePath in [nil, "/unused/grok-project-a", "/unused/grok-project-b"] as [String?] {
             do {
                 _ = try await client.discoverModels(workspacePath: workspacePath)
                 XCTFail("Expected the probe to stop before bootstrap")
