@@ -124,6 +124,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     extraEnvironment: ["ACP_RECORD_PATH": recordPath],
                     repoPromptMCPConfiguration: mcp
                 )
+            },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
             }
         )
         try await drain(provider, message: "ping")
