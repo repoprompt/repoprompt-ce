@@ -98,7 +98,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertEqual(meta?["reasoningEffort"] as? String, "low")
     }
 
-    func testHeadlessConfigPreservesFullAccessIntent() {
+    func testFullAccessIntentReachesLaunchRequest() {
         let config = GrokBuildAgentConfig(alwaysApproveTools: true)
         let provider = GrokBuildACPHeadlessAgentProvider(config: config)
         let requestConfig = provider.test_config
