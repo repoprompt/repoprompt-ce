@@ -61,6 +61,25 @@ package protocol WorkspaceDiskWritePolicy: Sendable {
     func trace(_ event: String, metadata: Metadata?, url: URL, extra: [String: String])
 }
 
+/// Both write paths belong to the same host-selected backend. Custom backends
+/// must supply both operations; neither silently falls back to physical writes.
+/// File stamp checks remain filesystem-owned. Normalization must not suspend
+/// between the actor's pending/stamp checks and the write.
+package struct WorkspaceDiskWriteBackend {
+    package let queuedAtomicWrite: @Sendable (Data, URL) async throws -> Void
+    package let normalizationAtomicWrite: @Sendable (Data, URL) throws -> Void
+
+    package init(queuedAtomicWrite: @escaping @Sendable (Data, URL) async throws -> Void, normalizationAtomicWrite: @escaping @Sendable (Data, URL) throws -> Void) {
+        self.queuedAtomicWrite = queuedAtomicWrite
+        self.normalizationAtomicWrite = normalizationAtomicWrite
+    }
+
+    package static let physical = WorkspaceDiskWriteBackend(
+        queuedAtomicWrite: { data, url in try data.write(to: url, options: .atomic) },
+        normalizationAtomicWrite: { data, url in try data.write(to: url, options: .atomic) }
+    )
+}
+
 /// One process-composed writer should be injected across windows. There is no
 /// library singleton and no knowledge of WorkspaceModel or a view model.
 package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
@@ -76,7 +95,7 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
     }
 
     package nonisolated let policy: Policy
-    private let atomicWrite: @Sendable (Data, URL) async throws -> Void
+    private let backend: WorkspaceDiskWriteBackend
     private var pendingByURL: [URL: Pending] = [:]
     private var waitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
     private var latestSelectionByWorkspaceTab: [Policy.SelectionKey: SelectionRecord] = [:]
@@ -87,9 +106,9 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         private var fullWorkspacePayloadCount = 0
     #endif
 
-    package init(policy: Policy, atomicWrite: @escaping @Sendable (Data, URL) async throws -> Void = { data, url in try data.write(to: url, options: .atomic) }) {
+    package init(policy: Policy, backend: WorkspaceDiskWriteBackend = .physical) {
         self.policy = policy
-        self.atomicWrite = atomicWrite
+        self.backend = backend
     }
 
     package func enqueue(data: Data, url: URL) {
@@ -151,7 +170,7 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
                 EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.WorkspaceDurability.writeEnded)
                 EditFlowPerf.end(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite, state)
             }
-            try data.write(to: url, options: .atomic)
+            try backend.normalizationAtomicWrite(data, url)
             recordLatestSelectionIfNeeded(metadata)
             policy.trace("workspaceSave.syncWrite.success", metadata: metadata, url: url, extra: ["path": "normalization"])
             return true
@@ -195,7 +214,7 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         let latest = key.flatMap { latestSelectionByWorkspaceTab[$0] }
         let lastWritten = key.map { lastWrittenSelectionRevisionByWorkspaceTab[$0, default: 0] } ?? 0
         let policy = policy
-        let atomicWrite = atomicWrite
+        let atomicWrite = backend.queuedAtomicWrite
         #if DEBUG
             let gate = atomicWriteGateForTesting
         #endif

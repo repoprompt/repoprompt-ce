@@ -3,11 +3,129 @@ import Foundation
 import XCTest
 
 final class WorkspaceDiskWriterContractTests: XCTestCase {
+    func testNormalizationDoesNotBypassInjectedBackendFailure() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let called = expectation(description: "Injected normalization backend refused the write")
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { _, _ in throw InjectedWriteFailure.refused },
+            normalizationAtomicWrite: { _, _ in
+                called.fulfill()
+                throw InjectedWriteFailure.refused
+            }
+        ))
+
+        let wrote = await writer.writeNormalizationIfUnchanged(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate
+        )
+
+        XCTAssertFalse(wrote, "Normalization must not fall back to physical I/O when the injected write backend refuses it")
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+        await fulfillment(of: [called], timeout: 1)
+    }
+
+    func testNormalizationUsesCustomBackendWithoutModifyingPhysicalFile() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let normalized = Data("normalized".utf8)
+        let called = expectation(description: "Custom backend receives normalization bytes and URL")
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { _, _ in XCTFail("Normalization must not use the queued backend operation") },
+            normalizationAtomicWrite: { data, url in
+                XCTAssertEqual(data, normalized)
+                XCTAssertEqual(url, fixture.url)
+                called.fulfill()
+            }
+        ))
+
+        let wrote = await writer.writeNormalizationIfUnchanged(
+            data: normalized,
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate
+        )
+
+        XCTAssertTrue(wrote)
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+        await fulfillment(of: [called], timeout: 1)
+    }
+
+    func testDefaultBackendPreservesPhysicalNormalizationWrite() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let normalized = Data("normalized".utf8)
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy())
+
+        let wrote = await writer.writeNormalizationIfUnchanged(
+            data: normalized,
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate
+        )
+
+        XCTAssertTrue(wrote)
+        XCTAssertEqual(try Data(contentsOf: fixture.url), normalized)
+    }
+
+    func testNormalizationRejectsStaleFileStampBeforeCallingBackend() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { _, _ in XCTFail("Stale normalization must not enqueue a write") },
+            normalizationAtomicWrite: { _, _ in XCTFail("Stale normalization must not invoke the backend") }
+        ))
+
+        let wrongSize = await writer.writeNormalizationIfUnchanged(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize + 1,
+            expectedModificationDate: fixture.modificationDate
+        )
+        let wrongDate = await writer.writeNormalizationIfUnchanged(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate.addingTimeInterval(1)
+        )
+
+        XCTAssertFalse(wrongSize)
+        XCTAssertFalse(wrongDate)
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+    }
+
+    func testNormalizationRejectsPendingWriteBeforeCallingBackend() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let writes = WriteGate()
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { data, _ in await writes.write(data) },
+            normalizationAtomicWrite: { _, _ in XCTFail("Normalization must not interleave with the pending write") }
+        ))
+        await writer.enqueue(data: Data("queued".utf8), url: fixture.url)
+        await writes.waitForFirstWrite()
+
+        let wrote = await writer.writeNormalizationIfUnchanged(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate
+        )
+
+        XCTAssertFalse(wrote)
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+        await writes.releaseFirstWrite()
+        await writer.flush(url: fixture.url)
+    }
+
     func testSelectionLookupKeepsKeyWhenIncomingMetadataHasNoSelection() async {
         let writes = WriteGate()
-        let writer = WorkspaceDiskWriter(policy: SelectionLookupPolicy(), atomicWrite: { data, _ in
-            await writes.write(data)
-        })
+        let writer = WorkspaceDiskWriter(policy: SelectionLookupPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { data, _ in await writes.write(data) },
+            normalizationAtomicWrite: { _, _ in XCTFail("This fixture only queues writes") }
+        ))
         let url = URL(fileURLWithPath: "/fixture/selection.json")
         await writer.enqueueWorkspace(
             data: Data(),
@@ -29,9 +147,10 @@ final class WorkspaceDiskWriterContractTests: XCTestCase {
 
     func testFlushWaitsForInFlightAndCoalescedPayload() async {
         let writes = WriteGate()
-        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), atomicWrite: { data, _ in
-            await writes.write(data)
-        })
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { data, _ in await writes.write(data) },
+            normalizationAtomicWrite: { _, _ in XCTFail("This fixture only queues writes") }
+        ))
         let url = URL(fileURLWithPath: "/fixture/workspace.json")
         await writer.enqueue(data: Data("first".utf8), url: url)
         await writes.waitForFirstWrite()
@@ -43,6 +162,33 @@ final class WorkspaceDiskWriterContractTests: XCTestCase {
         let payloads = await writes.snapshot()
         XCTAssertEqual(payloads, [Data("first".utf8), Data("newest".utf8)])
     }
+}
+
+private struct NormalizationFixture {
+    let directory: URL
+    let url: URL
+    let original: Data
+    let fileSize: Int64
+    let modificationDate: Date
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        url = directory.appendingPathComponent("workspace.json")
+        original = Data("original".utf8)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try original.write(to: url)
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        fileSize = try Int64(XCTUnwrap(values.fileSize))
+        modificationDate = try XCTUnwrap(values.contentModificationDate)
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private enum InjectedWriteFailure: Error {
+    case refused
 }
 
 private struct BytePayloadPolicy: WorkspaceDiskWritePolicy {

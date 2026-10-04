@@ -1240,3 +1240,47 @@ container corruption/hostile-file tests validate a different layer. Duplicate pu
 delta coalescing in the app and FileSystem is a non-blocking future divergence risk,
 not a demonstrated current algorithm mismatch. The historical final-materialization
 failure remains unattributed; broad GREEN is not causal proof of its disposition.
+
+### V194 injected write-backend contract resolution
+
+The PR5 coordinator owns this B1 repair. Revised-head review at `838a583a2`
+correctly left historical V194 (revised audit row 197) unresolved: the async
+`atomicWrite` callback controlled queued writes, while eligible normalization
+bypassed it and performed physical I/O. This was not cleared by eight hosted
+GREEN checks. The default physical app behavior matched main, but the custom
+write-backend contract was defective, not merely a mechanical-audit classification.
+
+Concrete regression receipt `11a451db-f630-4804-be31-0baedcefd6a6` executed one
+case, `testNormalizationDoesNotBypassInjectedBackendFailure`, and failed both the
+refusal and unchanged-file assertions: normalization returned success and replaced
+the real file despite the injected backend refusing writes. No production source
+had changed before this RED execution.
+
+The intended contract is now explicit: `WorkspaceDiskWriteBackend` requires both
+`queuedAtomicWrite` (async) and `normalizationAtomicWrite` (synchronous), with no
+implicit physical fallback when choosing a custom backend. It is a write backend,
+not a virtual filesystem; file-stamp reads remain filesystem-owned. The default
+`.physical` backend performs the same atomic writes as main. Normalization's
+pending-slot check, size/mtime checks, synchronous backend call, and successful
+selection recording remain one non-suspending actor operation. No `await`, task,
+lock, retry, timeout inflation, or authority bypass was inserted into that critical
+section. Application composition still uses the default process-owned writer.
+
+Focused correction receipt `769a00a9-582d-4897-96b6-811a40f6c37e` executed **seven
+owning contract tests, all passed**: the five new normalization regressions cover
+backend refusal without physical mutation, custom backend dispatch without physical
+mutation, default physical behavior, stale size/date rejection, and pending-write
+rejection. The two existing selection-key and in-flight/coalescing tests retain
+their original assertions. The extra DecodeWork selector matched no app tests;
+this receipt is not claimed as app integration coverage. Revised-head full tests,
+style, hosted checks and independent delta review are separate subsequent gates.
+
+The other 257 strict-audit rows at `838a583a2` retain their exact-path/owner intended
+adaptation dispositions; the strict tool remains FAIL, not suppressed or made GREEN.
+This repair resolves a substantive injected-backend defect but does not make the
+extraction a pure move. Manager-injected normalization routing and direct app
+raw-source-adapter mismatch coverage remain separately disclosed gaps, not tests
+supplied by these owning writer or neutral container suites. The historical
+final-materialization and graph authority failures remain unattributed; subsequent
+GREEN execution is not causal explanation. No typed-path claimed source or
+separately owned reliability source was modified.
