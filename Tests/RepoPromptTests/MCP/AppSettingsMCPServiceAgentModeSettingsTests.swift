@@ -513,6 +513,35 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         }
     }
 
+    func testContextBuilderModelWriteRepairsInvalidStoredAgentWithoutLosingRememberedModels() async throws {
+        try await withContextBuilderSettings { store, service, _, _ in
+            let claudeRaw = AgentProviderKind.claudeCode.rawValue
+            for (agentRaw, rememberedModel) in [
+                ("unknown-context-builder-agent", "unknown-remembered-model"),
+                (AgentProviderKind.antigravity.rawValue, "antigravity-remembered-model")
+            ] {
+                store.setGlobalAgentModelsProfile(
+                    AgentModelsSettingsProfile(
+                        contextBuilderAgentRaw: agentRaw,
+                        contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
+                    ),
+                    contextBuilderWriteIntent: .userInitiated
+                )
+
+                _ = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.model"),
+                    "value": .string("sonnet")
+                ])
+
+                let profile = store.globalAgentModelsProfile()
+                XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, agentRaw)
+                XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], "sonnet", agentRaw)
+                XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, agentRaw)
+            }
+        }
+    }
+
     func testContextBuilderModelReadsWritesAndClearsStoredAgentSlot() async throws {
         try await withContextBuilderSettings { store, service, _, _ in
             for (agent, originalModel, updatedModel): (AgentProviderKind, String, String) in [

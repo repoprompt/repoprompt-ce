@@ -823,8 +823,8 @@ private enum AppSettingsMCPRegistry {
                 var profile = store.globalAgentModelsProfile()
                 let agent = contextBuilderAgent(in: profile)
                 let modelRaw = try optionalString(from: value)
-                if modelRaw != nil, profile.contextBuilderAgentRaw == nil {
-                    // Runtime resolution needs an agent as well as the model.
+                if modelRaw != nil, profile.contextBuilderAgentRaw != agent.rawValue {
+                    // Runtime resolution needs a usable agent as well as the model.
                     profile.contextBuilderAgentRaw = agent.rawValue
                 }
                 let updated = profile.replacingContextBuilderModel(modelRaw, for: agent.rawValue)
