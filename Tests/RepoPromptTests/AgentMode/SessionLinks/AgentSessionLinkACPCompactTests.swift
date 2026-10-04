@@ -319,6 +319,11 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
 
 @MainActor
 final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private var harnesses: [AgentSessionLinkRunnerHarness] = []
     private var temporaryURLs: [URL] = []
 
