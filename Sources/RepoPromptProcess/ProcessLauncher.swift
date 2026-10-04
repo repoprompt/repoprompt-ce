@@ -44,6 +44,10 @@ package enum ProcessLauncherError: Error {
 }
 
 package enum ProcessLauncher {
+    /// The launcher owns child lifetime tracking; registries themselves are constructible and
+    /// independently injectable in non-live tests. Shutdown and reaping use this same authority.
+    package static let childProcessRegistry = AppChildProcessRegistry()
+
     package static func spawn(
         command: String,
         arguments: [String],
@@ -309,6 +313,13 @@ package enum ProcessLauncher {
             }
         }
 
+        // Close launch admission on app exit, while accounting for an already-admitted spawn
+        // until its child group is published. Do not hold the registry lock across posix_spawnp.
+        guard childProcessRegistry.beginLaunch() else {
+            closePipes()
+            throw ProcessLauncherError.spawnFailed(errno: ECANCELED)
+        }
+        defer { childProcessRegistry.finishLaunch() }
         var pid: pid_t = 0
         let spawnResult = posix_spawnp(
             &pid,
@@ -326,6 +337,7 @@ package enum ProcessLauncher {
             throw ProcessLauncherError.spawnFailed(errno: spawnResult)
         }
 
+        childProcessRegistry.register(pid: pid, processGroupID: pid)
         close(stdinPipe[0])
         close(stdoutPipe[1])
         close(stderrPipe[1])
