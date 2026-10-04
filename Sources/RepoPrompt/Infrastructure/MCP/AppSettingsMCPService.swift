@@ -794,18 +794,19 @@ private enum AppSettingsMCPRegistry {
             allowedValues: AgentProviderKind.allCases
                 .filter { AgentModelCatalog.AgentSelectionSurface.headless.allows($0) }
                 .map(\.rawValue),
-            read: { .string($0.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue) },
+            read: { .string(contextBuilderAgent(in: $0.globalAgentModelsProfile()).rawValue) },
             write: { store, value in
                 let agentRaw = try requiredString(from: value)
                 let kind = AgentProviderKind(rawValue: agentRaw) ?? .claudeCode
-                let rememberedModelRaw = store.globalContextBuilderRememberedModelRaw(for: kind.rawValue)
-                let modelRaw = rememberedModelRaw ?? AgentModelCatalog.defaultModelRaw(for: kind)
-                store.setGlobalContextBuilderAgentSelection(
-                    agentRaw: kind.rawValue,
-                    modelRaw: modelRaw,
-                    markUserDefined: true,
-                    reason: "app_settings.context_builder.agent"
-                )
+                var profile = store.globalAgentModelsProfile()
+                profile.contextBuilderAgentRaw = kind.rawValue
+                if profile.contextBuilderModelsByAgent?[kind.rawValue] == nil {
+                    profile = profile.replacingContextBuilderModel(
+                        AgentModelCatalog.defaultModelRaw(for: kind),
+                        for: kind.rawValue
+                    )
+                }
+                store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
             },
             afterWrite: postRecommendationsDidApply
         ),
@@ -814,22 +815,20 @@ private enum AppSettingsMCPRegistry {
             group: "context_builder",
             description: "Model raw identifier used by the Context Builder MCP tool.",
             read: { store in
-                let agentRaw = store.globalContextBuilderAgentSelection().agentRaw
-                return stringOrNull(agentRaw.flatMap { store.globalContextBuilderRememberedModelRaw(for: $0) })
+                let profile = store.globalAgentModelsProfile()
+                let agent = contextBuilderAgent(in: profile)
+                return stringOrNull(profile.contextBuilderModelsByAgent?[agent.rawValue])
             },
             write: { store, value in
-                let currentAgentRaw = store.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue
-                try store.setGlobalContextBuilderAgentSelection(
-                    agentRaw: currentAgentRaw,
-                    modelRaw: optionalString(from: value),
-                    markUserDefined: true,
-                    reason: "app_settings.context_builder.model"
-                )
+                let profile = store.globalAgentModelsProfile()
+                let agent = contextBuilderAgent(in: profile)
+                let updated = try profile.replacingContextBuilderModel(optionalString(from: value), for: agent.rawValue)
+                store.setGlobalAgentModelsProfile(updated, contextBuilderWriteIntent: .userInitiated)
             },
             afterWrite: postRecommendationsDidApply,
             candidateProvider: agentModelRawCandidates,
             defaultOptionsAgent: { store in
-                store.globalContextBuilderAgentSelection().agentRaw.flatMap(AgentProviderKind.init(rawValue:))
+                contextBuilderAgent(in: store.globalAgentModelsProfile())
             }
         ),
 
@@ -1643,6 +1642,15 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    /// Stored configuration is independent of runtime provider availability.
+    private static func contextBuilderAgent(in profile: AgentModelsSettingsProfile) -> AgentProviderKind {
+        guard let raw = profile.contextBuilderAgentRaw,
+              let agent = AgentProviderKind(rawValue: raw),
+              AgentModelCatalog.AgentSelectionSurface.headless.allows(agent)
+        else { return .claudeCode }
+        return agent
+    }
+
     /// Returns model-raw candidates for string-typed Context Builder settings using the shared
     /// `AgentModelCatalog` discovery data. Task labels such as explore/engineer/pair/design
     /// are intentionally excluded — they are higher-level `agent_run model_id` aliases and
@@ -1651,7 +1659,15 @@ private enum AppSettingsMCPRegistry {
     static func agentModelRawCandidates(
         request: AppSettingCandidateRequest
     ) throws -> AppSettingCandidatesResult {
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: request.availability, surface: .headless)
+        // Known models remain configurable even when runtime availability has not been verified.
+        let catalogAvailability: AgentModelCatalog.AvailabilityContext = if let agent = request.agentFilter,
+                                                                            agent == .grokBuild || agent == .cursor
+        {
+            request.availability.assumingAvailable(agent)
+        } else {
+            request.availability
+        }
+        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: catalogAvailability, surface: .headless)
         let filteredAgents: [AgentModelCatalog.DiscoveryAgent] = if let agentFilter = request.agentFilter {
             discoveryAgents.filter { $0.agent == agentFilter && $0.available }
         } else {
@@ -1667,9 +1683,10 @@ private enum AppSettingsMCPRegistry {
 
         var allCandidates: [AppSettingCandidate] = []
         for discoveryAgent in filteredAgents {
+            let runtimeAvailable = AgentModelCatalog.isAgentAvailable(discoveryAgent.agent, availability: request.availability)
             for model in discoveryAgent.models {
                 for target in model.startTargets {
-                    // Only surface available runtime candidates, skip anything that would fail
+                    // Only surface known catalog candidates, skip anything that would fail
                     // the shared `set` validator, and belt-and-braces exclude reserved task
                     // labels even if a future catalog entry happens to match one.
                     guard target.available else { continue }
@@ -1682,7 +1699,7 @@ private enum AppSettingsMCPRegistry {
                     var attributes: [String: Value] = [
                         "agent": .string(discoveryAgent.agent.rawValue),
                         "agent_name": .string(discoveryAgent.agent.displayName),
-                        "available": .bool(discoveryAgent.available && target.available),
+                        "available": .bool(runtimeAvailable && target.available),
                         "is_default": .bool(target.isDefault)
                     ]
                     if request.detailed {
@@ -1716,7 +1733,7 @@ private enum AppSettingsMCPRegistry {
         let options = truncated ? Array(allCandidates.prefix(clampedLimit)) : allCandidates
 
         let notes = [
-            "These are current runtime model candidates; custom raw identifiers may still be accepted by app_settings op='set'.",
+            "These are known model identifiers, not proof that a provider is installed or signed in; custom raw identifiers may still be accepted by app_settings op='set'.",
             "Task labels such as explore/engineer/pair/design are not valid values for this setting."
         ]
 
