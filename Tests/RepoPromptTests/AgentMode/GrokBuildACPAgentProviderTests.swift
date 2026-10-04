@@ -80,6 +80,18 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(launch.arguments.count(where: { $0 == "--always-approve" }), 1)
     }
 
+    func testLaunchIsolatesImportedMCPServersWithoutChangingUserDirectories() throws {
+        for apiKey in [nil, "xai-test-key-123"] as [String?] {
+            let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: apiKey))
+            let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+            XCTAssertEqual(launch.environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
+            XCTAssertEqual(launch.environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+            XCTAssertEqual(launch.environment["XAI_API_KEY"], apiKey)
+            XCTAssertNil(launch.environment["HOME"])
+            XCTAssertNil(launch.environment["GROK_HOME"])
+        }
+    }
+
     func testStoredGrokAPIKeyIsInjectedAsXAIAPIKey() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: "xai-test-key-123"))
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
@@ -98,17 +110,25 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         XCTAssertNil(launch.environment["XAI_API_KEY"])
     }
 
-    func testNewSessionInjectsRepoPromptMCP() throws {
+    func testNewAndLoadedSessionsUseGrokRuntimeMCPName() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig())
-        let session = try provider.makeSessionConfiguration(
-            for: makeRequest(workspacePath: directory.path),
-            mcpServer: .repoPrompt
-        )
-        guard case .new = session.mode else {
-            return XCTFail("expected new session, got \(session.mode)")
+        for resumeSessionID in [nil, "sess-123"] as [String?] {
+            let session = try provider.makeSessionConfiguration(
+                for: makeRequest(workspacePath: directory.path, resumeSessionID: resumeSessionID),
+                mcpServer: .repoPrompt
+            )
+            if let resumeSessionID {
+                XCTAssertEqual(session.mode, .load(existingSessionID: resumeSessionID))
+            } else {
+                XCTAssertEqual(session.mode, .new)
+            }
+            XCTAssertEqual(session.mcpServers.count, 1)
+            let server = try XCTUnwrap(session.mcpServers.first)
+            XCTAssertEqual(server.name, "RepoPromptCEGrokRuntime")
+            XCTAssertEqual(server.command, RepoPromptMCPServerConfiguration.repoPrompt.command)
+            XCTAssertEqual(server.args, RepoPromptMCPServerConfiguration.repoPrompt.args)
+            XCTAssertEqual(server.env, RepoPromptMCPServerConfiguration.repoPrompt.env)
         }
-        XCTAssertEqual(session.mcpServers.count, 1)
-        XCTAssertEqual(session.mcpServers.first, .repoPrompt)
     }
 
     func testSessionConfigCanDisableMCPInjection() throws {
