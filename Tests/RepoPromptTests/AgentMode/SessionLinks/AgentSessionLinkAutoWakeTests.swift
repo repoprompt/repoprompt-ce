@@ -230,7 +230,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
         XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
-        XCTAssertEqual(reOwed.inventoryGuidanceRevision, 8)
+        XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
         XCTAssertTrue(reOwed.fragment.contains("`create_lane`"))
