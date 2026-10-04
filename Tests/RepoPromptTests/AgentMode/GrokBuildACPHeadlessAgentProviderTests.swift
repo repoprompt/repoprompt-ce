@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -78,7 +79,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             attachments: [],
             taskLabelKind: nil
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         do {
             _ = try await controller.bootstrap()
@@ -134,6 +135,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     EnvForwardingGrokProvider(
                         config: config,
                         extraEnvironment: ["ACP_RECORD_PATH": recordPath]
+                    )
+                },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
                     )
                 }
             )
@@ -293,7 +300,9 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
     }
 
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult {
-        try await inner.support(for: request)
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await inner.support(for: request)
+        }
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

@@ -113,7 +113,7 @@ final class AgentSessionLinkRunnerHarness {
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             },
             connectionPolicyInstaller: policyInstaller,
             expectedPIDPolicyArmer: { _ in true },

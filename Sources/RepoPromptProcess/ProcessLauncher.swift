@@ -43,19 +43,30 @@ package enum ProcessLauncherError: Error {
     }
 }
 
+package typealias ProviderProcessLaunchPolicy = RepoPromptShared.ProviderProcessLaunchPolicy
+
 package enum ProcessLauncher {
+    package enum Purpose: Equatable {
+        case tool
+        case provider
+    }
+
     package static func spawn(
         command: String,
         arguments: [String],
         environment: [String: String],
-        workingDirectory: String?
+        workingDirectory: String?,
+        purpose: Purpose = .provider,
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) throws -> SpawnedProcess {
         try spawn(
             command: command,
             arguments: arguments,
             environment: environment,
             workingDirectory: workingDirectory,
-            initializationFailure: nil
+            initializationFailure: nil,
+            purpose: purpose,
+            allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
         )
     }
 
@@ -81,7 +92,9 @@ package enum ProcessLauncher {
                 arguments: arguments,
                 environment: environment,
                 workingDirectory: workingDirectory,
-                initializationFailure: failure
+                initializationFailure: failure,
+                purpose: .tool,
+                allowsProviderProcessLaunchForTesting: false
             )
         }
     #endif
@@ -96,8 +109,14 @@ package enum ProcessLauncher {
         arguments: [String],
         environment: [String: String],
         workingDirectory: String?,
-        initializationFailure: InitializationFailure?
+        initializationFailure: InitializationFailure?,
+        purpose: Purpose,
+        allowsProviderProcessLaunchForTesting: Bool
     ) throws -> SpawnedProcess {
+        if purpose == .provider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        }
+
         var stdinPipe: [Int32] = [-1, -1]
         var stdoutPipe: [Int32] = [-1, -1]
         var stderrPipe: [Int32] = [-1, -1]

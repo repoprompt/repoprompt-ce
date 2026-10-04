@@ -339,7 +339,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             toolTrackingHooks: .noOp,
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
         let initialRequest = ACPRunRequest(

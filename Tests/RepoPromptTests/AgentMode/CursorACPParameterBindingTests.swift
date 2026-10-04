@@ -14,7 +14,15 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(restored.preferredComposeModelRaw, model.rawValue)
         let provider = fixture.provider
         let cli = CursorCLIProvider(headlessProviderFactory: { config, workspace in
-            CursorACPHeadlessAgentProvider(config: config, workspacePath: workspace, providerFactory: { _ in provider })
+            CursorACPHeadlessAgentProvider(
+                config: config, workspacePath: workspace, providerFactory: { _ in provider },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
+                    )
+                }
+            )
         })
         let stream = try await cli.streamMessage(AIMessage(systemPrompt: "", userMessage: "Verify saved effort"), model: model)
         for try await _ in stream {}
@@ -54,7 +62,15 @@ final class CursorACPParameterBindingTests: XCTestCase {
     func testCursorHeadlessRejectsStaleBracketSelectorBeforePrompt() async throws {
         let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
         let provider = fixture.provider
-        let headless = CursorACPHeadlessAgentProvider(config: .init(modelString: "model-b[obsolete-effort=High]"), providerFactory: { _ in provider })
+        let headless = CursorACPHeadlessAgentProvider(
+            config: .init(modelString: "model-b[obsolete-effort=High]"), providerFactory: { _ in provider },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
+            }
+        )
         do {
             let stream = try await headless.streamAgentMessage(AgentMessage(userMessage: "Must not submit"))
             for try await _ in stream {}
@@ -468,7 +484,9 @@ final class CursorACPParameterBindingTests: XCTestCase {
             "ACP_RESET_TRIGGER": trigger
         ]
         environment["ACP_RESET_EFFORT"] = resetEffort
-        if resetModel { environment["ACP_RESET_MODEL"] = "model-b" }
+        if resetModel {
+            environment["ACP_RESET_MODEL"] = "model-b"
+        }
         let fixture = try makeFixture(shape: "modern", extraEnvironment: environment, providerID: .cursor, resumeSessionID: fallback ? "missing-session" : nil)
         _ = try await fixture.controller.bootstrap()
         if reused {
@@ -500,9 +518,13 @@ final class CursorACPParameterBindingTests: XCTestCase {
         )
         do {
             try await fixture.controller.prompt(AgentMessage(userMessage: "Configured turn"), request: request)
-            if shouldReject { XCTFail("Prompt must reject a configuration changed by a later mutation") }
+            if shouldReject {
+                XCTFail("Prompt must reject a configuration changed by a later mutation")
+            }
         } catch {
-            if !shouldReject { throw error }
+            if !shouldReject {
+                throw error
+            }
             XCTAssertTrue(error.localizedDescription.contains("before prompt"), error.localizedDescription)
         }
         await fixture.controller.shutdown()
@@ -552,7 +574,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
                 resumeSessionID: resumeSessionID,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            allowsProviderProcessLaunchForTesting: true
         )
         addTeardownBlock { await controller.shutdown() }
         return Fixture(controller: controller, recordURL: recordURL, provider: provider)

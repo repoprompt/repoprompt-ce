@@ -267,7 +267,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 command = ["diff", "--no-ext-diff", "--no-textconv", "--color=never"]
             default: throw MCPError.invalidParams("unknown git op: \(op)")
             }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + command)
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + command, isProvider: false)
             outputs.append(.object(["repo_root": .string(root.path), "output": .string(output)]))
         }
         return try .object(["op": .string(op), "repositories": .array(outputs)])
@@ -282,10 +282,10 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         let op = args["op"]?.stringValue ?? "list"
         switch op {
         case "list":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"])
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"], isProvider: false)
             return try .object(["op": .string(op), "output": .string(output)])
         case "show":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"])
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"], isProvider: false)
             return try .object(["op": .string(op), "output": .string(output)])
         case "create":
             guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("create requires path") }
@@ -299,7 +299,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             if let branch = args["branch"]?.stringValue { command += ["-b", branch] }
             command.append(url.path)
             if let base = args["base_ref"]?.stringValue { command.append(base) }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: command)
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: command, isProvider: false)
             return try .object(["op": .string(op), "path": .string(url.path), "output": .string(output)])
         case "bind", "select":
             let sessionID = try sessionID(args: args, request: request)
@@ -365,7 +365,8 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             )
             let patch = try await DirectProcess.run(
                 "/usr/bin/git",
-                arguments: ["-C", target.path, "diff", "--no-ext-diff", "--color=never", "\(targetHead)..\(sourceHead)"]
+                arguments: ["-C", target.path, "diff", "--no-ext-diff", "--color=never", "\(targetHead)..\(sourceHead)"],
+                isProvider: false
             )
             return try .object([
                 "op": .string(op),
@@ -395,13 +396,14 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                     targetRoot: targets.targetRoot,
                     gitDirectory: targets.targetGitDirectory,
                     command: ["merge", "--no-ff", "-m", message, operation.sourceHead]
-                )
+                ),
+                isProvider: false
             )
             mergeOperations.removeValue(forKey: operation.id)
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
         case "status":
             if let raw = args["operation_id"]?.stringValue, let id = UUID(uuidString: raw), let operation = mergeOperations[id] {
-                let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", operation.targetRoot.path, "status", "--short", "--branch"])
+                let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", operation.targetRoot.path, "status", "--short", "--branch"], isProvider: false)
                 return try .object(["op": .string(op), "operation_id": .string(id.uuidString), "output": .string(output)])
             }
             let bindings: [Value] = if let sessionID = try? sessionID(args: args, request: request) {
@@ -431,7 +433,8 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                     targetRoot: targets.targetRoot,
                     gitDirectory: targets.targetGitDirectory,
                     command: command
-                )
+                ),
+                isProvider: false
             )
             mergeOperations.removeValue(forKey: operation.id)
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
@@ -630,7 +633,8 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
     private func listedWorktrees(repository: URL) async throws -> [URL] {
         let output = try await DirectProcess.run(
             "/usr/bin/git",
-            arguments: ["-C", repository.path, "worktree", "list", "--porcelain"]
+            arguments: ["-C", repository.path, "worktree", "list", "--porcelain"],
+            isProvider: false
         )
         return output.split(separator: "\n").compactMap { line in
             guard line.hasPrefix("worktree ") else { return nil }
@@ -639,7 +643,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
     }
 
     private func gitLine(at root: URL, arguments: [String]) async throws -> String {
-        try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
+        try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments, isProvider: false)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -1147,9 +1151,14 @@ enum DirectProcess {
         arguments: [String],
         input: Data? = nil,
         environment: [String: String] = [:],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        isProvider: Bool = true,
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) async throws -> String {
-        try await DirectProcessInvocation(
+        if isProvider {
+            try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        }
+        return try await DirectProcessInvocation(
             executable: executable,
             arguments: arguments,
             input: input,

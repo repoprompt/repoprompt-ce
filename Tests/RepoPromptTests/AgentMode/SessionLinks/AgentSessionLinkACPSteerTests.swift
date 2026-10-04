@@ -43,7 +43,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             agentKind: .openCode, modelString: nil, workspacePath: directory.path,
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
         _ = try await controller.bootstrap()
 
         let tabID = UUID()

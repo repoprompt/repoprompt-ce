@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcess
 import XCTest
 
 final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
@@ -21,7 +22,9 @@ final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
         )
 
         do {
-            _ = try await provider.prepare()
+            _ = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                try await provider.prepare()
+            }
             XCTFail("prepare must fail when isolated Codex state preparation fails")
         } catch let AIProviderError.invalidConfiguration(detail) {
             XCTAssertTrue(detail.contains("unable to prepare its isolated Codex state"))

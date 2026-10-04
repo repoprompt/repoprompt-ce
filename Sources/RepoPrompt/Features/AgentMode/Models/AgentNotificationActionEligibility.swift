@@ -211,6 +211,7 @@ enum AgentNotificationActionEligibility {
               preferences.showDetails,
               descriptor.kind == .approval,
               descriptor.approvalKind == .commandExecution,
+              descriptor.supportsPlainApprove,
               let command = descriptor.command
         else {
             return false

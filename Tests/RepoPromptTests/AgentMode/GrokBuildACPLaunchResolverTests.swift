@@ -33,7 +33,7 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
     func testNonGrokBareCommandIsRejected() async throws {
         let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in [:] })
         let config = GrokBuildAgentConfig(commandName: "not-grok", additionalPathHints: [])
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
@@ -44,9 +44,9 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grokd", in: directory)
         let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in [:] })
-        let support = try await resolver.probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: executable.path, additionalPathHints: [])
-        )
+        ) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
@@ -57,9 +57,9 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grok", in: directory, exitStatus: 3)
         let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
-        let support = try await resolver.probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
-        )
+        ) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
@@ -71,9 +71,9 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         let directory = try makeTemporaryDirectory()
         _ = try makeExecutable(named: "grok", in: directory, output: "no agent surface here")
         let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
-        let support = try await resolver.probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
-        )
+        ) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
@@ -96,9 +96,9 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         )
 
         let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": binDirectory.path, "SHELL": "/bin/false"] })
-        let support = try await resolver.probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
-        )
+        ) }
         XCTAssertEqual(support, .supported)
         let launch = try resolver.resolvedLaunch(for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: []))
         XCTAssertTrue(launch.command.hasSuffix("grok-real"), "unexpected canonical command: \(launch.command)")
