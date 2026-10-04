@@ -40,6 +40,18 @@ package final class MCPDomainResponseDeliveryTracker: @unchecked Sendable {
     /// Explicit client cancellation abandons a response-delivery obligation; it
     /// does not certify that the handler or its cleanup has physically settled.
     package func recordAcceptedClientFrame(_ frame: Data, expectedGeneration: UInt64? = nil) {
+        _ = publishClientFrame(frame, expectedGeneration: expectedGeneration) { true }
+    }
+
+    /// Registers delivery debt before the synchronous publisher can expose a frame.
+    /// Return true only for accepted publication; rejection rolls back just this frame's
+    /// changes. The callback runs under the tracker lock and must not suspend, perform
+    /// physical I/O, or reenter this tracker. Delivery and reset cannot interleave with rollback.
+    package func publishClientFrame(
+        _ frame: Data,
+        expectedGeneration: UInt64? = nil,
+        publish: () -> Bool
+    ) -> Bool {
         enum Acceptance {
             case request(String)
             case cancellation(String)
@@ -56,21 +68,36 @@ package final class MCPDomainResponseDeliveryTracker: @unchecked Sendable {
             else { return nil }
             return .cancellation(id)
         }
-        guard !accepted.isEmpty else { return }
-
         let continuations: [CheckedContinuation<Bool, Never>]
         lock.lock()
         guard !isTerminal, expectedGeneration == nil || expectedGeneration == generation else {
             lock.unlock()
-            return
+            return false
         }
+        var rollback: [(id: String, wasPending: Bool)] = []
         for message in accepted {
             switch message {
-            case let .request(id): pendingRequestIDs.insert(id)
-            case let .cancellation(id): pendingRequestIDs.remove(id)
+            case let .request(id):
+                if pendingRequestIDs.insert(id).inserted {
+                    rollback.append((id, false))
+                }
+            case let .cancellation(id):
+                if pendingRequestIDs.remove(id) != nil {
+                    rollback.append((id, true))
+                }
             }
         }
-        if pendingRequestIDs.isEmpty {
+        let wasPublished = publish()
+        if !wasPublished {
+            for change in rollback.reversed() {
+                if change.wasPending {
+                    pendingRequestIDs.insert(change.id)
+                } else {
+                    pendingRequestIDs.remove(change.id)
+                }
+            }
+        }
+        if wasPublished, pendingRequestIDs.isEmpty {
             continuations = waiters
             waiters.removeAll()
         } else {
@@ -78,6 +105,7 @@ package final class MCPDomainResponseDeliveryTracker: @unchecked Sendable {
         }
         lock.unlock()
         continuations.forEach { $0.resume(returning: true) }
+        return wasPublished
     }
 
     package func recordDeliveredServerFrame(_ frame: Data) {

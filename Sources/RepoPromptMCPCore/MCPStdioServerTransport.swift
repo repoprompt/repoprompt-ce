@@ -38,6 +38,15 @@ actor MCPStdioServerTransport: Transport {
     private let writeGateObserver: (@Sendable (WriteGateEvent) -> Void)?
     private let beforeSealReaderTeardownForTesting: (@Sendable () async -> Void)?
     private let readEOFObserverForTesting: (@Sendable () -> Void)?
+    #if DEBUG
+        private var afterClientFramePublicationForTesting: (@Sendable () async -> Void)?
+
+        func debugSetAfterClientFramePublicationForTesting(
+            _ callback: (@Sendable () async -> Void)?
+        ) {
+            afterClientFramePublicationForTesting = callback
+        }
+    #endif
     private var writeOwnerActive = false
     private var writeWaiters: [(token: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var writeSealed: TerminalError?
@@ -100,11 +109,15 @@ actor MCPStdioServerTransport: Transport {
         let initialParentPID = initialParentPID
         let parentPIDProvider = parentPIDProvider
         let deliveryTracker = deliveryTracker
+        let deliveryGeneration = deliveryTracker.currentGeneration
         let terminalState = terminalState
         let readEOFObserverForTesting = readEOFObserverForTesting
         let maximumInboundFrameBytes = maximumInboundFrameBytes
         let maximumBufferedFrames = maximumBufferedFrames
         let readBackpressureStallTimeout = readBackpressureStallTimeout
+        #if DEBUG
+            let afterClientFramePublicationForTesting = afterClientFramePublicationForTesting
+        #endif
         readTask = Task.detached(priority: .userInitiated) { [captured] in
             var pending = Data()
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
@@ -176,9 +189,24 @@ actor MCPStdioServerTransport: Transport {
                         var backpressureDeadline: ContinuousClock.Instant?
                         let clock = ContinuousClock()
                         while !enqueued, !Task.isCancelled {
-                            switch captured.yield(data) {
+                            var yieldResult: AsyncThrowingStream<Data, Error>.Continuation.YieldResult?
+                            _ = deliveryTracker.publishClientFrame(data, expectedGeneration: deliveryGeneration) {
+                                let result = captured.yield(data)
+                                yieldResult = result
+                                if case .enqueued = result {
+                                    return true
+                                }
+                                return false
+                            }
+                            guard let yieldResult else {
+                                terminalState.record(.cancelled, finishing: captured)
+                                return
+                            }
+                            switch yieldResult {
                             case .enqueued:
-                                deliveryTracker.recordAcceptedClientFrame(data)
+                                #if DEBUG
+                                    await afterClientFramePublicationForTesting?()
+                                #endif
                                 enqueued = true
                             case .dropped:
                                 // Buffering-oldest drops only the incoming element. Retain it here and

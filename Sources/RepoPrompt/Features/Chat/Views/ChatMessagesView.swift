@@ -223,13 +223,18 @@ struct ChatMessagesView: View {
     }
 
     private func messagesStack() -> some View {
-        VStack(alignment: .leading, spacing: 20) {
+        // Lazy so only visible rows are materialized; an eager VStack built the entire
+        // transcript every scroll frame, which dominated main-thread layout/CA work.
+        // Read the rendered messages and latest id once so both stay coherent.
+        let messages = renderedMessages
+        let latestMessageID = messages.last?.id
+        return LazyVStack(alignment: .leading, spacing: 20) {
             topSentinel
-            ForEach(renderedMessages) { message in
+            ForEach(messages) { message in
                 MessageBubble(
                     message: message,
                     viewModel: viewModel,
-                    isLatestMessage: message.id == renderedMessages.last?.id,
+                    isLatestMessage: message.id == latestMessageID,
                     actionPolicy: actionPolicy
                 )
                 .id(message.id)
