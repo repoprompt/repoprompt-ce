@@ -2,7 +2,7 @@ import Foundation
 
 /// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
 struct GrokBuildAgentConfig {
-    /// Process-local MCP import isolation shared by every RPCE-launched Grok process.
+    /// Process-local MCP import isolation shared by Grok's ACP and one-shot launch adapters.
     static let importIsolationEnvironment: [String: String] = [
         "GROK_CLAUDE_MCPS_ENABLED": "0",
         "GROK_CURSOR_MCPS_ENABLED": "0"
