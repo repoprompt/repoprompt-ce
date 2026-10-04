@@ -494,6 +494,25 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         }
     }
 
+    func testContextBuilderModelOnlyWritePersistsFallbackAgentOnFreshProfile() async throws {
+        try await withContextBuilderSettings { store, service, _, _ in
+            XCTAssertNil(store.globalAgentModelsProfile().contextBuilderAgentRaw)
+            XCTAssertFalse(store.hasUserSetGlobalContextBuilderAgentDefaults)
+
+            let set = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.model"),
+                "value": .string("sonnet")
+            ])
+            XCTAssertEqual(set.objectValue?["new_value"]?.stringValue, "sonnet")
+
+            let profile = store.globalAgentModelsProfile()
+            XCTAssertEqual(profile.contextBuilderAgentRaw, AgentProviderKind.claudeCode.rawValue)
+            XCTAssertEqual(profile.contextBuilderModelsByAgent?[AgentProviderKind.claudeCode.rawValue], "sonnet")
+            XCTAssertTrue(store.hasUserSetGlobalContextBuilderAgentDefaults)
+        }
+    }
+
     func testContextBuilderModelReadsWritesAndClearsStoredAgentSlot() async throws {
         try await withContextBuilderSettings { store, service, _, _ in
             for (agent, originalModel, updatedModel): (AgentProviderKind, String, String) in [
