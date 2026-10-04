@@ -1363,9 +1363,11 @@ class WindowStatesManager: ObservableObject {
             participants: participants,
             additionalTeardown: {
                 await CodexModelPollingService.shared.suspendForManagedSignOut()
+                await CodexProviderQuotaService.shared.handleSignOutOrAccountChange()
             },
             failedLogoutRecovery: {
                 await CodexModelPollingService.shared.resumeAfterManagedAuthentication()
+                await CodexProviderQuotaService.shared.resumeAfterManagedAuthentication()
             }
         )
     }
@@ -1397,6 +1399,7 @@ class WindowStatesManager: ObservableObject {
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
+        await CodexProviderQuotaService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()

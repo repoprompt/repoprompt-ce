@@ -1856,6 +1856,10 @@ struct CLIProvidersSettingsView: View {
                                 .fontWeight(.semibold)
                             codexAccountSummary(account)
                         }
+
+                        Divider()
+                        // Account-scoped plan usage. Distinct from per-session context usage.
+                        CodexUsageQuotaSection()
                     }
 
                     HStack(spacing: 8) {

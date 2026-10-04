@@ -994,6 +994,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var codexToolSuggestionsEnabled: Bool?
         var codexHookApprovalStrictModeEnabled: Bool?
         var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
+        /// Opt-in, observe-only Codex account usage/quota display. Defaults to off.
+        /// When unset or false, RepoPrompt creates no quota app-server client, process,
+        /// subscription, or polling of any kind.
+        var codexUsageQuotaEnabled: Bool?
         var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         var agentSessionHandoffInstructions: String?
@@ -1017,6 +1021,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             codexToolSuggestionsEnabled: Bool? = nil,
             codexHookApprovalStrictModeEnabled: Bool? = nil,
             codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
+            codexUsageQuotaEnabled: Bool? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
@@ -1039,6 +1044,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.codexToolSuggestionsEnabled = codexToolSuggestionsEnabled
             self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
             self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
+            self.codexUsageQuotaEnabled = codexUsageQuotaEnabled
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
