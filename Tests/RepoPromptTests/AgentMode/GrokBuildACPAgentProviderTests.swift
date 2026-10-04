@@ -19,8 +19,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             modelString: config.modelString,
             includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
             alwaysApproveTools: config.alwaysApproveTools,
-            apiKey: config.apiKey,
-            launchPurpose: config.launchPurpose
+            apiKey: config.apiKey
         )
         let provider = GrokBuildACPAgentProvider(
             config: resolvedConfig,
@@ -82,16 +81,14 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
     }
 
     func testLaunchIsolatesImportedMCPServersWithoutChangingUserDirectories() throws {
-        for purpose in [GrokBuildLaunchPurpose.agentMode, .contextBuilder, .modelDiscovery] {
-            for apiKey in [nil, "xai-test-key-123"] as [String?] {
-                let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: apiKey, launchPurpose: purpose))
-                let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
-                XCTAssertEqual(launch.environment["GROK_CLAUDE_MCPS_ENABLED"], "0", "\(purpose)")
-                XCTAssertEqual(launch.environment["GROK_CURSOR_MCPS_ENABLED"], "0", "\(purpose)")
-                XCTAssertEqual(launch.environment["XAI_API_KEY"], apiKey)
-                XCTAssertNil(launch.environment["HOME"])
-                XCTAssertNil(launch.environment["GROK_HOME"])
-            }
+        for apiKey in [nil, "xai-test-key-123"] as [String?] {
+            let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: apiKey))
+            let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+            XCTAssertEqual(launch.environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
+            XCTAssertEqual(launch.environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+            XCTAssertEqual(launch.environment["XAI_API_KEY"], apiKey)
+            XCTAssertNil(launch.environment["HOME"])
+            XCTAssertNil(launch.environment["GROK_HOME"])
         }
     }
 

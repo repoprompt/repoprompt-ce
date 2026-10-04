@@ -98,12 +98,11 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertEqual(meta?["reasoningEffort"] as? String, "low")
     }
 
-    func testFullAccessIntentReachesLaunchRequest() {
+    func testHeadlessConfigPreservesFullAccessIntent() {
         let config = GrokBuildAgentConfig(alwaysApproveTools: true)
         let provider = GrokBuildACPHeadlessAgentProvider(config: config)
         let requestConfig = provider.test_config
         XCTAssertTrue(requestConfig.alwaysApproveTools)
-        XCTAssertEqual(requestConfig.launchPurpose, .contextBuilder)
     }
 
     func testContextBuilderLaunchIsolatesImportsAndPreservesMCPInjection() async throws {
@@ -118,8 +117,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             config: GrokBuildAgentConfig(commandName: harness.scriptPath, apiKey: "xai-test-key-123"),
             workspacePath: harness.workspace.path,
             providerFactory: { config in
-                XCTAssertEqual(config.launchPurpose, .contextBuilder)
-                return EnvForwardingGrokProvider(
+                EnvForwardingGrokProvider(
                     config: config,
                     extraEnvironment: ["ACP_RECORD_PATH": recordPath],
                     repoPromptMCPConfiguration: mcp

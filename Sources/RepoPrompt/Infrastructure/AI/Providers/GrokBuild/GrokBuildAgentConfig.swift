@@ -1,28 +1,18 @@
 import Foundation
 
-/// Launch-local policy shared by Grok's ACP and one-shot adapters.
-enum GrokBuildLaunchPurpose: Equatable {
-    case agentMode, contextBuilder, modelDiscovery, oneShot
-
-    var environmentOverrides: [String: String] {
-        switch self {
-        case .agentMode, .contextBuilder, .modelDiscovery, .oneShot:
-            [
-                "GROK_CLAUDE_MCPS_ENABLED": "0",
-                "GROK_CURSOR_MCPS_ENABLED": "0"
-            ]
-        }
-    }
-}
-
 /// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
 struct GrokBuildAgentConfig {
+    /// Process-local MCP import isolation shared by every RPCE-launched Grok process.
+    static let importIsolationEnvironment: [String: String] = [
+        "GROK_CLAUDE_MCPS_ENABLED": "0",
+        "GROK_CURSOR_MCPS_ENABLED": "0"
+    ]
+
     let commandName: String
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
     let modelString: String?
     let includeRepoPromptMCPServer: Bool
-    let launchPurpose: GrokBuildLaunchPurpose
     /// Provider-native full-access intent; when true the provider launches
     /// `grok agent --always-approve stdio`. Interactive runs may also carry the
     /// intent via `ACPRunRequest.autoApproveAllToolPermissions`; the provider ORs both.
@@ -41,8 +31,7 @@ struct GrokBuildAgentConfig {
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
         alwaysApproveTools: Bool = false,
-        apiKey: String? = nil,
-        launchPurpose: GrokBuildLaunchPurpose = .agentMode
+        apiKey: String? = nil
     ) {
         self.commandName = commandName
         self.additionalPathHints = additionalPathHints
@@ -51,6 +40,5 @@ struct GrokBuildAgentConfig {
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
         self.alwaysApproveTools = alwaysApproveTools
         self.apiKey = apiKey
-        self.launchPurpose = launchPurpose
     }
 }

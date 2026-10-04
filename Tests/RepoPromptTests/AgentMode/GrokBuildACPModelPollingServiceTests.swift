@@ -37,7 +37,6 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         let resumeIDs = LifecycleRecorder()
         let client = GrokBuildACPControllerModelDiscoveryClient(
             providerFactory: { config in
-                XCTAssertEqual(config.launchPurpose, .modelDiscovery)
                 XCTAssertFalse(config.includeRepoPromptMCPServer)
                 XCTAssertNil(config.apiKey)
                 return fixtureProvider
