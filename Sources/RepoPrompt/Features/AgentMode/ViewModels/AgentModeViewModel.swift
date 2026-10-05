@@ -658,8 +658,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
-        /// Test-only suspension point after async catalog readiness and before Codex's final route fence.
-        var test_agentSessionLinkAfterProviderInputCatalogReadiness: (() async -> Void)?
+        /// Test-only suspension point after async route qualification and before Codex's final route fence.
+        var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -2351,13 +2351,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            ensureAgentSessionLinkProviderInputCatalogReady: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
                 guard let self else { return .unavailable }
-                return await ensureProviderInputCatalogReady(for: session)
+                return await qualifyProviderInputRoute(for: session)
             },
-            hasCurrentAgentSessionLinkProviderInputCatalogRoute: { [weak self] session in
+            hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
-                return agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session)
+                return agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification)
             },
             decorateAgentSessionLinkPrompt: { [weak self] text, session, dispatchID in
                 guard let self else {
@@ -17033,15 +17033,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func waitingInstructionReadinessErrorMessage(
-        _ readiness: ProviderInputCatalogReadiness
+        _ readiness: ProviderInputRouteReadiness
     ) -> String {
         switch readiness {
-        case .timedOut:
-            "RepoPrompt MCP catalog readiness timed out. Your instruction was restored."
         case .unavailable:
-            "RepoPrompt MCP catalog readiness was unavailable. Your instruction was restored."
+            "RepoPrompt MCP route qualification was unavailable. Your instruction was restored."
         case .superseded:
-            "RepoPrompt MCP catalog readiness changed before dispatch. Your instruction was restored."
+            "RepoPrompt MCP route qualification changed before dispatch. Your instruction was restored."
         case .cancelled:
             "The instruction was cancelled before provider dispatch and was restored."
         case .notRequired, .ready:
@@ -17181,8 +17179,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return
             }
 
-            let readiness = await ensureProviderInputCatalogReady(for: session)
-            guard readiness == .ready || readiness == .notRequired else {
+            let readiness = await qualifyProviderInputRoute(for: session)
+            guard readiness.allowsDispatch else {
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
                     tabID: tabID,
@@ -17200,7 +17198,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
-            guard readiness != .ready || agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) else {
+            guard agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) else {
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
                     tabID: tabID,
@@ -17214,7 +17212,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
-                    message: "RepoPrompt MCP catalog routing changed before provider dispatch. Your instruction was restored."
+                    message: "RepoPrompt MCP routing changed before provider dispatch. Your instruction was restored."
                 )
                 return
             }
