@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 
 extension CodeMapArtifactRuntime {
