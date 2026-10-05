@@ -2170,6 +2170,25 @@ final class ClaudeAgentModeCoordinator {
     }
 
     func currentClaudeEffortLevel(for session: AgentTabSession) -> ClaudeCodeEffortLevel {
+        let supported = AgentModelCatalog.supportedClaudeEfforts(
+            forSelectedModelRaw: session.selectedModelRaw,
+            agentKind: session.selectedAgent
+        )
+        let pinned = Self.validatedMCPPinnedEffort(
+            modelRaw: session.selectedModelRaw,
+            agentKind: session.selectedAgent,
+            pinnedEffortRaw: session.selectedReasoningEffortRaw,
+            isMCPOriginated: session.isMCPOriginated
+        )
+        if let pinned {
+            retainClaudeEffort(pinned, for: session)
+            return pinned
+        }
+        if let selected = ClaudeCodeEffortLevel.parse(session.selectedClaudeEffortRaw),
+           supported.contains(selected)
+        {
+            return selected
+        }
         let stored = providerBindingService?.claudeEffortLevel(
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
@@ -2177,13 +2196,24 @@ final class ClaudeAgentModeCoordinator {
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
         )
-        return Self.resolvedMCPPinnedEffort(
+        let selected = Self.resolvedMCPPinnedEffort(
             modelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent,
             pinnedEffortRaw: session.selectedReasoningEffortRaw,
             isMCPOriginated: session.isMCPOriginated,
             stored: stored
         )
+        retainClaudeEffort(selected, for: session)
+        return selected
+    }
+
+    private func retainClaudeEffort(_ effort: ClaudeCodeEffortLevel, for session: AgentTabSession) {
+        // A cold persisted session is only an index projection, not a saveable payload.
+        guard session.activeAgentSessionID == nil || session.hasLoadedPersistedState else { return }
+        guard session.selectedClaudeEffortRaw != effort.rawValue else { return }
+        session.selectedClaudeEffortRaw = effort.rawValue
+        session.isDirty = true
+        hostCapabilities.scheduleSave(session)
     }
 
     static func resolvedMCPPinnedEffort(

@@ -1,5 +1,5 @@
 {
-  "description": "Build-modularization ratchet baselines. App Swift lines above the recorded baseline plus the unchanged 2000-line headroom are advisory, not a failing gate. The Global Code Maps disable port raised the recorded app baseline from 649794 to 649967 (+173). Closed-window Git status shutdown ports fork #57 and is forward-synced with upstream main 4f96429e: measured app source lines increase from 653082 to 653153 (+71). Its recorded advisory baseline is main 649967 plus exactly this change's own 71 lines, or 650038 (advisory reference 652038). Existing upstream drift is not absorbed; headroom and every other ratchet field, including test imports and wrong-way edges, are unchanged. Missing or invalid baseline configuration and all other ratchets remain mandatory.",
+  "description": "Per-conversation Claude effort upstream port: upstream/main recorded app baseline 650075 plus exact own delta 95 = 650170; existing 2000-line advisory headroom is unchanged. Other ratchets, including test imports and wrong-way edges, are unchanged. The recorded upstream app-line drift is not absorbed into this fix. Missing or invalid baseline configuration and all other ratchets remain mandatory.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -24,7 +24,7 @@
     "app_shared_accessor_uses": 1218,
     "app_static_shared_declarations": 89,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 650038,
+    "app_target_swift_lines": 650170,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,

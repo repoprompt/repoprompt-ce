@@ -5994,10 +5994,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     private func createLane(
         _ fixture: Fixture,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        request: AgentSessionLaneCreateRequest
+        request: AgentSessionLaneCreateRequest,
+        workspaceName: String = "Original destination"
     ) async -> AgentSessionLaneCreateReceipt {
         await fixture.bridge.createLane(observerEndpoint: observerEndpoint, request: request) {
-            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID)
+            (windowID: fixture.observer.windowID, workspaceID: fixture.observer.workspaceID, workspaceName: workspaceName)
         }
     }
 
@@ -6075,7 +6076,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             second = await createLane(
                 fixture,
                 observerEndpoint: fixture.observer.domainEndpoint,
-                request: request
+                request: request,
+                workspaceName: "Changed while creating"
             )
             completed.fulfill()
         }
@@ -6084,14 +6086,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(first?.result, .created)
         XCTAssertEqual(first?.sessionID, lane.sessionID)
         XCTAssertEqual(second?.sessionID, lane.sessionID)
+        XCTAssertEqual(first?.workspaceName, "Original destination")
+        XCTAssertEqual(second?.workspaceName, first?.workspaceName)
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
         let replay = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: request
+            request: request,
+            workspaceName: "Changed before replay"
         )
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(replay.workspaceName, first?.workspaceName)
         let conflict = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
@@ -6230,16 +6236,19 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(receipt.result, .creationIncomplete)
         XCTAssertEqual(receipt.reason, .saveFailed)
         XCTAssertEqual(receipt.sessionID, lane.sessionID)
+        XCTAssertEqual(receipt.workspaceName, "Original destination")
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertEqual(inbound.items.count, 0)
         let replay = await createLane(
             fixture,
             observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture)
+            request: laneRequest(fixture),
+            workspaceName: "Changed before tombstone replay"
         )
         XCTAssertEqual(replay.result, .creationIncomplete)
         XCTAssertTrue(replay.duplicate)
         XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(replay.workspaceName, receipt.workspaceName)
         XCTAssertEqual(fixture.host.laneCreationCount, 1, "an incomplete key cannot allocate again")
     }
 
@@ -6416,7 +6425,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let request = laneRequest(fixture, key: "published-hydration-failure")
         let first = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id) }
+            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
         )
         XCTAssertEqual(first.result, .creationIncomplete)
         XCTAssertNotNil(first.sessionID)
@@ -6437,7 +6446,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         window.agentModeViewModel.test_setAfterDurableChildTabCreation(nil)
         let replay = await fixture.bridge.createLane(
             observerEndpoint: fixture.observer.domainEndpoint, request: request,
-            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id) }
+            resolveDestination: { (windowID: window.windowID, workspaceID: destination.id, workspaceName: destination.name) }
         )
         XCTAssertEqual(replay.result, .creationIncomplete)
         XCTAssertEqual(replay.sessionID, first.sessionID)
@@ -6552,7 +6561,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             observerEndpoint: fixture.observer.domainEndpoint,
             request: laneRequest(fixture, key: "create-and-attend", message: "Do the first task")
         ) {
-            (windowID: lane.windowID, workspaceID: lane.workspaceID)
+            (windowID: lane.windowID, workspaceID: lane.workspaceID, workspaceName: "Original destination")
         }
         XCTAssertEqual(created.result, .created)
         XCTAssertEqual(created.firstTask, .delivered)

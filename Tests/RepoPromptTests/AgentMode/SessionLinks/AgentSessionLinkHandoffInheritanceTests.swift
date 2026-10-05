@@ -15,7 +15,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             )
             var events: [String] = []
 
-            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            fixture.viewModel.test_setAgentSessionSaver { session, _, _ in
+                // The source may also persist an adopted default; only the child's save fences inheritance.
+                guard session.id != fixture.sourceSession.activeAgentSessionID else {
+                    return fixture.rootURL.appendingPathComponent("source-session.json")
+                }
                 XCTAssertEqual(
                     fixture.window.promptManager.activeComposeTabID,
                     fixture.sourceTabID,
