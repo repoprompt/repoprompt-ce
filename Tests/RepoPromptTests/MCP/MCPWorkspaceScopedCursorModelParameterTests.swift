@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
+import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -7,6 +9,7 @@ import XCTest
 final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
     override func setUp() {
         super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
             ACPDiscoveredSessionModels(

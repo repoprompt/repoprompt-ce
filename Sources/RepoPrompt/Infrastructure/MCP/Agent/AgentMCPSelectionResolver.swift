@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 // SEARCH-HELPER: model_id, compound identifier, task label, agent+model resolution, MCP parsing, global role defaults
 // Related:

@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  WindowStateManager.swift
 //  RepoPrompt

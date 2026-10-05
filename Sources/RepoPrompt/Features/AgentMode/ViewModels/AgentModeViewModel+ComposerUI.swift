@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
     func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {

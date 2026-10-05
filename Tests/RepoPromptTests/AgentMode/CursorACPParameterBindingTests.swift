@@ -1,8 +1,14 @@
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class CursorACPParameterBindingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testPersistedCursorOracleAndChatOverrideReachesRealHeadlessACPRequests() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }

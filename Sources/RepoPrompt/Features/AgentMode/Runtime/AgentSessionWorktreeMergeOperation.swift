@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 /// Persisted, compact Agent-session metadata for a worktree merge workflow.
 ///

@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
 
 #if !DEBUG
     struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}

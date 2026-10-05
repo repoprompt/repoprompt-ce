@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 /// Build-modularization P0.6 goldens: runtime identities that a module move must not change.
@@ -8,6 +9,17 @@ import XCTest
 /// "P0.6 compatibility inventory". When a slice moves one of these types, move the matching test
 /// with it and keep the literals unchanged.
 final class ModularizationCompatibilityGoldenTests: XCTestCase {
+    func testSettingsProviderIdentitiesMatchAppProviderMappings() throws {
+        XCTAssertEqual(
+            Set(SettingsAgentKind.allCases.map(\.rawValue)),
+            Set(AgentProviderKind.allCases.map(\.rawValue))
+        )
+        for agent in AgentProviderKind.allCases {
+            let settingsIdentity = try XCTUnwrap(SettingsAgentKind(rawValue: agent.rawValue))
+            XCTAssertEqual(settingsIdentity.acpProviderID, agent.acpProviderID)
+        }
+    }
+
     // MARK: - Reflection-based sort key
 
     /// `automaticSelectionIssuePrecedes` orders issues by `String(reflecting:)`, so the key text

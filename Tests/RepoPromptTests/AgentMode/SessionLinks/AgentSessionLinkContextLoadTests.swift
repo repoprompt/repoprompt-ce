@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// The link snapshot's `context` load is the usage the target's context ring already shows, for the
@@ -9,6 +10,11 @@ import XCTest
 /// live usage report produced. Everything else is unknown (`nil`).
 @MainActor
 final class AgentSessionLinkContextLoadTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private func makeCandidate(tabID: UUID) -> AgentSessionLinkEndpointCandidate {
         AgentSessionLinkEndpointCandidate(
             windowID: 1,

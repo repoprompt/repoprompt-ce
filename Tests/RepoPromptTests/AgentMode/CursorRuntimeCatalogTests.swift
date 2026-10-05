@@ -1,9 +1,15 @@
 import AppKit
+import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class CursorRuntimeCatalogTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     override func tearDown() {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         super.tearDown()

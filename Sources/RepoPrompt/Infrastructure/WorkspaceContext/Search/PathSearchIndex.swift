@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptC
+import RepoPromptFileSystem
 import RepoPromptWorkspaceCore
 
 /// Define size_t for C interop

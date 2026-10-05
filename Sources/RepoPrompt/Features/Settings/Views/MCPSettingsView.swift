@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptSettingsCore
 import SwiftUI
 
 struct MCPSettingsView: View {

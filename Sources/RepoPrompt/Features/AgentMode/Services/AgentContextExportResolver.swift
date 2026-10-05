@@ -1,7 +1,9 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 
 struct AgentContextExportSource: Equatable {

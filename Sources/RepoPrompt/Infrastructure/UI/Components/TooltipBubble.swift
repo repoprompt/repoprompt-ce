@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  TooltipBubble.swift
 //  RepoPrompt

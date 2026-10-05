@@ -1,6 +1,7 @@
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -20,13 +21,13 @@ import XCTest
                 .appendingPathComponent("WorkspaceEphemeralPersistenceTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -131,7 +132,7 @@ import XCTest
             await manager.awaitInitialized()
             await manager.setWorkspaceLibraryMembership(workspace, saved: true)
             let url = manager.workspaceFileURL(for: workspace)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
             let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
             XCTAssertEqual(saved.isSavedWorkspace, true)
             XCTAssertFalse(saved.isTemporaryWorkspace)

@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  KeyboardShortcutsSettingsView.swift
 //  RepoPrompt

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 /// Runner-level harness for the cross-window oversight prompt supplement.

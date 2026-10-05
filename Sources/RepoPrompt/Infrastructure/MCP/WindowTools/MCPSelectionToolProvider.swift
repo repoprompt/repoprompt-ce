@@ -2,7 +2,9 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 @MainActor
 final class MCPSelectionToolProvider: MCPAppToolProviding {

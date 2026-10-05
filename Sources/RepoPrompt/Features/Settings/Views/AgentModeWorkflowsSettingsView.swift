@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Settings-native management surface for Agent Mode workflow prompts.

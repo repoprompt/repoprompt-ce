@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 final class WorkspaceGitignorePolicyIdentityTests: XCTestCase {

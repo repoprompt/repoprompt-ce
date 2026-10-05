@@ -9,6 +9,14 @@ included:
   - Sources/RepoPromptMCP
   - Sources/RepoPromptMCPCore
   - Sources/RepoPromptShared
+  - Sources/RepoPromptFileSystem
+  - Sources/RepoPromptVCS
+  - Sources/RepoPromptPersistence
+  - Sources/RepoPromptSettingsCore
+  - Tests/RepoPromptFileSystemTests
+  - Tests/RepoPromptVCSTests
+  - Tests/RepoPromptPersistenceTests
+  - Tests/RepoPromptSettingsCoreTests
   - Tests/RepoPromptTests
   - Tests/RepoPromptMCPCoreTests
   - Tests/RepoPromptTestSupport

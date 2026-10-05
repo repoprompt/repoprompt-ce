@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 private let issue863GateWatchdogNanoseconds: UInt64 = 5_000_000_000

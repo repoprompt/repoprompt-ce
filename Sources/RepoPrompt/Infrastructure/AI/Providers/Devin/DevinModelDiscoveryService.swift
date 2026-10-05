@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 actor DevinModelDiscoveryService {
     static let shared = DevinModelDiscoveryService()

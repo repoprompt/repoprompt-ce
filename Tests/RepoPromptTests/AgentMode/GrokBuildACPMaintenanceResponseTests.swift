@@ -1,9 +1,11 @@
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
     override func setUp() {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         super.setUp()
         AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
     }

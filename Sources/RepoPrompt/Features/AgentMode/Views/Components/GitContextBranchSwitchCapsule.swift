@@ -1,3 +1,4 @@
+import RepoPromptVCS
 import SwiftUI
 
 struct AgentWorkspaceBranchSwitchActions {

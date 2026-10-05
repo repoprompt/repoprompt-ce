@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
     struct MCPModelParameterSelectionStagingRollback {

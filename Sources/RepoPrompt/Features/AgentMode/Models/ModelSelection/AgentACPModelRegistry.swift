@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 final class AgentACPModelRegistry {
     static let shared = AgentACPModelRegistry()

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptPersistence
+import RepoPromptVCS
 
 struct ValidatedGitBlobSourceSnapshot {
     let rawBytes: Data

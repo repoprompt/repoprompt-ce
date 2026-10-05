@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 
 /// Store-local identity for a root whose watcher and catalog are prepared before

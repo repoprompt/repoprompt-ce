@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import SwiftUI
 

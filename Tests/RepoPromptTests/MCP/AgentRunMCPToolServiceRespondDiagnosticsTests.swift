@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

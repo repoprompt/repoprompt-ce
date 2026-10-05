@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 #if DEBUG
     import Darwin
     import Foundation

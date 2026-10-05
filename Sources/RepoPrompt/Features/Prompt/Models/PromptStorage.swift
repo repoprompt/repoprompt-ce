@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  PromptStorage.swift
 //  RepoPrompt

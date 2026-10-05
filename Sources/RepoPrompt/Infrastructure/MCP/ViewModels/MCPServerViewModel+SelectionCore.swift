@@ -1,6 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {

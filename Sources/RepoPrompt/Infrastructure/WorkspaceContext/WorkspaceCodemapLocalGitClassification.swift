@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
 
 enum WorkspaceCodemapLocalGitClassification: Equatable {
     case definitelyNonGit(WorkspaceCodemapNonGitFilesystemProof)

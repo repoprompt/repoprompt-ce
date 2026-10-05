@@ -1,13 +1,6 @@
 import Foundation
 import RepoPromptProcess
-
-enum ACPProviderID: String, Codable, Hashable {
-    case openCode
-    case cursor
-    case grokBuild
-    case antigravity
-    case devin
-}
+import RepoPromptSettingsCore
 
 enum ACPSupportResult: Equatable {
     case supported

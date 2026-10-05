@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 struct GitTargetEvidencePathPolicy: Equatable {
     let maximumPathBytes: Int

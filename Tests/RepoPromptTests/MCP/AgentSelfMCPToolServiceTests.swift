@@ -6,6 +6,64 @@ import XCTest
 
 @MainActor
 final class AgentSelfMCPToolServiceTests: XCTestCase {
+    func testRenamedToolDispatchesContextToCallingSession() async throws {
+        let fixture = Fixture()
+        let registry = MCPDomainToolRegistry()
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "self_compact"))
+        let scope = MCPDomainToolRegistrationScope.window(id: fixture.window.windowID)
+        try await registry.register(registrationID: .init(), scope: scope, bindings: [
+            MCPDomainToolBinding(definition: definition) { args in
+                try await .object(fixture.execute(args))
+            }
+        ])
+        let candidate = await registry.resolve(toolName: ServerNetworkManager.canonicalToolName(for: "self_compact"), scope: scope)
+        let tool = try XCTUnwrap(candidate)
+        let result = try await tool.binding(["op": .string("context")])
+        XCTAssertEqual(result.objectValue?["result"], .string("ok"))
+        XCTAssertEqual(fixture.reads, 1)
+        let legacy = await registry.resolve(toolName: ServerNetworkManager.canonicalToolName(for: "agent_self"), scope: scope)
+        XCTAssertNil(legacy)
+    }
+
+    func testRenamedToolKeepsSavedAvailability() async throws {
+        let suite = "self-compact-availability-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for saved in [["read_file"], ["agent_self", "read_file"], ["self_compact", "read_file"], ["agent_self", "self_compact", "read_file"]] {
+            defaults.set(saved, forKey: "mcp.disabledTools")
+            let store = ToolAvailabilityStore(defaults: defaults)
+            let wasEnabled = saved == ["read_file"]
+            XCTAssertEqual(store.isEnabled("self_compact"), wasEnabled)
+            XCTAssertEqual(ToolAvailabilityStore(defaults: defaults).isEnabled("self_compact"), wasEnabled)
+            XCTAssertFalse(store.disabledTools.contains("agent_self"))
+            XCTAssertEqual(
+                Set(defaults.stringArray(forKey: "mcp.disabledTools") ?? []),
+                wasEnabled ? ["read_file"] : ["self_compact", "read_file"]
+            )
+            await store.toggle("self_compact", enabled: !wasEnabled)
+            XCTAssertEqual(ToolAvailabilityStore(defaults: defaults).isEnabled("self_compact"), !wasEnabled)
+            XCTAssertEqual(store.isEnabled("read_file"), false)
+        }
+    }
+
+    func testDisabledSelfToolCannotReadOrSchedule() async {
+        let fixture = Fixture()
+        fixture.enabled = false
+        for args: [String: Value] in [
+            ["op": .string("context")],
+            ["op": .string("compact"), "note": .string("continue"), "idempotency_key": .string("key")]
+        ] {
+            do {
+                _ = try await fixture.execute(args)
+                XCTFail("Disabled self_compact must not enter the calling session")
+            } catch let error as MCPError {
+                XCTAssertEqual(error, .invalidParams("self_compact is disabled."))
+            } catch { XCTFail("\(error)") }
+        }
+        XCTAssertEqual(fixture.reads, 0)
+        XCTAssertEqual(fixture.schedules, 0)
+    }
+
     func testContextReturnsExactLoadAndStatusOrNull() async throws {
         let fixture = Fixture()
         let load = try XCTUnwrap(DomainAgentSessionContextLoad(
@@ -189,6 +247,7 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
         var reads = 0
         var schedules = 0
         var forcedAdmission: AgentSelfMCPToolService.Admission?
+        var enabled = true
 
         init() {
             endpoint = .init(
@@ -212,7 +271,9 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                     return self.snapshot
                 },
                 scheduleCompact: { _, _, _, note, key in
-                    if let forcedAdmission = self.forcedAdmission { return forcedAdmission }
+                    if let forcedAdmission = self.forcedAdmission {
+                        return forcedAdmission
+                    }
                     var state = self.state
                     let reservation = state.reserve(note: note, idempotencyKey: key)
                     switch reservation {
@@ -226,7 +287,8 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                     case .alreadyPending: return .blocked(reason: "compact_already_pending")
                     case .invalidNote, .invalidIdempotencyKey: return .blocked(reason: "invalid")
                     }
-                }
+                },
+                isToolEnabled: { self.enabled }
             )
             let result = try await service.execute(args: args)
             return try XCTUnwrap(result.objectValue)

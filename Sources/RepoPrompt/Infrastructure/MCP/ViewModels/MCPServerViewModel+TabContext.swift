@@ -4,6 +4,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptShared
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 #if DEBUG

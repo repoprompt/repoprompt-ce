@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct AgentSessionIndexEntry: Identifiable, Equatable {
     let id: UUID

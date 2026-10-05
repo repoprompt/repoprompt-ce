@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // File: RepoPrompt/Models/PathCharPolicy.swift
 import Foundation
 

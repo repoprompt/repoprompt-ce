@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 
 /// App-global composition owner for bundled router adapters and their credential/readiness state.
 final class AgentTaskRouterRuntime: ObservableObject {

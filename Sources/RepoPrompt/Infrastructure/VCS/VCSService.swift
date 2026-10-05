@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 // MARK: - VCS Resolved Repo

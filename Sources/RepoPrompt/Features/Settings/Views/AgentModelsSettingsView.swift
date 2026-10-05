@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentModelsSettingsView.swift
 //  RepoPrompt

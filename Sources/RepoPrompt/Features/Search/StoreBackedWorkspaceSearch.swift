@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 

@@ -3,6 +3,7 @@ import Foundation
 import os
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 actor ACPAgentSessionController {
     struct RequestTimeouts {

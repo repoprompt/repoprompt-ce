@@ -1,5 +1,5 @@
 {
-  "description": "Global Code Maps disable upstream port: upstream/main recorded app baseline 649794 plus exact own delta 173 = 649967; existing 2000-line advisory headroom is unchanged. Other ratchets, including test imports and wrong-way edges, are unchanged. The recorded upstream app-line drift is not absorbed into this fix.",
+  "description": "Per-conversation Claude effort upstream port: upstream/main recorded app baseline 650075 plus exact own delta 95 = 650170; existing 2000-line advisory headroom is unchanged. Other ratchets, including test imports and wrong-way edges, are unchanged. The recorded upstream app-line drift is not absorbed into this fix. The untracked-stat cache adds its exact 98 app-source lines, raising 650170 to 650268 with no additional headroom. Missing or invalid baseline configuration and all other ratchets remain mandatory. Approved self_compact plain rename and saved-toggle carry-over add exactly 11 app lines (650268 to 650279); all other metrics and the existing advisory/headroom policy are unchanged. Identical FSEvents replay fix adds exactly 10 app-source lines (650279 to 650289); all other metrics and the existing advisory/headroom policy are unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -17,18 +17,18 @@
   ],
   "metrics": {
     "app_components": 69,
-    "app_files_over_2000_lines": 53,
-    "app_files_over_5000_lines": 17,
+    "app_files_over_2000_lines": 47,
+    "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
     "app_share_permille": 868,
     "app_shared_accessor_uses": 1218,
-    "app_static_shared_declarations": 94,
+    "app_static_shared_declarations": 89,
     "app_target_swift_files": 1126,
-    "app_target_swift_lines": 649967,
+    "app_target_swift_lines": 650289,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1079,
     "first_party_swift_lines": 747202,
     "tests_sleep_calls": 59,
-    "tests_testable_import_app_files": 333
+    "tests_testable_import_app_files": 326
   }
 }

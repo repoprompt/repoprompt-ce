@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPersistence
 
 #if DEBUG
     enum CodemapGraphStatusDebugSupport {

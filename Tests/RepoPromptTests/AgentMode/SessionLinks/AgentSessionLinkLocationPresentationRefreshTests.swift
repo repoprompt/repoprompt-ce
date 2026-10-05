@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// Presentation-only projection refresh exercised through execution-location invalidation.
@@ -161,6 +162,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        GlobalSettingsStore.shared.installApplicationEventBridge()
         previousExactSink = AgentSessionLinkLocationInvalidationSink.refreshExactTargets
         previousObservedSink = AgentSessionLinkLocationInvalidationSink.refreshObservedTargets
     }

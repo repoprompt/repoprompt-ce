@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 // MARK: - Headless Mode
 

@@ -1,8 +1,10 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF

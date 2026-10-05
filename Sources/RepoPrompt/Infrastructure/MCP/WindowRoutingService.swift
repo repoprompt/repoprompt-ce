@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 import SwiftUI

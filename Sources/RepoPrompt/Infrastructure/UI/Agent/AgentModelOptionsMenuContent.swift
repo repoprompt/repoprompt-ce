@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 enum AgentModelSelectionWarningVisuals {

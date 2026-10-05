@@ -49,6 +49,10 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptProcess",
     "RepoPromptInstrumentation",
     "RepoPromptSecureStorage",
+    "RepoPromptFileSystem",
+    "RepoPromptVCS",
+    "RepoPromptPersistence",
+    "RepoPromptSettingsCore",
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
@@ -74,12 +78,20 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
     .enableUpcomingFeature("BareSlashRegexLiterals")
 ]
 
+var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
     "RepoPromptFoundation",
     "RepoPromptProcess",
     "RepoPromptInstrumentation",
     "RepoPromptSecureStorage",
+    "RepoPromptFileSystem",
+    "RepoPromptVCS",
+    "RepoPromptPersistence",
+    "RepoPromptSettingsCore",
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptMCPCore",
@@ -101,6 +113,7 @@ if sentryEnabled {
     let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
     repoPromptAppDependencies.append(sentryDependency)
     repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
+    repoPromptSettingsCoreSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
     repoPromptTestDependencies.append(sentryDependency)
     repoPromptTestSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
 }
@@ -156,6 +169,54 @@ let package = Package(
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug))
             ]
+        ),
+        .testTarget(
+            name: "RepoPromptFileSystemTests",
+            dependencies: ["RepoPromptFileSystem"],
+            path: "Tests/RepoPromptFileSystemTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptFileSystem",
+            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptWorkspaceCore", "RepoPromptC", .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"), .product(name: "Cuchardet", package: "UniversalCharsetDetection")],
+            path: "Sources/RepoPromptFileSystem",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptVCSTests",
+            dependencies: ["RepoPromptVCS"],
+            path: "Tests/RepoPromptVCSTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptVCS",
+            dependencies: ["RepoPromptFoundation", "RepoPromptProcess", "RepoPromptInstrumentation", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptWorkspaceCore"],
+            path: "Sources/RepoPromptVCS",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptPersistenceTests",
+            dependencies: ["RepoPromptPersistence", "RepoPromptCodeMapCore", "RepoPromptFoundation", "RepoPromptFileSystem", "RepoPromptVCS"],
+            path: "Tests/RepoPromptPersistenceTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptPersistence",
+            dependencies: ["RepoPromptCodeMapCore", "RepoPromptFileSystem", "RepoPromptVCS", "RepoPromptShared"],
+            path: "Sources/RepoPromptPersistence",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptSettingsCoreTests",
+            dependencies: ["RepoPromptSettingsCore"],
+            path: "Tests/RepoPromptSettingsCoreTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptSettingsCore",
+            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptShared"],
+            path: "Sources/RepoPromptSettingsCore",
+            swiftSettings: repoPromptSettingsCoreSwiftSettings
         ),
         .target(
             name: "RepoPromptSecureStorage",

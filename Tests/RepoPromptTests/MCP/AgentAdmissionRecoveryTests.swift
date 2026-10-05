@@ -1,6 +1,7 @@
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -216,7 +217,7 @@ import XCTest
                 .appendingPathComponent("AgentAdmissionRecoveryTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -226,7 +227,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             runtimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -679,7 +680,9 @@ import XCTest
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
-                if id == workspaceID { awaitedOwnSaves.count = count }
+                if id == workspaceID {
+                    awaitedOwnSaves.count = count
+                }
             }
 
             let createdTab = await fixture.prompt.createBackgroundComposeTab(strategy: .blank, name: "Agent target")
@@ -836,7 +839,9 @@ import XCTest
             let gate = await installFirstAuthoritySaveGate(fixture)
             let awaitedOwnSaves = Observation()
             fixture.manager.agentAdmissionWillAwaitOwnSavesHandlerForTesting = { id, count in
-                if id == workspaceID { awaitedOwnSaves.count = count }
+                if id == workspaceID {
+                    awaitedOwnSaves.count = count
+                }
             }
             let createdTab = await fixture.prompt.createBackgroundComposeTab(strategy: .blank, name: "Cancelled start")
             let backgroundTab = try XCTUnwrap(createdTab)
@@ -2540,13 +2545,13 @@ import XCTest
                 sessionID: sessionID,
                 replacementTabID: UUID()
             )
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.setAtomicWriteGateForTesting {
+            await WorkspaceDiskWriterComposition.processWriter.setAtomicWriteGateForTesting {
                 try? FileManager.default.removeItem(at: fileURL)
                 try? FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
             }
 
             let outcome = await manager.recoverProvisionalAgentAdmission(identity)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.setAtomicWriteGateForTesting(nil)
+            await WorkspaceDiskWriterComposition.processWriter.setAtomicWriteGateForTesting(nil)
 
             XCTAssertEqual(outcome, .failed(.durabilityUncertain))
             XCTAssertEqual(manager.workspace(withID: workspace.id), managerBefore)

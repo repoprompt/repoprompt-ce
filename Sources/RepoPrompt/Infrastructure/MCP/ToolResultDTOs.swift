@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
 
 /// Namespace for MCP Tool result DTOs.

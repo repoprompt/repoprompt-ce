@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptFileSystem
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 

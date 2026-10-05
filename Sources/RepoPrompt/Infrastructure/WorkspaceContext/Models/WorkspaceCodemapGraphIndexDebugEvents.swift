@@ -1,3 +1,4 @@
+import RepoPromptPersistence
 #if DEBUG
     import Foundation
 

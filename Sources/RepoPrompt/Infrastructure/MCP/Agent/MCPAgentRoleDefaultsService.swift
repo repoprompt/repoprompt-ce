@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // MARK: - MCP Agent Role Defaults Storage
 

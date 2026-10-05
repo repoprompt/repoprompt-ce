@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptShared
 
 // MARK: - Cooperative Work Budgets

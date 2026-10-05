@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptRegexCore
 import RepoPromptShared

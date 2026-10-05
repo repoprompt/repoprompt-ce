@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // MARK: - Agent Session Error
 
@@ -171,7 +172,7 @@ struct AgentSession: Codable, Identifiable {
     /// Model used for this session (e.g., "sonnet", "opus", "codexMedium")
     var agentModel: String?
 
-    /// User-selected reasoning effort (Codex-only)
+    /// User-selected effort for this conversation (Codex or Claude-compatible providers).
     var agentReasoningEffort: String?
 
     /// Explicit provider-advertised ACP model parameters, stored independently from the base model.

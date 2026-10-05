@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptPersistence
 
 struct WorkspaceCodemapGraphSizeAccounting: Hashable {
     static let zero = Self(nodes: 0, postings: 0, edges: 0, bytes: 0)

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 
 enum StableUserInteractionIdentity {
     static func uuid(from seed: String) -> UUID {

@@ -99,6 +99,105 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNotNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID])
     }
 
+    func testRoutineAndAttentionWakeCarryVerifiedParkedNoteBeforeUpdatesOnce() async throws {
+        for basis in ["routine", "attention", "manual"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = basis == "routine"
+            let waiting = Task { @MainActor in
+                try await fixture.viewModel.waitForNextUserInstruction(
+                    tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5
+                )
+            }
+            try await AsyncTestWait.waitUntil("instruction continuation installed") {
+                fixture.session.instructionContinuation != nil
+            }
+            let noteID = try installVerifiedParkedNote(fixture)
+            XCTAssertFalse(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
+            XCTAssertFalse(fixture.viewModel.agentSessionLinkPeriodicPreparationIsUnblocked(fixture.session))
+            let attention = Self.attentionRequest(0)
+            try publishLane(
+                fixture, linkSetRevision: 1, queueRevision: 1,
+                targetIndices: basis == "attention" ? [] : [0], laneIndices: [0],
+                attentionRequests: basis == "attention" ? [attention] : []
+            )
+            if basis == "manual" {
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            }
+            let response = try await waiting.value
+            guard case let .laneUpdateAutoWake(wakeID) = response.origin else {
+                return XCTFail("expected an event-driven wake")
+            }
+            let text = try XCTUnwrap(response.text)
+            XCTAssertTrue(text.hasPrefix(AgentSelfCompactNoteEnvelope.frame("continue safely") + "\n\n"))
+            XCTAssertTrue(text.contains("<repoprompt_session_oversight_status_changes"))
+            XCTAssertEqual(text.components(separatedBy: "<note>").count - 1, 1)
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.requestID, noteID.requestID)
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .prepended)
+            XCTAssertEqual(fixture.session.selfCompactState.latest?.completionVerified, true)
+            XCTAssertNil(fixture.session.selfCompactState.active)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 1)
+            let next = AgentSelfCompactParkedPrefix.prepare("next", session: fixture.session, scheduleSave: {})
+            XCTAssertEqual(next.text, "next")
+            XCTAssertNil(next.dispatchID)
+        }
+    }
+
+    func testNotificationWakeRetainsUnverifiedAttemptedAndForeignOwnerCompactGates() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        _ = try installVerifiedParkedNote(fixture)
+        let verified = fixture.session.selfCompactState
+        for phase in AgentSelfCompactAttempt.Phase.allCases where phase != .parked {
+            var state = verified
+            state.active?.phase = phase
+            fixture.session.selfCompactState = state
+            XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session), phase.rawValue)
+        }
+        for invalid in 0 ..< 4 {
+            var state = verified
+            switch invalid {
+            case 0: state.active?.acpCompletionUnverified = true
+            case 1: state.active?.compactTurnSucceeded = nil
+            case 2: state.active?.noteDispatchStarted = true
+            default: state.active = AgentSelfCompactAttempt(idempotencyKey: "ownerless", note: "note", phase: .parked)
+            }
+            fixture.session.selfCompactState = state
+            XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
+        }
+        // A valid-looking parked record belonging to another binding never opens admission.
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let foreign = AgentSelfCompactOwner(
+            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID, persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+            runID: UUID(), runAttemptID: UUID()
+        )
+        var attempt = try XCTUnwrap(verified.active)
+        attempt = AgentSelfCompactAttempt(idempotencyKey: "foreign", note: attempt.note, owner: foreign, phase: .parked)
+        attempt.compactTurnSucceeded = true
+        fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+        XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
+    }
+
+    private func installVerifiedParkedNote(_ fixture: Fixture) throws -> AgentSelfCompactionDispatchID {
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let owner = try AgentSelfCompactOwner(
+            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID,
+            persistentBindingGeneration: XCTUnwrap(endpoint.persistentBindingGeneration),
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+            runID: XCTUnwrap(fixture.session.runID), runAttemptID: UUID()
+        )
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: "continue safely", idempotencyKey: "parked-wake", owner: owner)
+        state.active?.compactTurnSucceeded = true
+        state.active?.phase = .parked
+        fixture.session.selfCompactState = state
+        return try AgentSelfCompactionDispatchID(requestID: XCTUnwrap(state.active?.id), stage: .note)
+    }
+
     // MARK: - Dispatch identity
 
     /// The wake ID survives a round trip through the opaque dispatch ID.
@@ -4648,13 +4747,24 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let workspaceManager: WorkspaceManagerViewModel
     }
 
-    private func makeFixture(catalogReady: Bool = true) throws -> Fixture {
+    private func makeFixture(catalogReady: Bool = true, fenceProviderLaunch: Bool = false) throws -> Fixture {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acpProviderFactory: { _, _ in
+                AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: "/usr/bin/false")
+            },
+            acpControllerFactory: { provider, request in
+                if fenceProviderLaunch {
+                    XCTFail("Parked-note wake fixtures must not launch even a fake ACP process")
+                    throw CancellationError()
+                }
+                return try ACPAgentSessionController(provider: provider, runRequest: request)
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }

@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptVCS
 
 enum WorkspaceRootSeedServingPlanningOutcome {
     case planned(

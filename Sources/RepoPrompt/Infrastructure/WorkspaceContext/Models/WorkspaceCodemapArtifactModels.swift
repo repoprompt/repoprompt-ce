@@ -1,5 +1,7 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptPersistence
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 /// Catalog paths retain the user's loaded spelling; capabilities use physical root paths.

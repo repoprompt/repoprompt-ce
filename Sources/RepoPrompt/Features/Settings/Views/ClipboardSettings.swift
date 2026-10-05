@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // File: RepoPrompt/Views/Settings/ClipboardSettings.swift
 
 import SwiftUI

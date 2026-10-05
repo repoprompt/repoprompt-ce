@@ -1,6 +1,9 @@
 import CryptoKit
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
 
 struct CodeMapSourceValidationToken: Hashable {
     let fingerprint: FileContentFingerprint

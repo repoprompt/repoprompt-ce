@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import RepoPromptShared
+import RepoPromptVCS
 
 /// Owns one immutable launch configuration. Releasing the lease removes only
 /// the unique file created for that launch; stable wrapper configs are not leased.

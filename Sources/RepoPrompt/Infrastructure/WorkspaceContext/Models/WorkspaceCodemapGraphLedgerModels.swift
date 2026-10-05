@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptPersistence
 import RepoPromptWorkspaceCore
 
 enum WorkspaceCodemapGraphTerminalArtifactReason: Hashable {

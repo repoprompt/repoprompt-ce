@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptShared
 
 /// Centralised helpers for installing the RepoPrompt MCP server

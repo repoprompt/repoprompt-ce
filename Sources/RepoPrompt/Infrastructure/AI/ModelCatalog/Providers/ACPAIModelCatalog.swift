@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct ACPDynamicModelRecord: Codable, Hashable {
     let rawValue: String

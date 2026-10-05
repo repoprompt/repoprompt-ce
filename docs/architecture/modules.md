@@ -13,6 +13,10 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPromptFoundation`, `RepoPromptInstrumentation` | Reusable substrate and diagnostic sink contracts | Never depend on app |
 | `RepoPromptProcess` | Headless process and CLI mechanics (no `Bundle.main` or `UserDefaults.standard`) | Foundation and Shared only |
 | `RepoPromptSecureStorage` | App-only secure storage | Never linked into MCP CLI |
+| `RepoPromptFileSystem` | File reads, FSEvents, ignore matching/compiler, catalog values, injected disk writer | No VCS or app dependency; repository authority and app defaults are supplied by adapters |
+| `RepoPromptVCS` | Repository/worktree query values and resolution, GitDiff core, process/clone substrate | FileSystem and lower substrate; intact GitService and app authority orchestration remain app-owned |
+| `RepoPromptPersistence` | CodeMap artifacts/catalog/manifests/leases and durable artifact storage | FileSystem, VCS values, CodeMapCore, Shared; no workspace capability or app source-provenance dependency |
+| `RepoPromptSettingsCore` | Persisted settings values/document/file store, settings store and global-ignore facet | App-only deployment, with typed events; app policy and notifications remain composition-owned |
 | `RepoPromptC`, `CSwiftPCRE2`, `TreeSitterScannerSupport`, `Sparkle` | C/binary support | Leaf support targets |
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 
@@ -20,4 +24,6 @@ Each extraction adds its production and test rows to the catalog, records its fo
 
 `RepoPromptDomainRuntime/ProviderContent` owns app-free prompt assembly, attachment values and managed storage, image previews, ACP/custom-OpenAI content encoding, and provider result/cleanup values. The app retains model policy, SDK-specific encoders, provider networking, controllers, UI, and composition. Existing app aliases preserve source compatibility; no new target dependency is needed. The Oracle image feature's app-line cost is offset by this extraction, so the combined change fits the existing ceiling without changing the ratchet baseline or headroom.
 
-The line ceiling is the recorded `app_target_swift_lines` baseline plus a **fixed 2,000-line headroom**. Move PRs lower the baseline by their moved lines; ordinary feature additions consume headroom rather than raising the ceiling. The `app_files_over_2000_lines` and `tests_testable_import_app_files` ratchets are non-increasing. Index and type-check budgets are separately build-produced CI gates.
+`app_target_swift_lines` is an advisory reference as of 2026-10-03; report the recorded baseline and unchanged 2,000-line headroom, without treating app line count as a PR blocker or changing its numeric policy. The `app_files_over_2000_lines` and `tests_testable_import_app_files` ratchets remain non-increasing. Index and type-check budgets are separately build-produced CI gates.
+
+Platform adapters preserve the existing app initialization and authorization owners. FileSystem does not discover repository authority, persistence does not grant workspace authority, and settings change events do not replace app notification/model policy. Presets and GitService decomposition are outside this extraction.

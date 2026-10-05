@@ -1,6 +1,7 @@
 import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -302,6 +303,7 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
                 fileURL: temp.appendingPathComponent("Settings/globalSettings.json")
             )
         )
+        store.installApplicationEventBridge()
         store.setGlobalRecommendationProviderFilter([.openAI])
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())

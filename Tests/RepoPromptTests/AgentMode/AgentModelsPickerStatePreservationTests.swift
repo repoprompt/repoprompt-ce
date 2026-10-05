@@ -2,6 +2,7 @@ import AppKit
 import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -134,7 +135,9 @@ final class AgentModelsPickerStatePreservationTests: XCTestCase {
         let suiteName = "AgentModelsPicker.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
-        return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json")))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json")))
+        store.installApplicationEventBridge()
+        return store
     }
 
     private func makeWindow(store: GlobalSettingsStore, workspaceID: UUID) -> Window {

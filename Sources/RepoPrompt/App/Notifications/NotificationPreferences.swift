@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Immutable snapshot of the user's notification preferences, consumed by notification policy code.
 ///
