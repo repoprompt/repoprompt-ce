@@ -56,12 +56,12 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let cursorMCPClientID = "Cursor"
     /// Devin's built-in Rust MCP client reports this exact initialize name.
     static let devinMCPClientID = "rmcp"
-    /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
+    /// Grok Build presents `grok-shell-<injected server name>` (here `grok-shell-RepoPromptCEGrokRuntime`)
     /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
     /// tab-context store keys are raw client names (no family canonicalization), so a
     /// family-only hint would never bind the run's frozen tab context. The canonical
     /// `grok-shell` family in `MCPClientIdentity` still covers family-level matching.
-    static let grokBuildMCPClientID = "grok-shell-\(RepoPromptMCPServerConfiguration.defaultServerName)"
+    static let grokBuildMCPClientID = "grok-shell-\(RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName)"
 
     var commandName: String {
         switch self {

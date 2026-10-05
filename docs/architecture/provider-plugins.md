@@ -220,7 +220,7 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 - **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
 - **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
-- **Grok Build:** The session-injected RepoPrompt MCP server follows Grok's default MCP timeout. To pin one, add `tool_timeout_sec` under `[mcp_servers.RepoPromptCE]` in `~/.grok/config.toml` (Grok's per-server MCP config; seconds).
+- **Grok Build:** RepoPrompt CE does not set a timeout for its session-injected `RepoPromptCEGrokRuntime` server. Without a valid same-named Grok configuration override, Grok's default applies. A per-server `tool_timeout_sec` override requires a server entry with a transport; a timeout-only `[mcp_servers.RepoPromptCEGrokRuntime]` table is rejected ("has no transport", Grok 1.0.46).
 
 ### Grok Build provider notes
 
@@ -231,6 +231,14 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - Full access is a launch flag (`grok agent --always-approve stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
 - Auth: RepoPrompt never sends ACP `authenticate`; Grok's own precedence (config.toml key → `~/.grok/auth.json` → `XAI_API_KEY` env, the last injected from the existing `.grokAPI` keychain account at provider construction) applies.
 - MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
+
+#### Current Grok MCP launch policy
+
+- Agent Mode, Context Builder discovery, model discovery and one-shot (Oracle/Chat) launches set `GROK_CLAUDE_MCPS_ENABLED=0` and `GROK_CURSOR_MCPS_ENABLED=0` as process-local overrides. This isolates Claude Code and Cursor MCP imports, including project-local Cursor imports. It does not change `HOME`, `GROK_HOME`, credentials or the user's configuration files.
+- Agent Mode and Context Builder inject the fixed server name `RepoPromptCEGrokRuntime`, with exact client-ID hint `grok-shell-RepoPromptCEGrokRuntime`. Grok renders its tools as `RepoPromptCEGrokRuntime__<tool>`; RPCE recognizes these aliases for known RepoPrompt tools while retaining canonical internal tool identities. Other providers keep `RepoPromptCE`.
+- The Grok-only name avoids the recorded collision with an imported `RepoPromptCE`: Grok drops client servers whose names match disabled imports, on both new and loaded sessions. It is not collision-proof if the user also configured or disabled `RepoPromptCEGrokRuntime` itself. Existing Grok grants for the old server name are not migrated, so users may see renewed permission prompts.
+- Model discovery injects no RPCE server and always uses the existing neutral `RepoPromptGrokBuildACPDiscovery` temporary directory, reusing one verified session there rather than following subscribed workspaces. Closing a window cancels its discovery subscription, not the shared polling service.
+- **Project-config limit:** Grok's project `.mcp.json` is not controlled by the two import switches. Neutral polling avoids the user's project file, but Context Builder and Agent Mode retain their real workspace and may still load it. Grok-native MCP configuration is not filtered or rewritten by this policy.
 
 ## How a new provider plugs in
 

@@ -33,6 +33,7 @@ final class ClaudeCodeAgentProviderGracefulDisposalTests: XCTestCase {
         let processStarted = AsyncTestSignal()
         let runner = CLIProcessRunner(config: CLIProcessConfiguration(
             command: executable.path,
+            allowsProviderProcessLaunchForTesting: true,
             workingDirectory: root.path,
             environment: ProcessInfo.processInfo.environment,
             additionalPaths: [],

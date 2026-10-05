@@ -1105,6 +1105,7 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
         stopCursorModelsSubscription()
+        stopGrokBuildModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -1128,6 +1129,7 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         cursorModelsRefreshTask?.cancel()
         cursorModelsTask?.cancel()
+        grokBuildModelsTask?.cancel()
         openRouterModelsTask?.cancel()
         customModelsTask?.cancel()
         contextBuilderProviderValidationTask?.cancel()

@@ -8,6 +8,22 @@ import RepoPromptTestSupport
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testDirectProviderProcessRefusesBeforeSpawnAndOrdinaryToolStillRuns() async throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        do {
+            _ = try await DirectProcess.run(
+                "/bin/sh", arguments: ["-c", "touch \"$1\"", "fixture", marker.path], isProvider: true
+            )
+            XCTFail("Direct provider processes must fail closed under XCTest")
+        } catch {
+            XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        let output = try await DirectProcess.run("/usr/bin/printf", arguments: ["tool-ok"], isProvider: false)
+        XCTAssertEqual(output, "tool-ok")
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")

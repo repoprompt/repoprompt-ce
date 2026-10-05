@@ -17,6 +17,16 @@ final class DevinPermissionLevelTests: XCTestCase {
 
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
 
+    func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
+        // Exercise the real discovery runner, not a replacement controller factory.
+        let service = DevinModelDiscoveryService(isInstalled: { true })
+        let outcome = await service.discoverIfNeeded()
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Default discovery must refuse before querying the installed provider")
+        }
+        XCTAssertTrue(message.hasPrefix("Provider process launch refused under XCTest."), message)
+    }
+
     // MARK: - PermissionLevel
 
     func testPickerOrderIsProviderDefaultFirstAndFullApprovalLast() {
@@ -326,7 +336,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: "auto")
 
-        let support = try await provider.support(for: request)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await provider.support(for: request)
+        }
         XCTAssertEqual(support, .supported)
         let launch = try provider.makeLaunchConfiguration(for: request)
 
@@ -364,9 +376,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         })
         let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
 
-        let initialSupport = try await resolver.probeSupport(for: config)
+        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await resolver.probeSupport(for: config) }
+        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
         await gate.waitForSecondCall()
         let resolved = Result { try resolver.resolvedLaunch(for: config) }
         await gate.releaseSecondCall()
@@ -721,8 +733,10 @@ final class DevinPermissionLevelTests: XCTestCase {
             )
             let shouldApprove = ["git", "git-input-update", "manage_selection", "corroborated"].contains(scenario)
             do {
-                let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
-                for try await _ in stream {}
+                try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                    let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
+                    for try await _ in stream {}
+                }
                 XCTAssertTrue(shouldApprove, scenario)
             } catch {
                 XCTAssertFalse(shouldApprove, "\(scenario): \(error)")
@@ -734,6 +748,147 @@ final class DevinPermissionLevelTests: XCTestCase {
                 XCTAssertEqual(response["outcome"], "selected", scenario)
                 XCTAssertEqual(response["optionId"], "allow_once", scenario)
             }
+        }
+    }
+
+    func testSparseDevinRepoPromptPermissionUsesExactAllowOnce() async throws {
+        let directory = try makeTestDirectory(name: "DevinSparsePermission")
+        let executable = directory.appendingPathComponent("devin")
+        let record = directory.appendingPathComponent("permission.json")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import sys
+        if "--help" in sys.argv:
+            print("Run as an ACP server over stdio")
+            sys.exit(0)
+
+        record_path = r"\#(record.path)"
+
+        def send(message):
+            print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+
+        prompt_id = None
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "initialize":
+                send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+            elif method == "session/new":
+                send({"id": request["id"], "result": {"sessionId": "test-session"}})
+            elif method == "session/prompt":
+                prompt_id = request["id"]
+                send({"method": "session/update", "params": {"sessionId": "test-session", "update": {
+                    "sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Calling get_file_tree from RepoPromptCE",
+                    "kind": "read", "rawInput": {"type": "roots"},
+                    "_meta": {"cognition.ai/toolName": "mcp__RepoPromptCE__get_file_tree"}
+                }}})
+                send({"id": "permission-1", "method": "session/request_permission", "params": {
+                    "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1"},
+                    "options": [
+                        {"optionId": "ALLOW_ONCE", "kind": "allow_once", "name": "Alias"},
+                        {"optionId": "allow_always", "kind": "allow_always", "name": "Always"},
+                        {"optionId": "allow_once", "kind": "allow_once", "name": "Allow"}
+                    ]
+                }})
+            elif request.get("id") == "permission-1":
+                with open(record_path, "w", encoding="utf-8") as output:
+                    json.dump(request.get("result"), output)
+                send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let provider = DevinACPAgentProvider(
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
+        )
+        let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+        let controller = try ACPAgentSessionController(
+            provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+        )
+        do {
+            _ = try await controller.bootstrap()
+            try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
+            await controller.shutdown()
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+        let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: Any])
+        let outcome = try XCTUnwrap(response["outcome"] as? [String: Any])
+        XCTAssertEqual(outcome["outcome"] as? String, "selected")
+        XCTAssertEqual(outcome["optionId"] as? String, "allow_once")
+    }
+
+    func testExplicitDevinPermissionUsesExactIDsOrCancels() async throws {
+        for (options, decision, expectedID) in [
+            (#"[{"optionId":"ALLOW_ONCE","kind":"allow_once"},{"optionId":"allow_session","kind":"allow_always"}]"#, AgentApprovalDecision.accept, nil),
+            (#"[{"optionId":"ALLOW_SESSION","kind":"allow_always"},{"optionId":"allow_once","kind":"allow_once"}]"#, .acceptForSession, "allow_once"),
+            (#"[{"optionId":"allow_session","kind":"allow_always"},{"optionId":"allow_once","kind":"allow_once"}]"#, .acceptForSession, "allow_session")
+        ] {
+            let directory = try makeTestDirectory(name: "DevinExactPermission")
+            let executable = directory.appendingPathComponent("devin")
+            let record = directory.appendingPathComponent("response.json")
+            let script = #"""
+            #!/usr/bin/env python3
+            import json
+            import sys
+            if "--help" in sys.argv:
+                print("Run as an ACP server over stdio")
+                sys.exit(0)
+            def send(message):
+                print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+            prompt_id = None
+            for line in sys.stdin:
+                request = json.loads(line)
+                method = request.get("method")
+                if method == "initialize":
+                    send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+                elif method == "session/new":
+                    send({"id": request["id"], "result": {"sessionId": "test-session"}})
+                elif method == "session/prompt":
+                    prompt_id = request["id"]
+                    send({"method": "session/update", "params": {"sessionId": "test-session", "update": {
+                        "sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Shell command", "kind": "execute"
+                    }}})
+                    send({"id": "permission-1", "method": "session/request_permission", "params": {
+                        "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1"},
+                        "options": json.loads(r'\#(options)')
+                    }})
+                elif request.get("id") == "permission-1":
+                    with open(r"\#(record.path)", "w", encoding="utf-8") as output:
+                        json.dump(request["result"]["outcome"], output)
+                    send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+            """#
+            try script.write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+            let controller = try ACPAgentSessionController(
+                provider: DevinACPAgentProvider(config: DevinAgentConfig(
+                    commandName: executable.path,
+                    includeRepoPromptMCPServer: false
+                )),
+                runRequest: request,
+                allowsProviderProcessLaunchForTesting: true
+            )
+            do {
+                _ = try await controller.bootstrap()
+                let events = await controller.events
+                let prompt = Task { try await controller.prompt(AgentMessage(userMessage: "Run"), request: request) }
+                for await event in events {
+                    if case let .approvalRequested(approval) = event {
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: decision)
+                        break
+                    }
+                }
+                try await prompt.value
+                await controller.shutdown()
+            } catch {
+                await controller.shutdown()
+                throw error
+            }
+            let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            XCTAssertEqual(response["outcome"], expectedID == nil ? "cancelled" : "selected")
+            XCTAssertEqual(response["optionId"], expectedID)
         }
     }
 

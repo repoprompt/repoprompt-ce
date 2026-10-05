@@ -99,6 +99,7 @@ struct AgentApprovalCard: View {
                 }
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!request.supportsPlainApprove)
             .keyboardShortcut(.return, modifiers: [])
         }
     }

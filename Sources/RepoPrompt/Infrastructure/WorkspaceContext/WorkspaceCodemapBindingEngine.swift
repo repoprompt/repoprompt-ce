@@ -679,6 +679,10 @@ actor WorkspaceCodemapBindingEngine {
     private let graphPullPause: WorkspaceCodemapGraphPullPause
     private var graphPullPauses: [WorkspaceCodemapRootEpoch: GraphPullPauseState] = [:]
     private var graphFlushWaiters: [WorkspaceCodemapRootEpoch: [GraphFlushWaiter]] = [:]
+    private let globalCodeMapsDisabled: @Sendable () async -> Bool
+    private var manifestPublicationDisabled = false
+    private var globalDisableRefreshID = UUID()
+    private var globalDisableRefreshTask: Task<[Task<Void, Never>], Never>?
     private let manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter
     private let uptimeNanoseconds: @Sendable () -> UInt64
     private let accessEpochSeconds: @Sendable () -> UInt64
@@ -796,6 +800,7 @@ actor WorkspaceCodemapBindingEngine {
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
         graphPullPause: WorkspaceCodemapGraphPullPause = .production,
         manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .production,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
@@ -818,11 +823,49 @@ actor WorkspaceCodemapBindingEngine {
         self.hooks = hooks
         self.graphPullPause = graphPullPause
         self.manifestWriterRetryWaiter = manifestWriterRetryWaiter
+        self.globalCodeMapsDisabled = globalCodeMapsDisabled
         nextQueueOrdinal = max(1, initialQueueOrdinal)
         nextAdmissionOrdinal = max(1, initialAdmissionOrdinal)
         counters = WorkspaceCodemapBindingEngineCounters(initialValue: initialCounterValue)
         self.uptimeNanoseconds = uptimeNanoseconds
         self.accessEpochSeconds = accessEpochSeconds
+    }
+
+    func refreshGlobalCodeMapsDisabled() async {
+        // Order setting reads/application across independent window observers. Callers
+        // must not resume setup while a newer refresh is still waiting to apply OFF.
+        let refreshID = UUID()
+        globalDisableRefreshID = refreshID
+        let predecessor = globalDisableRefreshTask
+        let refreshTask = Task {
+            if let predecessor { _ = await predecessor.value }
+            return await applyGlobalCodeMapsDisabled()
+        }
+        globalDisableRefreshTask = refreshTask
+        let tasks = await refreshTask.value
+        if globalDisableRefreshID == refreshID { globalDisableRefreshTask = nil }
+        // Drain outside the ordered state update: OFF may resume while an ON-era
+        // synchronous transaction is finishing, without stale cleanup cancelling it.
+        for task in tasks {
+            await task.value
+        }
+    }
+
+    private func applyGlobalCodeMapsDisabled() async -> [Task<Void, Never>] {
+        let disabled = await globalCodeMapsDisabled()
+        guard manifestPublicationDisabled != disabled else { return [] }
+        manifestPublicationDisabled = disabled
+        guard disabled else { return [] }
+        for rootEpoch in Array(graphIndexJobs.keys) {
+            _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled, cancelRunning: true)
+        }
+        return cancelAllManifestWriters()
+    }
+
+    private func manifestPublicationIsEnabled() async -> Bool {
+        guard !manifestPublicationDisabled, !isShuttingDown, !Task.isCancelled else { return false }
+        let disabled = await globalCodeMapsDisabled()
+        return !disabled && !manifestPublicationDisabled && !isShuttingDown && !Task.isCancelled
     }
 
     /// Registers one loaded root. `evidence` is the store's admission evidence and is separate from
@@ -832,6 +875,7 @@ actor WorkspaceCodemapBindingEngine {
         evidence: WorkspaceCodemapRootEligibilityEvidence? = nil,
         selectionGraph providedSelectionGraph: WorkspaceCodemapSelectionGraph? = nil
     ) async -> WorkspaceCodemapBindingRegistrationResult {
+        guard await manifestPublicationIsEnabled() else { return .failed }
         guard !isShuttingDown else { return .failed }
         let operationID = UUID()
         registrationOperations.insert(operationID)
@@ -1305,7 +1349,7 @@ actor WorkspaceCodemapBindingEngine {
     func scheduleGraphIndex(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapGraphIndexLaunchPhase {
-        guard !isShuttingDown else { return .cancelled }
+        guard !manifestPublicationDisabled, !isShuttingDown else { return .cancelled }
         guard case let .eligible(session)? = roots[rootEpoch] else { return .superseded }
         if let existing = graphIndexJobs[rootEpoch] {
             guard graphIndexJobIsCurrent(existing) else {
@@ -1396,6 +1440,7 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         recoveryReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
     ) -> Bool {
+        guard !manifestPublicationDisabled else { return false }
         guard var job = graphIndexJobs[rootEpoch],
               job.id == jobID,
               job.task == nil,
@@ -2576,6 +2621,7 @@ actor WorkspaceCodemapBindingEngine {
             return
         }
         incrementCounter(\.graphIndexRunsStarted)
+        guard await manifestPublicationIsEnabled() else { return }
         emit(.graphIndexRunStarted, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
 
         while !Task.isCancelled {
@@ -5757,7 +5803,8 @@ actor WorkspaceCodemapBindingEngine {
     @discardableResult
     private func cancelGraphIndexJob(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        terminalPhase: WorkspaceCodemapGraphIndexPhase
+        terminalPhase: WorkspaceCodemapGraphIndexPhase,
+        cancelRunning: Bool = false
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
         publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
@@ -5772,7 +5819,9 @@ actor WorkspaceCodemapBindingEngine {
         // An admitted graphIndex transaction is non-preemptive. Revocation removes publication
         // authority immediately, but the worker reaches its existing currentness boundary without
         // task cancellation. A queued worker owns no admitted transaction and may be cancelled.
-        if !wasActive, job.resources.retainedSourceBytes == 0 {
+        // Global disable also cancels suspended discovery/indexing waiters. Already-admitted
+        // shared artifact transactions retain their coordinator-owned non-preemptive drain.
+        if cancelRunning || (!wasActive && job.resources.retainedSourceBytes == 0) {
             job.task?.cancel()
         }
         let detached = graphIndexAdmissionQueue.filter { $0.jobID == job.id }
@@ -8223,6 +8272,7 @@ actor WorkspaceCodemapBindingEngine {
         retainRecordsInMemory: Bool
     ) async -> ManifestMutationSubmissionResult {
         // Only Git roots persist manifest mutations; a filesystem root never reaches this path.
+        guard await manifestPublicationIsEnabled() else { return .discarded }
         guard !mutations.isEmpty,
               case var .eligible(session)? = roots[rootEpoch],
               var pipeline = session.pipelines[pipelineIdentity],
@@ -8471,6 +8521,7 @@ actor WorkspaceCodemapBindingEngine {
         in state: inout ManifestWriterState,
         namespace: CodeMapRootManifestNamespace
     ) {
+        guard !manifestPublicationDisabled, !isShuttingDown else { return }
         let writerID = UUID()
         state.writerID = writerID
         state.task = Task {
@@ -8482,7 +8533,7 @@ actor WorkspaceCodemapBindingEngine {
         in state: inout ManifestWriterState,
         namespace: CodeMapRootManifestNamespace
     ) {
-        guard state.retryTask == nil else { return }
+        guard !manifestPublicationDisabled, !isShuttingDown, state.retryTask == nil else { return }
         let retryID = UUID()
         state.retryID = retryID
         state.retryTask = Task {
@@ -8559,6 +8610,14 @@ actor WorkspaceCodemapBindingEngine {
         writerID: UUID
     ) async {
         while !Task.isCancelled {
+            guard await manifestPublicationIsEnabled() else {
+                // The setting read suspends. A cancelled predecessor must not tear down an
+                // OFF-era replacement that now owns this namespace.
+                guard let writer = manifestWriters[namespace], writer.writerID == writerID else { return }
+                manifestWriters.removeValue(forKey: namespace)
+                _ = cancelManifestWriterTasks([writer])
+                return
+            }
             let batch: ManifestMutationBatch
             #if DEBUG
                 let debugDeferredRetry: Bool
@@ -9344,6 +9403,7 @@ actor WorkspaceCodemapBindingEngine {
         #endif
         var predecessor = previouslyObservedAuthority
         for attempt in 0 ... 1 {
+            guard await manifestPublicationIsEnabled() else { throw CancellationError() }
             do {
                 #if DEBUG
                     let retryKind: WorkspaceCodemapManifestMeasurementRetryKind = if attempt > 0 {
@@ -9506,6 +9566,7 @@ actor WorkspaceCodemapBindingEngine {
         }
         var retainedCount = min(ordered.count, CodeMapRootManifestCodec.maximumRecordCount)
         while true {
+            guard await manifestPublicationIsEnabled() else { throw CancellationError() }
             let retained = Array(ordered.prefix(retainedCount))
             let retainedPaths = Set(retained.map(\.repositoryRelativePath))
             let evictedPaths = Set(ordered.lazy.map(\.repositoryRelativePath)).subtracting(retainedPaths)
@@ -9561,6 +9622,7 @@ actor WorkspaceCodemapBindingEngine {
         workKey: ManifestWriterWorkKey,
         namespace: CodeMapRootManifestNamespace
     ) async -> ManifestRevisionCompletion {
+        guard !manifestPublicationDisabled, !Task.isCancelled else { return .discarded }
         guard case let .eligible(session)? = roots[scope.rootEpoch],
               let pipeline = session.pipelines[scope.pipelineIdentity],
               let gitPipeline = pipeline.git
@@ -9693,6 +9755,10 @@ actor WorkspaceCodemapBindingEngine {
         manifestWriters.removeAll()
         pendingManifestWaiterInstalls.removeAll()
         cancelledManifestWaiterInstalls.removeAll()
+        return cancelManifestWriterTasks(states)
+    }
+
+    private func cancelManifestWriterTasks(_ states: [ManifestWriterState]) -> [Task<Void, Never>] {
         for state in states {
             state.task?.cancel()
             state.retryTask?.cancel()
@@ -9700,7 +9766,7 @@ actor WorkspaceCodemapBindingEngine {
                 waiter.continuation.resume(returning: .discarded)
             }
         }
-        return states.compactMap(\.task)
+        return states.flatMap { [$0.task, $0.retryTask].compactMap(\.self) }
     }
 
     private func detachManifestAdoptionOperations(rootEpoch: WorkspaceCodemapRootEpoch) {

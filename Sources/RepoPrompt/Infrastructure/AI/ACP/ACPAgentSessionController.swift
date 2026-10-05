@@ -260,6 +260,7 @@ actor ACPAgentSessionController {
     }
 
     private let provider: any ACPAgentProvider
+    private let allowsProviderProcessLaunchForTesting: Bool
     private let runRequest: ACPRunRequest
     private let launchConfiguration: ACPLaunchConfiguration
     private let launchedPermissionMode: String?
@@ -394,9 +395,11 @@ actor ACPAgentSessionController {
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
         diagnosticSink: DiagnosticSink? = nil,
-        requestTimeouts: RequestTimeouts = .default
+        requestTimeouts: RequestTimeouts = .default,
+        allowsProviderProcessLaunchForTesting: Bool = false
     ) throws {
         self.provider = provider
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         providerSessionIdentity = ACPProviderSessionIdentity(
             providerID: provider.providerID,
             loadSessionID: runRequest.resumeSessionID,
@@ -565,6 +568,7 @@ actor ACPAgentSessionController {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
+        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
         promptImagesSupported = false
         state = .launching
         log("Launching ACP transport")
@@ -607,7 +611,9 @@ actor ACPAgentSessionController {
                 command: resolvedCommand,
                 arguments: launchConfiguration.arguments,
                 environment: environment,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                purpose: .provider,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
             )
         } catch {
             await recordRunLaunchContract(
@@ -1502,20 +1508,15 @@ actor ACPAgentSessionController {
                     "outcome": "cancelled"
                 ]
             ]
-        case .accept:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: false)
-                ]
-            ]
-        case .acceptForSession, .acceptWithExecpolicyAmendment:
-            [
-                "outcome": [
-                    "outcome": "selected",
-                    "optionId": preferredAllowOptionID(for: pending.options, sessionScoped: true)
-                ]
-            ]
+        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment:
+            if let optionID = preferredAllowOptionID(
+                for: pending.options,
+                sessionScoped: decision != .accept
+            ) {
+                ["outcome": ["outcome": "selected", "optionId": optionID]]
+            } else {
+                ["outcome": ["outcome": "cancelled"]]
+            }
         case .decline:
             if let optionID = preferredRejectOptionID(for: pending.options) {
                 [
@@ -2182,6 +2183,8 @@ actor ACPAgentSessionController {
             rawInput: rawInput,
             options: optionDictionaries
         )
+        let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
+        let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
         let request = AgentApprovalRequest(
             requestID: .acp(id.displayValue),
             method: "session/request_permission",
@@ -2194,6 +2197,10 @@ actor ACPAgentSessionController {
             cwd: sessionConfiguration.workingDirectory,
             overseerOneTimeAllowAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
                 options: options.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            plainApproveAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
                 providerID: provider.providerID
             ) != nil,
             details: approvalDetails(
@@ -3862,15 +3869,42 @@ actor ACPAgentSessionController {
         ])
     }
 
-    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
+    /// The option an `.accept`-family decision submits, or nil when the agent offered no
+    /// selectable allow option. The denylist-filtered fallback must stay allow-kind:
+    /// without it, a Devin prompt whose only allow-typed entry is a denylisted
+    /// `switch_*`/`plan_*` would collapse to submitting its `reject_once` (or an empty ID)
+    /// for an accept decision — answering the opposite of what was decided.
+    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String? {
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        // Devin is exact-ID only: broadening options (mode switches, persistent/global or
+        // server-wide grants) are unreachable here, which is why the denylist needs no
+        // `switch_*`/`plan_*`/`_always` pattern rules. Routing Devin through the
+        // kind-preference fallback below would silently loosen this — don't.
+        if provider.providerID == .devin {
+            if sessionScoped, let option = filteredOptions.first(where: { $0.optionID == "allow_session" }) {
+                return option.optionID
+            }
+            return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
+        }
+        // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
+        let scopedOptions = sessionScoped || provider.providerID == .grokBuild ? filteredOptions : filteredOptions.filter {
+            normalizedPermissionOptionValue($0.kind) != "allow_always"
+        }
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity, .devin:
+        case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
+        case .devin:
+            []
         }
-        let filteredOptions = safePermissionOptionsForAutoSelection(options)
-        return optionID(for: filteredOptions, preferences: preferences) ?? filteredOptions.first?.optionID ?? ""
+        if let preferred = optionID(for: scopedOptions, preferences: preferences) {
+            return preferred
+        }
+        return optionID(
+            for: scopedOptions,
+            preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
+        )
     }
 
     private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
@@ -3937,10 +3971,7 @@ actor ACPAgentSessionController {
         return [
             .optionID("once"),
             .optionID("allow_once"),
-            .kind("allow_once"),
-            .optionID("always"),
-            .optionID("allow_always"),
-            .kind("allow_always")
+            .kind("allow_once")
         ]
     }
 

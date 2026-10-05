@@ -46,7 +46,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             includeManagedConfigOverlay: false
         )
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         let launch = try resolver.resolvedLaunch(for: config)
 
         XCTAssertEqual(support, .supported)
@@ -76,7 +76,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             includeManagedConfigOverlay: false
         )
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case let .unsupported(reason) = support else {
             return XCTFail("Expected unsupported result with diagnostic reason")
@@ -115,7 +115,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         })
         let config = OpenCodeAgentConfig(commandName: "opencode", additionalPathHints: [])
 
-        let firstSupport = try await resolver.probeSupport(for: config)
+        let firstSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         let firstLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(firstSupport, .supported)
         XCTAssertEqual(firstLaunch.command, try canonicalExecutablePath(firstExecutable))
@@ -124,7 +124,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             "PATH": secondDirectory.path,
             "SHELL": "/bin/false"
         ])
-        let secondSupport = try await resolver.probeSupport(for: config)
+        let secondSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         let secondLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(secondSupport, .supported)
         XCTAssertEqual(secondLaunch.command, try canonicalExecutablePath(secondExecutable))
@@ -150,9 +150,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let executable = try makeExecutable(in: directory, marker: marker)
         try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: directory.path)
 
-        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await OpenCodeACPLaunchResolver().probeSupport(
             for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
-        )
+        ) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected unsafe launch path to be unsupported")
@@ -166,9 +166,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let executable = try makeExecutable(in: directory, marker: marker)
         try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: executable.path)
 
-        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await OpenCodeACPLaunchResolver().probeSupport(
             for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
-        )
+        ) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected unsafe launch path to be unsupported")
@@ -184,9 +184,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let executable = try makeExecutable(in: directory, marker: marker)
         try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
 
-        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await OpenCodeACPLaunchResolver().probeSupport(
             for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
-        )
+        ) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected unsafe launch path to be unsupported")
@@ -200,7 +200,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let resolver = OpenCodeACPLaunchResolver()
         let config = OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(support, .supported)
         try FileManager.default.removeItem(at: executable)
         _ = try makeExecutable(in: directory, output: "replacement OpenCode ACP")

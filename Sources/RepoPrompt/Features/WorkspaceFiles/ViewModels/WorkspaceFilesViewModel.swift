@@ -834,6 +834,8 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var partitionStoreSaveCancellable: AnyCancellable?
     private var fileSystemSettingsCancellable: AnyCancellable?
     private var nonGitCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingRevision: UInt64 = 0
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
@@ -13201,6 +13203,18 @@ extension WorkspaceFilesViewModel {
             )
         }
         return nil
+    }
+
+    func bindGlobalCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        globalCodeMapsSettingCancellable = settings.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak self] disabled in
+                guard let self else { return }
+                globalCodeMapsSettingRevision += 1
+                let revision = globalCodeMapsSettingRevision
+                let store = workspaceFileContextStore
+                Task { await store.setCodeMapsGloballyDisabled(disabled, settingsRevision: revision) }
+            }
     }
 
     func bindNonGitCodeMapsSetting(_ settings: GlobalSettingsStore) {

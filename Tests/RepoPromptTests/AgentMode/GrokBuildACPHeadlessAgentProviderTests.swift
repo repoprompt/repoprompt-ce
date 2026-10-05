@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -79,7 +80,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             attachments: [],
             taskLabelKind: nil
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         do {
             _ = try await controller.bootstrap()
@@ -103,6 +104,48 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         let provider = GrokBuildACPHeadlessAgentProvider(config: config)
         let requestConfig = provider.test_config
         XCTAssertTrue(requestConfig.alwaysApproveTools)
+    }
+
+    func testContextBuilderLaunchIsolatesImportsAndPreservesMCPInjection() async throws {
+        let harness = try makeHarness()
+        let mcp = RepoPromptMCPServerConfiguration(
+            command: harness.scriptPath,
+            args: ["--backend", "app"],
+            env: [.init(name: "RP_TEST_ROUTE", value: "scoped")]
+        )
+        let recordPath = harness.recordURL.path
+        let provider = GrokBuildACPHeadlessAgentProvider(
+            config: GrokBuildAgentConfig(commandName: harness.scriptPath, apiKey: "xai-test-key-123"),
+            workspacePath: harness.workspace.path,
+            providerFactory: { config in
+                EnvForwardingGrokProvider(
+                    config: config,
+                    extraEnvironment: ["ACP_RECORD_PATH": recordPath],
+                    repoPromptMCPConfiguration: mcp
+                )
+            },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
+            }
+        )
+        try await drain(provider, message: "ping")
+
+        let environment = try XCTUnwrap(harness.recordedMethods("launchEnvironment").first)
+        XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"] as? String, "0")
+        XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"] as? String, "0")
+        XCTAssertEqual(environment["XAI_API_KEY"] as? String, "xai-test-key-123")
+        let session = try XCTUnwrap(harness.recordedMethods("session/new").first)
+        XCTAssertEqual(session["cwd"] as? String, harness.workspace.path)
+        let servers = try XCTUnwrap(session["mcpServers"] as? [[String: Any]])
+        XCTAssertEqual(servers.count, 1)
+        let server = try XCTUnwrap(servers.first)
+        XCTAssertEqual(server["name"] as? String, "RepoPromptCEGrokRuntime")
+        XCTAssertEqual(server["command"] as? String, mcp.command)
+        XCTAssertEqual(server["args"] as? [String], mcp.args)
+        XCTAssertEqual(server["env"] as? [[String: String]], mcp.env.map(\.acpJSONObject))
     }
 
     func testMaintenanceRecognitionIsForwardedThroughProviderExistential() {
@@ -135,6 +178,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     EnvForwardingGrokProvider(
                         config: config,
                         extraEnvironment: ["ACP_RECORD_PATH": recordPath]
+                    )
+                },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
                     )
                 }
             )
@@ -207,6 +256,9 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
 
         def respond(request_id, result=None):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
+
+        record("launchEnvironment", {key: os.environ.get(key) for key in
+            ["GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "XAI_API_KEY"]})
 
         for line in sys.stdin:
             line = line.strip()
@@ -283,10 +335,14 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
 
     private let inner: GrokBuildACPAgentProvider
 
-    init(config: GrokBuildAgentConfig, extraEnvironment: [String: String]) {
+    init(
+        config: GrokBuildAgentConfig,
+        extraEnvironment: [String: String],
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt
+    ) {
         self.config = config
         self.extraEnvironment = extraEnvironment
-        inner = GrokBuildACPAgentProvider(config: config)
+        inner = GrokBuildACPAgentProvider(config: config, repoPromptMCPConfiguration: repoPromptMCPConfiguration)
     }
 
     var providerID: ACPProviderID {
@@ -294,7 +350,9 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
     }
 
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult {
-        try await inner.support(for: request)
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await inner.support(for: request)
+        }
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

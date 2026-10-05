@@ -3,6 +3,327 @@ import Foundation
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testGlobalDisableGatesManifestPublicationAndCancelsWriterUntilReenabled() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let relativePath = "Sources/Feature.swift"
+        let rootURL = try repository.makeRepository(
+            named: "root", files: [relativePath: "struct InitialFeature {}\n"]
+        )
+        let disabled = CodemapLockedValues<Bool>()
+        disabled.append(true)
+        let publications = CodemapLockedValues<Int>()
+        let scans = CodemapLockedValues<Int>()
+        let cancelledWrites = CodemapLockedValues<Int>()
+        let armReaderRace = CodemapLockedValues<Bool>()
+        let pauseReader = CodemapLockedValues<Bool>()
+        let cancelledReaders = CodemapLockedValues<Int>()
+        let readerGate = TestReleaseFence(name: "old writer setting read")
+        let armStoreFence = CodemapLockedValues<Bool>()
+        let storeFence = TestReleaseFence(name: "store final suspension")
+        let beforeWrite = TestReleaseFence(name: "manifest publication admission")
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            engineHooks: WorkspaceCodemapBindingEngineHooks(
+                debugBeforeManifestStoreWrite: { _ in
+                    await beforeWrite.enterAndWait()
+                    if Task.isCancelled { cancelledWrites.append(1) }
+                },
+                event: { event in
+                    if event.kind == .manifestRevisionQueued, armReaderRace.takeFirst() != nil {
+                        pauseReader.append(true)
+                    }
+                }
+            ),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                beforePublish: { publications.append(1) },
+                beforeMaintenanceLock: {
+                    if armStoreFence.takeFirst() != nil { await storeFence.enterAndWait() }
+                },
+                scanStarted: { scans.append(1) }
+            ),
+            globalCodeMapsDisabled: {
+                let value = disabled.values.last ?? false
+                if pauseReader.takeFirst() != nil {
+                    // Keep this one old setting read suspended through ON/OFF. The detached
+                    // fence is released explicitly; normal pre-write cancellation stays cooperative.
+                    await withTaskCancellationHandler {
+                        await Task.detached { await readerGate.enterAndWait() }.value
+                    } onCancel: {
+                        cancelledReaders.append(1)
+                    }
+                }
+                return value
+            }
+        )
+        let store = fixture.makeStore(codeMapsGloballyDisabled: true)
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            readerGate.release()
+            storeFence.release()
+            beforeWrite.release()
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == relativePath })
+
+        // Await a real Git demand, not a time window. The persisted initial ON value must
+        // gate writer admission even before the production observer's first delivery.
+        _ = await store.requestCodemapArtifact(forFileID: file.id)
+        let initiallyDisabled = await engine.accounting()
+        XCTAssertEqual(initiallyDisabled.counters.manifestWriteBatches, 0)
+        XCTAssertEqual(publications.values.count, 0)
+        XCTAssertEqual(scans.values.count, 0)
+
+        armReaderRace.append(true)
+        disabled.append(false)
+        await engine.refreshGlobalCodeMapsDisabled()
+        await store.setCodeMapsGloballyDisabled(false)
+        let demand = Task {
+            _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+            return await store.requestCodemapArtifact(forFileID: file.id)
+        }
+        addTeardownBlock {
+            readerGate.release()
+            beforeWrite.release()
+            demand.cancel()
+            _ = await demand.value
+        }
+        let readerEntered = await readerGate.waitUntilEntered(timeout: 30)
+        guard readerEntered else { return XCTFail("Enabled graph work must reach its writer setting read") }
+        disabled.append(true)
+        let disableDrain = Task { await engine.refreshGlobalCodeMapsDisabled() }
+        addTeardownBlock {
+            readerGate.release()
+            beforeWrite.release()
+            await disableDrain.value
+        }
+        try await AsyncTestWait.waitUntil("old writer is cancelled during its setting read", timeout: 30) {
+            !cancelledReaders.values.isEmpty
+        }
+        disabled.append(false)
+        await engine.refreshGlobalCodeMapsDisabled()
+        try "struct ReplacementFeature {}\n".write(
+            to: rootURL.appendingPathComponent(relativePath), atomically: true, encoding: .utf8
+        )
+        let replacement = Task {
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id, deltas: [.fileModified(relativePath, Date())]
+            )
+            _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+            return await store.requestCodemapArtifact(forFileID: file.id)
+        }
+        addTeardownBlock {
+            readerGate.release()
+            beforeWrite.release()
+            replacement.cancel()
+            _ = await replacement.value
+        }
+        let entered = await beforeWrite.waitUntilEntered(timeout: 30)
+        guard entered else { return XCTFail("Replacement writer must reach persistence") }
+        readerGate.release()
+        await disableDrain.value
+        _ = await demand.value
+        XCTAssertTrue(cancelledWrites.values.isEmpty, "An old writer must not cancel its OFF-era replacement")
+
+        disabled.append(true)
+        await engine.refreshGlobalCodeMapsDisabled()
+        _ = await replacement.value
+        XCTAssertFalse(cancelledWrites.values.isEmpty, "The admitted writer must be cancelled")
+        XCTAssertEqual(publications.values.count, 0, "Recheck after the DEBUG suspension")
+        XCTAssertEqual(scans.values.count, 0)
+        beforeWrite.release()
+
+        // The engine gate is not enough: ON can arrive during the store's own last hook.
+        disabled.append(false)
+        await engine.refreshGlobalCodeMapsDisabled()
+        armStoreFence.append(true)
+        try "struct StoreSuspendedFeature {}\n".write(
+            to: rootURL.appendingPathComponent(relativePath), atomically: true, encoding: .utf8
+        )
+        let storeDemand = Task {
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id, deltas: [.fileModified(relativePath, Date())]
+            )
+            _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+            return await store.requestCodemapArtifact(forFileID: file.id)
+        }
+        addTeardownBlock {
+            storeFence.release()
+            storeDemand.cancel()
+            _ = await storeDemand.value
+        }
+        let storeEntered = await storeFence.waitUntilEntered(timeout: 30)
+        guard storeEntered else { return XCTFail("Writer must reach the store suspension") }
+        disabled.append(true)
+        await engine.refreshGlobalCodeMapsDisabled()
+        _ = await storeDemand.value
+        XCTAssertEqual(publications.values.count, 0)
+        XCTAssertEqual(scans.values.count, 0, "ON during the store suspension must not enter reconciliation")
+        storeFence.release()
+
+        disabled.append(false)
+        await engine.refreshGlobalCodeMapsDisabled()
+        try "struct ResumedFeature {}\n".write(
+            to: rootURL.appendingPathComponent(relativePath), atomically: true, encoding: .utf8
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id, deltas: [.fileModified(relativePath, Date())]
+        )
+        _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+        _ = await store.requestCodemapArtifact(forFileID: file.id)
+        try await AsyncTestWait.waitUntil("reenabled writer publishes", timeout: 30) {
+            !publications.values.isEmpty && !scans.values.isEmpty
+        }
+    }
+
+    func testGlobalDisableCancelsDiscoveryAndIndexingAcrossStoresAndPreservesManualPause() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let firstRoot = try repository.makeRepository(
+            named: "first", files: ["Sources/First.swift": "struct FirstWindowType {}\n"]
+        )
+        let secondRoot = try repository.makeRepository(
+            named: "second", files: ["Sources/Second.swift": "struct SecondWindowType {}\n"]
+        )
+        let disabled = CodemapLockedValues<Bool>()
+        disabled.append(true)
+        let discovery = TestReleaseFence(name: "first window catalog discovery")
+        let indexing = TestReleaseFence(name: "second window artifact indexing")
+        let discoveryCancelled = CodemapLockedValues<Bool>()
+        let indexingCancelled = CodemapLockedValues<Bool>()
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            globalCodeMapsDisabled: { disabled.values.last ?? false },
+            beforeArtifactBuild: { text in
+                if text.contains("SecondWindowType") {
+                    await indexing.enterAndWait()
+                    indexingCancelled.append(Task.isCancelled)
+                }
+            }
+        )
+        let first = fixture.makeStore(codeMapsGloballyDisabled: true)
+        let second = fixture.makeStore(codeMapsGloballyDisabled: true)
+        await first.setCodemapGraphIndexCatalogBuildHandlerForTesting { _ in
+            await discovery.enterAndWait()
+            discoveryCancelled.append(Task.isCancelled)
+        }
+        let loadedFirst = try await first.loadRoot(path: firstRoot.path)
+        let loadedSecond = try await second.loadRoot(path: secondRoot.path)
+        addTeardownBlock {
+            discovery.release()
+            indexing.release()
+            await first.unloadRoot(id: loadedFirst.id)
+            await second.unloadRoot(id: loadedSecond.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let state = try await fixture.manifestWriterSessionState()
+        XCTAssertEqual(state.nextSequence, 1)
+        XCTAssertEqual(state.activeCount, 0)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+        let firstDisabled = await first.currentCodemapRootStatusUpdate()
+        let secondDisabled = await second.currentCodemapRootStatusUpdate()
+        XCTAssertTrue(firstDisabled.roots.allSatisfy(\.isGenerationSuspended))
+        XCTAssertTrue(secondDisabled.roots.allSatisfy(\.isGenerationSuspended))
+
+        disabled.append(false)
+        let engine = try fixture.runtime().bindingEngine()
+        await engine.refreshGlobalCodeMapsDisabled()
+        await first.setCodeMapsGloballyDisabled(false, settingsRevision: 1)
+        await second.setCodeMapsGloballyDisabled(false, settingsRevision: 1)
+        let discoveryEntered = await discovery.waitUntilEntered(timeout: 30)
+        let indexingEntered = await indexing.waitUntilEntered(timeout: 30)
+        guard discoveryEntered, indexingEntered else { return XCTFail("Both windows must admit real work") }
+        disabled.append(true)
+        await engine.refreshGlobalCodeMapsDisabled()
+        await first.setCodeMapsGloballyDisabled(true, settingsRevision: 3)
+        await second.setCodeMapsGloballyDisabled(true, settingsRevision: 3)
+        try await AsyncTestWait.waitUntil("global disable cancels suspended catalog discovery", timeout: 30) {
+            discoveryCancelled.values.contains(true)
+        }
+        let coordinator = try fixture.runtime().coordinator
+        try await AsyncTestWait.waitUntil("global disable detaches the indexing waiter", timeout: 30) {
+            let accounting = await coordinator.accounting()
+            return accounting.waiterCount == 0 && accounting.counters.lastWaiterCancellations > 0
+        }
+        // An already-admitted shared artifact transaction is intentionally non-preemptive.
+        // ON cancels its graph owner, but the coordinator must finish its durable transaction.
+        XCTAssertTrue(indexingCancelled.values.isEmpty)
+        await first.setCodeMapsGloballyDisabled(false, settingsRevision: 2)
+        let staleDelivery = await first.currentCodemapRootStatusUpdate()
+        XCTAssertTrue(staleDelivery.roots.allSatisfy(\.isGenerationSuspended))
+        _ = await second.setCodemapGenerationSuspended(rootID: loadedSecond.id, suspended: true)
+        discovery.release()
+        indexing.release()
+        try await AsyncTestWait.waitUntil("admitted artifact transaction drains", timeout: 30) {
+            !indexingCancelled.values.isEmpty
+        }
+        XCTAssertEqual(indexingCancelled.values, [false])
+        await first.setCodemapGraphIndexCatalogBuildHandlerForTesting(nil)
+
+        disabled.append(false)
+        await engine.refreshGlobalCodeMapsDisabled()
+        await first.setCodeMapsGloballyDisabled(false, settingsRevision: 4)
+        await second.setCodeMapsGloballyDisabled(false, settingsRevision: 4)
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loadedFirst.id)
+        let stillPaused = await second.currentCodemapRootStatusUpdate()
+        XCTAssertTrue(stillPaused.roots.allSatisfy(\.isGenerationSuspended))
+        _ = await second.setCodemapGenerationSuspended(rootID: loadedSecond.id, suspended: false)
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loadedSecond.id)
+    }
+
+    func testGlobalReenableResumesWhenStoreAndEngineDeliveriesAreReordered() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root", files: ["Sources/Feature.swift": "struct ReenabledFeature {}\n"]
+        )
+        let disabled = CodemapLockedValues<Bool>()
+        disabled.append(false)
+        let fixture = try CodemapStoreFixture(
+            name: #function, globalCodeMapsDisabled: { disabled.values.last ?? false }
+        )
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let initial = await engine.accounting()
+
+        // The engine receives ON, but the store's ON delivery is held until after OFF.
+        // Its store flag therefore still says enabled even though its graph was cancelled.
+        disabled.append(true)
+        await engine.refreshGlobalCodeMapsDisabled()
+        disabled.append(false)
+        await store.setCodeMapsGloballyDisabled(false, settingsRevision: 2)
+        await store.setCodeMapsGloballyDisabled(true, settingsRevision: 1)
+        let enabled = await store.currentCodemapRootStatusUpdate()
+        XCTAssertFalse(enabled.roots.isEmpty)
+        XCTAssertTrue(enabled.roots.allSatisfy { !$0.isGenerationSuspended })
+        // Do not deliver the engine's OFF callback until work has actually resumed.
+        // Otherwise that callback would mask the independent-observer ordering bug.
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let resumed = await engine.accounting()
+        XCTAssertGreaterThan(resumed.counters.graphIndexRunsStarted, initial.counters.graphIndexRunsStarted)
+        await engine.refreshGlobalCodeMapsDisabled()
+
+        // Also cover the normal store ON transition followed by store OFF ahead of engine OFF.
+        disabled.append(true)
+        await store.setCodeMapsGloballyDisabled(true, settingsRevision: 3)
+        await engine.refreshGlobalCodeMapsDisabled()
+        disabled.append(false)
+        await store.setCodeMapsGloballyDisabled(false, settingsRevision: 4)
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let resumedAgain = await engine.accounting()
+        XCTAssertGreaterThan(resumedAgain.counters.graphIndexRunsStarted, resumed.counters.graphIndexRunsStarted)
+        await engine.refreshGlobalCodeMapsDisabled()
+    }
+
     func testPlainRootRequiresExplicitOptInAndRevokesOnDisable() async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         try workspace.write("export interface OptedInType { id: string }\n", to: "src/OptedIn.ts")

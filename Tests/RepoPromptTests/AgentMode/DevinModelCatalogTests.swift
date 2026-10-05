@@ -243,7 +243,8 @@ final class DevinModelCatalogTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            allowsProviderProcessLaunchForTesting: true
         )
         addTeardownBlock { await controller.shutdown() }
         return Fixture(controller: controller, recordURL: recordURL)

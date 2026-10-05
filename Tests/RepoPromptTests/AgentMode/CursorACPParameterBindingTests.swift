@@ -20,7 +20,15 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(restored.preferredComposeModelRaw, model.rawValue)
         let provider = fixture.provider
         let cli = CursorCLIProvider(headlessProviderFactory: { config, workspace in
-            CursorACPHeadlessAgentProvider(config: config, workspacePath: workspace, providerFactory: { _ in provider })
+            CursorACPHeadlessAgentProvider(
+                config: config, workspacePath: workspace, providerFactory: { _ in provider },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
+                    )
+                }
+            )
         })
         let stream = try await cli.streamMessage(AIMessage(systemPrompt: "", userMessage: "Verify saved effort"), model: model)
         for try await _ in stream {}
@@ -60,7 +68,15 @@ final class CursorACPParameterBindingTests: XCTestCase {
     func testCursorHeadlessRejectsStaleBracketSelectorBeforePrompt() async throws {
         let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
         let provider = fixture.provider
-        let headless = CursorACPHeadlessAgentProvider(config: .init(modelString: "model-b[obsolete-effort=High]"), providerFactory: { _ in provider })
+        let headless = CursorACPHeadlessAgentProvider(
+            config: .init(modelString: "model-b[obsolete-effort=High]"), providerFactory: { _ in provider },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
+            }
+        )
         do {
             let stream = try await headless.streamAgentMessage(AgentMessage(userMessage: "Must not submit"))
             for try await _ in stream {}
@@ -564,7 +580,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
                 resumeSessionID: resumeSessionID,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            allowsProviderProcessLaunchForTesting: true
         )
         addTeardownBlock { await controller.shutdown() }
         return Fixture(controller: controller, recordURL: recordURL, provider: provider)

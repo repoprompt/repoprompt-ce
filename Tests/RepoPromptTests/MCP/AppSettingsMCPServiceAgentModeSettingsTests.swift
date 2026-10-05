@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
@@ -427,6 +427,339 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertTrue(warning.contains("original file is preserved"))
         XCTAssertTrue(warning.contains("explicit recovery"))
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), falseV4JSON)
+    }
+
+    func testContextBuilderAgentRoundTripsPreserveCodexModelAndDiskSelection() async throws {
+        try await withContextBuilderSettings { store, service, defaults, fileURL in
+            let codexRaw = AgentProviderKind.codexExec.rawValue
+            // Recorded Run B starting state: switching to Grok must not replace this with "default".
+            let codexModel = "gpt-6.1-sol-fast-high"
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: codexRaw,
+                    contextBuilderModelsByAgent: [codexRaw: codexModel]
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+
+            var previousAgentRaw = codexRaw
+            for (agent, seededModel, storedModel): (AgentProviderKind, String, String) in [
+                (.grokBuild, "default", "default"),
+                (.cursor, "auto", "cursor-custom[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]")
+            ] {
+                let setAgent = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.agent"),
+                    "value": .string(agent.rawValue)
+                ])
+                XCTAssertEqual(setAgent.objectValue?["old_value"]?.stringValue, previousAgentRaw)
+                XCTAssertEqual(setAgent.objectValue?["new_value"]?.stringValue, agent.rawValue)
+                XCTAssertEqual(setAgent.objectValue?["changed"]?.boolValue, true)
+                XCTAssertEqual(setAgent.objectValue?["applied"]?.boolValue, true)
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, agent.rawValue)
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent?[agent.rawValue], seededModel)
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent?[codexRaw], codexModel)
+
+                if storedModel != seededModel {
+                    // Custom compound Cursor IDs are writable even without catalog membership.
+                    let setModel = try await service.handleForTesting([
+                        "op": .string("set"),
+                        "key": .string("context_builder.model"),
+                        "value": .string(storedModel)
+                    ])
+                    XCTAssertEqual(setModel.objectValue?["old_value"]?.stringValue, seededModel)
+                    XCTAssertEqual(setModel.objectValue?["new_value"]?.stringValue, storedModel)
+                    XCTAssertEqual(setModel.objectValue?["changed"]?.boolValue, true)
+                    XCTAssertEqual(setModel.objectValue?["applied"]?.boolValue, true)
+                }
+
+                let reloaded = GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+                )
+                for currentStore in [store, reloaded] {
+                    let get = try await AppSettingsMCPService(store: currentStore).handleForTesting([
+                        "op": .string("get"),
+                        "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+                    ])
+                    let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+                    XCTAssertEqual(values["context_builder.agent"]?.stringValue, agent.rawValue)
+                    XCTAssertEqual(values["context_builder.model"]?.stringValue, storedModel)
+                    let profile = currentStore.globalAgentModelsProfile()
+                    XCTAssertEqual(profile.contextBuilderAgentRaw, agent.rawValue)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[agent.rawValue], storedModel)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[codexRaw], codexModel)
+                }
+                previousAgentRaw = agent.rawValue
+            }
+
+            let cursorRaw = AgentProviderKind.cursor.rawValue
+            let cursorModel = "cursor-custom[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]"
+            for (oldAgentRaw, agentRaw, expectedModel) in [
+                (cursorRaw, codexRaw, codexModel),
+                (codexRaw, cursorRaw, cursorModel)
+            ] {
+                let setAgent = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.agent"),
+                    "value": .string(agentRaw)
+                ])
+                XCTAssertEqual(setAgent.objectValue?["old_value"]?.stringValue, oldAgentRaw)
+                XCTAssertEqual(setAgent.objectValue?["new_value"]?.stringValue, agentRaw)
+                XCTAssertEqual(setAgent.objectValue?["changed"]?.boolValue, true)
+                XCTAssertEqual(setAgent.objectValue?["applied"]?.boolValue, true)
+
+                let reloaded = GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+                )
+                for currentStore in [store, reloaded] {
+                    let get = try await AppSettingsMCPService(store: currentStore).handleForTesting([
+                        "op": .string("get"),
+                        "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+                    ])
+                    let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+                    XCTAssertEqual(values["context_builder.agent"]?.stringValue, agentRaw)
+                    XCTAssertEqual(values["context_builder.model"]?.stringValue, expectedModel)
+                    let profile = currentStore.globalAgentModelsProfile()
+                    XCTAssertEqual(profile.contextBuilderAgentRaw, agentRaw)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[codexRaw], codexModel)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[cursorRaw], cursorModel)
+                }
+            }
+        }
+    }
+
+    func testContextBuilderModelOnlyWritePersistsFallbackAgentOnFreshProfile() async throws {
+        try await withContextBuilderSettings { store, service, _, _ in
+            XCTAssertNil(store.globalAgentModelsProfile().contextBuilderAgentRaw)
+            XCTAssertFalse(store.hasUserSetGlobalContextBuilderAgentDefaults)
+
+            let set = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.model"),
+                "value": .string("sonnet")
+            ])
+            XCTAssertEqual(set.objectValue?["new_value"]?.stringValue, "sonnet")
+
+            let profile = store.globalAgentModelsProfile()
+            XCTAssertEqual(profile.contextBuilderAgentRaw, AgentProviderKind.claudeCode.rawValue)
+            XCTAssertEqual(profile.contextBuilderModelsByAgent?[AgentProviderKind.claudeCode.rawValue], "sonnet")
+            XCTAssertTrue(store.hasUserSetGlobalContextBuilderAgentDefaults)
+        }
+    }
+
+    func testContextBuilderModelWriteRepairsInvalidStoredAgentWithoutLosingRememberedModels() async throws {
+        try await withContextBuilderSettings { store, service, _, _ in
+            let claudeRaw = AgentProviderKind.claudeCode.rawValue
+            for (agentRaw, rememberedModel) in [
+                ("unknown-context-builder-agent", "unknown-remembered-model"),
+                (AgentProviderKind.antigravity.rawValue, "antigravity-remembered-model")
+            ] {
+                store.setGlobalAgentModelsProfile(
+                    AgentModelsSettingsProfile(
+                        contextBuilderAgentRaw: agentRaw,
+                        contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
+                    ),
+                    contextBuilderWriteIntent: .userInitiated
+                )
+
+                _ = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.model"),
+                    "value": .string("sonnet")
+                ])
+
+                let profile = store.globalAgentModelsProfile()
+                XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, agentRaw)
+                XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], "sonnet", agentRaw)
+                XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, agentRaw)
+            }
+        }
+    }
+
+    func testContextBuilderModelReadsWritesAndClearsStoredAgentSlot() async throws {
+        try await withContextBuilderSettings { store, service, _, _ in
+            for (agent, originalModel, updatedModel): (AgentProviderKind, String, String) in [
+                (.grokBuild, "grok-custom-a", "grok-custom-b"),
+                (.cursor, "cursor-custom-a", "cursor-custom-b")
+            ] {
+                var expectedModels = [
+                    AgentProviderKind.codexExec.rawValue: "gpt-6.1-sol-fast-high",
+                    AgentProviderKind.grokBuild.rawValue: "other-grok-model",
+                    AgentProviderKind.cursor.rawValue: "other-cursor-model"
+                ]
+                expectedModels[agent.rawValue] = originalModel
+                store.setGlobalAgentModelsProfile(
+                    AgentModelsSettingsProfile(
+                        contextBuilderAgentRaw: agent.rawValue,
+                        contextBuilderModelsByAgent: expectedModels
+                    ),
+                    contextBuilderWriteIntent: .userInitiated
+                )
+
+                let get = try await service.handleForTesting([
+                    "op": .string("get"),
+                    "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+                ])
+                let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+                XCTAssertEqual(values["context_builder.agent"]?.stringValue, agent.rawValue)
+                XCTAssertEqual(values["context_builder.model"]?.stringValue, originalModel)
+
+                let set = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.model"),
+                    "value": .string(updatedModel)
+                ])
+                XCTAssertEqual(set.objectValue?["old_value"]?.stringValue, originalModel)
+                XCTAssertEqual(set.objectValue?["new_value"]?.stringValue, updatedModel)
+                XCTAssertEqual(set.objectValue?["changed"]?.boolValue, true)
+                XCTAssertEqual(set.objectValue?["applied"]?.boolValue, true)
+                expectedModels[agent.rawValue] = updatedModel
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, agent.rawValue)
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent, expectedModels)
+
+                let clear = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string("context_builder.model"),
+                    "value": .null
+                ])
+                XCTAssertEqual(clear.objectValue?["old_value"]?.stringValue, updatedModel)
+                XCTAssertEqual(clear.objectValue?["new_value"], .null)
+                XCTAssertEqual(clear.objectValue?["changed"]?.boolValue, true)
+                XCTAssertEqual(clear.objectValue?["applied"]?.boolValue, true)
+                expectedModels[agent.rawValue] = nil
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, agent.rawValue)
+                XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent, expectedModels)
+
+                let getCleared = try await service.handleForTesting([
+                    "op": .string("get"),
+                    "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+                ])
+                let clearedValues = try XCTUnwrap(getCleared.objectValue?["values"]?.objectValue)
+                XCTAssertEqual(clearedValues["context_builder.agent"]?.stringValue, agent.rawValue)
+                XCTAssertEqual(clearedValues["context_builder.model"], .null)
+            }
+        }
+    }
+
+    func testContextBuilderGrokOptionsUseKnownModelsWithoutClaimingAvailability() async throws {
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .grokBuild)
+        defer { registry.test_reset(providerID: .grokBuild) }
+
+        try await withContextBuilderSettings { store, service, _, _ in
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: AgentProviderKind.grokBuild.rawValue,
+                    contextBuilderModelsByAgent: [AgentProviderKind.grokBuild.rawValue: "default"]
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+            try await assertContextBuilderModelOptions(service: service, agent: .grokBuild, expectedModels: ["default"])
+
+            _ = registry.updateDiscoveredModels(
+                ACPDiscoveredSessionModels(
+                    options: [AgentModelOption(
+                        rawValue: "grok-settings-test-model",
+                        displayName: "Grok Settings Test Model",
+                        description: nil,
+                        isDefault: false
+                    )],
+                    currentModelRaw: "grok-settings-test-model"
+                ),
+                for: .grokBuild
+            )
+            try await assertContextBuilderModelOptions(
+                service: service,
+                agent: .grokBuild,
+                expectedModels: ["default", "grok-settings-test-model"]
+            )
+        }
+    }
+
+    func testContextBuilderCursorOptionsFollowDiscoveredCatalogWithoutClaimingAvailability() async throws {
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .cursor)
+        defer { registry.test_reset(providerID: .cursor) }
+
+        try await withContextBuilderSettings { store, service, _, _ in
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: AgentProviderKind.cursor.rawValue,
+                    contextBuilderModelsByAgent: [AgentProviderKind.cursor.rawValue: "auto"]
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+            try await assertContextBuilderModelOptions(service: service, agent: .cursor, expectedModels: ["auto"])
+
+            let discoveredModels = ["cursor-settings-model-a", "cursor-settings-model-b"]
+            _ = registry.updateDiscoveredModels(
+                ACPDiscoveredSessionModels(
+                    options: discoveredModels.map {
+                        AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+                    },
+                    currentModelRaw: discoveredModels[0]
+                ),
+                for: .cursor
+            )
+            // A discovered catalog need not contain "auto"; don't append historical models.
+            try await assertContextBuilderModelOptions(
+                service: service,
+                agent: .cursor,
+                expectedModels: Set(discoveredModels)
+            )
+        }
+    }
+
+    private func withContextBuilderSettings(
+        _ body: (GlobalSettingsStore, AppSettingsMCPService, UserDefaults, URL) async throws -> Void
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceContextBuilderTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suiteName = "AppSettingsMCPServiceContextBuilderTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+        try await body(store, AppSettingsMCPService(store: store), defaults, fileURL)
+    }
+
+    private func assertContextBuilderModelOptions(
+        service: AppSettingsMCPService,
+        agent: AgentProviderKind,
+        expectedModels: Set<String>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        for explicitAgent in [true, false] {
+            var arguments: [String: Value] = [
+                "op": .string("options"),
+                "key": .string("context_builder.model")
+            ]
+            if explicitAgent {
+                arguments["agent"] = .string(agent.rawValue)
+            }
+            let result = try await service.handleForTesting(arguments)
+            XCTAssertEqual(result.objectValue?["filters"]?.objectValue?["agent"]?.stringValue, agent.rawValue, file: file, line: line)
+            let options = try XCTUnwrap(result.objectValue?["options"]?.arrayValue, file: file, line: line)
+            XCTAssertEqual(Set(options.compactMap { $0.objectValue?["value"]?.stringValue }), expectedModels, file: file, line: line)
+            XCTAssertEqual(options.count, expectedModels.count, file: file, line: line)
+            XCTAssertTrue(
+                options.allSatisfy { $0.objectValue?["agent"]?.stringValue == agent.rawValue },
+                "Every option must belong to \(agent.rawValue) (explicit filter: \(explicitAgent))",
+                file: file,
+                line: line
+            )
+            XCTAssertTrue(
+                options.allSatisfy { $0.objectValue?["available"]?.boolValue == false },
+                "Known models must not claim runtime availability (explicit filter: \(explicitAgent))",
+                file: file,
+                line: line
+            )
+        }
     }
 
     func testSubagentDefaultWaitSecondsListsReadsPersistsAndRejectsInvalidValues() async throws {

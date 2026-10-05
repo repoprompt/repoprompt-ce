@@ -6,6 +6,10 @@ package struct CLIProcessConfiguration {
     }
 
     package var command: String
+    /// Provider commands are refused in XCTest unless the calling test explicitly opts in.
+    /// Non-provider tooling (such as worktree Git operations) uses `.tool`.
+    package var processPurpose: ProcessLauncher.Purpose
+    package var allowsProviderProcessLaunchForTesting: Bool
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
     package var workingDirectory: String
     package var environment: [String: String]
@@ -26,6 +30,8 @@ package struct CLIProcessConfiguration {
 
     package init(
         command: String = "claude",
+        processPurpose: ProcessLauncher.Purpose = .provider,
+        allowsProviderProcessLaunchForTesting: Bool = false,
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
         environment: [String: String] = [:],
         additionalPaths: [String] = CLINativePathDefaults.defaultAdditionalPaths,
@@ -39,6 +45,8 @@ package struct CLIProcessConfiguration {
         logStdinSampleBytes: Int = 0
     ) {
         self.command = command
+        self.processPurpose = processPurpose
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         self.workingDirectory = Self.resolvedWorkingDirectory(workingDirectory)
         self.environment = environment
         self.additionalPaths = additionalPaths

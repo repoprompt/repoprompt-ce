@@ -23,7 +23,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, try canonicalExecutablePath(executable))
@@ -68,7 +68,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, currentPath)
@@ -132,7 +132,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             }
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let supportTask = Task { try await resolver.probeSupport(for: config) }
+        let supportTask = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
 
         // This timeout is a deadlock guard, not a performance oracle.
         await fulfillment(of: [entered], timeout: 30)
@@ -167,7 +167,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard support == .supported else {
             return XCTFail("Expected supported Cursor entrypoint: \(support)")
         }
@@ -188,7 +188,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: directory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected an unverified generic agent executable to be unsupported")
@@ -217,7 +217,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected cursor-agent resolving to a generic agent executable to be unsupported")
@@ -253,7 +253,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard support == .supported else {
             return XCTFail("Expected supported Cursor entrypoint: \(support)")
         }
@@ -280,7 +280,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected a timed-out probe to be unsupported")
@@ -324,7 +324,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             aggregateProbeTimeout: 10
         )
 
-        let support = try await resolver.probeSupport(for: CursorAgentConfig(additionalPathHints: []))
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: CursorAgentConfig(additionalPathHints: [])) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected aggregate deadline exhaustion to be unsupported")
@@ -355,7 +355,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case let .unsupported(reason) = support else {
             return XCTFail("Expected an expired clock to reject the successful producer result")
@@ -417,7 +417,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             sharingProbeOwnershipWith: firstResolver
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let firstProbe = Task { try await firstResolver.probeSupport(for: config) }
+        let firstProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await firstResolver.probeSupport(for: config) } }
 
         await producer.waitUntilEntered()
         await firstDeadline.waitUntilEntered()
@@ -430,7 +430,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertTrue(reason.contains("aggregate timeout"))
         await producer.waitUntilCancellation()
 
-        let pendingSupport = try await secondResolver.probeSupport(for: config)
+        let pendingSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await secondResolver.probeSupport(for: config) }
         guard case let .unsupported(pendingReason) = pendingSupport else {
             return XCTFail("Expected a retry to be rejected while the producer drains")
         }
@@ -445,7 +445,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         await firstResolver.waitForProbeAttemptSettlementForTesting()
         XCTAssertThrowsError(try secondResolver.resolvedLaunch(for: config))
 
-        let recoveredSupport = try await secondResolver.probeSupport(for: config)
+        let recoveredSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await secondResolver.probeSupport(for: config) }
         XCTAssertEqual(recoveredSupport, .supported)
         let recoveredCallCount = await secondCalls.count()
         XCTAssertEqual(recoveredCallCount, 1)
@@ -487,7 +487,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             aggregateProbeTimeout: 10
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let firstProbe = Task { try await resolver.probeSupport(for: config) }
+        let firstProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
 
         await producer.waitUntilEntered()
         firstProbe.cancel()
@@ -499,7 +499,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         }
         await producer.waitUntilCancellation()
 
-        let pendingSupport = try await resolver.probeSupport(for: config)
+        let pendingSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard case let .unsupported(pendingReason) = pendingSupport else {
             return XCTFail("Expected a retry to be rejected while the canceled producer drains")
         }
@@ -512,7 +512,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         await resolver.waitForProbeAttemptSettlementForTesting()
         XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
 
-        let recoveredSupport = try await resolver.probeSupport(for: config)
+        let recoveredSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(recoveredSupport, .supported)
         let recoveredCallCount = await calls.count()
         XCTAssertEqual(recoveredCallCount, 2)
@@ -566,7 +566,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: lookupMarker.path))
         XCTAssertEqual(support, .supported)

@@ -29,6 +29,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         locatorStoreHooks: GitBlobCodeMapLocatorStoreHooks = .none,
         manifestStorePolicy: CodeMapRootManifestStorePolicy = .default,
         manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         builder: CodeMapArtifactBuilderClient = CodeMapArtifactBuilderClient(),
         coordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         coordinatorClock: CodeMapArtifactBuildCoordinatorClock = .continuous,
@@ -53,7 +54,8 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         let manifestStore = try CodeMapRootManifestStore(
             rootURL: rootURL,
             policy: manifestStorePolicy,
-            hooks: manifestStoreHooks
+            hooks: manifestStoreHooks,
+            globalCodeMapsDisabled: globalCodeMapsDisabled
         )
         let coordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: CodeMapArtifactStoreClient(store: artifactStore),
@@ -103,7 +105,9 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
             -> WorkspaceCodemapBindingIntegrationRegistry = {
                 WorkspaceCodemapBindingIntegrationRegistry()
             },
-        postSuccessfulInitialization: @escaping @Sendable () -> Void = {}
+        postSuccessfulInitialization: @escaping @Sendable () -> Void = {},
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
+        bindingEngineDidInitialize: @escaping @Sendable (WorkspaceCodemapBindingEngine) -> Void = { _ in }
     ) -> CodeMapArtifactRuntimeProvider {
         CodeMapArtifactRuntimeProvider {
             let rootURL = processWideRootURL(
@@ -119,41 +123,27 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
             let runtime = try CodeMapArtifactRuntime(
                 rootURL: rootURL,
                 artifactStoreLeaseAdmission: .processWide,
+                globalCodeMapsDisabled: globalCodeMapsDisabled,
                 bindingIntegrationRegistry: registry,
                 bindingEngineFactory: { runtime in
                     let namespaceSalt = try namespaceSaltProvider(rootURL, identity)
-                    return WorkspaceCodemapBindingEngine(
+                    let engine = WorkspaceCodemapBindingEngine(
                         runtime: runtime,
                         capabilityService: WorkspaceCodemapRootCapabilityService(
                             namespaceSalt: namespaceSalt
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
-                        catalogClient: registry.makeBindingCatalogClient()
+                        catalogClient: registry.makeBindingCatalogClient(),
+                        globalCodeMapsDisabled: globalCodeMapsDisabled
                     )
+                    bindingEngineDidInitialize(engine)
+                    return engine
                 }
             )
             postSuccessfulInitialization()
             return runtime
         }
     }
-
-    private static let processWideProvider: CodeMapArtifactRuntimeProvider = {
-        let identity = WorkspaceContextFilesystemIdentity.identity
-        #if DEBUG
-            return makeProcessWideProvider(
-                identity: identity,
-                applicationSupportRootURL: identity.applicationSupportRootURL()
-            )
-        #else
-            return makeProcessWideProvider(
-                identity: identity,
-                applicationSupportRootURL: identity.applicationSupportRootURL(),
-                postSuccessfulInitialization: {
-                    CodeMapV6CacheDeletionScheduler.schedule()
-                }
-            )
-        #endif
-    }()
 }
 
 enum CodeMapRepositoryNamespaceSaltStoreError: Error {

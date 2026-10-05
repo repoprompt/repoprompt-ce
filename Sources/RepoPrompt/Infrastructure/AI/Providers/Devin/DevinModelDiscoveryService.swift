@@ -103,6 +103,7 @@ actor DevinModelDiscoveryService {
     }
 
     private static func runThrowawaySession(_ config: DevinAgentConfig) async throws -> Int? {
+        try ProviderProcessLaunchPolicy.check()
         let provider = DevinACPAgentProvider(config: config, isolateForeignMCPImports: true)
         let request = ACPRunRequest(
             agentKind: .devin,

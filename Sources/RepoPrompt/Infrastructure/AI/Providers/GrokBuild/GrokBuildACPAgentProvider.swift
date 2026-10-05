@@ -20,7 +20,12 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver()
     ) {
         self.config = config
-        self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
+        self.repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration(
+            name: RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName,
+            command: repoPromptMCPConfiguration.command,
+            args: repoPromptMCPConfiguration.args,
+            env: repoPromptMCPConfiguration.env
+        )
         self.launchResolver = launchResolver
     }
 
@@ -48,7 +53,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             }
         }
 
-        var environment: [String: String] = [:]
+        var environment = GrokBuildAgentConfig.importIsolationEnvironment
         if let apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty {
             // Never log this value; it exists only as a child-process launch override.
             environment["XAI_API_KEY"] = apiKey

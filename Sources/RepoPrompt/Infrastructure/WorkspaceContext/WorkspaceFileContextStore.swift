@@ -3120,6 +3120,9 @@ actor WorkspaceFileContextStore {
     private let codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe
     private let codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy
     private var nonGitCodeMapsEnabled: Bool
+    private var codeMapsGloballyDisabled: Bool
+    private var codeMapsGlobalSettingRevision: UInt64 = 0
+    private var codeMapsGlobalTransitionID = UUID()
     private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
     private let selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy
     private let automaticSelectionAccountingMaximum: Int
@@ -3319,6 +3322,7 @@ actor WorkspaceFileContextStore {
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = true,
+            codeMapsGloballyDisabled: Bool = false,
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3356,6 +3360,7 @@ actor WorkspaceFileContextStore {
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
+            self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3395,6 +3400,7 @@ actor WorkspaceFileContextStore {
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = false,
+            codeMapsGloballyDisabled: Bool = false,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3430,6 +3436,7 @@ actor WorkspaceFileContextStore {
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
+            self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -10968,8 +10975,48 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// Global suspension is independent of user-paused roots, so OFF never resumes a manual pause.
+    func setCodeMapsGloballyDisabled(_ disabled: Bool, settingsRevision: UInt64? = nil) async {
+        if let settingsRevision {
+            guard settingsRevision > codeMapsGlobalSettingRevision else { return }
+            codeMapsGlobalSettingRevision = settingsRevision
+        }
+        // An OFF delivery can overtake ON in this store while the process-wide engine
+        // already cancelled its graph. Even an unchanged enabled flag must resume work.
+        guard codeMapsGloballyDisabled != disabled || !disabled else { return }
+        codeMapsGloballyDisabled = disabled
+        let transitionID = UUID()
+        codeMapsGlobalTransitionID = transitionID
+        let epochs = rootStatesByID.map { rootID, state in
+            WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+        }
+        // Retire stale handed-off launches on OFF too: the engine's independent ON
+        // observer may have cancelled them without this store ever receiving ON.
+        for rootEpoch in epochs {
+            codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
+            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
+        }
+        publishCodemapRootStatusesIfChanged()
+        await awaitCodemapCleanupFlights(rootIDs: Set(epochs.map(\.rootID)))
+        guard codeMapsGlobalTransitionID == transitionID, !codeMapsGloballyDisabled else { return }
+        // Re-enable the shared engine from the live setting before admitting setup;
+        // its subscription may deliver OFF after this window's subscription does.
+        if !epochs.isEmpty, let engine = try? codemapRuntimeProvider().bindingEngine() {
+            await engine.refreshGlobalCodeMapsDisabled()
+        }
+        guard codeMapsGlobalTransitionID == transitionID, !codeMapsGloballyDisabled else { return }
+        for rootEpoch in epochs {
+            guard rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID else { continue }
+            restartCodemapCatalogRecoveryIfPending(rootEpoch: rootEpoch)
+            scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
+        }
+        publishCodemapRootStatusesIfChanged()
+    }
+
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codemapSuspendedRootEpochs.contains(rootEpoch)
+        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch)
     }
 
     /// True when the deltas being applied on *this* call chain are the ones produced by the root's
@@ -16114,15 +16161,21 @@ actor WorkspaceFileContextStore {
             #if DEBUG
                 let buildHandler = codemapGraphIndexCatalogBuildHandler
             #endif
-            let shard = await Task.detached(priority: .userInitiated) { [snapshot] in
+            let buildTask = Task.detached(priority: .userInitiated) { [snapshot] in
                 #if DEBUG
                     if let buildHandler {
                         await buildHandler(snapshot.authority.rootEpoch)
                     }
                 #endif
+                guard !Task.isCancelled else { return nil as RootCatalogShard? }
                 return Self.buildCodemapGraphIndexCatalogShard(snapshot: snapshot)
-            }.value
-            guard !Task.isCancelled else { return false }
+            }
+            let shard = await withTaskCancellationHandler {
+                await buildTask.value
+            } onCancel: {
+                buildTask.cancel()
+            }
+            guard !Task.isCancelled, let shard else { return false }
             switch publishCodemapGraphIndexCatalogShard(shard, snapshot: snapshot) {
             case .ready:
                 return true

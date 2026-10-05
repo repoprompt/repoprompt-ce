@@ -381,7 +381,8 @@ actor GitService {
             command: executablePath,
             arguments: arguments,
             environment: environment,
-            workingDirectory: workingDirectoryPath
+            workingDirectory: workingDirectoryPath,
+            purpose: .tool
         )
     }
 

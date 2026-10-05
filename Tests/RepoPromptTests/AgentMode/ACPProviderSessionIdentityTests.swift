@@ -2,10 +2,38 @@ import Foundation
 import os
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testACPBootstrapRefusesDevinNewAndColdResumeWithoutFixtureOptIn() async throws {
+        // Hydration can request a fresh controller for a persisted provider session;
+        // neither that identity nor discovery is permission to start a provider in XCTest.
+        for resumeID in [nil, "persisted-devin-session"] as [String?] {
+            let workspace = try makeTemporaryDirectory()
+            let recordURL = workspace.appendingPathComponent("requests.jsonl")
+            let provider = try FakeACPProvider(
+                providerID: .devin,
+                commandPath: makeFakeACPServerScript().path,
+                environment: ["ACP_RECORD_PATH": recordURL.path]
+            )
+            let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+            do {
+                _ = try await controller.bootstrap()
+                XCTFail("Discovery and cold resume must fail closed without an explicit fixture permit")
+            } catch {
+                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+            }
+            let identity = await controller.currentProviderSessionIdentity()
+            XCTAssertNil(identity.runtimeSessionID)
+            XCTAssertEqual(identity.loadSessionID, resumeID)
+            await controller.shutdown()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path), "Refusal must precede ACP initialization")
+        }
+    }
+
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -15,7 +43,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RUNTIME_SESSION_ID": "cursor-runtime-id"]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
         let stream = await controller.currentEventsStream()
 
         let bootstrap = try await controller.bootstrap()
@@ -45,7 +73,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RECORD_PATH": recordURL.path]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -75,7 +103,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_RUNTIME_SESSION_ID": "fresh-runtime-id"
             ]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -114,7 +142,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 builds: builds
             )
             let request = makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
-            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5))
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5), allowsProviderProcessLaunchForTesting: true)
             let bootstrap = try await controller.bootstrap()
             let image = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: nil)
             let supported = capability == "{\"image\":true}"
@@ -201,7 +229,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
-            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5)
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
         )
         _ = try await controller.bootstrap()
         do {
@@ -234,7 +263,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path),
-            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5)
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
         )
         _ = try await controller.bootstrap()
         do { try await controller.prompt(AgentMessage(userMessage: "transport failure"))

@@ -65,7 +65,8 @@ enum AgentSessionLinkPrompts {
     /// Version of active inventory wording, independent of membership and passive lane guidance.
     /// Revision 7 combines Stop with lean compaction wording and just-in-time outcome receipts;
     /// revision 8 adds creator provenance and lane operations.
-    static let currentInventoryGuidanceRevision: UInt64 = 8
+    /// Revision 9 teaches Grok's isolated runtime server name.
+    static let currentInventoryGuidanceRevision: UInt64 = 9
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."
@@ -788,8 +789,9 @@ enum AgentSessionLinkPrompts {
     private static func hostNamingGuidance(toolReference: String) -> [String] {
         guard isHostDeterminedToolReference(toolReference) else { return [] }
         let server = MCPIntegrationHelper.repoPromptMCPServerName
+        let grokServer = RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName
         return [
-            "Your host decides how RepoPrompt's MCP tools are named for you, so that exact string may not be what your tool list shows. The same tool also appears as `\(server)-\(toolReference)`, `\(toolReference) (\(server))`, or `mcp__\(server)__\(toolReference)` depending on the host. Call whichever advertised tool carries the name `\(toolReference)` from the `\(server)` server; do not conclude oversight is unavailable just because the unprefixed name is not listed verbatim."
+            "Your host decides how RepoPrompt's MCP tools are named for you, so that exact string may not be what your tool list shows. The same tool also appears as `\(server)-\(toolReference)`, `\(toolReference) (\(server))`, or `mcp__\(server)__\(toolReference)` depending on the host. Grok uses `\(grokServer)__\(toolReference)`. Call whichever advertised tool carries the name `\(toolReference)` from the `\(server)` or `\(grokServer)` server; do not conclude oversight is unavailable just because the unprefixed name is not listed verbatim."
         ]
     }
 

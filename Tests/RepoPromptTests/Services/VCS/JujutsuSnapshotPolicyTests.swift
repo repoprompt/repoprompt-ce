@@ -389,6 +389,212 @@ final class JujutsuSnapshotPolicyTests: XCTestCase {
     }
 }
 
+#if DEBUG
+    /// Exercises the Git lifecycle hooks called by WindowState, not full window composition.
+    /// No Prompt, Agent Mode, router, provider or workspace restoration is constructed.
+    @MainActor
+    final class GitViewModelWindowCloseTests: XCTestCase {
+        private var originalGitMode: String?
+        private var owners: [(viewModel: GitViewModel, actor: GitStatusActor)] = []
+
+        override func setUp() async throws {
+            try await super.setUp()
+            originalGitMode = UserDefaults.standard.string(forKey: "gitDiffInclusionMode")
+            UserDefaults.standard.set(GitDiffInclusionMode.none.rawValue, forKey: "gitDiffInclusionMode")
+        }
+
+        override func tearDown() async throws {
+            for owner in owners {
+                await owner.viewModel.shutdownForWindowClose()
+                await owner.actor.shutdown() // Also clean up when testing a broken close hook.
+            }
+            owners.removeAll()
+            if let originalGitMode {
+                UserDefaults.standard.set(originalGitMode, forKey: "gitDiffInclusionMode")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "gitDiffInclusionMode")
+            }
+            try await super.tearDown()
+        }
+
+        func testWindowCloseHookStopsStatusPollingAndRejectsLateRefreshes() async throws {
+            let firstWait = expectation(description: "Open Git owner awaits its first poll")
+            let secondWait = expectation(description: "Open Git owner refreshes and awaits its second poll")
+            let clock = PollClock(waits: [firstWait, secondWait])
+            let (viewModel, actor) = await openGitOwner(clock: clock)
+            await fulfillment(of: [firstWait], timeout: 2)
+            let initialSnapshot = await actor.test_latestSnapshot
+            let initial = try XCTUnwrap(initialSnapshot)
+
+            await clock.advance()
+            await fulfillment(of: [secondWait], timeout: 2)
+            let beforeCloseSnapshot = await actor.test_latestSnapshot
+            let beforeClose = try XCTUnwrap(beforeCloseSnapshot)
+            XCTAssertEqual(beforeClose.generation, initial.generation + 1)
+
+            // These are the same hooks called by WindowState.beginClose() and tearDown().
+            viewModel.prepareForWindowClose()
+            await viewModel.shutdownForWindowClose()
+            let hasPollerAfterClose = await actor.test_hasPollingTask
+            XCTAssertFalse(hasPollerAfterClose)
+            XCTAssertEqual(viewModel.test_pendingWindowCloseTaskCount, 0)
+
+            // Exercise late observer/root work as well as a tick after the close boundary.
+            await clock.advance()
+            await actor.setInclusionMode(.none)
+            await actor.setInclusionMode(.all)
+            await actor.setSelectedRoot("/closed-window-root")
+            await actor.restartPollingIfNeeded()
+            let lateRefresh = await actor.refresh(trigger: .explicitRefresh)
+            let afterClose = await actor.test_latestSnapshot
+            let hasRestartedPoller = await actor.test_hasPollingTask
+            let waits = await clock.waitCount
+            XCTAssertNil(lateRefresh)
+            XCTAssertEqual(afterClose?.generation, beforeClose.generation)
+            XCTAssertFalse(hasRestartedPoller)
+            XCTAssertEqual(waits, 2)
+        }
+
+        private func openGitOwner(clock: PollClock) async -> (GitViewModel, GitStatusActor) {
+            let vcs = VCSService()
+            let actor = GitStatusActor(vcsService: vcs, diffEngine: GitDiffEngine(vcsService: vcs))
+            await actor.test_setPollingWait { try await clock.sleep() }
+            // Inject a fresh window-scoped poller without any production window composition.
+            let viewModel = GitViewModel(statusActor: actor)
+            owners.append((viewModel, actor))
+            // No repository is needed: the real refresh publishes a generation on every tick.
+            viewModel.gitDiffInclusionMode = .all
+            await actor.setInclusionMode(.all)
+            return (viewModel, actor)
+        }
+
+        private actor PollClock {
+            private let waits: [XCTestExpectation]
+            private var sleepers: [UUID: CheckedContinuation<Void, Error>] = [:]
+            private(set) var waitCount = 0
+
+            init(waits: [XCTestExpectation]) {
+                self.waits = waits
+            }
+
+            func sleep() async throws {
+                let id = UUID()
+                try await withTaskCancellationHandler {
+                    try Task.checkCancellation()
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        if Task.isCancelled {
+                            continuation.resume(throwing: CancellationError())
+                        } else {
+                            sleepers[id] = continuation
+                            waitCount += 1
+                            if waitCount <= waits.count { waits[waitCount - 1].fulfill() }
+                        }
+                    }
+                } onCancel: {
+                    Task { await self.cancel(id) }
+                }
+            }
+
+            func advance() {
+                let pending = sleepers
+                sleepers.removeAll()
+                pending.values.forEach { $0.resume() }
+            }
+
+            private func cancel(_ id: UUID) {
+                sleepers.removeValue(forKey: id)?.resume(throwing: CancellationError())
+            }
+        }
+    }
+#endif
+
+#if DEBUG
+    final class GitStatusShutdownTests: XCTestCase {
+        func testShutdownDrainsObserverRefreshBeforeReturningAndSuppressesLateSnapshot() async throws {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("status-shutdown-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(".jj"), withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let statsEntered = expectation(description: "Repository stats refresh is suspended")
+            let drainEntered = expectation(description: "Shutdown waits for the observer-owned refresh")
+            let gate = StatsGate(entered: statsEntered)
+            let runner = JJCommandRunner { arguments, _, _ in
+                let command = arguments.first == "--ignore-working-copy" ? Array(arguments.dropFirst()) : arguments
+                if command.prefix(2) == ["diff", "--summary"] {
+                    return ("M App.swift\n", "", 0)
+                }
+                if command.prefix(2) == ["diff", "--stat"] {
+                    await gate.waitIfArmed()
+                    return ("App.swift | 1 +\n1 file changed, 1 insertion(+), 0 deletions(-)\n", "", 0)
+                }
+                return ("", "", 0)
+            }
+            let status = GitStatusActor(vcsService: VCSService(jjRunner: runner))
+            _ = await status.updateRoots([root.path])
+            await status.setSelectedRoot(root.path)
+            let initialSnapshot = await status.test_latestSnapshot
+            let initial = try XCTUnwrap(initialSnapshot)
+            XCTAssertEqual(initial.backendKind, .jujutsu)
+            await status.test_setRefreshDrainStarted { drainEntered.fulfill() }
+
+            await gate.arm()
+            // This is the untracked observer-style refresh, not the actor's polling task.
+            let refresh = Task { await status.refresh(trigger: .explicitRefresh) }
+            await fulfillment(of: [statsEntered], timeout: 2)
+            let shutdown = Task {
+                await status.shutdown()
+                await gate.recordShutdownFinished()
+            }
+            await fulfillment(of: [drainEntered], timeout: 2)
+            await gate.release()
+            let lateResult = await refresh.value
+            await shutdown.value
+
+            let afterClose = await status.test_latestSnapshot
+            let completionOrder = await gate.completionOrder
+            XCTAssertNil(lateResult)
+            XCTAssertEqual(afterClose?.generation, initial.generation)
+            XCTAssertEqual(completionOrder, ["stats_finished", "shutdown_finished"])
+            await status.test_setRefreshDrainStarted(nil)
+        }
+
+        private actor StatsGate {
+            private let entered: XCTestExpectation
+            private var isArmed = false
+            private var continuation: CheckedContinuation<Void, Never>?
+            private(set) var completionOrder: [String] = []
+
+            init(entered: XCTestExpectation) {
+                self.entered = entered
+            }
+
+            func arm() {
+                isArmed = true
+            }
+
+            func waitIfArmed() async {
+                guard isArmed else { return }
+                await withCheckedContinuation { continuation in
+                    self.continuation = continuation
+                    entered.fulfill()
+                }
+                completionOrder.append("stats_finished")
+            }
+
+            func release() {
+                isArmed = false
+                continuation?.resume()
+                continuation = nil
+            }
+
+            func recordShutdownFinished() {
+                completionOrder.append("shutdown_finished")
+            }
+        }
+    }
+#endif
+
 private actor JJInvocationLog {
     private(set) var invocations: [[String]] = []
 

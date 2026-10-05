@@ -463,7 +463,8 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 command: "/bin/sh",
                 arguments: ["-c", "exit 0"],
                 environment: [:],
-                workingDirectory: nil
+                workingDirectory: nil,
+                purpose: .tool
             )
             let fixture = OwnedFixtureCleanup(spawned)
             addTeardownBlock { await fixture.cleanup() }
@@ -491,7 +492,8 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
             command: "/bin/sh",
             arguments: ["-c", "exit 7"],
             environment: [:],
-            workingDirectory: nil
+            workingDirectory: nil,
+            purpose: .tool
         )
         let fixture = OwnedFixtureCleanup(spawned)
         addTeardownBlock { await fixture.cleanup() }
@@ -514,7 +516,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         streamingDrainTimeout: TimeInterval = 5
     ) -> CLIProcessRunner {
         CLIProcessRunner(
-            config: CLIProcessConfiguration(command: "/bin/sh", enableDebugLogging: false),
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
             processExitObserverFactory: { pid in
                 ChildProcessExitObserver(pid: pid, statusObserver: statusObserver)
             },

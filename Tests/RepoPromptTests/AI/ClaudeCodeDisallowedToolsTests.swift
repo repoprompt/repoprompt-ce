@@ -149,6 +149,7 @@ private final class OracleCancellationFixture {
         """#
         let runner = CLIProcessRunner(config: CLIProcessConfiguration(
             command: "/usr/bin/env",
+            allowsProviderProcessLaunchForTesting: true,
             workingDirectory: directory.path,
             additionalPaths: [],
             commandSuffix: ["-i", "/bin/sh", "-c", script, "oracle-fixture", gate.path, readiness.path, acknowledgement.path],

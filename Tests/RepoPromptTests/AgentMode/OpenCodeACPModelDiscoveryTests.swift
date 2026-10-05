@@ -17,7 +17,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         let client = OpenCodeACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
 
@@ -43,7 +43,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         let client = OpenCodeACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
         let service = OpenCodeACPModelPollingService(client: client, intervalNanos: 60_000_000_000)
@@ -400,6 +400,12 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                     commandPath: scriptURL.path,
                     environment: ["ACP_RECORD_PATH": recordURL.path]
                 )
+            },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
             }
         )
         let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
@@ -466,7 +472,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         let client = OpenCodeACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
         return try await body(client, workspace, recordURL)
@@ -577,7 +583,8 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            allowsProviderProcessLaunchForTesting: true
         )
         addTeardownBlock { await controller.shutdown() }
         return controller
