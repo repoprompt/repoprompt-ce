@@ -36,12 +36,83 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
+    func testGrokShellSessionApprovalUsesOnlyOneTimeOptions() async throws {
+        let cases: [(name: String, options: [[String: String]], expectedOptionID: String?)] = [
+            ("generic Bash", [
+                ["optionId": "always-allow", "kind": "allow_always", "name": "Yes, and don't ask again for bash commands"],
+                ["optionId": "allow-once", "kind": "allow_once", "name": "Yes, proceed"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"],
+                ["optionId": "reject-always", "kind": "reject_always", "name": "No, and don't ask again for this command"]
+            ], "allow-once"),
+            ("remember disabled", [
+                ["optionId": "allow-once", "kind": "allow_once", "name": "Yes, proceed"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], "allow-once"),
+            ("opaque kind fallback", [
+                ["optionId": "opaque-persistent", "kind": "allow_always", "name": "Remember"],
+                ["optionId": "opaque-once", "kind": "allow_once", "name": "Allow"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], "opaque-once"),
+            ("always preference", [
+                ["optionId": "always", "kind": "allow_always", "name": "Remember"],
+                ["optionId": "allow-once", "kind": "allow_once", "name": "Allow"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], "allow-once"),
+            ("allow_always preference", [
+                ["optionId": "allow_always", "kind": "allow_always", "name": "Remember"],
+                ["optionId": "allow-once", "kind": "allow_once", "name": "Allow"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], "allow-once"),
+            ("persistent only", [
+                ["optionId": "always-allow", "kind": "allow_always", "name": "Remember"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], nil)
+        ]
+        for testCase in cases {
+            let outcome = try await permissionOutcome(
+                providerID: .grokBuild, decision: .acceptForSession, options: testCase.options
+            )
+            XCTAssertEqual(outcome["outcome"], testCase.expectedOptionID == nil ? "cancelled" : "selected", testCase.name)
+            XCTAssertEqual(outcome["optionId"], testCase.expectedOptionID, testCase.name)
+        }
+    }
+
+    func testGrokEditSessionApprovalPreservesScope() async throws {
+        let options = [
+            ["optionId": "allow-edits-session", "kind": "allow_always", "name": "Yes, allow all edits during this session"],
+            ["optionId": "allow-once", "kind": "allow_once", "name": "Yes"],
+            ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+        ]
+        for (decision, expectedOptionID): (AgentApprovalDecision, String) in [
+            (.acceptForSession, "allow-edits-session"), (.accept, "allow-once")
+        ] {
+            let outcome = try await permissionOutcome(
+                providerID: .grokBuild, decision: decision, options: options, toolKind: "edit"
+            )
+            XCTAssertEqual(outcome["outcome"], "selected", "\(decision)")
+            XCTAssertEqual(outcome["optionId"], expectedOptionID, "\(decision)")
+        }
+    }
+
     private func permissionOutcome(
         providerID: ACPProviderID,
         decision: AgentApprovalDecision,
         optionID: String,
         optionKind: String = "allow_always"
     ) async throws -> [String: String] {
+        try await permissionOutcome(providerID: providerID, decision: decision, options: [
+            ["optionId": optionID, "kind": optionKind, "name": "Allow"],
+            ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
+        ])
+    }
+
+    private func permissionOutcome(
+        providerID: ACPProviderID,
+        decision: AgentApprovalDecision,
+        options: [[String: String]],
+        toolKind: String = "execute"
+    ) async throws -> [String: String] {
+        let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPPermissionScope")
         let executable = directory.appendingPathComponent("scripted-acp")
         let record = directory.appendingPathComponent("response.json")
@@ -62,11 +133,8 @@ final class ACPPermissionScopeTests: XCTestCase {
             elif method == "session/prompt":
                 prompt_id = request["id"]
                 send({"id": "permission-1", "method": "session/request_permission", "params": {
-                    "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1", "title": "Shell command", "kind": "execute"},
-                    "options": [
-                        {"optionId": "\#(optionID)", "kind": "\#(optionKind)", "name": "Allow"},
-                        {"optionId": "reject_once", "kind": "reject_once", "name": "Decline"}
-                    ]
+                    "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1", "title": "Test tool", "kind": "\#(toolKind)"},
+                    "options": \#(optionsJSON)
                 }})
             elif request.get("id") == "permission-1":
                 with open(r"\#(record.path)", "w", encoding="utf-8") as output:
@@ -96,7 +164,7 @@ final class ACPPermissionScopeTests: XCTestCase {
             let prompt = Task { try await controller.prompt(AgentMessage(userMessage: "Run"), request: request) }
             for await event in events {
                 if case let .approvalRequested(approval) = event {
-                    XCTAssertEqual(approval.supportsPlainApprove, optionKind == "allow_once", "\(providerID): \(optionID)")
+                    XCTAssertEqual(approval.supportsPlainApprove, options.contains { $0["kind"] == "allow_once" }, "\(providerID)")
                     await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: decision)
                     break
                 }
