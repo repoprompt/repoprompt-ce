@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import RepoPromptProcess
 
@@ -100,6 +101,12 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         }
         try Task.checkCancellation()
 
+        // Freeze the same effective environment the runner uses, including inherited Grok home.
+        let environment = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner, overrides: launch.environment)
+        ).environment
+        try Task.checkCancellation()
+
         let promptDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-grok-oneshot-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -107,101 +114,317 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
-        defer {
-            try? Self.cleanupRequestArtifacts(
-                promptDirectory: promptDirectory,
-                environment: launch.environment
+        return try await Self.withRequestCleanup(
+            promptDirectory: promptDirectory,
+            environment: environment
+        ) {
+            let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
+            let prompt = Self.promptText(from: message)
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AIProviderError.invalidResponse(detail: "Grok Build prompt is empty")
+            }
+            try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
+
+            let processConfig = CLIProcessConfiguration(
+                command: launch.command,
+                workingDirectory: promptDirectory.path,
+                environment: environment,
+                additionalPaths: [],
+                enableDebugLogging: config.enableDebugLogging,
+                resolveCandidates: [(launch.command as NSString).lastPathComponent],
+                shellLookupMode: .disabled
             )
-        }
+            let runner = CLIProcessRunner(config: processConfig)
 
-        let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
-        let prompt = Self.promptText(from: message)
-        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "Grok Build prompt is empty")
-        }
-        try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
+            var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if apiKey?.isEmpty != false {
+                apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let additionalEnvironment = Self.launchEnvironment(apiKey: apiKey)
+            try Task.checkCancellation()
 
-        let processConfig = CLIProcessConfiguration(
-            command: launch.command,
-            workingDirectory: promptDirectory.path,
-            environment: launch.environment,
-            additionalPaths: [],
-            enableDebugLogging: config.enableDebugLogging,
-            resolveCandidates: [(launch.command as NSString).lastPathComponent],
-            shellLookupMode: .disabled
-        )
-        let runner = CLIProcessRunner(config: processConfig)
+            let arguments = GrokBuildOneShotCLIOptions(
+                promptFilePath: promptURL.path,
+                model: selection.model,
+                effort: selection.effort
+            ).toTokens()
 
-        var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey?.isEmpty != false {
-            apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let additionalEnvironment = Self.launchEnvironment(apiKey: apiKey)
-        try Task.checkCancellation()
+            let result: (stdout: Data, stderr: Data, status: Int32, timedOut: Bool)
+            do {
+                // Revalidate at the final launch boundary after all async/keychain work.
+                try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
+                result = try await Self.runRequestProcess(
+                    runner: runner,
+                    arguments: arguments,
+                    timeout: requestTimeout,
+                    additionalEnvironment: additionalEnvironment,
+                    additionalRemovedKeys: environment["GROK_HOME"] == nil ? ["GROK_HOME"] : []
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw mapProcessError(error)
+            }
 
-        let arguments = GrokBuildOneShotCLIOptions(
-            promptFilePath: promptURL.path,
-            model: selection.model,
-            effort: selection.effort
-        ).toTokens()
+            if result.timedOut {
+                throw runtimeError(
+                    code: Int(result.status),
+                    message: "Grok Build timed out after \(Int(requestTimeout))s."
+                )
+            }
 
-        let result: CLIProcessRunner.Result
-        do {
-            // Revalidate at the final launch boundary after all async/keychain work.
-            try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
-            result = try await runner.run(
-                args: arguments,
-                stdin: nil,
-                outputMode: .none,
-                timeout: requestTimeout,
-                additionalEnvironment: additionalEnvironment,
-                cancelChildOnTaskCancellation: true
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw mapProcessError(error)
-        }
+            if result.status != 0 {
+                throw mapProcessFailure(
+                    exitCode: result.status,
+                    stdout: result.stdout,
+                    stderr: result.stderr
+                )
+            }
 
-        if result.timedOut {
-            throw runtimeError(
-                code: Int(result.status),
-                message: "Grok Build timed out after \(Int(requestTimeout))s."
-            )
-        }
-
-        if result.status != 0 {
-            throw mapProcessFailure(
-                exitCode: result.status,
-                stdout: result.stdout,
-                stderr: result.stderr
-            )
-        }
-
-        if let errorMessage = Self.structuredErrorMessage(from: result.stdout) {
-            throw normalizeCLIError(message: errorMessage, exitCode: result.status)
-        }
-        guard !result.stdout.isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "Grok Build CLI returned no output")
-        }
-        do {
-            return try Self.parseCompletion(result.stdout)
-        } catch let error as AIProviderError {
-            throw error
-        } catch {
-            throw AIProviderError.invalidResponse(
-                detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
-            )
+            if let errorMessage = Self.structuredErrorMessage(from: result.stdout) {
+                throw normalizeCLIError(message: errorMessage, exitCode: result.status)
+            }
+            guard !result.stdout.isEmpty else {
+                throw AIProviderError.invalidResponse(detail: "Grok Build CLI returned no output")
+            }
+            do {
+                return try Self.parseCompletion(result.stdout)
+            } catch let error as AIProviderError {
+                throw error
+            } catch {
+                throw AIProviderError.invalidResponse(
+                    detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
+                )
+            }
         }
     }
 
-    /// The existing cleanup boundary, extracted so request-owned artifacts can be verified without a CLI.
+    /// The streaming runner's physical finalizer, not its bounded result or cancellation,
+    /// is the authority for when the request's child has stopped writing.
+    private static func runRequestProcess(
+        runner: CLIProcessRunner,
+        arguments: [String],
+        timeout: TimeInterval,
+        additionalEnvironment: [String: String],
+        additionalRemovedKeys: Set<String>
+    ) async throws -> (stdout: Data, stderr: Data, status: Int32, timedOut: Bool) {
+        let termination = GrokBuildOneShotProcessTermination()
+        let stream = try await runner.runStreaming(
+            args: arguments,
+            stdin: nil,
+            outputMode: .none,
+            timeout: timeout,
+            additionalEnvironment: additionalEnvironment,
+            additionalRemovedKeys: additionalRemovedKeys,
+            onProcessTerminated: { _ in await termination.finish() }
+        )
+        var stdout = Data()
+        var stderr = Data()
+        var exitStatus: (status: Int32, timedOut: Bool)?
+        do {
+            for try await event in stream {
+                switch event {
+                case let .stdout(data): stdout.append(data)
+                case let .stderr(data): stderr.append(data)
+                case let .terminated(status, timedOut): exitStatus = (status, timedOut)
+                }
+            }
+        } catch {
+            await termination.wait()
+            try Task.checkCancellation()
+            throw error
+        }
+        // AsyncThrowingStream can end normally on consumer cancellation. Always join
+        // physical finalization before the outer request scope removes any artifacts.
+        await termination.wait()
+        try Task.checkCancellation()
+        guard let exitStatus else {
+            throw AIProviderError.invalidResponse(detail: "Grok Build process ended without an exit status")
+        }
+        return (stdout: stdout, stderr: stderr, status: exitStatus.status, timedOut: exitStatus.timedOut)
+    }
+
+    /// Failed deletion is diagnostic and must not replace a successful completion,
+    /// original request failure, or cancellation.
+    static func withRequestCleanup<Value>(
+        promptDirectory: URL,
+        environment: [String: String],
+        removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
+        reportFailure: (String) -> Void = { NSLog("%@", $0) },
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        var resolvedDirectory: URL?
+        var existingHashedNames: Set<String>?
+        defer {
+            do {
+                if let resolvedDirectory {
+                    try cleanupRequestArtifacts(
+                        promptDirectory: promptDirectory,
+                        environment: environment,
+                        resolvedDirectory: resolvedDirectory,
+                        existingHashedNames: existingHashedNames,
+                        removeItem: removeItem
+                    )
+                } else {
+                    // Path resolution failed before launch; no child owns session storage.
+                    try removeItemIfPresent(promptDirectory, removeItem: removeItem)
+                }
+            } catch {
+                reportFailure(cleanupFailureDiagnostic(error))
+            }
+        }
+        let physicalDirectory = try resolvedRequestDirectory(promptDirectory)
+        resolvedDirectory = physicalDirectory
+        // Long cwd names are hashed upstream. Capture pre-existing matching names
+        // so a child crash before finishing .cwd does not leave its newly-created folder.
+        // Other requests have distinct UUID-bearing cwd slugs; this is not a history sweep.
+        if encodedCWD(physicalDirectory.path).utf8.count > 255 {
+            do {
+                existingHashedNames = try Set(hashedSessionCandidates(
+                    sessionsRoot: sessionsRoot(promptDirectory: physicalDirectory, environment: environment),
+                    cwd: physicalDirectory.path
+                ).map(\.lastPathComponent))
+            } catch {
+                reportFailure(cleanupFailureDiagnostic(error))
+            }
+        }
+        return try await operation()
+    }
+
     static func cleanupRequestArtifacts(
         promptDirectory: URL,
-        environment _: [String: String]
+        environment: [String: String],
+        resolvedDirectory: URL? = nil,
+        existingHashedNames: Set<String>? = nil,
+        removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
     ) throws {
-        try FileManager.default.removeItem(at: promptDirectory)
+        let cwd = try (resolvedDirectory ?? resolvedRequestDirectory(promptDirectory)).path
+        let root = sessionsRoot(promptDirectory: URL(fileURLWithPath: cwd, isDirectory: true), environment: environment)
+        var failure: Error?
+        do {
+            let encoded = encodedCWD(cwd)
+            if encoded.utf8.count <= 255 {
+                try removeItemIfPresent(root.appendingPathComponent(encoded, isDirectory: true), removeItem: removeItem)
+            } else {
+                for candidate in try hashedSessionCandidates(sessionsRoot: root, cwd: cwd) {
+                    let values = try candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                    guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+                    let marker = candidate.appendingPathComponent(".cwd")
+                    let storedCWD: String?
+                    var incompleteMarker = false
+                    do {
+                        let handle = try FileHandle(forReadingFrom: marker)
+                        defer { try? handle.close() }
+                        // A cwd marker is a path, never a prompt. Bound the read to the
+                        // expected path plus a newline, even if a malformed marker is large.
+                        let limit = cwd.utf8.count + 2
+                        let bytes = try handle.read(upToCount: limit) ?? Data()
+                        guard bytes.count < limit else { continue }
+                        // A failed write can end inside a UTF-8 character. Recognize
+                        // a partial prefix without decoding it as a complete path.
+                        incompleteMarker = bytes.count < cwd.utf8.count && cwd.utf8.starts(with: bytes)
+                        storedCWD = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    } catch {
+                        guard isMissingFile(error) else { throw error }
+                        storedCWD = nil
+                        incompleteMarker = true
+                    }
+                    let newlyCreatedWithIncompleteMarker = incompleteMarker
+                        && existingHashedNames.map { !$0.contains(candidate.lastPathComponent) } == true
+                    guard storedCWD == cwd || newlyCreatedWithIncompleteMarker else { continue }
+                    do {
+                        try removeItemIfPresent(candidate, removeItem: removeItem)
+                    } catch {
+                        if failure == nil { failure = error }
+                    }
+                }
+            }
+        } catch {
+            failure = error
+        }
+        // Even a failed session delete must not retain the temporary prompt file too.
+        do {
+            try removeItemIfPresent(promptDirectory, removeItem: removeItem)
+        } catch {
+            if failure == nil { failure = error }
+        }
+        if let failure { throw failure }
+    }
+
+    private static func resolvedRequestDirectory(_ directory: URL) throws -> URL {
+        // Foundation can shorten /private/var back to /var while resolving symlinks.
+        // Grok uses the physical getcwd path, so preserve POSIX realpath's spelling.
+        guard let path = realpath(directory.path, nil) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { free(path) }
+        return URL(fileURLWithPath: String(cString: path), isDirectory: true)
+    }
+
+    private static func sessionsRoot(promptDirectory: URL, environment: [String: String]) -> URL {
+        let grokHome: URL
+        if let override = environment["GROK_HOME"], !override.isEmpty {
+            grokHome = URL(fileURLWithPath: override, isDirectory: true, relativeTo: promptDirectory)
+        } else {
+            let home = URL(fileURLWithPath: environment["HOME"] ?? NSHomeDirectory(), isDirectory: true, relativeTo: promptDirectory)
+            grokHome = home.resolvingSymlinksInPath().appendingPathComponent(".grok", isDirectory: true)
+        }
+        return grokHome.appendingPathComponent("sessions", isDirectory: true)
+    }
+
+    private static func encodedCWD(_ cwd: String) -> String {
+        cwd.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))!
+    }
+
+    private static func hashedSessionCandidates(sessionsRoot: URL, cwd: String) throws -> [URL] {
+        var slug = ""
+        for scalar in (cwd as NSString).lastPathComponent.lowercased().unicodeScalars {
+            if (48 ... 57).contains(scalar.value) || (97 ... 122).contains(scalar.value) {
+                slug.unicodeScalars.append(scalar)
+            } else if slug.last != "-" {
+                slug.append("-")
+            }
+        }
+        slug = String(slug.trimmingCharacters(in: CharacterSet(charactersIn: "-")).prefix(40))
+        let prefix = (slug.isEmpty ? "workspace" : slug) + "-"
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(
+                at: sessionsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: []
+            )
+        } catch {
+            if isMissingFile(error) { return [] }
+            throw error
+        }
+        return entries.filter { entry in
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(prefix) else { return false }
+            let suffix = name.dropFirst(prefix.count)
+            return suffix.count == 16 && suffix.allSatisfy { "0123456789abcdef".contains($0) }
+        }
+    }
+
+    private static func removeItemIfPresent(_ url: URL, removeItem: (URL) throws -> Void) throws {
+        do {
+            try removeItem(url)
+        } catch {
+            if !isMissingFile(error) { throw error }
+        }
+    }
+
+    private static func isMissingFile(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code))
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+    }
+
+    private static func cleanupFailureDiagnostic(_ error: Error) -> String {
+        // Do not include error descriptions, domains, paths, or userInfo: any of
+        // those can contain prompt content. The numeric filesystem code is bounded.
+        "[GrokBuildOneShot] Request artifact cleanup failed (filesystem code \((error as NSError).code)); artifacts may remain."
     }
 
     /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
@@ -380,6 +603,23 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             )
         )
         return results
+    }
+}
+
+/// One request has one finalization waiter. Cancellation must not cancel this join.
+private actor GrokBuildOneShotProcessTermination {
+    private var terminated = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func finish() {
+        terminated = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func wait() async {
+        guard !terminated else { return }
+        await withCheckedContinuation { continuation = $0 }
     }
 }
 
