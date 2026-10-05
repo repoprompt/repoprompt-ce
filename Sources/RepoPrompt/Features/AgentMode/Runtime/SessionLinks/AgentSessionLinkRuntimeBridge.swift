@@ -7074,10 +7074,12 @@ final class AgentSessionLinkRuntimeBridge {
                     modelID, availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID)
                 )
             } else {
-                // Preserve the existing role/default behavior. Explicit selections never warm.
+                // Role/default selections retain persisted-catalog warming. Explicit selections never warm.
                 await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
                 selection = try AgentSessionLanePolicy.resolveRole(
-                    request.role, availability: .current, workspaceID: destination.workspaceID
+                    request.role,
+                    availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID),
+                    workspaceID: destination.workspaceID
                 )
             }
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }

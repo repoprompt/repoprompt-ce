@@ -336,6 +336,60 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         }
     }
 
+    func testRuntimeOwnedRolePinsUseRecommendationAvailability() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let registry = AgentACPModelRegistry.shared
+        let providers: [(id: ACPProviderID, agent: AgentProviderKind)] = [
+            (.antigravity, .antigravity), (.devin, .devin)
+        ]
+        for provider in providers {
+            registry.test_reset(providerID: provider.id)
+        }
+        defer {
+            for provider in providers {
+                registry.test_reset(providerID: provider.id)
+            }
+        }
+        let fixture = try makeFixture()
+        defer { fixture.apiSettings.prepareForWindowClose() }
+        let status = ProviderStatusSnapshot(
+            claudeCodeCLI: .notConfigured, codexCLI: .ready, cursorCLI: .notConfigured,
+            grokBuildCLI: .notConfigured, openAI: .notConfigured
+        )
+        for provider in providers {
+            let model = AgentModelOption(
+                rawValue: "test-\(provider.agent.rawValue)-pinned", displayName: "Pinned model", description: nil, isDefault: false
+            )
+            XCTAssertTrue(registry.updateDiscoveredModels(
+                .init(options: [model], currentModelRaw: model.rawValue), for: provider.id
+            ))
+            let pin = AgentModelSelectionID(agentRaw: provider.agent.rawValue, modelRaw: model.rawValue).rawValue
+            for available in [true, false] {
+                let name = "\(provider.agent.rawValue) available=\(available)"
+                let context = fixture.engine.mcpAgentAvailabilityContext(
+                    from: status,
+                    runtimeAvailability: AgentModelCatalog.AvailabilityContext(
+                        antigravityAvailable: provider.agent == .antigravity && available,
+                        devinAvailable: provider.agent == .devin && available
+                    )
+                )
+                let resolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+                    for: .pair,
+                    availability: context,
+                    settingsStore: AgentModelsProfileRoleDefaultsStore(overrides: ["pair": pin])
+                ), name)
+                XCTAssertEqual(
+                    resolution.selectionID.rawValue,
+                    available ? pin : AgentModelSelectionID(
+                        agentRaw: resolution.recommended.agent.rawValue, modelRaw: resolution.recommended.modelRaw
+                    ).rawValue,
+                    "\(name): recommendation inputs must preserve an executable current pin"
+                )
+                XCTAssertEqual(resolution.overrideUnavailable, !available, "\(name): unavailable pins must remain flagged")
+            }
+        }
+    }
+
     func testContextBuilderRecommendationWriteIntentDistinguishesAutomaticSeedFromExplicitApply() throws {
         let fixture = try makeFixture()
         let workspaceID = UUID()
