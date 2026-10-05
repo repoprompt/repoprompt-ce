@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 import RepoPromptProcess
@@ -107,7 +108,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     /// Uses this suite's fixture for the real controller/stdio boundary, not the headless facade.
-    /// Completed-open diagnostics fence notification delivery after the successful response.
+    /// Diagnostics establish notification send-attempt ordering after the successful response, not delivery.
     func testPermissionOverridesReachSessionOpenBeforePrompt() async throws {
         let cases: [(name: String, resumeID: String?, openMethods: [String])] = [
             ("new", nil, ["session/new"]),
@@ -200,6 +201,49 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testPostOpenNotificationWriteFailurePreventsPrompt() async throws {
+        let harness = try makeHarness(closeStdinOnOpen: true)
+        let provider = EnvForwardingGrokProvider(
+            config: GrokBuildAgentConfig(
+                commandName: harness.scriptPath,
+                additionalPathHints: [],
+                includeRepoPromptMCPServer: false
+            ),
+            extraEnvironment: ["ACP_RECORD_PATH": harness.recordURL.path]
+        )
+        let request = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: nil,
+            workspacePath: harness.workspace.path,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
+        )
+
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("Expected the post-open notification write to fail")
+        } catch {
+            XCTAssertEqual(error as? FDWriteError, .brokenPipe(errno: EPIPE))
+        }
+        let reusable = await controller.hasReusableSession
+        XCTAssertFalse(reusable, "Failed permission setup must not leave a prompt-ready session")
+        do {
+            try await controller.prompt(AgentMessage(userMessage: "must not send"), request: request)
+            XCTFail("Expected an unopened session to refuse the prompt")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "ACP controller expected sessionOpen or promptRunning, but was openingSession.")
+        }
+        XCTAssertEqual(harness.recordedMethods("session/new").count, 1)
+        XCTAssertTrue(harness.recordedMethods("session/prompt").isEmpty)
+        await controller.shutdown()
     }
 
     func testContextBuilderLaunchIsolatesImportsAndPreservesMCPInjection() async throws {
@@ -329,18 +373,20 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         await provider.dispose()
     }
 
-    private func makeHarness(advertiseConfigOptions: Bool = false) throws -> Harness {
+    private func makeHarness(advertiseConfigOptions: Bool = false, closeStdinOnOpen: Bool = false) throws -> Harness {
         let workspace = try makeTestDirectory(name: "GrokBuildACPHeadlessTests")
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
         let script = #"""
         #!/usr/bin/env python3
         import json
         import os
+        import signal
         import sys
 
         record_path = os.environ.get("ACP_RECORD_PATH")
         session_id = "grok-headless-session"
         ADVERTISE_CONFIG_OPTIONS = __ADVERTISE_CONFIG_OPTIONS__
+        CLOSE_STDIN_ON_OPEN = __CLOSE_STDIN_ON_OPEN__
 
         if "--help" in sys.argv:
             print("Usage: grok agent [OPTIONS] [COMMAND]\n\nCommands:\n  stdio    Run the agent over stdio")
@@ -402,7 +448,14 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                          "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]},
                         {"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": "xhigh",
                          "options": [{"value": e} for e in ["xhigh", "high", "medium", "low"]]}]
+                if CLOSE_STDIN_ON_OPEN:
+                    # Close before replying so the next write fails deterministically; keep
+                    # stdout and the process alive until controller shutdown, avoiding exit races.
+                    os.close(sys.stdin.fileno())
                 respond(request_id, result)
+                if CLOSE_STDIN_ON_OPEN:
+                    signal.pause()
+                    break
             elif method == "session/set_model":
                 respond(request_id, {"_meta": {"model": {"Ok": params.get("modelId")}}})
             elif method == "session/prompt":
@@ -424,7 +477,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 respond(request_id, {"stopReason": "end_turn"})
             elif request_id is not None:
                 respond(request_id, {})
-        """#.replacingOccurrences(of: "__ADVERTISE_CONFIG_OPTIONS__", with: advertiseConfigOptions ? "True" : "False") + "\n"
+        """#.replacingOccurrences(of: "__ADVERTISE_CONFIG_OPTIONS__", with: advertiseConfigOptions ? "True" : "False")
+            .replacingOccurrences(of: "__CLOSE_STDIN_ON_OPEN__", with: closeStdinOnOpen ? "True" : "False") + "\n"
         let scriptURL = workspace.appendingPathComponent("grok")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)

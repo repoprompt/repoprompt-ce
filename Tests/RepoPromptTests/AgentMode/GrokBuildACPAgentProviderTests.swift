@@ -152,11 +152,11 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
                         "yoloMode": .bool(false),
                         "autoMode": .bool(false)
                     ]
-                    let expectedNotifications: [ACPSessionConfiguration.PostOpenNotification] = fullAccess ? [] : [
-                        .init(method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)])
-                    ]
+                    let expectedNotification: ACPSessionConfiguration.PostOpenNotification? = fullAccess ? nil : .init(
+                        method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
+                    )
                     XCTAssertEqual(session.metadata, expectedMetadata, context)
-                    XCTAssertEqual(session.postOpenNotifications, expectedNotifications, context)
+                    XCTAssertEqual(session.postOpenNotification, expectedNotification, context)
                 }
             }
         }

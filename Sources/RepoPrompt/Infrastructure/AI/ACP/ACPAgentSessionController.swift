@@ -707,7 +707,7 @@ actor ACPAgentSessionController {
         log("Opening ACP session")
         logSessionMCPInjection()
         let openSessionResult = try await openSession()
-        for notification in sessionConfiguration.postOpenNotifications {
+        if let notification = sessionConfiguration.postOpenNotification {
             try sendJSONLine([
                 "jsonrpc": "2.0",
                 "method": notification.method,

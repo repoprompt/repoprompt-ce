@@ -224,20 +224,20 @@ struct ACPSessionConfiguration: Equatable {
     /// Provider-owned `_meta` on every session-open attempt; empty means omit the key.
     let metadata: [String: AgentJSONValue]
     /// Sent once after successful opening (including fallback), before the first prompt.
-    let postOpenNotifications: [PostOpenNotification]
+    let postOpenNotification: PostOpenNotification?
 
     init(
         mode: Mode,
         workingDirectory: String,
         mcpServers: [RepoPromptMCPServerConfiguration],
         metadata: [String: AgentJSONValue] = [:],
-        postOpenNotifications: [PostOpenNotification] = []
+        postOpenNotification: PostOpenNotification? = nil
     ) {
         self.mode = mode
         self.workingDirectory = workingDirectory
         self.mcpServers = mcpServers
         self.metadata = metadata
-        self.postOpenNotifications = postOpenNotifications
+        self.postOpenNotification = postOpenNotification
     }
 }
 

@@ -91,9 +91,9 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
             mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : [],
             metadata: fullAccess ? [:] : ["yoloMode": .bool(false), "autoMode": .bool(false)],
-            postOpenNotifications: fullAccess ? [] : [
-                .init(method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)])
-            ]
+            postOpenNotification: fullAccess ? nil : .init(
+                method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
+            )
         )
     }
 
