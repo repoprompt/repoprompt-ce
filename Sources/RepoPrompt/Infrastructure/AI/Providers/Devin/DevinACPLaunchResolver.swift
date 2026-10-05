@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum DevinACPLaunchCandidate: Equatable {
     case devinACP

@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -5,6 +6,7 @@ import XCTest
 final class CursorLocalModelCatalogTests: XCTestCase {
     override func setUp() {
         super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
     }
 

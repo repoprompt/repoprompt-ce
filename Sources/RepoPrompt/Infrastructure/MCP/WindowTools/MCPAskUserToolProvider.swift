@@ -4,6 +4,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
 final class MCPAskUserToolProvider: MCPAppToolProviding {

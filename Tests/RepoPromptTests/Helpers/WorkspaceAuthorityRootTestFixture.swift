@@ -2,6 +2,8 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 #if DEBUG
@@ -382,8 +384,8 @@ import XCTest
             let catalog = await runtime.workspaceStore.snapshot()
             let projected = await bridge.waitUntilProjected(through: catalog.publicationSequence)
             guard projected else { throw CheckpointFailure.projectionTimedOut }
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
         }
 
         /// Active admission is deliberately separate from the passive convergence checkpoint.
@@ -433,20 +435,42 @@ import XCTest
             let after = await runtime.workspaceStore.snapshot()
             let diskAfter = try Data(contentsOf: workspaceURL)
             var changed: [String] = []
-            if model != manager.workspace(withID: workspace.id) { changed.append("manager model") }
+            if model != manager.workspace(withID: workspace.id) {
+                changed.append("manager model")
+            }
             // Debounced in-memory observers can advance the dirty-tracking version while
             // this cross-actor read is suspended, without changing the model or authority.
             // No-op actions bracket their own version on the main actor instead.
-            if shells != files.visibleRootShellProjections { changed.append("visible shells") }
-            if ticket != manager.currentRootReconciliationTicketForTesting { changed.append("reconciliation ticket") }
-            if selection != files.snapshotSelection() { changed.append("selection") }
-            if notifications != rootNotificationCount { changed.append("root notifications") }
-            if roots != rootsAfter { changed.append("primary roots") }
-            if readinessObservation != observationAfter { changed.append("root readiness") }
-            if savedState != savedAfter { changed.append("saved state") }
-            if before.publicationSequence != after.publicationSequence { changed.append("publication sequence") }
-            if canonical != canonicalAfter { changed.append("canonical workspace") }
-            if diskBytes != diskAfter { changed.append("disk bytes") }
+            if shells != files.visibleRootShellProjections {
+                changed.append("visible shells")
+            }
+            if ticket != manager.currentRootReconciliationTicketForTesting {
+                changed.append("reconciliation ticket")
+            }
+            if selection != files.snapshotSelection() {
+                changed.append("selection")
+            }
+            if notifications != rootNotificationCount {
+                changed.append("root notifications")
+            }
+            if roots != rootsAfter {
+                changed.append("primary roots")
+            }
+            if readinessObservation != observationAfter {
+                changed.append("root readiness")
+            }
+            if savedState != savedAfter {
+                changed.append("saved state")
+            }
+            if before.publicationSequence != after.publicationSequence {
+                changed.append("publication sequence")
+            }
+            if canonical != canonicalAfter {
+                changed.append("canonical workspace")
+            }
+            if diskBytes != diskAfter {
+                changed.append("disk bytes")
+            }
             guard changed.isEmpty else {
                 throw CheckpointFailure.authorityChangedDuringCapture(changed.joined(separator: ", "))
             }
@@ -500,7 +524,9 @@ import XCTest
                 manager.prepareForWindowClose()
                 await manager.awaitRootReconciliationShutdown()
             }
-            if let notificationObserver { NotificationCenter.default.removeObserver(notificationObserver) }
+            if let notificationObserver {
+                NotificationCenter.default.removeObserver(notificationObserver)
+            }
             notificationObserver = nil
             if let files {
                 for root in await files.workspaceFileContextStore.roots() {
@@ -514,8 +540,8 @@ import XCTest
                 XCTAssertEqual(result.finalLifecycle, .stopped)
             }
             if workspace != nil {
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL)
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL)
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
             }
             bridge = nil
             manager = nil

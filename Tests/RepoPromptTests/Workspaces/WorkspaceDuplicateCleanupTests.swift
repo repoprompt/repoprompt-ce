@@ -1,6 +1,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -28,13 +29,13 @@ import XCTest
             await AgentSessionDataService.shared.test_setWorkspaceRootOverride(agentWorkspaceRoot)
             await ChatDataService.test_setWorkspaceRootOverride(chatWorkspaceRoot)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             await AgentSessionDataService.shared.test_setWorkspaceRootOverride(nil)
             await ChatDataService.test_setWorkspaceRootOverride(nil)
             try? FileManager.default.removeItem(at: storageRoot)

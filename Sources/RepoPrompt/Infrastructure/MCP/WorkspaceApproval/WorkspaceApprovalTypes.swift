@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  WorkspaceApprovalTypes.swift
 //  RepoPrompt

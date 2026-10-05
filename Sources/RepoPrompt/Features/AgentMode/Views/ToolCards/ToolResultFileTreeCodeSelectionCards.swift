@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import SwiftUI
 
 struct FileTreeCardPresentation: Equatable {

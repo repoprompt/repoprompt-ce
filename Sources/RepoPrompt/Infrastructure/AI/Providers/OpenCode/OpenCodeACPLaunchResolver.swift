@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct OpenCodeACPResolvedLaunch: Equatable {
     let command: String

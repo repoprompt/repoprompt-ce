@@ -2,7 +2,9 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptShared
+import RepoPromptVCS
 
 struct OracleExportFile: Equatable {
     let path: String

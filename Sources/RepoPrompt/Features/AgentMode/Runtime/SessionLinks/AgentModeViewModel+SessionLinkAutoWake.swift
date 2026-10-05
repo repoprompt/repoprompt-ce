@@ -1277,12 +1277,28 @@ extension AgentModeViewModel {
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return
         }
-        _ = resumeWaitingInstructionContinuation(
+        // The continuation is also a physical acceptance boundary. Carry the note first, just as
+        // native/ACP provider sends do; never consume either receipt before the resume succeeds.
+        let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}
+        if let noteID = carry.dispatchID {
+            guard AgentSelfCompactParkedPrefix.markAttempted(noteID, session: session) else { return }
+        }
+        let accepted = resumeWaitingInstructionContinuation(
             session: session,
-            providerText: claim.fragment,
+            providerText: carry.text,
             claim: claim,
             origin: .laneUpdateAutoWake(wakeID: wakeID)
         )
+        if let noteID = carry.dispatchID {
+            if accepted {
+                AgentSelfCompactParkedPrefix.markAccepted(noteID, session: session)
+            } else {
+                var state = session.selfCompactState
+                _ = state.noteDefinitivelyNotAttempted(noteID)
+                session.selfCompactState = state
+            }
+            scheduleSave(for: session)
+        }
     }
 
     // MARK: - Routine wake interval
@@ -1831,7 +1847,7 @@ extension AgentModeViewModel {
             && !session.bindingTransitionInProgress
             && !session.terminalCommitInProgress
             && !session.mcpFollowUpRunPending
-            && !session.selfCompactState.blocksAutomaticWake
+            && !agentSelfCompactBlocksNotificationWake(session)
             && !session.isComposerSubmissionInFlight
             && !session.isPreparingInitialWorktree
             && !session.isChangingExecutionLocation

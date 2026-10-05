@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 
 enum AgentToolCardRenderStatus: String, Codable, Equatable {
     case neutral

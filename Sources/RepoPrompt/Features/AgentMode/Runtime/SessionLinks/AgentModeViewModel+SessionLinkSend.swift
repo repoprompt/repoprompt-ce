@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 // The target-side execution of one attributed cross-session `send`.
 //

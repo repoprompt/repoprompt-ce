@@ -2,8 +2,10 @@ import AppKit
 import Combine
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import SwiftUI
 

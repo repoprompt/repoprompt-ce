@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum AgentModelCatalog {
     static func cursorEffortOption(_ option: AgentModelOption, configID: String, valueRaw: String) -> AgentModelOption? {

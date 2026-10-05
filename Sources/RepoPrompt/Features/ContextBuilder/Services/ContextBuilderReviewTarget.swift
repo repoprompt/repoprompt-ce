@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 /// Single source of truth for notification preference keys, labels, and descriptions, shared by the
 /// Settings pane and the `app_settings` MCP `notifications` group.

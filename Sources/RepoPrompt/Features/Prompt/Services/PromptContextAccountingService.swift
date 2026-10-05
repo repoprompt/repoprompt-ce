@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 
 /// Dormant value-based orchestration for resolving persisted workspace selections into prompt-entry

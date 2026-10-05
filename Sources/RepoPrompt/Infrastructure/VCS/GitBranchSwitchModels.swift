@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 // MARK: - Git Branch Switch Models
 

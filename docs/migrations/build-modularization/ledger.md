@@ -1149,3 +1149,138 @@ denial, multiwindow, cancellation, replay), and headless initialize/list/read-on
 runtime checks. Dedicated validator owns these next gates. Live lifecycle requires
 separate explicit overseer approval. Local commit authorization is not push/PR or
 lifecycle authorization; no integration engineer builds/tests/formatter were run.
+
+## PR5 — B1–B4 platform extraction (2026-10-04)
+
+Base: `3fbf7d0d41a4fe04c1bc701327afd297ccaeaf74`, branch
+`modularization/pr5-platform`. Three disjoint Sol engineers owned FileSystem,
+VCS, and SettingsCore; the coordinator owned Persistence, manifests, app
+composition, and integration. PR6 WorkspaceContext extraction is not included.
+
+- **B1:** FileSystem owns watchers/FSEvents, ignore compilation and neutral
+  matching contracts, content reads, seed-plan reading, and the generic injected
+  disk writer. App metrics/recording, settings policy, authenticated seed-plan
+  adapters, and workspace write policy remain app-owned.
+- **B2:** VCS owns app-free repository/worktree queries and reusable parsers and
+  values. GitService and feature-dependent receipt/presentation authority stay
+  app-owned; no full GitService rewrite.
+- **B3:** Persistence owns CodeMapArtifacts and DurableArtifacts plus canonical
+  selection contribution values. App source-snapshot verification adapters retain
+  the original raw-byte/OID/digest guards. Presets remain deferred.
+- **B4:** SettingsCore owns the document, file store, neutral values and store,
+  including `.shared` compatibility and immutable global-ignore settings.
+  Application catalogs, notification mapping, UI normalization and bootstrap stay
+  app-owned. Persisted keys and compatibility literals are unchanged.
+
+`Sources/RepoPromptShared`, `Sources/RepoPromptDomainRuntime`,
+`Sources/RepoPromptMCP`, and the frozen prototype are untouched. Reliability
+transport/bootstrap/Exec-reporting repairs are not absorbed. Contributor overlaps
+in GitService/receipts stay at their original app paths; moved root-manifest and
+settings fixes require path reconciliation against their exact contributor heads,
+not blanket deferral or unreviewed cherry-picks.
+
+### Executed receipts
+
+| Boundary | Conductor ticket | Actual result |
+| --- | --- | --- |
+| App product | `231c341a-3c12-4eff-9f80-22d8565dee0b` | PASS |
+| MCP product | `f9e08926-d451-4d47-a78f-c50ceb82bb79` | PASS |
+| Content reads + compatibility goldens | `9fdd0a5c-051d-499d-8316-e3e768aababa` | 40 tests, zero failures |
+| Final platform owners + focused app integration | `deb667b5-66db-44cc-8c87-aa59a4bc0ec5` | 61 owning tests + 97 app tests, zero failures |
+| Event-bridge fixture regressions | `30f34235-741b-414c-829e-ffd576050374` | 12 tests, zero failures |
+| Broad final Swift source validation | `46a276bf-e38f-40ff-9ed0-fab61ce555a0` | 4,399 tests, four skipped, zero failures; 14 targets |
+| Pinned formatter + strict lint | `a4c64972-916f-4805-b49d-896de7145a2d` | PASS; 0/1,632 files require formatting |
+
+Guardrails passed, including 36 target rows, placement, dependency edges, licenses,
+headless fences and 15 metrics tests. Nested-sandbox SwiftPM manifest evaluation
+failed first; the approved unsandboxed guardrail invocation passed. This is a
+validation-environment receipt, not a source defect.
+
+Historical failed receipts are retained: focused content reads
+`010cf4d8-a793-450b-905f-0480a165f5a1` and broad
+`e89816c4-9ff6-454e-9933-a90beb1d0317`. The former exposed lost host TaskLocal
+attribution across the existing detached read worker; a captured app-owned
+attribution adapter restores the original tag without new tasks, locks or unsafe
+annotations. Its final-materialization gate failure remains unattributed despite
+subsequent focused and broad passes; it is not labeled inherited. The latter
+exposed three app test hosts bypassing startup notification-bridge installation;
+explicit fixture adapters repaired delivery without weakening any assertions.
+
+Disk-writer injection preserves independent selection keys when incoming records
+are nil; the owning contract regression exercises this behavior. Source review
+confirms normalization writeback forwards the manager's injected writer, but no
+committed integration regression directly injects a non-default manager writer.
+That routing contract remains a coverage gap, not a claimed executed test. No
+timeout widening, retry sleeps, authorization weakening or assertion removal was
+used to repair failures.
+
+The four gated metrics tighten to 16 files over 5,000 lines, 47 over 2,000,
+326 app-testable imports and 89 app static shared declarations. App line count
+remains advisory; its numeric baseline and headroom are unchanged. Tracked sleep
+count growth (59 to 64) is disclosed, not silently baselined upward.
+
+**NOT_RUN:** debug packaging, visible-app lifecycle, live CE MCP acceptance and
+paid provider calls. No timing benchmark is claimed; conductor execution/queue
+and global-wait accounting are available in the ticket logs. Exact-head hosted
+checks and fresh milestone Astra review remain acceptance gates.
+
+### Independent milestone review
+
+Read-only Astra XHigh review of exact `2467154530eb0b31f2d196dde1f1dfcc3647cee5`
+found no demonstrated B1–B4 behavior, security or authority regression. It confirmed
+preserved read cancellation/permit ownership, authenticated seed-plan readers,
+raw artifact provenance/OID/byte-count/digest/CAS guards, and settings startup/event
+boundaries. Review report: `/tmp/pr5-astra-246715453-review.md` (local artifact,
+not a hosted check or new test execution).
+
+Its P3 evidence finding is corrected above: injected manager normalization routing
+is source-reviewed, not directly covered by a committed injection regression.
+Direct app raw-source-adapter mismatch coverage is also an explicit gap; owning
+container corruption/hostile-file tests validate a different layer. Duplicate pure
+delta coalescing in the app and FileSystem is a non-blocking future divergence risk,
+not a demonstrated current algorithm mismatch. The historical final-materialization
+failure remains unattributed; broad GREEN is not causal proof of its disposition.
+
+### V194 injected write-backend contract resolution
+
+The PR5 coordinator owns this B1 repair. Revised-head review at `838a583a2`
+correctly left historical V194 (revised audit row 197) unresolved: the async
+`atomicWrite` callback controlled queued writes, while eligible normalization
+bypassed it and performed physical I/O. This was not cleared by eight hosted
+GREEN checks. The default physical app behavior matched main, but the custom
+write-backend contract was defective, not merely a mechanical-audit classification.
+
+Concrete regression receipt `11a451db-f630-4804-be31-0baedcefd6a6` executed one
+case, `testNormalizationDoesNotBypassInjectedBackendFailure`, and failed both the
+refusal and unchanged-file assertions: normalization returned success and replaced
+the real file despite the injected backend refusing writes. No production source
+had changed before this RED execution.
+
+The intended contract is now explicit: `WorkspaceDiskWriteBackend` requires both
+`queuedAtomicWrite` (async) and `normalizationAtomicWrite` (synchronous), with no
+implicit physical fallback when choosing a custom backend. It is a write backend,
+not a virtual filesystem; file-stamp reads remain filesystem-owned. The default
+`.physical` backend performs the same atomic writes as main. Normalization's
+pending-slot check, size/mtime checks, synchronous backend call, and successful
+selection recording remain one non-suspending actor operation. No `await`, task,
+lock, retry, timeout inflation, or authority bypass was inserted into that critical
+section. Application composition still uses the default process-owned writer.
+
+Focused correction receipt `769a00a9-582d-4897-96b6-811a40f6c37e` executed **seven
+owning contract tests, all passed**: the five new normalization regressions cover
+backend refusal without physical mutation, custom backend dispatch without physical
+mutation, default physical behavior, stale size/date rejection, and pending-write
+rejection. The two existing selection-key and in-flight/coalescing tests retain
+their original assertions. The extra DecodeWork selector matched no app tests;
+this receipt is not claimed as app integration coverage. Revised-head full tests,
+style, hosted checks and independent delta review are separate subsequent gates.
+
+The other 257 strict-audit rows at `838a583a2` retain their exact-path/owner intended
+adaptation dispositions; the strict tool remains FAIL, not suppressed or made GREEN.
+This repair resolves a substantive injected-backend defect but does not make the
+extraction a pure move. Manager-injected normalization routing and direct app
+raw-source-adapter mismatch coverage remain separately disclosed gaps, not tests
+supplied by these owning writer or neutral container suites. The historical
+final-materialization and graph authority failures remain unattributed; subsequent
+GREEN execution is not causal explanation. No typed-path claimed source or
+separately owned reliability source was modified.

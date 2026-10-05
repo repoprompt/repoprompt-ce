@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {

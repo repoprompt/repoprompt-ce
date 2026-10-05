@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptVCS
 
 actor WorkspaceRootMaterializationHintEvaluator {
     static let shared = WorkspaceRootMaterializationHintEvaluator()

@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptCodeMapCore
 import RepoPromptFoundation
+import RepoPromptPersistence
 
 /// Root-local derived graph authority. Overlay generations are freshness metadata; queries always
 /// pin the latest immutable commit and destructive safety is enforced independently by fences.

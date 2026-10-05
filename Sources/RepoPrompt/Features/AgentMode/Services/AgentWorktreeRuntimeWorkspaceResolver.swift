@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 enum AgentWorktreeRuntimeWorkspaceResolver {
     struct Dependencies {

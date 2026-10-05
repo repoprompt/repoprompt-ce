@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 actor WorkspaceRootReusableSnapshotCoordinator {
     enum CurrentnessValidation: Equatable {

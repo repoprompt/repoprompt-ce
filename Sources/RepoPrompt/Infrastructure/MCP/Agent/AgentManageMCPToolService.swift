@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 @MainActor
 struct AgentManageMCPToolService {

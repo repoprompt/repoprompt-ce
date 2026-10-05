@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct DevinACPAgentProvider: ACPAgentProvider {
     private let config: DevinAgentConfig

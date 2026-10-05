@@ -1,6 +1,9 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 struct WorkspaceCodemapPathFingerprintClient {

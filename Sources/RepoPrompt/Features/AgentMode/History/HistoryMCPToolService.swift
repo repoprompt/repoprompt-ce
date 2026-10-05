@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 struct HistoryExecutionBudget: Equatable {
     let maxTurns: Int

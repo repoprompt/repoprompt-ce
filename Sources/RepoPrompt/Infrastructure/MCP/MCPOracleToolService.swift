@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
 struct MCPOracleToolService {

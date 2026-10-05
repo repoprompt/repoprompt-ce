@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import XCTest
 
@@ -22,7 +24,7 @@ import XCTest
                 .appendingPathComponent("WindowStateOpenFolderCommandTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -37,7 +39,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -1487,7 +1489,9 @@ import XCTest
             )
             XCTAssertEqual(dirty.disposition, .applied)
             XCTAssertNotNil(dirty.after?.dirtyRevision)
-            if unreadable { try FileManager.default.removeItem(at: fileURL) }
+            if unreadable {
+                try FileManager.default.removeItem(at: fileURL)
+            }
             return working
         }
 

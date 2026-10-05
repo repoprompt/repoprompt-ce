@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 enum GitTargetEvidenceFamily: UInt8, Equatable {
     case treeDelta = 1

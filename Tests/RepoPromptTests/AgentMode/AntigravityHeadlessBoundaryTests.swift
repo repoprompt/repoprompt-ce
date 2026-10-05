@@ -1,9 +1,15 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AntigravityHeadlessBoundaryTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private let availability = AgentModelCatalog.AvailabilityContext(
         claudeCodeAvailable: true,
         codexAvailable: true,

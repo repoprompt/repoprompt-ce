@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Test-only compatibility codec frozen from the released RepoPrompt CE v1.3.0
 /// source at `b8042678fac558842ef4bc37027d0cd26246fdd6`, before commit

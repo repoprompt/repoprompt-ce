@@ -1,9 +1,15 @@
 import Foundation
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class CursorACPModelDiscoveryTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testControllerDiscoveryReturnsLiveParameterizedCursorSnapshotWithoutRegistryPublication() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }

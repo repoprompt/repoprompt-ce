@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig

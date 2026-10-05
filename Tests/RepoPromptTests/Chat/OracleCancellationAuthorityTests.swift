@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor

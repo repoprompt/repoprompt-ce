@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// The probe context a chip host resolves for its target. `.resolved(nil)` builds the

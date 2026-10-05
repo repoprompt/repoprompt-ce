@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 
 extension MCPServerViewModel {
     struct DomainReadAppExecutionContext {

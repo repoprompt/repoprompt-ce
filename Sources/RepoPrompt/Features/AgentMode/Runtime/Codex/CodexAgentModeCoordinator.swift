@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 #if canImport(Darwin)
     import Darwin
 #endif

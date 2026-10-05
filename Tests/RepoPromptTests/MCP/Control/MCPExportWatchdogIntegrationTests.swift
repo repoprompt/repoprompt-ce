@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
 

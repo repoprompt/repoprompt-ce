@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Admission over the already-advertised catalogue, never a discovery or persistence entrypoint.
 /// Producers refresh this index while building ordinary picker/list_agents options. A cold or

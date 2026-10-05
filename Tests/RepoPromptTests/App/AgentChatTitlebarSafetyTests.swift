@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor

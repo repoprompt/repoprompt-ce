@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptWorkspaceCore
 #if os(macOS)
     import Darwin

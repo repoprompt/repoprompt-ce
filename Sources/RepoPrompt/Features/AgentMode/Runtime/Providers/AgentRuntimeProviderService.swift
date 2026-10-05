@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum ClaudeCodeRuntimeVariant: String {
     case standard

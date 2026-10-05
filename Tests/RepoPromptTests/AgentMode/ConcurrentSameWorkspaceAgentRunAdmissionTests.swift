@@ -2,6 +2,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 #if DEBUG
@@ -2084,7 +2085,7 @@ import XCTest
             guard creation.disposition == .applied else {
                 throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
             }
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceFileURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
             // A sibling window can publish a catalog projection while this synthetic workspace is
             // being created, so establish the local projection from the workspace just committed.
             if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
@@ -2198,7 +2199,7 @@ import XCTest
                 guard creation.disposition == .applied else {
                     throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
                 }
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceFileURL)
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
                 // Catalog projection and fixture creation are independent publications; the test
                 // window must expose the workspace that the authority has already committed.
                 if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {

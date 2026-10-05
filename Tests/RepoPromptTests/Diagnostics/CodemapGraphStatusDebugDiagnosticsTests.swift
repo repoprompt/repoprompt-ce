@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 #if DEBUG
     import Foundation
     import MCP
@@ -6,6 +7,11 @@
 
     @MainActor
     final class CodemapGraphStatusDebugDiagnosticsTests: XCTestCase {
+        override func setUp() {
+            super.setUp()
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        }
+
         func testOperationAttachesToCurrentWindowWorkspaceWithoutArm() async throws {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -187,7 +193,9 @@
             _ result: CallTool.Result
         ) throws -> [String: Any] {
             let text = try XCTUnwrap(result.content.compactMap { content -> String? in
-                if case let .text(text, _, _) = content { return text }
+                if case let .text(text, _, _) = content {
+                    return text
+                }
                 return nil
             }.first)
             let data = try XCTUnwrap(text.data(using: .utf8))

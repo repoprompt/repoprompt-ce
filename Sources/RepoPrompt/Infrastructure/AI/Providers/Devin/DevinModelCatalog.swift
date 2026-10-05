@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Devin reasoning effort expressed as effort-encoded model IDs (`gpt-6-sol-high`).
 ///

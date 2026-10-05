@@ -12,13 +12,17 @@ final class AgentModeProviderBindingService {
         self.preferences = preferences
     }
 
-    func topLevelSettingsControlsBinding(providerID: AgentProviderBindingID) -> AgentProviderControlsBinding {
-        preferences.topLevelSettingsControlsBinding(providerID: providerID)
+    func topLevelSettingsControlsBinding(
+        providerID: AgentProviderBindingID,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil
+    ) -> AgentProviderControlsBinding {
+        preferences.topLevelSettingsControlsBinding(providerID: providerID, claudeEffortLevel: claudeEffortLevel)
     }
 
     func controlsBinding(
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String? = nil,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent: Bool,
         externallyManagedReason: String?
@@ -26,6 +30,7 @@ final class AgentModeProviderBindingService {
         preferences.controlsBinding(
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
+            claudeEffortLevel: claudeEffortLevel,
             permissionProfile: permissionProfile,
             isSubagent: isSubagent,
             externallyManagedReason: externallyManagedReason

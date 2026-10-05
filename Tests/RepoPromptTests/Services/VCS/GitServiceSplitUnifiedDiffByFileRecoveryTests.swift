@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptVCS
 import XCTest
 
 final class GitServiceSplitUnifiedDiffByFileRecoveryTests: XCTestCase {
@@ -162,6 +164,150 @@ final class GitUntrackedLineStatsTests: XCTestCase {
         }
         let elapsed = DispatchTime.now().uptimeNanoseconds - started
         print("UNTRACKED_STATS_BENCH bytes=4194304 refreshes=5 elapsed_ns=\(elapsed)")
+    }
+
+    #if DEBUG
+        func testUntrackedStatsReuseAndFileIdentityInvalidation() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: "UntrackedStatsCacheIdentity")
+            defer { fixture.cleanup() }
+            let root = try fixture.makeRepository(named: "repo", files: ["README.md": "tracked\n"])
+            let url = root.appendingPathComponent("file.txt")
+            try Data("one\n".utf8).write(to: url)
+            let service = GitService()
+            _ = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            _ = try await service.getChangedFilesStats(
+                compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, at: root
+            )
+            var snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 1, "Both entry points share unchanged-file counts")
+            try Data("one\ntwo\n".utf8).write(to: url)
+            var files = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            XCTAssertEqual(files.first?.additions, 2)
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 2, "Changed size must reread")
+            let modified = Date(timeIntervalSince1970: 1_700_000_000)
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+            _ = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 3, "Changed mtime must reread")
+            // Atomic replacement keeps size/mtime but changes inode (and normally ctime).
+            try Data("abcdefgh".utf8).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+            files = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            XCTAssertEqual(files.first?.additions, 1)
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 4)
+            try Data([0, 10]).write(to: url)
+            for _ in 0 ..< 2 {
+                files = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+                XCTAssertNil(files.first?.additions)
+                XCTAssertNil(files.first?.deletions)
+            }
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 5, "A stable binary result is reusable too")
+        }
+
+        func testUntrackedCachePrunesFullListingsButNotPathScopedListings() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: "UntrackedStatsCachePruning")
+            defer { fixture.cleanup() }
+            let root = try fixture.makeRepository(named: "repo", files: ["README.md": "tracked\n"])
+            for name in ["one.txt", "two.txt"] {
+                try Data("line\n".utf8).write(to: root.appendingPathComponent(name))
+            }
+            let service = GitService()
+            _ = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            _ = try await service.getChangedFilesStats(
+                compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, paths: ["one.txt"], at: root
+            )
+            var snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.paths, ["one.txt", "two.txt"])
+            XCTAssertEqual(snapshot.reads, 2)
+            try FileManager.default.moveItem(at: root.appendingPathComponent("one.txt"), to: root.appendingPathComponent("renamed.txt"))
+            try FileManager.default.removeItem(at: root.appendingPathComponent("two.txt"))
+            _ = try await service.getChangedFilesStats(
+                compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, at: root
+            )
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.paths, ["renamed.txt"])
+            XCTAssertEqual(snapshot.reads, 3)
+            await service.invalidateUntrackedStats(at: root)
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertTrue(snapshot.paths.isEmpty)
+            _ = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+            snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 4, "Repository invalidation discards counts")
+        }
+
+        func testUntrackedSymlinkStatsAreNotCached() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: "UntrackedStatsSymlink")
+            defer { fixture.cleanup() }
+            let root = try fixture.makeRepository(named: "repo", files: ["README.md": "tracked\n"])
+            try FileManager.default.createSymbolicLink(
+                at: root.appendingPathComponent("link.txt"), withDestinationURL: root.appendingPathComponent("README.md")
+            )
+            let service = GitService()
+            for (text, lines) in [("one\n", 1), ("one\ntwo\n", 2)] {
+                try Data(text.utf8).write(to: root.appendingPathComponent("README.md"))
+                let files = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+                let link = try XCTUnwrap(files.first { $0.path == "link.txt" })
+                XCTAssertEqual(link.additions, lines)
+            }
+            let snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 2)
+            XCTAssertTrue(snapshot.paths.isEmpty)
+        }
+
+        func testUntrackedCacheIsBoundedAndSeparatesRepositories() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: "UntrackedStatsCacheBound")
+            defer { fixture.cleanup() }
+            let service = GitService(untrackedStatsCacheLimit: 1)
+            let one = try fixture.makeRepository(named: "one", files: ["README.md": "tracked\n"])
+            let two = try fixture.makeRepository(named: "two", files: ["README.md": "tracked\n"])
+            for (root, text, lines) in [(one, "one\n", 1), (two, "one\ntwo\n", 2)] {
+                try Data(text.utf8).write(to: root.appendingPathComponent("same.txt"))
+                let files = try await service.getChangedFilesStats(relativeTo: .head, at: root)
+                XCTAssertEqual(files.first?.additions, lines)
+            }
+            let snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: one)
+            XCTAssertEqual(snapshot.count, 1)
+            XCTAssertEqual(snapshot.paths, ["same.txt"])
+            await service.invalidateUntrackedStats(at: two)
+            _ = try await service.getChangedFilesStats(relativeTo: .head, at: one)
+            let after = await service.untrackedStatsCacheSnapshotForTesting(at: one)
+            XCTAssertEqual(after.reads, 2, "Invalidating another root cannot evict this root")
+        }
+    #endif
+
+    func testUnchangedUntrackedFilesRefreshMeasurement() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "UntrackedStatsRefresh")
+        defer { fixture.cleanup() }
+        let root = try fixture.makeRepository(named: "repo", files: ["README.md": "tracked\n"])
+        let bytes = Data((String(repeating: "a", count: 63) + "\n").utf8)
+        var data = Data()
+        for _ in 0 ..< 4096 {
+            data.append(bytes)
+        }
+        for index in 0 ..< 100 {
+            try data.write(to: root.appendingPathComponent("file-\(index).txt"))
+        }
+        let service = GitService()
+        _ = try await service.getChangedFilesStats(
+            compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, at: root
+        )
+        let started = DispatchTime.now().uptimeNanoseconds
+        for _ in 0 ..< 5 {
+            let files = try await service.getChangedFilesStats(
+                compare: .uncommitted(base: "HEAD"), includeUntrackedWhenApplicable: true, at: root
+            )
+            XCTAssertEqual(files.count, 100)
+            XCTAssertTrue(files.allSatisfy { $0.additions == 4096 && $0.deletions == 0 })
+        }
+        #if DEBUG
+            let snapshot = await service.untrackedStatsCacheSnapshotForTesting(at: root)
+            XCTAssertEqual(snapshot.reads, 100, "Warm refreshes must not reopen unchanged files")
+        #endif
+        let elapsed = DispatchTime.now().uptimeNanoseconds - started
+        print("UNTRACKED_REFRESH_BENCH files=100 bytes_each=262144 warm_refreshes=5 elapsed_ns=\(elapsed)")
     }
 
     func testNewlinesAndBinaryBytesAcrossReadChunkBoundaries() async throws {

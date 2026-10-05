@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptSettingsCore
 
 @MainActor
 final class RouterSettingsViewModel: ObservableObject {

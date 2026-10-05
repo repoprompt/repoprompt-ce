@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import SwiftUI
 
 /// Error definitions analogous to ChatSessionError:

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 struct AppOracleGroupExecutionCallbacks {
     let prepared: @MainActor @Sendable (

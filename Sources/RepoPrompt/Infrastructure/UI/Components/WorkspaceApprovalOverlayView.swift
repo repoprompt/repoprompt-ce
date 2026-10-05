@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  WorkspaceApprovalOverlayView.swift
 //  RepoPrompt

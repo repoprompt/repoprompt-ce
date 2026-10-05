@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 // MARK: - Copy Preset MCP Helpers
 

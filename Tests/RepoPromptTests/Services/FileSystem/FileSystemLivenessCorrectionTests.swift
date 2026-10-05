@@ -2,6 +2,7 @@ import CoreServices
 import Dispatch
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 final class FileSystemLivenessCorrectionTests: XCTestCase {
@@ -86,7 +87,8 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,
-            isTestMode: true
+            isTestMode: true,
+            ignoreRulesManager: makeIgnoreRulesManager()
         )
         let deliveryGeneration = service.fseventDeliveryBarrier.currentGeneration
         let streamGeneration = await service.fseventStreamGenerationForTesting()
@@ -116,7 +118,8 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,
-            isTestMode: true
+            isTestMode: true,
+            ignoreRulesManager: makeIgnoreRulesManager()
         )
         let deliveryGeneration = service.fseventDeliveryBarrier.currentGeneration
 
@@ -575,7 +578,8 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             respectRepoIgnore: true,
             respectCursorignore: false,
             skipSymlinks: true,
-            isTestMode: true
+            isTestMode: true,
+            ignoreRulesManager: makeIgnoreRulesManager()
         )
 
         let restoredRegistration = await service.beginExplicitlyManagedRegularFileRegistration(
@@ -924,7 +928,8 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,
-            isTestMode: true
+            isTestMode: true,
+            ignoreRulesManager: makeIgnoreRulesManager()
         )
         let initializationID = FileSystemSeedInitializationID()
         _ = try await service.startWatchingForSeedPreparation(
@@ -1021,4 +1026,12 @@ private final class LivenessLockedValue<Value>: @unchecked Sendable {
         storage = value
         lock.unlock()
     }
+}
+
+private func makeIgnoreRulesManager() -> IgnoreRulesManager {
+    IgnoreRulesManager(
+        globalIgnoreProvider: { "" },
+        ignorePolicyResolver: { _ in .nonGitRoot },
+        repositoryRootValidator: { _ in false }
+    )
 }

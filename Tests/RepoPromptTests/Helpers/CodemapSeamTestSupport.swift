@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptPersistence
 
 final class CodemapRuntimeTracker: @unchecked Sendable {
     private let lock = NSLock()

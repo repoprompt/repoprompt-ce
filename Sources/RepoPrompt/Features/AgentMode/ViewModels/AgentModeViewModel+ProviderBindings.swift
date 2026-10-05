@@ -107,6 +107,11 @@ extension AgentModeViewModel {
 
     func setClaudeEffortLevel(_ level: ClaudeCodeEffortLevel) {
         if let activeSession, activeSession.selectedAgent.usesClaudeTooling {
+            guard AgentModelCatalog.supportedClaudeEfforts(
+                forSelectedModelRaw: activeSession.selectedModelRaw,
+                agentKind: activeSession.selectedAgent
+            ).contains(level) else { return }
+            activeSession.selectedClaudeEffortRaw = level.rawValue
             providerBindingService.setClaudeEffortLevel(
                 level,
                 forModelRaw: activeSession.selectedModelRaw,
@@ -115,15 +120,24 @@ extension AgentModeViewModel {
             if activeSession.isMCPOriginated {
                 activeSession.selectedReasoningEffortRaw = level.rawValue
             }
+            activeSession.isDirty = true
+            scheduleSave(for: activeSession)
+            updateBindingsFromSession(activeSession)
+            claudeCoordinator.scheduleApplyCurrentClaudeModelAndEffortIfPossible(
+                for: activeSession,
+                reason: "claude_effort_changed"
+            )
         } else {
             providerBindingService.setClaudeEffortLevel(level)
         }
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-        for session in sessions.values where session.runState.isActive {
-            claudeCoordinator.scheduleApplyCurrentClaudeModelAndEffortIfPossible(
-                for: session,
-                reason: "claude_effort_changed"
-            )
+        syncAllActiveUIState()
+    }
+
+    func restoreClaudeEffort(from persisted: AgentSession, to session: TabSession) {
+        session.selectedClaudeEffortRaw = session.selectedAgent.usesClaudeTooling
+            ? persisted.agentReasoningEffort : nil
+        if session.selectedAgent.usesClaudeTooling {
+            _ = claudeCoordinator.currentClaudeEffortLevel(for: session)
         }
     }
 

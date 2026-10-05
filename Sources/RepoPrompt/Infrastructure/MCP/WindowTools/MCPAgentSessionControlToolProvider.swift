@@ -28,7 +28,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     private func agentSelfTool() -> Tool {
         guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf) else {
-            preconditionFailure("Missing canonical agent_self definition")
+            preconditionFailure("Missing canonical self_compact definition")
         }
         return runtime.tool(
             name: MCPWindowToolName.agentSelf,

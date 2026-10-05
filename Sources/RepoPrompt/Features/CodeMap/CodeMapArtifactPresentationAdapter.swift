@@ -1,4 +1,5 @@
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
 
 extension CodeMapSyntaxArtifact {
     var apiTokenCount: Int {

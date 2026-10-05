@@ -1,6 +1,9 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptPersistence
+import RepoPromptVCS
 
 struct GitPrefixControlEvidenceCacheLimits: Equatable {
     static let production = GitPrefixControlEvidenceCacheLimits(

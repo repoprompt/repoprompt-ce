@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import RepoPromptShared
 
 class SystemPromptService {

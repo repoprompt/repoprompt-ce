@@ -5,6 +5,7 @@ import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 @MainActor

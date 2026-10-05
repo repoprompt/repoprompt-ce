@@ -1,14 +1,8 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
-/// Determines how CodeMap definitions are inserted.
-enum CodeMapUsage: String, CaseIterable, Codable {
-    case auto
-    case complete
-    /// Include code-map for selected files only (handled at injection sites;
-    /// returning it here would duplicate).
-    case selected
-    case none
-}
+// Determines how CodeMap definitions are inserted.
 
 /// File tree build result with marker flags
 struct FileTreeResult {
