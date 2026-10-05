@@ -1010,16 +1010,43 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         XCTAssertTrue(text.contains("read-only `oracle_chat_log` with that lane's chat ID"), text)
         XCTAssertTrue(text.contains("Do not start a follow-up just to retrieve prior text."), text)
         XCTAssertTrue(text.contains(
-            "- Make the reconciliation visible to the user: begin your answer with `**Oracle reconciliation**`, "
-                + "state how many lanes completed and name any that did not"
+            "Begin your answer with `**Oracle reconciliation**`, "
+                + "state how many lanes completed and name any that did not."
         ), text)
-        XCTAssertTrue(text.contains("whether you accepted, rejected, or left it unresolved."), text)
+        XCTAssertTrue(text.contains("exactly one disposition: `accepted`, `rejected`, or `unresolved`."), text)
         XCTAssertTrue(text.hasSuffix("""
         Lanes (3):
         - Oracle — `model-a` — Completed — chat ID `chat-0`
         - Oracle 2 — `model-b` — Failed (partial) — chat ID `chat-1`
         - Oracle 3 — model unspecified — Failed — chat ID `chat-2`
         """), text)
+    }
+
+    func testPreambleKeepsCompleteInventoryGuidanceCompactAcrossSupportedLaneCounts() throws {
+        for count in 2 ... OracleRosterContract.maximumCount {
+            let lanes = (0 ..< count).map { index in
+                OracleGroupDeliveryContract.Lane(
+                    laneIndex: index, modelID: "model-\(index)", chatID: "chat-\(index)", status: "Completed", response: "answer"
+                )
+            }
+            let text = try XCTUnwrap(OracleGroupDeliveryContract.preamble(lanes: lanes))
+            XCTAssertTrue(text.contains(
+                "Before synthesizing, inventory every material claim from every lane, including single-lane claims."
+            ), text)
+            XCTAssertTrue(text.contains("exactly one disposition"), text)
+            XCTAssertTrue(text.contains("Never silently omit an item."), text)
+            XCTAssertTrue(text.contains("\(count) independent answers to the same request follow."), text)
+            XCTAssertTrue(try text.contains("`\(XCTUnwrap(OracleGroupDeliveryContract.endMarker(laneCount: count)))`"), text)
+
+            let lines = text.components(separatedBy: "\n")
+            let manifestRows = lines.filter { $0.hasPrefix("- Oracle") }
+            XCTAssertEqual(manifestRows, (0 ..< count).map { index in
+                let label = index == 0 ? "Oracle" : "Oracle \(index + 1)"
+                return "- \(label) — `model-\(index)` — Completed — chat ID `chat-\(index)`"
+            }, text)
+            let guidance = lines.filter { !$0.hasPrefix("- Oracle") }.joined(separator: "\n")
+            XCTAssertLessThanOrEqual(guidance.utf8.count, 1400, "\(count) lanes: \(guidance.utf8.count) guidance bytes")
+        }
     }
 
     func testLaneIsPartialOnlyWhenResponseIsBlankAndPartialIsNot() {
