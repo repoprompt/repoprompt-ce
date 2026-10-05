@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import RepoPromptVCS
 import XCTest
 
