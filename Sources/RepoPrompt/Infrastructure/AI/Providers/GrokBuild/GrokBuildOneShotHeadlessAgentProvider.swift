@@ -313,14 +313,15 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     private static func sessionsRoot(promptDirectory: URL, environment: [String: String]) -> URL {
-        let grokHome: URL
-        if let override = environment["GROK_HOME"], !override.isEmpty {
-            grokHome = URL(fileURLWithPath: override, isDirectory: true, relativeTo: promptDirectory)
-        } else {
-            let home = URL(fileURLWithPath: environment["HOME"] ?? NSHomeDirectory(), isDirectory: true, relativeTo: promptDirectory)
-            grokHome = home.resolvingSymlinksInPath().appendingPathComponent(".grok", isDirectory: true)
-        }
-        return grokHome.appendingPathComponent("sessions", isDirectory: true)
+        let override = environment["GROK_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        let home = override ?? environment["HOME"] ?? NSHomeDirectory()
+        // Preserve symlink/.. spelling: Grok lets the filesystem resolve the path,
+        // and the home may not exist until the child creates it during the request.
+        let absoluteHome = home.hasPrefix("/") ? home : promptDirectory.path + "/" + home
+        return URL(
+            fileURLWithPath: absoluteHome + (override == nil ? "/.grok/sessions" : "/sessions"),
+            isDirectory: true
+        )
     }
 
     private static func encodedCWD(_ cwd: String) -> String {
