@@ -7087,14 +7087,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionOptions(for approval: AgentApprovalRequest) -> [AgentRunMCPSnapshot.Interaction.Option] {
-        mcpApprovalDecisionLabels(for: approval, includeAliases: false).map { label in
+        let sessionDescription: String = switch approval.sessionApprovalScope {
+        case .oneTime:
+            approval.supportsPlainApprove
+                ? "Allow this action once (session-long approval is unavailable)"
+                : "Cancel this request (no one-time approval is available)"
+        case .editsSession:
+            "Allow edits for the rest of this session"
+        case nil:
+            "Allow this action for the rest of the session"
+        }
+        return mcpApprovalDecisionLabels(for: approval, includeAliases: false).map { label in
             let description: String? = switch label {
             case "accept":
                 "Allow this action"
             case "accept_for_session":
-                "Allow this action for the rest of the session"
+                sessionDescription
             case "accept_with_amendment":
-                "Allow with exec policy amendment (provide amendment field)"
+                approval.sessionApprovalScope == nil
+                    ? "Allow with exec policy amendment (provide amendment field)" : sessionDescription
             case "decline":
                 "Reject this action"
             case "cancel":

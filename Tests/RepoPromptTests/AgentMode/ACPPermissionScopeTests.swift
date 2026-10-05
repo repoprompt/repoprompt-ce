@@ -66,11 +66,21 @@ final class ACPPermissionScopeTests: XCTestCase {
             ("persistent only", [
                 ["optionId": "always-allow", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], nil)
+            ], nil),
+            ("one-time ID with persistent kind", [
+                ["optionId": "allow-once", "kind": "allow_always", "name": "Remember"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], nil),
+            ("persistent ID with one-time kind", [
+                ["optionId": "always-allow", "kind": "allow_once", "name": "Remember"],
+                ["optionId": "opaque-once", "kind": "allow_once", "name": "Allow"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], "opaque-once")
         ]
         for testCase in cases {
             let outcome = try await permissionOutcome(
-                providerID: .grokBuild, decision: .acceptForSession, options: testCase.options
+                providerID: .grokBuild, decision: .acceptForSession, options: testCase.options,
+                expectedSessionScope: .oneTime
             )
             XCTAssertEqual(outcome["outcome"], testCase.expectedOptionID == nil ? "cancelled" : "selected", testCase.name)
             XCTAssertEqual(outcome["optionId"], testCase.expectedOptionID, testCase.name)
@@ -87,7 +97,8 @@ final class ACPPermissionScopeTests: XCTestCase {
             (.acceptForSession, "allow-edits-session"), (.accept, "allow-once")
         ] {
             let outcome = try await permissionOutcome(
-                providerID: .grokBuild, decision: decision, options: options, toolKind: "edit"
+                providerID: .grokBuild, decision: decision, options: options, toolKind: "edit",
+                expectedSessionScope: .editsSession
             )
             XCTAssertEqual(outcome["outcome"], "selected", "\(decision)")
             XCTAssertEqual(outcome["optionId"], expectedOptionID, "\(decision)")
@@ -110,7 +121,8 @@ final class ACPPermissionScopeTests: XCTestCase {
         providerID: ACPProviderID,
         decision: AgentApprovalDecision,
         options: [[String: String]],
-        toolKind: String = "execute"
+        toolKind: String = "execute",
+        expectedSessionScope: AgentApprovalSessionScope? = nil
     ) async throws -> [String: String] {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPPermissionScope")
@@ -165,6 +177,11 @@ final class ACPPermissionScopeTests: XCTestCase {
             for await event in events {
                 if case let .approvalRequested(approval) = event {
                     XCTAssertEqual(approval.supportsPlainApprove, options.contains { $0["kind"] == "allow_once" }, "\(providerID)")
+                    if let expectedSessionScope {
+                        XCTAssertEqual(approval.sessionApprovalScope, expectedSessionScope)
+                    } else if providerID != .grokBuild {
+                        XCTAssertNil(approval.sessionApprovalScope, "Other providers retain legacy scope")
+                    }
                     await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: decision)
                     break
                 }
@@ -263,6 +280,46 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
             for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember"), .decline] {
                 context.session.pendingApproval = request
                 XCTAssertTrue(viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: decision))
+            }
+        }
+    }
+
+    func testGrokApprovalPresentationMatchesSelectedScope() async throws {
+        let context = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "ACP approval scope", workspaceSwitchReason: "acpApprovalScopeTests",
+            clientName: "acp-approval-scope-tests", unusedStartRunMessage: "No provider starts"
+        )
+        addTeardownBlock { @MainActor in await context.cleanup() }
+        let cases: [(scope: AgentApprovalSessionScope?, available: Bool, label: String?, description: String)] = [
+            (.oneTime, true, nil, "Allow this action once (session-long approval is unavailable)"),
+            (.oneTime, false, nil, "Cancel this request (no one-time approval is available)"),
+            (.editsSession, true, "Allow edits this session", "Allow edits for the rest of this session"),
+            (nil, true, "Always Allow", "Allow this action for the rest of the session")
+        ]
+        for testCase in cases {
+            let request = AgentApprovalRequest(
+                requestID: .acp("permission"), method: "session/request_permission",
+                kind: testCase.scope == .editsSession ? .fileChange : .commandExecution,
+                threadID: "thread", turnID: "turn", itemID: "item",
+                plainApproveAvailable: testCase.available, sessionApprovalScope: testCase.scope
+            )
+            XCTAssertEqual(request.supportsAlwaysAllow, testCase.label != nil)
+            if let label = testCase.label {
+                XCTAssertEqual(request.sessionApprovalLabel, label)
+            }
+            context.session.pendingApproval = request
+            context.session.runState = .waitingForApproval
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            XCTAssertEqual(interaction.options.contains { $0.label == "accept" }, testCase.available)
+            let sessionOption = try XCTUnwrap(interaction.options.first { $0.label == "accept_for_session" })
+            XCTAssertEqual(sessionOption.description, testCase.description)
+            if request.kind == .commandExecution {
+                let amendmentOption = try XCTUnwrap(interaction.options.first { $0.label == "accept_with_amendment" })
+                XCTAssertEqual(
+                    amendmentOption.description,
+                    testCase.scope == nil
+                        ? "Allow with exec policy amendment (provide amendment field)" : testCase.description
+                )
             }
         }
     }
