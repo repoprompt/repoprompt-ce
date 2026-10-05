@@ -433,6 +433,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 invocation: bindingRequest.invocation,
                 beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
             )
+        } else {
+            // A successful authorized no-op still owns an applied journal receipt.
+            // Do not transition or retire the provider merely to settle that receipt.
+            try await MCPDomainMutationCommitContext.willCommit()
         }
 
         return ToolResultDTOs.ManageWorktreeReplyDTO(
@@ -474,6 +478,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     invocation: invocation,
                     beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
                 )
+            } else {
+                try await MCPDomainMutationCommitContext.willCommit()
             }
             return (nil, previous.map(bindingDTO))
         }

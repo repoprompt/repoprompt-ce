@@ -113,6 +113,40 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
 #if DEBUG
     @MainActor
     final class WorktreeBindingProviderRegressionTests: XCTestCase {
+        func testSelectingAlreadyLogicalCheckoutSettlesApplied() async throws {
+            try await withProvider { fixture in
+                let reply = try await fixture.call([
+                    "op": .string("select"), "worktree": .string("@main")
+                ], includeWorktree: false)
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+                XCTAssertNil(reply.objectValue?["binding"]?.objectValue)
+                let journal = try await fixture.driver.fixture.runtime.mutationJournal.snapshot()
+                XCTAssertEqual(journal.recordSnapshots.last?.status, .applied)
+            }
+        }
+
+        func testRepeatedUnbindSettlesAppliedWithoutRetiringActiveProvider() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                _ = try await fixture.call(["op": .string("unbind")], includeWorktree: false)
+                let native = MonitorFakeNativeController()
+                fixture.session.claudeController = native
+                fixture.session.runState = .running
+                defer {
+                    fixture.session.runState = .idle
+                    fixture.session.claudeController = nil
+                }
+                let reply = try await fixture.call(["op": .string("unbind")], includeWorktree: false)
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+                XCTAssertNotNil(reply.objectValue?["warning"]?.stringValue)
+                XCTAssertEqual(fixture.session.runState, .running)
+                let shutdowns = await native.shutdownCount
+                XCTAssertEqual(shutdowns, 0)
+                let journal = try await fixture.driver.fixture.runtime.mutationJournal.snapshot()
+                XCTAssertEqual(journal.recordSnapshots.last?.status, .applied)
+            }
+        }
+
         func testIconAndMarkerOnlyRebindPersistsWithoutRetiringActiveProvider() async throws {
             try await withProvider { fixture in
                 _ = try await fixture.call(["op": .string("bind")])
