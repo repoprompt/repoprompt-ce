@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import XCTest
@@ -356,6 +357,132 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
+    func testCodexIdleProbeUsesExistingBoundedDeadlineAndFailurePreservesRuntime() async throws {
+        let (viewModel, session, sessionID) = fixture()
+        let controller = WorktreeProbeCodexController(failSnapshot: true)
+        session.codexController = controller
+        let original = session.worktreeBindings
+        var committed = false
+        do {
+            _ = try await viewModel.transitionWorktreeBindings(
+                [], forSessionID: sessionID, intent: .externalManagement,
+                beforeCommit: { committed = true }
+            )
+            XCTFail("Unverified provider readiness must fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Could not verify"))
+            XCTAssertEqual(controller.requestedTimeouts, [2])
+            XCTAssertFalse(committed)
+            XCTAssertEqual(session.worktreeBindings, original)
+            XCTAssertTrue(session.codexController === controller)
+            XCTAssertFalse(session.isChangingExecutionLocation)
+        }
+    }
+
+    func testCodexNotLoadedIsNotAssumedIdle() async {
+        let (viewModel, session, sessionID) = fixture()
+        session.codexController = WorktreeProbeCodexController(runtimeStatus: .notLoaded)
+        await assertRemovalRejected(viewModel, session: session, sessionID: sessionID)
+    }
+
+    func testCancellationAfterProviderTeardownPersistsVisibleOldRootRecovery() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let native = WorktreeTeardownNativeController {
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+        fixture.session.claudeController = native
+        var savedRecovery: AgentSession?
+        var saverWasCancelled = true
+        fixture.viewModel.test_setAgentSessionSaver { saved, _, _ in
+            savedRecovery = saved
+            saverWasCancelled = Task.isCancelled
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        var committed = false
+        let transition = Task { @MainActor in
+            try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: { committed = true }
+            )
+        }
+        do {
+            _ = try await transition.value
+            XCTFail("Cancelled post-teardown switch must not publish the target")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("previous execution binding is unchanged"))
+            XCTAssertTrue(committed, "Retirement follows the real protected mutation fence")
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            XCTAssertNil(fixture.session.claudeController)
+            XCTAssertNotNil(fixture.session.pendingHandoff.payload)
+            XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+            XCTAssertFalse(saverWasCancelled)
+            let saved = try XCTUnwrap(savedRecovery)
+            XCTAssertEqual(saved.worktreeBindings, original)
+            XCTAssertNotNil(saved.pendingHandoffPayload)
+            XCTAssertNotNil(saved.transcript, "Modern session persistence stores the transcript, not legacy flat items")
+            XCTAssertTrue(saved.workingSourceItems().contains { $0.text.contains("provider runtime was retired") })
+            let ownership = await fixture.prompt.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownership.installedOwnerCount, 1)
+            XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        }
+    }
+
+    func testLogicalRootLookupAndUnbindAgreeAcrossSymlinkAlias() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let primary = fixture.session.worktreeBindings[0]
+        let alias = fixture.git.sandbox.appendingPathComponent("logical-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: URL(fileURLWithPath: primary.logicalRootPath))
+        let aliased = Self.copyBinding(primary, logicalRootPath: alias.path)
+        XCTAssertEqual(MCPWorktreeToolProvider.bindingForLogicalRoot([aliased], logicalRootPath: primary.logicalRootPath), aliased)
+        XCTAssertEqual(MCPWorktreeToolProvider.bindingsReturningToLogicalCheckout(
+            [aliased], logicalRootPath: primary.logicalRootPath, selectedWorktreePath: alias.path
+        ), [])
+    }
+
+    func testLogicalCheckoutVisualArgumentsAreRejectedRatherThanClaimedApplied() throws {
+        XCTAssertThrowsError(try MCPWorktreeToolProvider.validateLogicalCheckoutVisualArguments(["color": .string("#112233")])) {
+            XCTAssertTrue($0.localizedDescription.contains("Visual updates are not applied"))
+        }
+        XCTAssertNoThrow(try MCPWorktreeToolProvider.validateLogicalCheckoutVisualArguments([:]))
+    }
+
+    func testRequestedVisualColorIsValidatedWithoutCrossingMutationFence() throws {
+        XCTAssertThrowsError(try MCPWorktreeToolProvider.validatedPlannedVisualColor("#BAD")) {
+            XCTAssertTrue($0.localizedDescription.contains("#RRGGBB"))
+        }
+        XCTAssertEqual(try MCPWorktreeToolProvider.validatedPlannedVisualColor(" #abcdef "), "#ABCDEF")
+        XCTAssertNil(try MCPWorktreeToolProvider.validatedPlannedVisualColor(nil))
+    }
+
+    func testPersistedVisualIdentityIsTheExactPlanDespiteInterveningSettingsChange() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let suite = "WorktreeVisualPlan-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fixture.git.sandbox.appendingPathComponent("settings.json")))
+        let planned = WorktreeVisualIdentity(label: "Planned", colorHex: "#112233", iconName: "branch", markerStyle: .capsule, updatedAt: Date(timeIntervalSince1970: 123))
+        _ = try store.ensureWorktreeVisualIdentity(repositoryID: "repo", worktreeID: "wt", label: "Intervening", colorHex: "#445566", commit: false)
+        try MCPWorktreeToolProvider.persistPlannedVisualIdentity(planned, repositoryID: "repo", worktreeID: "wt", store: store)
+        XCTAssertEqual(store.worktreeVisualIdentity(repositoryID: "repo", worktreeID: "wt"), planned)
+    }
+
+    func testInstalledSessionRootOwnershipRemainsReusable() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let store = fixture.prompt.workspaceFileContextStore
+        let before = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        let preparation = try await WorkspaceRootBindingProjectionMaterializer(store: store).prepare(
+            sessionID: fixture.sessionID, bindings: fixture.session.worktreeBindings
+        )
+        XCTAssertTrue(preparation.ownership.reusesInstalledOwnership)
+        let after = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(before, after)
+    }
+
     private struct DurableFixture {
         let git: ReviewGitRepositoryFixture
         let prompt: PromptViewModel
@@ -460,4 +587,89 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         )]
         return (viewModel, session, sessionID)
     }
+}
+
+private final class WorktreeProbeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    private let lock = NSLock()
+    private var deadlines: [TimeInterval?] = []
+    private let failSnapshot: Bool
+    private let runtimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
+
+    init(failSnapshot: Bool = false, runtimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus = .idle) {
+        self.failSnapshot = failSnapshot
+        self.runtimeStatus = runtimeStatus
+    }
+
+    var requestedTimeouts: [TimeInterval?] {
+        lock.withLock { deadlines }
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        AsyncStream { $0.finish() }
+    }
+
+    func readThreadSnapshot(includeTurns _: Bool, timeout: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        lock.withLock { deadlines.append(timeout) }
+        if failSnapshot { throw CodexAppServerClient.ClientError.invalidResponse }
+        return .init(conversationID: "test", rolloutPath: nil, model: nil, reasoningEffort: nil, runtimeStatus: runtimeStatus, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil)
+    }
+
+    func shutdown() async {}
+}
+
+private actor WorktreeTeardownNativeController: NativeAgentRuntimeControlling {
+    private let delegate = MonitorFakeNativeController()
+    private let onShutdown: @Sendable () async -> Void
+    init(onShutdown: @escaping @Sendable () async -> Void) {
+        self.onShutdown = onShutdown
+    }
+
+    var hasActiveSession: Bool {
+        true
+    }
+
+    var hasTurnInFlight: Bool {
+        false
+    }
+
+    var events: AsyncStream<NativeAgentRuntimeEvent> {
+        get async { await delegate.events }
+    }
+
+    func ensureEventsStreamReady() async {}
+    func resetEventsStreamForNewRun() async {}
+    func startOrResume(existingSessionID: String?, model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, systemPromptOverride: String?) async throws -> NativeAgentRuntimeSessionRef {
+        try await delegate.startOrResume(existingSessionID: existingSessionID, model: model, effortLevel: effortLevel, systemPromptOverride: systemPromptOverride)
+    }
+
+    func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
+        await delegate.currentSessionRef()
+    }
+
+    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws {
+        try await delegate.applyModelAndEffort(model: model, effortLevel: effortLevel)
+    }
+
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        try await delegate.applyModelAndEffortWithProof(model: model, effortLevel: effortLevel)
+    }
+
+    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try await delegate.sendUserMessage(text, configuration: configuration)
+    }
+
+    func sendUserMessage(_ text: String) async throws -> UUID {
+        try await delegate.sendUserMessage(text)
+    }
+
+    func interruptTurn(reason _: String) async -> NativeAgentRuntimeInterruptOutcome {
+        .noTurnInFlight
+    }
+
+    func shutdown() async {
+        await delegate.shutdown()
+        await onShutdown()
+    }
+
+    func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) async {}
 }

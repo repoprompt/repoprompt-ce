@@ -58,7 +58,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
             **Session binding and merge source**:
             - `bind` and `select` persist a binding for one Agent session. Destination changes require an idle provider with no queued work or pending interactions; they restart/handoff the runtime, never reroute an active turn.
-            - Selecting the logical checkout itself (normally `@main`) removes only its binding and preserves secondary-root bindings. Other folders already loaded with workspace ownership must be removed before session binding.
+            - Selecting the logical checkout itself (normally `@main`) removes only its binding and preserves secondary-root bindings; omit visual arguments for this unbind. Other folders already loaded with workspace ownership must be removed before session binding.
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
             - `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.
             - `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.
@@ -459,11 +459,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let logicalRoot = try await logicalRoot(for: context)
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
         let normalizedRoot = standardizedPath(logicalRoot.standardizedFullPath)
-        let previous = existing.first { standardizedPath($0.logicalRootPath) == normalizedRoot }
+        let previous = Self.bindingForLogicalRoot(existing, logicalRootPath: normalizedRoot)
 
         if let localBindings = Self.bindingsReturningToLogicalCheckout(
             existing, logicalRootPath: normalizedRoot, selectedWorktreePath: worktree.path
         ) {
+            try Self.validateLogicalCheckoutVisualArguments(args)
             if previous != nil {
                 _ = try await agentModeVM.transitionWorktreeBindings(
                     localBindings,
@@ -504,22 +505,54 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             boundAt: previous?.worktreeID == worktree.worktreeID ? previous?.boundAt ?? Date() : Date(),
             source: source
         )
-        var desiredBindings = existing.filter { standardizedPath($0.logicalRootPath) != normalizedRoot }
+        var desiredBindings = existing.filter {
+            GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != GitRepoRootAuthorization.canonicalPath(normalizedRoot)
+        }
         desiredBindings.append(binding)
         _ = try await agentModeVM.transitionWorktreeBindings(
             desiredBindings,
             forSessionID: sessionID,
             intent: .externalManagement,
             invocation: invocation,
-            beforeCommit: { [self] in
+            beforeCommit: {
                 try await MCPDomainMutationCommitContext.willCommit()
                 if persistsVisualIdentity {
-                    _ = try persistOrResolveVisualIdentity(for: worktree, args: args, persist: true)
+                    try Self.persistPlannedVisualIdentity(
+                        visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+                    )
                 }
             }
         )
         let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
         return (bindingDTO(binding), previousDTO)
+    }
+
+    static func bindingForLogicalRoot(
+        _ bindings: [AgentSessionWorktreeBinding], logicalRootPath: String
+    ) -> AgentSessionWorktreeBinding? {
+        let logicalPath = GitRepoRootAuthorization.canonicalPath(logicalRootPath)
+        return bindings.first { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == logicalPath }
+    }
+
+    static func validateLogicalCheckoutVisualArguments(_ args: [String: Value]) throws {
+        guard !["label", "color", "icon_name", "marker_style"].contains(where: { args[$0] != nil }) else {
+            throw MCPError.invalidParams("Selecting the logical checkout removes its session binding. Visual updates are not applied by this unbind operation; omit label, color, icon_name, and marker_style.")
+        }
+    }
+
+    static func persistPlannedVisualIdentity(
+        _ identity: WorktreeVisualIdentity,
+        repositoryID: String,
+        worktreeID: String,
+        store: GlobalSettingsStore = .shared
+    ) throws {
+        do {
+            // Persist precisely the plan carried by the binding and reply, not a second
+            // merge against settings that may have changed while preparation awaited.
+            try store.setWorktreeVisualIdentity(identity, repositoryID: repositoryID, worktreeID: worktreeID)
+        } catch let error as GlobalSettingsStore.WorktreeVisualIdentityError {
+            throw MCPError.invalidParams("Invalid worktree visual identity: \(error)")
+        }
     }
 
     /// Selecting the logical checkout is the inverse of this root's binding, not an
@@ -534,11 +567,20 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         return existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != logicalPath }
     }
 
+    static func validatedPlannedVisualColor(_ requestedColor: String?) throws -> String? {
+        guard let requestedColor else { return nil }
+        let color = requestedColor.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard GlobalSettingsStore.isValidWorktreeColorHex(color) else {
+            throw MCPError.invalidParams("Invalid worktree visual identity: color must be a #RRGGBB hex value.")
+        }
+        return color
+    }
+
     private func plannedVisualIdentity(for worktree: GitWorktreeDescriptor, args: [String: Value]) throws -> WorktreeVisualIdentity {
         let existing = try persistOrResolveVisualIdentity(for: worktree, args: args, persist: false)
         return try WorktreeVisualIdentity(
             label: trimmedString(args["label"]) ?? existing.label ?? fallbackLabel(for: worktree),
-            colorHex: trimmedString(args["color"])?.uppercased() ?? existing.colorHex,
+            colorHex: Self.validatedPlannedVisualColor(trimmedString(args["color"])) ?? existing.colorHex,
             iconName: trimmedString(args["icon_name"]) ?? existing.iconName,
             markerStyle: parseMarkerStyle(args["marker_style"]) ?? existing.markerStyle
         )

@@ -8155,6 +8155,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         var ownershipCommitted = preparation == nil
+        var providerContextInvalidated = false
+        var bindingsPublished = false
         do {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
@@ -8217,6 +8219,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 if !changedDuringActiveRun {
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
                 }
+                providerContextInvalidated = true
                 await invalidateProviderContextForExecutionLocationChange(session)
                 guard sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
@@ -8236,6 +8239,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ownershipCommitted = true
             }
             _ = commitWorktreeBindings(desiredBindings, to: session)
+            bindingsPublished = true
             if previousBindings != desiredBindings, case .externalManagement = intent {
                 guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
                     throw ExecutionLocationTransitionError.unavailable(
@@ -8254,6 +8258,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } catch {
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
+            }
+            if providerContextInvalidated, !bindingsPublished,
+               sessions[session.tabID] === session,
+               session.activeAgentSessionID == sessionID,
+               session.worktreeBindings == previousBindings
+            {
+                // Native retirement cannot be undone. Keep the old execution binding and
+                // staged handoff, and make its fresh-runtime recovery explicit and durable.
+                let message = "The worktree switch did not apply. The previous execution binding is unchanged, but its provider runtime was retired. The next user message will restart at the previous location using the retained handoff; no turn was replayed. Cause: \(error.localizedDescription)"
+                session.appendItem(.system(message, sequenceIndex: session.nextSequenceIndex))
+                session.isDirty = true
+                syncTranscriptUIState()
+                let recoverySave: Result<Void, AgentSessionPersistenceFailure> = if let workspaceID = workspaceManager?.activeWorkspace?.id {
+                    // Cancellation of the switch must not suppress saving its recovery state.
+                    await Task { @MainActor in
+                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
+                    }.value
+                } else {
+                    .failure(.init(operation: .save, tabID: session.tabID, message: "The owning workspace is unavailable."))
+                }
+                if case let .failure(failure) = recoverySave {
+                    scheduleSave(for: session)
+                    throw ExecutionLocationTransitionError.unavailable("\(message) Recovery persistence failed: \(failure.message). Inspect the session before retrying.")
+                }
+                throw ExecutionLocationTransitionError.unavailable(message)
             }
             throw error
         }
@@ -8313,9 +8342,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The ACP runtime still has execution in flight. Wait for it to settle before switching worktrees.")
         }
         if let controller = codexController {
-            let snapshot = try await controller.readThreadSnapshot(includeTurns: false, timeout: nil)
+            let snapshot: CodexNativeSessionController.ThreadSnapshot
+            do {
+                // Match the existing queued-fallback idle probe, not the transport's much
+                // longer ordinary request deadline, while next-turn admission is gated.
+                snapshot = try await controller.readThreadSnapshot(includeTurns: false, timeout: 2)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams("Could not verify that the Codex runtime is idle. Its execution binding and runtime were not changed. Wait for it to settle and inspect the session before retrying. \(error.localizedDescription)")
+            }
             let outstandingTools = await controller.outstandingBlockingNativeToolCallNames()
-            guard !snapshot.hasActiveTurn, outstandingTools.isEmpty else {
+            guard snapshot.runtimeStatus == .idle, !snapshot.hasActiveTurn, outstandingTools.isEmpty else {
                 throw MCPError.invalidParams("The Codex runtime still has a turn or native tool in flight. Wait for it to settle before switching worktrees.")
             }
         }
