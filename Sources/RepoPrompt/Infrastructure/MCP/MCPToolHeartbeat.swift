@@ -19,7 +19,16 @@ enum MCPToolHeartbeat {
                 // Cancellation is the expected completion path for progress delivery.
             }
         }
-        defer { heartbeatTask.cancel() }
-        return try await operation()
+        let outcome: Result<T, Error>
+        do {
+            outcome = try await .success(operation())
+        } catch {
+            outcome = .failure(error)
+        }
+        heartbeatTask.cancel()
+        // Cancellation is cooperative: an in-flight progress callback must drain before
+        // terminal progress or a response can be delivered for this request.
+        await heartbeatTask.value
+        return try outcome.get()
     }
 }

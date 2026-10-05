@@ -540,6 +540,51 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: "[]"))
     }
 
+    func testAuthoritativeChatIDPolicyRoutesCanonicalGroupsWithoutAdmittingConflictingIDs() {
+        let lanes: [[String: Any]] = [
+            ["lane_index": 0, "role": "primary", "chat_id": "primary-chat", "model_id": "primary-model", "status": "completed"],
+            ["lane_index": 1, "role": "additional", "chat_id": "additional-chat", "model_id": "additional-model", "status": "completed"]
+        ]
+        let digest: [String: Any] = [
+            "chat_id": "primary-chat", "oracle_group_id": UUID().uuidString,
+            "oracle_count": 2, "oracle_results": lanes, "status": "success", "summary_only": true
+        ]
+        var live = digest
+        live["oracle_results"] = lanes.map { $0.merging(["response": "answer"]) { current, _ in current } }
+        live["status"] = "completed"
+        live.removeValue(forKey: "summary_only")
+        for payload in [digest, live] {
+            XCTAssertEqual(AgentOracleAuthoritativeChatIDPolicy.extract(fromRootObject: payload), "primary-chat")
+            XCTAssertEqual(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: jsonString(payload)), "primary-chat")
+        }
+
+        var rejected: [[String: Any]] = []
+        for changes: [String: Any] in [
+            ["chat_id": "wrong-primary"], ["oracle_count": 3], ["oracle_group_id": "not-a-group-id"],
+            ["chatID": "alias"], ["result": ["chat_id": "unrelated"]]
+        ] {
+            rejected.append(digest.merging(changes) { _, new in new })
+        }
+        var missingGroup = digest
+        missingGroup.removeValue(forKey: "oracle_group_id")
+        rejected.append(missingGroup)
+        for changes: [String: Any] in [
+            ["lane_index": 0], ["lane_index": true], ["role": "primary"], ["chat_id": "primary-chat"],
+            ["chat_id": "  "], ["chatID": "alias"], ["result": ["chat_id": "nested"]], ["status": "unknown"]
+        ] {
+            var malformedLanes = lanes
+            malformedLanes[1].merge(changes) { _, new in new }
+            var payload = digest
+            payload["oracle_results"] = malformedLanes
+            rejected.append(payload)
+        }
+        for payload in rejected {
+            XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromRootObject: payload))
+            XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: jsonString(payload)))
+            XCTAssertFalse(AgentOracleAuthoritativeChatIDPolicy.allowsLatestFallback(fromSerializedJSON: jsonString(payload)))
+        }
+    }
+
     func testContextBuilderRoutingRejectsMismatchedOrUnknownResponseBranch() throws {
         let reviewWithPlanOnly = try XCTUnwrap(ToolJSON.decode(
             ToolResultDTOs.ContextBuilderDTO.self,
@@ -749,6 +794,10 @@ final class OracleLaneCoverageTests: XCTestCase {
                     toolResultJSON: jsonString(raw),
                     toolIsError: fixture.toolError
                 )
+                if !isBuilder {
+                    let liveRoute = oracleToolResultPopoverUserInfo(item: row, openContext: openContext)
+                    XCTAssertEqual(liveRoute?["chatID"] as? String, "fixture-chat-0", "Live encoded groups must route to the same primary chat as restored digests")
+                }
                 let unfinished = AgentChatItem.toolCall(name: "file_search", invocationID: UUID(), argsJSON: #"{"pattern":"pending"}"#, sequenceIndex: 1)
                 let activities = [row, unfinished].map { AgentTranscriptActivity(from: $0, toolExecution: AgentTranscriptToolNormalizer.toolExecution(for: $0)) }
                 var saved = AgentSession(
@@ -801,14 +850,8 @@ final class OracleLaneCoverageTests: XCTestCase {
                         dto = ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: restored.toolResultJSON)
                         XCTAssertEqual(ChatSendResultCard(item: restored, oracleOpenContext: openContext).status, expected, "\(tool) \(fixture) pass \(pass)")
                         XCTAssertEqual(dto?.chatID, "fixture-chat-0")
-                        // Existing routing rejects nested chat IDs, including lane IDs.
-                        // Do not turn this outcome regression into a routing-policy change.
                         let route = oracleToolResultPopoverUserInfo(item: restored, openContext: openContext)
-                        if fixture.oversized {
-                            XCTAssertEqual(route?["chatID"] as? String, "fixture-chat-0")
-                        } else {
-                            XCTAssertNil(route)
-                        }
+                        XCTAssertEqual(route?["chatID"] as? String, "fixture-chat-0", "Saved primary route must survive fitting digests and budget fallback")
                     }
                     if !isBuilder, fixture.completed == 1 {
                         XCTAssertEqual(dto?.status, "partial_failure", "canonical group outcome must survive persistence")

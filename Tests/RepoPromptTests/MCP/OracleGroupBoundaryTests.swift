@@ -1199,6 +1199,73 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
 }
 
 final class MCPToolHeartbeatTests: XCTestCase {
+    private enum OperationFailure: Error { case expected }
+
+    private actor HeartbeatGate {
+        private var entered = false
+        private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+        private(set) var exited = false
+
+        func send() async {
+            guard !entered else { return }
+            entered = true
+            entryWaiters.forEach { $0.resume() }
+            entryWaiters.removeAll()
+            await withCheckedContinuation { releaseContinuation = $0 }
+            exited = true
+        }
+
+        func waitUntilEntered() async {
+            guard !entered else { return }
+            await withCheckedContinuation { entryWaiters.append($0) }
+        }
+
+        func release() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    func testSuccessAndFailureDrainInFlightHeartbeatBeforeReturning() async {
+        for shouldThrow in [false, true] {
+            let gate = HeartbeatGate()
+            let operationFinished = expectation(description: "operation finished")
+            let returnedBeforeCleanup = expectation(description: "request returned before heartbeat cleanup")
+            returnedBeforeCleanup.isInverted = true
+            let task = Task { () -> Result<String, Error> in
+                let outcome: Result<String, Error>
+                do {
+                    let value = try await MCPToolHeartbeat.run(interval: .milliseconds(1), heartbeat: { await gate.send() }) {
+                        await gate.waitUntilEntered()
+                        operationFinished.fulfill()
+                        if shouldThrow { throw OperationFailure.expected }
+                        return "settled"
+                    }
+                    outcome = .success(value)
+                } catch {
+                    outcome = .failure(error)
+                }
+                if await !gate.exited { returnedBeforeCleanup.fulfill() }
+                return outcome
+            }
+            await fulfillment(of: [operationFinished], timeout: 2)
+            await fulfillment(of: [returnedBeforeCleanup], timeout: 0.1)
+            await gate.release()
+            let outcome = await task.value
+            let heartbeatExited = await gate.exited
+            XCTAssertTrue(heartbeatExited)
+            switch outcome {
+            case let .success(value):
+                XCTAssertFalse(shouldThrow)
+                XCTAssertEqual(value, "settled")
+            case let .failure(error):
+                XCTAssertTrue(shouldThrow)
+                XCTAssertTrue(error is OperationFailure)
+            }
+        }
+    }
+
     func testCancellationPreservesSettledPartialOperationResult() async throws {
         let entered = expectation(description: "operation entered")
         let task = Task {
