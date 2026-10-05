@@ -254,94 +254,44 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         reportFailure: (String) -> Void = { NSLog("%@", $0) },
         operation: () async throws -> Value
     ) async throws -> Value {
-        var resolvedDirectory: URL?
-        var existingHashedNames: Set<String>?
+        var sessionDirectory: URL?
         defer {
             do {
-                if let resolvedDirectory {
-                    try cleanupRequestArtifacts(
-                        promptDirectory: promptDirectory,
-                        environment: environment,
-                        resolvedDirectory: resolvedDirectory,
-                        existingHashedNames: existingHashedNames,
-                        removeItem: removeItem
-                    )
-                } else {
-                    // Path resolution failed before launch; no child owns session storage.
-                    try removeItemIfPresent(promptDirectory, removeItem: removeItem)
-                }
+                try cleanupRequestArtifacts(
+                    promptDirectory: promptDirectory,
+                    sessionDirectory: sessionDirectory,
+                    removeItem: removeItem
+                )
             } catch {
                 reportFailure(cleanupFailureDiagnostic(error))
             }
         }
         let physicalDirectory = try resolvedRequestDirectory(promptDirectory)
-        resolvedDirectory = physicalDirectory
-        // Long cwd names are hashed upstream. Capture pre-existing matching names
-        // so a child crash before finishing .cwd does not leave its newly-created folder.
-        // Other requests have distinct UUID-bearing cwd slugs; this is not a history sweep.
-        if encodedCWD(physicalDirectory.path).utf8.count > 255 {
-            do {
-                existingHashedNames = try Set(hashedSessionCandidates(
-                    sessionsRoot: sessionsRoot(promptDirectory: physicalDirectory, environment: environment),
-                    cwd: physicalDirectory.path
-                ).map(\.lastPathComponent))
-            } catch {
-                reportFailure(cleanupFailureDiagnostic(error))
-            }
+        let encoded = encodedCWD(physicalDirectory.path)
+        // Grok hashes longer paths. Refuse before launch rather than infer ownership
+        // from directory names or potentially unfinished .cwd metadata.
+        guard encoded.utf8.count <= 255 else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot request directory is too long for safe session cleanup (URL-encoded physical path exceeds 255 bytes). Use a shorter temporary directory and retry."
+            )
         }
+        sessionDirectory = sessionsRoot(promptDirectory: physicalDirectory, environment: environment)
+            .appendingPathComponent(encoded, isDirectory: true)
         return try await operation()
     }
 
-    static func cleanupRequestArtifacts(
+    private static func cleanupRequestArtifacts(
         promptDirectory: URL,
-        environment: [String: String],
-        resolvedDirectory: URL? = nil,
-        existingHashedNames: Set<String>? = nil,
-        removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
+        sessionDirectory: URL?,
+        removeItem: (URL) throws -> Void
     ) throws {
-        let cwd = try (resolvedDirectory ?? resolvedRequestDirectory(promptDirectory)).path
-        let root = sessionsRoot(promptDirectory: URL(fileURLWithPath: cwd, isDirectory: true), environment: environment)
         var failure: Error?
-        do {
-            let encoded = encodedCWD(cwd)
-            if encoded.utf8.count <= 255 {
-                try removeItemIfPresent(root.appendingPathComponent(encoded, isDirectory: true), removeItem: removeItem)
-            } else {
-                for candidate in try hashedSessionCandidates(sessionsRoot: root, cwd: cwd) {
-                    let values = try candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                    guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
-                    let marker = candidate.appendingPathComponent(".cwd")
-                    let storedCWD: String?
-                    var incompleteMarker = false
-                    do {
-                        let handle = try FileHandle(forReadingFrom: marker)
-                        defer { try? handle.close() }
-                        // A cwd marker is a path, never a prompt. Bound the read to the
-                        // expected path plus a newline, even if a malformed marker is large.
-                        let limit = cwd.utf8.count + 2
-                        let bytes = try handle.read(upToCount: limit) ?? Data()
-                        guard bytes.count < limit else { continue }
-                        // A failed write can end inside a UTF-8 character. Recognize
-                        // a partial prefix without decoding it as a complete path.
-                        incompleteMarker = bytes.count < cwd.utf8.count && cwd.utf8.starts(with: bytes)
-                        storedCWD = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    } catch {
-                        guard isMissingFile(error) else { throw error }
-                        storedCWD = nil
-                        incompleteMarker = true
-                    }
-                    let newlyCreatedWithIncompleteMarker = incompleteMarker
-                        && existingHashedNames.map { !$0.contains(candidate.lastPathComponent) } == true
-                    guard storedCWD == cwd || newlyCreatedWithIncompleteMarker else { continue }
-                    do {
-                        try removeItemIfPresent(candidate, removeItem: removeItem)
-                    } catch {
-                        if failure == nil { failure = error }
-                    }
-                }
+        if let sessionDirectory {
+            do {
+                try removeItemIfPresent(sessionDirectory, removeItem: removeItem)
+            } catch {
+                failure = error
             }
-        } catch {
-            failure = error
         }
         // Even a failed session delete must not retain the temporary prompt file too.
         do {
@@ -375,36 +325,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
 
     private static func encodedCWD(_ cwd: String) -> String {
         cwd.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))!
-    }
-
-    private static func hashedSessionCandidates(sessionsRoot: URL, cwd: String) throws -> [URL] {
-        var slug = ""
-        for scalar in (cwd as NSString).lastPathComponent.lowercased().unicodeScalars {
-            if (48 ... 57).contains(scalar.value) || (97 ... 122).contains(scalar.value) {
-                slug.unicodeScalars.append(scalar)
-            } else if slug.last != "-" {
-                slug.append("-")
-            }
-        }
-        slug = String(slug.trimmingCharacters(in: CharacterSet(charactersIn: "-")).prefix(40))
-        let prefix = (slug.isEmpty ? "workspace" : slug) + "-"
-        let entries: [URL]
-        do {
-            entries = try FileManager.default.contentsOfDirectory(
-                at: sessionsRoot,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: []
-            )
-        } catch {
-            if isMissingFile(error) { return [] }
-            throw error
-        }
-        return entries.filter { entry in
-            let name = entry.lastPathComponent
-            guard name.hasPrefix(prefix) else { return false }
-            let suffix = name.dropFirst(prefix.count)
-            return suffix.count == 16 && suffix.allSatisfy { "0123456789abcdef".contains($0) }
-        }
     }
 
     private static func removeItemIfPresent(_ url: URL, removeItem: (URL) throws -> Void) throws {
