@@ -58,6 +58,39 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testScheduledWakeDuringWorktreeCommitAdmissionCannotDispatchOrChangeBinding() async throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .idle
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let original = AgentSessionWorktreeBinding(
+            id: "primary", repositoryID: "repo", repoKey: "repo", logicalRootPath: "/tmp/wake-logical",
+            logicalRootName: "Project", worktreeID: "wt", worktreeRootPath: "/tmp/wake-physical", source: "test"
+        )
+        fixture.session.worktreeBindings = [original]
+        var wake: AgentSessionLinkAutoWakeAttempt?
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    XCTAssertTrue(fixture.session.isChangingExecutionLocation)
+                    try self.publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+                    wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                    XCTAssertEqual(wake?.phase, .scheduled)
+                    XCTAssertEqual(wake?.physicalOutcome, .notAttempted)
+                    wake?.task?.cancel()
+                }
+            )
+            XCTFail("A competing wake reservation must fail closed, not migrate its provider turn")
+        } catch {
+            XCTAssertNotNil(wake, "The test must reach the deterministic reservation boundary")
+            XCTAssertTrue(error.localizedDescription.contains("queued work"))
+            XCTAssertEqual(fixture.session.worktreeBindings, [original])
+            XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+            XCTAssertEqual(wake?.physicalOutcome, .notAttempted)
+        }
+    }
+
     func testRepeatedCancellationKeepsRawProviderDispatchFenced() async throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)

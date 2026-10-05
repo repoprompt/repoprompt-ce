@@ -58,6 +58,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
             **Session binding and merge source**:
             - `bind` and `select` persist a binding for one Agent session. Destination changes require an idle provider with no queued work or pending interactions; they restart/handoff the runtime, never reroute an active turn.
+            - If settlement is indeterminate, inspect the current binding and session transcript before retrying; recovery details may be recorded in the transcript rather than the tool error.
             - Selecting the logical checkout itself (normally `@main`) removes only its binding and preserves secondary-root bindings; omit visual arguments for this unbind. Other folders already loaded with workspace ownership must be removed before session binding.
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
             - `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.
@@ -415,9 +416,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
             let logicalRoot = try await logicalRoot(for: context)
-            let normalized = standardizedPath(logicalRoot.standardizedFullPath)
-            removed = existing.filter { standardizedPath($0.logicalRootPath) == normalized }
-            remaining = existing.filter { standardizedPath($0.logicalRootPath) != normalized }
+            let normalized = GitRepoRootAuthorization.canonicalPath(logicalRoot.standardizedFullPath)
+            removed = existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == normalized }
+            remaining = existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != normalized }
             authorizationRoots = removed.isEmpty ? [logicalRoot.standardizedFullPath] : removed.map(\.logicalRootPath)
         }
 
@@ -484,6 +485,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
            trimmedString(args["icon_name"]) == nil,
            trimmedString(args["marker_style"]) == nil
         {
+            if persistsVisualIdentity {
+                try await MCPDomainMutationCommitContext.willCommit()
+                try Self.persistPlannedVisualIdentity(
+                    visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+                )
+            }
             return (bindingDTO(previous), nil)
         }
 
@@ -509,6 +516,16 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != GitRepoRootAuthorization.canonicalPath(normalizedRoot)
         }
         desiredBindings.append(binding)
+        // Icon and marker are presentation-only and are not part of the execution binding.
+        // An identical binding must still commit its requested visual plan, while preserving
+        // the running provider and its frozen execution authority.
+        if desiredBindings == existing, persistsVisualIdentity {
+            try await MCPDomainMutationCommitContext.willCommit()
+            try Self.persistPlannedVisualIdentity(
+                visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+            )
+            return (bindingDTO(binding), nil)
+        }
         _ = try await agentModeVM.transitionWorktreeBindings(
             desiredBindings,
             forSessionID: sessionID,
