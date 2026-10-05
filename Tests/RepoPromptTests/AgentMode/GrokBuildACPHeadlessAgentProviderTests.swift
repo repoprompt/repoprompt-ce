@@ -1,4 +1,5 @@
 import Foundation
+import os
 import RepoPromptProcess
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -105,6 +106,102 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertTrue(requestConfig.alwaysApproveTools)
     }
 
+    /// Uses this suite's fixture for the real controller/stdio boundary, not the headless facade.
+    /// Completed-open diagnostics fence notification delivery after the successful response.
+    func testPermissionOverridesReachSessionOpenBeforePrompt() async throws {
+        let cases: [(name: String, resumeID: String?, openMethods: [String])] = [
+            ("new", nil, ["session/new"]),
+            ("load", "saved-session", ["session/load"]),
+            ("load-to-new fallback", "missing-session", ["session/load", "session/new"])
+        ]
+        for fullAccess in [false, true] {
+            for testCase in cases {
+                let context = "\(testCase.name), fullAccess=\(fullAccess)"
+                let harness = try makeHarness()
+                let provider = EnvForwardingGrokProvider(
+                    config: GrokBuildAgentConfig(
+                        commandName: harness.scriptPath,
+                        additionalPathHints: [],
+                        includeRepoPromptMCPServer: false
+                    ),
+                    extraEnvironment: ["ACP_RECORD_PATH": harness.recordURL.path]
+                )
+                let request = ACPRunRequest(
+                    agentKind: .grokBuild,
+                    modelString: nil,
+                    workspacePath: harness.workspace.path,
+                    resumeSessionID: testCase.resumeID,
+                    attachments: [],
+                    taskLabelKind: nil,
+                    autoApproveAllToolPermissions: fullAccess
+                )
+                let permissionMethod = "_x.ai/yolo_mode_changed"
+                let lifecycle = OSAllocatedUnfairLock(initialState: [String]())
+                let controller = try ACPAgentSessionController(
+                    provider: provider,
+                    runRequest: request,
+                    diagnosticSink: { event in
+                        switch event {
+                        case let .phaseCompleted(phase) where phase == "session/new" || phase == "session/load":
+                            lifecycle.withLock { $0.append("opened") }
+                        case let .outboundJSON(line):
+                            guard let data = line.data(using: .utf8),
+                                  let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                  let method = message["method"] as? String,
+                                  method == permissionMethod || method == "session/prompt"
+                            else { return }
+                            lifecycle.withLock { $0.append(method) }
+                        default:
+                            break
+                        }
+                    },
+                    allowsProviderProcessLaunchForTesting: true
+                )
+                do {
+                    _ = try await controller.bootstrap()
+                    try await controller.prompt(AgentMessage(userMessage: "hi"), request: request)
+                    await controller.shutdown()
+                } catch {
+                    await controller.shutdown()
+                    throw error
+                }
+
+                let messages = harness.recordedMessages()
+                let methods = messages.compactMap { $0["method"] as? String }
+                // Shutdown may send session/cancel after prompting; only setup traffic is relevant.
+                let setupMethods = methods.filter { ["session/new", "session/load", permissionMethod, "session/prompt"].contains($0) }
+                let expectedMethods = testCase.openMethods + (fullAccess ? [] : [permissionMethod]) + ["session/prompt"]
+                XCTAssertEqual(setupMethods, expectedMethods, context)
+                XCTAssertEqual(
+                    lifecycle.withLock { $0 },
+                    ["opened"] + (fullAccess ? [] : [permissionMethod]) + ["session/prompt"],
+                    context
+                )
+
+                for method in testCase.openMethods {
+                    let params = try XCTUnwrap(harness.recordedMethods(method).first, context)
+                    if fullAccess {
+                        XCTAssertNil(params["_meta"], context)
+                    } else {
+                        XCTAssertEqual(
+                            params["_meta"] as? [String: Bool],
+                            ["yoloMode": false, "autoMode": false],
+                            context
+                        )
+                    }
+                }
+                let arguments = try XCTUnwrap(harness.recordedMethods("launchArguments").first?["arguments"] as? [String], context)
+                XCTAssertEqual(arguments.contains("--always-approve"), fullAccess, context)
+
+                if !fullAccess, let notification = messages.first(where: { $0["method"] as? String == permissionMethod }) {
+                    XCTAssertEqual(notification["jsonrpc"] as? String, "2.0", context)
+                    XCTAssertNil(notification["id"], "must be a notification: \(context)")
+                    XCTAssertEqual(notification["params"] as? [String: Bool], ["auto_mode": false], context)
+                }
+            }
+        }
+    }
+
     func testContextBuilderLaunchIsolatesImportsAndPreservesMCPInjection() async throws {
         let harness = try makeHarness()
         let mcp = RepoPromptMCPServerConfiguration(
@@ -192,17 +289,19 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             workspace.appendingPathComponent("grok").path
         }
 
-        func recordedMethods(_ method: String) -> [[String: Any]] {
+        func recordedMessages() -> [[String: Any]] {
             guard let data = try? Data(contentsOf: recordURL),
                   let text = String(data: data, encoding: .utf8)
             else { return [] }
             return text.split(separator: "\n").compactMap { line in
-                guard let lineData = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                      object["method"] as? String == method
-                else { return nil }
-                return object["params"] as? [String: Any] ?? [:]
+                guard let lineData = line.data(using: .utf8) else { return nil }
+                return try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
             }
+        }
+
+        func recordedMethods(_ method: String) -> [[String: Any]] {
+            recordedMessages().filter { $0["method"] as? String == method }
+                .map { $0["params"] as? [String: Any] ?? [:] }
         }
     }
 
@@ -247,17 +346,18 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             print("Usage: grok agent [OPTIONS] [COMMAND]\n\nCommands:\n  stdio    Run the agent over stdio")
             sys.exit(0)
 
-        def record(method, params):
+        def record(method, params, message=None):
             if not record_path:
                 return
             with open(record_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"method": method, "params": params}) + "\n")
+                handle.write(json.dumps(message if message is not None else {"method": method, "params": params}) + "\n")
 
         def respond(request_id, result=None):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
 
         record("launchEnvironment", {key: os.environ.get(key) for key in
             ["GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "XAI_API_KEY"]})
+        record("launchArguments", {"arguments": sys.argv[1:]})
 
         for line in sys.stdin:
             line = line.strip()
@@ -272,14 +372,20 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             params = message.get("params") or {}
             if method is None:
                 continue
-            record(method, params)
+            record(method, params, message)
             if method == "initialize":
                 respond(request_id, {
                     "protocolVersion": 1,
                     "agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True}},
                     "authMethods": []
                 })
-            elif method == "session/new":
+            elif method in ("session/new", "session/load"):
+                if method == "session/load":
+                    if params.get("sessionId") == "missing-session":
+                        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {
+                            "code": -32602, "message": "Session not found"}}), flush=True)
+                        continue
+                    session_id = params.get("sessionId")
                 result = {"sessionId": session_id, "models": {
                     "currentModelId": "grok-4.6",
                     "availableModels": [

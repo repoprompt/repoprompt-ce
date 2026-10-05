@@ -213,9 +213,32 @@ struct ACPSessionConfiguration: Equatable {
         case load(existingSessionID: String)
     }
 
+    struct PostOpenNotification: Equatable {
+        let method: String
+        let params: [String: AgentJSONValue]
+    }
+
     let mode: Mode
     let workingDirectory: String
     let mcpServers: [RepoPromptMCPServerConfiguration]
+    /// Provider-owned `_meta` on every session-open attempt; empty means omit the key.
+    let metadata: [String: AgentJSONValue]
+    /// Sent once after successful opening (including fallback), before the first prompt.
+    let postOpenNotifications: [PostOpenNotification]
+
+    init(
+        mode: Mode,
+        workingDirectory: String,
+        mcpServers: [RepoPromptMCPServerConfiguration],
+        metadata: [String: AgentJSONValue] = [:],
+        postOpenNotifications: [PostOpenNotification] = []
+    ) {
+        self.mode = mode
+        self.workingDirectory = workingDirectory
+        self.mcpServers = mcpServers
+        self.metadata = metadata
+        self.postOpenNotifications = postOpenNotifications
+    }
 }
 
 enum NormalizedAgentRuntimeEvent {
