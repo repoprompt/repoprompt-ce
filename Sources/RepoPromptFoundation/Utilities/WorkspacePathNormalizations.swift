@@ -91,21 +91,21 @@ package enum GitDiffPathNormalization {
     }
 
     package static func gitPathspecs(from paths: [String], repoRootPath: String) -> [String] {
-        var seen = Set<String>()
+        var seen = Set<Data>()
         return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
-            seen.insert(normalized.plain).inserted ? normalized.plain : nil
+            seen.insert(Data(normalized.plain.utf8)).inserted ? normalized.plain : nil
         }
     }
 
     /// Produces command pathspecs while preserving user-authored relative Git pathspec semantics.
     /// Absolute inputs are app/worktree-derived paths and must be literalized before invoking Git.
     package static func gitDiscoveryPathspecs(from paths: [String], repoRootPath: String) -> [String] {
-        var seen = Set<String>()
+        var seen = Set<Data>()
         return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
             let pathspec = normalized.requiresLiteralMagic
                 ? literalGitPathspec(normalized.plain)
                 : normalized.plain
-            return seen.insert(pathspec).inserted ? pathspec : nil
+            return seen.insert(Data(pathspec.utf8)).inserted ? pathspec : nil
         }
     }
 
@@ -121,36 +121,24 @@ package enum GitDiffPathNormalization {
         from paths: [String],
         repoRootPath: String
     ) -> [NormalizedGitPathspec] {
-        let standardizedRoot = normalizedAbsolutePath(repoRootPath)
+        guard let root = try? WorkspaceAbsolutePath.nativeText(repoRootPath) else { return [] }
         var results: [NormalizedGitPathspec] = []
         results.reserveCapacity(paths.count)
 
         for rawPath in paths {
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, !StandardizedPath.containsNUL(trimmed) else { continue }
-
-            let expanded = (trimmed as NSString).expandingTildeInPath
-            guard expanded.hasPrefix("/") else {
-                results.append(NormalizedGitPathspec(plain: trimmed, requiresLiteralMagic: false))
+            guard !rawPath.isEmpty, !StandardizedPath.containsNUL(rawPath) else { continue }
+            guard rawPath.hasPrefix("/") else {
+                results.append(NormalizedGitPathspec(plain: rawPath, requiresLiteralMagic: false))
                 continue
             }
-
-            let standardizedPath = normalizedAbsolutePath(expanded)
-            guard StandardizedPath.isDescendant(standardizedPath, of: standardizedRoot) else {
+            guard let path = try? WorkspaceAbsolutePath.nativeText(rawPath), path.isLexicallyWithin(root) else {
                 continue
             }
-            if standardizedPath == standardizedRoot {
+            if path.directoryKey == root.directoryKey {
                 results.append(NormalizedGitPathspec(plain: ".", requiresLiteralMagic: true))
                 continue
             }
-
-            let suffix: Substring = if standardizedRoot == "/" {
-                standardizedPath.dropFirst()
-            } else {
-                standardizedPath.dropFirst(standardizedRoot.count)
-            }
-            let pathspec = StandardizedPath.relative(String(suffix))
-            guard !pathspec.isEmpty else { continue }
+            guard let relative = try? path.relative(to: root), let pathspec = try? relative.utf8ForWire() else { continue }
             results.append(NormalizedGitPathspec(plain: pathspec, requiresLiteralMagic: true))
         }
         return results

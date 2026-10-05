@@ -2,15 +2,8 @@ import Foundation
 import RepoPromptFoundation
 
 enum AutoSliceSelection {
-    struct SliceEntry: Equatable {
-        let path: String
-        let ranges: [LineRange]
-    }
-
-    enum ReadFileSelection: Equatable {
-        case full(path: String)
-        case slice(SliceEntry)
-    }
+    typealias SliceEntry = ReadReplySelectionPolicy.SliceEntry
+    typealias ReadFileSelection = ReadReplySelectionPolicy.Selection
 
     static func shouldApply(purpose: MCPRunPurpose, hasVirtualContext: Bool) -> Bool {
         purpose == .agentModeRun && hasVirtualContext
@@ -20,26 +13,14 @@ enum AutoSliceSelection {
         from reply: ToolResultDTOs.ReadFileReply,
         fallbackPath: String? = nil
     ) -> ReadFileSelection? {
-        guard reply.totalLines > 0 else { return nil }
-        guard reply.firstLine > 0 else { return nil }
-        guard reply.lastLine >= reply.firstLine else { return nil }
-        guard reply.firstLine <= reply.totalLines else { return nil }
-
-        let displayPath = reply.displayPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let fallback = fallbackPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let resolvedPath = displayPath.isEmpty ? fallback : displayPath
-        guard !resolvedPath.isEmpty else { return nil }
-        guard !isAgentsInstructionsFile(resolvedPath) else { return nil }
-
-        if reply.firstLine == 1, reply.lastLine == reply.totalLines {
-            return .full(path: resolvedPath)
-        }
-
-        return .slice(
-            SliceEntry(
-                path: resolvedPath,
-                ranges: [LineRange(start: reply.firstLine, end: reply.lastLine)]
-            )
+        ReadReplySelectionPolicy.selection(
+            from: .init(
+                totalLines: reply.totalLines,
+                firstLine: reply.firstLine,
+                lastLine: reply.lastLine,
+                displayPath: reply.displayPath
+            ),
+            fallbackPath: fallbackPath
         )
     }
 
@@ -47,22 +28,11 @@ enum AutoSliceSelection {
         _ selection: ReadFileSelection,
         existingFullPaths: [String]
     ) -> ReadFileSelection {
-        guard case let .slice(entry) = selection else { return selection }
-        guard let standardizedEntryPath = StoredSelectionPathNormalization.standardizedPath(entry.path) else {
-            return selection
-        }
-
-        let existingFullSet = Set(existingFullPaths.compactMap(StoredSelectionPathNormalization.standardizedPath))
-        guard existingFullSet.contains(standardizedEntryPath) else { return selection }
-        return .full(path: entry.path)
+        ReadReplySelectionPolicy.preserveExistingFullFileSelection(selection, existingFullPaths: existingFullPaths)
     }
 
     static func shouldSliceFileSearch(mode: SearchMode, contextLines: Int) -> Bool {
         mode == .content && contextLines > 1
-    }
-
-    private static func isAgentsInstructionsFile(_ path: String) -> Bool {
-        (path as NSString).lastPathComponent.caseInsensitiveCompare("AGENTS.md") == .orderedSame
     }
 
     static func searchEntries(

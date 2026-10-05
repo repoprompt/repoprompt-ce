@@ -235,6 +235,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptWorkspaceCore",
+            dependencies: [.product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptWorkspaceCore"
         ),
         .target(
