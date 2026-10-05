@@ -541,6 +541,7 @@ final class GitViewModel: ObservableObject {
             await task.value
         }
         pendingWindowCloseTasks.removeAll()
+        await statusActor.invalidateUntrackedStats()
     }
 
     #if DEBUG
