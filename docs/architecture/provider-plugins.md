@@ -240,6 +240,12 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - Model discovery injects no RPCE server and always uses the existing neutral `RepoPromptGrokBuildACPDiscovery` temporary directory, reusing one verified session there rather than following subscribed workspaces. Closing a window cancels its discovery subscription, not the shared polling service.
 - **Project-config limit:** Grok's project `.mcp.json` is not controlled by the two import switches. Neutral polling avoids the user's project file, but Context Builder and Agent Mode retain their real workspace and may still load it. Grok-native MCP configuration is not filtered or rewritten by this policy.
 
+#### Grok background-feature launch policy
+
+- Agent Mode and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` in the child-process environment. These host-managed paths must not start Grok-owned background work that RepoPrompt CE does not orchestrate or surface.
+- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, so Context Builder and one-shot (Oracle/Chat) callers retain their existing native background-feature behavior. No user configuration or global environment is changed.
+- The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
+
 ## How a new provider plugs in
 
 The recommended pattern when adding (for example) a hypothetical `acmeAgent` family:

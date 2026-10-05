@@ -53,7 +53,9 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             }
         }
 
-        var environment = GrokBuildAgentConfig.importIsolationEnvironment
+        var environment = config.backgroundFeatureEnvironment.merging(GrokBuildAgentConfig.importIsolationEnvironment) { _, isolation in
+            isolation
+        }
         if let apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty {
             // Never log this value; it exists only as a child-process launch override.
             environment["XAI_API_KEY"] = apiKey

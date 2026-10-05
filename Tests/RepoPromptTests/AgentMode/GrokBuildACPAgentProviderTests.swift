@@ -19,7 +19,8 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             modelString: config.modelString,
             includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
             alwaysApproveTools: config.alwaysApproveTools,
-            apiKey: config.apiKey
+            apiKey: config.apiKey,
+            backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
         )
         let provider = GrokBuildACPAgentProvider(
             config: resolvedConfig,
@@ -50,6 +51,9 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
         XCTAssertEqual(launch.arguments, ["agent", "--no-leader", "stdio"])
         XCTAssertNil(launch.cleanupArtifact)
+        for key in ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"] {
+            XCTAssertNil(launch.environment[key], "Default config must preserve native behavior for \(key)")
+        }
     }
 
     func testManagedModeDoesNotAppendAlwaysApprove() throws {
@@ -90,6 +94,24 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             XCTAssertNil(launch.environment["HOME"])
             XCTAssertNil(launch.environment["GROK_HOME"])
         }
+    }
+
+    func testBackgroundFeatureEnvironmentPreservesImportIsolationAndStoredKey() throws {
+        let config = GrokBuildAgentConfig(
+            apiKey: "xai-test-key-123",
+            backgroundFeatureEnvironment: [
+                "GROK_MEMORY": "1",
+                "GROK_CLAUDE_MCPS_ENABLED": "1",
+                "GROK_CURSOR_MCPS_ENABLED": "1",
+                "XAI_API_KEY": "background-test-key"
+            ]
+        )
+        let (provider, directory) = try makeProvider(config: config)
+        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+        XCTAssertEqual(launch.environment["GROK_MEMORY"], "1")
+        XCTAssertEqual(launch.environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
+        XCTAssertEqual(launch.environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+        XCTAssertEqual(launch.environment["XAI_API_KEY"], "xai-test-key-123")
     }
 
     func testStoredGrokAPIKeyIsInjectedAsXAIAPIKey() throws {
