@@ -1,5 +1,7 @@
+import Darwin
 import Foundation
 import RepoPromptSecureStorage
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -92,6 +94,255 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             XCTAssertNil(environment["HOME"])
             XCTAssertNil(environment["GROK_HOME"])
         }
+    }
+
+    func testOneShotCleanupUsesEffectiveHomeAndRemovesEntireOwnedFolder() throws {
+        for homeSelection in ["default", "empty override", "absolute override", "relative override"] {
+            let root = try makeOneShotFixtureRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let promptDirectory = root.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
+            try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
+            let home = root.appendingPathComponent("home", isDirectory: true)
+            let defaultGrokHome = home.appendingPathComponent(".grok", isDirectory: true)
+            var environment = ["HOME": home.path]
+            let grokHome: URL
+            switch homeSelection {
+            case "empty override":
+                environment["GROK_HOME"] = ""
+                grokHome = defaultGrokHome
+            case "absolute override":
+                grokHome = root.appendingPathComponent("custom-grok", isDirectory: true)
+                environment["GROK_HOME"] = grokHome.path
+            case "relative override":
+                environment["GROK_HOME"] = "relative-grok"
+                grokHome = promptDirectory.appendingPathComponent("relative-grok", isDirectory: true)
+            default:
+                grokHome = defaultGrokHome
+            }
+            let encodedCWD = encodedOneShotCWD(promptDirectory.resolvingSymlinksInPath().path)
+            let owned = grokHome.appendingPathComponent("sessions/\(encodedCWD)", isDirectory: true)
+            try makeStoredOneShotSession(at: owned)
+            let neighbor = grokHome.appendingPathComponent("sessions/neighbor/prompt_history.jsonl")
+            try writeOneShotFixture("neighbor prompt", to: neighbor)
+            let configFile = grokHome.appendingPathComponent("config.toml")
+            try writeOneShotFixture("existing config", to: configFile)
+            let unselectedSession = defaultGrokHome.appendingPathComponent("sessions/\(encodedCWD)")
+            if homeSelection == "absolute override" {
+                try makeStoredOneShotSession(at: unselectedSession)
+            }
+
+            try GrokBuildOneShotHeadlessAgentProvider.cleanupRequestArtifacts(
+                promptDirectory: promptDirectory,
+                environment: environment
+            )
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path), homeSelection)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path), homeSelection)
+            // A relative Grok home lives inside the request cwd and is request-owned too.
+            if homeSelection != "relative override" {
+                XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "neighbor prompt", homeSelection)
+                XCTAssertEqual(try String(contentsOf: configFile, encoding: .utf8), "existing config", homeSelection)
+            }
+            if homeSelection == "absolute override" {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: unselectedSession.path))
+            }
+        }
+    }
+
+    func testOneShotCleanupUsesResolvedWorkingDirectoryIdentity() throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let physicalParent = root.appendingPathComponent("physical", isDirectory: true)
+        let physicalCWD = physicalParent.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
+        try FileManager.default.createDirectory(at: physicalCWD, withIntermediateDirectories: true)
+        let alias = root.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: physicalParent)
+        let promptDirectory = alias.appendingPathComponent(physicalCWD.lastPathComponent, isDirectory: true)
+        let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
+        let owned = grokHome.appendingPathComponent(
+            "sessions/\(encodedOneShotCWD(promptDirectory.resolvingSymlinksInPath().path))"
+        )
+        let logicalPathSession = grokHome.appendingPathComponent(
+            "sessions/\(encodedOneShotCWD(promptDirectory.path))"
+        )
+        XCTAssertNotEqual(owned, logicalPathSession)
+        try makeStoredOneShotSession(at: owned)
+        try makeStoredOneShotSession(at: logicalPathSession)
+
+        try GrokBuildOneShotHeadlessAgentProvider.cleanupRequestArtifacts(
+            promptDirectory: promptDirectory,
+            environment: ["GROK_HOME": grokHome.path]
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: physicalCWD.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: logicalPathSession.path))
+    }
+
+    func testOneShotCleanupFindsLongWorkingDirectoryByExactCWDMetadata() throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let promptDirectory = root
+            .appendingPathComponent(String(repeating: "中", count: 30), isDirectory: true)
+            .appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
+        try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
+        let resolvedCWD = promptDirectory.resolvingSymlinksInPath().path
+        XCTAssertGreaterThan(encodedOneShotCWD(resolvedCWD).utf8.count, 255)
+        let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
+        // Grok's hash-form directory carries the authoritative original cwd in .cwd.
+        let owned = grokHome.appendingPathComponent("sessions/rp-grok-oneshot-request-0123456789abcdef")
+        try makeStoredOneShotSession(at: owned, cwdMetadata: resolvedCWD)
+        let neighbor = grokHome.appendingPathComponent("sessions/rp-grok-oneshot-request-fedcba9876543210")
+        try makeStoredOneShotSession(at: neighbor, cwdMetadata: resolvedCWD + "-other")
+        let undecodable = grokHome.appendingPathComponent("sessions/unknown-session")
+        try makeStoredOneShotSession(at: undecodable)
+
+        try GrokBuildOneShotHeadlessAgentProvider.cleanupRequestArtifacts(
+            promptDirectory: promptDirectory,
+            environment: ["GROK_HOME": grokHome.path]
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path))
+        XCTAssertEqual(try String(contentsOf: neighbor.appendingPathComponent(".cwd"), encoding: .utf8), resolvedCWD + "-other")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: undecodable.path))
+    }
+
+    func testOneShotCleanupWithoutStoredSessionDoesNotCreateGrokHome() throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let promptDirectory = root.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
+        try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
+        let grokHome = root.appendingPathComponent("absent-grok-home", isDirectory: true)
+
+        XCTAssertNoThrow(try GrokBuildOneShotHeadlessAgentProvider.cleanupRequestArtifacts(
+            promptDirectory: promptDirectory,
+            environment: ["GROK_HOME": grokHome.path]
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: grokHome.path))
+    }
+
+    func testOneShotCancellationRemovesSessionAfterChildStopsWriting() async throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
+        let neighbor = grokHome.appendingPathComponent("sessions/neighbor/prompt_history.jsonl")
+        try writeOneShotFixture("neighbor prompt", to: neighbor)
+        let executable = root.appendingPathComponent("grok")
+        let script = #"""
+        #!/bin/sh
+        if [ "$1" = agent ] && [ "$2" = --help ]; then
+            printf 'stdio\n'
+            exit 0
+        fi
+        cwd=$(/bin/pwd -P)
+        encoded=$(printf '%s' "$cwd" | /usr/bin/od -An -v -t x1 | /usr/bin/awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    hex = "0123456789abcdef"
+                    byte = (index(hex, substr($i, 1, 1)) - 1) * 16 + index(hex, substr($i, 2, 1)) - 1
+                    if ((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+                        (byte >= 97 && byte <= 122) || byte == 45 || byte == 46 || byte == 95 || byte == 126)
+                        printf "%c", byte
+                    else
+                        printf "%%%s", toupper($i)
+                }
+            }')
+        if [ "${#encoded}" -gt 255 ]; then
+            encoded=rp-grok-oneshot-fixture-0123456789abcdef
+        fi
+        session="$GROK_HOME/sessions/$encoded"
+        /bin/mkdir -p "$session/session-id/attachments"
+        printf '%s' "$cwd" > "$session/.cwd"
+        /bin/cat prompt.txt > "$session/prompt_history.jsonl"
+        /bin/cat prompt.txt > "$session/session-id/system_prompt.txt"
+        printf 'opaque artifact' > "$session/session-id/attachments/opaque.txt"
+        printf '%s' "$cwd" > "$RPCE_FIXTURE_ROOT/request-cwd"
+        printf '%s' "$session" > "$RPCE_FIXTURE_ROOT/session-path"
+        trap 'printf "last write" > "$session/session-id/final-write" && printf "stopped" > "$RPCE_FIXTURE_ROOT/child-stopped"; exit 0' TERM
+        printf 'ready\n' > "$RPCE_FIXTURE_ROOT/ready.fifo"
+        /bin/sleep 60 &
+        wait $!
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let readyFIFO = root.appendingPathComponent("ready.fifo")
+        XCTAssertEqual(mkfifo(readyFIFO.path, 0o600), 0)
+        let readyHandle = try FileHandle(forUpdating: readyFIFO)
+        defer {
+            readyHandle.readabilityHandler = nil
+            try? readyHandle.close()
+        }
+        let ready = expectation(description: "Synthetic Grok has written the request session")
+        readyHandle.readabilityHandler = { handle in
+            _ = handle.availableData
+            handle.readabilityHandler = nil
+            ready.fulfill()
+        }
+        let environment = [
+            "PATH": "/usr/bin:/bin",
+            "HOME": root.appendingPathComponent("home", isDirectory: true).path,
+            "GROK_HOME": grokHome.path,
+            "RPCE_FIXTURE_ROOT": root.path
+        ]
+        let provider = GrokBuildOneShotHeadlessAgentProvider(
+            config: GrokBuildAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false),
+            launchResolver: GrokBuildACPLaunchResolver(environmentProvider: { _ in environment }),
+            requestTimeout: 30,
+            apiKeyProvider: { nil }
+        )
+
+        // The provider task inherits this fixture-only opt-in for both its support probe and request.
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            let stream = try await provider.streamAgentMessage(
+                AgentMessage(systemPrompt: "fixture system", userMessage: "fixture prompt")
+            )
+            let consumer = Task {
+                for try await _ in stream {}
+            }
+            await fulfillment(of: [ready], timeout: 10)
+            await provider.dispose()
+            switch await consumer.result {
+            case .success:
+                XCTFail("Expected request cancellation")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError, "Cancellation must remain the primary error: \(error)")
+            }
+        }
+
+        let ownedPath = try String(contentsOf: root.appendingPathComponent("session-path"), encoding: .utf8)
+        let requestCWD = try String(contentsOf: root.appendingPathComponent("request-cwd"), encoding: .utf8)
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("child-stopped"), encoding: .utf8), "stopped")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownedPath), "The whole request-owned session must be removed after the child's final write")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: requestCWD))
+        XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "neighbor prompt")
+    }
+
+    private func makeOneShotFixtureRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GrokOneShotCleanup-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func encodedOneShotCWD(_ cwd: String) -> String {
+        cwd.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))!
+    }
+
+    private func makeStoredOneShotSession(at directory: URL, cwdMetadata: String? = nil) throws {
+        try writeOneShotFixture("fixture prompt", to: directory.appendingPathComponent("prompt_history.jsonl"))
+        try writeOneShotFixture("fixture system", to: directory.appendingPathComponent("session-id/system_prompt.txt"))
+        try writeOneShotFixture("opaque artifact", to: directory.appendingPathComponent("session-id/attachments/opaque.txt"))
+        if let cwdMetadata {
+            try writeOneShotFixture(cwdMetadata, to: directory.appendingPathComponent(".cwd"))
+        }
+    }
+
+    private func writeOneShotFixture(_ text: String, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
     func testOneShotRejectsImagesBeforeLaunchWithoutLeakingPayload() async {

@@ -107,7 +107,12 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
-        defer { try? FileManager.default.removeItem(at: promptDirectory) }
+        defer {
+            try? Self.cleanupRequestArtifacts(
+                promptDirectory: promptDirectory,
+                environment: launch.environment
+            )
+        }
 
         let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
         let prompt = Self.promptText(from: message)
@@ -189,6 +194,14 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
             )
         }
+    }
+
+    /// The existing cleanup boundary, extracted so request-owned artifacts can be verified without a CLI.
+    static func cleanupRequestArtifacts(
+        promptDirectory: URL,
+        environment _: [String: String]
+    ) throws {
+        try FileManager.default.removeItem(at: promptDirectory)
     }
 
     /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
