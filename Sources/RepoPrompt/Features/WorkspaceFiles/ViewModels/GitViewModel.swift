@@ -1,23 +1,12 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
-
-enum GitDiffInclusionMode: String, CaseIterable, Codable {
-    case none
-    case selectedFiles
-    case all
-
-    var displayName: String {
-        switch self {
-        case .none: "None"
-        case .selectedFiles: "Selected"
-        case .all: "All"
-        }
-    }
-}
 
 @MainActor
 final class GitViewModel: ObservableObject {
@@ -257,9 +246,13 @@ final class GitViewModel: ObservableObject {
         resolvedStateTask = Task.detached(
             priority: .userInitiated
         ) { [input, generation, rebuildGeneration, rootPath, selectedRootPath] in
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
             let output = Self.buildResolvedState(input: input)
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                return
+            }
 
             await MainActor.run { [weak self] in
                 guard !Task.isCancelled else { return }
@@ -497,7 +490,9 @@ final class GitViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
-                    if self == nil { break }
+                    if self == nil {
+                        break
+                    }
                     continue
                 }
                 let detections = await refreshGitContexts(request.rootPaths)
@@ -540,11 +535,13 @@ final class GitViewModel: ObservableObject {
 
     func shutdownForWindowClose() async {
         prepareForWindowClose()
+        await statusActor.shutdown()
         let tasks = pendingWindowCloseTasks
         for task in tasks {
             await task.value
         }
         pendingWindowCloseTasks.removeAll()
+        await statusActor.invalidateUntrackedStats()
     }
 
     #if DEBUG

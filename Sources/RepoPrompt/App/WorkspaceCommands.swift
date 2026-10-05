@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 /// Extra File-menu items that operate on the *focused* window’s workspace.

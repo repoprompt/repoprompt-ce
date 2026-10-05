@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+
 //
 //  AdvancedSettingsView.swift
 //  RepoPrompt

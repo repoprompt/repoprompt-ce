@@ -1,6 +1,6 @@
 # Native self-compaction continuation boundary
 
-Agent Mode exposes the self-only `agent_self` MCP tool and supports native Claude, Codex, and advertised ACP compaction. The tool cannot name another session; only the calling run attempt may reserve a request.
+Agent Mode exposes the self-only `self_compact` MCP tool and supports native Claude, Codex, and advertised ACP compaction. The tool cannot name another session; only the calling run attempt may reserve a request.
 
 Claude and Codex command turns are correlated to the request ID and originating provider run attempt before the compact RPC. Only a successful terminal completion of that exact Claude command turn, or a successful correlated Codex `.compact` turn, permits a dedicated continuation-note turn. A session-owned 300-second monotonic deadline settles missing completion as `completion_unverified`; a late event cannot restart delivery. The deadline uses an injected sleeper in tests.
 

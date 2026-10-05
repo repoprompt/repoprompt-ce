@@ -318,6 +318,13 @@ extension AgentModeViewModel {
             && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
     }
 
+    /// Only event-driven wakes can carry this note; periodic prompting remains excluded.
+    func agentSelfCompactBlocksNotificationWake(_ session: TabSession) -> Bool {
+        guard session.selfCompactState.blocksAutomaticWake else { return false }
+        guard let owner = session.selfCompactState.verifiedParkedNoteOwner else { return true }
+        return !agentSelfCompactOwnerIsCurrent(owner, session: session)
+    }
+
     private func agentSelfCompactDispatchNative(
         requestID: UUID,
         session: TabSession,

@@ -1,10 +1,17 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 @testable import RepoPromptProcess
+import RepoPromptSettingsCore
 import XCTest
 
 final class CursorACPLaunchResolverTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testHealthyLegacyDoesNotDiscoverSecondaryEntrypoint() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "cursor-agent", in: directory)
@@ -93,7 +100,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let reader = DispatchSource.makeReadSource(fileDescriptor: enteredDescriptor, queue: .global())
         reader.setEventHandler {
             var byte: UInt8 = 0
-            if Darwin.read(enteredDescriptor, &byte, 1) == 1 { entered.fulfill() }
+            if Darwin.read(enteredDescriptor, &byte, 1) == 1 {
+                entered.fulfill()
+            }
         }
         reader.setCancelHandler { close(enteredDescriptor) }
         reader.resume()
@@ -542,7 +551,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             supplementalPathProvider: { $0 },
             probeRunner: { launch, _, timeout, _ in
                 await probes.record(launch.command, timeout: timeout)
-                if launch.command == legacyPath { clock.advance(by: 6) }
+                if launch.command == legacyPath {
+                    clock.advance(by: 6)
+                }
                 return CLIProcessRunner.Result(
                     stdout: Data("Cursor Agent ACP support".utf8), stderr: Data(),
                     status: launch.command == legacyPath ? 2 : 0, timedOut: false
@@ -806,7 +817,9 @@ private actor CursorProbeCommands {
 
     func record(_ command: String, timeout: TimeInterval? = nil) {
         commands.append(command)
-        if let timeout { timeouts.append(timeout) }
+        if let timeout {
+            timeouts.append(timeout)
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct AgentComposerDraftRestorationOperation: Equatable {
     struct Fragment: Equatable {

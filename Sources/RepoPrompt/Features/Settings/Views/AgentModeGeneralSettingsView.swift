@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptSettingsCore
 import RepoPromptShared
 import SwiftUI
 

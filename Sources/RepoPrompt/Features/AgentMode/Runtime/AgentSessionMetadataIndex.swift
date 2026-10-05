@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
     /// 8 adds canonical transcript-turn counts for history analytics.

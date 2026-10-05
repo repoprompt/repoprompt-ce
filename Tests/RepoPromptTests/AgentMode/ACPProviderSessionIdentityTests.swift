@@ -3,6 +3,7 @@ import os
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess
+import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 #if REPOPROMPT_SENTRY_ENABLED
     import Sentry

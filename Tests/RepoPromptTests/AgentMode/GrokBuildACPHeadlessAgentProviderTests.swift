@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import os
 import RepoPromptProcess
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

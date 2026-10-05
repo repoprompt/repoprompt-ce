@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Centralizes Codex Agent Mode boolean preferences that use GlobalSettingsStore in
 /// app-standard contexts and legacy UserDefaults shims in injected-defaults tests.

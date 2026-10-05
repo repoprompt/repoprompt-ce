@@ -2,7 +2,10 @@ import CryptoKit
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptPersistence
+import RepoPromptVCS
 import XCTest
 
 enum CodemapGraphIndexHarnessError: Error {

@@ -1,5 +1,6 @@
 import AppKit
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Oracle Pill

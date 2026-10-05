@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // MARK: - Enums
 
@@ -28,12 +29,7 @@ extension CopyPresetKind: Codable {
     }
 }
 
-/// How to include git diff in the copy
-enum GitInclusion: String, Codable, CaseIterable {
-    case none
-    case selected
-    case complete
-}
+// How to include git diff in the copy
 
 // MARK: - Copy Preset Model
 

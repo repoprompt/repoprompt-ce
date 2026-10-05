@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 struct WorkspacePublishedGitArtifactIngressRequest {

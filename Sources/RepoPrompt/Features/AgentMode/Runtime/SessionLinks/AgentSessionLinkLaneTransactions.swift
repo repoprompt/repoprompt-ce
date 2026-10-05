@@ -65,6 +65,8 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     let laneCount: Int
     var duplicate = false
     var firstTaskReason: String?
+    /// Original destination display name, preserved on replay; not a live location or selector.
+    var workspaceName: String?
 
     static func refused(_ reason: Reason, laneCount: Int = 0) -> Self {
         Self(

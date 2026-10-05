@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 enum WorkspaceCodemapBindingIntegrationRoutingError: Error, Equatable {
     case routeUnavailable(WorkspaceCodemapRootEpoch)

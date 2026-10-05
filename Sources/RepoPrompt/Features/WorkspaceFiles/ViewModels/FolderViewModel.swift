@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 

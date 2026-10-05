@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 protocol OpenCodeACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?, modelRaw: String?) async throws -> OpenCodeACPModelDiscoveryResult?

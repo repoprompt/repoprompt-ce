@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptPersistence
 import XCTest
 
 final class WorkspaceCodemapRootCapabilityServiceTests: XCTestCase {

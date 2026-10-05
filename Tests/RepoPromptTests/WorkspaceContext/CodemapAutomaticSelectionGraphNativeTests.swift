@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptPersistence
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {

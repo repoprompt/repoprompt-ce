@@ -2,8 +2,10 @@ import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptFileSystem
 import RepoPromptProcess
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import Sparkle
 import SwiftUI
 
@@ -201,6 +203,7 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
         case .skipped: .skipped
@@ -223,6 +226,8 @@ public enum RepoPromptApplication {
         CodexRuntimeAuthority.initializeLaunchSnapshot()
 
         SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
+        GlobalSettingsStore.installProcessApplicationEventBridge()
+        FileSystemAppIntegration.installHooks()
         RepoPromptSwiftUIApp.main()
     }
 }

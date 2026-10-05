@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum CodexMemories {
     static let defaultsKey = "enableCodexMemories"

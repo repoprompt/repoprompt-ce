@@ -1,6 +1,8 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 import XCTest
 
@@ -23,7 +25,7 @@ import XCTest
                 .appendingPathComponent("WorkspaceOpenFolderOrchestrationTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -36,7 +38,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -291,7 +293,9 @@ import XCTest
             while clock.now < deadline {
                 let snapshot = await mutatingManager.workspaceRoutingCatalogSnapshot()
                 existingIsAuthoritative = snapshot?.contains(where: { $0.id == existing.id }) == true
-                if existingIsAuthoritative { break }
+                if existingIsAuthoritative {
+                    break
+                }
                 try await clock.sleep(for: .milliseconds(10))
             }
             XCTAssertTrue(existingIsAuthoritative)
@@ -1066,7 +1070,9 @@ import XCTest
                     matches = snapshot.filter {
                         WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
                     }
-                    if matches.count == 2 { break }
+                    if matches.count == 2 {
+                        break
+                    }
                 }
                 try await clock.sleep(for: .milliseconds(10))
             }
@@ -1101,7 +1107,7 @@ import XCTest
                 activeComposeTabID: preservedTab.id
             )
             let workspaceFile = try manager.saveWorkspaceToFile(existing)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceFile)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFile)
             manager.workspaces.append(WorkspaceModel(
                 id: existing.id,
                 dateModified: existing.dateModified,

@@ -24,6 +24,10 @@
         "RepoPromptProcess",
         "RepoPromptRegexCore",
         "RepoPromptSecureStorage",
+        "RepoPromptFileSystem",
+        "RepoPromptVCS",
+        "RepoPromptPersistence",
+        "RepoPromptSettingsCore",
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
         "Sparkle"
@@ -154,6 +158,61 @@
         "RepoPromptRegexCore"
       ]
     },
+    "RepoPromptFileSystem": {
+      "source_root": "Sources/RepoPromptFileSystem",
+      "allowed_dependencies": [
+        "RepoPromptFoundation",
+        "RepoPromptDomainRuntime",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptC"
+      ],
+      "test_target": "RepoPromptFileSystemTests",
+      "app_free_tests": true
+    },
+    "RepoPromptVCS": {
+      "source_root": "Sources/RepoPromptVCS",
+      "allowed_dependencies": [
+        "RepoPromptFoundation",
+        "RepoPromptProcess",
+        "RepoPromptInstrumentation",
+        "RepoPromptDomainRuntime",
+        "RepoPromptFileSystem",
+        "RepoPromptWorkspaceCore"
+      ],
+      "test_target": "RepoPromptVCSTests",
+      "app_free_tests": true
+    },
+    "RepoPromptPersistence": {
+      "source_root": "Sources/RepoPromptPersistence",
+      "allowed_dependencies": [
+        "RepoPromptCodeMapCore",
+        "RepoPromptFileSystem",
+        "RepoPromptVCS",
+        "RepoPromptShared"
+      ],
+      "test_target": "RepoPromptPersistenceTests",
+      "app_free_tests": true
+    },
+    "RepoPromptPersistenceTests": {
+      "source_root": "Tests/RepoPromptPersistenceTests",
+      "allowed_dependencies": [
+        "RepoPromptPersistence",
+        "RepoPromptCodeMapCore",
+        "RepoPromptFoundation",
+        "RepoPromptFileSystem",
+        "RepoPromptVCS"
+      ]
+    },
+    "RepoPromptSettingsCore": {
+      "source_root": "Sources/RepoPromptSettingsCore",
+      "allowed_dependencies": [
+        "RepoPromptFoundation",
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared"
+      ],
+      "test_target": "RepoPromptSettingsCoreTests",
+      "app_free_tests": true
+    },
     "RepoPromptSecureStorage": {
       "source_root": "Sources/RepoPromptSecureStorage",
       "allowed_dependencies": [],
@@ -186,6 +245,10 @@
         "RepoPromptMCPCore",
         "RepoPromptProcess",
         "RepoPromptSecureStorage",
+        "RepoPromptFileSystem",
+        "RepoPromptVCS",
+        "RepoPromptPersistence",
+        "RepoPromptSettingsCore",
         "RepoPromptShared",
         "RepoPromptTestSupport",
         "RepoPromptWorkspaceCore"
@@ -210,6 +273,24 @@
     "TreeSitterScannerSupport": {
       "source_root": "Sources/TreeSitterScannerSupport",
       "allowed_dependencies": []
+    },
+    "RepoPromptFileSystemTests": {
+      "source_root": "Tests/RepoPromptFileSystemTests",
+      "allowed_dependencies": [
+        "RepoPromptFileSystem"
+      ]
+    },
+    "RepoPromptVCSTests": {
+      "source_root": "Tests/RepoPromptVCSTests",
+      "allowed_dependencies": [
+        "RepoPromptVCS"
+      ]
+    },
+    "RepoPromptSettingsCoreTests": {
+      "source_root": "Tests/RepoPromptSettingsCoreTests",
+      "allowed_dependencies": [
+        "RepoPromptSettingsCore"
+      ]
     }
   },
   "moved_families": {
@@ -277,6 +358,111 @@
       "owner": "RepoPromptSecureStorage",
       "former_app_roots": [
         "Sources/RepoPrompt/Infrastructure/Security"
+      ]
+    },
+    "FileSystem": {
+      "owner": "RepoPromptFileSystem",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/FileSystem/CodeMapSecureFileRemoval.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FSEventAsyncDeliveryBarrier.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileContentSnapshot.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemOperation.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemProviding.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemSeededInventory.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemSeededInventoryReplayOverlay.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+ContentLoading.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+DirectoryEnumeration.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+DirectoryListing.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FileOperations.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+IgnoreRules.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+PathUtilities.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+SeededInitialization.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+Testing.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemServiceTypes.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemWatcherEarlyFilter.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemWatcherIngressMailbox.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/GitignoreCompiler.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/HierarchicalIgnoreEvaluator.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/IgnoreCacheStore.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/IgnoreDebugMetricsRecorder.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/IgnoreRules.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/IgnoreRulesManager.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/LRUCache.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/PathComponentsCache.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/PatternPool.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/SpillBackedSortedArtifactStore.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/WorkspaceCatalogDirectoryReachability.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/WorkspaceRootNamespaceManifest.swift",
+        "Sources/RepoPrompt/Infrastructure/FileSystem/WorkspaceRootNamespaceManifestStore.swift"
+      ]
+    },
+    "VCS": {
+      "owner": "RepoPromptVCS",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/VCS/GitBlobIdentityModels.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffDataMaintenance.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffEngine.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffPatchParsing.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffPrimaryArtifacts.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffPublishedArtifacts.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffSnapshotPublisher.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitDiffSnapshotStore.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitRepoDescriptor.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/GitRepoRootAuthorization.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffCompareSpec.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffFingerprint.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffPublishMode.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffScope.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffSnapshotManifest.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitDiff/Models/GitDiffTarget.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitProcessActivityTimeoutController.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitProcessAdmissionController.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitProcessLifecycleController.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitProcessLifecycleTarget.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitProcessSpawnDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitRawOutputSpool.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitRepoTargetResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitRepositoryLayout.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitStatusPorcelainV2Parser.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTreeInventoryModels.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeDisplayLabelHumanizer.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeFileCloner.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeMergeModels.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeTrackedCheckoutClone.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/JJCommandRunner.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/VCSBackend.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/VCSModels.swift"
+      ]
+    },
+    "Persistence": {
+      "owner": "RepoPromptPersistence",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/CodeMap/CodeMapArtifactStore.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapArtifactCatalog.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapArtifactContainer.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapArtifactFileStore.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapRootManifestModels.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapRootManifestStore.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapV6CacheDeletionExecutor.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapV6CacheDeletionPlanner.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/CodeMapV6CacheDeletionScheduler.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/GitBlobCodeMapLocatorModels.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/CodeMapArtifacts/GitBlobCodeMapLocatorStore.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/DurableArtifacts/DurableArtifactGarbageCollector.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/DurableArtifacts/DurableArtifactInstallationIdentity.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/DurableArtifacts/DurableArtifactLease.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/DurableArtifacts/DurableArtifactSecureIO.swift",
+        "Sources/RepoPrompt/Infrastructure/Persistence/DurableArtifacts/DurableArtifactStore.swift",
+        "Sources/RepoPrompt/Features/CodeMap/Models/CodeMapSelectionGraphContribution.swift"
+      ]
+    },
+    "SettingsPersistence": {
+      "owner": "RepoPromptSettingsCore",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift",
+        "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsFileStore.swift"
       ]
     }
   }

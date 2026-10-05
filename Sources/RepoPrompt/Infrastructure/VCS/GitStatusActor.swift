@@ -1,5 +1,7 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 /// Background actor that handles all VCS (git/jj) operations off the main thread.
@@ -82,8 +84,17 @@ actor GitStatusActor {
 
     private var snapshotGeneration: Int = 0
     private var latestSnapshot: GitStatusSnapshot?
+    private var activeRefreshes = 0
+    private var refreshDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    #if DEBUG
+        private var test_refreshDrainStarted: (@Sendable () -> Void)?
+    #endif
 
     private var pollingTask: Task<Void, Never>?
+    private var isShutDown = false
+    private var waitForNextPoll: @Sendable () async throws -> Void = {
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+    }
 
     /// Timestamp of last fetch to throttle network calls
     private var lastFetchTime: Date?
@@ -103,6 +114,10 @@ actor GitStatusActor {
     }
 
     private func setStatusContinuation(_ continuation: AsyncStream<GitStatusSnapshot>.Continuation) {
+        guard !isShutDown else {
+            continuation.finish()
+            return
+        }
         statusContinuation = continuation
         if let snap = latestSnapshot {
             continuation.yield(snap)
@@ -124,9 +139,11 @@ actor GitStatusActor {
 
     /// Update the list of workspace roots and return detection results
     func updateRoots(_ roots: [String]) async -> [RepoDetection] {
+        guard !isShutDown else { return [] }
         let previousRoots = Set(workspaceRoots)
         let currentRoots = Set(roots)
         let removedRoots = previousRoots.subtracting(currentRoots)
+        let removedRepos = Set(removedRoots.compactMap { rootInfos[$0]?.repoRootPath })
         workspaceRoots = roots
 
         rootInfos = rootInfos.filter { key, _ in currentRoots.contains(key) }
@@ -135,6 +152,12 @@ actor GitStatusActor {
             await vcsService.invalidateCache(for: URL(fileURLWithPath: root))
         }
 
+        let backend = await vcsService.gitBackend()
+        for root in removedRepos {
+            await backend.invalidateUntrackedStats(at: URL(fileURLWithPath: root))
+        }
+
+        guard !isShutDown else { return [] }
         let rootsToDetect = roots.filter { rootInfos[$0] == nil }
         await withTaskGroup(of: (String, RootInfo).self) { group in
             for root in rootsToDetect {
@@ -165,6 +188,7 @@ actor GitStatusActor {
             }
         }
 
+        guard !isShutDown else { return [] }
         await refreshGitWorktreeContexts(for: roots)
 
         return roots.map { root in
@@ -175,6 +199,15 @@ actor GitStatusActor {
                 backendKind: info?.backendKind,
                 gitWorktreeContext: info?.gitWorktreeContext
             )
+        }
+    }
+
+    /// Best-effort cache release on window close; an in-flight refresh can repopulate it.
+    /// Poller teardown policy is unchanged.
+    func invalidateUntrackedStats() async {
+        let backend = await vcsService.gitBackend()
+        for root in Set(rootInfos.values.compactMap(\.repoRootPath)) {
+            await backend.invalidateUntrackedStats(at: URL(fileURLWithPath: root))
         }
     }
 
@@ -231,7 +264,7 @@ actor GitStatusActor {
     }
 
     func setSelectedRoot(_ rootPath: String?) async {
-        guard selectedRootPath != rootPath else { return }
+        guard !isShutDown, selectedRootPath != rootPath else { return }
         selectedRootPath = rootPath
         await refresh(trigger: .rootChanged)
     }
@@ -239,7 +272,7 @@ actor GitStatusActor {
     // MARK: - Mode & Branch Management
 
     func setInclusionMode(_ mode: GitDiffInclusionMode) async {
-        guard inclusionMode != mode else { return }
+        guard !isShutDown, inclusionMode != mode else { return }
         inclusionMode = mode
 
         if mode == .none {
@@ -251,7 +284,7 @@ actor GitStatusActor {
     }
 
     func setSelectedDiffBranch(_ branch: String) async {
-        guard selectedDiffBranch != branch else { return }
+        guard !isShutDown, selectedDiffBranch != branch else { return }
         selectedDiffBranch = branch
         await refresh(trigger: .branchChanged)
     }
@@ -397,6 +430,16 @@ actor GitStatusActor {
 
     @discardableResult
     func refresh(trigger: Trigger) async -> GitStatusSnapshot? {
+        guard !isShutDown else { return nil }
+        activeRefreshes += 1
+        defer {
+            activeRefreshes -= 1
+            if activeRefreshes == 0 {
+                let waiters = refreshDrainWaiters
+                refreshDrainWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        }
         guard let rootPath = selectedRootPath else {
             snapshotGeneration &+= 1
             let snap = GitStatusSnapshot(
@@ -460,11 +503,13 @@ actor GitStatusActor {
 
         let repoURL = URL(fileURLWithPath: gitRoot)
         let backend = await vcsService.backend(forRepoRoot: repoURL)
+        guard !isShutDown else { return nil }
 
         // Auto-fetch from remotes when popover opens to get latest remote branch refs
         if trigger == .popoverOpen {
             await fetchIfNeeded(at: repoURL)
         }
+        guard !isShutDown else { return nil }
 
         // Compute compare spec (normalize HEAD for jj backend)
         let baseRef = backend.normalizeBaseRef(selectedDiffBranch)
@@ -511,6 +556,7 @@ actor GitStatusActor {
         remoteBranches = await remoteBranchesTask ?? []
         tags = await tagsTask ?? []
         gitWorktreeContext = await gitWorktreeContextTask ?? rootInfo?.gitWorktreeContext
+        guard !isShutDown else { return nil }
         rootInfos[rootPath] = RootInfo(
             isRepo: true,
             repoRootPath: gitRoot,
@@ -526,6 +572,7 @@ actor GitStatusActor {
                 delta = try? await backend.getAheadBehind(vs: selectedDiffBranch, at: repoURL)
             }
         }
+        guard !isShutDown else { return nil }
 
         let totalAdd = files.compactMap(\.additions).reduce(0, +)
         let totalDel = files.compactMap(\.deletions).reduce(0, +)
@@ -584,14 +631,14 @@ actor GitStatusActor {
     // MARK: - Polling
 
     private func startPollingIfNeeded() {
-        guard pollingTask == nil, inclusionMode != .none else { return }
+        guard !isShutDown, pollingTask == nil, inclusionMode != .none else { return }
 
         pollingTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                try? await waitForNextPoll()
                 if Task.isCancelled { break }
 
-                guard inclusionMode != .none else { break }
+                guard !isShutDown, inclusionMode != .none else { break }
                 _ = await refresh(trigger: .backgroundPoll)
             }
         }
@@ -603,9 +650,49 @@ actor GitStatusActor {
     }
 
     func restartPollingIfNeeded() {
+        guard !isShutDown else { return }
         stopPolling()
         startPollingIfNeeded()
     }
+
+    /// Terminal window teardown: late mode/root updates must not restart this actor's poller.
+    func shutdown() async {
+        isShutDown = true
+        pollingTask?.cancel()
+        statusContinuation?.finish()
+        statusContinuation = nil
+        // Keep the handle until it drains so concurrent shutdown callers also wait for it.
+        await pollingTask?.value
+        pollingTask = nil
+        // Observer refreshes and previously cancelled polls may not own the current task handle.
+        if activeRefreshes > 0 {
+            await withCheckedContinuation { continuation in
+                refreshDrainWaiters.append(continuation)
+                #if DEBUG
+                    test_refreshDrainStarted?()
+                #endif
+            }
+        }
+    }
+
+    #if DEBUG
+        func test_setRefreshDrainStarted(_ callback: (@Sendable () -> Void)?) {
+            test_refreshDrainStarted = callback
+        }
+
+        func test_setPollingWait(_ wait: @escaping @Sendable () async throws -> Void) {
+            precondition(pollingTask == nil && !isShutDown)
+            waitForNextPoll = wait
+        }
+
+        var test_hasPollingTask: Bool {
+            pollingTask != nil
+        }
+
+        var test_latestSnapshot: GitStatusSnapshot? {
+            latestSnapshot
+        }
+    #endif
 
     // MARK: - Diff Generation
 

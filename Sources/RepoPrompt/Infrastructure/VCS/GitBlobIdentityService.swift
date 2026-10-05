@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct GitBlobIdentityServiceHooks {
     var afterGitCollection: @Sendable () async -> Void

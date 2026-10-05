@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension Notification.Name {
     /// Posted by `GlobalSettingsStore` after the notification preference group changes.

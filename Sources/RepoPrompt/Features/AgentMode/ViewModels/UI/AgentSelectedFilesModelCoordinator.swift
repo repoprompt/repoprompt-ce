@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 struct AgentSelectedFilesModelIdentity: Equatable, Hashable {
     let exportContextIdentity: AgentContextExportIdentity

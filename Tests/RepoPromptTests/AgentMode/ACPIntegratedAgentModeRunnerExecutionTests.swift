@@ -1,9 +1,15 @@
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
 final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testCompletedTerminalUsesSharedExecutionClassification() async {
         let classification = await ACPIntegratedAgentModeRunner.testClassifyTransientTerminal(
             state: .completed,

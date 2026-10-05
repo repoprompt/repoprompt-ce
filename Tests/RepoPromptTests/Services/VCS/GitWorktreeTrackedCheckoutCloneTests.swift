@@ -1,6 +1,7 @@
 import Darwin
 @testable import RepoPromptApp
 @testable import RepoPromptDomainRuntime
+import RepoPromptVCS
 import XCTest
 
 final class GitWorktreeTrackedCheckoutCloneTests: XCTestCase {

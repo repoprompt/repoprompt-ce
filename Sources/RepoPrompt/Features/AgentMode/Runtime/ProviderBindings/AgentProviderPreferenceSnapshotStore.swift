@@ -29,10 +29,14 @@ final class AgentProviderPreferenceSnapshotStore {
     ///
     /// This is intentionally separate from the profile-aware runtime binding entry point
     /// below so Settings provider rows do not accidentally inherit sub-agent preview policy.
-    func topLevelSettingsControlsBinding(providerID: AgentProviderBindingID) -> AgentProviderControlsBinding {
+    func topLevelSettingsControlsBinding(
+        providerID: AgentProviderBindingID,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil
+    ) -> AgentProviderControlsBinding {
         controlsBinding(
             selectedAgent: Self.representativeAgent(for: providerID),
             selectedModelRaw: nil,
+            claudeEffortLevel: claudeEffortLevel,
             permissionProfile: .userConfigured,
             isSubagent: false,
             externallyManagedReason: nil
@@ -46,6 +50,7 @@ final class AgentProviderPreferenceSnapshotStore {
     func controlsBinding(
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String? = nil,
+        claudeEffortLevel: ClaudeCodeEffortLevel? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent _: Bool,
         externallyManagedReason: String?
@@ -69,7 +74,8 @@ final class AgentProviderPreferenceSnapshotStore {
                 ? claudeToolSettingsBinding(
                     profile: permissionProfile,
                     selectedAgent: selectedAgent,
-                    selectedModelRaw: selectedModelRaw
+                    selectedModelRaw: selectedModelRaw,
+                    sessionEffortLevel: claudeEffortLevel
                 )
                 : nil
         )
@@ -532,9 +538,11 @@ final class AgentProviderPreferenceSnapshotStore {
     private func claudeToolSettingsBinding(
         profile: AgentProviderPermissionProfile,
         selectedAgent: AgentProviderKind,
-        selectedModelRaw: String?
+        selectedModelRaw: String?,
+        sessionEffortLevel: ClaudeCodeEffortLevel?
     ) -> ClaudeToolSettingsBinding {
-        let effortLevel = claudeEffortLevel(selectedAgent: selectedAgent, selectedModelRaw: selectedModelRaw)
+        let effortLevel = sessionEffortLevel
+            ?? claudeEffortLevel(selectedAgent: selectedAgent, selectedModelRaw: selectedModelRaw)
         switch profile {
         case .userConfigured, .providerOverride:
             return ClaudeToolSettingsBinding(

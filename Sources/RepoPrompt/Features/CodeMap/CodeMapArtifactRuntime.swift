@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptPersistence
 import RepoPromptShared
 
 /// Process-lifetime ownership for content-addressed codemap artifact infrastructure.

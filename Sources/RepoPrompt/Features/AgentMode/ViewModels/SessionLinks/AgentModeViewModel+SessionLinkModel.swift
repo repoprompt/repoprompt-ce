@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
     /// Workspace-qualified model routing never invokes the generic lifecycle discovery sweep.

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {

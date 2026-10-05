@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // MARK: - DEBUG MCP Apply-Edits Stable-Rebase Diagnostics
 
 import CryptoKit

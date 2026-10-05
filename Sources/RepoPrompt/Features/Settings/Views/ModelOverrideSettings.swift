@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  ModelOverrideSettings.swift
 //  RepoPrompt

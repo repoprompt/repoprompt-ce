@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Stable identity for a bundled routing backend. Router selection is exact and never falls back.
 struct AgentTaskRouterBackendID: RawRepresentable, Codable, Hashable, Comparable {

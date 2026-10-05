@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")

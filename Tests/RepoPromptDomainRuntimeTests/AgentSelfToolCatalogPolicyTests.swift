@@ -5,7 +5,9 @@ import XCTest
 
 final class AgentSelfToolCatalogPolicyTests: XCTestCase {
     func testCanonicalSelfToolHasOnlyTwoOperationsAndNoTargetSelectors() throws {
-        let name = "agent_self"
+        let name = "self_compact"
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.filter { $0.name == name }.count, 1)
+        XCTAssertNil(MCPDomainToolCatalog.entry(named: "agent_self"))
         let entry = try XCTUnwrap(MCPDomainToolCatalog.entry(named: name))
         XCTAssertEqual(entry.scope, .window)
         XCTAssertEqual(entry.capability, .agentSelfControl)
@@ -24,9 +26,9 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
     }
 
     func testCanonicalSelfDefinitionFitsOneThousandCharactersWithEssentialContract() throws {
-        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_self"))
-        let serialized = String(decoding: try JSONEncoder().encode(definition), as: UTF8.self)
-        XCTAssertLessThanOrEqual(serialized.count, 1_000, "Complete minified definition, not description alone")
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "self_compact"))
+        let serialized = try String(decoding: JSONEncoder().encode(definition), as: UTF8.self)
+        XCTAssertLessThanOrEqual(serialized.count, 1000, "Complete minified definition, not description alone")
         let description = definition.description
         for required in [
             "Agent Mode session", "no target selector", "`context`", "load", "status",
@@ -39,7 +41,7 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
     }
 
     func testSelfToolGrantedToAllAgentProfilesIncludingExploreButNotDirectOrDiscovery() {
-        let name = "agent_self"
+        let name = "self_compact"
         for profile in MCPClientToolPolicyProfile.allCases {
             let visible = MCPClientToolPolicyCatalog.resolvedToolNames(for: profile)
             XCTAssertEqual(visible.contains(name), profile != .direct && profile != .discovery, profile.rawValue)
@@ -56,14 +58,14 @@ final class AgentSelfToolCatalogPolicyTests: XCTestCase {
             externalReloadInterval: nil
         ))
         try await runtime.start()
-        let name = "agent_self"
+        let name = "self_compact"
         let revoked = MCPDomainClientPolicySnapshot(
             restrictedToolNames: [], additionalToolNames: [], role: .engineer,
             allowsAgentExternalControlTools: true, hasExactAgentSessionLinkGrant: true
         )
         do {
             try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: name, policy: revoked)
-            XCTFail("revoked agent_self grant must deny a named call")
+            XCTFail("revoked self_compact grant must deny a named call")
         } catch let denial as MCPDomainCallPolicyDenial {
             XCTAssertEqual(denial, .missingAdditionalGrant(toolName: name))
         }

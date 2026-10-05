@@ -2,6 +2,8 @@ import Foundation
 import JSONSchema
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 import RepoPromptShared
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.

@@ -1,3 +1,5 @@
+import RepoPromptVCS
+
 // MARK: - DEBUG Worktree Startup Benchmark Diagnostics
 
 import Foundation

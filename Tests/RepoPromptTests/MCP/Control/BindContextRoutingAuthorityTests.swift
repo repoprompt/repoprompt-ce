@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 final class BindContextRoutingAuthorityTests: XCTestCase {

@@ -1,9 +1,15 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AgentMCPModelParameterSupportTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private func installCursorMetadata() {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         // Scripted ACP advertisement: this test must not rely on offline product choices.

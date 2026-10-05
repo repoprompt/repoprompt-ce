@@ -1,5 +1,6 @@
 import AppKit
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import SwiftUI
 import XCTest
 

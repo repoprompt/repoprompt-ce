@@ -1,6 +1,8 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptPersistence
 
 enum CodeMapArtifactBuildPriority: Equatable {
     case demand

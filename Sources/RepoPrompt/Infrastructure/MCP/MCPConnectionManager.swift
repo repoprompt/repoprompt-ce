@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 // MARK: - Connection Management Components
 
 import CryptoKit
@@ -734,7 +736,9 @@ actor ServerNetworkManager {
     private let defaultDomainHost: MCPDomainHost
     private var domainHost: MCPDomainHost {
         #if DEBUG
-            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting { return runtime.domainHost }
+            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting {
+                return runtime.domainHost
+            }
         #endif
         return defaultDomainHost
     }
@@ -2440,7 +2444,10 @@ actor ServerNetworkManager {
     ) async -> Bool {
         guard await AppDomainRuntimeComposition.shared.isActive(identity.catalogRegistrationHandle) else { return false }
         if let token = identity.modelRouteToken,
-           await cachedModelCatalogRouteToken(connectionID: token.connectionID) != token { return false }
+           await cachedModelCatalogRouteToken(connectionID: token.connectionID) != token
+        {
+            return false
+        }
         return await MainActor.run {
             let window = identity.modelRouteToken != nil ? WindowStatesManager.shared.modelRoutingWindow(withID: identity.windowID)
                 : WindowStatesManager.shared.window(withID: identity.windowID)
@@ -3962,7 +3969,9 @@ actor ServerNetworkManager {
     ) async -> UUID? {
         // Completion must retain the original call attribution without invoking the generic
         // cold-route recovery sweep after a disconnect or handover.
-        if modelOnly { return callTimeRunID }
+        if modelOnly {
+            return callTimeRunID
+        }
         if let callTimeRunID {
             if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName),
                let completionTimeRunID = await runIDForConnection(connectionID),
@@ -15442,9 +15451,9 @@ actor ServerNetworkManager {
         blocks.compactMap { block -> String? in
             switch block {
             case .text(text: let text, annotations: _, _meta: _):
-                return text
+                text
             default:
-                return nil
+                nil
             }
         }.joined(separator: "\n")
     }

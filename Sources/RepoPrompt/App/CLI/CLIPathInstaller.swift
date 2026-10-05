@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // CLIPathInstaller.swift
 // Manages installation of the CLI tool to the user's PATH by creating
 // symlinks in /usr/local/bin.

@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 #if canImport(Darwin)
     import Darwin
 #else

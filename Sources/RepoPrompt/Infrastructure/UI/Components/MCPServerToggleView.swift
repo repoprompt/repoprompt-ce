@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptSettingsCore
 import SwiftUI
 
 private struct MCPToolbarVisualState: Equatable {

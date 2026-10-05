@@ -1,6 +1,8 @@
 import Combine
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 
 #if DEBUG

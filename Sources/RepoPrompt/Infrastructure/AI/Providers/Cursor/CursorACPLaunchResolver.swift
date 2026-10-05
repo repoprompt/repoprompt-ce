@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum CursorACPLaunchCandidate: CaseIterable, Equatable {
     case cursorAgentACP

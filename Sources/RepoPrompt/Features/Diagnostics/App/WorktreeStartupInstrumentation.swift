@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptVCS
 #if DEBUG
     import CryptoKit
 #endif

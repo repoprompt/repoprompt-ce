@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Cursor runtime membership and parameter authority, with legacy offline metadata.
 ///

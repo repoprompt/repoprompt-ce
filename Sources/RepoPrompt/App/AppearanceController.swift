@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptSettingsCore
 
 @MainActor
 final class AppearanceController: ObservableObject {

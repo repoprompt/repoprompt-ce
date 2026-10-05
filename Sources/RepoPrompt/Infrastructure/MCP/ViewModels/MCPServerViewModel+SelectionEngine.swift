@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptFoundation
+import RepoPromptVCS
 
 struct WorkspaceGitDiffArtifactSelectionMergeResult: Equatable {
     let selection: StoredSelection

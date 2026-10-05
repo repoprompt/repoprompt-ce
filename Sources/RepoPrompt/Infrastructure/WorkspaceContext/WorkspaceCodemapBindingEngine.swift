@@ -1,7 +1,10 @@
 import Foundation
 import OSLog
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptPersistence
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.

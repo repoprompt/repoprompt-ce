@@ -456,9 +456,12 @@ struct SettingsView: View {
                 guard let agentModeVM else { return }
                 agentModeVM.providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
             },
-            // Route Claude effort changes through `AgentModeViewModel.setClaudeEffortLevel(_:)`
-            // so active sessions pick up the new effort via the same scheduling path that
-            // `AgentInputBar` uses.
+            claudeEffortLevelProvider: { [weak agentModeVM] in
+                guard let agentModeVM, let session = agentModeVM.activeSession,
+                      session.selectedAgent.usesClaudeTooling else { return nil }
+                return agentModeVM.claudeCoordinator.currentClaudeEffortLevel(for: session)
+            },
+            // Settings and the composer edit the same active conversation's effort.
             onClaudeEffortLevelChanged: { [weak agentModeVM] level in
                 agentModeVM?.setClaudeEffortLevel(level)
             }

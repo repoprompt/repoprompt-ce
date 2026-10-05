@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 @MainActor

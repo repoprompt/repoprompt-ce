@@ -29,6 +29,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
     /// effort level delegates end-to-end to this closure so active Claude sessions pick
     /// up the new effort via the existing AgentModeViewModel scheduling path.
     var onClaudeEffortLevelChanged: ((ClaudeCodeEffortLevel) -> Void)?
+    var claudeEffortLevelProvider: (() -> ClaudeCodeEffortLevel?)?
 
     init(
         defaults: UserDefaults = .standard,
@@ -37,6 +38,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         diagnostics: AgentPermissionStorageDiagnosticsViewModel? = nil,
         notificationCenter: NotificationCenter = .default,
         onProviderPreferenceChanged: ((AgentProviderBindingID) -> Void)? = nil,
+        claudeEffortLevelProvider: (() -> ClaudeCodeEffortLevel?)? = nil,
         onClaudeEffortLevelChanged: ((ClaudeCodeEffortLevel) -> Void)? = nil
     ) {
         self.defaults = defaults
@@ -58,6 +60,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         self.notificationCenter = notificationCenter
         self.onProviderPreferenceChanged = onProviderPreferenceChanged
         self.onClaudeEffortLevelChanged = onClaudeEffortLevelChanged
+        self.claudeEffortLevelProvider = claudeEffortLevelProvider
         subscribeToSecureStoreChanges()
     }
 
@@ -75,7 +78,10 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
     func controlsBinding(for providerID: AgentProviderBindingID) -> AgentProviderControlsBinding? {
         guard let bindingService else { return nil }
         _ = revision // ensure SwiftUI redraws when this VM publishes changes
-        return bindingService.topLevelSettingsControlsBinding(providerID: providerID)
+        return bindingService.topLevelSettingsControlsBinding(
+            providerID: providerID,
+            claudeEffortLevel: providerID == .claude ? claudeEffortLevelProvider?() : nil
+        )
     }
 
     func summaries(

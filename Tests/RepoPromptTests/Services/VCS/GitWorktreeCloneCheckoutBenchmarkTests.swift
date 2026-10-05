@@ -1,5 +1,6 @@
 import Darwin
 @testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 /// Opt-in, bounded benchmark comparing the tracked-checkout APFS clone fast path with an

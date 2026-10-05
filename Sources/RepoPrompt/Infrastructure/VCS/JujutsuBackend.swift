@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 /// Jujutsu (jj) backend implementation.
 /// Uses `JJCommandRunner` for all commands and translates RepoPrompt's VCS API into jj operations.

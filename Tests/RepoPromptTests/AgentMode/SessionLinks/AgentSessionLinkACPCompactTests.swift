@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -318,6 +319,11 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
 
 @MainActor
 final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private var harnesses: [AgentSessionLinkRunnerHarness] = []
     private var temporaryURLs: [URL] = []
 

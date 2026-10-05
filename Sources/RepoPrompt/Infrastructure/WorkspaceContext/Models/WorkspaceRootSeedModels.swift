@@ -1,6 +1,9 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptPersistence
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 enum FileContentFreshnessPolicy {
@@ -73,157 +76,6 @@ final class WorkspaceContextRootLifetimeToken: @unchecked Sendable {
         valid = false
         lock.unlock()
     }
-}
-
-struct WorkspaceRootByteExactPathKey: Hashable, Comparable {
-    let value: String
-    private let bytes: [UInt8]
-
-    init(_ value: String) {
-        self.value = value
-        bytes = Array(value.utf8)
-    }
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.bytes == rhs.bytes
-    }
-
-    static func < (lhs: Self, rhs: Self) -> Bool {
-        lhs.bytes.lexicographicallyPrecedes(rhs.bytes)
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(bytes.count)
-        for byte in bytes {
-            hasher.combine(byte)
-        }
-    }
-
-    static func rootRelativePath(
-        repositoryRelativePath: String,
-        prefix: GitRepositoryRelativeRootPrefix
-    ) -> String? {
-        let pathBytes = Array(repositoryRelativePath.utf8)
-        let prefixBytes = Array(prefix.value.utf8)
-        guard !prefixBytes.isEmpty else { return repositoryRelativePath }
-        let requiredPrefix = prefixBytes + [UInt8(ascii: "/")]
-        guard pathBytes.starts(with: requiredPrefix), pathBytes.count > requiredPrefix.count else {
-            return nil
-        }
-        return String(decoding: pathBytes.dropFirst(requiredPrefix.count), as: UTF8.self)
-    }
-
-    var parent: Self? {
-        guard let slash = bytes.lastIndex(of: UInt8(ascii: "/")), slash > bytes.startIndex else {
-            return nil
-        }
-        return Self(String(decoding: bytes[..<slash], as: UTF8.self))
-    }
-
-    func isSameOrDescendant(of ancestor: Self) -> Bool {
-        if ancestor.bytes.isEmpty { return true }
-        if bytes == ancestor.bytes { return true }
-        return bytes.starts(with: ancestor.bytes + [UInt8(ascii: "/")])
-    }
-}
-
-struct WorkspaceRootByteExactPathSet: Equatable {
-    private let valuesByKey: [WorkspaceRootByteExactPathKey: String]
-
-    init?(
-        _ paths: some Sequence<String>,
-        rejectExactDuplicates: Bool = false
-    ) {
-        var valuesByKey: [WorkspaceRootByteExactPathKey: String] = [:]
-        var canonicalRepresentatives: [String: WorkspaceRootByteExactPathKey] = [:]
-        for path in paths {
-            let key = WorkspaceRootByteExactPathKey(path)
-            if valuesByKey[key] != nil {
-                if rejectExactDuplicates { return nil }
-                continue
-            }
-            if let existing = canonicalRepresentatives[path], existing != key {
-                return nil
-            }
-            valuesByKey[key] = path
-            canonicalRepresentatives[path] = key
-        }
-        self.valuesByKey = valuesByKey
-    }
-
-    private init(valuesByKey: [WorkspaceRootByteExactPathKey: String]) {
-        self.valuesByKey = valuesByKey
-    }
-
-    var count: Int {
-        valuesByKey.count
-    }
-
-    var isEmpty: Bool {
-        valuesByKey.isEmpty
-    }
-
-    var keys: Set<WorkspaceRootByteExactPathKey> {
-        Set(valuesByKey.keys)
-    }
-
-    var sortedKeys: [WorkspaceRootByteExactPathKey] {
-        valuesByKey.keys.sorted()
-    }
-
-    var stringValues: [String] {
-        sortedKeys.map(\.value)
-    }
-
-    func contains(_ key: WorkspaceRootByteExactPathKey) -> Bool {
-        valuesByKey[key] != nil
-    }
-
-    func subtracting(_ other: Self) -> Self {
-        Self(valuesByKey: valuesByKey.filter { !other.contains($0.key) })
-    }
-}
-
-struct WorkspaceRootCatalogPolicyIdentity: Hashable {
-    static let currentSchemaVersion = 1
-
-    let schemaVersion: Int
-    let mandatoryIgnorePolicyIdentity: String
-    let globalIgnoreDefaultsDigest: String
-    let respectRepoIgnore: Bool
-    let respectCursorignore: Bool
-    let enableHierarchicalIgnores: Bool
-    let skipSymlinks: Bool
-
-    static let canonicalDefaults = WorkspaceRootCatalogPolicyIdentity(
-        schemaVersion: currentSchemaVersion,
-        mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
-        globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
-            for: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
-        ),
-        respectRepoIgnore: true,
-        respectCursorignore: true,
-        enableHierarchicalIgnores: true,
-        skipSymlinks: true
-    )
-}
-
-enum WorkspaceRootCommittedRegularProjectionDisposition: Equatable {
-    case searchableRegularFile
-    case policyIgnoredRegularFile
-    case ineligible(CatalogRegularFileIneligibilityReason)
-}
-
-struct WorkspaceRootCatalogProjectionEvidence: Equatable {
-    let policyIdentity: WorkspaceRootCatalogPolicyIdentity
-    let dispositionsByRelativePath: [WorkspaceRootByteExactPathKey: WorkspaceRootCommittedRegularProjectionDisposition]
-    let ignoreRulesRevision: UInt64
-}
-
-struct WorkspaceRootValidatedCatalogProjection {
-    let discoverableRelativeFilePaths: WorkspaceRootByteExactPathSet
-    let policyIgnoredCommittedRegularRelativePaths: WorkspaceRootByteExactPathSet
-    let policyIdentity: WorkspaceRootCatalogPolicyIdentity
 }
 
 enum WorkspaceRootSeedDeltaCompatibilitySource: String, CaseIterable, Hashable {

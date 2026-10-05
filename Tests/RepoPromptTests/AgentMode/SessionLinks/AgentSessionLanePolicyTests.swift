@@ -1,8 +1,14 @@
 import Foundation
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AgentSessionLanePolicyTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     @MainActor
     func testSharedWarmCompletionDoesNotInvalidateAlreadyAdvertisedModels() async throws {
         let registry = AgentACPModelRegistry.shared

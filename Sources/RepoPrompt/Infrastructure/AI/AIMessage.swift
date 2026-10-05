@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import SwiftOpenAI
 
 typealias ConversationEntry = RepoPromptDomainRuntime.ConversationEntry

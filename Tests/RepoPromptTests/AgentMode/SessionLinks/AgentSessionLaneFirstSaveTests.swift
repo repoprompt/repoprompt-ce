@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -29,7 +30,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
             if !ephemeral {
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+                await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
                 if let previousStoragePath {
                     UserDefaults.standard.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
                 } else {

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 struct OraclePromptConfiguration {
     let chatPreset: ChatPreset

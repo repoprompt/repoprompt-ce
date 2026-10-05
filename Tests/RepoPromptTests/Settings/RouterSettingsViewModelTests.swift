@@ -1,5 +1,6 @@
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptPersistence
 
 /// Bounded catalog paging and writer contracts owned directly by the graph index.
 struct WorkspaceCodemapGraphIndexCatalogToken: Hashable {

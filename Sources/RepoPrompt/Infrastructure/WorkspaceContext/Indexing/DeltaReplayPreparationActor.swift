@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptWorkspaceCore
 #if DEBUG || EDIT_FLOW_PERF
     import os

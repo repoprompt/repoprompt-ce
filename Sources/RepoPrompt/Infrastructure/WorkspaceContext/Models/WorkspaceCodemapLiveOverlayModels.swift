@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptPersistence
 
 // Explicit checked conformances are intentional actor-boundary contracts.
 // swiftformat:disable redundantSendable

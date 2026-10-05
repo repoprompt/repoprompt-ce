@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension MCPServerViewModel {
     nonisolated static func makeTokenStats(

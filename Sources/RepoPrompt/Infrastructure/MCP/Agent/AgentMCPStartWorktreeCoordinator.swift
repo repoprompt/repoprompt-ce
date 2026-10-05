@@ -2,6 +2,8 @@ import Foundation
 import MCP
 import RepoPromptInstrumentation
 import RepoPromptProcess
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 @MainActor

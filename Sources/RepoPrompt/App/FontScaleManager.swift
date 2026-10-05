@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Centralised manager for app-wide font scaling.

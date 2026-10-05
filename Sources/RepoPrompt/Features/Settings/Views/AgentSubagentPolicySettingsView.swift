@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  AgentSubagentPolicySettingsView.swift
 //  RepoPrompt
