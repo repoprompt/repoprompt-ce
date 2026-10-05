@@ -320,6 +320,21 @@ extension GrokBuildACPAgentProviderTests {
         let grokProvider = try XCTUnwrap(provider as? GrokBuildACPAgentProvider)
         XCTAssertFalse(grokProvider.test_config.alwaysApproveTools)
     }
+
+    func testInteractiveFactoryDisablesUnmanagedBackgroundFeatures() async throws {
+        let factoryProvider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild,
+            modelString: nil,
+            grokAPIKeyProvider: { nil }
+        )
+        let grokProvider = try XCTUnwrap(factoryProvider as? GrokBuildACPAgentProvider)
+        let (provider, directory) = try makeProvider(config: grokProvider.test_config)
+        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+
+        for key in ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"] {
+            XCTAssertEqual(launch.environment[key], "0", "Agent Mode must disable unmanaged background feature \(key)")
+        }
+    }
 }
 
 extension GrokBuildACPAgentProviderTests {
