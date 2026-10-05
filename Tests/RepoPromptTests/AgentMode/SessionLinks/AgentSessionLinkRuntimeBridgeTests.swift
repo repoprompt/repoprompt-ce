@@ -5996,6 +5996,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
             let lane = prepareCreatedLane(fixture)
             let available = AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: false,
+                codexAvailable: scenario.agent == .codexExec,
+                openCodeAvailable: false,
                 cursorAvailable: scenario.agent == .cursor,
                 grokBuildAvailable: scenario.agent == .grokBuild
             )
