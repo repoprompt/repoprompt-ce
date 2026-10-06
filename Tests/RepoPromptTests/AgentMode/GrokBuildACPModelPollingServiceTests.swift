@@ -14,6 +14,17 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testControllerDiscoveryReusesVerifiedSessionAcrossWorkspacesInNeutralDirectory() async throws {
+        let agentModeProvider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild, modelString: nil, grokAPIKeyProvider: { nil }
+        )
+        let agentModeEnvironment = try XCTUnwrap(agentModeProvider as? GrokBuildACPAgentProvider)
+            .test_config.backgroundFeatureEnvironment
+        let contextBuilderEnvironment = try XCTUnwrap(
+            AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild) as? GrokBuildACPHeadlessAgentProvider
+        ).test_config.backgroundFeatureEnvironment
+        let managedEnvironment = [
+            "GROK_MEMORY": "0", "GROK_SUBAGENTS": "0", "GROK_WORKFLOWS": "0", "GROK_AUTO_WAKE": "0"
+        ]
         let neutralPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
             .standardizedFileURL.path
@@ -39,6 +50,13 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
             providerFactory: { config in
                 XCTAssertFalse(config.includeRepoPromptMCPServer)
                 XCTAssertNil(config.apiKey)
+                for (usage, environment, expected) in [
+                    ("Agent Mode", agentModeEnvironment, managedEnvironment),
+                    ("model polling", config.backgroundFeatureEnvironment, managedEnvironment),
+                    ("Context Builder", contextBuilderEnvironment, [:])
+                ] {
+                    XCTAssertEqual(environment, expected, "Background-feature policy for \(usage)")
+                }
                 return fixtureProvider
             },
             controllerFactory: { provider, request in

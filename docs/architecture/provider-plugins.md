@@ -240,6 +240,18 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - Model discovery injects no RPCE server and always uses the existing neutral `RepoPromptGrokBuildACPDiscovery` temporary directory, reusing one verified session there rather than following subscribed workspaces. Closing a window cancels its discovery subscription, not the shared polling service.
 - **Project-config limit:** Grok's project `.mcp.json` is not controlled by the two import switches. Neutral polling avoids the user's project file, but Context Builder and Agent Mode retain their real workspace and may still load it. Grok-native MCP configuration is not filtered or rewritten by this policy.
 
+#### Grok background-feature launch policy
+
+- Agent Mode and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` to disable Grok's memory, subagents, workflows and auto-wake. Switch behavior is source-verified against Grok 1.0.45 (`2bdd1d6a`), not live-proven; pinned/remote settings can affect feature-specific resolution, and auto-wake requirements pins can override the environment. Imported hooks are separate and not controlled by these switches. In the pinned source, an explicit `/workflow resume` of an existing resumable workflow record in a loaded session is not gated by `GROK_WORKFLOWS` ([`ManageOp::Resume`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs)); this is not observed live, and passive or model-initiated restart is not established.
+- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, leaving the ACP caller's background policy unchanged (Context Builder). One-shot (Oracle/Chat) is a separate path that never reads this field and remains unchanged. No user configuration or global environment is changed.
+- The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
+
+#### Grok cancellation boundaries
+
+- **Turn cancellation:** stopping or steering an active ACP turn sends a bare `session/cancel` with only `sessionId`. [Grok's cancellation handler](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs) cancels every non-workflow subagent in that session, including earlier turns' background children, and kills running foreground commands. These effects are source-verified at Grok 1.0.45, not limited to the current turn.
+- **Idle `stop_session`:** MCP `agent_manage.stop_session` cancels only an active RPCE run. For an idle session it returns `stop_requested: false`, sends no `session/cancel` and leaves the controller alive; it is not background-work cleanup.
+- **Controller teardown:** `ACPAgentSessionController.shutdown()` calls `cancelPrompt()` whenever a session ID exists, including when idle. It attempts the same bare cancellation before closing stdio and terminating the provider process, so a received cancel has the subagent and foreground-command effects above. Teardown is distinct from an idle `stop_session`; the launch policy does not change either path.
+
 ## How a new provider plugs in
 
 The recommended pattern when adding (for example) a hypothetical `acmeAgent` family:

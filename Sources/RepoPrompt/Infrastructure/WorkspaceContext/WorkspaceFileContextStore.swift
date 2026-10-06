@@ -5308,6 +5308,14 @@ actor WorkspaceFileContextStore {
         let standardizedPaths = Array(Set(physicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
         })).sorted()
+        // Configuration/ownership conflicts are deterministic admission failures. Reject them
+        // before advancing owner generations or reserving provisional roots; never promote an
+        // ordinary visible workspace folder into session-owned execution authority.
+        for path in standardizedPaths {
+            if let configuration = rootLoadConfigurationsByPath[path], configuration.kind != .sessionWorktree {
+                throw WorkspaceSessionWorktreeOwnershipError.invalidRootKind(path)
+            }
+        }
         if let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
            let installedRecord = sessionWorktreeOwnershipRecordsByToken[installedToken],
            installedRecord.bindingFingerprint == bindingFingerprint,

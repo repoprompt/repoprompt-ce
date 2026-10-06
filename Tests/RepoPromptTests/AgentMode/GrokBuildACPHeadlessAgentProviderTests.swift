@@ -248,45 +248,67 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     func testContextBuilderLaunchIsolatesImportsAndPreservesMCPInjection() async throws {
-        let harness = try makeHarness()
-        let mcp = RepoPromptMCPServerConfiguration(
-            command: harness.scriptPath,
-            args: ["--backend", "app"],
-            env: [.init(name: "RP_TEST_ROUTE", value: "scoped")]
-        )
-        let recordPath = harness.recordURL.path
-        let provider = GrokBuildACPHeadlessAgentProvider(
-            config: GrokBuildAgentConfig(commandName: harness.scriptPath, apiKey: "xai-test-key-123"),
-            workspacePath: harness.workspace.path,
-            providerFactory: { config in
-                EnvForwardingGrokProvider(
-                    config: config,
-                    extraEnvironment: ["ACP_RECORD_PATH": recordPath],
-                    repoPromptMCPConfiguration: mcp
-                )
-            },
-            controllerFactory: { provider, request, diagnosticSink in
-                try ACPAgentSessionController(
-                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
-                    allowsProviderProcessLaunchForTesting: true
-                )
-            }
-        )
-        try await drain(provider, message: "ping")
+        let backgroundKeys = ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"]
+        let managedEnvironment = Dictionary(uniqueKeysWithValues: backgroundKeys.map { ($0, "0") })
+        for (usage, backgroundEnvironment) in [
+            ("Context Builder", [:]),
+            ("forwarded managed policy", managedEnvironment)
+        ] {
+            let harness = try makeHarness()
+            let mcp = RepoPromptMCPServerConfiguration(
+                command: harness.scriptPath,
+                args: ["--backend", "app"],
+                env: [.init(name: "RP_TEST_ROUTE", value: "scoped")]
+            )
+            let recordPath = harness.recordURL.path
+            // Deterministic fixture defaults sit below real launch overrides: an empty
+            // policy preserves native values, while a forwarded policy disables them.
+            let fixtureEnvironment = Dictionary(uniqueKeysWithValues: backgroundKeys.map { ($0, "1") })
+                .merging([
+                    "ACP_RECORD_PATH": recordPath,
+                    "GROK_CLAUDE_MCPS_ENABLED": "1",
+                    "GROK_CURSOR_MCPS_ENABLED": "1"
+                ]) { _, new in new }
+            let provider = GrokBuildACPHeadlessAgentProvider(
+                config: GrokBuildAgentConfig(
+                    commandName: harness.scriptPath,
+                    apiKey: "xai-test-key-123",
+                    backgroundFeatureEnvironment: backgroundEnvironment
+                ),
+                workspacePath: harness.workspace.path,
+                providerFactory: { config in
+                    EnvForwardingGrokProvider(
+                        config: config,
+                        extraEnvironment: fixtureEnvironment,
+                        repoPromptMCPConfiguration: mcp
+                    )
+                },
+                controllerFactory: { provider, request, diagnosticSink in
+                    try ACPAgentSessionController(
+                        provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                        allowsProviderProcessLaunchForTesting: true
+                    )
+                }
+            )
+            try await drain(provider, message: "ping")
 
-        let environment = try XCTUnwrap(harness.recordedMethods("launchEnvironment").first)
-        XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"] as? String, "0")
-        XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"] as? String, "0")
-        XCTAssertEqual(environment["XAI_API_KEY"] as? String, "xai-test-key-123")
-        let session = try XCTUnwrap(harness.recordedMethods("session/new").first)
-        XCTAssertEqual(session["cwd"] as? String, harness.workspace.path)
-        let servers = try XCTUnwrap(session["mcpServers"] as? [[String: Any]])
-        XCTAssertEqual(servers.count, 1)
-        let server = try XCTUnwrap(servers.first)
-        XCTAssertEqual(server["name"] as? String, "RepoPromptCEGrokRuntime")
-        XCTAssertEqual(server["command"] as? String, mcp.command)
-        XCTAssertEqual(server["args"] as? [String], mcp.args)
-        XCTAssertEqual(server["env"] as? [[String: String]], mcp.env.map(\.acpJSONObject))
+            let environment = try XCTUnwrap(harness.recordedMethods("launchEnvironment").first)
+            for key in backgroundKeys {
+                XCTAssertEqual(environment[key] as? String, backgroundEnvironment[key] ?? "1", "\(usage): \(key)")
+            }
+            XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"] as? String, "0")
+            XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"] as? String, "0")
+            XCTAssertEqual(environment["XAI_API_KEY"] as? String, "xai-test-key-123")
+            let session = try XCTUnwrap(harness.recordedMethods("session/new").first)
+            XCTAssertEqual(session["cwd"] as? String, harness.workspace.path)
+            let servers = try XCTUnwrap(session["mcpServers"] as? [[String: Any]])
+            XCTAssertEqual(servers.count, 1)
+            let server = try XCTUnwrap(servers.first)
+            XCTAssertEqual(server["name"] as? String, "RepoPromptCEGrokRuntime")
+            XCTAssertEqual(server["command"] as? String, mcp.command)
+            XCTAssertEqual(server["args"] as? [String], mcp.args)
+            XCTAssertEqual(server["env"] as? [[String: String]], mcp.env.map(\.acpJSONObject))
+        }
     }
 
     func testMaintenanceRecognitionIsForwardedThroughProviderExistential() {
@@ -403,7 +425,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
 
         record("launchEnvironment", {key: os.environ.get(key) for key in
-            ["GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "XAI_API_KEY"]})
+            ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE",
+             "GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "XAI_API_KEY"]})
         record("launchArguments", {"arguments": sys.argv[1:]})
 
         for line in sys.stdin:
@@ -487,8 +510,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 }
 
-/// Wraps the real provider so the fake ACP server script sees ACP_RECORD_PATH (the real
-/// provider intentionally has no environment-override channel).
+/// Wraps the real provider so the fake ACP server script sees ACP_RECORD_PATH and
+/// deterministic fixture defaults, with real launch overrides remaining authoritative.
 private struct EnvForwardingGrokProvider: ACPAgentProvider {
     let config: GrokBuildAgentConfig
     let extraEnvironment: [String: String]
@@ -521,7 +544,7 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
             providerID: launch.providerID,
             command: launch.command,
             arguments: launch.arguments,
-            environment: launch.environment.merging(extraEnvironment) { _, new in new },
+            environment: extraEnvironment.merging(launch.environment) { _, launchValue in launchValue },
             workingDirectory: launch.workingDirectory,
             additionalPathHints: launch.additionalPathHints,
             enableDebugLogging: launch.enableDebugLogging,

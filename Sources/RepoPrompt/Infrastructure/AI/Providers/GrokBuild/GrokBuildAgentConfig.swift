@@ -8,6 +8,14 @@ struct GrokBuildAgentConfig {
         "GROK_CURSOR_MCPS_ENABLED": "0"
     ]
 
+    /// Disable Grok-owned background features for host-managed Agent Mode and model polling.
+    static let managedBackgroundFeatureEnvironment: [String: String] = [
+        "GROK_MEMORY": "0",
+        "GROK_SUBAGENTS": "0",
+        "GROK_WORKFLOWS": "0",
+        "GROK_AUTO_WAKE": "0"
+    ]
+
     let commandName: String
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
@@ -23,6 +31,10 @@ struct GrokBuildAgentConfig {
     /// (`ACPAgentProviderFactory`). nil means "no stored key" — Grok's own credential
     /// precedence (`~/.grok/auth.json`, config.toml) still applies.
     let apiKey: String?
+    /// Process-local background-feature policy. Empty leaves the ACP caller's background
+    /// policy unchanged (Context Builder); managed callers opt in explicitly.
+    /// One-shot is a separate path that never reads this field.
+    let backgroundFeatureEnvironment: [String: String]
 
     init(
         commandName: String = "grok",
@@ -31,7 +43,8 @@ struct GrokBuildAgentConfig {
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
         alwaysApproveTools: Bool = false,
-        apiKey: String? = nil
+        apiKey: String? = nil,
+        backgroundFeatureEnvironment: [String: String] = [:]
     ) {
         self.commandName = commandName
         self.additionalPathHints = additionalPathHints
@@ -40,5 +53,6 @@ struct GrokBuildAgentConfig {
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
         self.alwaysApproveTools = alwaysApproveTools
         self.apiKey = apiKey
+        self.backgroundFeatureEnvironment = backgroundFeatureEnvironment
     }
 }
