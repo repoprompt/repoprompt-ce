@@ -6,7 +6,11 @@
     @MainActor
     final class AgentRetentionCompactionTests: XCTestCase {
         func testFullReconciliationPreservesPayloadsAndMeasuresRetentionScan() {
-            for resultCount in [128, 1000, 4000, 16000] {
+            // Keep the larger timing workloads opt-in without changing the correctness oracle.
+            let resultCounts = ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1"
+                ? [128, 1000, 4000, 16000]
+                : [128]
+            for resultCount in resultCounts {
                 assertFullReconciliation(resultCount: resultCount, runState: .idle)
             }
         }
