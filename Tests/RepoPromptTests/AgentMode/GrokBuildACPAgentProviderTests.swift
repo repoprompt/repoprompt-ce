@@ -153,6 +153,37 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         }
     }
 
+    func testSessionPermissionOverridesFollowEffectiveFullAccess() throws {
+        for configFullAccess in [false, true] {
+            let (provider, directory) = try makeProvider(
+                config: GrokBuildAgentConfig(alwaysApproveTools: configFullAccess)
+            )
+            for requestFullAccess in [false, true] {
+                for resumeSessionID in [nil, "sess-123"] as [String?] {
+                    let context = "configFullAccess=\(configFullAccess), requestFullAccess=\(requestFullAccess), resume=\(resumeSessionID ?? "new")"
+                    let session = try provider.makeSessionConfiguration(
+                        for: makeRequest(
+                            workspacePath: directory.path,
+                            resumeSessionID: resumeSessionID,
+                            autoApprove: requestFullAccess
+                        ),
+                        mcpServer: .repoPrompt
+                    )
+                    let fullAccess = configFullAccess || requestFullAccess
+                    let expectedMetadata: [String: AgentJSONValue] = fullAccess ? [:] : [
+                        "yoloMode": .bool(false),
+                        "autoMode": .bool(false)
+                    ]
+                    let expectedNotification: ACPSessionConfiguration.PostOpenNotification? = fullAccess ? nil : .init(
+                        method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
+                    )
+                    XCTAssertEqual(session.metadata, expectedMetadata, context)
+                    XCTAssertEqual(session.postOpenNotification, expectedNotification, context)
+                }
+            }
+        }
+    }
+
     func testSessionConfigCanDisableMCPInjection() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(includeRepoPromptMCPServer: false))
         let session = try provider.makeSessionConfiguration(

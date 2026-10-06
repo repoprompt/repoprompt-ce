@@ -224,12 +224,12 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 ### Grok Build provider notes
 
-`AgentProviderKind.grokBuild` drives `grok agent stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
+`AgentProviderKind.grokBuild` drives `grok agent --no-leader stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
 
 - Model advertisement is a top-level `SessionModelState` (`models` in `session/new`/`session/load` responses), not modern `configOptions`; explicit selection goes through `session/set_model` (`{sessionId, modelId}`). The controller consults the provider's `ACPDirectSessionModelProvider` conformance only when no modern model selector exists; malformed modern selectors never fall back.
 - Usage arrives in the `session/prompt` response `_meta.usage` (same field names as the ACP-standard top-level `usage`); Grok emits no `usage_update` notifications.
-- Full access is a launch flag (`grok agent --always-approve stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
-- Auth: RepoPrompt never sends ACP `authenticate`; Grok's own precedence (config.toml key → `~/.grok/auth.json` → `XAI_API_KEY` env, the last injected from the existing `.grokAPI` keychain account at provider construction) applies.
+- Full access is a launch flag (`grok agent --always-approve --no-leader stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
+- Auth: RPCE never sends ACP `authenticate`. Grok checks a model key (`api_key`/`env_key`), then a configured auth-provider branch, then an eligible session token, then `XAI_API_KEY`, subject to `[auth] preferred_method` and `disable_api_key_auth`. The auth-provider branch does not fall through when its cached token is absent. RPCE reads a stored key from the existing `.grokAPI` keychain account at provider construction and passes it as the launch-environment `XAI_API_KEY`. Credential order is source-only at Grok 1.0.45 (`2bdd1d6a`), not live-tested.
 - MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
 
 #### Current Grok MCP launch policy

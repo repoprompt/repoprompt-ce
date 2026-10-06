@@ -66,51 +66,45 @@ struct AgentSessionLinkPromptContext: Equatable {
 }
 
 extension AgentModeViewModel {
-    enum ProviderInputCatalogReadiness: Equatable {
+    enum ProviderInputRouteReadiness: Equatable {
         case notRequired
-        case ready
+        case ready(AgentSessionLinkRunCatalogRouteToken)
         case unavailable
-        case timedOut
         case superseded
         case cancelled
+
+        var allowsDispatch: Bool {
+            switch self {
+            case .notRequired, .ready: true
+            case .unavailable, .superseded, .cancelled: false
+            }
+        }
     }
 
-    private func requiresExactSessionLinkProviderInputCatalog(
-        _ agent: AgentProviderKind
-    ) -> Bool {
+    private func requiresExactSessionLinkProviderInputRoute(_ agent: AgentProviderKind) -> Bool {
         agent == .codexExec || agent.usesClaudeNativeRuntime
     }
 
-    /// Providers that retain or initialize an MCP catalog before dispatch wait for the exact
-    /// server-observed catalog instead of treating client configuration as acknowledgement.
-    func ensureProviderInputCatalogReady(
-        for session: TabSession,
-        timeout: TimeInterval = 2.0
-    ) async -> ProviderInputCatalogReadiness {
-        guard requiresExactSessionLinkProviderInputCatalog(session.selectedAgent) else { return .notRequired }
+    /// Qualify the exact server-owned route, independently of whether a client has refreshed tools.
+    /// Carry this immutable token to the final mapping fence; catalog observations are discovery
+    /// facts, never authority to dispatch (or reasons to wait or recycle a healthy controller).
+    func qualifyProviderInputRoute(for session: TabSession) async -> ProviderInputRouteReadiness {
+        guard requiresExactSessionLinkProviderInputRoute(session.selectedAgent) else { return .notRequired }
         guard sessions[session.tabID] === session,
               let runID = session.runID
         else { return .unavailable }
-        // Outbound oversight links are keyed by exact endpoint incarnation. Without one, this run
-        // has no oversight route whose provider catalog must be qualified before an ordinary send.
         guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID) else { return .notRequired }
-        guard let sessionID = session.activeAgentSessionID,
-              endpoint.sessionID == sessionID
-        else {
-            return .unavailable
-        }
+        guard endpoint.sessionID == session.activeAgentSessionID else { return .unavailable }
 
         let isRequired = await agentSessionLinkHasActiveOutboundLink(endpoint)
         if Task.isCancelled { return .cancelled }
         guard sessions[session.tabID] === session else { return .unavailable }
         guard session.runID == runID,
               agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
-        else {
-            return .superseded
-        }
+        else { return .superseded }
         guard isRequired else { return .notRequired }
 
-        let authoritativeRouteToken = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
+        let token = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
             runID: runID,
             windowID: endpoint.windowID,
             tabID: session.tabID
@@ -119,63 +113,9 @@ extension AgentModeViewModel {
         guard sessions[session.tabID] === session else { return .unavailable }
         guard session.runID == runID,
               agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
-        else {
-            return .superseded
-        }
-        if let current = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
-           current.runID == runID,
-           current.isReady,
-           current.routeToken == authoritativeRouteToken,
-           authoritativeRouteToken != nil
-        {
-            return .ready
-        }
-        let outcome = await ServerNetworkManager.shared.awaitRunCatalogReadiness(
-            runID: runID,
-            observerEndpoint: endpoint,
-            expectedRouteToken: authoritativeRouteToken,
-            timeout: timeout
-        )
-        switch outcome {
-        case .cancelled:
-            return .cancelled
-        case .timedOut:
-            return .timedOut
-        case .superseded:
-            return .superseded
-        case let .ready(ready):
-            let remainsRequired = await agentSessionLinkHasActiveOutboundLink(endpoint)
-            if Task.isCancelled { return .cancelled }
-            guard sessions[session.tabID] === session else { return .unavailable }
-            guard session.runID == runID,
-                  agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
-            else {
-                return .superseded
-            }
-            guard remainsRequired else { return .notRequired }
-            let authoritativeRouteToken = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
-                runID: runID,
-                windowID: endpoint.windowID,
-                tabID: session.tabID
-            )
-            if Task.isCancelled { return .cancelled }
-            guard sessions[session.tabID] === session else { return .unavailable }
-            guard session.runID == runID,
-                  agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
-            else {
-                return .superseded
-            }
-            guard let authoritativeRouteToken,
-                  let applied = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
-                  applied.runID == runID,
-                  applied.projectionRevision >= ready.projectionRevision,
-                  applied.isReady,
-                  applied.routeToken == authoritativeRouteToken
-            else {
-                return .unavailable
-            }
-            return .ready
-        }
+        else { return .superseded }
+        guard let token, token.runID == runID, token.observerEndpoint == endpoint else { return .unavailable }
+        return .ready(token)
     }
 
     private func agentSessionLinkHasActiveOutboundLink(
@@ -208,37 +148,33 @@ extension AgentModeViewModel {
         )
     }
 
-    /// Synchronous final fence for providers whose MCP catalog can outlive or race a connection.
-    /// The async readiness query proves policy/lifecycle authority; this last check proves that the
-    /// exact connection it qualified still owns the MainActor route at composition time.
-    func agentSessionLinkHasCurrentProviderInputCatalogRoute(for session: TabSession) -> Bool {
-        guard requiresExactSessionLinkProviderInputCatalog(session.selectedAgent) else { return true }
-        guard sessions[session.tabID] === session,
-              let runID = session.runID,
-              let sessionID = session.activeAgentSessionID,
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
-              endpoint.sessionID == sessionID,
-              let projection = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
-              projection.runID == runID,
-              projection.isReady,
-              let routeToken = projection.routeToken,
-              routeToken.observerEndpoint == endpoint
+    /// The async query proves route/policy authority; this synchronous final fence checks that
+    /// the qualified connection is still live, not removing, and owns both mapping directions.
+    func agentSessionLinkHasCurrentProviderInputRoute(
+        for session: TabSession,
+        qualification: ProviderInputRouteReadiness
+    ) -> Bool {
+        if qualification == .notRequired {
+            // A first link may land while configuration or hook review suspends. Never let the
+            // earlier negative result authorize a newly owed native oversight supplement.
+            return !requiresExactSessionLinkProviderInputRoute(session.selectedAgent)
+                || agentSessionLinkEffectivePromptInventory(for: session)?.items.isEmpty != false
+        }
+        guard case let .ready(routeToken) = qualification,
+              sessions[session.tabID] === session,
+              session.runID == routeToken.runID,
+              session.activeAgentSessionID == routeToken.observerEndpoint.sessionID,
+              agentSessionLinkObserverEndpoint(tabID: session.tabID) == routeToken.observerEndpoint
         else { return false }
         #if DEBUG
             if let test_agentSessionLinkCurrentRunCatalogRouteToken {
                 return test_agentSessionLinkCurrentRunCatalogRouteToken(routeToken, session.tabID)
             }
-            // Existing synthetic readiness fixtures replace the async authority query without
-            // installing a real MCP mapping. They may opt into the stricter synchronous seam when
-            // exercising handover behavior; otherwise the synthetic token is their authority.
             if test_agentSessionLinkAuthoritativeRunCatalogRouteToken != nil {
                 return true
             }
         #endif
-        return hasCurrentRunCatalogRouteTokenInCurrentMCPServer(
-            routeToken,
-            tabID: session.tabID
-        )
+        return hasCurrentRunCatalogRouteTokenInCurrentMCPServer(routeToken, tabID: session.tabID)
     }
 
     // MARK: - Inventory publication
@@ -699,21 +635,9 @@ extension AgentModeViewModel {
             published.inventory,
             input: input
         )
-        // A missing process-local run identifies pre-run bootstrap: the wake this context admits is
-        // what creates the run and its catalog. Once any run exists, keep requiring its exact ready
-        // catalog and provider-input route; a stale or unready established run still fails closed.
-        if !effectiveInventory.items.isEmpty, let runID = session.runID {
-            guard let catalog = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
-                  catalog.runID == runID,
-                  catalog.isReady,
-                  catalog.routeToken?.observerEndpoint == endpoint
-            else {
-                return nil
-            }
-            guard agentSessionLinkHasCurrentProviderInputCatalogRoute(for: session) else {
-                return nil
-            }
-        }
+        // Current exact membership and the claim/physical-acquisition fences own supplement
+        // authority. Discovery may lag forever; it must not withhold this inventory or its wake.
+        // Native dispatch independently qualifies and re-fences the exact server-owned route.
         return AgentSessionLinkPromptContext(
             epoch: AgentSessionLinkPromptEpoch(
                 endpoint: endpoint,
