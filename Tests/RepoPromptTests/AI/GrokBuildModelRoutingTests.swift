@@ -85,11 +85,15 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
-    func testOneShotLaunchIsolatesImportedMCPServersAndPreservesAPIKey() {
+    func testOneShotLaunchIsolatesImportsAndSessionStorageAndPreservesAPIKey() {
         for apiKey in [nil, "xai-test-key-123"] as [String?] {
             let environment = GrokBuildOneShotHeadlessAgentProvider.launchEnvironment(apiKey: apiKey)
             XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
             XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"], "0")
+            XCTAssertEqual(environment["GROK_CLAUDE_HOOKS_ENABLED"], "0")
+            XCTAssertEqual(environment["GROK_CURSOR_HOOKS_ENABLED"], "0")
+            XCTAssertEqual(environment["GROK_SESSION_SEARCH"], "0")
+            XCTAssertEqual(environment["GROK_STORAGE_MODE"], "local")
             XCTAssertEqual(environment["XAI_API_KEY"], apiKey)
             XCTAssertNil(environment["HOME"])
             XCTAssertNil(environment["GROK_HOME"])
@@ -388,7 +392,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         }
     }
 
-    func testOneShotSuccessParsesCompletionAndRemovesEntireSession() async throws {
+    func testOneShotSuccessAppliesIsolationPolicyParsesCompletionAndRemovesEntireSession() async throws {
         let root = try makeOneShotFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let neighbor = root.appendingPathComponent("grok-home/sessions/neighbor/prompt_history.jsonl")
@@ -416,6 +420,15 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertEqual(terminal.promptTokens, 11)
         XCTAssertEqual(terminal.completionTokens, 7)
         XCTAssertEqual(terminal.cost, 0.25)
+        let launchPolicy = try String(contentsOf: root.appendingPathComponent("launch-policy"), encoding: .utf8)
+        XCTAssertEqual(launchPolicy, [
+            "GROK_CLAUDE_MCPS_ENABLED=0",
+            "GROK_CURSOR_MCPS_ENABLED=0",
+            "GROK_CLAUDE_HOOKS_ENABLED=0",
+            "GROK_CURSOR_HOOKS_ENABLED=0",
+            "GROK_SESSION_SEARCH=0",
+            "GROK_STORAGE_MODE=local"
+        ].joined(separator: "\n") + "\n", "The request child must receive one-shot overrides, not inherited isolation policy")
         let ownedPath = try String(contentsOf: root.appendingPathComponent("session-path"), encoding: .utf8)
         let requestCWD = try String(contentsOf: root.appendingPathComponent("request-cwd"), encoding: .utf8)
         XCTAssertFalse(FileManager.default.fileExists(atPath: ownedPath), "Remove all artifacts, including opaque attachments")
@@ -476,6 +489,13 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             printf 'stdio\n'
             exit 0
         fi
+        printf '%s\n' \
+            "GROK_CLAUDE_MCPS_ENABLED=$GROK_CLAUDE_MCPS_ENABLED" \
+            "GROK_CURSOR_MCPS_ENABLED=$GROK_CURSOR_MCPS_ENABLED" \
+            "GROK_CLAUDE_HOOKS_ENABLED=$GROK_CLAUDE_HOOKS_ENABLED" \
+            "GROK_CURSOR_HOOKS_ENABLED=$GROK_CURSOR_HOOKS_ENABLED" \
+            "GROK_SESSION_SEARCH=$GROK_SESSION_SEARCH" \
+            "GROK_STORAGE_MODE=$GROK_STORAGE_MODE" > "$RPCE_FIXTURE_ROOT/launch-policy"
         cwd=$(/bin/pwd -P)
         encoded=$(printf '%s' "$cwd" | /usr/bin/od -An -v -t x1 | /usr/bin/awk '
             {
@@ -519,6 +539,12 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             "PATH": "/usr/bin:/bin",
             "HOME": root.appendingPathComponent("home", isDirectory: true).path,
             "GROK_HOME": root.appendingPathComponent("grok-home", isDirectory: true).path,
+            "GROK_CLAUDE_MCPS_ENABLED": "1",
+            "GROK_CURSOR_MCPS_ENABLED": "1",
+            "GROK_CLAUDE_HOOKS_ENABLED": "1",
+            "GROK_CURSOR_HOOKS_ENABLED": "1",
+            "GROK_SESSION_SEARCH": "1",
+            "GROK_STORAGE_MODE": "writeback",
             "RPCE_FIXTURE_ROOT": root.path,
             "RPCE_FIXTURE_MODE": mode
         ]
