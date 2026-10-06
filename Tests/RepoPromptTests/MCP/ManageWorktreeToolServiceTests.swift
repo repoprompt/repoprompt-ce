@@ -172,6 +172,91 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             }
         }
 
+        func testProjectedSameWorktreeIDVisualBindPreservesActiveExecutionAndPersists() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call([
+                    "op": .string("bind"), "label": .string("Session 2026-10-06"), "color": .string("#DB2777")
+                ])
+                let original = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                let native = MonitorFakeNativeController()
+                await native.setTurnInFlight(true)
+                fixture.session.claudeController = native
+                fixture.session.runState = .running
+                defer {
+                    fixture.session.runState = .idle
+                    fixture.session.claudeController = nil
+                }
+                var savedBindings: [AgentSessionWorktreeBinding]?
+                fixture.driver.window.agentModeViewModel.test_setAgentSessionSaver { saved, _, _ in
+                    savedBindings = saved.worktreeBindings
+                    return fixture.physical.appendingPathComponent("session.json")
+                }
+                let reply = try await fixture.call([
+                    "op": .string("bind"), "worktree_id": .string(original.worktreeID),
+                    "label": .string(original.visualLabel ?? "Session"), "color": .string("#2563EB")
+                ], includeWorktree: false, projectSession: true)
+                let applied = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                XCTAssertEqual(applied.id, original.id)
+                XCTAssertEqual(applied.boundAt, original.boundAt)
+                XCTAssertEqual(applied.logicalRootPath, original.logicalRootPath)
+                XCTAssertEqual(applied.worktreeRootPath, original.worktreeRootPath)
+                XCTAssertEqual(applied.worktreeID, original.worktreeID)
+                XCTAssertEqual(applied.visualColorHex, "#2563EB")
+                XCTAssertEqual(savedBindings, [applied])
+                XCTAssertEqual(reply.objectValue?["binding"]?.objectValue?["logical_root_path"]?.stringValue, fixture.logical.path)
+                XCTAssertEqual(reply.objectValue?["binding"]?.objectValue?["worktree_id"]?.stringValue, original.worktreeID)
+                let persisted = try XCTUnwrap(GlobalSettingsStore.shared.worktreeVisualIdentity(
+                    repositoryID: original.repositoryID, worktreeID: original.worktreeID
+                ))
+                XCTAssertEqual(persisted.colorHex, "#2563EB")
+                XCTAssertEqual(fixture.session.runState, .running)
+                XCTAssertTrue(fixture.session.claudeController === native)
+                let shutdowns = await native.shutdownCount
+                XCTAssertEqual(shutdowns, 0)
+            }
+        }
+
+        func testProjectedLogicalCheckoutSelectionRemovesItsBinding() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let original = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                let reply = try await fixture.call([
+                    "op": .string("select"), "worktree": .string("@main")
+                ], includeWorktree: false, projectSession: true)
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+                XCTAssertNil(reply.objectValue?["binding"]?.objectValue)
+                XCTAssertEqual(reply.objectValue?["previous_binding"]?.objectValue?["id"]?.stringValue, original.id)
+            }
+        }
+
+        func testProjectedActiveDestinationChangeRejectsWithoutMutation() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let original = fixture.session.worktreeBindings
+                let native = MonitorFakeNativeController()
+                await native.setTurnInFlight(true)
+                fixture.session.claudeController = native
+                fixture.session.runState = .running
+                defer {
+                    fixture.session.runState = .idle
+                    fixture.session.claudeController = nil
+                }
+                do {
+                    _ = try await fixture.call([
+                        "op": .string("bind"), "worktree": .string("@main")
+                    ], includeWorktree: false, projectSession: true)
+                    XCTFail("Projected routing must not permit an active execution change")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("active Agent run"), error.localizedDescription)
+                }
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+                XCTAssertTrue(fixture.session.claudeController === native)
+                XCTAssertEqual(fixture.session.runState, .running)
+                let shutdowns = await native.shutdownCount
+                XCTAssertEqual(shutdowns, 0)
+            }
+        }
+
         func testPlainUnbindMatchesCanonicalLogicalRootAlias() async throws {
             try await withProvider { fixture in
                 _ = try await fixture.call(["op": .string("bind")])
@@ -224,12 +309,17 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             let binding: MCPDomainToolBinding
             let security: DomainToolInvocationSecurityContext
 
-            func call(_ extra: [String: Value], includeWorktree: Bool = true) async throws -> Value {
+            func call(_ extra: [String: Value], includeWorktree: Bool = true, projectSession: Bool = false) async throws -> Value {
                 var args = extra
                 args["repo_root"] = .string(logical.path)
                 args["session_id"] = .string(sessionID.uuidString)
                 if includeWorktree { args["worktree"] = .string(physical.path) }
-                let metadata = MCPRequestMetadata(connectionID: nil, clientName: nil, windowID: driver.window.windowID)
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    tabContextHint: projectSession ? MCPTabContextHint(
+                        tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID
+                    ) : nil
+                )
                 let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_worktree", metadata: metadata)
                 let requestSecurity = DomainToolInvocationSecurityContext(
                     principal: security.principal,
@@ -260,7 +350,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                 session.hasLoadedPersistedState = true
                 let sessionID = UUID()
                 vm.test_installLiveSession(session)
-                _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+                _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true)
                 vm.test_setAgentSessionSaver { _, _, _ in git.sandbox.appendingPathComponent("session.json") }
                 let tools = await driver.window.mcpServer.windowMCPTools
                 let tool = try XCTUnwrap(tools.first { $0.name == "manage_worktree" })

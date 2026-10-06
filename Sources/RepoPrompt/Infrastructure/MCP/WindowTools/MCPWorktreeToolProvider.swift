@@ -774,10 +774,13 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let translated = lookupContext.translateInputPath(rawRepoRoot)
         let canonicalTranslated = standardizedPath(translated)
         let lowered = rawRepoRoot.lowercased()
-        return visibleRoots.first { root in
+        // Lookup roots are physical under a session projection; binding classification
+        // must retain the corresponding logical root rather than treating that worktree as local.
+        let logicalRoots = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? visibleRoots
+        return logicalRoots.first { root in
             root.name.lowercased() == lowered
-                || standardizedPath(root.standardizedFullPath) == canonicalTranslated
-                || standardizedPath(root.fullPath) == canonicalTranslated
+                || standardizedPath(lookupContext.translateInputPath(root.standardizedFullPath)) == canonicalTranslated
+                || standardizedPath(lookupContext.translateInputPath(root.fullPath)) == canonicalTranslated
         }
     }
 
