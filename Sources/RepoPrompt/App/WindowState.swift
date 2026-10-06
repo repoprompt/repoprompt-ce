@@ -488,10 +488,13 @@ class WindowState: ObservableObject {
 
     func beginClose() {
         guard !isClosing else { return }
+        let manager = windowStatesManager ?? WindowStatesManager.shared
+        if !manager.isTerminating {
+            AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
+        }
         isClosing = true
         failUnstartedCommandsForWindowClose()
 
-        let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }

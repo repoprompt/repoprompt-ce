@@ -24,6 +24,20 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
+
 ## Route authority is independent of tool discovery
 
 A provider input never waits for a returned tool catalog. For native Claude/Codex runs with exact

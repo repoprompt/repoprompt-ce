@@ -181,8 +181,11 @@ extension AgentModeViewModel {
     /// a provider. Tabs already hydrated or already loading are skipped (the load joins in-flight
     /// work anyway).
     func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
+        let discovery = agentSessionLinkDiscoveryState
+        guard discovery.isComplete else { return }
         for descriptor in agentSessionLinkComposeTabDescriptors()
             where sessionIDs.contains(descriptor.sessionID)
+            && discovery.epoch.workspaceID == descriptor.workspaceID
         {
             let tabID = descriptor.tabID
             if let existing = sessions[tabID],
@@ -191,11 +194,13 @@ extension AgentModeViewModel {
                 continue
             }
             Task { @MainActor [weak self] in
+                #if DEBUG
+                    await self?.test_beforeRestorationHydrationAdmission?()
+                    defer { self?.test_restorationHydrationTaskDidFinish?() }
+                #endif
                 guard let self,
-                      // Re-read after the hop: the tab may have been closed or rebound meanwhile.
-                      agentSessionLinkComposeTabDescriptors().contains(where: {
-                          $0.tabID == tabID && $0.sessionID == descriptor.sessionID
-                      })
+                      agentSessionLinkDiscoveryState == discovery,
+                      agentSessionLinkComposeTabDescriptors().contains(descriptor)
                 else { return }
                 _ = await ensureSessionReady(tabID: tabID)
             }
