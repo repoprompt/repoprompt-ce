@@ -3828,6 +3828,8 @@ actor ACPAgentSessionController {
         if let rawInputJSON, !rawInputJSON.isEmpty {
             details.append(AgentApprovalDetail(label: "Input", value: rawInputJSON, isCode: true))
         }
+        // Grok's raw option list does not match the scoped approval actions RPCE offers.
+        guard provider.providerID != .grokBuild else { return details }
         let optionLabels = options.map {
             Self.optionLabel(name: $0.name, optionID: $0.optionID)
         }
