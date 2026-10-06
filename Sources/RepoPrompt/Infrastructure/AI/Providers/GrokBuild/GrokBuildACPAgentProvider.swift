@@ -56,6 +56,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         var environment = config.backgroundFeatureEnvironment.merging(GrokBuildAgentConfig.importIsolationEnvironment) { _, isolation in
             isolation
         }
+        environment["GROK_MAX_MCP_OUTPUT_BYTES"] = "100000"
         if let apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty {
             // Never log this value; it exists only as a child-process launch override.
             environment["XAI_API_KEY"] = apiKey
@@ -147,9 +148,11 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     }
 
     func preferredAuthMethodID(context _: ACPAuthenticationContext) -> String? {
-        // Never send ACP `authenticate`: Grok's own credential precedence (config.toml key →
-        // ~/.grok/auth.json session token → XAI_API_KEY env) is authoritative, and a stored
-        // RepoPrompt key arrives as the XAI_API_KEY launch-environment override.
+        // Never send ACP `authenticate`: Grok checks model `api_key`/`env_key`, then a configured
+        // auth-provider branch (no fallthrough without its cached token), then an eligible
+        // session token, then `XAI_API_KEY`, subject to `[auth] preferred_method` and
+        // `disable_api_key_auth`. A stored RepoPrompt key arrives as the `XAI_API_KEY`
+        // launch-environment override.
         nil
     }
 
