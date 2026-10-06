@@ -246,6 +246,12 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, leaving the ACP caller's background policy unchanged (Context Builder). One-shot (Oracle/Chat) is a separate path that never reads this field and remains unchanged. No user configuration or global environment is changed.
 - The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
 
+#### Grok one-shot safety policy
+
+- One-shot (Oracle/Chat) request children additionally set `GROK_CLAUDE_HOOKS_ENABLED=0` and `GROK_CURSOR_HOOKS_ENABLED=0` as process-local overrides. These disable imported Claude/Cursor hook-file discovery, not Grok-native or config-layer hooks.
+- `GROK_SESSION_SEARCH=0` requests indexing off for that child; higher-priority requirements/MDM pins can override it. `GROK_STORAGE_MODE=local` prevents account-history writeback, including after late settings arrive. It does not erase earlier uploads or change inference traffic, and is not a blanket upload/network prohibition.
+- The overrides do not erase existing index rows or prevent other Grok processes from indexing retained files. Successful request cleanup removes its owned artifacts; cleanup failures can leave them behind. Missing-source rows can be pruned both at bootstrap and through queued updates, not necessarily immediately. These control semantics are source-verified at Grok 1.0.45 (`2bdd1d6a`), not live-proven.
+
 #### Grok cancellation boundaries
 
 - **Turn cancellation:** stopping or steering an active ACP turn sends a bare `session/cancel` with only `sessionId`. [Grok's cancellation handler](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs) cancels every non-workflow subagent in that session, including earlier turns' background children, and kills running foreground commands. These effects are source-verified at Grok 1.0.45, not limited to the current turn.
