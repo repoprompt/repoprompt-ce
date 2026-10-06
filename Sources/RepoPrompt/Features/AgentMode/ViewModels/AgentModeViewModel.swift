@@ -13166,17 +13166,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     retainedPayloadByItemID: session.ephemeralToolResultPayloadByItemID
                 )
             if canApplyWorkingItems, trimmedWorkingItems != session.items {
-                let retainedPayloadByItemID = session.ephemeralToolResultPayloadByItemID
-                let retainedPayloadRevisionByItemID = session.ephemeralToolResultPayloadRevisionByItemID
-                let retainedTrimmedItemIDs = Set(trimmedWorkingItems.map(\.id))
-                session.setItemsSilently(trimmedWorkingItems, reason: .retentionCompaction)
-                session.replaceEphemeralToolResultPayloadMap(
-                    retainedPayloadByItemID.filter { retainedTrimmedItemIDs.contains($0.key) },
-                    liveItemIDs: retainedTrimmedItemIDs
-                )
-                session.ephemeralToolResultPayloadRevisionByItemID = retainedPayloadRevisionByItemID.filter {
-                    retainedTrimmedItemIDs.contains($0.key) && session.ephemeralToolResultPayloadByItemID[$0.key] != nil
-                }
+                session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
                 markDerivedTranscriptSynchronized(
                     for: session,
                     projectionProtection: builtPresentation.projectionProtection
