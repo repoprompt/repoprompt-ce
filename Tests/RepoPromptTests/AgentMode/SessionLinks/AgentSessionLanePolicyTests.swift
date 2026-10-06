@@ -293,25 +293,83 @@ final class AgentSessionLanePolicyTests: XCTestCase {
 
     @MainActor
     func testEveryRoleUsesItsEffectiveRoleDefaultAndMappedEffort() throws {
-        let workspaceID = UUID()
-        let overrides = Dictionary(
-            uniqueKeysWithValues: AgentModelCatalog.TaskLabelKind.allCases.map {
-                ($0.rawValue, "codexExec:gpt-5.4-high")
-            }
+        let registry = AgentACPModelRegistry.shared
+        registry.test_reset(providerID: .devin)
+        registry.test_reset(providerID: .cursor)
+        defer {
+            registry.test_reset(providerID: .devin)
+            registry.test_reset(providerID: .cursor)
+        }
+        let devinModel = AgentModelOption(
+            rawValue: "test-devin-pinned", displayName: "Pinned Devin", description: nil, isDefault: false
         )
-        let settings = AgentModelsProfileRoleDefaultsStore(overrides: overrides)
-        let availability = AgentModelCatalog.AvailabilityContext()
-        for role in AgentModelCatalog.TaskLabelKind.allCases {
-            let selected = try AgentSessionLanePolicy.resolveRole(
-                role.rawValue,
-                availability: availability,
-                workspaceID: workspaceID,
-                settingsStore: settings
-            )
-            XCTAssertEqual(selected.role, role)
-            XCTAssertEqual(selected.agentRaw, AgentProviderKind.codexExec.rawValue)
-            XCTAssertEqual(selected.modelRaw, "gpt-5.4-high")
-            XCTAssertEqual(selected.reasoningEffortRaw, "high")
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            .init(options: [devinModel], currentModelRaw: devinModel.rawValue), for: .devin
+        ))
+        let workspaceID = UUID()
+        var scenarios: [(
+            name: String, role: AgentModelCatalog.TaskLabelKind, agent: AgentProviderKind,
+            model: String, effort: String?, availability: AgentModelCatalog.AvailabilityContext, admitted: Bool
+        )] = AgentModelCatalog.TaskLabelKind.allCases.map {
+            ("\($0.rawValue) Codex pin", $0, .codexExec, "gpt-5.4-high", "high", .init(), true)
+        }
+        scenarios.append(contentsOf: [
+            (
+                "Devin-only pin",
+                .pair,
+                .devin,
+                devinModel.rawValue,
+                nil,
+                .init(claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false, devinAvailable: true),
+                true
+            ),
+            (
+                "Cursor-only Auto pin",
+                .pair,
+                .cursor,
+                AgentModel.cursorAuto.rawValue,
+                nil,
+                .init(claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false, cursorAvailable: true),
+                true
+            ),
+            ("disconnected Devin pin", .pair, .devin, devinModel.rawValue, nil, .none, false)
+        ])
+        for scenario in scenarios {
+            let settings = AgentModelsProfileRoleDefaultsStore(overrides: [scenario.role.rawValue: AgentModelSelectionID(
+                agentRaw: scenario.agent.rawValue, modelRaw: scenario.model
+            ).rawValue])
+            if scenario.agent != .codexExec {
+                XCTAssertNil(MCPAgentRoleDefaultsService.effectiveSelection(
+                    for: scenario.role, availability: scenario.availability,
+                    workspaceID: workspaceID, settingsStore: settings
+                ), "\(scenario.name): no recommendation row should be synthesized")
+            }
+            if !scenario.admitted {
+                XCTAssertThrowsError(try AgentSessionLanePolicy.resolveRole(
+                    scenario.role.rawValue, availability: scenario.availability,
+                    workspaceID: workspaceID, settingsStore: settings
+                ), scenario.name) { error in
+                    XCTAssertEqual(error as? AgentSessionLanePolicy.RoleResolutionError, .roleUnavailable, scenario.name)
+                }
+                continue
+            }
+            let selected: AgentSessionLanePolicy.RoleSelection
+            do {
+                selected = try AgentSessionLanePolicy.resolveRole(
+                    scenario.role.rawValue,
+                    availability: scenario.availability,
+                    workspaceID: workspaceID,
+                    settingsStore: settings
+                )
+            } catch {
+                XCTFail("\(scenario.name): an executable destination pin must resolve, got \(error)")
+                continue
+            }
+            XCTAssertEqual(selected.role, scenario.role, scenario.name)
+            XCTAssertEqual(selected.agentRaw, scenario.agent.rawValue, scenario.name)
+            XCTAssertEqual(selected.modelRaw, scenario.model, scenario.name)
+            XCTAssertEqual(selected.reasoningEffortRaw, scenario.effort, scenario.name)
+            XCTAssertTrue(selected.modelParameterSelections.isEmpty, scenario.name)
         }
     }
 

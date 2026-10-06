@@ -719,6 +719,13 @@ actor ACPAgentSessionController {
         log("Opening ACP session")
         logSessionMCPInjection()
         let openSessionResult = try await openSession()
+        if let notification = sessionConfiguration.postOpenNotification {
+            try sendJSONLine([
+                "jsonrpc": "2.0",
+                "method": notification.method,
+                "params": notification.params.mapValues { $0.toAny() }
+            ])
+        }
         sessionID = openSessionResult.sessionID
         state = .sessionOpen
 
@@ -2333,11 +2340,7 @@ actor ACPAgentSessionController {
                 diagnose(.phaseStarted("session/load"))
                 let requestResponse = try await sendRequestResponse(
                     method: "session/load",
-                    params: [
-                        "sessionId": existingSessionID,
-                        "cwd": sessionConfiguration.workingDirectory,
-                        "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
-                    ]
+                    params: sessionOpenParams(existingSessionID: existingSessionID)
                 )
                 let response = requestResponse.result
                 applyOpenedSessionConfiguration(
@@ -2385,10 +2388,7 @@ actor ACPAgentSessionController {
         diagnose(.phaseStarted("session/new"))
         let requestResponse = try await sendRequestResponse(
             method: "session/new",
-            params: [
-                "cwd": sessionConfiguration.workingDirectory,
-                "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
-            ]
+            params: sessionOpenParams()
         )
         let response = requestResponse.result
         guard let sessionID = response["sessionId"] as? String else {
@@ -2413,6 +2413,20 @@ actor ACPAgentSessionController {
             providerSessionIdentity: identity,
             invalidatedResumeSessionID: nil
         )
+    }
+
+    private func sessionOpenParams(existingSessionID: String? = nil) -> [String: Any] {
+        var params: [String: Any] = [
+            "cwd": sessionConfiguration.workingDirectory,
+            "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
+        ]
+        if let existingSessionID {
+            params["sessionId"] = existingSessionID
+        }
+        if !sessionConfiguration.metadata.isEmpty {
+            params["_meta"] = sessionConfiguration.metadata.mapValues { $0.toAny() }
+        }
+        return params
     }
 
     private func sendRequest(
