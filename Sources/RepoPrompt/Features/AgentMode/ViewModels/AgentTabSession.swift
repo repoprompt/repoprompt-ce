@@ -53,6 +53,7 @@ final class AgentTabSession: ObservableObject {
     var onRunStateChanged: ((AgentTabSession) -> Void)?
     #if DEBUG
         private(set) var test_incrementalRetentionCompactionCount = 0
+        private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
     #endif
 
     /// Run state
@@ -1996,6 +1997,9 @@ final class AgentTabSession: ObservableObject {
         repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
         syncNextSequenceIndexFromItems()
         liveItemIDs = Set(items.map(\.id))
+        #if DEBUG
+            test_fullRetentionPayloadMapScannedItemCount += items.count
+        #endif
         replaceEphemeralToolResultPayloadMap(
             AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
                 from: items,
