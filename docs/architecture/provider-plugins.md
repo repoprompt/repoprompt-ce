@@ -242,8 +242,8 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 #### Grok background-feature launch policy
 
-- Agent Mode and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` in the child-process environment. These host-managed paths must not start Grok-owned background work that RepoPrompt CE does not orchestrate or surface.
-- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, so Context Builder and one-shot (Oracle/Chat) callers retain their existing native background-feature behavior. No user configuration or global environment is changed.
+- Agent Mode and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` to disable Grok's memory, subagents, workflows and auto-wake. Switch behavior is source-verified against Grok 1.0.45 (`2bdd1d6a`), not live-proven; pinned/remote settings can affect feature-specific resolution, and auto-wake requirements pins can override the environment. Imported hooks are separate and not controlled by these switches. In the pinned source, an explicit `/workflow resume` of an existing resumable workflow record in a loaded session is not gated by `GROK_WORKFLOWS` ([`ManageOp::Resume`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs)); this is not observed live, and passive or model-initiated restart is not established.
+- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, leaving the ACP caller's background policy unchanged (Context Builder). One-shot (Oracle/Chat) is a separate path that never reads this field and remains unchanged. No user configuration or global environment is changed.
 - The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
 
 #### Grok cancellation boundaries

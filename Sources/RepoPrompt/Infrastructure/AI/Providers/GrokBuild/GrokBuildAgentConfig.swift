@@ -31,8 +31,9 @@ struct GrokBuildAgentConfig {
     /// (`ACPAgentProviderFactory`). nil means "no stored key" — Grok's own credential
     /// precedence (`~/.grok/auth.json`, config.toml) still applies.
     let apiKey: String?
-    /// Process-local background-feature policy. Empty preserves Grok's native defaults
-    /// for Context Builder and one-shot callers; managed callers opt in explicitly.
+    /// Process-local background-feature policy. Empty leaves the ACP caller's background
+    /// policy unchanged (Context Builder); managed callers opt in explicitly.
+    /// One-shot is a separate path that never reads this field.
     let backgroundFeatureEnvironment: [String: String]
 
     init(
