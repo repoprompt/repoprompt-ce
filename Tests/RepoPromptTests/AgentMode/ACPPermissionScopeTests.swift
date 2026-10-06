@@ -9,7 +9,9 @@ final class ACPPermissionScopeTests: XCTestCase {
         for providerID: ACPProviderID in [.openCode, .cursor, .antigravity] {
             for optionID in ["allow_always", "always", "opaque-always", "once", "allow_once"] {
                 for decision: AgentApprovalDecision in [.accept, .acceptForSession, .acceptWithExecpolicyAmendment("remember")] {
-                    let outcome = try await permissionOutcome(providerID: providerID, decision: decision, optionID: optionID)
+                    let outcome = try await permissionOutcome(
+                        providerID: providerID, decision: decision, optionID: optionID, expectedPlainApprove: false
+                    )
                     let oneTime = decision == .accept
                     XCTAssertEqual(outcome["outcome"], oneTime ? "cancelled" : "selected", "\(providerID): \(decision)")
                     XCTAssertEqual(outcome["optionId"], oneTime ? nil : optionID, "\(providerID): \(decision)")
@@ -20,7 +22,9 @@ final class ACPPermissionScopeTests: XCTestCase {
 
     func testNoOneTimeOptionDisablesPlainApproveForEveryACPProvider() async throws {
         for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
-            let outcome = try await permissionOutcome(providerID: providerID, decision: .decline, optionID: "allow_always")
+            let outcome = try await permissionOutcome(
+                providerID: providerID, decision: .decline, optionID: "allow_always", expectedPlainApprove: false
+            )
             XCTAssertEqual(outcome["outcome"], "selected")
             XCTAssertEqual(outcome["optionId"], "reject_once")
         }
@@ -29,7 +33,7 @@ final class ACPPermissionScopeTests: XCTestCase {
     func testOneTimeOptionKeepsPlainApprovalAvailable() async throws {
         for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
             let outcome = try await permissionOutcome(
-                providerID: providerID, decision: .accept, optionID: "allow_once", optionKind: "allow_once"
+                providerID: providerID, decision: .accept, optionID: "allow_once", optionKind: "allow_once", expectedPlainApprove: true
             )
             XCTAssertEqual(outcome["outcome"], "selected")
             XCTAssertEqual(outcome["optionId"], "allow_once")
@@ -37,53 +41,61 @@ final class ACPPermissionScopeTests: XCTestCase {
     }
 
     func testGrokShellSessionApprovalUsesOnlyOneTimeOptions() async throws {
-        let cases: [(name: String, options: [[String: String]], expectedOptionID: String?)] = [
+        let cases: [(name: String, options: [[String: String]], expectedPlainApprove: Bool, expectedOptionID: String?)] = [
             ("generic Bash", [
                 ["optionId": "always-allow", "kind": "allow_always", "name": "Yes, and don't ask again for bash commands"],
                 ["optionId": "allow-once", "kind": "allow_once", "name": "Yes, proceed"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"],
                 ["optionId": "reject-always", "kind": "reject_always", "name": "No, and don't ask again for this command"]
-            ], "allow-once"),
+            ], true, "allow-once"),
             ("remember disabled", [
                 ["optionId": "allow-once", "kind": "allow_once", "name": "Yes, proceed"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], "allow-once"),
+            ], true, "allow-once"),
             ("opaque kind fallback", [
                 ["optionId": "opaque-persistent", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "opaque-once", "kind": "allow_once", "name": "Allow"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], "opaque-once"),
+            ], true, "opaque-once"),
             ("always preference", [
                 ["optionId": "always", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "allow-once", "kind": "allow_once", "name": "Allow"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], "allow-once"),
+            ], true, "allow-once"),
             ("allow_always preference", [
                 ["optionId": "allow_always", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "allow-once", "kind": "allow_once", "name": "Allow"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], "allow-once"),
+            ], true, "allow-once"),
             ("persistent only", [
                 ["optionId": "always-allow", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], nil),
+            ], false, nil),
             ("one-time ID with persistent kind", [
                 ["optionId": "allow-once", "kind": "allow_always", "name": "Remember"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], nil),
+            ], false, nil),
             ("persistent ID with one-time kind", [
                 ["optionId": "always-allow", "kind": "allow_once", "name": "Remember"],
                 ["optionId": "opaque-once", "kind": "allow_once", "name": "Allow"],
                 ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
-            ], "opaque-once")
+            ], true, "opaque-once"),
+            ("persistent ID with one-time kind only", [
+                ["optionId": "always-allow", "kind": "allow_once", "name": "Remember"],
+                ["optionId": "reject-once", "kind": "reject_once", "name": "No"]
+            ], false, nil)
         ]
         for testCase in cases {
-            let outcome = try await permissionOutcome(
-                providerID: .grokBuild, decision: .acceptForSession, options: testCase.options,
-                expectedSessionScope: .oneTime
-            )
-            XCTAssertEqual(outcome["outcome"], testCase.expectedOptionID == nil ? "cancelled" : "selected", testCase.name)
-            XCTAssertEqual(outcome["optionId"], testCase.expectedOptionID, testCase.name)
+            for decision: AgentApprovalDecision in [.accept, .acceptForSession] {
+                let outcome = try await permissionOutcome(
+                    providerID: .grokBuild, decision: decision, options: testCase.options,
+                    expectedPlainApprove: testCase.expectedPlainApprove, expectedSessionScope: .oneTime
+                )
+                XCTAssertEqual(
+                    outcome["outcome"], testCase.expectedOptionID == nil ? "cancelled" : "selected", "\(testCase.name): \(decision)"
+                )
+                XCTAssertEqual(outcome["optionId"], testCase.expectedOptionID, "\(testCase.name): \(decision)")
+            }
         }
     }
 
@@ -97,7 +109,7 @@ final class ACPPermissionScopeTests: XCTestCase {
             (.acceptForSession, "allow-edits-session"), (.accept, "allow-once")
         ] {
             let outcome = try await permissionOutcome(
-                providerID: .grokBuild, decision: decision, options: options, toolKind: "edit",
+                providerID: .grokBuild, decision: decision, options: options, expectedPlainApprove: true, toolKind: "edit",
                 expectedSessionScope: .editsSession
             )
             XCTAssertEqual(outcome["outcome"], "selected", "\(decision)")
@@ -111,18 +123,20 @@ private extension XCTestCase {
         providerID: ACPProviderID,
         decision: AgentApprovalDecision,
         optionID: String,
-        optionKind: String = "allow_always"
+        optionKind: String = "allow_always",
+        expectedPlainApprove: Bool
     ) async throws -> [String: String] {
         try await permissionOutcome(providerID: providerID, decision: decision, options: [
             ["optionId": optionID, "kind": optionKind, "name": "Allow"],
             ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
-        ])
+        ], expectedPlainApprove: expectedPlainApprove)
     }
 
     func permissionOutcome(
         providerID: ACPProviderID,
         decision: AgentApprovalDecision,
         options: [[String: String]],
+        expectedPlainApprove: Bool,
         toolKind: String = "execute",
         expectedSessionScope: AgentApprovalSessionScope? = nil,
         expectedOptionsDetail: Bool? = nil
@@ -181,7 +195,7 @@ private extension XCTestCase {
             let prompt = Task { try await controller.prompt(AgentMessage(userMessage: "Run"), request: request) }
             for await event in events {
                 if case let .approvalRequested(approval) = event {
-                    XCTAssertEqual(approval.supportsPlainApprove, options.contains { $0["kind"] == "allow_once" }, "\(providerID)")
+                    XCTAssertEqual(approval.supportsPlainApprove, expectedPlainApprove, "\(providerID): \(decision)")
                     if let expectedSessionScope {
                         XCTAssertEqual(approval.sessionApprovalScope, expectedSessionScope)
                     } else if providerID != .grokBuild {
@@ -277,17 +291,18 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
             toolKind: String,
             options: [[String: String]],
             scope: AgentApprovalSessionScope?,
+            expectedPlainApprove: Bool,
             showsOptions: Bool,
             selectedOptionID: String
         )] = [
-            (.grokBuild, "execute", bashOptions, .oneTime, false, "allow-once"),
-            (.grokBuild, "edit", editOptions, .editsSession, false, "allow-edits-session"),
-            (.openCode, "execute", bashOptions, nil, true, "always-allow")
+            (.grokBuild, "execute", bashOptions, .oneTime, true, false, "allow-once"),
+            (.grokBuild, "edit", editOptions, .editsSession, true, false, "allow-edits-session"),
+            (.openCode, "execute", bashOptions, nil, true, true, "always-allow")
         ]
         for testCase in cases {
             let outcome = try await permissionOutcome(
                 providerID: testCase.providerID, decision: .acceptForSession, options: testCase.options,
-                toolKind: testCase.toolKind, expectedSessionScope: testCase.scope, expectedOptionsDetail: testCase.showsOptions
+                expectedPlainApprove: testCase.expectedPlainApprove, toolKind: testCase.toolKind, expectedSessionScope: testCase.scope, expectedOptionsDetail: testCase.showsOptions
             )
             XCTAssertEqual(outcome["outcome"], "selected", "\(testCase.providerID): \(testCase.toolKind)")
             XCTAssertEqual(outcome["optionId"], testCase.selectedOptionID, "\(testCase.providerID): \(testCase.toolKind)")
@@ -344,22 +359,86 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
         }
     }
 
+    func testOneTimeApprovalRejectsScopedMCPResponsesWithoutConsumingPrompt() async throws {
+        let context = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "ACP one-time responses", workspaceSwitchReason: "acpOneTimeResponseTests",
+            clientName: "acp-one-time-response-tests", unusedStartRunMessage: "No provider starts"
+        )
+        addTeardownBlock { @MainActor in await context.cleanup() }
+        let viewModel = context.window.agentModeViewModel
+        for available in [false, true] {
+            let request = approval(available: available, sessionApprovalScope: .oneTime)
+            context.session.pendingApproval = request
+            context.session.runState = .waitingForApproval
+            for (response, amendment): (String, String?) in [
+                ("accept_for_session", nil), ("always_allow", nil), ("approve_for_session", nil),
+                ("accept_with_amendment", "remember"), ("amend", "remember")
+            ] {
+                let payload = AgentModeViewModel.MCPInteractionResponsePayload(
+                    text: nil, skip: false, responseArgument: .scalar(response), amendment: amendment, answersByQuestionID: [:]
+                )
+                XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                    for: context.session, kind: .approval, interactionID: request.id, payload: payload
+                ), "\(response), plain approval: \(available)") { error in
+                    guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
+                        return XCTFail("Expected MCPError.invalidParams for \(response), got \(error)")
+                    }
+                }
+                XCTAssertEqual(context.session.pendingApproval, request, "\(response) must leave the same approval pending")
+                XCTAssertEqual(context.session.runState, .waitingForApproval)
+            }
+        }
+    }
+
     func testGrokApprovalPresentationMatchesSelectedScope() async throws {
         let context = try await AgentRunMCPControlledSessionContext.make(
             workspaceNamePrefix: "ACP approval scope", workspaceSwitchReason: "acpApprovalScopeTests",
             clientName: "acp-approval-scope-tests", unusedStartRunMessage: "No provider starts"
         )
         addTeardownBlock { @MainActor in await context.cleanup() }
-        let cases: [(scope: AgentApprovalSessionScope?, available: Bool, label: String?, description: String)] = [
-            (.oneTime, true, nil, "Allow this action once (session-long approval is unavailable)"),
-            (.oneTime, false, nil, "Cancel this request (no one-time approval is available)"),
-            (.editsSession, true, "Allow edits this session", "Allow edits for the rest of this session"),
-            (nil, true, "Always Allow", "Allow this action for the rest of the session")
+        let cases: [(
+            scope: AgentApprovalSessionScope?, kind: AgentApprovalKind, available: Bool,
+            label: String?, options: [String], sessionDescription: String?
+        )] = [
+            (.oneTime, .commandExecution, true, nil, ["accept", "decline", "cancel"], nil),
+            (.oneTime, .commandExecution, false, nil, ["decline", "cancel"], nil),
+            (
+                .editsSession,
+                .fileChange,
+                true,
+                "Allow edits this session",
+                ["accept", "accept_for_session", "decline", "cancel"],
+                "Allow edits for the rest of this session"
+            ),
+            (
+                .editsSession,
+                .commandExecution,
+                true,
+                "Allow edits this session",
+                ["accept", "accept_for_session", "decline", "cancel"],
+                "Allow edits for the rest of this session"
+            ),
+            (
+                nil,
+                .commandExecution,
+                true,
+                "Always Allow",
+                ["accept", "accept_for_session", "accept_with_amendment", "decline", "cancel"],
+                "Allow this action for the rest of the session"
+            ),
+            (
+                nil,
+                .fileChange,
+                true,
+                "Always Allow",
+                ["accept", "accept_for_session", "decline", "cancel"],
+                "Allow this action for the rest of the session"
+            )
         ]
         for testCase in cases {
             let request = AgentApprovalRequest(
                 requestID: .acp("permission"), method: "session/request_permission",
-                kind: testCase.scope == .editsSession ? .fileChange : .commandExecution,
+                kind: testCase.kind,
                 threadID: "thread", turnID: "turn", itemID: "item",
                 plainApproveAvailable: testCase.available, sessionApprovalScope: testCase.scope
             )
@@ -370,16 +449,17 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
             context.session.pendingApproval = request
             context.session.runState = .waitingForApproval
             let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
-            XCTAssertEqual(interaction.options.contains { $0.label == "accept" }, testCase.available)
-            let sessionOption = try XCTUnwrap(interaction.options.first { $0.label == "accept_for_session" })
-            XCTAssertEqual(sessionOption.description, testCase.description)
-            if request.kind == .commandExecution {
+            XCTAssertEqual(
+                interaction.options.map(\.label), testCase.options,
+                "\(String(describing: testCase.scope)): \(testCase.kind), plain approval: \(testCase.available)"
+            )
+            if let sessionDescription = testCase.sessionDescription {
+                let sessionOption = try XCTUnwrap(interaction.options.first { $0.label == "accept_for_session" })
+                XCTAssertEqual(sessionOption.description, sessionDescription)
+            }
+            if testCase.scope == nil, request.kind == .commandExecution {
                 let amendmentOption = try XCTUnwrap(interaction.options.first { $0.label == "accept_with_amendment" })
-                XCTAssertEqual(
-                    amendmentOption.description,
-                    testCase.scope == nil
-                        ? "Allow with exec policy amendment (provide amendment field)" : testCase.description
-                )
+                XCTAssertEqual(amendmentOption.description, "Allow with exec policy amendment (provide amendment field)")
             }
         }
     }
@@ -393,11 +473,11 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
         XCTAssertFalse(approval(available: nil).supportsPlainApprove)
     }
 
-    private func approval(available: Bool?) -> AgentApprovalRequest {
+    private func approval(available: Bool?, sessionApprovalScope: AgentApprovalSessionScope? = nil) -> AgentApprovalRequest {
         AgentApprovalRequest(
             requestID: .acp("permission"), method: "session/request_permission", kind: .commandExecution,
             threadID: "thread", turnID: "turn", itemID: "item", command: "ls",
-            plainApproveAvailable: available
+            plainApproveAvailable: available, sessionApprovalScope: sessionApprovalScope
         )
     }
 }
