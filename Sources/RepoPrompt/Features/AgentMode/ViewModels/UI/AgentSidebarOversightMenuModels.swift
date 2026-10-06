@@ -96,7 +96,7 @@ enum AgentSidebarOversightActionKey: Hashable {
 /// observer candidate. Available options intersect exact authority-owned outbound membership with a
 /// live-candidate presentation snapshot; the exact Add operation revalidates them before mutating.
 enum AgentSidebarOversightMenuProjection {
-    private struct Seed {
+    fileprivate struct Seed {
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
         let observerSessionID: UUID
         let displayName: String
@@ -104,25 +104,72 @@ enum AgentSidebarOversightMenuProjection {
         let locationLabel: String?
         let relationship: AgentSidebarOversightMenuProps.Relationship
 
-        var baseMenuLabel: String {
-            guard let location = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !location.isEmpty
-            else {
-                return displayName
-            }
-            return "\(location): \(displayName)"
-        }
+        let baseMenuLabel: String
+        let fullIdentityDescription: String
+        let foldedName: String
+        let sessionSortKey: String
+        let workspaceSortKey: String
+        let tabSortKey: String
+        let bindingSortKey: String
 
-        var fullIdentityDescription: String {
-            let binding = observerEndpoint.persistentBindingGeneration?.uuidString ?? "unresolved"
-            return "session \(observerSessionID.uuidString); window \(observerEndpoint.windowID); "
-                + "workspace \(observerEndpoint.workspaceID.uuidString); "
-                + "tab \(observerEndpoint.tabID.uuidString); binding \(binding); "
+        init(
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            observerSessionID: UUID,
+            displayName: String,
+            providerDisplayName: String?,
+            locationLabel: String?,
+            relationship: AgentSidebarOversightMenuProps.Relationship
+        ) {
+            self.observerEndpoint = observerEndpoint
+            self.observerSessionID = observerSessionID
+            self.displayName = displayName
+            self.providerDisplayName = providerDisplayName
+            self.locationLabel = locationLabel
+            self.relationship = relationship
+            let location = locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            baseMenuLabel = location.isEmpty ? displayName : "\(location): \(displayName)"
+            foldedName = folded(displayName)
+            sessionSortKey = observerSessionID.uuidString
+            workspaceSortKey = observerEndpoint.workspaceID.uuidString
+            tabSortKey = observerEndpoint.tabID.uuidString
+            bindingSortKey = observerEndpoint.persistentBindingGeneration?.uuidString ?? ""
+            fullIdentityDescription = "session \(sessionSortKey); window \(observerEndpoint.windowID); "
+                + "workspace \(workspaceSortKey); tab \(tabSortKey); "
+                + "binding \(bindingSortKey.isEmpty ? "unresolved" : bindingSortKey); "
                 + "transition \(observerEndpoint.bindingTransitionGeneration)"
         }
     }
 
     private static let foldingLocale = Locale(identifier: "en_US_POSIX")
+
+    /// Immutable preparation for one candidate snapshot, shared by every row in a refresh pass.
+    struct CandidateIndex {
+        let byEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate]
+        fileprivate let labelsAreUnique: Bool
+        fileprivate let orderedObservers: [Seed]
+        fileprivate let observerEligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+
+        init(_ candidates: [AgentSessionLinkEndpointCandidate]) {
+            // Choose representatives before sorting: descriptive lookups remain live first-match.
+            byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
+            orderedObservers = byEndpoint.values.map { candidate in
+                Seed(
+                    observerEndpoint: candidate.domainEndpoint,
+                    observerSessionID: candidate.sessionID,
+                    displayName: candidate.resolvedDisplayName,
+                    providerDisplayName: normalizedProvider(candidate.providerDisplayName),
+                    locationLabel: candidate.locationLabel,
+                    relationship: .available
+                )
+            }.sorted(by: orderedBefore)
+            labelsAreUnique = Set(orderedObservers.map(\.baseMenuLabel)).count == orderedObservers.count
+            observerEligibleEndpoints = Set(byEndpoint.values.filter {
+                AgentSessionLinkEndpointEligibility.addDisabledReason(
+                    $0.eligibilityInput, roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
+                ) == nil
+            }.map(\.domainEndpoint))
+        }
+    }
 
     static func make(
         target: AgentSessionLinkEndpointCandidate,
@@ -130,14 +177,25 @@ enum AgentSidebarOversightMenuProjection {
         candidates: [AgentSessionLinkEndpointCandidate],
         createdByLabel: String? = nil
     ) -> AgentSidebarOversightMenuProps? {
+        make(
+            target: target,
+            inputs: inputs,
+            candidateIndex: CandidateIndex(candidates),
+            createdByLabel: createdByLabel
+        )
+    }
+
+    static func make(
+        target: AgentSessionLinkEndpointCandidate,
+        inputs: DomainAgentSessionLinkEndpointProjectionInputs,
+        candidateIndex: CandidateIndex,
+        createdByLabel: String? = nil
+    ) -> AgentSidebarOversightMenuProps? {
         guard AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil else {
             return nil
         }
 
-        let candidatesByEndpoint = Dictionary(
-            candidates.map { ($0.domainEndpoint, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
+        let candidatesByEndpoint = candidateIndex.byEndpoint
         var linkedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
         var linked: [Seed] = []
         linked.reserveCapacity(inputs.inbound.items.count)
@@ -178,33 +236,21 @@ enum AgentSidebarOversightMenuProjection {
             ))
         }
 
-        var availableEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
         var available: [Seed] = []
-        for observer in candidates {
-            let observerEndpoint = observer.domainEndpoint
-            guard observer.sessionID != target.sessionID,
+        for observer in candidateIndex.orderedObservers {
+            let observerEndpoint = observer.observerEndpoint
+            guard observer.observerSessionID != target.sessionID,
                   !linkedEndpoints.contains(observerEndpoint),
-                  availableEndpoints.insert(observerEndpoint).inserted,
                   inputs.activeOutboundObserverEndpoints.contains(observerEndpoint),
-                  AgentSessionLinkEndpointEligibility.addDisabledReason(
-                      observer.eligibilityInput,
-                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-                  ) == nil
+                  candidateIndex.observerEligibleEndpoints.contains(observerEndpoint)
             else {
                 continue
             }
-            available.append(Seed(
-                observerEndpoint: observerEndpoint,
-                observerSessionID: observer.sessionID,
-                displayName: observer.resolvedDisplayName,
-                providerDisplayName: normalizedProvider(observer.providerDisplayName),
-                locationLabel: observer.locationLabel,
-                relationship: .available
-            ))
+            available.append(observer)
         }
 
-        let seeds = linked.sorted(by: orderedBefore) + available.sorted(by: orderedBefore)
-        let labels = collisionSafeLabels(for: seeds)
+        let seeds = linked.sorted(by: orderedBefore) + available
+        let labels = collisionSafeLabels(for: seeds, linked: linked, candidateIndex: candidateIndex)
         let options = seeds.map { seed in
             AgentSidebarOversightMenuProps.ObserverOption(
                 observerEndpoint: seed.observerEndpoint,
@@ -235,27 +281,27 @@ enum AgentSidebarOversightMenuProjection {
     }
 
     private static func orderedBefore(_ lhs: Seed, _ rhs: Seed) -> Bool {
-        let lhsName = folded(lhs.displayName)
-        let rhsName = folded(rhs.displayName)
+        let lhsName = lhs.foldedName
+        let rhsName = rhs.foldedName
         if lhsName != rhsName { return lhsName < rhsName }
 
-        let lhsSession = lhs.observerSessionID.uuidString
-        let rhsSession = rhs.observerSessionID.uuidString
+        let lhsSession = lhs.sessionSortKey
+        let rhsSession = rhs.sessionSortKey
         if lhsSession != rhsSession { return lhsSession < rhsSession }
         if lhs.observerEndpoint.windowID != rhs.observerEndpoint.windowID {
             return lhs.observerEndpoint.windowID < rhs.observerEndpoint.windowID
         }
 
-        let lhsWorkspace = lhs.observerEndpoint.workspaceID.uuidString
-        let rhsWorkspace = rhs.observerEndpoint.workspaceID.uuidString
+        let lhsWorkspace = lhs.workspaceSortKey
+        let rhsWorkspace = rhs.workspaceSortKey
         if lhsWorkspace != rhsWorkspace { return lhsWorkspace < rhsWorkspace }
 
-        let lhsTab = lhs.observerEndpoint.tabID.uuidString
-        let rhsTab = rhs.observerEndpoint.tabID.uuidString
+        let lhsTab = lhs.tabSortKey
+        let rhsTab = rhs.tabSortKey
         if lhsTab != rhsTab { return lhsTab < rhsTab }
 
-        let lhsBinding = lhs.observerEndpoint.persistentBindingGeneration?.uuidString ?? ""
-        let rhsBinding = rhs.observerEndpoint.persistentBindingGeneration?.uuidString ?? ""
+        let lhsBinding = lhs.bindingSortKey
+        let rhsBinding = rhs.bindingSortKey
         if lhsBinding != rhsBinding { return lhsBinding < rhsBinding }
         return lhs.observerEndpoint.bindingTransitionGeneration
             < rhs.observerEndpoint.bindingTransitionGeneration
@@ -270,8 +316,19 @@ enum AgentSidebarOversightMenuProjection {
 
     /// Widen only colliding labels, one exact component at a time, while keeping unique names clean.
     private static func collisionSafeLabels(
-        for seeds: [Seed]
+        for seeds: [Seed],
+        linked: [Seed],
+        candidateIndex: CandidateIndex
     ) -> [DomainAgentSessionLinkEndpointIdentity: String] {
+        // Every subset of unique snapshot labels is unique. Linked fallback labels must first prove
+        // they are the same snapshot labels; missing peers and changed fallback locations use the
+        // ordinary row-specific collision widening below, never global disambiguation.
+        if candidateIndex.labelsAreUnique, linked.allSatisfy({ seed in
+            guard let candidate = candidateIndex.byEndpoint[seed.observerEndpoint] else { return false }
+            return seed.displayName == candidate.resolvedDisplayName && seed.locationLabel == candidate.locationLabel
+        }) {
+            return [:]
+        }
         var labels = Dictionary(
             uniqueKeysWithValues: seeds.map { ($0.observerEndpoint, $0.baseMenuLabel) }
         )

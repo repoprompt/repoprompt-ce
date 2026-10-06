@@ -3259,6 +3259,35 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(targetProps.hasInbound)
     }
 
+    func testFullProjectionRefreshReadsCandidatesIndependentlyOfOpenChatCount() async {
+        let fixture = makeFixture()
+        fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        fixture.host.candidates += (0 ..< 200).map { makeCandidate(windowID: 3 + $0 % 3, displayName: "Chat \($0)") }
+        let readsBefore = fixture.host.candidateReadCount
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        XCTAssertLessThan(
+            fixture.host.candidateReadCount - readsBefore,
+            50,
+            "A full refresh must not re-read every candidate once per candidate"
+        )
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[fixture.observer.domainEndpoint]?.items.first?.createdByYou, true)
+
+        let duplicate = makeCandidate(windowID: 6, sessionID: fixture.target.sessionID, displayName: "Duplicate target")
+        let nextPassRead = fixture.host.candidateReadCount
+        fixture.host.onCandidatesRead = { read in
+            // Two pass snapshots precede the authority hops; the observer's fresh read sees drift.
+            if read == nextPassRead + 3 { fixture.host.candidates.append(duplicate) }
+        }
+        await fixture.bridge.test_settleProjections()
+        fixture.host.onCandidatesRead = nil
+        XCTAssertEqual(
+            fixture.host.publishedInventoriesByEndpoint[fixture.observer.domainEndpoint]?.items.first?.createdByYou,
+            false,
+            "Pass-local presentation indexes must not supply pre-hop UUID uniqueness to prompt provenance"
+        )
+    }
+
     func testRevokeClearsBothProjectionsAndLeavesEndpointRelativeNotices() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }

@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest

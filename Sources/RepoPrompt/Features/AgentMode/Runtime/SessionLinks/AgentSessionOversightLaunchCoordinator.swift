@@ -11,7 +11,7 @@ import RepoPromptInstrumentation
 // an intent is replayed against exact restoration-ready incarnations only, never against a UUID
 // match alone; restore never starts a run, publishes prompt inventory, or arms an Auto-wake by
 // itself — the bootstrap after restore goes through the ordinary publication path. The only
-// hydration it causes is a one-shot, passive transcript load of the background tabs a saved pair
+// hydration it causes is a passive transcript load of the background tabs a saved pair
 // is actually waiting on, so saved oversight comes back at launch instead of only after the user
 // happens to open every endpoint's tab.
 
@@ -88,7 +88,7 @@ enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
     case deleted
     /// The shared establishment path refused for a non-shutdown reason.
     case activationFailed = "activation_failed"
-    /// Lifecycle revoked the restored grant. Never requeued.
+    /// Lifecycle revoked the restored grant; only exact captured window-close ownership may requeue.
     case lifecycleRevoked = "lifecycle_revoked"
 }
 
@@ -144,23 +144,19 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 
 // MARK: - Coordinator
 
-/// Reauthorizes the **launch snapshot** of durable oversight intent, once, after every barrier.
+/// Reauthorizes launch-loaded and exact close-captured oversight intent after every barrier.
 ///
 /// Three properties define it:
 ///
-/// - It is *bounded*: only pairs present in the initial ready load ever enter the worklist. A pair
-///   the user creates later is persisted and activated by the ordinary interactive path.
+/// - It is *bounded*: launch-loaded pairs and reference-backed pairs captured at window close enter
+///   the worklist. Other interactive pairs remain owned by the ordinary interactive path.
 /// - It is *reason-aware*: it distinguishes "the window topology we expected was fully observed" from
 ///   "we gave up waiting", and only the former lets an absent session be classified as gone.
-/// - It is *not a controller*: there is no timer, no polling, no debounce, and no perpetual
-///   desired-state enforcement. A dirty flag is drained by one retained MainActor task, and an entry
-///   that has nothing to do simply waits for process lifetime. The one proactive step is a single
-///   passive load request per saved endpoint whose background tab is described but not hydrated —
-///   without it a saved pair whose tabs the user never reopens would never be restored at all.
+/// - It is *not a controller*: one MainActor task drains events, without timers or polling.
+///   Described background endpoints receive bounded passive hydration requests.
 ///
-/// Each automatic entry may call reservation **at most once**. Later lifecycle revocation terminalizes
-/// it permanently rather than requeueing it: a user who watched oversight end must not have it
-/// silently reappear.
+/// Each automatic entry may reserve once, with one fresh allowance per exact captured window close.
+/// Other lifecycle revocation ends the entry permanently; no-reference waiting pairs are not rearmed.
 @MainActor
 final class AgentSessionOversightLaunchCoordinator {
     private var restorePerfRecorder: any WorkspaceRestorePerfRecording
@@ -188,8 +184,7 @@ final class AgentSessionOversightLaunchCoordinator {
         let pair: AgentSessionOversightIntent
         var token: AgentSessionOversightIntentToken?
         var state: EntryState = .waiting
-        /// Once true, this entry may never reserve again — not after a transient failure, and not
-        /// after a later revocation.
+        /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it.
         var didStartReservation = false
         /// Sessions this launch has actually seen described or live at least once.
         ///
@@ -212,6 +207,10 @@ final class AgentSessionOversightLaunchCoordinator {
         /// process. An explicit Add bumps it, which is what makes a retirement decided before that
         /// Add compare out instead of deleting what the user just recreated.
         var assertionGeneration: UInt64 = 0
+        /// Non-nil rearms restoration; only this capture may authorize a pre-close Unlink.
+        var parkedReference: DomainAgentSessionLinkReference?
+        /// Retained after relink to fence delayed cleanup of a predecessor under the same token.
+        var closedReferences: Set<DomainAgentSessionLinkReference> = []
         #if DEBUG
             /// A waiting entry is re-evaluated on every event, so its "still waiting" diagnostic is
             /// reported once per entry rather than once per pass.
@@ -222,8 +221,7 @@ final class AgentSessionOversightLaunchCoordinator {
     // MARK: State
 
     private weak var delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)?
-    /// Stable pair order, fixed at load. Processing serially in a stable order keeps a pass
-    /// deterministic; roughly ten windows never justify parallel reservation.
+    /// Stable, serial pair order; extended only by exact close capture.
     private var launchPairOrder: [AgentSessionOversightIntent] = []
     private var entries: [AgentSessionOversightIntent: Entry] = [:]
 
@@ -236,9 +234,6 @@ final class AgentSessionOversightLaunchCoordinator {
 
     private var isDirty = false
     private var drainTask: Task<Void, Never>?
-    /// Sessions this launch already asked the host to hydrate. One request per session per launch:
-    /// a load that ends terminal must not be retried in a loop, and the pass re-runs on every event.
-    private var hydrationRequestedSessionIDs: Set<UUID> = []
 
     init(
         delegate: (any AgentSessionOversightLaunchCoordinatorDelegate)? = nil,
@@ -336,6 +331,8 @@ final class AgentSessionOversightLaunchCoordinator {
     ) {
         guard var entry = entries[pair] else { return }
         entry.token = token
+        entry.parkedReference = nil
+        entry.closedReferences.removeAll()
         if let generation { entry.assertionGeneration = generation }
         entry.state = token == nil ? .terminal(.lifecycleRevoked) : .active
         // The interactive path owns this pair from here, so the automatic entry stops carrying an
@@ -366,12 +363,71 @@ final class AgentSessionOversightLaunchCoordinator {
         guard generation.map({ $0 == entry.assertionGeneration }) ?? true else { return }
         entry.token = nil
         entry.reference = nil
+        entry.parkedReference = nil
+        entry.closedReferences.removeAll()
         // An audit that already recorded *why* this entry ended keeps its reason: the revocation it
         // triggered is the consequence, not the diagnosis.
         if case .terminal = entry.state {} else {
             entry.state = .terminal(.lifecycleRevoked)
         }
         entries[pair] = entry
+    }
+
+    /// Capture exact saved ownership synchronously, before close hides either endpoint.
+    func noteWindowClose(
+        pair: AgentSessionOversightIntent,
+        token: AgentSessionOversightIntentToken,
+        assertedAt generation: UInt64,
+        reference: DomainAgentSessionLinkReference
+    ) {
+        guard !isFrozen else { return }
+        var entry = entries[pair] ?? Entry(pair: pair, token: token)
+        guard entry.token == token, entry.assertionGeneration <= generation else { return }
+        if case .cleanupPending = entry.state { return }
+        if entry.assertionGeneration != generation {
+            entry.closedReferences.removeAll()
+        }
+        // Historical cleanup ownership cannot replace the successor's current parked owner.
+        if entry.closedReferences.contains(reference), entry.parkedReference != reference { return }
+        entry.assertionGeneration = generation
+        entry.parkedReference = reference
+        entry.closedReferences.insert(reference)
+        entry.state = .terminal(.lifecycleRevoked)
+        entry.reference = nil
+        entry.observerEndpoint = nil
+        entry.targetEndpoint = nil
+        entries[pair] = entry
+        if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
+        markDirty()
+    }
+
+    func permitsCloseRetirement(
+        _ reference: DomainAgentSessionLinkReference,
+        pair: AgentSessionOversightIntent,
+        token: AgentSessionOversightIntentToken?,
+        assertedAt generation: UInt64?
+    ) -> Bool {
+        entries[pair]?.parkedReference == reference
+            && preservesClosedReference(reference, pair: pair, token: token, assertedAt: generation)
+    }
+
+    func preservesClosedReference(
+        _ reference: DomainAgentSessionLinkReference,
+        pair: AgentSessionOversightIntent,
+        token: AgentSessionOversightIntentToken?,
+        assertedAt generation: UInt64?
+    ) -> Bool {
+        guard let entry = entries[pair] else { return false }
+        return entry.token == token && entry.assertionGeneration == generation
+            && entry.closedReferences.contains(reference)
+    }
+
+    func permitsRemoval(pair: AgentSessionOversightIntent, token: AgentSessionOversightIntentToken) -> Bool {
+        guard let entry = entries[pair], entry.token == token, entry.parkedReference == nil else { return false }
+        switch entry.state {
+        case .terminal, .cleanupPending: return true
+        default: return false
+        }
     }
 
     /// A window, tab, workspace, or binding teardown covering these sessions.
@@ -397,7 +453,10 @@ final class AgentSessionOversightLaunchCoordinator {
         assertedAt generation: UInt64?
     ) {
         var entry = entries[pair] ?? Entry(pair: pair, token: token)
+        guard generation.map({ $0 >= entry.assertionGeneration }) ?? true else { return }
         entry.token = token
+        entry.parkedReference = nil
+        entry.closedReferences.removeAll()
         if let generation { entry.assertionGeneration = generation }
         entry.state = .cleanupPending(token)
         entries[pair] = entry
@@ -440,6 +499,8 @@ final class AgentSessionOversightLaunchCoordinator {
             case .applied, .unchanged, .absent:
                 entry.state = .terminal(.lifecycleRevoked)
                 entry.token = nil
+                entry.parkedReference = nil
+                entry.closedReferences.removeAll()
                 entries[pair] = entry
             case .tokenMismatch:
                 // A newer same-token assertion compared this retry out. Its interactive notification
@@ -448,6 +509,8 @@ final class AgentSessionOversightLaunchCoordinator {
                 guard receipt.assertionGeneration == assertion else { continue }
                 entry.state = .terminal(.lifecycleRevoked)
                 entry.token = nil
+                entry.parkedReference = nil
+                entry.closedReferences.removeAll()
                 entries[pair] = entry
             case .writeFailed, .blocked:
                 continue
@@ -533,13 +596,9 @@ final class AgentSessionOversightLaunchCoordinator {
         entries.values.count { $0.didStartReservation }
     }
 
-    var requestedHydrationSessionIDs: Set<UUID> {
-        hydrationRequestedSessionIDs
-    }
-
     // MARK: Pass
 
-    /// One reconciliation pass over the fixed worklist.
+    /// One reconciliation pass over the launch-loaded and close-captured worklist.
     ///
     /// Barriers first, and all of them: a ready store, a host, a non-pending outer topology, and a
     /// *complete current* discovery level for every registered window. Reserving before any of these
@@ -589,19 +648,40 @@ final class AgentSessionOversightLaunchCoordinator {
         )
 
         for pair in launchPairOrder {
-            guard !isFrozen else { return }
-            guard let entry = entries[pair] else { continue }
+            guard !isFrozen, !isDirty else { return }
+            guard var entry = entries[pair] else { continue }
+            if entry.parkedReference != nil {
+                let sessions = [pair.observerSessionID, pair.targetSessionID]
+                guard sessions.allSatisfy({ sessionID in
+                    (descriptorCounts[sessionID] ?? 0) == 1
+                        && (candidatesBySession[sessionID] ?? []).count == 1
+                        && candidatesBySession[sessionID]?.first?.isClosing == false
+                        && !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: sessionID)
+                }) else { continue }
+                // Classify without consuming parking: a present candidate may still be hydrating.
+                entry.state = .waiting
+            }
             switch entry.state {
             case .waiting:
-                switch classify(
+                let disposition = classify(
                     pair: pair,
                     descriptorCounts: descriptorCounts,
                     candidatesBySession: candidatesBySession
-                ) {
-                case .wait:
+                )
+                if case .wait = disposition {
                     #if DEBUG
                         logWaitingOnce(pair: pair)
                     #endif
+                    continue
+                }
+                if entry.parkedReference != nil, var current = entries[pair] {
+                    current.parkedReference = nil
+                    current.didStartReservation = false
+                    current.state = .waiting
+                    entries[pair] = current
+                }
+                switch disposition {
+                case .wait:
                     continue
                 case let .terminal(reason):
                     await retire(pair: pair, reason: reason)
@@ -614,8 +694,8 @@ final class AgentSessionOversightLaunchCoordinator {
             case .active:
                 // Restored grants are re-audited on every candidate/topology event. A late duplicate,
                 // a target that became a child or started closing, a permanent observer-policy loss,
-                // and drift of the exact incarnation the grant was issued against all end the entry
-                // — and none of them is ever requeued.
+                // and drift of the exact incarnation the grant was issued against all end the entry.
+                // Only synchronous window-close capture can preserve and rearm exact saved ownership.
                 await auditActiveEntry(
                     pair: pair,
                     descriptorCounts: descriptorCounts,
@@ -630,9 +710,8 @@ final class AgentSessionOversightLaunchCoordinator {
     /// Requests a passive load for every endpoint a waiting entry is blocked on only because its
     /// background tab has not been hydrated yet.
     ///
-    /// Bounded to the saved pairs' own endpoints, requested at most once per session per launch, and
-    /// only after every restore barrier has cleared (this runs inside the gated pass). A session that
-    /// is not described anywhere, is described more than once, or is being deleted is left alone:
+    /// Bounded to saved endpoints after restore barriers clear; the host deduplicates loads.
+    /// Undescribed, ambiguous, or deleted sessions are left alone:
     /// hydration could not make it restorable, and classification decides its fate as before.
     private func requestHydrationForWaitingEntries(
         descriptorCounts: [UUID: Int],
@@ -642,10 +721,9 @@ final class AgentSessionOversightLaunchCoordinator {
         let registry = AgentSessionDeletionRegistry.shared
         var requested: Set<UUID> = []
         for pair in launchPairOrder {
-            guard entries[pair]?.state == .waiting else { continue }
+            guard entries[pair]?.state == .waiting || entries[pair]?.parkedReference != nil else { continue }
             for sessionID in [pair.observerSessionID, pair.targetSessionID] {
-                guard !hydrationRequestedSessionIDs.contains(sessionID),
-                      !registry.isPermanentlyDeleted(sessionID: sessionID),
+                guard !registry.isPermanentlyDeleted(sessionID: sessionID),
                       !registry.isDeletionInProgress(sessionID: sessionID),
                       (descriptorCounts[sessionID] ?? 0) == 1
                 else {
@@ -667,7 +745,6 @@ final class AgentSessionOversightLaunchCoordinator {
             }
         }
         guard !requested.isEmpty else { return }
-        hydrationRequestedSessionIDs.formUnion(requested)
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.hydrationRequested",
@@ -853,14 +930,12 @@ final class AgentSessionOversightLaunchCoordinator {
             // removal that follows is expected-token.
             await delegate.launchCoordinatorRevoke(reference: reference)
         }
-        // The revocation's follow-through already removes this token through the bridge's pre-hop
-        // bookkeeping capture. Anything it left behind is removed here, still expected-token, and the
-        // entry is never requeued either way.
-        guard let settled = entries[pair], settled.token != nil else {
-            reportTerminalSummaryIfNeeded()
-            return
-        }
-        if case .cleanupPending = settled.state { return }
+        // Runtime-only revocation: recheck durable ownership after the authority hop.
+        guard let settled = entries[pair], settled.token != nil,
+              settled.reference == entry.reference, settled.state == .terminal(reason),
+              settled.assertionGeneration == entry.assertionGeneration,
+              settled.closedReferences == entry.closedReferences
+        else { return }
         await retire(pair: pair, reason: reason)
     }
 
@@ -973,6 +1048,8 @@ final class AgentSessionOversightLaunchCoordinator {
             return
         }
         guard let token = entry.token else {
+            entry.parkedReference = nil
+            entry.closedReferences.removeAll()
             entry.state = .terminal(reason)
             entries[pair] = entry
             #if DEBUG
@@ -981,6 +1058,8 @@ final class AgentSessionOversightLaunchCoordinator {
             reportTerminalSummaryIfNeeded()
             return
         }
+        entry.state = .terminal(reason)
+        entries[pair] = entry
         let assertion = entry.assertionGeneration
         let receipt = await delegate.launchCoordinatorRemoveIntent(
             pair: pair,
@@ -991,12 +1070,17 @@ final class AgentSessionOversightLaunchCoordinator {
         // An explicit Add that landed while this removal was in flight reasserted the pair under the
         // same durable token. The store compared this retirement out; recording it as terminal would
         // still strand a live interactive link behind a finished entry.
-        guard settled.assertionGeneration == assertion else { return }
+        guard settled.assertionGeneration == assertion, settled.token == token,
+              settled.state == entry.state, settled.closedReferences == entry.closedReferences,
+              settled.parkedReference == nil
+        else { return }
         switch receipt.outcome {
         case .applied, .unchanged, .absent:
             settled.state = .terminal(reason)
             settled.token = nil
             settled.reference = nil
+            settled.parkedReference = nil
+            settled.closedReferences.removeAll()
             entries[pair] = settled
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
@@ -1009,6 +1093,8 @@ final class AgentSessionOversightLaunchCoordinator {
             settled.state = .terminal(reason)
             settled.token = nil
             settled.reference = nil
+            settled.parkedReference = nil
+            settled.closedReferences.removeAll()
             entries[pair] = settled
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
