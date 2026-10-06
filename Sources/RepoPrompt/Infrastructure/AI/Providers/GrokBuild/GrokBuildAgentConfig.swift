@@ -14,7 +14,7 @@ struct GrokBuildAgentConfig {
     let modelString: String?
     let includeRepoPromptMCPServer: Bool
     /// Provider-native full-access intent; when true the provider launches
-    /// `grok agent --always-approve stdio`. Interactive runs may also carry the
+    /// `grok agent --always-approve --no-leader stdio`. Interactive runs may also carry the
     /// intent via `ACPRunRequest.autoApproveAllToolPermissions`; the provider ORs both.
     let alwaysApproveTools: Bool
     /// Grok (xAI) API key resolved asynchronously at provider-construction time from
