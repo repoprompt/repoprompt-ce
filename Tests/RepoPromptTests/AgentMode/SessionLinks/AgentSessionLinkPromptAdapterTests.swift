@@ -1858,6 +1858,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
             let connectionID = UUID()
             let manager = ServerNetworkManager.shared
+            let transportBaseline = await manager.debugTransportState()
+            // Direct admission starts the shared manager even without a listener. Removing
+            // only the connection leaves that owner active for later routed-runtime tests.
+            // Register first so the gate/connection teardown below runs before restoration.
+            addTeardownBlock {
+                if !transportBaseline.isRunning { await manager.stop() }
+                await manager.setEnabled(transportBaseline.isEnabled)
+                let restored = await manager.debugTransportState()
+                XCTAssertEqual(restored, transportBaseline, "Fixture must restore its shared transport ownership")
+            }
             let removalGate = CatalogAuthorityGate()
             await manager.debugInstallDirectAdmissionConnectionForTesting(
                 connectionID: connectionID,

@@ -1,5 +1,5 @@
 import Combine
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
@@ -257,6 +257,137 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             [AgentModelCatalog.TaskLabelKind.explore.rawValue: globalOverride]
         )
         XCTAssertNil(fixture.store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides)
+    }
+
+    func testRoleDefaultsRecommendationUsesActualAvailabilityAndFilteredRecommendations() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let registry = AgentACPModelRegistry.shared
+        let providers: [ACPProviderID] = [.grokBuild, .openCode]
+        for provider in providers {
+            registry.test_reset(providerID: provider)
+        }
+        defer {
+            for provider in providers {
+                registry.test_reset(providerID: provider)
+            }
+        }
+        let grokModel = AgentModelOption(
+            rawValue: "test-grok-pinned", displayName: "Pinned Grok", description: nil, isDefault: false
+        )
+        let openCodeModel = AgentModelOption(
+            rawValue: "test-opencode-pinned", displayName: "Pinned OpenCode", description: nil, isDefault: false
+        )
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            .init(options: [grokModel], currentModelRaw: grokModel.rawValue), for: .grokBuild
+        ))
+        XCTAssertTrue(registry.updateDiscoveredModels(
+            .init(options: [openCodeModel], currentModelRaw: openCodeModel.rawValue), for: .openCode
+        ))
+        let scenarios: [(
+            name: String, grokReady: Bool, codexReady: Bool, enabled: Set<RecommendationProviderKind>,
+            agent: AgentProviderKind, model: String, preservesPin: Bool, satisfied: Bool
+        )] = [
+            ("available Grok pin", true, true, [.codex, .grokBuild], .grokBuild, grokModel.rawValue, true, false),
+            ("Grok excluded from recommendations", true, true, [.codex], .grokBuild, grokModel.rawValue, true, false),
+            ("disconnected Grok pin", false, true, [.codex, .grokBuild], .grokBuild, grokModel.rawValue, false, true),
+            ("Grok-only ready CLI", true, false, [.grokBuild], .grokBuild, AgentModel.defaultModel.rawValue, true, true),
+            ("OpenCode stays excluded", false, true, [.codex], .openCode, openCodeModel.rawValue, false, true)
+        ]
+        for scenario in scenarios {
+            let fixture = try makeFixture()
+            defer { fixture.apiSettings.prepareForWindowClose() }
+            fixture.apiSettings.isClaudeCodeConnected = false
+            fixture.apiSettings.isCodexConnected = scenario.codexReady
+            fixture.apiSettings.isCursorConnected = false
+            fixture.apiSettings.isGrokBuildConnected = scenario.grokReady
+            fixture.apiSettings.isOpenCodeConnected = scenario.agent == .openCode
+            var verified: Set<AgentProviderKind> = []
+            if scenario.codexReady { verified.insert(.codexExec) }
+            if scenario.grokReady { verified.insert(.grokBuild) }
+            fixture.apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: verified)
+            let workspaceID = UUID()
+            let pin = AgentModelSelectionID(agentRaw: scenario.agent.rawValue, modelRaw: scenario.model).rawValue
+            fixture.store.setWorkspaceAgentModelsProfile(
+                workspaceID: workspaceID,
+                profile: AgentModelsSettingsProfile(mcpAgentRoleOverrides: ["pair": pin])
+            )
+
+            let result = fixture.engine.computeRecommendations(
+                for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID)),
+                enabledProviders: scenario.enabled
+            )
+            guard let recommendation = result.mcpAgentDefaults else {
+                XCTFail("\(scenario.name): ready providers must keep all role rows")
+                continue
+            }
+            XCTAssertEqual(
+                Set(recommendation.currentRoleDefaults.map(\.role)), Set(AgentModelCatalog.TaskLabelKind.allCases), scenario.name
+            )
+            let current = try XCTUnwrap(recommendation.currentRoleDefaults.first { $0.role == .pair }, scenario.name)
+            let recommended = try XCTUnwrap(recommendation.recommendedRoleDefaults.first { $0.role == .pair }, scenario.name)
+            XCTAssertEqual(
+                current.selectionIDRaw, scenario.preservesPin ? pin : recommended.selectionIDRaw,
+                "\(scenario.name): current must reflect the available pin, not the recommendation filter"
+            )
+            XCTAssertEqual(recommendation.alreadySatisfied, scenario.satisfied, "\(scenario.name): satisfaction must compare the actual current selection")
+            if scenario.codexReady {
+                XCTAssertEqual(recommended.agent, .codexExec, "\(scenario.name): preserve recommendation eligibility and ordering")
+            }
+        }
+    }
+
+    func testRuntimeOwnedRolePinsUseRecommendationAvailability() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let registry = AgentACPModelRegistry.shared
+        let providers: [(id: ACPProviderID, agent: AgentProviderKind)] = [
+            (.antigravity, .antigravity), (.devin, .devin)
+        ]
+        for provider in providers {
+            registry.test_reset(providerID: provider.id)
+        }
+        defer {
+            for provider in providers {
+                registry.test_reset(providerID: provider.id)
+            }
+        }
+        let fixture = try makeFixture()
+        defer { fixture.apiSettings.prepareForWindowClose() }
+        let status = ProviderStatusSnapshot(
+            claudeCodeCLI: .notConfigured, codexCLI: .ready, cursorCLI: .notConfigured,
+            grokBuildCLI: .notConfigured, openAI: .notConfigured
+        )
+        for provider in providers {
+            let model = AgentModelOption(
+                rawValue: "test-\(provider.agent.rawValue)-pinned", displayName: "Pinned model", description: nil, isDefault: false
+            )
+            XCTAssertTrue(registry.updateDiscoveredModels(
+                .init(options: [model], currentModelRaw: model.rawValue), for: provider.id
+            ))
+            let pin = AgentModelSelectionID(agentRaw: provider.agent.rawValue, modelRaw: model.rawValue).rawValue
+            for available in [true, false] {
+                let name = "\(provider.agent.rawValue) available=\(available)"
+                let context = fixture.engine.mcpAgentAvailabilityContext(
+                    from: status,
+                    runtimeAvailability: AgentModelCatalog.AvailabilityContext(
+                        antigravityAvailable: provider.agent == .antigravity && available,
+                        devinAvailable: provider.agent == .devin && available
+                    )
+                )
+                let resolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+                    for: .pair,
+                    availability: context,
+                    settingsStore: AgentModelsProfileRoleDefaultsStore(overrides: ["pair": pin])
+                ), name)
+                XCTAssertEqual(
+                    resolution.selectionID.rawValue,
+                    available ? pin : AgentModelSelectionID(
+                        agentRaw: resolution.recommended.agent.rawValue, modelRaw: resolution.recommended.modelRaw
+                    ).rawValue,
+                    "\(name): recommendation inputs must preserve an executable current pin"
+                )
+                XCTAssertEqual(resolution.overrideUnavailable, !available, "\(name): unavailable pins must remain flagged")
+            }
+        }
     }
 
     func testContextBuilderRecommendationWriteIntentDistinguishesAutomaticSeedFromExplicitApply() throws {

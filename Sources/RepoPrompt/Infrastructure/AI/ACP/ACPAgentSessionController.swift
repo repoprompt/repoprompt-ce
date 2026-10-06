@@ -292,6 +292,17 @@ actor ACPAgentSessionController {
         }
     }
 
+    /// Provider-owned execution readiness, independent of the app's published run state.
+    var hasExecutionInFlight: Bool {
+        if activePromptTurnID != nil { return true }
+        switch state {
+        case .launching, .initialized, .openingSession, .promptRunning, .closing:
+            return true
+        case .idle, .sessionOpen, .failed, .closed:
+            return false
+        }
+    }
+
     private var process: SpawnedProcess?
     private var stdoutChannel: FileHandleChunkChannel?
     private var stderrChannel: FileHandleChunkChannel?

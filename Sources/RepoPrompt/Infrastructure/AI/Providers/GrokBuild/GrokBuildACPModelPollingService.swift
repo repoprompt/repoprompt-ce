@@ -28,7 +28,8 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
                     modelString: config.modelString,
                     includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
                     alwaysApproveTools: config.alwaysApproveTools,
-                    apiKey: KeyManager().getAPIKey(for: .grok)
+                    apiKey: KeyManager().getAPIKey(for: .grok),
+                    backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
                 )
             )
         },
@@ -54,7 +55,8 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         // Polling every 300s must not spawn tool servers for nothing.
         let config = GrokBuildAgentConfig(
             enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            includeRepoPromptMCPServer: false
+            includeRepoPromptMCPServer: false,
+            backgroundFeatureEnvironment: GrokBuildAgentConfig.managedBackgroundFeatureEnvironment
         )
         guard let provider = try await providerFactory(config) else { return nil }
         let support = try await provider.support(for: request)

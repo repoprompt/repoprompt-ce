@@ -811,6 +811,42 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(nestedMatch.source, .nestedToolName)
         XCTAssertEqual(nestedMatch.normalizedToolName, "read_file")
 
+        for (tool, operation) in [
+            ("agent_session_link", "list"),
+            ("self_compact", "context"),
+            ("manage_worktree", "list")
+        ] {
+            let toolUseID = "toolu_\(tool)"
+            let payload: [String: Any] = [
+                "tool_name": tool,
+                "tool_use_id": toolUseID,
+                "input": ["op": operation]
+            ]
+            let match = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+                toolName: tool,
+                requestPayload: payload
+            )
+            XCTAssertEqual(match?.source, .topLevelToolName, tool)
+            XCTAssertEqual(match?.normalizedToolName, tool, tool)
+
+            let response = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
+                pendingRequest: payload,
+                includeUpdatedPermissions: false
+            )
+            XCTAssertEqual(response["behavior"] as? String, "allow", tool)
+            XCTAssertEqual(response["toolUseID"] as? String, toolUseID, tool)
+            XCTAssertEqual((response["updatedInput"] as? [String: Any])?["op"] as? String, operation, tool)
+            XCTAssertNil(response["updatedPermissions"], tool)
+        }
+
+        let metadataMatch = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+            toolName: "",
+            requestPayload: ["server_name": "RepoPromptCE"]
+        )
+        XCTAssertEqual(metadataMatch?.source, .serverIdentifier)
+        XCTAssertEqual(metadataMatch?.serverIdentifier, "RepoPromptCE")
+        XCTAssertNil(metadataMatch?.normalizedToolName)
+
         XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
             toolName: "Bash",
             requestPayload: ["input": ["command": "rm -rf /tmp/example"]]

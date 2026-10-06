@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -49,6 +50,48 @@ final class GrokBuildPermissionAndIdentityTests: XCTestCase {
                 tool
             )
             XCTAssertFalse(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix("RepoPromptCEGrokRuntimeOther__\(tool)"))
+        }
+    }
+
+    func testPublicCatalogToolsHaveCanonicalRecognition() {
+        var prefixes: [(value: String, explicit: Bool)] = [
+            ("", false),
+            ("functions.functions.", false)
+        ]
+        for server in [
+            RepoPromptMCPServerConfiguration.defaultServerName,
+            RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName
+        ] {
+            prefixes += [
+                ("mcp__\(server)__", true),
+                ("mcp_\(server)__", true),
+                ("\(server)__", true),
+                ("\(server)_", true),
+                ("functions.functions.mcp__\(server)__", true)
+            ]
+        }
+
+        // The public catalog is the oracle: new tools must not silently lose their identity.
+        for tool in MCPDomainToolCatalog.orderedToolNames + ["ask_user_question"] {
+            let canonical = tool == "ask_user_question" ? "ask_user" : tool
+            for prefix in prefixes {
+                let name = prefix.value + tool
+                XCTAssertEqual(MCPIntegrationHelper.canonicalRepoPromptToolName(name), canonical, name)
+                XCTAssertEqual(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(name), prefix.explicit, name)
+            }
+        }
+
+        for name in [
+            "agent_self",
+            "mcp__RepoPromptCE__agent_self",
+            "functions.functions.RepoPromptCEGrokRuntime__agent_self",
+            "not_a_public_tool",
+            "RepoPromptCE__not_a_public_tool",
+            "mcp__OtherServer__manage_worktree",
+            "RepoPromptCEGrokRuntimeOther__self_compact"
+        ] {
+            XCTAssertNil(MCPIntegrationHelper.canonicalRepoPromptToolName(name), name)
+            XCTAssertFalse(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(name), name)
         }
     }
 

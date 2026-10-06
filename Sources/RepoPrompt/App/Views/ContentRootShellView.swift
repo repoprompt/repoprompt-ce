@@ -10,10 +10,24 @@ struct ContentRootShellView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var lastAgentNavigationHUDCommand: (mode: AgentNavigationHUDMode, at: Date)?
 
+    /// A workspace approval is only this window's business when it targets this
+    /// window (or targets none). The manager is a process-wide singleton, so every
+    /// consumer of its pending request must apply this same scope.
+    private var presentedWorkspaceApprovalRequest: WorkspaceApprovalRequest? {
+        guard let request = workspaceApprovalManager.pendingRequest,
+              workspaceApprovalManager.isApprovalOverlayVisible,
+              WorkspaceApprovalPresentationPolicy.shouldPresent(
+                  targetWindowID: workspaceApprovalManager.presentedTargetWindowID,
+                  inWindowID: viewModel.state.windowID
+              )
+        else { return nil }
+        return request
+    }
+
     private var isBlockingOverlayVisible: Bool {
         showWorkspaceSwitchOverlay
             || (viewModel.state.mcpServer.pendingClientID != nil && viewModel.state.mcpServer.isApprovalOverlayVisible)
-            || (workspaceApprovalManager.pendingRequest != nil && workspaceApprovalManager.isApprovalOverlayVisible)
+            || presentedWorkspaceApprovalRequest != nil
     }
 
     var body: some View {
@@ -56,13 +70,13 @@ struct ContentRootShellView: View {
             }
 
             // Workspace Operation Approval Overlay
-            if let request = workspaceApprovalManager.pendingRequest,
-               workspaceApprovalManager.isApprovalOverlayVisible
-            {
+            if let request = presentedWorkspaceApprovalRequest {
                 WorkspaceApprovalOverlayView(
                     approvalManager: workspaceApprovalManager,
-                    request: request
+                    request: request,
+                    respondingWindowID: viewModel.state.windowID
                 )
+                .id(request.id)
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
             }

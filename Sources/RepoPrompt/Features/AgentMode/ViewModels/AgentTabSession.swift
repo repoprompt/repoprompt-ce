@@ -53,6 +53,7 @@ final class AgentTabSession: ObservableObject {
     var onRunStateChanged: ((AgentTabSession) -> Void)?
     #if DEBUG
         private(set) var test_incrementalRetentionCompactionCount = 0
+        private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
     #endif
 
     /// Run state
@@ -1932,16 +1933,22 @@ final class AgentTabSession: ObservableObject {
         case notify(AgentModeViewModel.SourceItemsMutation)
     }
 
+    private enum SourceItemPayloadUpdate {
+        case rebuildFromSource
+        case preserveForRetentionCompaction
+    }
+
     private func commitSourceItems(
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
+        payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
         diagnosticContext: String
     ) {
         let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         suppressSourceItemsChanged = true
         items = repairedItems
         suppressSourceItemsChanged = false
-        rebuildSourceItemDerivedState()
+        rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -1992,17 +1999,25 @@ final class AgentTabSession: ObservableObject {
         return true
     }
 
-    private func rebuildSourceItemDerivedState() {
+    private func rebuildSourceItemDerivedState(payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource) {
         repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
         syncNextSequenceIndexFromItems()
         liveItemIDs = Set(items.map(\.id))
-        replaceEphemeralToolResultPayloadMap(
-            AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
-                from: items,
-                diagnosticContext: "tab_session tab_id=\(tabID.uuidString) rebuildSourceItemDerivedState"
-            ),
-            liveItemIDs: liveItemIDs
-        )
+        switch payloadUpdate {
+        case .rebuildFromSource:
+            #if DEBUG
+                test_fullRetentionPayloadMapScannedItemCount += items.count
+            #endif
+            replaceEphemeralToolResultPayloadMap(
+                AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
+                    from: items,
+                    diagnosticContext: "tab_session tab_id=\(tabID.uuidString) rebuildSourceItemDerivedState"
+                ),
+                liveItemIDs: liveItemIDs
+            )
+        case .preserveForRetentionCompaction:
+            replaceEphemeralToolResultPayloadMap(ephemeralToolResultPayloadByItemID, liveItemIDs: liveItemIDs)
+        }
         rebuildToolCorrelationIndexes()
         assertSourceItemDerivedStateIsConsistent()
     }
@@ -2271,6 +2286,21 @@ final class AgentTabSession: ObservableObject {
     }
 
     func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
+        setItemsSilently(items, reason: reason, payloadUpdate: .rebuildFromSource)
+    }
+
+    /// Reconcile compacted source items without re-inspecting payloads that the session already owns.
+    /// Unlike hydration or ordinary replacement, surviving payloads and their revisions stay intact.
+    /// Pruning uses repaired live IDs; a rekeyed duplicate never inherits another item's raw payload.
+    func setItemsSilentlyForRetentionCompaction(_ items: [AgentChatItem]) {
+        setItemsSilently(items, reason: .retentionCompaction, payloadUpdate: .preserveForRetentionCompaction)
+    }
+
+    private func setItemsSilently(
+        _ items: [AgentChatItem],
+        reason: SilentItemReplacementReason,
+        payloadUpdate: SourceItemPayloadUpdate
+    ) {
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.emitSessionItemsReplacement(.init(
@@ -2286,6 +2316,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             items,
             dispatch: .silent,
+            payloadUpdate: payloadUpdate,
             diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
         )
         pendingSourceItemsMutationSummary = nil
