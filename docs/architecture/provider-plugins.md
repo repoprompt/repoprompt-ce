@@ -246,6 +246,12 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 - `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty, so Context Builder and one-shot (Oracle/Chat) callers retain their existing native background-feature behavior. No user configuration or global environment is changed.
 - The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
 
+#### Grok cancellation boundaries
+
+- **Turn cancellation:** stopping or steering an active ACP turn sends a bare `session/cancel` with only `sessionId`. [Grok's cancellation handler](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs) cancels every non-workflow subagent in that session, including earlier turns' background children, and kills running foreground commands. These effects are source-verified at Grok 1.0.45, not limited to the current turn.
+- **Idle `stop_session`:** MCP `agent_manage.stop_session` cancels only an active RPCE run. For an idle session it returns `stop_requested: false`, sends no `session/cancel` and leaves the controller alive; it is not background-work cleanup.
+- **Controller teardown:** `ACPAgentSessionController.shutdown()` calls `cancelPrompt()` whenever a session ID exists, including when idle. It attempts the same bare cancellation before closing stdio and terminating the provider process, so a received cancel has the subagent and foreground-command effects above. Teardown is distinct from an idle `stop_session`; the launch policy does not change either path.
+
 ## How a new provider plugs in
 
 The recommended pattern when adding (for example) a hypothetical `acmeAgent` family:
