@@ -4885,7 +4885,7 @@ final class CodexNativeSessionController {
         }
     }
 
-    private static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
+    static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
         MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
             requestToolName: nil,
             requestPayload: params

@@ -802,14 +802,13 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         )
         XCTAssertEqual((allowForSession["updatedPermissions"] as? [[String: Any]])?.first?["name"] as? String, "mcp__RepoPromptCE__read_file")
 
-        let nestedMatch = try XCTUnwrap(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        // A RepoPrompt permission suggestion must not authorize a different actual invocation.
+        XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
             toolName: "Bash",
             requestPayload: [
                 "permission_suggestions": [["rules": [["toolName": "mcp__RepoPromptCE__read_file"]]]]
             ]
         ))
-        XCTAssertEqual(nestedMatch.source, .nestedToolName)
-        XCTAssertEqual(nestedMatch.normalizedToolName, "read_file")
 
         for (tool, operation) in [
             ("agent_session_link", "list"),
@@ -817,13 +816,18 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             ("manage_worktree", "list")
         ] {
             let toolUseID = "toolu_\(tool)"
+            let qualifiedTool = "mcp__RepoPromptCE__\(tool)"
             let payload: [String: Any] = [
-                "tool_name": tool,
+                "tool_name": qualifiedTool,
                 "tool_use_id": toolUseID,
                 "input": ["op": operation]
             ]
-            let match = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+            XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
                 toolName: tool,
+                requestPayload: ["tool_name": tool, "input": ["op": operation]]
+            ), "bare top-level name without provenance: \(tool)")
+            let match = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+                toolName: qualifiedTool,
                 requestPayload: payload
             )
             XCTAssertEqual(match?.source, .topLevelToolName, tool)
@@ -851,5 +855,154 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             toolName: "Bash",
             requestPayload: ["input": ["command": "rm -rf /tmp/example"]]
         ))
+    }
+
+    /// Issue #1243: a bare RepoPrompt tool name in request metadata must not auto-approve a
+    /// request that another MCP server owns. Codex elicitation/permission auto-accept uses the
+    /// same matcher with `requestToolName: nil`, so a nil match means Codex does not auto-accept.
+    func testRepoPromptPermissionAutoApprovalRequiresRepoPromptProvenance() {
+        let toolNames = MCPDomainToolCatalog.orderedToolNames
+        XCTAssertTrue(toolNames.contains("manage_worktree"))
+        XCTAssertTrue(toolNames.contains("agent_session_link"))
+        XCTAssertTrue(toolNames.contains("self_compact"))
+
+        for tool in toolNames {
+            let foreignPayloads: [[String: Any]] = [
+                ["serverName": "OtherServer", "request": ["_meta": ["tool_title": tool]]],
+                ["server_name": "OtherServer", "name": tool],
+                ["request": ["_meta": ["connector_name": "OtherServer", "tool_title": tool]]],
+                ["serverName": "OtherServer", "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__\(tool)"]]],
+                ["serverName": "OtherServer", "tool_name": tool]
+            ]
+            for payload in foreignPayloads {
+                XCTAssertNil(
+                    MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: payload),
+                    "foreign server payload must not match: \(tool) \(payload)"
+                )
+                XCTAssertNil(
+                    MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: tool, requestPayload: payload),
+                    "foreign server payload must not match with top-level name: \(tool)"
+                )
+            }
+
+            // Bare nested names without any server provenance do not auto-approve.
+            XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_title": tool]]]
+            ), tool)
+            // Free-text descriptions are not tool-name candidates.
+            XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_description": "mcp__RepoPromptCE__\(tool)"]]]
+            ), tool)
+
+            // Positive controls: RepoPrompt server identifier or a server-prefixed name.
+            let serverMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["serverName": "RepoPromptCE", "request": ["_meta": ["tool_title": tool]]]
+            )
+            XCTAssertEqual(serverMatch?.source, .nestedToolName, tool)
+            XCTAssertEqual(serverMatch?.normalizedToolName, tool, tool)
+
+            let connectorMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["connector_name": "RepoPromptCE", "tool_title": tool]]]
+            )
+            XCTAssertEqual(connectorMatch?.normalizedToolName, tool, tool)
+
+            let prefixedMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["request": ["_meta": ["tool_title": "mcp__RepoPromptCE__\(tool)"]]]
+            )
+            XCTAssertEqual(prefixedMatch?.source, .nestedToolName, tool)
+
+            let grokMatch = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                requestToolName: nil,
+                requestPayload: ["serverName": "RepoPromptCEGrokRuntime", "name": tool]
+            )
+            XCTAssertNotNil(grokMatch, tool)
+
+            // Look-alike server names that merely contain the RepoPrompt server name are foreign.
+            for lookAlike in ["NotRepoPromptCE", "RepoPromptCE-evil", "evil.repopromptce", "RepoPromptCEX"] {
+                XCTAssertNil(MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                    requestToolName: nil,
+                    requestPayload: ["serverName": lookAlike, "request": ["_meta": ["tool_title": tool]]]
+                ), "\(lookAlike) \(tool)")
+            }
+        }
+
+        XCTAssertTrue(MCPIntegrationHelper.isRepoPromptServerIdentifier(" repopromptce "))
+        XCTAssertTrue(MCPIntegrationHelper.isRepoPromptServerIdentifier("RepoPromptCEGrokRuntime"))
+        XCTAssertFalse(MCPIntegrationHelper.isRepoPromptServerIdentifier("NotRepoPromptCE"))
+        XCTAssertFalse(MCPIntegrationHelper.isRepoPromptServerIdentifier("RepoPromptCE MCP Server"))
+    }
+
+    /// Issue #1243 review follow-ups: display labels, permission suggestions, foreign qualified
+    /// actual tool names, and server-field aliases must not grant RepoPrompt provenance.
+    func testRepoPromptPermissionAutoApprovalRejectsLabelAndSuggestionProvenance() {
+        func match(_ toolName: String?, _ payload: [String: Any]) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
+            MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: toolName, requestPayload: payload)
+        }
+
+        // Unanchored / look-alike labels.
+        for title in [
+            "RepoPromptCE-evil: git",
+            "RepoPromptCE anything: manage_worktree",
+            "Other RepoPromptCE MCP Server: git",
+            "Unrelated operation (RepoPromptCE MCP Server)",
+            "printf '(RepoPromptCE MCP Server)'"
+        ] {
+            XCTAssertNil(match(title, ["toolCall": ["title": title, "kind": "execute"], "title": title]), title)
+        }
+
+        // Anchored labels naming a catalog tool still match.
+        XCTAssertEqual(match("read_file (RepoPromptCE MCP Server)", [:])?.normalizedToolName, "read_file")
+        XCTAssertEqual(match("RepoPromptCE: git", [:])?.normalizedToolName, "git")
+        XCTAssertEqual(match("RepoPromptCE MCP Server: git", [:])?.normalizedToolName, "git")
+
+        // Foreign qualified actual tool cannot borrow a RepoPrompt suggestion or nested name.
+        XCTAssertNil(match("mcp__OtherServer__delete_files", [
+            "tool_name": "mcp__OtherServer__delete_files",
+            "permission_suggestions": [["rules": [["toolName": "mcp__RepoPromptCE__git"]]]]
+        ]))
+        XCTAssertNil(match("mcp__OtherServer__delete_files", [
+            "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]
+        ]))
+        XCTAssertNil(match(nil, [
+            "name": "mcp__OtherServer__git",
+            "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]
+        ]))
+
+        // Server-field aliases recognized by the Codex parser also veto.
+        for key in ["mcpServerName", "mcp_server_name"] {
+            XCTAssertNil(match(nil, [key: "OtherServer", "request": ["_meta": ["tool_title": "mcp__RepoPromptCE__git"]]]), key)
+            XCTAssertNil(match(nil, ["request": [key: "OtherServer", "_meta": ["tool_title": "mcp__RepoPromptCE__git"]]]), key)
+            XCTAssertNotNil(match(nil, [key: "RepoPromptCE", "request": ["_meta": ["tool_title": "git"]]]), key)
+        }
+    }
+
+    func testCodexMCPElicitationAutoAcceptRequiresRepoPromptProvenance() {
+        // Reported shape and flattened upstream shape from a foreign server.
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "OtherServer",
+            "request": ["_meta": ["tool_title": "manage_worktree"]]
+        ]))
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "OtherServer",
+            "_meta": ["tool_title": "git"],
+            "message": "Allow git?"
+        ]))
+        XCTAssertFalse(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "request": ["_meta": ["tool_title": "git"]]
+        ]))
+        // Genuine RepoPrompt elicitation still auto-accepts.
+        XCTAssertTrue(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "RepoPromptCE",
+            "request": ["_meta": ["tool_title": "manage_worktree"]]
+        ]))
+        XCTAssertTrue(CodexNativeSessionController.isRepoPromptMCPElicitationRequest(params: [
+            "serverName": "RepoPromptCE",
+            "message": "Approve?"
+        ]))
     }
 }

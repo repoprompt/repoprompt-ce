@@ -223,15 +223,42 @@ enum MCPIntegrationHelper {
         guard let rawValue else { return false }
         let lowered = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer || lowered.contains(repoPromptServer)
+        // Exact match only: a substring check would let look-alike servers such as
+        // `NotRepoPromptCE` borrow RepoPrompt provenance for auto-approval.
+        return repoPromptServerIdentifiers.contains(lowered)
     }
+
+    private static let repoPromptServerIdentifiers: Set<String> = [
+        repoPromptMCPServerName.lowercased(),
+        RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName.lowercased()
+    ]
 
     static func repoPromptPermissionAutoApprovalMatch(
         requestToolName: String?,
         requestPayload: [String: Any]
     ) -> RepoPromptPermissionAutoApprovalMatch? {
-        if let requestToolName, isRepoPromptToolName(requestToolName) {
+        // Catalog membership identifies RepoPrompt tools but is not permission authority on its
+        // own: fail closed whenever the payload attributes the request to a different MCP server,
+        // even if a bare tool name also happens to match a RepoPrompt tool.
+        let serverCandidates = permissionRequestServerCandidates(input: requestPayload)
+        if serverCandidates.contains(where: { !isRepoPromptServerIdentifier($0) }) {
+            return nil
+        }
+        // The same applies to a tool name qualified with another server (`mcp__OtherServer__x`),
+        // whether it is the actual invocation or nested request metadata.
+        let toolNameCandidates = permissionRequestToolNameCandidates(input: requestPayload)
+        if ([requestToolName].compactMap(\.self) + toolNameCandidates).contains(where: isForeignServerQualifiedToolName) {
+            return nil
+        }
+
+        // Bare names (top-level or nested) only auto-approve when the payload also carries
+        // RepoPrompt provenance (an exact RepoPrompt server identifier). Server-prefixed names
+        // carry their own provenance.
+        let hasRepoPromptServerProvenance = serverCandidates.contains { isRepoPromptServerIdentifier($0) }
+
+        if let requestToolName, isRepoPromptToolName(requestToolName),
+           hasRepoPromptServerProvenance || isRepoPromptToolNameWithServerPrefix(requestToolName)
+        {
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .topLevelToolName,
                 normalizedToolName: normalizedRepoPromptToolName(requestToolName),
@@ -249,8 +276,10 @@ enum MCPIntegrationHelper {
             }
         }
 
-        for toolName in permissionRequestToolNameCandidates(input: requestPayload) {
-            guard isRepoPromptToolName(toolName) else { continue }
+        for toolName in toolNameCandidates {
+            guard isRepoPromptToolName(toolName),
+                  hasRepoPromptServerProvenance || isRepoPromptToolNameWithServerPrefix(toolName)
+            else { continue }
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .nestedToolName,
                 normalizedToolName: normalizedRepoPromptToolName(toolName),
@@ -283,13 +312,31 @@ enum MCPIntegrationHelper {
         }
     }
 
+    /// True when the name is qualified with an MCP server other than RepoPrompt, e.g.
+    /// `mcp__OtherServer__delete_files`.
+    private static func isForeignServerQualifiedToolName(_ rawName: String) -> Bool {
+        guard let lowered = trimmedLowercasedToolName(rawName) else { return false }
+        let name = stripFunctionsPrefix(from: lowered)
+        guard name.hasPrefix("mcp__") else { return false }
+        let remainder = name.dropFirst("mcp__".count)
+        guard let separator = remainder.range(of: "__") else { return false }
+        let server = String(remainder[..<separator.lowerBound])
+        return !server.isEmpty && !isRepoPromptServerIdentifier(server)
+    }
+
+    /// Display labels are host-rendered text, so they only count as provenance in two anchored
+    /// shapes whose tool part is a RepoPrompt catalog tool:
+    /// `<tool> (RepoPromptCE MCP Server)` and `<RepoPrompt server>[ MCP Server]: <tool>`.
     private static func repoPromptPermissionLabelMatch(_ rawLabel: String?) -> RepoPromptPermissionAutoApprovalMatch? {
         guard let label = trimmedPermissionRequestString(rawLabel) else { return nil }
-        let legacyServerLabel = "(\(repoPromptMCPServerName) MCP Server)"
-        if label.localizedCaseInsensitiveContains(legacyServerLabel) {
+        let legacyServerSuffix = "(\(repoPromptMCPServerName) MCP Server)".lowercased()
+        if label.lowercased().hasSuffix(legacyServerSuffix) {
+            let toolLabel = String(label.dropLast(legacyServerSuffix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard canonicalRepoPromptToolName(toolLabel) != nil else { return nil }
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .serverIdentifier,
-                normalizedToolName: nil,
+                normalizedToolName: normalizedRepoPromptToolName(toolLabel),
                 serverIdentifier: repoPromptMCPServerName
             )
         }
@@ -311,13 +358,13 @@ enum MCPIntegrationHelper {
     private static func isRepoPromptPermissionServerLabel(_ rawLabel: String) -> Bool {
         let lowered = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer
-            || lowered.hasPrefix("\(repoPromptServer)-")
-            || lowered.hasPrefix("\(repoPromptServer) ")
-            || lowered.contains("\(repoPromptServer) mcp server")
+        let mcpServerSuffix = " mcp server"
+        let server = lowered.hasSuffix(mcpServerSuffix) ? String(lowered.dropLast(mcpServerSuffix.count)) : lowered
+        return isRepoPromptServerIdentifier(server)
     }
 
+    /// Candidate paths intentionally exclude `rawInput`: those are model-controlled tool arguments,
+    /// never provider-attested invocation identity, so they must not supply provenance.
     private static func permissionRequestLabelCandidates(input: [String: Any]) -> [String] {
         let values = collectPermissionRequestStrings(
             from: input,
@@ -327,17 +374,10 @@ enum MCPIntegrationHelper {
                 ["tool_title"],
                 ["displayName"],
                 ["display_name"],
-                ["rawInput", "title"],
-                ["rawInput", "toolTitle"],
-                ["rawInput", "tool_title"],
                 ["toolCall", "title"],
                 ["toolCall", "name"],
                 ["toolCall", "displayName"],
                 ["toolCall", "display_name"],
-                ["rawInput", "toolCall", "title"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "displayName"],
-                ["rawInput", "toolCall", "display_name"],
                 ["request", "title"],
                 ["request", "toolTitle"],
                 ["request", "tool_title"],
@@ -345,8 +385,7 @@ enum MCPIntegrationHelper {
                 ["request", "toolCall", "name"],
                 ["request", "toolCall", "displayName"],
                 ["request", "toolCall", "display_name"],
-                ["request", "_meta", "tool_title"],
-                ["request", "_meta", "tool_description"]
+                ["request", "_meta", "tool_title"]
             ]
         )
 
@@ -363,11 +402,8 @@ enum MCPIntegrationHelper {
                 ["server"],
                 ["mcp_server"],
                 ["mcpServer"],
-                ["rawInput", "server_name"],
-                ["rawInput", "serverName"],
-                ["rawInput", "server"],
-                ["rawInput", "mcp_server"],
-                ["rawInput", "mcpServer"],
+                ["mcp_server_name"],
+                ["mcpServerName"],
                 ["serverInfo", "name"],
                 ["tool", "server"],
                 ["tool", "server_name"],
@@ -375,12 +411,11 @@ enum MCPIntegrationHelper {
                 ["toolCall", "server"],
                 ["toolCall", "server_name"],
                 ["toolCall", "serverName"],
-                ["rawInput", "toolCall", "server"],
-                ["rawInput", "toolCall", "server_name"],
-                ["rawInput", "toolCall", "serverName"],
                 ["request", "server"],
                 ["request", "server_name"],
                 ["request", "serverName"],
+                ["request", "mcp_server_name"],
+                ["request", "mcpServerName"],
                 ["request", "tool", "server"],
                 ["request", "tool", "server_name"],
                 ["request", "tool", "serverName"],
@@ -393,15 +428,12 @@ enum MCPIntegrationHelper {
     }
 
     private static func permissionRequestToolNameCandidates(input: [String: Any]) -> [String] {
-        var values = collectPermissionRequestStrings(
+        let values = collectPermissionRequestStrings(
             from: input,
             paths: [
                 ["tool_name"],
                 ["toolName"],
                 ["name"],
-                ["rawInput", "tool_name"],
-                ["rawInput", "toolName"],
-                ["rawInput", "name"],
                 ["tool", "tool_name"],
                 ["tool", "toolName"],
                 ["tool", "name"],
@@ -409,13 +441,6 @@ enum MCPIntegrationHelper {
                 ["toolCall", "toolName"],
                 ["toolCall", "name"],
                 ["toolCall", "title"],
-                ["rawInput", "tool", "tool_name"],
-                ["rawInput", "tool", "toolName"],
-                ["rawInput", "tool", "name"],
-                ["rawInput", "toolCall", "tool_name"],
-                ["rawInput", "toolCall", "toolName"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "title"],
                 ["request", "tool_name"],
                 ["request", "toolName"],
                 ["request", "name"],
@@ -426,22 +451,12 @@ enum MCPIntegrationHelper {
                 ["request", "toolCall", "toolName"],
                 ["request", "toolCall", "name"],
                 ["request", "toolCall", "title"],
-                ["request", "_meta", "tool_title"],
-                ["request", "_meta", "tool_description"],
-                ["request", "_meta", "connector_name"]
+                ["request", "_meta", "tool_title"]
             ]
         )
 
-        if let suggestions = input["permission_suggestions"] as? [[String: Any]] {
-            for suggestion in suggestions {
-                guard let rules = suggestion["rules"] as? [[String: Any]] else { continue }
-                for rule in rules {
-                    if let toolName = trimmedPermissionRequestString(rule["toolName"]) {
-                        values.append(toolName)
-                    }
-                }
-            }
-        }
+        // `permission_suggestions` describe proposed permission updates, not the invocation being
+        // approved, so they are intentionally not tool-name candidates.
 
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
