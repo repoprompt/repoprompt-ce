@@ -2201,6 +2201,12 @@ actor ACPAgentSessionController {
         )
         let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
         let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
+        let sessionApprovalScope: AgentApprovalSessionScope? = if provider.providerID == .grokBuild {
+            normalizedPermissionOptionValue(preferredAllowOptionID(for: options, sessionScoped: true)) == "allow-edits-session"
+                ? .editsSession : .oneTime
+        } else {
+            nil
+        }
         let request = AgentApprovalRequest(
             requestID: .acp(id.displayValue),
             method: "session/request_permission",
@@ -2219,6 +2225,7 @@ actor ACPAgentSessionController {
                 options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
                 providerID: provider.providerID
             ) != nil,
+            sessionApprovalScope: sessionApprovalScope,
             details: approvalDetails(
                 toolTitle: toolTitle,
                 toolKind: toolKind,
@@ -3832,6 +3839,8 @@ actor ACPAgentSessionController {
         if let rawInputJSON, !rawInputJSON.isEmpty {
             details.append(AgentApprovalDetail(label: "Input", value: rawInputJSON, isCode: true))
         }
+        // Grok's raw option list does not match the scoped approval actions RPCE offers.
+        guard provider.providerID != .grokBuild else { return details }
         let optionLabels = options.map {
             Self.optionLabel(name: $0.name, optionID: $0.optionID)
         }
@@ -3911,19 +3920,26 @@ actor ACPAgentSessionController {
             }
             return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
         }
+        if provider.providerID == .grokBuild {
+            // Grok's only genuine session grant is the exact edit option. All other
+            // approvals must be genuinely one-time, including ID and kind fallbacks.
+            let scopedOptions = filteredOptions.filter { option in
+                (
+                    sessionScoped
+                        && normalizedPermissionOptionValue(option.optionID) == "allow-edits-session"
+                        && normalizedPermissionOptionValue(option.kind) == "allow_always"
+                )
+                    || ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                        options: [(optionID: option.optionID, kind: option.kind)], providerID: .grokBuild
+                    ) != nil
+            }
+            return optionID(for: scopedOptions, preferences: grokBuildAllowOptionPreferences(sessionScoped: sessionScoped))
+        }
         // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
-        let scopedOptions = sessionScoped || provider.providerID == .grokBuild ? filteredOptions : filteredOptions.filter {
+        let scopedOptions = sessionScoped ? filteredOptions : filteredOptions.filter {
             normalizedPermissionOptionValue($0.kind) != "allow_always"
         }
-        let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
-            genericAllowOptionPreferences(sessionScoped: sessionScoped)
-        case .grokBuild:
-            grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
-        case .devin:
-            []
-        }
-        if let preferred = optionID(for: scopedOptions, preferences: preferences) {
+        if let preferred = optionID(for: scopedOptions, preferences: genericAllowOptionPreferences(sessionScoped: sessionScoped)) {
             return preferred
         }
         return optionID(
@@ -3933,20 +3949,13 @@ actor ACPAgentSessionController {
     }
 
     private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
-        if sessionScoped {
-            return [
-                .optionID("allow-edits-session"),
-                .optionID("always"),
-                .optionID("allow_always"),
-                .kind("allow_always")
-            ]
-        }
-        return [
+        let oneTime: [PermissionOptionPreference] = [
             .optionID("allow-once"),
             .optionID("once"),
             .optionID("allow_once"),
             .kind("allow_once")
         ]
+        return sessionScoped ? [.optionID("allow-edits-session")] + oneTime : oneTime
     }
 
     private func preferredRejectOptionID(for options: [PermissionOption]) -> String? {

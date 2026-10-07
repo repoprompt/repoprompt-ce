@@ -7094,7 +7094,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case "accept":
                 "Allow this action"
             case "accept_for_session":
-                "Allow this action for the rest of the session"
+                approval.sessionApprovalScope == .editsSession
+                    ? "Allow edits for the rest of this session" : "Allow this action for the rest of the session"
             case "accept_with_amendment":
                 "Allow with exec policy amendment (provide amendment field)"
             case "decline":
@@ -7109,8 +7110,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = approval.supportsPlainApprove ? ["accept", "accept_for_session"] : ["accept_for_session"]
-        if approval.kind == .commandExecution {
+        var labels = approval.supportsPlainApprove ? ["accept"] : []
+        if approval.supportsAlwaysAllow {
+            labels.append("accept_for_session")
+        }
+        if approval.kind == .commandExecution, approval.sessionApprovalScope == nil {
             labels.append("accept_with_amendment")
         }
         labels.append("decline")
@@ -11595,10 +11599,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
+                guard approval.supportsAlwaysAllow else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
+                }
                 decision = .acceptForSession
             case "accept_with_amendment", "amend":
-                guard approval.kind == .commandExecution else {
-                    throw MCPError.invalidParams("accept_with_amendment is only supported for command approvals.")
+                guard approval.kind == .commandExecution, approval.sessionApprovalScope == nil else {
+                    throw MCPError.invalidParams(
+                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
                 }
                 let amendment = payload.amendment?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 guard !amendment.isEmpty else {
