@@ -111,6 +111,125 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         )
     }
 
+    func testCandidateIdentityWorkIsLinearAndSidebarReadsValidateOneTab() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        // Exercise the real candidate producer, not a mock host's outer read count. Fixture setup
+        // is outside the measured reads; no candidate/row read may hydrate or change model bindings.
+        for count in [32, 200] {
+            var workspace = try XCTUnwrap(manager.activeWorkspace)
+            workspace.composeTabs = (0 ..< count).map { index in
+                var tab = ComposeTabState(id: UUID(), name: "Chat \(index)")
+                tab.activeAgentSessionID = UUID()
+                return tab
+            }
+            manager.workspaces = [workspace]
+            for tab in workspace.composeTabs {
+                let session = fixture.viewModel.session(for: tab.id)
+                session.selectedAgent = .claudeCode
+                session.hasLoadedPersistedState = true
+            }
+            let modelBefore = manager.workspaces
+            manager.test_lifecycleBindingTabValidationCount = 0
+            let candidates = fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false)
+            XCTAssertEqual(candidates.count, count)
+            XCTAssertEqual(
+                manager.test_lifecycleBindingTabValidationCount,
+                count,
+                "One current-model tab validation per candidate, independent of its array position"
+            )
+            let last = try XCTUnwrap(candidates.last)
+            manager.test_lifecycleBindingTabValidationCount = 0
+            XCTAssertEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ), last.domainEndpoint)
+            XCTAssertFalse(fixture.viewModel.agentSessionLinkIsOverseer(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ))
+            XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(
+                tabID: last.tabID, expectedSessionID: last.sessionID
+            ))
+            XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 3)
+            XCTAssertEqual(manager.workspaces, modelBefore, "Reads must neither rebuild nor mutate bindings")
+        }
+    }
+
+    func testLifecycleIndexPreservesFirstExactMatchAcrossDuplicatesAndNestedEdits() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        let original = try XCTUnwrap(manager.activeWorkspace)
+        let sessionID = fixture.endpoint.sessionID
+        var mismatched = original.composeTabs[0]
+        mismatched.activeAgentSessionID = UUID()
+        var first = WorkspaceModel(name: "First", repoPaths: [], ephemeralFlag: true)
+        first.composeTabs = [mismatched, original.composeTabs[0], original.composeTabs[0]]
+        // Repeated workspace IDs must not inherit model-routing's ambiguous/last-wins semantics.
+        var wrongIncarnation = first
+        wrongIncarnation.composeTabs = [mismatched]
+        manager.workspaces = [wrongIncarnation, first, original]
+
+        func assertMatchesScan(file: StaticString = #filePath, line: UInt = #line) {
+            let expected = manager.workspaces.first { workspace in
+                workspace.composeTabs.contains { $0.id == fixture.tabID && $0.activeAgentSessionID == sessionID }
+            }?.id
+            XCTAssertEqual(fixture.viewModel.agentSessionLifecycleIdentity(
+                tabID: fixture.tabID, expectedSessionID: sessionID
+            )?.workspaceID, expected, file: file, line: line)
+        }
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, first.id)
+        manager.workspaces.swapAt(1, 2)
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, original.id)
+        manager.workspaces[1].composeTabs.removeAll()
+        assertMatchesScan()
+        manager.workspaces[2].composeTabs.remove(at: 1)
+        assertMatchesScan()
+        manager.workspaces[2].composeTabs[1].activeAgentSessionID = UUID()
+        assertMatchesScan()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        manager.workspaces = [original]
+        assertMatchesScan()
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.endpoint)
+    }
+
+    func testIndexedIdentityReadsLiveGenerationsAndDoesNotHydrateRemovedBindings() async throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(retainedWorkspaces.last)
+        let original = manager.workspaces
+        fixture.session.hasLoadedPersistedState = false
+        let cold = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
+        XCTAssertFalse(cold.hasLoadedPersistedState)
+        XCTAssertEqual(cold.domainEndpoint, fixture.endpoint)
+        XCTAssertFalse(fixture.session.hasLoadedPersistedState)
+        XCTAssertNil(fixture.session.persistedLoadTask)
+
+        // A synchronous model index must never cache session generations across an authority hop.
+        let beforeHop = fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+        await Task.yield()
+        fixture.session.beginPersistentBindingTransition()
+        let transitioned = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        XCTAssertNotEqual(transitioned, beforeHop)
+        XCTAssertEqual(transitioned.bindingTransitionGeneration, fixture.session.bindingTransitionGeneration)
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: nil, on: fixture.session, updateWorkspaceMetadata: false
+        )
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: fixture.endpoint.sessionID, on: fixture.session, updateWorkspaceMetadata: false
+        )
+        let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        XCTAssertEqual(rebound.persistentBindingGeneration, fixture.session.persistentSessionBindingIdentity?.generation)
+        XCTAssertNotEqual(rebound.persistentBindingGeneration, fixture.endpoint.persistentBindingGeneration)
+        manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        manager.workspaces = original
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), rebound)
+        fixture.viewModel.test_removeSession(tabID: fixture.tabID)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false).isEmpty)
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+    }
+
     func testProjectionOverlayPreservesSidebarOversightMenu() throws {
         let fixture = try makeFixture()
         let availableEndpoint = AgentSessionLinkIdentityTestSupport.endpoint(

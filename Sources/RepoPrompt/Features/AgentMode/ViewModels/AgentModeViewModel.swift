@@ -3732,14 +3732,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> AgentSessionLifecycleAuthority.Identity? {
         guard let session = sessions[tabID],
               session.activeAgentSessionID == expectedSessionID,
-              let workspace = workspaceManager?.workspaces.first(where: { workspace in
-                  workspace.composeTabs.contains(where: {
-                      $0.id == tabID && $0.activeAgentSessionID == expectedSessionID
-                  })
-              })
+              let workspaceID = workspaceManager?.agentSessionLifecycleWorkspaceID(
+                  tabID: tabID, sessionID: expectedSessionID
+              )
         else { return nil }
         return AgentSessionLifecycleAuthority.Identity(
-            workspaceID: workspace.id,
+            workspaceID: workspaceID,
             tabID: tabID,
             sessionID: expectedSessionID,
             persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,

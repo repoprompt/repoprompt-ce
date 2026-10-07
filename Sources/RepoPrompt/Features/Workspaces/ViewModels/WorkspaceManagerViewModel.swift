@@ -1026,8 +1026,50 @@ class WorkspaceManagerViewModel: ObservableObject {
                 },
                 uniquingKeysWith: { _, _ in [:] }
             )
+            // Lifecycle lookup has different duplicate semantics from model routing: preserve the
+            // first exact tab/session match in array order, including across duplicate workspace IDs.
+            // These positions are derived alongside the routing indexes, never a second authority.
+            lifecycleBindingPositions.removeAll(keepingCapacity: true)
+            for (workspaceIndex, workspace) in workspaces.enumerated() {
+                for (tabIndex, tab) in workspace.composeTabs.enumerated() {
+                    guard let sessionID = tab.activeAgentSessionID else { continue }
+                    let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
+                    if lifecycleBindingPositions[key] == nil {
+                        lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
+                    }
+                }
+            }
             refreshSelectionMirrorContextRevision()
         }
+    }
+
+    private struct LifecycleBindingKey: Hashable {
+        let tabID: UUID
+        let sessionID: UUID
+    }
+
+    private var lifecycleBindingPositions: [LifecycleBindingKey: (workspace: Int, tab: Int)] = [:]
+
+    #if DEBUG
+        /// Counts actual model-tab validations inside lifecycle reads, not outer candidate calls.
+        var test_lifecycleBindingTabValidationCount = 0
+    #endif
+
+    /// O(1) first exact model binding. Nested tab edits and projection replacement rebuild the
+    /// positions synchronously in `workspaces.didSet`; reads validate the current model and never
+    /// repair or sweep. Live session generations remain the Agent Mode lifecycle adapter's concern.
+    func agentSessionLifecycleWorkspaceID(tabID: UUID, sessionID: UUID) -> UUID? {
+        let key = LifecycleBindingKey(tabID: tabID, sessionID: sessionID)
+        guard let position = lifecycleBindingPositions[key],
+              workspaces.indices.contains(position.workspace),
+              workspaces[position.workspace].composeTabs.indices.contains(position.tab)
+        else { return nil }
+        #if DEBUG
+            test_lifecycleBindingTabValidationCount += 1
+        #endif
+        let tab = workspaces[position.workspace].composeTabs[position.tab]
+        guard tab.id == tabID, tab.activeAgentSessionID == sessionID else { return nil }
+        return workspaces[position.workspace].id
     }
 
     private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
