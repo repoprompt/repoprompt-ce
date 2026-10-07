@@ -1,3 +1,4 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Content Root Shell
@@ -8,7 +9,7 @@ struct ContentRootShellView: View {
     @Binding var showWorkspaceSwitchOverlay: Bool
     @StateObject private var agentNavigationHUD = AgentNavigationHUDViewModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var lastAgentNavigationHUDCommand: (mode: AgentNavigationHUDMode, at: Date)?
+    @State private var agentNavigationHUDCommands = AgentNavigationHUDCommandDeduplicator()
 
     /// A workspace approval is only this window's business when it targets this
     /// window (or targets none). The manager is a process-wide singleton, so every
@@ -84,20 +85,39 @@ struct ContentRootShellView: View {
         .animation(hudAnimation, value: agentNavigationHUD.isPresented)
         .onReceive(NotificationCenter.default.publisher(for: .showAgentNavigationHUD)) { note in
             guard noteTargetsCurrentWindow(note) else { return }
+            #if DEBUG
+                let startMS = viewModel.state.agentModeViewModel.perfRecorder.timestampMSIfEnabled()
+                defer { viewModel.state.agentModeViewModel.perfRecorder.durationEvent("hud.command.shell", startMS: startMS) }
+            #endif
             guard !isBlockingOverlayVisible else {
+                recordHUDCommandIgnored("blockingOverlay")
                 animateHUD { agentNavigationHUD.dismiss() }
                 return
             }
             let rawMode = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.mode] as? String
             let mode = rawMode.flatMap(AgentNavigationHUDMode.init(rawValue:)) ?? .currentWindow
-            guard !isDuplicateAgentNavigationHUDCommand(mode) else { return }
+            guard !agentNavigationHUDCommands.isDuplicate(
+                mode: mode,
+                eventTimestamp: note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.eventTimestamp] as? TimeInterval
+            ) else {
+                recordHUDCommandIgnored("duplicateEvent")
+                return
+            }
             guard viewModel.rootRoute != .workspaceEntry || mode == .allAgents else {
+                recordHUDCommandIgnored("workspaceEntry")
                 animateHUD { agentNavigationHUD.dismiss() }
                 return
             }
             animateHUD {
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange)) { note in
+            guard agentNavigationHUD.isPresented,
+                  agentNavigationHUD.snapshot.mode == .allAgents || (note.object as? AgentModeViewModel) === viewModel.state.agentModeViewModel
+            else { return }
+            // The VM coalesces projection bursts into one raw-row snapshot turn.
+            agentNavigationHUD.refresh(currentWindow: viewModel.state)
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
             guard noteTargetsCurrentWindow(note), agentNavigationHUD.isPresented else { return }
@@ -109,11 +129,13 @@ struct ContentRootShellView: View {
         }
         .onChange(of: isBlockingOverlayVisible) { _, isVisible in
             if isVisible {
+                recordHUDCommandIgnored("overlayBecameVisible")
                 animateHUD { agentNavigationHUD.dismiss() }
             }
         }
         .onChange(of: viewModel.state.promptManager.activeComposeTabID) { _, _ in
             if agentNavigationHUD.isPresented, !agentNavigationHUD.isRouting {
+                recordHUDCommandIgnored("activeTabChanged")
                 animateHUD { agentNavigationHUD.dismiss() }
             }
         }
@@ -133,17 +155,10 @@ struct ContentRootShellView: View {
         }
     }
 
-    /// SwiftUI menu commands and the app-focus-gated KeyboardShortcuts handler
-    /// can both see the same physical ⌘K event. Coalesce same-mode repeats from
-    /// a single keypress so the VM's deliberate toggle semantics don't open and
-    /// immediately close the switcher.
-    private func isDuplicateAgentNavigationHUDCommand(_ mode: AgentNavigationHUDMode) -> Bool {
-        let now = Date()
-        defer { lastAgentNavigationHUDCommand = (mode, now) }
-        guard let lastAgentNavigationHUDCommand,
-              lastAgentNavigationHUDCommand.mode == mode
-        else { return false }
-        return now.timeIntervalSince(lastAgentNavigationHUDCommand.at) < 0.20
+    private func recordHUDCommandIgnored(_ reason: String) {
+        #if DEBUG
+            viewModel.state.agentModeViewModel.perfRecorder.event("hud.command.ignored", fields: ["reason": reason])
+        #endif
     }
 
     private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {

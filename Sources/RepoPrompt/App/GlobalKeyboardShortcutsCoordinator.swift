@@ -1,6 +1,8 @@
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 import KeyboardShortcuts
+import RepoPromptInstrumentation
 
 @MainActor
 final class GlobalKeyboardShortcutsCoordinator {
@@ -216,8 +218,8 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.toggleContextComposer) { [weak self] in self?.toggleContextComposerFromShortcut() }
         register(.previousParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: false) }
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
-        register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
-        register(.showAllAgentsNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .allAgents) }
+        registerHUDShortcut(.showCurrentWindowAgentNavigationHUD, mode: .currentWindow)
+        registerHUDShortcut(.showAllAgentsNavigationHUD, mode: .allAgents)
     }
 
     private func startNewAgentSessionFromShortcut() {
@@ -263,15 +265,50 @@ final class GlobalKeyboardShortcutsCoordinator {
         Task { await win.promptManager.switchComposeTab(targetTabID) }
     }
 
-    private func showAgentNavigationHUD(mode: AgentNavigationHUDMode) {
-        guard let win = guardedHUDWindowState() else { return }
+    private func registerHUDShortcut(_ name: KeyboardShortcuts.Name, mode: AgentNavigationHUDMode) {
+        KeyboardShortcuts.onKeyDown(for: name) { [weak self] in
+            // Carbon's physical event timestamp must be captured in the callback,
+            // not after a potentially delayed main-actor Task hop.
+            let eventTimestamp: TimeInterval? = if let event = GetCurrentEvent(),
+                                                   GetEventClass(event) == UInt32(kEventClassKeyboard),
+                                                   [UInt32(kEventHotKeyPressed), UInt32(kEventRawKeyDown)].contains(GetEventKind(event))
+            {
+                GetEventTime(event)
+            } else {
+                // The library's menu-tracking monitor may have no current Carbon
+                // key event. Never use an unrelated event to suppress a real press.
+                nil
+            }
+            let callbackAt = ProcessInfo.processInfo.systemUptime
+            Task { @MainActor [weak self] in
+                self?.showAgentNavigationHUD(mode: mode, eventTimestamp: eventTimestamp, callbackAt: callbackAt)
+            }
+        }
+    }
+
+    private func showAgentNavigationHUD(mode: AgentNavigationHUDMode, eventTimestamp: TimeInterval?, callbackAt: TimeInterval) {
+        guard let win = guardedHUDWindowState() else {
+            #if DEBUG
+                focusedOrLatestWindowState()?.agentModeViewModel.perfRecorder.event("hud.command.ignored", fields: ["reason": "inactiveOrNoWindow"])
+            #endif
+            return
+        }
+        #if DEBUG
+            win.agentModeViewModel.perfRecorder.event("hud.command.dispatched", fields: [
+                "mode": mode.rawValue,
+                "taskHopMS": String(format: "%.3f", (ProcessInfo.processInfo.systemUptime - callbackAt) * 1000),
+                "hasEventTimestamp": String(eventTimestamp != nil)
+            ])
+        #endif
+        var userInfo: [String: Any] = [
+            AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
+            AgentNavigationHUDNotificationUserInfoKey.mode: mode.rawValue
+        ]
+        if let eventTimestamp { userInfo[AgentNavigationHUDNotificationUserInfoKey.eventTimestamp] = eventTimestamp }
         NotificationCenter.default.post(
             name: .showAgentNavigationHUD,
             object: nil,
-            userInfo: [
-                AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
-                AgentNavigationHUDNotificationUserInfoKey.mode: mode.rawValue
-            ]
+            userInfo: userInfo
         )
     }
 }

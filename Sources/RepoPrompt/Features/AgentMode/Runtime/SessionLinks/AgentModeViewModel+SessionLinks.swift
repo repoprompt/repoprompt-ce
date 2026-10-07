@@ -881,14 +881,68 @@ extension AgentModeViewModel {
     /// A session UUID match is insufficient: an in-place rebind advances the endpoint generations,
     /// and a projection addressed to the retired incarnation must fail closed.
     func agentSessionLinkIsOverseer(tabID: UUID, expectedSessionID: UUID) -> Bool {
+        agentSessionLinkOversightRole(tabID: tabID, expectedSessionID: expectedSessionID).overseeingCount > 0
+    }
+
+    /// Presentation-only roles for the exact current incarnation. Neither a durable
+    /// session UUID nor a cached map key alone proves that this projection is current.
+    func agentSessionLinkOversightRole(tabID: UUID, expectedSessionID: UUID) -> (overseeingCount: Int, isOverseen: Bool) {
+        agentSessionLinkOversightRole(
+            tabID: tabID,
+            expectedSessionID: expectedSessionID,
+            endpoint: agentSessionLinkObserverEndpoint(tabID: tabID)
+        )
+    }
+
+    /// Bulk equivalent of the scalar accessor for the HUD. Resolve the first exact
+    /// owning workspace (as `agentSessionLifecycleIdentity` does) in one membership
+    /// pass, rather than scanning every workspace's tabs once for each sidebar row.
+    /// This is a transient read-only projection, not a second identity cache.
+    func agentSessionLinkOversightRoles(for rows: [SidebarSession]) -> [UUID: (overseeingCount: Int, isOverseen: Bool)] {
+        guard !monitorPillPropsByEndpoint.isEmpty else { return [:] }
+        let expectedSessionIDs = Dictionary(uniqueKeysWithValues: rows.compactMap { row in
+            row.sessionID.map { (row.tabID, $0) }
+        })
+        var resolvedTabIDs: Set<UUID> = []
+        var roles: [UUID: (overseeingCount: Int, isOverseen: Bool)] = [:]
+        for workspace in workspaceManager?.workspaces ?? [] {
+            for tab in workspace.composeTabs {
+                guard let expectedSessionID = expectedSessionIDs[tab.id],
+                      tab.activeAgentSessionID == expectedSessionID,
+                      resolvedTabIDs.insert(tab.id).inserted,
+                      let session = sessions[tab.id],
+                      session.activeAgentSessionID == expectedSessionID
+                else { continue }
+                let identity = AgentSessionLifecycleAuthority.Identity(
+                    workspaceID: workspace.id,
+                    tabID: tab.id,
+                    sessionID: expectedSessionID,
+                    persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
+                    bindingTransitionGeneration: session.bindingTransitionGeneration
+                )
+                roles[tab.id] = agentSessionLinkOversightRole(
+                    tabID: tab.id,
+                    expectedSessionID: expectedSessionID,
+                    endpoint: identity.monitorEndpoint(windowID: windowID)
+                )
+            }
+        }
+        return roles
+    }
+
+    private func agentSessionLinkOversightRole(
+        tabID: UUID,
+        expectedSessionID: UUID,
+        endpoint: DomainAgentSessionLinkEndpointIdentity?
+    ) -> (overseeingCount: Int, isOverseen: Bool) {
         guard sessions[tabID]?.activeAgentSessionID == expectedSessionID,
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID),
+              let endpoint,
               let props = monitorPillPropsByEndpoint[endpoint],
               props.endpoint == endpoint
         else {
-            return false
+            return (0, false)
         }
-        return props.isOverseer
+        return (props.outbound.count, props.hasInbound)
     }
 
     /// Convenience for callers that already hold a live tab identity.

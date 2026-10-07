@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 /// Internal mode for the Agent Session Switcher HUD.
 enum AgentNavigationHUDMode: String, Equatable, CaseIterable, Identifiable {
@@ -37,6 +38,63 @@ enum AgentNavigationHUDNotificationUserInfoKey {
     static let mode = "mode"
     static let resultIndex = "resultIndex"
     static let handledRequest = "handledRequest"
+    static let eventTimestamp = "eventTimestamp"
+}
+
+/// Coalesces exact event deliveries, not wall-clock receipts. A slow main-actor build
+/// cannot turn a duplicate into a second toggle, and fast distinct presses still work.
+struct AgentNavigationHUDCommandDeduplicator {
+    private struct EventIdentity: Equatable {
+        let mode: AgentNavigationHUDMode
+        let timestamp: TimeInterval
+    }
+
+    /// Bound window-lifetime storage, without assuming main-actor Tasks arrive in
+    /// timestamp order or using a receipt-time debounce that absorbs real presses.
+    private var recentEvents: [EventIdentity] = []
+
+    mutating func isDuplicate(mode: AgentNavigationHUDMode, eventTimestamp: TimeInterval?) -> Bool {
+        guard let eventTimestamp, eventTimestamp.isFinite else { return false }
+        let event = EventIdentity(mode: mode, timestamp: eventTimestamp)
+        guard !recentEvents.contains(event) else { return true }
+        recentEvents.append(event)
+        if recentEvents.count > 32 { recentEvents.removeFirst() }
+        return false
+    }
+}
+
+enum AgentNavigationHUDRoleFilter: String, CaseIterable, Identifiable {
+    case all
+    case overseers
+    case overseen
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .overseers: "Overseers"
+        case .overseen: "Overseen"
+        }
+    }
+
+    var symbol: String? {
+        switch self {
+        case .all: nil
+        case .overseers: "eye.fill"
+        case .overseen: "eye"
+        }
+    }
+
+    func includes(_ item: AgentNavigationHUDItem) -> Bool {
+        switch self {
+        case .all: true
+        case .overseers: !item.isArchived && item.overseenSessionCount > 0
+        case .overseen: !item.isArchived && item.isOverseen
+        }
+    }
 }
 
 final class AgentNavigationHUDHandledRequest {
@@ -59,6 +117,8 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
     let depth: Int
     let subagentCount: Int
     let subagentAttentionCount: Int
+    let overseenSessionCount: Int
+    let isOverseen: Bool
     let isActiveTab: Bool
     let runState: AgentSessionRunState?
     let attentionState: AgentSessionRunState?
@@ -70,7 +130,30 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
     let mergeLabel: String?
     let isMCPControlled: Bool
     let isArchived: Bool
-    let searchFields: AgentSessionSearchFields
+    /// Keep raw sources on the empty-query path. The HUD VM memoizes normalization
+    /// only when searching; ordinary opening/filtering never pays ICU folding cost.
+    let searchFieldSource: AgentSessionSearchFieldSource
+    let archivedSearchFields: AgentSessionSearchFields?
+
+    var searchFields: AgentSessionSearchFields {
+        let base = archivedSearchFields ?? AgentModeSidebarSessionBuilder.searchFields(source: searchFieldSource)
+        return AgentSessionSearchFields(
+            fields: base.fields + AgentSessionSearchFields(
+                title: nil,
+                primary: [workspaceTitle, windowTitle],
+                status: [attentionState?.searchLabel, runState?.searchLabel, mergeLabel == nil ? nil : "merge", isArchived ? "archived" : nil],
+                worktree: [mergeLabel],
+                secondary: [
+                    depth > 0 ? "sub-agent" : nil, subagentCount > 0 ? "subagents" : nil,
+                    overseenSessionCount > 0 ? "overseer" : nil,
+                    overseenSessionCount > 0 ? "overseeing" : nil,
+                    isOverseen ? "overseen" : nil,
+                    isArchived ? "stashed" : nil, isArchived ? "restorable" : nil
+                ],
+                identifier: [workspaceID.uuidString]
+            ).fields
+        )
+    }
 
     var isSubagent: Bool {
         depth > 0
@@ -115,6 +198,8 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
     var accessibilityStatusText: String {
         var parts: [String] = []
         if let statusLabel { parts.append(statusLabel) }
+        if overseenSessionCount > 0 { parts.append("Overseeing \(overseenSessionCount)") }
+        if isOverseen { parts.append("Overseen by another session") }
         if isArchived { parts.append("Archived") }
         if isMCPControlled { parts.append("MCP controlled") }
         if let worktreeLabel { parts.append("worktree \(worktreeLabel)") }
@@ -169,20 +254,21 @@ enum AgentNavigationHUDSnapshotBuilder {
     }
 
     @MainActor
-    static func allAgentsSnapshot(currentWindow: WindowState? = nil, now: Date = Date()) -> AgentNavigationHUDSnapshot {
-        allAgentsSnapshot(windows: WindowStatesManager.shared.allWindows, currentWindow: currentWindow, now: now)
+    static func allAgentsSnapshot(currentWindow: WindowState? = nil, now: Date = Date(), includeArchived: Bool = false) -> AgentNavigationHUDSnapshot {
+        allAgentsSnapshot(windows: WindowStatesManager.shared.allWindows, currentWindow: currentWindow, now: now, includeArchived: includeArchived)
     }
 
     @MainActor
     static func allAgentsSnapshot(
         windows: [WindowState],
         currentWindow: WindowState? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        includeArchived: Bool = false
     ) -> AgentNavigationHUDSnapshot {
         let liveRows = windows
             .filter { !$0.isClosing }
             .flatMap { currentWindowItems(windowState: $0) }
-        let archivedRows = currentWindow.map(currentWorkspaceArchivedItems(windowState:)) ?? []
+        let archivedRows = includeArchived ? (currentWindow.map(currentWorkspaceArchivedItems(windowState:)) ?? []) : []
         // Archived rows deliberately bypass the live 24h inclusion filter; they are search-only.
         return AgentNavigationHUDSnapshot(
             mode: .allAgents,
@@ -201,8 +287,15 @@ enum AgentNavigationHUDSnapshotBuilder {
         runStateByTabID: [UUID: AgentSessionRunState] = [:],
         attentionRunStateByTabID: [UUID: AgentSessionRunState] = [:],
         attentionMarkedAtByTabID: [UUID: Date] = [:],
-        baseSearchFieldsByRowID: [UUID: AgentSessionSearchFields] = [:]
+        oversightRoleByTabID: [UUID: (overseeingCount: Int, isOverseen: Bool)] = [:],
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentNavigationHUDItem] {
+        #if DEBUG
+            let startMS = perfRecorder.timestampMSIfEnabled()
+            defer {
+                perfRecorder.durationEvent("hud.snapshot.items", startMS: startMS, fields: ["rowCount": String(rows.count)])
+            }
+        #endif
         let rootDescendantCounts = descendantCountsByRootTabID(
             rows: rows,
             attentionRunStateByTabID: attentionRunStateByTabID
@@ -212,17 +305,7 @@ enum AgentNavigationHUDSnapshotBuilder {
             let runState = runStateByTabID[row.tabID]
             let attentionState = attentionRunStateByTabID[row.tabID]
             let mergeLabel = row.worktreeMergeAttention?.targetLabel
-            let baseSearchFields = baseSearchFieldsByRowID[row.id] ?? row.makeSearchFields()
-            let searchFields = AgentSessionSearchFields(
-                fields: baseSearchFields.fields + AgentSessionSearchFields(
-                    title: nil,
-                    primary: [workspaceTitle, windowTitle],
-                    status: [attentionState?.searchLabel, runState?.searchLabel, mergeLabel == nil ? nil : "merge"],
-                    worktree: [mergeLabel],
-                    secondary: [row.depth > 0 ? "sub-agent" : nil, row.hasThreadChildren ? "subagents" : nil],
-                    identifier: [workspaceID.uuidString]
-                ).fields
-            )
+            let role = oversightRoleByTabID[row.tabID] ?? (overseeingCount: 0, isOverseen: false)
             return AgentNavigationHUDItem(
                 windowID: windowID,
                 workspaceID: workspaceID,
@@ -235,6 +318,8 @@ enum AgentNavigationHUDSnapshotBuilder {
                 depth: row.depth,
                 subagentCount: row.depth == 0 ? descendantCounts.count : 0,
                 subagentAttentionCount: row.depth == 0 ? descendantCounts.attentionCount : 0,
+                overseenSessionCount: role.overseeingCount,
+                isOverseen: role.isOverseen,
                 isActiveTab: row.tabID == currentTabID,
                 runState: runState,
                 attentionState: attentionState,
@@ -246,7 +331,8 @@ enum AgentNavigationHUDSnapshotBuilder {
                 mergeLabel: mergeLabel,
                 isMCPControlled: row.isMCPControlled,
                 isArchived: false,
-                searchFields: searchFields
+                searchFieldSource: row.searchFieldSource,
+                archivedSearchFields: nil
             )
         }
     }
@@ -285,15 +371,6 @@ enum AgentNavigationHUDSnapshotBuilder {
             let entry = descriptor.entry
             let title = AgentSessionRestoreSupport.normalizedSessionTitle(entry?.name ?? stashed.tab.name)
             let runState = entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") }
-            let searchFields = AgentSessionSearchFields(
-                fields: descriptor.searchFields.fields + AgentSessionSearchFields(
-                    title: nil,
-                    primary: [workspace.name, windowState.displayedWindowTitle],
-                    status: ["archived", runState?.searchLabel],
-                    secondary: ["stashed", "restorable"],
-                    identifier: [workspace.id.uuidString]
-                ).fields
-            )
             return AgentNavigationHUDItem(
                 windowID: windowState.windowID,
                 workspaceID: workspace.id,
@@ -306,6 +383,8 @@ enum AgentNavigationHUDSnapshotBuilder {
                 depth: 0,
                 subagentCount: 0,
                 subagentAttentionCount: 0,
+                overseenSessionCount: 0,
+                isOverseen: false,
                 isActiveTab: false,
                 runState: runState,
                 attentionState: nil,
@@ -319,7 +398,8 @@ enum AgentNavigationHUDSnapshotBuilder {
                 mergeLabel: entry?.activeWorktreeMergeSummaries.max(by: { $0.updatedAt < $1.updatedAt })?.targetLabel,
                 isMCPControlled: entry?.isMCPOriginated == true,
                 isArchived: true,
-                searchFields: searchFields
+                searchFieldSource: .empty,
+                archivedSearchFields: descriptor.searchFields
             )
         }
     }
@@ -369,11 +449,18 @@ enum AgentNavigationHUDSnapshotBuilder {
         let agentModeVM = windowState.agentModeViewModel
         let tabs = windowState.promptManager.currentComposeTabs
         let currentTabID = windowState.promptManager.activeComposeTabID
+        #if DEBUG
+            let rowsStartMS = agentModeVM.perfRecorder.timestampMSIfEnabled()
+        #endif
         let rows = agentModeVM.sidebarSessions(for: tabs)
-        let baseSearchFields = agentModeVM.sidebarSearchFields(for: rows)
-        let baseSearchFieldsByRowID = Dictionary(
-            uniqueKeysWithValues: zip(rows, baseSearchFields).map { ($0.id, $1) }
-        )
+        #if DEBUG
+            agentModeVM.perfRecorder.durationEvent("hud.snapshot.sidebarRows", startMS: rowsStartMS, fields: ["rowCount": String(rows.count)])
+            let rolesStartMS = agentModeVM.perfRecorder.timestampMSIfEnabled()
+        #endif
+        let roles = agentModeVM.agentSessionLinkOversightRoles(for: rows)
+        #if DEBUG
+            agentModeVM.perfRecorder.durationEvent("hud.snapshot.oversightRoles", startMS: rolesStartMS, fields: ["rowCount": String(rows.count)])
+        #endif
         let attentionSnapshot = agentModeVM.ui.sessionSidebar.snapshot
         return currentWindowItems(
             rows: rows,
@@ -385,7 +472,8 @@ enum AgentNavigationHUDSnapshotBuilder {
             runStateByTabID: agentModeVM.agentNavigationHUDRunStateByTabID(for: rows.map(\.tabID)),
             attentionRunStateByTabID: attentionSnapshot.attentionRunStateByTabID,
             attentionMarkedAtByTabID: attentionSnapshot.attentionMarkedAtByTabID,
-            baseSearchFieldsByRowID: baseSearchFieldsByRowID
+            oversightRoleByTabID: roles,
+            perfRecorder: agentModeVM.perfRecorder
         )
     }
 }

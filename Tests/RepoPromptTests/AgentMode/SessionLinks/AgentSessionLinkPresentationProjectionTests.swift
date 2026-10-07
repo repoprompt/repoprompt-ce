@@ -424,6 +424,57 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         )
     }
 
+    func testHUDOversightRolesCountExactProjectionAndFailClosedAfterRebind() throws {
+        let fixture = try makeFixture()
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1),
+            to: fixture.endpoint
+        )
+        let role = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(role.overseeingCount, 3)
+        XCTAssertTrue(role.isOverseen)
+        let row = AgentModeViewModel.SidebarSession(
+            id: fixture.tabID, tabID: fixture.tabID, title: "Controller", lastUserMessageAt: nil,
+            activityDate: Date(timeIntervalSince1970: 100), isPinned: false, sessionID: fixture.endpoint.sessionID,
+            parentSessionID: nil, depth: 4, isMCPControlled: false
+        )
+        let items = AgentNavigationHUDSnapshotBuilder.currentWindowItems(
+            rows: [row], currentTabID: nil, windowID: fixture.endpoint.windowID,
+            workspaceID: fixture.endpoint.workspaceID, workspaceTitle: "Workspace", windowTitle: "Window",
+            oversightRoleByTabID: fixture.viewModel.agentSessionLinkOversightRoles(for: [row])
+        )
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(item.overseenSessionCount, 3)
+        XCTAssertTrue(item.isOverseen)
+        XCTAssertEqual(item.overseenSessionCount, role.overseeingCount)
+        XCTAssertEqual(item.isOverseen, role.isOverseen)
+        XCTAssertTrue(item.accessibilityStatusText.contains("Overseeing 3"))
+        XCTAssertTrue(item.accessibilityStatusText.contains("Overseen by another session"))
+        for token in ["overseer", "overseeing", "overseen"] {
+            XCTAssertTrue(AgentSessionSearchMatcher.matches(query: .parse(token), fields: item.searchFields))
+        }
+        let wrongSession = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: UUID())
+        XCTAssertEqual(wrongSession.overseeingCount, 0)
+        XCTAssertFalse(wrongSession.isOverseen)
+        fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint] = props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1)
+        let unstamped = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(unstamped.overseeingCount, 0)
+        XCTAssertFalse(unstamped.isOverseen)
+        let unstampedBulk = fixture.viewModel.agentSessionLinkOversightRoles(for: [row])[fixture.tabID]
+        XCTAssertEqual(unstampedBulk?.overseeingCount, 0)
+        XCTAssertEqual(unstampedBulk?.isOverseen, false)
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 3, inboundCount: 1), to: fixture.endpoint
+        )
+        fixture.session.beginPersistentBindingTransition()
+        let stale = fixture.viewModel.agentSessionLinkOversightRole(tabID: fixture.tabID, expectedSessionID: fixture.endpoint.sessionID)
+        XCTAssertEqual(stale.overseeingCount, 0)
+        XCTAssertFalse(stale.isOverseen)
+        let staleBulk = fixture.viewModel.agentSessionLinkOversightRoles(for: [row])[fixture.tabID]
+        XCTAssertEqual(staleBulk?.overseeingCount, 0)
+        XCTAssertEqual(staleBulk?.isOverseen, false)
+    }
+
     func testExactRoleAccessorsFailClosedForInboundWrongSessionAndStaleIncarnation() throws {
         let fixture = try makeFixture()
         fixture.viewModel.agentSessionLinkPublishProjection(
