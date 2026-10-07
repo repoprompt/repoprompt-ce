@@ -2,59 +2,11 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 import RepoPromptProcess
+import RepoPromptProviderQuota
 
-enum CodexJSONValue: Equatable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: CodexJSONValue])
-    case array([CodexJSONValue])
-    case null
-
-    func toAny() -> Any {
-        switch self {
-        case let .string(value):
-            value
-        case let .number(value):
-            value
-        case let .bool(value):
-            value
-        case let .object(value):
-            value.mapValues { $0.toAny() }
-        case let .array(value):
-            value.map { $0.toAny() }
-        case .null:
-            NSNull()
-        }
-    }
-
-    static func from(_ value: Any) -> CodexJSONValue? {
-        switch value {
-        case let string as String:
-            return .string(string)
-        case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                return .bool(number.boolValue)
-            }
-            return .number(number.doubleValue)
-        case let dict as [String: Any]:
-            var output: [String: CodexJSONValue] = [:]
-            for (key, value) in dict {
-                if let converted = CodexJSONValue.from(value) {
-                    output[key] = converted
-                }
-            }
-            return .object(output)
-        case let array as [Any]:
-            let converted = array.compactMap { CodexJSONValue.from($0) }
-            return .array(converted)
-        case _ as NSNull:
-            return .null
-        default:
-            return nil
-        }
-    }
-}
+/// Preserve the app's transport vocabulary while sharing the same typed boundary value
+/// with the app-free quota runtime. Encoding/decoding behavior is unchanged.
+typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
 
 enum CodexAppServerRequestID: Hashable {
     case int(Int)

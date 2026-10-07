@@ -536,6 +536,9 @@ class WindowStatesManager: ObservableObject {
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
 
+    /// Default-off, app-scoped usage observers; construction starts no provider process.
+    let providerQuotaRuntime = ProviderQuotaRuntime()
+
     /// Serializes workspace activation and deletion claims across every app window.
     let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
@@ -1365,9 +1368,11 @@ class WindowStatesManager: ObservableObject {
             participants: participants,
             additionalTeardown: {
                 await CodexModelPollingService.shared.suspendForManagedSignOut()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.handleSignOutOrAccountChange()
             },
             failedLogoutRecovery: {
                 await CodexModelPollingService.shared.resumeAfterManagedAuthentication()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.resumeAfterManagedAuthentication()
             }
         )
     }
@@ -1399,6 +1404,9 @@ class WindowStatesManager: ObservableObject {
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
+        await providerQuotaRuntime.codex.shutdown()
+        await providerQuotaRuntime.claude.shutdown()
+        await providerQuotaRuntime.claudeTelemetry.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()

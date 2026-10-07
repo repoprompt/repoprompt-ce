@@ -33,6 +33,29 @@ production builds, release-candidate ad-hoc builds, UI-test launches, and stress
 Local DEBUG builds may use `REPOPROMPT_SENTRY_DSN` only for integration testing; official release
 telemetry uses the signed bundle's `RepoPromptSentryDSN` instead.
 
+## Account usage limits (separate from diagnostic telemetry)
+
+The optional usage-limit display is controlled by **Settings → Agent Mode → Overview →
+Show usage limits when available**. This presentation preference does not authorize credential
+access or change model selection. Codex usage must be enabled separately; it uses a dedicated
+Codex app-server account read and account notifications without creating a conversation.
+
+Claude account usage requires explicit **Connect Claude usage** consent in CLI Providers for
+one Claude Code config-folder profile. RepoPrompt reads that profile's existing credentials file,
+or the default profile's `Claude Code-credentials` Keychain item, and sends the OAuth bearer only
+to `https://api.anthropic.com/api/oauth/profile` and `/api/oauth/usage`. Requests reject redirects,
+use ephemeral sessions without cookies or URL caching, and never rotate or write Claude's login.
+Interactive Keychain prompts are restricted to connection or manual refresh. Automatic reads
+are noninteractive and limited to once per 15 minutes while a usage surface is visible;
+manual reads are throttled and server Retry-After restrictions apply to both. With no visible
+usage surface, or with the master preference off, quota acquisition stops.
+
+Only the display preference, source preference and profile-scoped consent record are persisted.
+Quota snapshots stay in memory; account identities and credential values are not logged or sent
+to RepoPrompt diagnostic telemetry. Legacy Claude run-event observation is separate, anonymous
+SDK telemetry and never grants account credential access or contributes to account usage. The
+quota data seam supports cached advisory consumers, but no routing policy uses it in this change.
+
 ## What is collected
 
 When active, RepoPrompt can send:

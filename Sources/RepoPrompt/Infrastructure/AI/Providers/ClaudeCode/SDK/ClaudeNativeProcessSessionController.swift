@@ -71,6 +71,7 @@ final actor ClaudeNativeProcessSessionController {
 
     enum Event {
         case stream(AIStreamResult)
+        case rateLimit(ClaudeCompatiblePluginRateLimitInfo)
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
@@ -1492,6 +1493,13 @@ final actor ClaudeNativeProcessSessionController {
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return
+        }
+        // Preserve quota telemetry separately from transcript events, including routine
+        // "allowed" events that the transcript translator intentionally suppresses.
+        if payload["type"] as? String == "rate_limit_event",
+           let rateLimit = ClaudeCompatiblePluginRateLimitInfo.decodeEvent(data)
+        {
+            emit(.rateLimit(rateLimit))
         }
         let streamResults = translator.parseNDJSONLine(data)
         #if DEBUG

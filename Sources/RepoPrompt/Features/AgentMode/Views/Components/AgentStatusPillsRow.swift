@@ -79,6 +79,11 @@ struct AgentStatusPillsRow: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 6) {
+                // Value-only input: quota updates re-render the pill, never this row.
+                if let usageTarget = ProviderQuotaSettingsTarget(agent: snapshot.selectedAgent) {
+                    AgentUsageLimitsPill(target: usageTarget, windowID: windowID)
+                }
+
                 AgentOraclePill(
                     oracleViewModel: oracleViewModel,
                     windowID: windowID,

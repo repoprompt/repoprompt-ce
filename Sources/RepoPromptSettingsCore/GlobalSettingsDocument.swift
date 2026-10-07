@@ -2,6 +2,24 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
+/// Persisted, non-secret record that the user explicitly connected Claude account usage for one
+/// Claude config profile. It holds no token, account identifier, or token-derived value. A grant
+/// for a different profile than the active one is inert; it is only ever written from the UI.
+package struct ClaudeAccountUsageGrant: Codable, Equatable {
+    /// Canonical Claude config-directory identity (e.g. resolved `CLAUDE_CONFIG_DIR` path).
+    package let credentialProfileID: String
+    package let grantedAt: Date
+
+    package init(credentialProfileID: String, grantedAt: Date) {
+        self.credentialProfileID = credentialProfileID
+        self.grantedAt = grantedAt
+    }
+
+    package func applies(toProfileID profileID: String) -> Bool {
+        !credentialProfileID.isEmpty && credentialProfileID == profileID
+    }
+}
+
 private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
     OracleRosterContract.sanitizedAdditionalModelIDs(raws)
 }
@@ -974,6 +992,18 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var codexToolSuggestionsEnabled: Bool?
         package var codexHookApprovalStrictModeEnabled: Bool?
         package var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
+        /// Default-off opt-in flags only; quota readings themselves are never persisted.
+        /// `codexUsageQuotaEnabled` authorizes the Codex app-server quota source.
+        package var codexUsageQuotaEnabled: Bool?
+        /// Legacy name. Gates passive Claude run rate-limit telemetry only; it never authorizes
+        /// an account usage read and is never migrated into `claudeAccountUsageGrant`.
+        package var claudeUsageQuotaEnabled: Bool?
+        /// Master presentation switch ("Show usage limits when available"). `nil` means
+        /// "never chosen"; the store derives it from the legacy per-provider flags.
+        /// Presentation only: it never authorizes acquisition by itself.
+        package var usageLimitsDisplayEnabled: Bool?
+        /// Explicit, UI-only consent to read Claude account usage for one config profile.
+        package var claudeAccountUsageGrant: ClaudeAccountUsageGrant?
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
@@ -997,6 +1027,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             codexToolSuggestionsEnabled: Bool? = nil,
             codexHookApprovalStrictModeEnabled: Bool? = nil,
             codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
+            codexUsageQuotaEnabled: Bool? = nil,
+            claudeUsageQuotaEnabled: Bool? = nil,
+            usageLimitsDisplayEnabled: Bool? = nil,
+            claudeAccountUsageGrant: ClaudeAccountUsageGrant? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
@@ -1019,6 +1053,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.codexToolSuggestionsEnabled = codexToolSuggestionsEnabled
             self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
             self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
+            self.codexUsageQuotaEnabled = codexUsageQuotaEnabled
+            self.claudeUsageQuotaEnabled = claudeUsageQuotaEnabled
+            self.usageLimitsDisplayEnabled = usageLimitsDisplayEnabled
+            self.claudeAccountUsageGrant = claudeAccountUsageGrant
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions

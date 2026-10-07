@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeIntegratedAgentModeRunner {
@@ -18,6 +21,7 @@ final class ClaudeIntegratedAgentModeRunner {
     private let claudeCoordinator: ClaudeAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let quotaService: ClaudeRunRateLimitTelemetryService
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
@@ -42,11 +46,13 @@ final class ClaudeIntegratedAgentModeRunner {
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks,
-        terminalCommitBarrier: AgentRunTerminalCommitBarrier
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier,
+        quotaService: ClaudeRunRateLimitTelemetryService = WindowStatesManager.shared.providerQuotaRuntime.claudeTelemetry
     ) {
         self.claudeCoordinator = claudeCoordinator
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
+        self.quotaService = quotaService
     }
 
     /// Whether cancelling an attempt on `runID` must keep that run's committed MCP route.
@@ -291,6 +297,17 @@ final class ClaudeIntegratedAgentModeRunner {
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
         var exitedDueToAttemptMismatch = false
+        // Only first-party Claude owns this subscription telemetry. No extra request or
+        // process is started; compatible launchers cannot populate Claude account usage.
+        var quotaLease: UUID?
+        if session.selectedAgent == .claudeCode,
+           session.runID == runID, session.activeRunAttemptID == runAttemptID
+        {
+            await quotaService.setEnabled(GlobalSettingsStore.shared.claudeUsageQuotaEnabled())
+            if session.runID == runID, session.activeRunAttemptID == runAttemptID {
+                quotaLease = await quotaService.beginObservation()
+            }
+        }
 
         eventLoop: for await event in events {
             guard session.runID == runID,
@@ -313,6 +330,10 @@ final class ClaudeIntegratedAgentModeRunner {
                     }
                 #endif
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+            case let .rateLimit(info):
+                if session.selectedAgent == .claudeCode, let quotaLease {
+                    await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
+                }
             case let .runtimeInit(status):
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
