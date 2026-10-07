@@ -114,10 +114,10 @@ struct ContentRootShellView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange)) { note in
             guard agentNavigationHUD.isPresented,
-                  agentNavigationHUD.snapshot.mode == .allAgents || (note.object as? AgentModeViewModel) === viewModel.state.agentModeViewModel
+                  let owner = note.object as? AgentModeViewModel,
+                  agentNavigationHUD.snapshot.mode == .allAgents || owner === viewModel.state.agentModeViewModel
             else { return }
-            // The VM coalesces projection bursts into one raw-row snapshot turn.
-            agentNavigationHUD.refresh(currentWindow: viewModel.state)
+            agentNavigationHUD.refreshOversightRoles(from: owner)
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
             guard noteTargetsCurrentWindow(note), agentNavigationHUD.isPresented else { return }

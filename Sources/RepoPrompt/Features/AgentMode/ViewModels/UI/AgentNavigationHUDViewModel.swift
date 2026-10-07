@@ -12,6 +12,8 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     @Published var query = "" {
         didSet {
             guard query != oldValue else { return }
+            parsedQuery = AgentSessionSearchQuery.parse(query)
+            pendingSelection = nil
             ensureArchivedSearchRows()
             rebuildFilteredItems(preserveSelection: true)
         }
@@ -29,6 +31,16 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     typealias SnapshotLoader = @MainActor (AgentNavigationHUDMode, Bool) -> AgentNavigationHUDSnapshot
     private var snapshotLoader: SnapshotLoader?
     private var snapshotTask: Task<Void, Never>?
+    private var snapshotTaskID: UUID?
+    private var hasLoadedSnapshot = false
+    private var parsedQuery = AgentSessionSearchQuery.parse("")
+    private enum SelectionIntent {
+        case highlighted
+        case displayIndex(Int)
+    }
+
+    typealias SelectionAction = @MainActor (AgentNavigationHUDItem) async -> Void
+    private var pendingSelection: (intent: SelectionIntent, action: SelectionAction)?
     private var includesArchivedSearchRows = false
     private var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     private var searchFieldsMemo: [String: (item: AgentNavigationHUDItem, fields: AgentSessionSearchFields)] = [:]
@@ -38,6 +50,10 @@ final class AgentNavigationHUDViewModel: ObservableObject {
 
         func test_waitForSnapshot() async {
             await snapshotTask?.value
+        }
+
+        func test_cancelSnapshotTask() {
+            snapshotTask?.cancel()
         }
     #endif
 
@@ -49,11 +65,11 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     }
 
     var totalItemCount: Int {
-        snapshot.items.count { !$0.isArchived }
+        displayCorpus(searching: false).count
     }
 
     var needsAttentionCount: Int {
-        snapshot.items.count(where: { !$0.isArchived && $0.attentionState != nil })
+        displayCorpus(searching: false).count { $0.attentionState != nil || $0.hasHiddenSubagentAttention }
     }
 
     var hiddenSubagentCount: Int {
@@ -61,11 +77,16 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     }
 
     var showsSubagentToggleHint: Bool {
-        roleFilter == .all && queryIsEmpty && hiddenSubagentCount > 0
+        roleFilter == .all && !hasSearchTerms && hiddenSubagentCount > 0
     }
 
     var queryIsEmpty: Bool {
-        AgentSessionSearchQuery.parse(query).isEmpty
+        // Esc clears any entered text, even text such as two quotes that parses to no tokens.
+        parsedQuery.rawValue.isEmpty
+    }
+
+    var hasSearchTerms: Bool {
+        !parsedQuery.isEmpty
     }
 
     var showsRoleFilter: Bool {
@@ -86,6 +107,7 @@ final class AgentNavigationHUDViewModel: ObservableObject {
 
     func setRoleFilter(_ filter: AgentNavigationHUDRoleFilter) {
         guard roleFilter != filter else { return }
+        pendingSelection = nil
         roleFilter = filter
         errorMessage = nil
         ensureArchivedSearchRows()
@@ -113,6 +135,9 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         let shouldResetQuery = !isPresented
         snapshotTask?.cancel()
         snapshotTask = nil
+        snapshotTaskID = nil
+        pendingSelection = nil
+        hasLoadedSnapshot = false
         snapshotLoader = loadSnapshot
         snapshot = AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: [])
         includesArchivedSearchRows = false
@@ -139,6 +164,30 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         scheduleSnapshot()
     }
 
+    /// Activity, unread counts and notices share the oversight notification. Resolve
+    /// only this owner's exact roles, without rebuilding sidebar rows in any window.
+    func refreshOversightRoles(from owner: AgentModeViewModel) {
+        guard isPresented, hasLoadedSnapshot else { return }
+        let items = snapshot.items.filter { $0.windowID == owner.windowID && !$0.isArchived }
+        let expectedSessionIDs = Dictionary(items.compactMap { item in
+            item.sessionID.map { (item.tabID, $0) }
+        }, uniquingKeysWith: { first, _ in first })
+        refreshIfOversightRolesChanged(
+            windowID: owner.windowID,
+            roles: owner.agentSessionLinkOversightRoles(expectedSessionIDs: expectedSessionIDs)
+        )
+    }
+
+    func refreshIfOversightRolesChanged(windowID: Int, roles: [UUID: (overseeingCount: Int, isOverseen: Bool)]) {
+        guard isPresented, hasLoadedSnapshot else { return }
+        let changed = snapshot.items.contains { item in
+            guard item.windowID == windowID, !item.isArchived else { return false }
+            let role = roles[item.tabID] ?? (0, false)
+            return item.overseenSessionCount != role.overseeingCount || item.isOverseen != role.isOverseen
+        }
+        if changed { refresh() }
+    }
+
     private static func loader(for currentWindow: WindowState) -> SnapshotLoader {
         { [weak currentWindow] mode, includeArchived in
             guard let currentWindow else { return AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: []) }
@@ -152,7 +201,7 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     }
 
     private func ensureArchivedSearchRows() {
-        if isPresented, snapshot.mode == .allAgents, roleFilter == .all, !queryIsEmpty, !includesArchivedSearchRows {
+        if isPresented, snapshot.mode == .allAgents, roleFilter == .all, !parsedQuery.isEmpty, !includesArchivedSearchRows {
             scheduleSnapshot()
         }
     }
@@ -160,28 +209,45 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     private func scheduleSnapshot(preserveSelection: Bool = true) {
         guard isPresented, snapshotTask == nil, snapshotLoader != nil else { return }
         let mode = snapshot.mode
+        let taskID = UUID()
+        snapshotTaskID = taskID
         let previousSelection = preserveSelection ? selectedItemID : nil
-        isLoadingSnapshot = true
+        // Refreshes retain both previous rows and recoverable empty-filter states.
+        isLoadingSnapshot = !hasLoadedSnapshot
         snapshotTask = Task { [weak self] in
             await Task.yield()
-            guard !Task.isCancelled, let self, isPresented, snapshot.mode == mode,
+            guard let self, snapshotTaskID == taskID else { return }
+            guard !Task.isCancelled, isPresented, snapshot.mode == mode,
                   let snapshotLoader
-            else { return }
-            let includeArchived = mode == .allAgents && roleFilter == .all && !queryIsEmpty
+            else {
+                snapshotTask = nil
+                snapshotTaskID = nil
+                isLoadingSnapshot = false
+                pendingSelection = nil
+                return
+            }
+            let includeArchived = mode == .allAgents && roleFilter == .all && !parsedQuery.isEmpty
             let next = snapshotLoader(mode, includeArchived)
             snapshotTask = nil
+            snapshotTaskID = nil
             includesArchivedSearchRows = includeArchived
             if next != snapshot { snapshot = next }
             let liveIDs = Set(next.items.map(\.id))
             searchFieldsMemo = searchFieldsMemo.filter { liveIDs.contains($0.key) }
             isLoadingSnapshot = false
+            hasLoadedSnapshot = true
             if selectedItemID == nil { selectedItemID = previousSelection }
             rebuildFilteredItems(preserveSelection: preserveSelection)
+            if let pending = pendingSelection {
+                pendingSelection = nil
+                await select(intent: pending.intent, using: pending.action)
+            }
         }
     }
 
     func toggleSubagents() {
         guard roleFilter == .all else { return }
+        pendingSelection = nil
         showSubagents.toggle()
         errorMessage = nil
         rebuildFilteredItems(preserveSelection: true)
@@ -190,8 +256,11 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     func dismiss() {
         snapshotTask?.cancel()
         snapshotTask = nil
+        snapshotTaskID = nil
         snapshotLoader = nil
         isLoadingSnapshot = false
+        hasLoadedSnapshot = false
+        pendingSelection = nil
         searchFieldsMemo.removeAll()
         isPresented = false
         errorMessage = nil
@@ -229,8 +298,29 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     }
 
     func selectHighlighted(currentWindow: WindowState) async {
-        guard filteredItems.indices.contains(selectedIndex) else { return }
-        await select(filteredItems[selectedIndex], currentWindow: currentWindow)
+        await selectHighlighted { [weak currentWindow, weak self] item in
+            guard let currentWindow, let self else { return }
+            await select(item, currentWindow: currentWindow)
+        }
+    }
+
+    func selectHighlighted(using action: @escaping SelectionAction) async {
+        await select(intent: .highlighted, using: action)
+    }
+
+    private func select(intent: SelectionIntent, using action: @escaping SelectionAction) async {
+        guard isPresented else { return }
+        if isLoadingSnapshot {
+            // Last pick wins; do not resolve an index against the empty opening shell.
+            pendingSelection = (intent, action)
+            return
+        }
+        let index = switch intent {
+        case .highlighted: selectedIndex
+        case let .displayIndex(index): index
+        }
+        guard filteredItems.indices.contains(index) else { return }
+        await action(filteredItems[index])
     }
 
     func select(_ item: AgentNavigationHUDItem, currentWindow: WindowState) async {
@@ -260,7 +350,7 @@ final class AgentNavigationHUDViewModel: ObservableObject {
 
     private func rebuildFilteredItems(preserveSelection: Bool) {
         let previousSelection = preserveSelection ? selectedItemID : nil
-        let searchQuery = AgentSessionSearchQuery.parse(query)
+        let searchQuery = parsedQuery
         let corpus = displayCorpus(searching: !searchQuery.isEmpty)
         let matchingItems: [AgentNavigationHUDItem] = if searchQuery.isEmpty {
             corpus
@@ -313,8 +403,14 @@ final class AgentNavigationHUDViewModel: ObservableObject {
     }
 
     func selectItem(atDisplayIndex index: Int, currentWindow: WindowState) async {
-        guard filteredItems.indices.contains(index) else { return }
-        await select(filteredItems[index], currentWindow: currentWindow)
+        await selectItem(atDisplayIndex: index) { [weak currentWindow, weak self] item in
+            guard let currentWindow, let self else { return }
+            await select(item, currentWindow: currentWindow)
+        }
+    }
+
+    func selectItem(atDisplayIndex index: Int, using action: @escaping SelectionAction) async {
+        await select(intent: .displayIndex(index), using: action)
     }
 
     private func rankedMatches(

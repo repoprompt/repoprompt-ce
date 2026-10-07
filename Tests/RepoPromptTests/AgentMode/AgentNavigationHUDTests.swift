@@ -26,7 +26,10 @@ final class AgentNavigationHUDTests: XCTestCase {
         }
     }
 
-    func testSnapshotBuild519Rows() {
+    func testSnapshotBuild519Rows() throws {
+        guard ProcessInfo.processInfo.environment["RPCE_RUN_PERF_BENCHMARKS"] == "1" else {
+            throw XCTSkip("Set RPCE_RUN_PERF_BENCHMARKS=1 to run the opt-in snapshot benchmark")
+        }
         let rows = rows(count: 519)
         let workspaceID = UUID()
         var samples: [Double] = []
@@ -52,14 +55,15 @@ final class AgentNavigationHUDTests: XCTestCase {
 
     private func item(
         title: String, depth: Int = 0, overseeing: Int = 0, overseen: Bool = false,
-        archived: Bool = false, tabID: UUID = UUID(), windowID: Int = 1
+        archived: Bool = false, tabID: UUID = UUID(), windowID: Int = 1,
+        attention: AgentSessionRunState? = nil, subagentAttentionCount: Int = 0
     ) -> AgentNavigationHUDItem {
         AgentNavigationHUDItem(
             windowID: windowID, workspaceID: UUID(), tabID: tabID, sessionID: tabID,
             title: title, workspaceTitle: "Workspace", windowTitle: "Window",
-            parentSessionID: nil, depth: depth, subagentCount: 0, subagentAttentionCount: 0,
+            parentSessionID: nil, depth: depth, subagentCount: 0, subagentAttentionCount: subagentAttentionCount,
             overseenSessionCount: archived ? 0 : overseeing, isOverseen: !archived && overseen,
-            isActiveTab: false, runState: .idle, attentionState: nil, attentionMarkedAt: nil,
+            isActiveTab: false, runState: .idle, attentionState: attention, attentionMarkedAt: nil,
             activityDate: now, worktree: nil, worktreeLabel: nil, mergeAttention: nil,
             mergeLabel: nil, isMCPControlled: false, isArchived: archived,
             searchFieldSource: AgentSessionSearchFieldSource(title: title),
@@ -99,7 +103,7 @@ final class AgentNavigationHUDTests: XCTestCase {
         XCTAssertTrue(vm.filteredItems.isEmpty, "search narrows the role, not the whole snapshot")
         vm.query = ""
         XCTAssertEqual(vm.filteredItems.map(\.title), ["Leaf", "Both"])
-        XCTAssertEqual(vm.totalItemCount, 4)
+        XCTAssertEqual(vm.totalItemCount, 2)
         XCTAssertEqual(vm.roleItemCount, 2)
         vm.query = "overseen"
         XCTAssertEqual(vm.filteredItems.map(\.title), ["Leaf", "Both"])
@@ -216,7 +220,11 @@ final class AgentNavigationHUDTests: XCTestCase {
         await vm.test_waitForSnapshot()
         XCTAssertEqual(includeArchivedCalls, [false])
         vm.query = "\"\""
-        XCTAssertTrue(vm.queryIsEmpty)
+        XCTAssertFalse(vm.queryIsEmpty, "Esc must clear entered quotes rather than dismiss")
+        XCTAssertFalse(vm.hasSearchTerms)
+        XCTAssertFalse(vm.clearQueryOrDismiss())
+        XCTAssertTrue(vm.isPresented)
+        XCTAssertEqual(vm.query, "")
         XCTAssertEqual(includeArchivedCalls, [false], "an empty parsed query must not materialize archives")
         vm.setRoleFilter(.overseers)
         vm.query = "archived"
@@ -261,6 +269,170 @@ final class AgentNavigationHUDTests: XCTestCase {
         vm.dismiss()
         vm.refresh()
         XCTAssertEqual(loads, 2, "dismissed HUDs do not refresh")
+    }
+
+    func testEarlyHighlightedAndIndexedPicksReplayAfterFirstLoad() async {
+        let items = [item(title: "First"), item(title: "Second"), item(title: "Third")]
+        for index in [nil, 2] as [Int?] {
+            let vm = AgentNavigationHUDViewModel()
+            var picked: [String] = []
+            vm.present(mode: .currentWindow) { mode, _ in
+                AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: items)
+            }
+            let pick: AgentNavigationHUDViewModel.SelectionAction = { picked.append($0.title) }
+            if let index {
+                await vm.selectItem(atDisplayIndex: index, using: pick)
+            } else {
+                await vm.selectHighlighted(using: pick)
+            }
+            XCTAssertTrue(picked.isEmpty)
+            await vm.test_waitForSnapshot()
+            XCTAssertEqual(picked, [index == nil ? "First" : "Third"])
+            await vm.test_waitForSnapshot()
+            XCTAssertEqual(picked.count, 1, "a pending intent is consumed once")
+        }
+    }
+
+    func testPendingPickIsLastWinsAndOutOfBoundsDoesNotFallbackToHighlight() async {
+        let vm = AgentNavigationHUDViewModel()
+        var picked: [String] = []
+        let items = [item(title: "First"), item(title: "Second")]
+        let loader: AgentNavigationHUDViewModel.SnapshotLoader = { mode, _ in
+            AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: items)
+        }
+        vm.present(mode: .currentWindow, loadSnapshot: loader)
+        await vm.selectHighlighted { picked.append($0.title) }
+        await vm.selectItem(atDisplayIndex: 1) { picked.append($0.title) }
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(picked, ["Second"])
+        vm.dismiss()
+        vm.present(mode: .currentWindow, loadSnapshot: loader)
+        await vm.selectItem(atDisplayIndex: 8) { picked.append($0.title) }
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(picked, ["Second"])
+    }
+
+    func testPendingPicksAreClearedByQueryDismissScopeAndRoleChanges() async {
+        let items = [item(title: "First", overseeing: 1)]
+        let loader: AgentNavigationHUDViewModel.SnapshotLoader = { mode, _ in
+            AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: items)
+        }
+        for change in 0 ..< 4 {
+            let vm = AgentNavigationHUDViewModel()
+            var picked = false
+            vm.present(mode: .currentWindow, loadSnapshot: loader)
+            await vm.selectHighlighted { _ in picked = true }
+            switch change {
+            case 0: vm.query = "first"
+            case 1:
+                vm.dismiss()
+                vm.present(mode: .currentWindow, loadSnapshot: loader)
+            case 2: vm.present(mode: .allAgents, loadSnapshot: loader)
+            default: vm.setRoleFilter(.overseers)
+            }
+            await vm.test_waitForSnapshot()
+            XCTAssertFalse(picked, "a pick must not leak into a changed corpus or presentation")
+            XCTAssertFalse(vm.isLoadingSnapshot, "cancelled older tasks must not affect the newer load")
+        }
+    }
+
+    func testCancelledLoadClearsLoadingStateAndAllowsAnotherLoad() async {
+        let vm = AgentNavigationHUDViewModel()
+        var loads = 0
+        vm.present(mode: .currentWindow) { mode, _ in
+            loads += 1
+            return AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: [])
+        }
+        vm.test_cancelSnapshotTask()
+        await vm.test_waitForSnapshot()
+        XCTAssertFalse(vm.isLoadingSnapshot)
+        XCTAssertEqual(loads, 0)
+        vm.refresh()
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(loads, 1, "early returns must release the task slot")
+    }
+
+    func testRefreshKeepsResultsAndRecoverableEmptyStatesWithoutLoadingFlash() async {
+        let vm = await loadedVM([item(title: "Plain")])
+        let previous = vm.filteredItems
+        vm.refresh()
+        XCTAssertFalse(vm.isLoadingSnapshot)
+        XCTAssertEqual(vm.filteredItems, previous)
+        await vm.test_waitForSnapshot()
+        vm.query = "missing"
+        vm.refresh()
+        XCTAssertFalse(vm.isLoadingSnapshot)
+        XCTAssertTrue(vm.filteredItems.isEmpty)
+        await vm.test_waitForSnapshot()
+        vm.query = ""
+        vm.setRoleFilter(.overseen)
+        vm.refresh()
+        XCTAssertFalse(vm.isLoadingSnapshot, "Show all stays available during an empty-filter refresh")
+        XCTAssertTrue(vm.showsRoleFilter)
+        XCTAssertEqual(vm.emptyTitle, "No overseen sessions in this window")
+        await vm.test_waitForSnapshot()
+    }
+
+    func testRoleOnlyInvalidationIgnoresChurnOtherWindowsAndArchives() async {
+        let tabID = UUID()
+        let remoteTabID = UUID()
+        let archivedTabID = UUID()
+        var items = [
+            item(title: "Controller", overseeing: 2, tabID: tabID),
+            item(title: "Remote", depth: 4, overseen: true, tabID: remoteTabID, windowID: 2),
+            item(title: "Archived", archived: true, tabID: archivedTabID)
+        ]
+        let vm = AgentNavigationHUDViewModel()
+        var loads = 0
+        vm.present(mode: .allAgents) { mode, _ in
+            loads += 1
+            return AgentNavigationHUDSnapshot(mode: mode, title: mode.title, items: items)
+        }
+        await vm.test_waitForSnapshot()
+        for _ in 0 ..< 10 {
+            vm.refreshIfOversightRolesChanged(windowID: 1, roles: [tabID: (2, false), archivedTabID: (9, true)])
+            vm.refreshIfOversightRolesChanged(windowID: 2, roles: [remoteTabID: (0, true)])
+            vm.refreshIfOversightRolesChanged(windowID: 3, roles: [tabID: (0, false)])
+        }
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(loads, 1)
+        items[1] = item(title: "Remote", depth: 4, overseeing: 1, tabID: remoteTabID, windowID: 2)
+        vm.refreshIfOversightRolesChanged(windowID: 2, roles: [remoteTabID: (1, false)])
+        vm.refreshIfOversightRolesChanged(windowID: 2, roles: [remoteTabID: (1, false)])
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(loads, 2, "real role changes still coalesce into one load")
+        vm.refreshIfOversightRolesChanged(windowID: 2, roles: [remoteTabID: (1, false)])
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(loads, 2)
+        items[1] = item(title: "Remote", depth: 4, tabID: remoteTabID, windowID: 2)
+        vm.refreshIfOversightRolesChanged(windowID: 2, roles: [:])
+        await vm.test_waitForSnapshot()
+        XCTAssertEqual(loads, 3, "role loss or an unresolvable endpoint must refresh too")
+    }
+
+    func testHeaderCountsUseVisibleDepthCappedCorpusAndCountParentAttentionOnce() async {
+        let vm = await loadedVM([
+            item(title: "Attention root", overseeing: 1, attention: .waitingForUser, subagentAttentionCount: 3),
+            item(title: "Hidden attention root", overseeing: 1, subagentAttentionCount: 2),
+            item(title: "Plain"),
+            item(title: "Child", depth: 1, overseen: true, attention: .waitingForUser),
+            item(title: "Deep", depth: 3, overseen: true, attention: .waitingForUser),
+            item(title: "Archive", archived: true, attention: .waitingForUser)
+        ])
+        XCTAssertEqual(vm.totalItemCount, 3)
+        XCTAssertEqual(vm.needsAttentionCount, 2, "row plus several hidden alerts count one parent")
+        vm.query = "child"
+        XCTAssertEqual(vm.totalItemCount, 3, "search does not rewrite scope totals")
+        vm.query = ""
+        vm.toggleSubagents()
+        XCTAssertEqual(vm.totalItemCount, 4)
+        XCTAssertEqual(vm.needsAttentionCount, 3)
+        vm.setRoleFilter(.overseen)
+        XCTAssertEqual(vm.totalItemCount, 2, "role totals flatten all depths and exclude archives")
+        XCTAssertEqual(vm.needsAttentionCount, 2)
+        vm.setRoleFilter(.overseers)
+        XCTAssertEqual(vm.totalItemCount, 2)
+        XCTAssertEqual(vm.needsAttentionCount, 2)
     }
 
     func testRoleFilterKeysHandleBackTabAndLockStateWithoutInterceptingOtherShortcuts() {

@@ -302,7 +302,7 @@ struct AgentNavigationHUDView: View {
                                 fontPreset: fontPreset,
                                 now: activityReferenceDate,
                                 shortcutNumber: index < 9 ? index + 1 : nil,
-                                showsSubagentRollup: viewModel.roleFilter == .all && !viewModel.showSubagents && viewModel.queryIsEmpty,
+                                showsSubagentRollup: viewModel.roleFilter == .all && !viewModel.showSubagents && !viewModel.hasSearchTerms,
                                 flattensHierarchy: viewModel.roleFilter != .all,
                                 onHover: {
                                     guard Date() >= suppressHoverSelectionUntil else { return }
@@ -337,7 +337,7 @@ struct AgentNavigationHUDView: View {
             Text(
                 viewModel.isLoadingSnapshot
                     ? "Loading sessions…"
-                    : (viewModel.queryIsEmpty ? viewModel.emptyTitle : "No matches for “\(viewModel.query)”")
+                    : (viewModel.hasSearchTerms ? "No matches for “\(viewModel.query)”" : viewModel.emptyTitle)
             )
             .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
             .foregroundStyle(.primary)
@@ -362,7 +362,7 @@ struct AgentNavigationHUDView: View {
     private var emptyHint: String {
         if viewModel.isLoadingSnapshot { return "Preparing the session list." }
         if viewModel.roleFilter != .all { return "Show all to remove the role filter. Search narrows the selected role." }
-        if !viewModel.queryIsEmpty {
+        if viewModel.hasSearchTerms {
             return viewModel.snapshot.mode == .currentWindow
                 ? "Press ⇧⌘K to search across all Agent sessions."
                 : "Try a session title, workspace, worktree, or status."

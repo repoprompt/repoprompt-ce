@@ -899,10 +899,16 @@ extension AgentModeViewModel {
     /// pass, rather than scanning every workspace's tabs once for each sidebar row.
     /// This is a transient read-only projection, not a second identity cache.
     func agentSessionLinkOversightRoles(for rows: [SidebarSession]) -> [UUID: (overseeingCount: Int, isOverseen: Bool)] {
-        guard !monitorPillPropsByEndpoint.isEmpty else { return [:] }
-        let expectedSessionIDs = Dictionary(uniqueKeysWithValues: rows.compactMap { row in
+        let expectedSessionIDs = Dictionary(rows.compactMap { row in
             row.sessionID.map { (row.tabID, $0) }
-        })
+        }, uniquingKeysWith: { first, _ in first })
+        return agentSessionLinkOversightRoles(expectedSessionIDs: expectedSessionIDs)
+    }
+
+    /// Also serves role-only HUD invalidation, using identities from the existing
+    /// snapshot rather than reconstructing sidebar rows on activity notifications.
+    func agentSessionLinkOversightRoles(expectedSessionIDs: [UUID: UUID]) -> [UUID: (overseeingCount: Int, isOverseen: Bool)] {
+        guard !expectedSessionIDs.isEmpty, !monitorPillPropsByEndpoint.isEmpty else { return [:] }
         var resolvedTabIDs: Set<UUID> = []
         var roles: [UUID: (overseeingCount: Int, isOverseen: Bool)] = [:]
         for workspace in workspaceManager?.workspaces ?? [] {
