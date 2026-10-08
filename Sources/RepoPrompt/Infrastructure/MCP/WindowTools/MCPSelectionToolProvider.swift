@@ -136,7 +136,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
                     agentSessionID: $0
                 )
             }
-            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
+            return try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(tag) {
                 try await executeManageSelectionWithRetry(args: args, invocationContext: invocationContext)
             }
         #else

@@ -6,6 +6,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -21,7 +22,11 @@ struct AgentContextUsage: Codable, Equatable {
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
 final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownParticipant {
-    @TaskLocal private static var mcpRunEpochTransitionToken: UUID?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    private nonisolated static let mcpRunEpochTransitionTokenTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    private nonisolated static var mcpRunEpochTransitionToken: UUID? {
+        mcpRunEpochTransitionTokenTaskLocal.get()
+    }
 
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
@@ -6760,7 +6765,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
         do {
-            return try await Self.$mcpRunEpochTransitionToken.withValue(token) {
+            return try await Self.mcpRunEpochTransitionTokenTaskLocal.withValue(token) {
                 try await operation()
             }
         } catch {

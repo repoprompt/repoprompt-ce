@@ -328,7 +328,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                     authorizedCanonicalRoots: security.authorizedCanonicalRoots,
                     hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
                 )
-                return try await MCPDomainInvocationSecurityContext.$current.withValue(requestSecurity) {
+                return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {
                     try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
                 }
             }
