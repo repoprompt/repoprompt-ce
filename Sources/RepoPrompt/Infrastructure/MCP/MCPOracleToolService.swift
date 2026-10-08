@@ -296,6 +296,7 @@ struct MCPOracleToolService {
                 chatID: result["chat_id"]?.stringValue ?? continuationChatID,
                 response: result["response"]?.stringValue,
                 groupResult: groupResult,
+                reconciliationGuidance: result["oracle_reconciliation_guidance"]?.stringValue,
                 destination: exportDestination
             ))
         }
@@ -419,6 +420,7 @@ struct MCPOracleToolService {
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
                 response: result["response"]?.stringValue,
                 groupResult: groupResult,
+                reconciliationGuidance: result["oracle_reconciliation_guidance"]?.stringValue,
                 destination: exportDestination
             ))
         }

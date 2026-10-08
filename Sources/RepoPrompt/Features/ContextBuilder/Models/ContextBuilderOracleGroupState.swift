@@ -269,6 +269,13 @@ enum ContextBuilderOraclePrimaryCompletionError: Error, LocalizedError, Equatabl
 
 struct ContextBuilderOracleGroupReply: Codable, Equatable {
     let result: OracleGroupResult
+    let reconciliationGuidance: String?
+
+    init(result: OracleGroupResult, reconciliationGuidance: String? = nil) {
+        self.result = result
+        let custom = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(reconciliationGuidance)
+        self.reconciliationGuidance = custom == OracleGroupDeliveryContract.defaultReconciliationGuidance ? nil : custom
+    }
 
     var orderedResults: [OracleLaneResult] {
         result.oracleResults
@@ -293,7 +300,12 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
     }
 
     func toMCPFields() -> [String: Value] {
-        OracleGroupMCPCodec.groupFields(result)
+        var fields = OracleGroupMCPCodec.groupFields(result)
+        // Default/legacy metadata stays absent; single-lane replies never own a group.
+        if let reconciliationGuidance {
+            fields["oracle_reconciliation_guidance"] = .string(reconciliationGuidance)
+        }
+        return fields
     }
 }
 

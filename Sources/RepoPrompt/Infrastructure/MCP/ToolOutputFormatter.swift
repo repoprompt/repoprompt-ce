@@ -4579,7 +4579,7 @@ extension ToolOutputFormatter {
                 response: lane.response,
                 partialResponse: lane.partialResponse
             )
-        }) {
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
             lines.append("")
             lines.append(preamble)
         }

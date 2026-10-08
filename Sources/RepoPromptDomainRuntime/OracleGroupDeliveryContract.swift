@@ -5,7 +5,7 @@ import Foundation
 /// RepoPrompt never merges lanes; the agent that receives the group reconciles
 /// them. Reconcilers are known to favor the first, the longest, or their own
 /// model family's answer. This text asks for evidence-based reconciliation
-/// and lets the reader detect a truncated group. Every function returns nil for
+/// and lets the reader detect a truncated group. Framing functions return nil for
 /// fewer than two lanes so single-lane output stays byte-for-byte unchanged.
 package enum OracleGroupDeliveryContract {
     package struct Lane: Equatable {
@@ -26,16 +26,31 @@ package enum OracleGroupDeliveryContract {
         }
     }
 
+    /// Only these behavioral instructions are editable; retrieval and lane framing stay fixed.
+    package static let defaultReconciliationGuidance = """
+    - Reconcile by evidence, not lane order, answer length, or model identity: check material single-lane and conflicting claims against the code, and report unresolved disagreements. A failed or partial lane is incomplete evidence.
+    - Before synthesizing, inventory every material claim from every lane, including single-lane claims. Merge only exact duplicates, retaining all source lanes. Begin your answer with `\(reconciliationHeading)`, state how many lanes completed and name any that did not. For every inventory item, give its source lanes, checked evidence, and exactly one disposition: `accepted`, `rejected`, or `unresolved`. Never silently omit an item.
+    """
+
+    /// Blank means no override. Whitespace on nonblank user text is never rewritten.
+    package static func normalizedReconciliationGuidanceOverride(_ text: String?) -> String? {
+        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
+    }
+
+    package static func effectiveReconciliationGuidance(_ override: String?) -> String {
+        normalizedReconciliationGuidanceOverride(override) ?? defaultReconciliationGuidance
+    }
+
     /// Reconciliation guidance plus a lane manifest, placed before the lane bodies.
-    package static func preamble(lanes: [Lane]) -> String? {
+    package static func preamble(lanes: [Lane], reconciliationGuidance: String? = nil) -> String? {
         guard lanes.count > 1 else { return nil }
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
         var lines = [
             "**Reconciling these Oracle lanes**",
             "\(ordered.count) independent answers to the same request follow. Lane order is not a ranking; the first lane supplies the top-level continuation handle, and a successful follow-up through any lane's chat ID re-runs every lane.",
             "- Read every lane through the end-of-group marker (`\(endMarkerText(laneCount: ordered.count))`). If the marker or a lane is missing, page the export or try the read-only `oracle_chat_log` with that lane's chat ID. Logs may be scoped or clipped; report any remaining gap. Do not start a follow-up just to retrieve prior text.",
-            "- Reconcile by evidence, not lane order, answer length, or model identity: check material single-lane and conflicting claims against the code, and report unresolved disagreements. A failed or partial lane is incomplete evidence.",
-            "- Before synthesizing, inventory every material claim from every lane, including single-lane claims. Merge only exact duplicates, retaining all source lanes. Begin your answer with `\(reconciliationHeading)`, state how many lanes completed and name any that did not. For every inventory item, give its source lanes, checked evidence, and exactly one disposition: `accepted`, `rejected`, or `unresolved`. Never silently omit an item.",
+            effectiveReconciliationGuidance(reconciliationGuidance),
             "",
             "Lanes (\(ordered.count)):"
         ]

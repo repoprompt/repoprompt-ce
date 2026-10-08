@@ -1817,7 +1817,7 @@ final class ACPIntegratedAgentModeRunner {
                 association.groupID = groupID
                 association.turnID = turnID
             },
-            settled: { [weak self, weak session] result, turnID in
+            settled: { [weak self, weak session] result, turnID, reconciliationGuidance in
                 guard let self, let session, isOwnerCurrent(), session.activeAgentSessionID == sessionID,
                       session.runID == nil || session.runID == runID,
                       result.groupID == association.groupID, turnID == association.turnID,
@@ -1825,7 +1825,9 @@ final class ACPIntegratedAgentModeRunner {
                       let rowID = association.rowID, let index = session.items.firstIndex(where: { $0.id == rowID }) else { return }
                 var row = session.items[index]
                 let hadResult = hasNonEmptyPayload(row.toolResultJSON)
-                var fields = OracleGroupMCPCodec.groupFields(result)
+                var fields = ContextBuilderOracleGroupReply(
+                    result: result, reconciliationGuidance: reconciliationGuidance
+                ).toMCPFields()
                 fields["chat_id"] = .string(result.primary.chatID)
                 if let response = result.primary.response { fields["response"] = .string(response) }
                 let payload = ToolOutputFormatter.rawJSONString(.object(fields))

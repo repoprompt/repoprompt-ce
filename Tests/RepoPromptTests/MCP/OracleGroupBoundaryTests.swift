@@ -374,10 +374,22 @@ import XCTest
             var grouped = OracleGroupMCPCodec.groupFields(group)
             grouped["chat_id"] = .string(group.primary.chatID)
             grouped["response"] = .string("Primary answer")
+            let capturedGuidance = "  Retain each material disagreement.\nDo not vote.  "
+            grouped["oracle_reconciliation_guidance"] = .string(capturedGuidance)
             let single: [String: Value] = ["chat_id": .string("single-chat"), "response": .string("Single answer")]
-            for payload in [grouped, single] {
-                let fixture = makeOracleSendFixture(stopAfterRoute: false, exportOperation: { request in
+            for (sourceTool, payload) in [grouped, single].flatMap({ payload in
+                ["oracle_send", "ask_oracle"].map { ($0, payload) }
+            }) {
+                let fixture = makeOracleSendFixture(stopAfterRoute: false, connectionID: UUID(), exportOperation: { request in
                     XCTAssertEqual(request.chatID, payload["chat_id"]?.stringValue)
+                    XCTAssertEqual(request.reconciliationGuidance, payload["oracle_reconciliation_guidance"]?.stringValue)
+                    let markdown = AgentOracleExport.oracleMarkdown(request: request)
+                    if request.groupResult != nil {
+                        XCTAssertTrue(markdown.contains(capturedGuidance))
+                        XCTAssertFalse(markdown.contains(OracleGroupDeliveryContract.defaultReconciliationGuidance))
+                    } else {
+                        XCTAssertEqual(markdown, "# Oracle Response\n\nSingle answer")
+                    }
                     throw NSError(domain: "OracleExportFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "Private export diagnostic"])
                 }, settledReply: payload)
                 defer { fixture.cleanup() }
@@ -391,7 +403,11 @@ import XCTest
                 let args: [String: Value] = ["message": .string("fixture"), "new_chat": .bool(true), "export_response": .bool(true)]
                 let reply: Value
                 do {
-                    reply = try await fixture.service.executeOracleSend(args: args, invocationContext: fixture.invocationContext)
+                    reply = if sourceTool == "ask_oracle" {
+                        try await fixture.service.executeAskOracle(args: args, invocationContext: fixture.invocationContext)
+                    } else {
+                        try await fixture.service.executeOracleSend(args: args, invocationContext: fixture.invocationContext)
+                    }
                 } catch {
                     XCTFail("Optional export failure discarded settled reply: \(error)")
                     XCTAssertEqual(fixture.sendRecorder.calls.count, 1)
@@ -1147,6 +1163,50 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         XCTAssertTrue(grouped.hasPrefix(single + " "), grouped)
         XCTAssertTrue(grouped.contains("The file contains 3 independent Oracle lanes"), grouped)
         XCTAssertTrue(grouped.contains("read through the \"End of Oracle group\" marker"), grouped)
+    }
+
+    func testCapturedGuidanceSurvivesReplyRoundTripAndNestedPlanReviewDelivery() throws {
+        let group = try OracleGroupResult(
+            groupID: OracleGroupID(rawValue: UUID()), status: .completed,
+            oracleResults: [lane(index: 0, response: "primary"), lane(index: 1, response: "additional")]
+        )
+        let guidance = "  Compare evidence.\nPreserve disagreements verbatim.  "
+        let reply = ChatSendReply(
+            chatId: UUID(), shortId: "chat-0", mode: "plan", response: "primary", errors: nil,
+            oracleGroup: ContextBuilderOracleGroupReply(result: group, reconciliationGuidance: guidance)
+        )
+        let roundTrip = try JSONDecoder().decode(ChatSendReply.self, from: JSONEncoder().encode(reply))
+        let value = roundTrip.toMCPValue()
+        XCTAssertEqual(value.objectValue?["oracle_reconciliation_guidance"]?.stringValue, guidance)
+        for blocks in [
+            ToolOutputFormatter.formatAskOracle(args: [:], value: value, emitResources: false),
+            ToolOutputFormatter.formatChatSend(args: [:], value: value, emitResources: false),
+            ToolOutputFormatter.formatDiscoverContext(value: .object(["plan": value])),
+            ToolOutputFormatter.formatDiscoverContext(value: .object(["review": value]))
+        ] {
+            let text = joinedText(blocks)
+            XCTAssertTrue(text.contains(guidance), text)
+            XCTAssertFalse(text.contains(OracleGroupDeliveryContract.defaultReconciliationGuidance), text)
+            XCTAssertTrue(text.contains("Lanes (2):"), text)
+            XCTAssertTrue(text.contains("End of Oracle group: 2 lanes above."), text)
+        }
+
+        let legacyFields = OracleGroupMCPCodec.groupFields(group)
+        let defaultText = joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(legacyFields), emitResources: false))
+        for override in [nil, " \n\t", OracleGroupDeliveryContract.defaultReconciliationGuidance] as [String?] {
+            let fields = ContextBuilderOracleGroupReply(result: group, reconciliationGuidance: override).toMCPFields()
+            XCTAssertEqual(fields, legacyFields)
+            XCTAssertEqual(joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(fields), emitResources: false)), defaultText)
+        }
+        for raw in [Value.null, .string(" \n")] {
+            var fields = legacyFields
+            fields["oracle_reconciliation_guidance"] = raw
+            XCTAssertEqual(joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(fields), emitResources: false)), defaultText)
+        }
+        let single = ChatSendReply(chatId: UUID(), shortId: "single", mode: "chat", response: "single answer", errors: nil)
+        XCTAssertEqual(single.toMCPValue(), .object([
+            "chat_id": .string("single"), "mode": .string("chat"), "response": .string("single answer")
+        ]))
     }
 
     func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsUnchanged() {

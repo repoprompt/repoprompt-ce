@@ -40,6 +40,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var workspaceName: String?
     @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
+    @Published var oracleReconciliationGuidanceDraft: String
+    @Published private(set) var oracleGuidanceHasConflict = false
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
     @Published var syncChatWithOracle: Bool {
@@ -82,6 +84,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     private var isReloadingScopedState = false
+    // The draft depends only on guidance and scope; unrelated refreshed profile edits are safe.
+    private var oracleGuidanceDraftWorkspaceID: UUID?
+    private var oracleGuidanceDraftScope: AgentModelsEditingScope
+    private var oracleGuidanceDraftBaseline: String?
 
     // MARK: - Init
 
@@ -107,6 +113,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         self.workspaceName = workspaceName
         inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
+        oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(initialProfile.oracleReconciliationGuidance)
+        oracleGuidanceDraftWorkspaceID = workspaceID
+        oracleGuidanceDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
+        oracleGuidanceDraftBaseline = initialProfile.oracleReconciliationGuidance
         self.settingsManager = settingsManager
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
         self.notificationCenter = notificationCenter
@@ -290,6 +300,67 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     var hasUnsatisfiedRecommendations: Bool {
         recommendations.hasUnsatisfied
+    }
+
+    // MARK: - Oracle reconciliation draft
+
+    var isOracleGuidanceDraftDirty: Bool {
+        oracleReconciliationGuidanceDraft != OracleGroupDeliveryContract.effectiveReconciliationGuidance(
+            oracleGuidanceDraftBaseline
+        )
+    }
+
+    /// Acceptance is not a disk-save receipt; the existing Settings persistence banner owns failures.
+    @discardableResult
+    func saveOracleReconciliationGuidanceDraft() -> Bool {
+        guard isOracleGuidanceDraftDirty else { return false }
+        let text = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidanceDraft)
+        return persistOracleGuidanceDraft(text)
+    }
+
+    @discardableResult
+    func restoreDefaultOracleReconciliationGuidance() -> Bool {
+        persistOracleGuidanceDraft(nil)
+    }
+
+    /// Explicitly discard the old draft and adopt the current live profile.
+    func reloadOracleReconciliationGuidanceDraft() {
+        reloadScopedState()
+        refresh()
+        loadOracleGuidanceDraft()
+    }
+
+    private var oracleGuidanceDraftMatchesCurrentProfile: Bool {
+        oracleGuidanceDraftWorkspaceID == workspaceID
+            && oracleGuidanceDraftScope == editingScope
+            && oracleGuidanceDraftBaseline == profileSnapshot.oracleReconciliationGuidance
+    }
+
+    private func loadOracleGuidanceDraft() {
+        oracleGuidanceDraftWorkspaceID = workspaceID
+        oracleGuidanceDraftScope = editingScope
+        oracleGuidanceDraftBaseline = profileSnapshot.oracleReconciliationGuidance
+        oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(profileSnapshot.oracleReconciliationGuidance)
+        oracleGuidanceHasConflict = false
+    }
+
+    private func persistOracleGuidanceDraft(_ text: String?) -> Bool {
+        guard !oracleGuidanceHasConflict, oracleGuidanceDraftMatchesCurrentProfile else {
+            oracleGuidanceHasConflict = true
+            return false
+        }
+        let draft = oracleReconciliationGuidanceDraft
+        let accepted = updateSelectedProfile(reason: "agent_models.oracle_guidance") { profile in
+            profile.oracleReconciliationGuidance = text
+        }
+        if accepted {
+            loadOracleGuidanceDraft()
+        } else {
+            // The live/cache guard refreshes on rejection. Never retry that click against its new base.
+            oracleReconciliationGuidanceDraft = draft
+            oracleGuidanceHasConflict = true
+        }
+        return accepted
     }
 
     // MARK: - Scope
@@ -872,6 +943,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         syncChatWithOracle = nextProfile.syncChatModelWithOracle
         restrictMCPAgentDiscoveryToRoleLabels = nextProfile.restrictMCPAgentDiscoveryToRoleLabels
         isReloadingScopedState = false
+        if !isOracleGuidanceDraftDirty, !oracleGuidanceHasConflict {
+            loadOracleGuidanceDraft()
+        } else if !oracleGuidanceDraftMatchesCurrentProfile {
+            oracleGuidanceHasConflict = true
+        }
     }
 
     /// Read-modify-write the selected Agent Models profile — or refuse.

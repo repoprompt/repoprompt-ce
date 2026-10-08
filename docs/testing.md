@@ -101,6 +101,13 @@ to the configured instance or task, not a process-global environment switch. Mar
 
 The inventory-first reconciliation guidance in `OracleGroupDeliveryContract` showed a paired GPT score gain in the local r02 experiment, but failed its final holdout factual/format gates (more false acceptances) and produced longer answers. Delivery-string tests verify the guidance contract, not reconciliation accuracy.
 
+## Oracle reconciliation settings editor
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Settings → Agent Models → beneath Oracle roster; background Cua controls labeled `Oracle reconciliation guidance`, `Save Oracle reconciliation guidance`, `Restore default Oracle reconciliation guidance`, `Reload Oracle reconciliation guidance`; `make dev-test FILTER=AgentModelsSettingsViewModelStaleEditTests` | Typing does not write; Save persists only guidance in the selected whole profile; blank/Restore Default removes the override. Dirty drafts survive unrelated refreshed profile edits (including same-page Add Oracle), and Save preserves those edits. Guidance, workspace, or editing-scope changes create a sticky conflict until explicit Reload Current Text. The whole-profile cache/live guard still refuses an uncached edit without retrying that click. Clean drafts follow settings notifications. | Global/workspace routing is authoritative; nil workspace guidance uses the built-in default, not global fieldwise inheritance. The existing Settings persistence banner owns pending-save/recovery warnings. GUI driving requires an authorized matching artifact; VM tests are not GUI proof. |
+| Save guidance, start grouped `ask_oracle` / `oracle_send` or Context Builder plan/question/review, then change settings while discovery/lanes are pending; inspect returned text and optional export; `make dev-test FILTER='OraclePresetExecutionTests\|ContextBuilderOraclePresetTests\|ContextBuilderOracleGroupStateTests\|OracleGroupDeliveryContractTests\|OracleGroupBoundaryTests'` | The pending request retains its captured guidance in inline and exported results; a later continuation uses new scoped text without changing the conversation roster/prompt. Default and N=1 delivery are unchanged. | Caller-facing policy only: lane prompts and canonical history contain no guidance. Direct headless delivery retains the built-in default. Live provider uploads/paid requests and app lifecycle need separate authorization; deterministic transport hooks prove capture/serialization, not live model behavior. |
+
 ## Oracle image delivery
 
 Feature map (app-backed only):

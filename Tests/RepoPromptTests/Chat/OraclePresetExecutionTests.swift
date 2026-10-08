@@ -410,6 +410,8 @@ final class OraclePresetExecutionTests: XCTestCase {
             storedPromptIds: [promptID],
             useStoredPromptsAsSystem: true
         )
+        let dispatchGuidance = "  Compare evidence before proposing changes.\nKeep disagreements explicit.  "
+        let continuationGuidance = "Review the new evidence independently."
         let preset = try ModelPreset(
             name: "Review-Group",
             modelStrings: [AIModel.gpt54Mini.rawValue, AIModel.gpt54.rawValue],
@@ -417,7 +419,8 @@ final class OraclePresetExecutionTests: XCTestCase {
         )
         let profile = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54.rawValue,
-            additionalOracleModelRaws: [AIModel.gpt54.rawValue]
+            additionalOracleModelRaws: [AIModel.gpt54.rawValue],
+            oracleReconciliationGuidance: dispatchGuidance
         )
         let snapshot = OracleSelectionSnapshot(
             origin: .mcp,
@@ -487,6 +490,7 @@ final class OraclePresetExecutionTests: XCTestCase {
         let startedLanes = try XCTUnwrap(started["oracle_results"]?.arrayValue)
         XCTAssertEqual(startedLanes.compactMap { $0.objectValue?["model_id"]?.stringValue }, preset.modelStrings)
         XCTAssertEqual(started["oracle_count"]?.intValue, 2)
+        XCTAssertEqual(started["oracle_reconciliation_guidance"]?.stringValue, dispatchGuidance)
         XCTAssertEqual(capturedMessages.count, 2)
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
         await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
@@ -503,7 +507,8 @@ final class OraclePresetExecutionTests: XCTestCase {
 
         let changedProfile = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54.rawValue,
-            additionalOracleModelRaws: []
+            additionalOracleModelRaws: [],
+            oracleReconciliationGuidance: continuationGuidance
         )
         let continued = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
             args: [
@@ -518,6 +523,11 @@ final class OraclePresetExecutionTests: XCTestCase {
         )
         XCTAssertEqual(continued["oracle_group_id"]?.stringValue, groupID)
         XCTAssertEqual(continued["oracle_count"]?.intValue, 2)
+        XCTAssertEqual(continued["oracle_reconciliation_guidance"]?.stringValue, continuationGuidance)
+        XCTAssertEqual(started["oracle_reconciliation_guidance"]?.stringValue, dispatchGuidance)
+        XCTAssertTrue(capturedMessages.allSatisfy {
+            !$0.systemPrompt.contains(dispatchGuidance) && !$0.systemPrompt.contains(continuationGuidance)
+        })
         XCTAssertEqual(capturedMessages.count, 4)
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
 

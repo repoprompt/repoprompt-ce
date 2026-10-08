@@ -42,6 +42,7 @@ struct OracleExportRequest {
     let chatID: String?
     let response: String?
     let groupResult: OracleGroupResult?
+    let reconciliationGuidance: String?
     let destination: OracleExportDestination?
 
     init(
@@ -51,6 +52,7 @@ struct OracleExportRequest {
         chatID: String?,
         response: String?,
         groupResult: OracleGroupResult? = nil,
+        reconciliationGuidance: String? = nil,
         destination: OracleExportDestination? = nil
     ) {
         self.sourceTool = sourceTool
@@ -59,6 +61,7 @@ struct OracleExportRequest {
         self.chatID = chatID
         self.response = response
         self.groupResult = groupResult
+        self.reconciliationGuidance = reconciliationGuidance
         self.destination = destination
     }
 }
@@ -94,7 +97,7 @@ enum AgentOracleExport {
             "# Oracle Response"
         }
         if let groupResult = request.groupResult {
-            return "\(title)\n\n\(groupMarkdown(groupResult))"
+            return "\(title)\n\n\(groupMarkdown(groupResult, reconciliationGuidance: request.reconciliationGuidance))"
         }
         let response: String = if let responseText = request.response,
                                   !responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -106,7 +109,7 @@ enum AgentOracleExport {
         return "\(title)\n\n\(response)"
     }
 
-    private static func groupMarkdown(_ result: OracleGroupResult) -> String {
+    private static func groupMarkdown(_ result: OracleGroupResult, reconciliationGuidance: String?) -> String {
         let lanes = result.oracleResults.sorted { $0.laneIndex < $1.laneIndex }
         var sections = [
             """
@@ -131,7 +134,7 @@ enum AgentOracleExport {
                 response: lane.response,
                 partialResponse: lane.error?.partialResponse
             )
-        }) {
+        }, reconciliationGuidance: reconciliationGuidance) {
             sections.append(preamble)
         }
         sections.append("## Oracle results")

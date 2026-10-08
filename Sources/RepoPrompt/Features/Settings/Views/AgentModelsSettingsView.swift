@@ -375,6 +375,56 @@ struct AgentModelsSettingsView: View {
                         ? "Add another Oracle model."
                         : "Choose an Oracle first, or remove an Oracle to stay within the five-model limit."
                 )
+
+                Divider()
+                oracleReconciliationGuidanceEditor
+            }
+        }
+    }
+
+    private var oracleReconciliationGuidanceEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Reconciliation guidance")
+                .font(.callout.weight(.medium))
+            Text("Used when two or more Oracle answers are returned to the calling agent. The agent reconciles them; no extra synthesis model runs. Changes affect future requests. Blank text restores the default; the lane manifest and end marker remain fixed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextEditor(text: $viewModel.oracleReconciliationGuidanceDraft)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .frame(height: 160)
+                .padding(6)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                }
+                .accessibilityLabel("Oracle reconciliation guidance")
+
+            HStack {
+                Button("Save") { viewModel.saveOracleReconciliationGuidanceDraft() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || !viewModel.isOracleGuidanceDraftDirty)
+                    .accessibilityLabel("Save Oracle reconciliation guidance")
+                Button("Restore Default") { viewModel.restoreDefaultOracleReconciliationGuidance() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || (
+                        !viewModel.isOracleGuidanceDraftDirty && viewModel.profileSnapshot.oracleReconciliationGuidance == nil
+                    ))
+                    .accessibilityLabel("Restore default Oracle reconciliation guidance")
+                if viewModel.oracleGuidanceHasConflict {
+                    Button("Reload Current Text") { viewModel.reloadOracleReconciliationGuidanceDraft() }
+                        .accessibilityLabel("Reload Oracle reconciliation guidance")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            if viewModel.oracleGuidanceHasConflict {
+                Text("Settings or scope changed while you were editing. Reload the current text before saving; this discards your draft.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

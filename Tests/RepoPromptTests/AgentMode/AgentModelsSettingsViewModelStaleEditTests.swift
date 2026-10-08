@@ -1,4 +1,6 @@
+import Combine
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
@@ -96,22 +98,240 @@ final class AgentModelsSettingsViewModelStaleEditTests: XCTestCase {
         XCTAssertEqual(viewModel.additionalOracleModelRaws, [])
     }
 
+    /// A refreshed cache must not turn an older text draft into a valid write.
+    func testGuidanceDraftCannotOverwriteProfileAfterCacheRefresh() throws {
+        let fixture = try makeFixture()
+        let workspaceID = UUID()
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: workspaceID)
+        viewModel.oracleReconciliationGuidanceDraft = "unsaved older draft"
+        var external = fixture.store.globalAgentModelsProfile()
+        external.oracleReconciliationGuidance = "new external guidance"
+        external.preferredComposeModelRaw = AIModel.claude4Sonnet.rawValue
+        fixture.store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+        // Rename forces synchronous refresh of the cache, without changing its editing scope.
+        viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: "Renamed")
+        XCTAssertEqual(viewModel.profileSnapshot, external)
+
+        XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile(), external)
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "unsaved older draft")
+    }
+
+    func testGuidanceSaveBlankAndRestoreDefaultPreserveScopedProfileAndOwnership() throws {
+        for workspaceID in [nil, UUID()] {
+            let fixture = try makeFixture()
+            let global = AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54.rawValue,
+                oracleReconciliationGuidance: "global rule",
+                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                mcpAgentRoleOverrides: ["engineer": "codex:fixture-model"]
+            )
+            fixture.store.setGlobalAgentModelsProfile(global, contextBuilderWriteIntent: .preserveExistingOwnership)
+            var original = global
+            if let workspaceID {
+                original.oracleReconciliationGuidance = nil
+                fixture.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: original)
+            }
+            let ownership = fixture.store.globalDefaults.didUserSetDiscoverAgentDefaults
+            let viewModel = makeViewModel(fixture: fixture, workspaceID: workspaceID)
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, workspaceID == nil ? "global rule" : OracleGroupDeliveryContract.defaultReconciliationGuidance)
+            let custom = "  Check evidence.\nKeep disagreements visible.  \n"
+            viewModel.oracleReconciliationGuidanceDraft = custom
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), original, "Typing must not persist.")
+            XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+            var expected = original
+            expected.oracleReconciliationGuidance = custom
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), expected)
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, custom)
+            XCTAssertFalse(viewModel.isOracleGuidanceDraftDirty)
+
+            viewModel.oracleReconciliationGuidanceDraft = " \t\n"
+            XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+            expected.oracleReconciliationGuidance = nil
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), expected)
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+            viewModel.oracleReconciliationGuidanceDraft = custom
+            XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+            XCTAssertTrue(viewModel.restoreDefaultOracleReconciliationGuidance())
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), expected)
+            XCTAssertEqual(fixture.store.globalDefaults.didUserSetDiscoverAgentDefaults, ownership)
+            if workspaceID != nil { XCTAssertEqual(fixture.store.globalAgentModelsProfile(), global) }
+        }
+    }
+
+    func testGuidanceLiveChangeRejectsSaveAndResetWithoutRetryUntilReload() throws {
+        for restore in [false, true] {
+            let fixture = try makeFixture()
+            let viewModel = makeViewModel(fixture: fixture, workspaceID: nil)
+            viewModel.oracleReconciliationGuidanceDraft = "older draft"
+            var external = fixture.store.globalAgentModelsProfile()
+            external.oracleReconciliationGuidance = "external rule"
+            fixture.store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+            // Isolated notifications leave the cache stale: the existing live/cache guard must refuse.
+            XCTAssertFalse(restore ? viewModel.restoreDefaultOracleReconciliationGuidance() : viewModel.saveOracleReconciliationGuidanceDraft())
+            XCTAssertEqual(viewModel.profileSnapshot, external)
+            XCTAssertTrue(viewModel.oracleGuidanceHasConflict)
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "older draft")
+            XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+            XCTAssertFalse(viewModel.restoreDefaultOracleReconciliationGuidance())
+            XCTAssertEqual(fixture.store.globalAgentModelsProfile(), external)
+            viewModel.reloadOracleReconciliationGuidanceDraft()
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "external rule")
+            XCTAssertFalse(viewModel.oracleGuidanceHasConflict)
+            viewModel.oracleReconciliationGuidanceDraft = "new deliberate edit"
+            XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+            XCTAssertEqual(fixture.store.globalAgentModelsProfile().oracleReconciliationGuidance, "new deliberate edit")
+        }
+    }
+
+    func testGuidanceScopeChangeRejectsBothActionsWithoutOverwritingEitherProfile() throws {
+        let fixture = try makeFixture()
+        let workspaceID = UUID()
+        let global = AgentModelsSettingsProfile(oracleReconciliationGuidance: "global")
+        let workspace = AgentModelsSettingsProfile(oracleReconciliationGuidance: "workspace")
+        fixture.store.setGlobalAgentModelsProfile(global, contextBuilderWriteIntent: .preserveExistingOwnership)
+        fixture.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspace)
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: workspaceID)
+        viewModel.oracleReconciliationGuidanceDraft = "unsaved workspace draft"
+        viewModel.setInheritanceMode(.useGlobalSettings)
+        XCTAssertEqual(viewModel.editingScope, .global)
+        XCTAssertTrue(viewModel.oracleGuidanceHasConflict)
+        XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+        XCTAssertFalse(viewModel.restoreDefaultOracleReconciliationGuidance())
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile(), global)
+        XCTAssertEqual(fixture.store.workspaceAgentModelsProfile(for: workspaceID), workspace)
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "unsaved workspace draft")
+    }
+
+    func testGuidanceDraftCannotCrossWorkspacesSharingTheSameGlobalProfile() throws {
+        let fixture = try makeFixture()
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: UUID())
+        let original = fixture.store.globalAgentModelsProfile()
+        viewModel.oracleReconciliationGuidanceDraft = "old workspace draft"
+        viewModel.updateWorkspaceContext(workspaceID: UUID(), workspaceName: "Other")
+        XCTAssertEqual(viewModel.editingScope, .global)
+        XCTAssertEqual(viewModel.profileSnapshot, original)
+        XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+        XCTAssertFalse(viewModel.restoreDefaultOracleReconciliationGuidance())
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile(), original)
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "old workspace draft")
+    }
+
+    func testGuidanceDraftPreservesRefreshedUnrelatedProfileEdits() throws {
+        let fixture = try makeFixture()
+        let workspaceID = UUID()
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: workspaceID)
+        viewModel.oracleReconciliationGuidanceDraft = "pending guidance"
+        var external = fixture.store.globalAgentModelsProfile()
+        external.planningModelRaw = AIModel.gpt54.rawValue
+        fixture.store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+        viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: "Renamed")
+        XCTAssertFalse(viewModel.oracleGuidanceHasConflict)
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "pending guidance")
+        XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+        external.oracleReconciliationGuidance = "pending guidance"
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile(), external)
+    }
+
+    func testDirtyGuidanceDraftSurvivesSamePageAddOracleAndSave() throws {
+        for workspaceID in [nil, UUID()] {
+            let fixture = try makeFixture()
+            let original = AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54.rawValue,
+                oracleReconciliationGuidance: "original guidance"
+            )
+            fixture.store.setGlobalAgentModelsProfile(original, contextBuilderWriteIntent: .preserveExistingOwnership)
+            if let workspaceID {
+                fixture.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: original)
+            }
+            let viewModel = makeViewModel(fixture: fixture, workspaceID: workspaceID)
+            let draft = "  Pending guidance.\nKeep every disagreement.  "
+            viewModel.oracleReconciliationGuidanceDraft = draft
+            viewModel.addOracle()
+            var expected = original
+            expected.additionalOracleModelRaws = [AIModel.gpt54.rawValue]
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), expected)
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, draft)
+            XCTAssertTrue(viewModel.isOracleGuidanceDraftDirty)
+            XCTAssertFalse(viewModel.oracleGuidanceHasConflict)
+            XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft())
+            expected.oracleReconciliationGuidance = draft
+            XCTAssertEqual(fixture.store.effectiveAgentModelsProfile(workspaceID: workspaceID), expected)
+            XCTAssertFalse(viewModel.isOracleGuidanceDraftDirty)
+            if workspaceID != nil { XCTAssertEqual(fixture.store.globalAgentModelsProfile(), original) }
+        }
+    }
+
+    func testUncachedUnrelatedProfileEditStillRefusesGuidanceClickWithoutRetry() throws {
+        let fixture = try makeFixture()
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: nil)
+        viewModel.oracleReconciliationGuidanceDraft = "pending guidance"
+        var external = fixture.store.globalAgentModelsProfile()
+        external.planningModelRaw = AIModel.gpt54.rawValue
+        fixture.store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+        // No cache refresh: the existing whole-profile live/cache guard must still refuse.
+        XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+        XCTAssertEqual(viewModel.profileSnapshot, external)
+        XCTAssertTrue(viewModel.oracleGuidanceHasConflict)
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "pending guidance")
+        XCTAssertFalse(viewModel.saveOracleReconciliationGuidanceDraft())
+        XCTAssertFalse(viewModel.restoreDefaultOracleReconciliationGuidance())
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile(), external)
+    }
+
+    func testNotificationsFollowCleanTextButRetainDirtyDraftOnConflict() async throws {
+        let fixture = try makeFixture()
+        let center = NotificationCenter()
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: nil, notificationCenter: center)
+        for dirty in [false, true] {
+            if dirty { viewModel.oracleReconciliationGuidanceDraft = "unsaved text" }
+            var external = fixture.store.globalAgentModelsProfile()
+            external.oracleReconciliationGuidance = dirty ? "second external rule" : "first external rule"
+            fixture.store.setGlobalAgentModelsProfile(external, contextBuilderWriteIntent: .preserveExistingOwnership)
+            let refreshed = expectation(description: "Profile notification delivered")
+            let observation = viewModel.$profileSnapshot.dropFirst().sink { _ in refreshed.fulfill() }
+            center.post(name: .agentModelsSettingsDidChange, object: nil)
+            await fulfillment(of: [refreshed], timeout: 2)
+            observation.cancel()
+            XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, dirty ? "unsaved text" : "first external rule")
+            XCTAssertEqual(viewModel.oracleGuidanceHasConflict, dirty)
+            XCTAssertEqual(viewModel.isOracleGuidanceDraftDirty, dirty)
+        }
+    }
+
+    func testAcceptedGuidanceSaveCanRemainPendingInExistingPersistenceWarning() throws {
+        var failWrites = false
+        let fixture = try makeFixture(shouldFailSave: { failWrites })
+        let viewModel = makeViewModel(fixture: fixture, workspaceID: nil)
+        viewModel.oracleReconciliationGuidanceDraft = "pending save"
+        failWrites = true
+        XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft(), "Accepted in memory, not a durability receipt.")
+        XCTAssertEqual(fixture.store.persistenceBlockReason, .saveFailed)
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile().oracleReconciliationGuidance, "pending save")
+        XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "pending save")
+        XCTAssertFalse(viewModel.oracleGuidanceHasConflict)
+        failWrites = false
+        XCTAssertTrue(fixture.store.retryBlockedPersistenceSave())
+        XCTAssertNil(fixture.store.persistenceBlockReason)
+    }
+
     // MARK: - Fixture
 
     private func makeViewModel(
         fixture: (store: GlobalSettingsStore, apiSettings: APISettingsViewModel),
-        workspaceID: UUID?
+        workspaceID: UUID?,
+        notificationCenter: NotificationCenter = NotificationCenter()
     ) -> AgentModelsSettingsViewModel {
         AgentModelsSettingsViewModel(
             apiSettingsVM: fixture.apiSettings,
             workspaceID: workspaceID,
             settingsManager: fixture.store,
             settingsStore: fixture.store,
-            notificationCenter: NotificationCenter()
+            notificationCenter: notificationCenter
         )
     }
 
-    private func makeFixture() throws -> (store: GlobalSettingsStore, apiSettings: APISettingsViewModel) {
+    private func makeFixture(shouldFailSave: @escaping () -> Bool = { false }) throws -> (store: GlobalSettingsStore, apiSettings: APISettingsViewModel) {
         let temp = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentModelsSettingsViewModelStaleEditTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -125,7 +345,11 @@ final class AgentModelsSettingsViewModelStaleEditTests: XCTestCase {
         let store = GlobalSettingsStore(
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(
-                fileURL: temp.appendingPathComponent("Settings/globalSettings.json")
+                fileURL: temp.appendingPathComponent("Settings/globalSettings.json"),
+                atomicWriter: { data, url in
+                    if shouldFailSave() { throw CocoaError(.fileWriteUnknown) }
+                    try data.write(to: url, options: .atomic)
+                }
             )
         )
         let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
