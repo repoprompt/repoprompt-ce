@@ -63,7 +63,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         self.now = now
     }
 
-    package func latestSnapshot() -> ProviderQuotaSnapshot? {
+    package func latestSnapshot() async -> ProviderQuotaSnapshot? {
         snapshot
     }
 

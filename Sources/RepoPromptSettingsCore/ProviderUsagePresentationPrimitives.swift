@@ -18,9 +18,9 @@ package enum ProviderUsageSourceState: Equatable {
         )
     }
 
-    package static func claude(grant: ClaudeAccountUsageGrant?, currentProfileID: String?) -> Self {
+    package static func claude(grant: ClaudeCLIUsageGrant?, currentProfileID: String?) -> Self {
         if let grant, let currentProfileID, grant.applies(toProfileID: currentProfileID) { return .active(deactivateTitle: "Disconnect") }
-        let explanation = grant == nil ? "Connect to read plan limits using your Claude Code login."
+        let explanation = grant == nil ? "Connect to read plan limits through Claude Code’s /usage command."
             : "Connected for a different Claude profile. Connect again to use this profile."
         return .inactive(activateTitle: "Connect Claude usage…", explanation: explanation, requiresConsent: true)
     }

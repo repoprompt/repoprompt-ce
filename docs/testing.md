@@ -2,6 +2,24 @@
 
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
+## Claude status-line compatibility experiment (debug only)
+
+This is an explicit one-process probe, not a replacement quota source or persistent usage cache. It tests whether the installed Claude CLI invokes its documented status-line command during RepoPrompt's native headless run. It makes no independent account HTTP requests and reads no credentials.
+
+Prepare a new private directory (the path must not already exist):
+
+```bash
+python3 Scripts/diagnostics/claude_statusline_probe.py prepare /tmp/rpce-statusline-probe-UNIQUE
+python3 Tests/Diagnostics/test_claude_statusline_probe.py
+make dev-test FILTER=ClaudeStatusLineCompatibilityProbeTests
+```
+
+After separately authorizing and building/launching the debug app, pass `--claude-statusline-probe /tmp/rpce-statusline-probe-UNIQUE/settings.json` as an app launch argument. Only the first new first-party Claude native process claims it; existing processes and compatible backends are not instrumented. Start one ordinary user-requested Claude turn, then inspect `invocations.ndjson` in that private directory. Do not launch synthetic turns just to collect usage. There is no installation into user/project settings: `--settings` supplies only the session's status-line override. The probe deliberately does not run the user's original status-line script.
+
+Records contain receipt time, byte count, sanitized CLI version, and only five-hour/seven-day percentages and reset timestamps. Percentages remain 0–100; omitted values remain unknown. Receipt time and repeated identical values do not establish measurement freshness or account identity. No records feed the usage UI or router. The collector has a two-second timeout, 64 KiB input limit and 256 KiB log cap. Its fixed `RPCE_STATUSLINE_PROBE` stdout sentinel is deliberate: check whether it leaks into the native event stream or affects the turn. Do not ship that sentinel as a production status line.
+
+Managed settings can override the probe. Zero invocations are inconclusive without a known-working authorized interactive control, and results apply only to the tested CLI version/configuration. Keep the output private; remove the temporary directory manually after inspection. The `claimed` marker is intentionally not automatically reset, including after a failed launch.
+
 ## Quality gate before adding a test
 
 Add a test only when all four answers are concrete:

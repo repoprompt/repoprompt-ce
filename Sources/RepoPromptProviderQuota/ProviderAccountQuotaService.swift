@@ -9,6 +9,7 @@ package enum ProviderQuotaReadError: Error, Equatable {
     case invalidResponse
     case accountInvalidated(retryAt: Date?)
     case transport
+    case cliUnavailable
 
     package var message: String {
         switch self {
@@ -19,6 +20,7 @@ package enum ProviderQuotaReadError: Error, Equatable {
         case .invalidResponse: "The provider did not report readable usage limits."
         case .accountInvalidated: "Usage is not available for the current account. Refresh to try again."
         case .transport: "Usage limits are not available right now."
+        case .cliUnavailable: "Claude Code is not ready to read usage. Check installation, sign-in, and helper-folder trust, then refresh."
         }
     }
 }
@@ -41,6 +43,10 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     private let now: @Sendable () -> Date
     private let automaticInterval: TimeInterval
     private let manualInterval: TimeInterval
+    private let periodicReads: Bool
+    private let cachedRead: (@Sendable () async -> ProviderQuotaSnapshot?)?
+    private var hydration: Task<ProviderQuotaSnapshot?, Never>?
+    private var automaticConsumed = false
     private var enabled = false
     private var generation: UInt64 = 0
     private var status: ProviderQuotaStatus = .disabled
@@ -55,16 +61,20 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     package init(
         automaticInterval: TimeInterval = 900,
         manualInterval: TimeInterval = 60,
+        periodicReads: Bool = true,
+        cachedRead: (@Sendable () async -> ProviderQuotaSnapshot?)? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         read: @escaping Read
     ) {
         self.automaticInterval = automaticInterval
         self.manualInterval = manualInterval
+        self.periodicReads = periodicReads
+        self.cachedRead = cachedRead
         self.now = now
         self.read = read
     }
 
-    package func latestSnapshot() -> ProviderQuotaSnapshot? {
+    package func latestSnapshot() async -> ProviderQuotaSnapshot? {
         snapshot
     }
 
@@ -79,6 +89,9 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
 
     package func invalidate() {
         generation &+= 1
+        hydration?.cancel()
+        hydration = nil
+        automaticConsumed = false
         cadenceTask?.cancel()
         cadenceTask = nil
         inFlight?.task.cancel()
@@ -113,6 +126,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         observers[id] = nil
         guard observers.isEmpty else { return }
         generation &+= 1
+        hydration?.cancel()
+        hydration = nil
         cadenceTask?.cancel()
         cadenceTask = nil
         inFlight?.task.cancel()
@@ -126,7 +141,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     }
 
     private func startCadenceIfNeeded() {
-        guard cadenceTask == nil, enabled, !observers.isEmpty else { return }
+        guard periodicReads, cadenceTask == nil, enabled, !observers.isEmpty else { return }
         cadenceTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let delay = await self?.automaticReadDelay() else { return }
@@ -158,8 +173,28 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         await performRead(userInitiated: false)
     }
 
+    private func hydrateIfNeeded() async {
+        guard enabled, !observers.isEmpty, snapshot == nil, let cachedRead else { return }
+        let expected = generation
+        let task: Task<ProviderQuotaSnapshot?, Never>
+        if let hydration { task = hydration }
+        else {
+            task = Task { await cachedRead() }
+            hydration = task
+        }
+        let value = await task.value
+        guard generation == expected, enabled, !observers.isEmpty, !Task.isCancelled else { return }
+        hydration = nil
+        if snapshot == nil, let value, value.source != .claudeSDKEvent {
+            snapshot = value
+            publish(.loaded(value))
+        }
+    }
+
     private func performRead(userInitiated: Bool) async {
+        await hydrateIfNeeded()
         guard enabled, !observers.isEmpty, !Task.isCancelled else { return }
+        if !userInitiated, !periodicReads, automaticConsumed { return }
         if let inFlight { await inFlight.task.value
             return
         }
@@ -195,14 +230,19 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
             fail(.invalidResponse, generation: expected)
             return
         }
+        if !periodicReads { automaticConsumed = true }
         snapshot = value
         failureCount = 0
         blockedUntil = nil
+        // Concrete IO has completed. Release admission before publishing a terminal status,
+        // so a subscriber's next explicit action cannot coalesce with a finished request.
+        inFlight = nil
         publish(.loaded(value))
     }
 
     private func fail(_ error: ProviderQuotaReadError, generation expected: UInt64) {
         guard enabled, generation == expected, !observers.isEmpty else { return }
+        if !periodicReads { automaticConsumed = true }
         failureCount = min(failureCount + 1, 6)
         let fallback = now().addingTimeInterval(min(60 * pow(2, Double(failureCount - 1)), 1800))
         switch error {
@@ -215,6 +255,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
             snapshot = nil
         default: break
         }
+        inFlight = nil
         publish(.failed(reason: error.message, previous: snapshot))
     }
 

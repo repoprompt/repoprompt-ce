@@ -40,21 +40,37 @@ Show usage limits when available**. This presentation preference does not author
 access or change model selection. Codex usage must be enabled separately; it uses a dedicated
 Codex app-server account read and account notifications without creating a conversation.
 
-Claude account usage requires explicit **Connect Claude usage** consent in CLI Providers for
-one Claude Code config-folder profile. RepoPrompt reads that profile's existing credentials file,
-or the default profile's `Claude Code-credentials` Keychain item, and sends the OAuth bearer only
-to `https://api.anthropic.com/api/oauth/profile` and `/api/oauth/usage`. Requests reject redirects,
-use ephemeral sessions without cookies or URL caching, and never rotate or write Claude's login.
-Interactive Keychain prompts are restricted to connection or manual refresh. Automatic reads
-are noninteractive and limited to once per 15 minutes while a usage surface is visible;
-manual reads are throttled and server Retry-After restrictions apply to both. With no visible
-usage surface, or with the master preference off, quota acquisition stops.
+Claude usage requires explicit **Connect Claude usage** consent in CLI Providers for one Claude
+Code config-folder profile. Prior OAuth consent does not authorize this changed method. A short-lived,
+hidden terminal process runs the user's unmodified Claude Code, opens its built-in `/usage`, and
+consumes its documented status-line JSON. RepoPrompt does not read Claude login tokens or call
+account endpoints itself. Claude Code owns authentication, including any refresh it performs, and
+may update its own ordinary session bookkeeping. RepoPrompt writes only per-run settings in a
+private app-owned directory, never user/project Claude settings. User/project setting sources are
+excluded, explicit hooks are empty, and tools/MCP servers are disabled; managed policy is not
+bypassed. `disableAllHooks` is deliberately omitted because Claude also uses it to suppress the
+status-line collector. No model prompt is submitted and no trust or login prompt is approved
+automatically. If CLI setup prevents startup, the read fails closed.
+The first **Connect and open setup** confirmation opens Terminal for the user to approve the
+helper folder or sign in themselves. A clearly styled **Finish Claude setup…** action is also
+available beside unavailable readings, with another setup action under Details. Each uses that
+same isolated folder/configuration, sends no model message, and opens Terminal only after an
+explicit user confirmation. The first Connect defers collection until the user chooses
+**Check usage after setup**; setup completion starts a new generation so a pre-setup failure
+cannot consume the ordinary Refresh cooldown. Normal refreshes remain hidden.
 
-Only the display preference, source preference and profile-scoped consent record are persisted.
-Quota snapshots stay in memory; account identities and credential values are not logged or sent
-to RepoPrompt diagnostic telemetry. Legacy Claude run-event observation is separate, anonymous
-SDK telemetry and never grants account credential access or contributes to account usage. The
-quota data seam supports cached advisory consumers, but no routing policy uses it in this change.
+Claude checks once when usage is first demanded after launch/enable, plus manual Refresh with a
+60-second minimum gap. There is no periodic Claude polling or permanent helper. Hidden surfaces or
+the master preference being off cancel active collection. The local statistics cache is loaded before
+the startup refresh and retains the original observation date; expired/aged values remain stale.
+Only percentages, reset times and non-secret cache/profile metadata are persisted in private files.
+Account identity is unknown, so these readings cannot supply routing eligibility or account-balancing
+signals. Disconnect removes the statistics cache. Codex snapshots remain in memory in this change.
+
+The Claude-only opt-in disclosure explains this method and that Anthropic has not explicitly approved
+automated usage monitoring; using documented CLI features is not a compliance guarantee. Account
+identities, credentials and raw terminal output are not logged or sent to diagnostic telemetry. Legacy
+Claude run-event telemetry remains separate and cannot authorize usage collection.
 
 ## What is collected
 

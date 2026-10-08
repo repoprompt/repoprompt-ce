@@ -203,6 +203,7 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {

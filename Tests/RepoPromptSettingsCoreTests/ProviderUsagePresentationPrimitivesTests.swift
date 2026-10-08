@@ -4,10 +4,22 @@ import XCTest
 
 /// Pure primitives behind the unified usage section and the Agent Mode usage pill.
 final class ProviderUsagePresentationPrimitivesTests: XCTestCase {
+    func testCLIConsentIsVersionedAndLegacyConsentDoesNotPopulateIt() throws {
+        let grant = ClaudeCLIUsageGrant(credentialProfileID: "/profile", grantedAt: Date())
+        let decoded = try JSONDecoder().decode(ClaudeCLIUsageGrant.self, from: JSONEncoder().encode(grant))
+        XCTAssertEqual(decoded, grant)
+        XCTAssertTrue(decoded.applies(toProfileID: "/profile"))
+        XCTAssertFalse(ClaudeCLIUsageGrant(credentialProfileID: "/profile", grantedAt: Date(), consentVersion: 99).applies(toProfileID: "/profile"))
+        XCTAssertFalse(decoded.applies(toProfileID: "/different"))
+        let legacy = Data(#"{"claudeAccountUsageGrant":{"credentialProfileID":"/profile","grantedAt":0}}"#.utf8)
+        let settings = try JSONDecoder().decode(GlobalScalarPreferences.AgentModeSettings.self, from: legacy)
+        XCTAssertNil(settings.claudeCLIUsageGrant)
+    }
+
     // MARK: Source state
 
     func testClaudeSourceIsActiveOnlyForAGrantMatchingTheCurrentProfile() {
-        let grant = ClaudeAccountUsageGrant(credentialProfileID: "/a/.claude", grantedAt: Date())
+        let grant = ClaudeCLIUsageGrant(credentialProfileID: "/a/.claude", grantedAt: Date())
         XCTAssertTrue(ProviderUsageSourceState.claude(grant: grant, currentProfileID: "/a/.claude").isActive)
 
         let otherProfile = ProviderUsageSourceState.claude(grant: grant, currentProfileID: "/b/.claude")

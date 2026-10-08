@@ -5,6 +5,62 @@ import RepoPromptProviderQuota
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
+    func testCLIUsageConfigurationDoesNotDisableItsOwnStatusLine() throws {
+        let data = try ClaudeCLIUsageSource.collectionSettings(collector: "/fixture/collector --private-output")
+        let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(settings["disableAllHooks"], "This flag suppresses the status-line collector too; managed policy must not be overridden with false")
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        XCTAssertTrue(hooks.isEmpty)
+        let statusLine = try XCTUnwrap(settings["statusLine"] as? [String: String])
+        XCTAssertEqual(statusLine["type"], "command")
+        XCTAssertEqual(statusLine["command"], "/fixture/collector --private-output")
+    }
+
+    func testCLIUsageSetupIsExplicitAndDoesNotPinDefaultCredentialsOrSendInput() {
+        let root = URL(fileURLWithPath: "/fixture/helper's folder")
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/.claude"), isDefault: true)
+        let script = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: profile, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(script.contains("helper'\\''s folder"), "shell-quote paths containing apostrophes")
+        XCTAssertTrue(script.contains("'-u' 'CLAUDE_CONFIG_DIR'"))
+        XCTAssertFalse(script.contains("CLAUDE_CONFIG_DIR="), "default profile must retain Claude's normal Keychain/config identity")
+        XCTAssertTrue(script.contains("'--setting-sources' ''"))
+        XCTAssertTrue(script.contains("'--tools' ''"))
+        XCTAssertTrue(script.contains("'--strict-mcp-config'"))
+        XCTAssertFalse(script.contains("--dangerously-skip-permissions"))
+        XCTAssertFalse(script.contains("--print"))
+        XCTAssertTrue(script.contains("/exit or Ctrl-C twice"))
+        XCTAssertTrue(script.contains("Check usage after setup"))
+        XCTAssertFalse(script.contains("osascript"))
+        let custom = ClaudeUsageCredentialProfile(directory: root, isDefault: false)
+        let customScript = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: custom, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(customScript.contains("CLAUDE_CONFIG_DIR=/fixture/helper'\\''s folder"))
+    }
+
+    func testCLIUsageCommandAdmissionRequiresReadinessAndKeepsDeadlineAndFreshReceipt() throws {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let ready = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data("{}".utf8), now: date))
+        let reading = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date.addingTimeInterval(1)))
+        var state = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(state.next(record: nil, elapsed: 5, now: date), .wait, "never type into trust/login setup")
+        XCTAssertEqual(state.next(record: ready, elapsed: 6, now: date), .usage)
+        XCTAssertEqual(state.next(record: ready, elapsed: 7, now: date), .wait, "do not submit /usage twice")
+        XCTAssertEqual(state.next(record: ready, elapsed: 15, now: date), .wait, "slow usage fetch is not dismissed at 3 seconds")
+        XCTAssertEqual(state.next(record: ready, elapsed: 16, now: date), .escape)
+        XCTAssertEqual(state.next(record: ready, elapsed: 17, now: date), .wait, "escape is one-shot")
+        XCTAssertEqual(state.next(record: reading, elapsed: 18, now: date), .complete(reading))
+        var startup = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(startup.next(record: nil, elapsed: 30, now: date), .failed(.cliUnavailable))
+        var empty = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(empty.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(empty.next(record: ready, elapsed: 30, now: date), .failed(.invalidResponse))
+        var early = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(early.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(early.next(record: reading, elapsed: 1, now: date), .complete(reading), "accept JSON before Escape if CLI already reported it")
+        var stale = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(stale.next(record: reading, elapsed: 0, now: date.addingTimeInterval(2)), .usage)
+        XCTAssertEqual(stale.next(record: reading, elapsed: 1, now: date.addingTimeInterval(3)), .wait, "startup retained JSON is not a refreshed reading")
+    }
+
     func testOnlyFirstPartyAgentsHaveAUsageTarget() {
         XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .codexExec), .codex)
         XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .claudeCode), .claude)
@@ -13,134 +69,107 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }
     }
 
-    func testExpiredDefaultClaudeFileRecoversReadOnlyFromKeychainWithCallerPromptPolicy() async throws {
-        let date = Date(timeIntervalSince1970: 2_000_000_000)
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/default-fixture"), isDefault: true)
-        let expired = Data("{\"claudeAiOauth\":{\"accessToken\":\"expired-fixture\",\"expiresAt\":\(date.addingTimeInterval(-1).timeIntervalSince1970 * 1000)}}".utf8)
-        let current = Data("{\"claudeAiOauth\":{\"accessToken\":\"current-fixture\",\"expiresAt\":\(date.addingTimeInterval(3600).timeIntervalSince1970 * 1000),\"scopes\":[\"user:profile\"]}}".utf8)
-        for userInitiated in [false, true] {
-            let calls = CredentialKeychainCallsFixture()
-            let reader = ClaudeCodeCredentialReader(readFile: { _ in expired }, readKeychain: { interactive in
-                calls.record(interactive)
-                return current
-            }, now: { date })
-            let credential = try await reader.read(profile: profile, userInitiated: userInitiated)
-            XCTAssertEqual(credential.token, "current-fixture")
-            XCTAssertEqual(credential.profileID, profile.id)
-            XCTAssertEqual(calls.values(), [userInitiated], "automatic recovery must remain noninteractive")
-        }
-    }
-
-    func testClaudeCredentialFallbackPreservesProfileIsolationAndValidFilePrecedence() async {
-        let date = Date(timeIntervalSince1970: 2_000_000_000)
-        let expired = Data("{\"claudeAiOauth\":{\"accessToken\":\"expired-fixture\",\"expiresAt\":\(date.addingTimeInterval(-1).timeIntervalSince1970 * 1000)}}".utf8)
-        let valid = Data(#"{"claudeAiOauth":{"accessToken":"valid-fixture","scopes":["user:profile"]}}"#.utf8)
-        let noScope = Data(#"{"claudeAiOauth":{"accessToken":"inference-fixture","scopes":["user:inference"]}}"#.utf8)
-        let cases: [(Data, Bool, ProviderQuotaReadError?)] = [
-            (expired, false, .signInRequired),
-            (Data("malformed".utf8), true, .signInRequired),
-            (noScope, true, .insufficientScope),
-            (valid, true, nil)
-        ]
-        for (file, isDefault, expectedError) in cases {
-            let calls = CredentialKeychainCallsFixture()
-            let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/profile-fixture"), isDefault: isDefault)
-            let reader = ClaudeCodeCredentialReader(readFile: { _ in file }, readKeychain: { interactive in
-                calls.record(interactive)
-                return valid
-            }, now: { date })
-            do {
-                let credential = try await reader.read(profile: profile, userInitiated: true)
-                XCTAssertNil(expectedError)
-                XCTAssertEqual(credential.token, "valid-fixture")
-            } catch { XCTAssertEqual(error as? ProviderQuotaReadError, expectedError) }
-            XCTAssertTrue(calls.values().isEmpty, "custom, malformed, scoped, or usable files never bootstrap a different Keychain account")
-        }
-    }
-
-    private final class CredentialKeychainCallsFixture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var calls: [Bool] = []
-        func record(_ interactive: Bool) {
-            lock.withLock { calls.append(interactive) }
-        }
-
-        func values() -> [Bool] {
-            lock.withLock { calls }
-        }
-    }
-
-    func testClaudeAccountUsageRequiresConsentBeforeCredentialOrHTTPAccess() async {
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-claude-profile"), isDefault: false)
-        let reader = UsageCredentialFixture(profileID: profile.id)
-        let transport = UsageHTTPFixture()
-        let source = ClaudeAccountUsageSource(reader: reader, transport: transport, profileProvider: { profile }, consentProvider: { nil })
+    func testCLIUsageRequiresConsentBeforeCollection() async {
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let source = ClaudeCLIUsageSource(profileProvider: { profile }, collect: { _, _ in
+            XCTFail("Collection without consent")
+            throw ProviderQuotaReadError.transport
+        }, consentProvider: { nil })
         do {
-            _ = try await source.read(ProviderQuotaReadContext(userInitiated: true))
+            _ = try await source.read(.init(userInitiated: true))
             XCTFail("Read without consent")
         } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
-        let credentialReads = await reader.count
-        let httpReads = await transport.paths
-        XCTAssertEqual(credentialReads, 0)
-        XCTAssertTrue(httpReads.isEmpty)
     }
 
-    func testClaudeAccountUsageUsesVerifiedProfileAndPercentUnits() async throws {
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-claude-profile"), isDefault: false)
-        let reader = UsageCredentialFixture(profileID: profile.id)
-        let transport = UsageHTTPFixture()
-        let source = ClaudeAccountUsageSource(reader: reader, transport: transport, profileProvider: { profile }, consentProvider: { profile.id })
-        let value = try await source.read(ProviderQuotaReadContext(userInitiated: true))
-        XCTAssertTrue(value.accountKey.isIdentified)
-        XCTAssertEqual(value.accountKey.credentialProfileID, profile.id)
-        XCTAssertEqual(value.source, .claudeOAuthRead)
-        XCTAssertEqual(value.buckets[0].windows[0].percent?.rawValue, 1)
-        let paths = await transport.paths
-        XCTAssertEqual(paths, ["/api/oauth/profile", "/api/oauth/usage"])
+    func testCLIUsageWhitelistsStatisticsAndKeepsPercentUnitsAndUnknownAccount() throws {
+        let payload = Data(#"{"session_id":"secret-session","token":"secret-token","rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1900000300},"seven_day":{"used_percentage":23},"unexpected":{"used_percentage":99}}}"#.utf8)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload))
+        XCTAssertEqual(record.windows["five_hour"]?.used, 1)
+        XCTAssertEqual(record.windows.count, 2)
+        let encoded = try JSONEncoder().encode(record)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("secret"))
+        let snapshot = record.snapshot(profileID: "profile")
+        XCTAssertFalse(snapshot.accountKey.isIdentified)
+        XCTAssertEqual(snapshot.source, .claudeCLIUsage)
+        XCTAssertEqual(snapshot.coverage, .accountWideAggregateOnly)
+        XCTAssertNil(snapshot.buckets.first?.planType)
     }
 
-    func testClaudeConnectionPromptPermissionExpiresBeforeAutomaticAcquisition() async throws {
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-profile"), isDefault: false)
-        let clock = UsageClockFixture(Date(timeIntervalSince1970: 2_000_000_000))
-        let reader = UsageCredentialFixture(profileID: profile.id)
-        let source = ClaudeAccountUsageSource(reader: reader, transport: UsageHTTPFixture(), profileProvider: { profile }, now: { clock.current() }, consentProvider: { profile.id })
-        await source.prepareUserConnection()
-        clock.advance(31)
-        _ = try await source.read(ProviderQuotaReadContext(userInitiated: false))
-        let actions = await reader.userActions
-        XCTAssertEqual(actions, [false], "a previous Connect click cannot authorize a later background Keychain prompt")
-    }
-
-    private final class UsageClockFixture: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: Date
-        init(_ value: Date) {
-            self.value = value
+    func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {
+        for raw in [
+            #"{"rate_limits":{"five_hour":{"used_percentage":true}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":-1}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":101}}}"#,
+            #"{"rate_limits":{"five_hour":{"resets_at":1900000300}}}"#
+        ] {
+            XCTAssertTrue(try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(raw.utf8))).windows.isEmpty)
         }
-
-        func current() -> Date {
-            lock.withLock { value }
-        }
-
-        func advance(_ interval: TimeInterval) {
-            lock.withLock { value.addTimeInterval(interval) }
-        }
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data(repeating: 32, count: 65537)))
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data("invalid".utf8)))
     }
 
-    func testClaudeAccountUsageDropsProfileChangeBeforeUsageRequest() async {
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-profile-a"), isDefault: false)
+    func testCLIUsageCacheIsPrivateProfileScopedAndRetainsObservationDate() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = ClaudeCLIUsageCache(root: root)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date))
+        try cache.save(record, profileID: "profile-a")
+        XCTAssertEqual(cache.load(profileID: "profile-a")?.receivedAt, date)
+        XCTAssertNil(cache.load(profileID: "profile-b"))
+        let mode = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("cache.json").path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: root.appendingPathComponent("cache.json").path)
+        XCTAssertNil(cache.load(profileID: "profile-a"))
+    }
+
+    func testCLIUsageProfileChangeOrCancellationNeverCachesReading() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile-a"), isDefault: false)
         let profiles = UsageProfileFixture(profile)
-        let reader = UsageCredentialFixture(profileID: profile.id)
-        let transport = UsageHTTPFixture(onResponse: {
-            profiles.replace(ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-profile-b"), isDefault: false))
-        })
-        let source = ClaudeAccountUsageSource(reader: reader, transport: transport, profileProvider: { profiles.current() }, consentProvider: { profile.id })
-        do {
-            _ = try await source.read(ProviderQuotaReadContext(userInitiated: true))
-            XCTFail("Adopted a reading across profiles")
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let source = ClaudeCLIUsageSource(root: root, profileProvider: { profiles.current() }, collect: { _, _ in
+            profiles.replace(.init(directory: URL(fileURLWithPath: "/fixture/profile-b"), isDefault: false))
+            return record
+        }, consentProvider: { profile.id })
+        do { _ = try await source.read(.init(userInitiated: true))
+            XCTFail("Adopted changed profile")
         } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
-        let paths = await transport.paths
-        XCTAssertEqual(paths, ["/api/oauth/profile"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+        let cancelled = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in throw CancellationError() }, consentProvider: { profile.id })
+        do { _ = try await cancelled.read(.init(userInitiated: true))
+            XCTFail("Ignored cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+    }
+
+    func testCLIUsagePersistsAndHydratesWithoutAnotherCollection() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let first = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in record }, consentProvider: { profile.id })
+        let value = try await first.read(.init(userInitiated: true))
+        let restarted = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in XCTFail("Hydration launches CLI")
+            return record
+        }, consentProvider: { profile.id })
+        let cached = await restarted.cachedSnapshot()
+        XCTAssertEqual(cached, value)
+        await restarted.clearCache()
+        let cleared = await restarted.cachedSnapshot()
+        XCTAssertNil(cleared)
+    }
+
+    func testCLIUsageDisclosureExplainsMethodAndUncertaintyWithoutCredentialAccess() {
+        let copy = ProviderUsageSectionConfiguration.claudeConsent.message
+        XCTAssertTrue(copy.contains("/usage"))
+        XCTAssertTrue(copy.contains("does not read login tokens"))
+        XCTAssertTrue(copy.contains("One-time setup opens Claude Code in Terminal"))
+        XCTAssertTrue(copy.contains("Check usage after setup"))
+        XCTAssertTrue(ProviderUsageSectionConfiguration.claudeConsent.confirmTitle.contains("open setup"))
+        XCTAssertTrue(copy.contains("has not explicitly approved automated usage monitoring"))
+        XCTAssertFalse(copy.lowercased().contains("ban"))
     }
 
     private final class UsageProfileFixture: @unchecked Sendable {
@@ -156,81 +185,6 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
         func replace(_ value: ClaudeUsageCredentialProfile) {
             lock.withLock { self.value = value }
-        }
-    }
-
-    func testClaudeUsageRejectsRedirectsAndRedactsCredentialAndHTTPFailures() throws {
-        let token = "fixture-only-token-never-real"
-        let record = Data("{\"claudeAiOauth\":{\"accessToken\":\"\(token)\",\"scopes\":[\"user:profile\"]}}".utf8)
-        let credential = try ClaudeCodeCredentialReader.decode(record, profileID: "fixture")
-        XCTAssertFalse(String(reflecting: credential).contains(token))
-        XCTAssertThrowsError(try ClaudeCodeCredentialReader.decode(Data(#"{"claudeAiOauth":{"accessToken":"fixture\u0000token"}}"#.utf8), profileID: "fixture")) {
-            XCTAssertEqual($0 as? ProviderQuotaReadError, .signInRequired)
-        }
-        XCTAssertThrowsError(try ClaudeAccountUsageSource.check(.init(statusCode: 302, data: Data(token.utf8), retryAfter: nil))) {
-            XCTAssertEqual($0 as? ProviderQuotaReadError, .invalidResponse)
-            XCTAssertFalse(String(reflecting: $0).contains(token))
-        }
-        XCTAssertThrowsError(try ClaudeCodeCredentialReader.decode(Data("{\"claudeAiOauth\":{\"accessToken\":\"fixture\",\"scopes\":[\"user:inference\"]}}".utf8), profileID: "fixture")) {
-            XCTAssertEqual($0 as? ProviderQuotaReadError, .insufficientScope)
-        }
-    }
-
-    func testClaudeAccountSwitchFailureInvalidatesOldAccountWithoutLosingRetryAfter() async {
-        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/tmp/fixture-profile"), isDefault: false)
-        let date = Date(timeIntervalSince1970: 2_000_000_000)
-        let transport = UsageHTTPFixture(usageStatus: 429, retryAfter: "900")
-        let source = ClaudeAccountUsageSource(reader: UsageCredentialFixture(profileID: profile.id), transport: transport, profileProvider: { profile }, now: { date }, consentProvider: { profile.id })
-        let oldAccount = ProviderAccountKey(lineage: .anthropicFirstParty, opaqueAccountID: "different-account", credentialProfileID: profile.id)
-        do {
-            _ = try await source.read(ProviderQuotaReadContext(userInitiated: false, expectedAccount: oldAccount))
-            XCTFail("Retained previous account after a confirmed switch")
-        } catch {
-            XCTAssertEqual(error as? ProviderQuotaReadError, .accountInvalidated(retryAt: date.addingTimeInterval(900)))
-            XCTAssertFalse(String(reflecting: error).contains("fixture-only-token-never-real"))
-        }
-        let paths = await transport.paths
-        XCTAssertEqual(paths, ["/api/oauth/profile", "/api/oauth/usage"])
-    }
-
-    func testClaudeUsageRetryAfterParsesBothProviderForms() {
-        let now = Date(timeIntervalSince1970: 0)
-        XCTAssertEqual(ClaudeAccountUsageSource.retryDate("900", now: now), now.addingTimeInterval(900))
-        XCTAssertEqual(ClaudeAccountUsageSource.retryDate("Thu, 01 Jan 1970 00:15:00 GMT", now: now), now.addingTimeInterval(900))
-        XCTAssertEqual(ClaudeAccountUsageSource.retryDate("invalid", now: now), now.addingTimeInterval(900))
-    }
-
-    private actor UsageCredentialFixture: ClaudeUsageCredentialReading {
-        let profileID: String
-        var count = 0
-        var userActions: [Bool] = []
-        init(profileID: String) {
-            self.profileID = profileID
-        }
-
-        func read(profile: ClaudeUsageCredentialProfile, userInitiated: Bool) -> ClaudeUsageCredential {
-            count += 1
-            userActions.append(userInitiated)
-            return ClaudeUsageCredential(token: "fixture-only-token-never-real", profileID: profileID)
-        }
-    }
-
-    private actor UsageHTTPFixture: ClaudeUsageHTTPTransport {
-        let onResponse: (@Sendable () -> Void)?
-        let usageStatus: Int
-        let retryAfter: String?
-        init(onResponse: (@Sendable () -> Void)? = nil, usageStatus: Int = 200, retryAfter: String? = nil) {
-            self.onResponse = onResponse
-            self.usageStatus = usageStatus
-            self.retryAfter = retryAfter
-        }
-
-        var paths: [String] = []
-        func response(path: String, credential: ClaudeUsageCredential) -> ClaudeUsageHTTPResponse {
-            paths.append(path)
-            onResponse?()
-            let payload = path == "/api/oauth/profile" ? #"{"account":{"uuid":"fixture-account"},"organization":{"uuid":"fixture-org"}}"# : #"{"five_hour":{"utilization":1.0,"resets_at":null},"seven_day":{"utilization":42.0,"resets_at":null}}"#
-            return ClaudeUsageHTTPResponse(statusCode: path == "/api/oauth/profile" ? 200 : usageStatus, data: Data(payload.utf8), retryAfter: retryAfter)
         }
     }
 

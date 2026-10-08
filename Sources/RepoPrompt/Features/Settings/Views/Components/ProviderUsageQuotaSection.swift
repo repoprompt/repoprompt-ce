@@ -64,13 +64,15 @@ struct ProviderUsageSectionConfiguration {
     let deactivateSource: @MainActor () -> Void
     /// Optional diagnostics-only toggle rendered inside Details.
     let diagnosticsToggle: ProviderUsageDiagnosticsToggle?
+    var prepareSetup: (@MainActor () async throws -> URL)?
+    var completeSetup: (@MainActor () async throws -> Void)?
 
     static let observeOnlyLine = "Read-only. Never changes which model runs."
 
     static let claudeConsent = ProviderUsageConsentCopy(
         title: "Connect Claude usage?",
-        message: "RepoPrompt will read your existing Claude Code login for this profile (its config folder or Keychain) and send it only to api.anthropic.com to fetch your plan limits. It never refreshes or changes your login, and it reads only while usage is on screen. You can disconnect at any time.",
-        confirmTitle: "Connect"
+        message: "One-time setup opens Claude Code in Terminal so you can approve its helper folder or sign in. Quit Claude when ready, then click Check usage after setup here. After setup, RepoPrompt runs Claude Code in the background to open /usage. RepoPrompt does not read login tokens, send model prompts, or edit your Claude settings. Only usage percentages and reset times are cached on this Mac. This uses documented CLI features, but Anthropic has not explicitly approved automated usage monitoring. This is optional, and you can disconnect at any time.",
+        confirmTitle: "Connect and open setup"
     )
 }
 
@@ -97,6 +99,9 @@ struct ProviderUsageQuotaSection: View {
     @State private var claudeProfileID: String?
     @State private var showsConsent = false
     @State private var showsDetails = false
+    @State private var showsSetup = false
+    @State private var setupError: String?
+    @State private var setupWasOpened = false
     @ObservedObject private var store: ProviderQuotaUIStore
     @ObservedObject private var settingsStore = GlobalSettingsStore.shared
 
@@ -138,6 +143,31 @@ struct ProviderUsageQuotaSection: View {
                     )
                 case .active:
                     readings
+                    if style == .settings, setupWasOpened, let completeSetup = configuration.completeSetup {
+                        Text("Approve folder trust or sign in in Claude, then quit Claude and check usage here.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Check usage after setup") {
+                            Task { @MainActor in
+                                do { try await completeSetup()
+                                    setupWasOpened = false
+                                } catch { setupError = (error as? ProviderQuotaReadError)?.message ?? "Could not check Claude usage." }
+                            }
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                        .font(.caption)
+                    } else if style == .settings, configuration.prepareSetup != nil, offersSetup {
+                        Text("If Claude needs folder trust or sign-in, finish setup once, then check usage here.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button { showsSetup = true } label: {
+                            Label("Finish Claude setup…", systemImage: "arrow.up.forward.app")
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                        .font(.caption)
+                    }
                     footer(configuration: configuration)
                 }
             }
@@ -155,10 +185,41 @@ struct ProviderUsageQuotaSection: View {
             isPresented: $showsConsent,
             titleVisibility: .visible
         ) {
-            Button(configuration.consent?.confirmTitle ?? "Connect") { configuration.activateSource() }
+            Button(configuration.consent?.confirmTitle ?? "Connect") {
+                configuration.activateSource()
+                if configuration.prepareSetup != nil { openSetup(configuration: configuration) }
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(configuration.consent?.message ?? "")
+        }
+        .confirmationDialog("Set up Claude usage?", isPresented: $showsSetup, titleVisibility: .visible) {
+            Button("Open Terminal") { openSetup(configuration: configuration) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This one-time setup opens Claude Code in Terminal so you can approve its helper folder or sign in. Quit Claude when ready, then click Check usage after setup here. RepoPrompt will not accept prompts or send a model message for you.")
+        }
+        .alert("Claude usage setup", isPresented: Binding(get: { setupError != nil }, set: { if !$0 { setupError = nil } })) {
+            Button("OK") { setupError = nil }
+        } message: { Text(setupError ?? "") }
+    }
+
+    private var offersSetup: Bool {
+        switch store.state {
+        case .hidden, .idle, .unavailable: true
+        case .loading, .loaded: false
+        }
+    }
+
+    @MainActor
+    private func openSetup(configuration: ProviderUsageSectionConfiguration) {
+        Task { @MainActor in
+            do {
+                guard let prepare = configuration.prepareSetup else { return }
+                let script = try await prepare()
+                guard NSWorkspace.shared.open(script) else { throw ProviderQuotaReadError.cliUnavailable }
+                setupWasOpened = true
+            } catch { setupError = (error as? ProviderQuotaReadError)?.message ?? "Could not open Claude usage setup." }
         }
     }
 
@@ -185,23 +246,23 @@ struct ProviderUsageQuotaSection: View {
                 diagnosticsToggle: nil
             )
         case .claude:
-            var lines = ["Uses your existing Claude Code login; never refreshes or changes it."]
+            var lines = ["Checks once after launch when usage is shown, and when you press Refresh. No periodic polling.", "Cached readings may be older than your current usage. Account identity is not verified.", "If Claude asks for helper-folder trust or sign-in, use Open Claude setup. Claude may retain its own normal session bookkeeping."]
             if let claudeProfileID, !claudeProfileID.isEmpty {
                 lines.append("Profile: \((claudeProfileID as NSString).abbreviatingWithTildeInPath)")
             }
-            if let grant = settingsStore.claudeAccountUsageGrant() {
+            if let grant = settingsStore.claudeCLIUsageGrant() {
                 lines.append("Connected \(grant.grantedAt.formatted(date: .abbreviated, time: .shortened))")
             }
             return ProviderUsageSectionConfiguration(
                 displayName: "Claude",
-                sourceSentence: "Reads your Claude plan limits from api.anthropic.com.",
+                sourceSentence: "Reads your Claude plan limits through Claude Code’s /usage command.",
                 detailLines: lines,
                 sourceState: .claude(
-                    grant: settingsStore.claudeAccountUsageGrant(),
+                    grant: settingsStore.claudeCLIUsageGrant(),
                     currentProfileID: claudeProfileID
                 ),
                 consent: ProviderUsageSectionConfiguration.claudeConsent,
-                activateSource: { WindowStatesManager.shared.providerQuotaRuntime.connectClaudeUsage() },
+                activateSource: { WindowStatesManager.shared.providerQuotaRuntime.connectClaudeUsage(startReading: false) },
                 deactivateSource: { WindowStatesManager.shared.providerQuotaRuntime.disconnectClaudeUsage() },
                 diagnosticsToggle: ProviderUsageDiagnosticsToggle(
                     title: "Record rate-limit events from Claude runs (diagnostics)",
@@ -212,7 +273,9 @@ struct ProviderUsageQuotaSection: View {
                             ClaudeUsageQuotaRuntimeBridge.applyEnabled(enabled)
                         }
                     )
-                )
+                ),
+                prepareSetup: { try await WindowStatesManager.shared.providerQuotaRuntime.prepareClaudeUsageSetup() },
+                completeSetup: { try await WindowStatesManager.shared.providerQuotaRuntime.completeClaudeUsageSetup() }
             )
         }
     }
@@ -344,6 +407,10 @@ struct ProviderUsageQuotaSection: View {
                     .toggleStyle(.checkbox)
             }
             if case let .active(deactivateTitle) = configuration.sourceState {
+                if configuration.prepareSetup != nil {
+                    Button("Open Claude setup…") { showsSetup = true }
+                        .buttonStyle(CustomButtonStyle())
+                }
                 Button(deactivateTitle) { configuration.deactivateSource() }
                     .buttonStyle(.link)
             }

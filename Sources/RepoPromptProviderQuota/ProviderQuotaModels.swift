@@ -105,13 +105,14 @@ package enum ProviderQuotaSource: Equatable {
     case codexAppServerNotification
     case claudeSDKEvent
     case claudeOAuthRead
+    case claudeCLIUsage
     case providerRead(ProviderUsageProviderID)
     case providerPush(ProviderUsageProviderID)
 
     package var isPushUpdate: Bool {
         switch self {
         case .codexAppServerNotification, .claudeSDKEvent, .providerPush: true
-        case .codexAppServerRead, .claudeOAuthRead, .providerRead: false
+        case .codexAppServerRead, .claudeOAuthRead, .claudeCLIUsage, .providerRead: false
         }
     }
 }

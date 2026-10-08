@@ -16,7 +16,7 @@ final class ProviderQuotaRuntime {
     let claudeUI: ProviderQuotaUIStore
     let codexIndicator: ProviderQuotaIndicatorStore
     let claudeIndicator: ProviderQuotaIndicatorStore
-    private let claudeSource: ClaudeAccountUsageSource
+    private let claudeSource: ClaudeCLIUsageSource
     private let settingsStore: GlobalSettingsStore
     private var claudeConnectionGeneration: UInt64 = 0
     private var foregroundObservation: AnyCancellable?
@@ -35,11 +35,12 @@ final class ProviderQuotaRuntime {
     ) {
         self.settingsStore = settingsStore
         let codex = CodexProviderQuotaService(clientFactory: codexClientFactory, accountIDProvider: accountIDProvider)
-        let source = ClaudeAccountUsageSource(consentProvider: {
-            await settingsStore.claudeAccountUsageGrant()?.credentialProfileID
+        let source = ClaudeCLIUsageSource(consentProvider: {
+            let grant = await settingsStore.claudeCLIUsageGrant()
+            return grant?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true ? grant?.credentialProfileID : nil
         })
         claudeSource = source
-        let claude = ProviderAccountQuotaService(read: { context in try await source.read(context) })
+        let claude = ProviderAccountQuotaService(periodicReads: false, cachedRead: { await source.cachedSnapshot() }, read: { context in try await source.read(context) })
         self.codex = codex
         self.claude = claude
         data = ProviderUsageHub(sources: [.codex: codex, .claude: claude])
@@ -51,7 +52,7 @@ final class ProviderQuotaRuntime {
         claudeUI = ProviderQuotaUIStore(
             service: claude,
             settingsProvider: {
-                settingsStore.claudeAccountUsageGrant()?.credentialProfileID == ClaudeUsageCredentialProfile.current().id
+                settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true
             },
             presentationProvider: { settingsStore.usageLimitsDisplayEnabled() }
         )
@@ -70,7 +71,6 @@ final class ProviderQuotaRuntime {
     func applyUsageDisplayEnabled(_ enabled: Bool) {
         if !enabled {
             claudeConnectionGeneration &+= 1
-            Task { [claudeSource] in await claudeSource.cancelUserConnection() }
         }
         codexUI.setPresentationEnabled(enabled)
         claudeUI.setPresentationEnabled(enabled)
@@ -80,29 +80,56 @@ final class ProviderQuotaRuntime {
         codexUI.setEnabled(enabled)
     }
 
-    /// Only called after the UI's explicit read-only credential disclosure. A prior passive
+    /// Only called after the UI's explicit CLI usage disclosure. A prior passive
     /// SDK setting is deliberately not migrated into this profile-scoped consent record.
-    func connectClaudeUsage() {
+    func connectClaudeUsage(startReading: Bool = true) {
         claudeConnectionGeneration &+= 1
         let generation = claudeConnectionGeneration
         let profileID = currentClaudeUsageProfileID
-        settingsStore.setClaudeAccountUsageGrant(ClaudeAccountUsageGrant(credentialProfileID: profileID, grantedAt: Date()))
-        Task { [weak self, claudeSource, claude] in
-            await claudeSource.prepareUserConnection()
+        settingsStore.setClaudeAccountUsageGrant(nil)
+        settingsStore.setClaudeCLIUsageGrant(ClaudeCLIUsageGrant(credentialProfileID: profileID, grantedAt: Date()))
+        if !startReading { claudeUI.setEnabled(false) }
+        Task { [weak self, claude] in
             guard let self, claudeConnectionGeneration == generation,
-                  settingsStore.claudeAccountUsageGrant()?.credentialProfileID == profileID else { return }
+                  settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: profileID) == true else { return }
             await claude.invalidate()
             guard claudeConnectionGeneration == generation,
-                  settingsStore.claudeAccountUsageGrant()?.credentialProfileID == profileID else { return }
-            claudeUI.setEnabled(true)
+                  settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: profileID) == true else { return }
+            claudeUI.setEnabled(startReading)
         }
+    }
+
+    /// An explicit setup-completion transition, not a bypass of ordinary Refresh throttling.
+    func completeClaudeUsageSetup() async throws {
+        claudeConnectionGeneration &+= 1
+        let generation = claudeConnectionGeneration
+        let profileID = currentClaudeUsageProfileID
+        guard settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: profileID) == true else { throw ProviderQuotaReadError.needsConsent }
+        await claude.invalidate()
+        guard generation == claudeConnectionGeneration,
+              settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: profileID) == true else { throw ProviderQuotaReadError.needsConsent }
+        claudeUI.setEnabled(true)
+        claudeUI.refresh()
+    }
+
+    func prepareClaudeUsageSetup() async throws -> URL {
+        let generation = claudeConnectionGeneration
+        let url = try await claudeSource.prepareSetup()
+        guard generation == claudeConnectionGeneration,
+              settingsStore.claudeCLIUsageGrant()?.applies(toProfileID: currentClaudeUsageProfileID) == true else { throw ProviderQuotaReadError.needsConsent }
+        return url
     }
 
     func disconnectClaudeUsage() {
         claudeConnectionGeneration &+= 1
+        let generation = claudeConnectionGeneration
         settingsStore.setClaudeAccountUsageGrant(nil)
+        settingsStore.setClaudeCLIUsageGrant(nil)
         claudeUI.setEnabled(false)
-        Task { [claudeSource] in await claudeSource.cancelUserConnection() }
+        Task { [weak self, claudeSource] in
+            guard let self, claudeConnectionGeneration == generation else { return }
+            await claudeSource.clearCache()
+        }
     }
 }
 

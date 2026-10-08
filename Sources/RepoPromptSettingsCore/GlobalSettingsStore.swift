@@ -1112,6 +1112,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     }
 
     /// UI-only consent record. Deliberately has no MCP writer.
+    package func claudeCLIUsageGrant() -> ClaudeCLIUsageGrant? {
+        scalarPreferences.agentMode?.claudeCLIUsageGrant
+    }
+
+    package func setClaudeCLIUsageGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeCLIUsageGrant = grant }
+    }
+
     package func claudeAccountUsageGrant() -> ClaudeAccountUsageGrant? {
         scalarPreferences.agentMode?.claudeAccountUsageGrant
     }

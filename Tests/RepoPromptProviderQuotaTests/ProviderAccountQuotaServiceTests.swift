@@ -13,6 +13,51 @@ final class ProviderAccountQuotaServiceTests: XCTestCase {
         )
     }
 
+    func testOneShotSourceDoesNotPollOnForegroundOrAnotherSubscriber() async throws {
+        let value = try reading()
+        let date = instant
+        let counter = ReadCounter(value: value)
+        let service = ProviderAccountQuotaService(periodicReads: false, now: { date }, read: { _ in await counter.read() })
+        await service.setEnabled(true)
+        let stream = await service.subscribe()
+        var iterator = stream.makeAsyncIterator()
+        while let status = await iterator.next() {
+            if case .loaded = status { break }
+        }
+        await service.refreshOnForeground()
+        let other = await service.subscribe()
+        await service.refreshOnForeground()
+        await service.refreshNow()
+        let count = await counter.count
+        XCTAssertEqual(count, 1, "one startup read; foreground/subscribers and immediate manual clicks cannot create another process")
+        await service.shutdown()
+        withExtendedLifetime((stream, other)) {}
+    }
+
+    func testHydratedCacheSurvivesStartupFailureWithoutRestamping() async throws {
+        let value = try reading()
+        let date = instant.addingTimeInterval(1000)
+        let service = ProviderAccountQuotaService(periodicReads: false, cachedRead: { value }, now: { date }, read: { _ in throw ProviderQuotaReadError.cliUnavailable })
+        await service.setEnabled(true)
+        let stream = await service.subscribe()
+        var iterator = stream.makeAsyncIterator()
+        while let status = await iterator.next() {
+            if case let .failed(_, previous) = status {
+                XCTAssertEqual(previous, value)
+                XCTAssertEqual(previous?.observedAt, instant)
+                break
+            }
+            if case .loading = status { XCTFail("Cache must be visible before live read") }
+        }
+        let cached = await service.latestSnapshot()
+        XCTAssertEqual(cached, value)
+        let observing: any ProviderQuotaObserving = service
+        let sharedCached = await observing.latestSnapshot()
+        XCTAssertEqual(sharedCached, value, "Shared consumers must receive the actor cache, not a default protocol implementation")
+        await service.shutdown()
+        withExtendedLifetime(stream) {}
+    }
+
     func testAPIUnitsAndUnknownAreNotSDKFractionOrZero() throws {
         let snapshot = try reading()
         XCTAssertEqual(snapshot.buckets[0].windows[0].percent?.rawValue, 1)

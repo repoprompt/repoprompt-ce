@@ -751,10 +751,17 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
-        let arguments = buildArguments(
+        var arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil
         )
+        #if DEBUG
+            arguments += ClaudeStatusLineCompatibilityProbe.claimSettingsArguments(
+                launchArguments: ProcessInfo.processInfo.arguments,
+                isFirstParty: launchEnvironment.backend == .defaultClaude,
+                providerArguments: arguments
+            )
+        #endif
 
         let workingDirectory = resolvedWorkingDirectory()
         let spawned = try ProcessLauncher.spawn(

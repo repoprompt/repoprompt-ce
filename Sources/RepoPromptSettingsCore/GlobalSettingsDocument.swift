@@ -20,6 +20,23 @@ package struct ClaudeAccountUsageGrant: Codable, Equatable {
     }
 }
 
+/// Explicit consent for the CLI-owned usage collector; legacy OAuth grants never authorize it.
+package struct ClaudeCLIUsageGrant: Codable, Equatable {
+    package let credentialProfileID: String
+    package let grantedAt: Date
+    package let consentVersion: Int
+
+    package init(credentialProfileID: String, grantedAt: Date, consentVersion: Int = 1) {
+        self.credentialProfileID = credentialProfileID
+        self.grantedAt = grantedAt
+        self.consentVersion = consentVersion
+    }
+
+    package func applies(toProfileID profileID: String) -> Bool {
+        consentVersion == 1 && !credentialProfileID.isEmpty && credentialProfileID == profileID
+    }
+}
+
 private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
     OracleRosterContract.sanitizedAdditionalModelIDs(raws)
 }
@@ -1004,6 +1021,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var usageLimitsDisplayEnabled: Bool?
         /// Explicit, UI-only consent to read Claude account usage for one config profile.
         package var claudeAccountUsageGrant: ClaudeAccountUsageGrant?
+        package var claudeCLIUsageGrant: ClaudeCLIUsageGrant?
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
@@ -1031,6 +1049,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             claudeUsageQuotaEnabled: Bool? = nil,
             usageLimitsDisplayEnabled: Bool? = nil,
             claudeAccountUsageGrant: ClaudeAccountUsageGrant? = nil,
+            claudeCLIUsageGrant: ClaudeCLIUsageGrant? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
@@ -1057,6 +1076,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.claudeUsageQuotaEnabled = claudeUsageQuotaEnabled
             self.usageLimitsDisplayEnabled = usageLimitsDisplayEnabled
             self.claudeAccountUsageGrant = claudeAccountUsageGrant
+            self.claudeCLIUsageGrant = claudeCLIUsageGrant
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
