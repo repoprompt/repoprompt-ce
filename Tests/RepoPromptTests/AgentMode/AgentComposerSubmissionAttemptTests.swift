@@ -564,6 +564,8 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(audit.usageBalancingProviderRaw, AgentProviderKind.claudeCode.rawValue)
         XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(viewModel.executableTarget(for: session)))
         XCTAssertFalse(viewModel.freshTaskRoutingEligibility(session: session, text: "Follow up"))
+        store.setUsageBalancingEnabled(false)
+        XCTAssertNil(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general), "Disabled balancing keeps the starting model")
         let requests = await backend.requests
         XCTAssertTrue(requests.isEmpty, "Independent balancing must not request Jev or require a credential")
     }

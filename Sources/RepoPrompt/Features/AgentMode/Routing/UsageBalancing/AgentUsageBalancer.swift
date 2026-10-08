@@ -49,7 +49,7 @@ struct AgentUsageBalancingConfiguration: Equatable {
     var preset: AgentUsageBalancingPreset = .evenPace
 }
 
-/// Attributed memory cache over a pure policy. No provider IO, timer, or external disclosure.
+/// Thin app adapter: maps routing candidates onto the provider-neutral `ProviderUsageBalancer`.
 @MainActor
 final class AgentUsageBalancer {
     struct Decision {
@@ -57,15 +57,19 @@ final class AgentUsageBalancer {
         let reason: String?
     }
 
-    private var snapshots: [String: ProviderQuotaSnapshot] = [:]
-    var onRoutingActivity: (() -> Void)?
+    private let core = ProviderUsageBalancer()
+
+    var onRoutingActivity: (() -> Void)? {
+        get { core.onRoutingActivity }
+        set { core.onRoutingActivity = newValue }
+    }
 
     func update(_ snapshot: ProviderQuotaSnapshot?, provider: String) {
-        snapshots[provider] = snapshot
+        core.update(snapshot, provider: provider)
     }
 
     func clear() {
-        snapshots.removeAll()
+        core.clear()
     }
 
     func choose(
@@ -75,26 +79,23 @@ final class AgentUsageBalancer {
         configuration: AgentTaskRouterConfiguration,
         now: Date = Date()
     ) -> Decision {
-        let unchanged = Decision(candidate: selected, reason: nil)
-        guard configuration.usageBalancing.enabled,
-              let peerClass = selected.usagePeerClass,
-              let peer = candidates.first(where: {
-                  $0.usagePeerClass == peerClass && $0.target.agentRaw != selected.target.agentRaw
-                      && !AgentTaskRoutingCandidateBuilder.isPaidFast($0.target)
-              }) else { return unchanged }
-        // Only a balanceable decision justifies refreshing usage readings.
-        onRoutingActivity?()
-        let base = reading(for: selected, now: now)
-        let other = reading(for: peer, now: now)
-        guard ProviderUsageBalancePolicy.preferPeer(base: base, peer: other, strategy: configuration.usageBalancing.preset.strategy) else { return unchanged }
-        return Decision(candidate: peer, reason: "usage_balance_\(configuration.usageBalancing.preset.rawValue)")
+        let settings = configuration.usageBalancing
+        guard settings.enabled,
+              let index = core.preferredPeerIndex(
+                  selected: Self.option(selected),
+                  options: candidates.map(Self.option),
+                  strategy: settings.preset.strategy,
+                  now: now
+              ) else { return Decision(candidate: selected, reason: nil) }
+        return Decision(candidate: candidates[index], reason: "usage_balance_\(settings.preset.rawValue)")
     }
 
-    private func reading(for candidate: AgentTaskRoutingCandidateBuilder.Candidate, now: Date) -> ProviderUsageBalancePolicy.Reading {
-        ProviderUsageBalancePolicy.reading(
-            snapshots[candidate.target.agentRaw],
-            now: now,
-            modelAliases: candidate.usageModelAliases.union([candidate.target.modelRaw])
+    private static func option(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate) -> ProviderUsageModelOption {
+        ProviderUsageModelOption(
+            provider: candidate.target.agentRaw,
+            peerClass: candidate.usagePeerClass,
+            modelAliases: candidate.usageModelAliases.union([candidate.target.modelRaw]),
+            isPaidFast: AgentTaskRoutingCandidateBuilder.isPaidFast(candidate.target)
         )
     }
 }
