@@ -1114,7 +1114,7 @@ actor ACPAgentSessionController {
                 var updated = ACPDiscoveredSessionModels(
                     options: updatedOptions,
                     currentModelRaw: baseModel,
-                    currentEffortRaw: resolvedEffort == nil || hasFreshEffortReport ? reported?.currentEffortRaw : nil
+                    currentEffortRaw: hasFreshEffortReport ? reported?.currentEffortRaw : nil
                 )
                 updated.currentEffortInboundSequence = hasFreshEffortReport ? reported?.currentEffortInboundSequence : nil
                 discoveredSessionModels = updated
