@@ -63,11 +63,11 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     func testConfigOptionsOnlyUpdatePreservesLiveDirectEffortSelection() async throws {
-        let cases: [(name: String, order: String, reportedID: String?, afterSelection: String?, afterPrompt: String?)] = [
-            ("model-only control", "before", nil, nil, nil),
-            ("report before response", "before", "eff-low", "low", "low"),
-            ("response before differing report", "after", "eff-high", nil, "high"),
-            ("unresolvable option id", "before", "not-advertised", nil, nil)
+        let cases: [(name: String, order: String, reportedID: String?, postSelectionID: String?, afterSelection: String?, afterPrompt: String?)] = [
+            ("model-only update before response", "before", nil, nil, nil, nil),
+            ("report before response", "before", "eff-low", nil, "low", "low"),
+            ("response before differing report", "after", "eff-high", nil, nil, "high"),
+            ("unresolvable option id", "before", "eff-low", "not-advertised", "low", nil)
         ]
         var observedEfforts: [[String?]] = []
         for testCase in cases {
@@ -83,6 +83,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 "ACP_EFFORT_REPORT_ORDER": testCase.order
             ]
             environment["ACP_REPORTED_EFFORT_ID"] = testCase.reportedID
+            environment["ACP_POST_SELECTION_EFFORT_ID"] = testCase.postSelectionID
             let provider = EnvForwardingGrokProvider(config: config, extraEnvironment: environment)
             let request = ACPRunRequest(
                 agentKind: .grokBuild,
@@ -515,6 +516,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         CLOSE_STDIN_ON_OPEN = __CLOSE_STDIN_ON_OPEN__
         effort_report_order = os.environ.get("ACP_EFFORT_REPORT_ORDER")
         reported_effort_id = os.environ.get("ACP_REPORTED_EFFORT_ID")
+        post_selection_effort_id = os.environ.get("ACP_POST_SELECTION_EFFORT_ID")
         withhold_set_model_response = os.environ.get("ACP_WITHHOLD_SET_MODEL_RESPONSE") == "1"
         selected_model = "grok-4.6"
         late_effort_report_pending = False
@@ -607,13 +609,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 selected_model = params.get("modelId")
                 if effort_report_order == "before":
                     config_update(reported_effort_id)
-                elif effort_report_order == "after":
-                    late_effort_report_pending = True
+                late_effort_report_pending = effort_report_order == "after" or post_selection_effort_id is not None
                 respond(request_id, {"_meta": {"model": {"Ok": selected_model}}})
             elif method == "session/prompt":
                 if ADVERTISE_CONFIG_OPTIONS:
                     # A subsequent request fences the late report behind selection completion.
-                    config_update(reported_effort_id if late_effort_report_pending else None)
+                    config_update((post_selection_effort_id or reported_effort_id) if late_effort_report_pending else None)
                     late_effort_report_pending = False
                 print(json.dumps({
                     "jsonrpc": "2.0", "method": "session/update",
@@ -702,6 +703,14 @@ private struct EnvForwardingGrokProvider: ACPAgentProvider {
 }
 
 extension EnvForwardingGrokProvider: ACPDirectSessionModelProvider {
+    func parseDirectSessionEffortReport(
+        from configOptions: [[String: Any]],
+        sessionID: String,
+        options: [AgentModelOption]
+    ) -> ACPDirectSessionEffortReport? {
+        inner.parseDirectSessionEffortReport(from: configOptions, sessionID: sessionID, options: options)
+    }
+
     func parseDirectSessionModelSnapshot(from sessionResponse: [String: Any]) -> ACPProviderModelSnapshotResult {
         inner.parseDirectSessionModelSnapshot(from: sessionResponse)
     }
