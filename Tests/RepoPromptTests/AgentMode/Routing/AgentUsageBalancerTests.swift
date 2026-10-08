@@ -59,12 +59,15 @@ final class AgentUsageBalancerTests: XCTestCase {
 
     func testPeerClassesSingletonsAndModelLimitsAreRespected() throws {
         let advisor = AgentUsageBalancer()
+        var activities = 0
+        advisor.onRoutingActivity = { activities += 1 }
         let claude = candidate("claude", .claudeCode), codex = candidate("codex", .codexExec)
         try advisor.update(snapshot(95), provider: claude.target.agentRaw)
         try advisor.update(snapshot(5), provider: codex.target.agentRaw)
         for candidates in [[claude], [claude, candidate("codex", .codexExec, peer: "light")]] {
             XCTAssertEqual(advisor.choose(selected: claude, candidates: candidates, evidence: nil, configuration: configuration(), now: instant).candidate, claude)
         }
+        XCTAssertEqual(activities, 0, "No balanceable peer means no refresh activity")
         let base = try snapshot(10), id = ProviderQuotaBucketID(rawValue: "model-limit")
         let window = ProviderQuotaWindow(key: .init(bucketID: id, nativeRole: "weekly"), percent: .init(rawValue: 100, sense: .used, declaredUpperBound: 100), windowDuration: 604_800, resetsAt: instant.addingTimeInterval(60), observedAt: instant)
         let bucket = ProviderQuotaBucket(bucketID: id, displayLabel: nil, nativeModelAlias: "codex", scope: .nativeModelAlias("codex"), reachedType: nil, isReached: nil, planType: nil, credits: nil, spendControl: nil, windows: [window])

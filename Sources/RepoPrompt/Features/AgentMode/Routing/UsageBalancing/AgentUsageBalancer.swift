@@ -76,13 +76,14 @@ final class AgentUsageBalancer {
         now: Date = Date()
     ) -> Decision {
         let unchanged = Decision(candidate: selected, reason: nil)
-        guard configuration.usageBalancing.enabled else { return unchanged }
-        onRoutingActivity?()
-        guard let peerClass = selected.usagePeerClass,
+        guard configuration.usageBalancing.enabled,
+              let peerClass = selected.usagePeerClass,
               let peer = candidates.first(where: {
                   $0.usagePeerClass == peerClass && $0.target.agentRaw != selected.target.agentRaw
                       && !AgentTaskRoutingCandidateBuilder.isPaidFast($0.target)
               }) else { return unchanged }
+        // Only a balanceable decision justifies refreshing usage readings.
+        onRoutingActivity?()
         let base = reading(for: selected, now: now)
         let other = reading(for: peer, now: now)
         guard ProviderUsageBalancePolicy.preferPeer(base: base, peer: other, strategy: configuration.usageBalancing.preset.strategy) else { return unchanged }

@@ -15,10 +15,7 @@ extension AgentModeViewModel {
             : modelRouterAvailabilityContext
         let preferred = scope == .subagent ? configuration.subagentProvider : configuration.primaryProvider
         let allowed = AgentTaskRoutingCandidateBuilder.providers(preferring: preferred, from: AgentTaskRoutingCandidateBuilder.availableProviders(availability: availability, surface: surface))
-        guard let input = AgentTaskRoutingCandidateBuilder().usageCandidates(basedOn: target, allowedProviders: allowed, availability: availability, surface: surface) else {
-            advisor.onRoutingActivity?()
-            return nil
-        }
+        guard let input = AgentTaskRoutingCandidateBuilder().usageCandidates(basedOn: target, allowedProviders: allowed, availability: availability, surface: surface) else { return nil }
         let decision = advisor.choose(selected: input.selected, candidates: input.candidates, evidence: nil, configuration: configuration)
         return decision.reason == nil ? nil : decision
     }
