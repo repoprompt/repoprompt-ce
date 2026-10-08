@@ -1102,6 +1102,14 @@ actor ACPAgentSessionController {
                 #if DEBUG
                     await debugSuspendConfigurationMutationPostcheckIfNeeded()
                 #endif
+                // Never overwrite a different-base report that arrived after this acknowledgement.
+                if let reported = discoveredSessionModels,
+                   reported.currentModelRaw != baseModel,
+                   let reportSequence = reported.currentEffortInboundSequence,
+                   reportSequence > selectionResponse.inboundSequence
+                {
+                    throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(baseModel)'")
+                }
                 // The selection was already validated as a snapshot member; never append
                 // recovery options here — an appended compound would lack effortVariant
                 // provenance and later read back as a real base.
