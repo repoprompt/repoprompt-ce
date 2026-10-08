@@ -63,11 +63,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     func testConfigOptionsOnlyUpdatePreservesLiveDirectEffortSelection() async throws {
-        let cases: [(name: String, order: String, reportedID: String?, postSelectionID: String?, afterSelection: String?, afterPrompt: String?)] = [
-            ("model-only update before response", "before", nil, nil, nil, nil),
-            ("report before response", "before", "eff-low", nil, "low", "low"),
-            ("response before differing report", "after", "eff-high", nil, nil, "high"),
-            ("unresolvable option id", "before", "eff-low", "not-advertised", "low", nil)
+        let cases: [(name: String, order: String, reportedID: String?, postSelectionID: String?, afterSelection: String?, afterPrompt: String?, selectedModel: String, expectedBase: String, expectedWireEffort: String?)] = [
+            ("model-only update before response", "before", nil, nil, nil, nil, "grok-4.6-low", "grok-4.6", "low"),
+            ("report before response", "before", "eff-low", nil, "low", "low", "grok-4.6-low", "grok-4.6", "low"),
+            ("response before differing report", "after", "eff-high", nil, nil, "high", "grok-4.6-low", "grok-4.6", "low"),
+            ("unresolvable option id", "before", "eff-low", "not-advertised", "low", nil, "grok-4.6-low", "grok-4.6", "low"),
+            ("effort-free switch without report", "before", nil, nil, nil, nil, "grok-4.5", "grok-4.5", nil)
         ]
         var observedEfforts: [[String?]] = []
         for testCase in cases {
@@ -75,7 +76,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             let config = GrokBuildAgentConfig(
                 commandName: harness.scriptPath,
                 additionalPathHints: [],
-                modelString: "grok-4.6-low",
+                modelString: testCase.selectedModel,
                 includeRepoPromptMCPServer: false
             )
             var environment = [
@@ -101,21 +102,22 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 let bootstrap = try await controller.bootstrap()
                 let initialState = await controller.currentDiscoveredSessionModels()
                 let initial = try XCTUnwrap(initialState, testCase.name)
+                XCTAssertEqual(initial.currentModelRaw, "grok-4.6", "initial authority: \(testCase.name)")
                 XCTAssertEqual(initial.currentEffortRaw, "xhigh", "initial authority: \(testCase.name)")
                 XCTAssertTrue(initial.options.contains { $0.rawValue == "grok-4.6-low" }, testCase.name)
                 XCTAssertTrue(initial.options.contains { $0.rawValue == "grok-4.6-max" }, testCase.name)
 
                 // Preserve the original model-only update-before-selection regression.
                 try await controller.prompt(AgentMessage(userMessage: "before selection"), request: request)
-                try await controller.setSessionModel("grok-4.6-low")
+                try await controller.setSessionModel(testCase.selectedModel)
                 let selected = await controller.currentDiscoveredSessionModels()
-                XCTAssertEqual(selected?.currentModelRaw, "grok-4.6", testCase.name)
+                XCTAssertEqual(selected?.currentModelRaw, testCase.expectedBase, testCase.name)
 
                 // The peer releases the late report only on this request, which cannot be
                 // dispatched until setSessionModel has returned. Its prompt reply fences processing.
                 try await controller.prompt(AgentMessage(userMessage: "after selection"), request: request)
                 let reported = await controller.currentDiscoveredSessionModels()
-                XCTAssertEqual(reported?.currentModelRaw, "grok-4.6", testCase.name)
+                XCTAssertEqual(reported?.currentModelRaw, testCase.expectedBase, testCase.name)
                 observedEfforts.append([selected?.currentEffortRaw, reported?.currentEffortRaw])
                 XCTAssertEqual(reported?.options, initial.options, "direct catalog: \(testCase.name)")
                 let mapped = provider.makeDirectModelSelectionRequest(
@@ -130,9 +132,9 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
 
             let setModelCalls = harness.recordedMethods("session/set_model")
             XCTAssertEqual(setModelCalls.count, 1, testCase.name)
-            XCTAssertEqual(setModelCalls.first?["modelId"] as? String, "grok-4.6", testCase.name)
+            XCTAssertEqual(setModelCalls.first?["modelId"] as? String, testCase.expectedBase, testCase.name)
             let meta = setModelCalls.first?["_meta"] as? [String: Any]
-            XCTAssertEqual(meta?["reasoningEffort"] as? String, "low", testCase.name)
+            XCTAssertEqual(meta?["reasoningEffort"] as? String, testCase.expectedWireEffort, testCase.name)
         }
         // Exercise every row before asserting the red effort outcomes.
         XCTAssertEqual(observedEfforts, cases.map { [$0.afterSelection, $0.afterPrompt] }, cases.map(\.name).joined(separator: "; "))

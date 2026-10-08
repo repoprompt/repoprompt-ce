@@ -1111,12 +1111,11 @@ actor ACPAgentSessionController {
                 let reported = discoveredSessionModels
                 let hasFreshEffortReport = reported?.currentModelRaw == baseModel
                     && reported?.currentEffortInboundSequence.map { $0 > selectionBaselineSequence } == true
-                var updated = ACPDiscoveredSessionModels(
+                let updated = ACPDiscoveredSessionModels(
                     options: updatedOptions,
                     currentModelRaw: baseModel,
                     currentEffortRaw: hasFreshEffortReport ? reported?.currentEffortRaw : nil
                 )
-                updated.currentEffortInboundSequence = hasFreshEffortReport ? reported?.currentEffortInboundSequence : nil
                 discoveredSessionModels = updated
                 publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
                 return

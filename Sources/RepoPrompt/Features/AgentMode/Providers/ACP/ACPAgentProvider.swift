@@ -349,16 +349,6 @@ protocol ACPDirectSessionModelProvider: Sendable {
     ) -> ACPDirectModelSelectionRequest
 }
 
-extension ACPDirectSessionModelProvider {
-    func parseDirectSessionEffortReport(
-        from _: [[String: Any]],
-        sessionID _: String,
-        options _: [AgentModelOption]
-    ) -> ACPDirectSessionEffortReport? {
-        nil
-    }
-}
-
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
