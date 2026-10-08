@@ -677,6 +677,78 @@ private extension NSLock {
             )
         }
 
+        func testFullScanDoesNotRedecodeStoreLargerThanDecodedCacheBudget() async throws {
+            let fixture = try await makeFixture(recordCount: 2)
+            _ = try await fixture.publish()
+            let limited = try CodeMapRootManifestStore(rootURL: fixture.root, policy: policy(cacheBytes: 1))
+            let initial = try await limited.accounting()
+            XCTAssertEqual(initial.manifestCount, 1)
+            let decodesAfterFirstScan = await limited.scanDecodeCountForTesting()
+            XCTAssertEqual(decodesAfterFirstScan, 1)
+            let entries = await limited.decodedManifestCacheEntryCountForTesting()
+            XCTAssertEqual(entries, 0)
+
+            for _ in 0 ..< 3 {
+                let accounting = try await limited.accounting()
+                XCTAssertEqual(accounting, initial)
+            }
+            let decodesAfterRescans = await limited.scanDecodeCountForTesting()
+            XCTAssertEqual(decodesAfterRescans, 1)
+
+            _ = try await fixture.publish(using: limited)
+            _ = try await limited.accounting()
+            let decodesAfterRepublish = await limited.scanDecodeCountForTesting()
+            XCTAssertEqual(decodesAfterRepublish, 1)
+        }
+
+        func testScanSummaryIsNotReusedAfterManifestBytesChange() async throws {
+            let fixture = try await makeFixture()
+            _ = try await fixture.publish()
+            let limited = try CodeMapRootManifestStore(rootURL: fixture.root, policy: policy(cacheBytes: 1))
+            _ = try await limited.accounting()
+            let decodesBeforeRewrite = await limited.scanDecodeCountForTesting()
+            XCTAssertEqual(decodesBeforeRewrite, 1)
+
+            // Same inode, length and mtime: only the content checksum can reject the cached summary.
+            let replacement = try CodeMapRootManifestCodec.encode(snapshot: CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 9,
+                lastAccessEpochSeconds: 100,
+                records: []
+            ))
+            try overwriteInPlacePreservingModificationDate(fixture.manifestURL, with: replacement)
+            let afterRewrite = try await limited.accounting()
+            XCTAssertEqual(afterRewrite.manifestCount, 1)
+            let decodesAfterRewrite = await limited.scanDecodeCountForTesting()
+            XCTAssertEqual(decodesAfterRewrite, 2)
+
+            var corrupt = replacement
+            corrupt[corrupt.count - 1] ^= 1
+            try overwriteInPlacePreservingModificationDate(fixture.manifestURL, with: corrupt)
+            let afterCorruption = try await limited.accounting()
+            XCTAssertEqual(afterCorruption.manifestCount, 0)
+        }
+
+        func testLowercaseHexMatchesFormattedEncoding() {
+            let allBytes = Data((0 ... 255).map { UInt8($0) })
+            XCTAssertEqual(allBytes.lowercaseHex, allBytes.map { String(format: "%02x", $0) }.joined())
+            XCTAssertEqual(Data().lowercaseHex, "")
+            let slice = allBytes[250 ..< 256]
+            XCTAssertNotEqual(slice.startIndex, 0)
+            XCTAssertEqual(slice.lowercaseHex, "fafbfcfdfeff")
+        }
+
+        private func overwriteInPlacePreservingModificationDate(_ url: URL, with data: Data) throws {
+            let oldData = try Data(contentsOf: url)
+            XCTAssertEqual(data.count, oldData.count)
+            let oldDate = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate])
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.write(contentsOf: data)
+            try handle.close()
+            try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: url.path)
+        }
+
         func testTargetLargerThanCacheBudgetIsDecodedWithoutRetention() async throws {
             let fixture = try await makeFixture()
             _ = try await fixture.publish()

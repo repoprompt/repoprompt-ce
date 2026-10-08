@@ -21883,8 +21883,10 @@ actor WorkspaceFileContextStore {
         let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
         let allowedRootIDs = Set(roots.map(\.id))
+        // Records land in path-keyed dictionaries, so iteration order is irrelevant; sorting every
+        // path here dominated chat token estimation on large workspaces.
         var fileRecords: [String: FileRecord] = [:]
-        for file in filesByID.values.sorted(by: { $0.standardizedFullPath < $1.standardizedFullPath }) {
+        for file in filesByID.values {
             guard allowedRootIDs.contains(file.rootID),
                   isDiscoverableFileID(file.id),
                   let root = rootStatesByID[file.rootID]?.root,
@@ -21898,7 +21900,7 @@ actor WorkspaceFileContextStore {
             ) as FileRecord
         }
         var folderRecords: [String: FolderRecord] = [:]
-        for folder in foldersByID.values.sorted(by: { $0.standardizedFullPath < $1.standardizedFullPath }) {
+        for folder in foldersByID.values {
             guard allowedRootIDs.contains(folder.rootID),
                   isDiscoverableFolderID(folder.id),
                   let root = rootStatesByID[folder.rootID]?.root,

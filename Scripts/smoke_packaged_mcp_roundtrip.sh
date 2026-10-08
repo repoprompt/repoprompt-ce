@@ -47,8 +47,8 @@ process_matches() {
     [[ -n "$APP_PID" ]] || return 1
     kill -0 "$APP_PID" 2>/dev/null || return 1
     local command start
-    command="$(ps -p "$APP_PID" -o command= 2>/dev/null | sed 's/^[[:space:]]*//')"
-    start="$(ps -p "$APP_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//')"
+    command="$(LC_ALL=C LANG=C ps -p "$APP_PID" -o command= 2>/dev/null | sed 's/^[[:space:]]*//')"
+    start="$(LC_ALL=C LANG=C ps -p "$APP_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//')"
     [[ "$command" == "$APP_COMMAND" ]] || return 1
     [[ -z "$APP_START" || "$start" == "$APP_START" ]]
 }
@@ -180,8 +180,8 @@ env -i \
     "$APP_EXECUTABLE" >"$APP_LOG" 2>&1 &
 APP_PID=$!
 sleep 0.2
-ACTUAL_COMMAND="$(ps -p "$APP_PID" -o command= 2>/dev/null | sed 's/^[[:space:]]*//')"
-APP_START="$(ps -p "$APP_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//')"
+ACTUAL_COMMAND="$(LC_ALL=C LANG=C ps -p "$APP_PID" -o command= 2>/dev/null | sed 's/^[[:space:]]*//')"
+APP_START="$(LC_ALL=C LANG=C ps -p "$APP_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//')"
 [[ -n "$ACTUAL_COMMAND" && -n "$APP_START" ]] || fail "could not record launched packaged app process identity"
 [[ "$ACTUAL_COMMAND" == "$APP_EXECUTABLE" ]] ||
     fail "launched process identity mismatch: expected $APP_EXECUTABLE, got $ACTUAL_COMMAND"

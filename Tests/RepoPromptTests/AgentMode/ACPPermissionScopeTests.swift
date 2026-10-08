@@ -149,8 +149,78 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
-    /// Declines any surfaced approval, so `reject_once` means manual and `allow_once` means auto.
-    private func autoApprovalOutcome(toolCallJSON: String) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
+    func testGrokRepoPromptAutoApprovalRequiresGenuineOneTimeOption() async throws {
+        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
+        let cases: [(name: String, options: [[String: String]], expectedOptionID: String?)] = [
+            ("genuine one-time option", [
+                ["optionId": "allow-once", "kind": "allow_once"]
+            ], "allow-once"),
+            ("one-time ID with persistent kind alongside genuine option", [
+                ["optionId": "allow-once", "kind": "allow_always"],
+                ["optionId": "opaque-once", "kind": "allow_once"]
+            ], "opaque-once"),
+            ("persistent ID with one-time kind alongside genuine option", [
+                ["optionId": "always-allow", "kind": "allow_once"],
+                ["optionId": "opaque-once", "kind": "allow_once"]
+            ], "opaque-once"),
+            ("one-time ID with persistent kind only", [
+                ["optionId": "allow-once", "kind": "allow_always"]
+            ], nil),
+            ("persistent ID with one-time kind only", [
+                ["optionId": "always-allow", "kind": "allow_once"]
+            ], nil),
+            ("session grant and denylisted option only", [
+                ["optionId": "allow-edits-session", "kind": "allow_always"],
+                ["optionId": "enable-always-approve", "kind": "allow_once"]
+            ], nil)
+        ]
+        // Exercise every row before asserting so a red run reports both unsafe selection paths.
+        var mismatches: [String] = []
+        for testCase in cases {
+            let result = try await autoApprovalOutcome(
+                toolCallJSON: toolCall, providerID: .grokBuild,
+                options: testCase.options + [["optionId": "reject_once", "kind": "reject_once"]]
+            )
+            let expectedApprovalRequested = testCase.expectedOptionID == nil
+            let expectedOptionID = testCase.expectedOptionID ?? "reject_once"
+            if result.approvalRequested != expectedApprovalRequested {
+                mismatches.append("\(testCase.name): approvalRequested=\(result.approvalRequested), expected=\(expectedApprovalRequested)")
+            }
+            if result.outcome["outcome"] != "selected" {
+                mismatches.append("\(testCase.name): outcome=\(result.outcome["outcome"] ?? "missing"), expected=selected")
+            }
+            if result.outcome["optionId"] != expectedOptionID {
+                mismatches.append("\(testCase.name): optionId=\(result.outcome["optionId"] ?? "missing"), expected=\(expectedOptionID)")
+            }
+        }
+        XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "\n"))
+    }
+
+    func testOtherProvidersRepoPromptAutoApprovalIsUnchanged() async throws {
+        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
+        let options = [
+            ["optionId": "always", "kind": "allow_always"],
+            ["optionId": "allow_once", "kind": "allow_once"],
+            ["optionId": "reject_once", "kind": "reject_once"]
+        ]
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .devin] {
+            let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID, options: options)
+            XCTAssertFalse(result.approvalRequested, "\(providerID)")
+            XCTAssertEqual(result.outcome["outcome"], "selected", "\(providerID)")
+            XCTAssertEqual(result.outcome["optionId"], providerID == .devin ? "allow_once" : "always", "\(providerID)")
+        }
+    }
+
+    /// Declines any surfaced approval, distinguishing manual approval from automatic selection.
+    private func autoApprovalOutcome(
+        toolCallJSON: String,
+        providerID: ACPProviderID = .openCode,
+        options: [[String: String]] = [
+            ["optionId": "allow_once", "kind": "allow_once", "name": "Allow"],
+            ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
+        ]
+    ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
+        let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPAutoApprovalProvenance")
         let executable = directory.appendingPathComponent("scripted-acp")
         let record = directory.appendingPathComponent("response.json")
@@ -172,10 +242,7 @@ final class ACPPermissionScopeTests: XCTestCase {
                 prompt_id = request["id"]
                 send({"id": "permission-1", "method": "session/request_permission", "params": {
                     "sessionId": "test-session", "toolCall": json.loads(r'\#(toolCallJSON)'),
-                    "options": [
-                        {"optionId": "allow_once", "kind": "allow_once", "name": "Allow"},
-                        {"optionId": "reject_once", "kind": "reject_once", "name": "Decline"}
-                    ]
+                    "options": json.loads(r'\#(optionsJSON)')
                 }})
             elif request.get("id") == "permission-1":
                 with open(r"\#(record.path)", "w", encoding="utf-8") as output:
@@ -184,12 +251,19 @@ final class ACPPermissionScopeTests: XCTestCase {
         """#
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let agentKind: AgentProviderKind = switch providerID {
+        case .openCode: .openCode
+        case .cursor: .cursor
+        case .antigravity: .antigravity
+        case .grokBuild: .grokBuild
+        case .devin: .devin
+        }
         let request = ACPRunRequest(
-            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            agentKind: agentKind, modelString: nil, workspacePath: directory.path,
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
         let controller = try ACPAgentSessionController(
-            provider: ScriptedScopeProvider(providerID: .openCode, executable: executable.path), runRequest: request,
+            provider: ScriptedScopeProvider(providerID: providerID, executable: executable.path), runRequest: request,
             allowsProviderProcessLaunchForTesting: true
         )
         do {

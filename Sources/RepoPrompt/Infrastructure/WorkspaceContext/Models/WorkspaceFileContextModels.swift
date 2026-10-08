@@ -472,7 +472,7 @@ struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
         self.id = id
         self.name = name
         self.fullPath = fullPath
-        standardizedFullPath = (fullPath as NSString).standardizingPath
+        standardizedFullPath = StandardizedPath.absolute(fullPath)
         self.isSystemRoot = isSystemRoot
         self.kind = kind
     }
@@ -504,7 +504,7 @@ struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
         self.relativePath = relativePath
         standardizedRelativePath = StandardizedPath.relative(relativePath)
         self.fullPath = fullPath
-        standardizedFullPath = (fullPath as NSString).standardizingPath
+        standardizedFullPath = StandardizedPath.absolute(fullPath)
         self.parentFolderID = parentFolderID
         self.modificationDate = modificationDate
     }
@@ -536,7 +536,7 @@ struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
         self.relativePath = relativePath
         standardizedRelativePath = StandardizedPath.relative(relativePath)
         self.fullPath = fullPath
-        standardizedFullPath = (fullPath as NSString).standardizingPath
+        standardizedFullPath = StandardizedPath.absolute(fullPath)
         self.parentFolderID = parentFolderID
         self.modificationDate = modificationDate
     }

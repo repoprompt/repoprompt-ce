@@ -4060,7 +4060,8 @@ extension MCPServerViewModel {
     func cleanupRunIDMapping(
         runID: UUID,
         connectionID: UUID,
-        signalRoutingFailure: Bool = true
+        signalRoutingFailure: Bool = true,
+        routingWaitGeneration: UUID? = nil
     ) {
         readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         if connectionIDByRunID[runID] == connectionID {
@@ -4074,7 +4075,7 @@ extension MCPServerViewModel {
 
         // A stale generation must not fail routing for a newer replacement connection.
         if signalRoutingFailure, liveConnectionID(forRunID: runID) == nil {
-            MCPRoutingWaiter.signalFailed(runID)
+            MCPRoutingWaiter.signalFailed(runID, generation: routingWaitGeneration)
         }
     }
 
@@ -4311,7 +4312,8 @@ extension MCPServerViewModel {
         _ token: PendingPolicyRunIDMappingToken,
         clientName: String?,
         windowID: Int?,
-        signalRoutingFailure: Bool
+        signalRoutingFailure: Bool,
+        routingWaitGeneration: UUID? = nil
     ) -> PendingPolicyRunIDMappingRollbackResult {
         guard isCurrentPendingPolicyRunIDMapping(token) else {
             let supersededBySameConnection = connectionIDByRunID[token.runID] == token.connectionID
@@ -4325,7 +4327,7 @@ extension MCPServerViewModel {
                 )
             }
             if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
-                MCPRoutingWaiter.signalFailed(token.runID)
+                MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
             }
             return supersededBySameConnection
                 ? .supersededBySameConnection
@@ -4412,7 +4414,7 @@ extension MCPServerViewModel {
         }
 
         if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
-            MCPRoutingWaiter.signalFailed(token.runID)
+            MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
         }
         return .restored
     }

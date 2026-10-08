@@ -7,15 +7,40 @@ import RepoPromptDomainRuntime
 /// or activates a window: resolution, snapshotting, and observation are strictly read-only with
 /// respect to window state.
 extension WindowStatesManager: AgentSessionLinkEndpointHost {
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate] {
         guard !isTerminating else { return [] }
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         for window in allWindows where !window.isClosing {
+            guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             candidates.append(
-                contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false)
+                contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: includeLocation)
             )
         }
         return candidates
+    }
+
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
+        return window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: includeLocation)
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        guard !isTerminating else { return result }
+        for window in allWindows where !window.isClosing {
+            guard modelRoutingWindow(withID: window.windowID) === window else { continue }
+            let local = window.agentModeViewModel.agentSessionLinkCandidates(
+                forSessionIDs: sessionIDs, includeLocation: includeLocation
+            )
+            for sessionID in sessionIDs {
+                result[sessionID, default: []] += local[sessionID] ?? []
+            }
+        }
+        return result
     }
 
     func agentSessionLinkObservationSnapshot(

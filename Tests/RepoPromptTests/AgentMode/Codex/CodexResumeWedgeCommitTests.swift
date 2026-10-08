@@ -134,6 +134,89 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
     }
 
+    func testRepeatedTimeoutReplacementRenewsAdmissionAndDiscardsOldRoutingSignal() async throws {
+        let responseGate = TestReleaseFence(name: "replacement response")
+        let fixture = makeFixture([
+            [.timeout],
+            [.routedTimeout],
+            [.suspendedSuccess("replacement-thread", responseGate)]
+        ])
+        await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer {
+            responseGate.release()
+            startup.cancel()
+        }
+        let entered = await responseGate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        let clientName = try XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint)
+        let staleOutcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: runID)
+        XCTAssertNil(staleOutcome, "the retired process's routed signal must not satisfy the replacement wait")
+        let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertTrue(pendingPolicies.contains { $0.runID == runID }, "replacement needs fresh admission after the old permit expired")
+        assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.factory.controllers[1].shutdownCount, 1)
+        XCTAssertEqual(fixture.factory.controllers[2].runID, runID)
+
+        responseGate.release()
+        try await waitForPendingStart(fixture)
+        assertOldTuple(fixture.session)
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 2)
+        XCTAssertEqual(fixture.factory.controllers[2].startedTurnCount, 0)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        await startup.value
+        XCTAssertEqual(fixture.session.codexConversationID, "replacement-thread")
+        XCTAssertEqual(fixture.session.providerCleanupHandle?.conversationID, "replacement-thread")
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.text.contains("Started a fresh thread") }), 1)
+        let retainedPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
+        XCTAssertTrue(retainedPolicies.contains { $0.runID == runID }, "old lease cleanup must not revoke successor admission")
+        await ServerNetworkManager.shared.revokeClientConnectionPolicy(for: clientName, windowID: 1, runID: runID)
+        await MCPRoutingWaiter.shared.cleanup(runID: runID)
+    }
+
+    func testSettledOldLeaseCannotRevokeSameRunSuccessor() async {
+        let runID = UUID()
+        let tabID = UUID()
+        let clearGate = TestReleaseFence(name: "old permit revocation")
+        let oldLease = MCPBootstrapLease(
+            spec: .agentMode(tabID: tabID, runID: runID, gateID: UUID(), windowID: 1, agent: .codexExec),
+            policyClearer: { spec in
+                await clearGate.enterAndWait()
+                await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                    for: AgentProviderKind.codexMCPClientID,
+                    windowID: spec.windowID,
+                    runID: spec.runID
+                )
+            }
+        )
+        let acquired = await oldLease.acquire()
+        XCTAssertTrue(acquired)
+        let firstCleanup = Task { await oldLease.cancelAndCleanup() }
+        defer { clearGate.release() }
+        let entered = await clearGate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        let secondCleanup = Task { await oldLease.cancelAndCleanup() }
+        _ = await oldLease.debugWaitForPolicyClearJoiner()
+        clearGate.release()
+        await firstCleanup.value
+        await secondCleanup.value
+
+        let successor = MCPBootstrapLease(
+            spec: .agentMode(tabID: tabID, runID: runID, gateID: UUID(), windowID: 1, agent: .codexExec)
+        )
+        let successorAcquired = await successor.acquire()
+        XCTAssertTrue(successorAcquired)
+        await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+        await oldLease.cancelAndCleanup()
+        let pending = await hasPendingPolicy(for: runID)
+        XCTAssertTrue(pending, "settled predecessor must not clear the successor permit")
+        let outcome = await MCPRoutingWaiter.shared.currentTerminalOutcome(runID: runID)
+        XCTAssertEqual(outcome, .routed, "settled predecessor must not fail or remove the successor waiter")
+        await successor.cancelAndCleanup()
+    }
+
     func testRoutingSuccessCommitsFreshFallbackExactlyOnce() async throws {
         let fixture = makeFixture([[.missingRollout, .success("ready-fresh-thread")]])
         let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
@@ -455,6 +538,7 @@ private final class WedgeControllerFactory {
 private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
     enum Response {
         case timeout
+        case routedTimeout
         case missingRollout
         case suspendedSuccess(String, TestReleaseFence)
         case success(String)
@@ -506,6 +590,21 @@ private final class WedgeFakeCodexController: CodexSessionControllerPassiveStubD
             return responses.isEmpty ? nil : responses.removeFirst()
         }
         switch response {
+        case .routedTimeout:
+            // Model a permit pruned during the slow resume, with readiness already cached
+            // from the retired process. Neither may authorize the replacement process.
+            await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                for: AgentProviderKind.codexMCPClientID,
+                windowID: 1,
+                runID: runID
+            )
+            await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: "thread/resume",
+                code: nil,
+                message: "Request timed out after 120.0s",
+                data: nil
+            ))
         case .timeout:
             throw CodexAppServerClient.ClientError.requestFailed(.init(
                 method: "thread/resume",

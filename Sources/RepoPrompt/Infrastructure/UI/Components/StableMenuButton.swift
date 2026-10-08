@@ -60,6 +60,7 @@ struct StableMenuButton<Label: View>: View {
 enum StableMenuItemStyle: Equatable {
     case normal
     case warning
+    case destructive
 }
 
 struct StableMenuItem {
@@ -76,6 +77,9 @@ struct StableMenuItem {
     let isSelected: Bool
     let imageSystemName: String?
     let style: StableMenuItemStyle
+    let accessibilityLabel: String?
+    let accessibilityValue: String?
+    let accessibilityHint: String?
 
     private init(
         title: String,
@@ -83,7 +87,10 @@ struct StableMenuItem {
         isEnabled: Bool = true,
         isSelected: Bool = false,
         imageSystemName: String? = nil,
-        style: StableMenuItemStyle = .normal
+        style: StableMenuItemStyle = .normal,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        accessibilityHint: String? = nil
     ) {
         self.title = title
         self.kind = kind
@@ -91,6 +98,9 @@ struct StableMenuItem {
         self.isSelected = isSelected
         self.imageSystemName = imageSystemName
         self.style = style
+        self.accessibilityLabel = accessibilityLabel
+        self.accessibilityValue = accessibilityValue
+        self.accessibilityHint = accessibilityHint
     }
 
     static func action(
@@ -99,6 +109,9 @@ struct StableMenuItem {
         isSelected: Bool = false,
         imageSystemName: String? = nil,
         style: StableMenuItemStyle = .normal,
+        accessibilityLabel: String? = nil,
+        accessibilityValue: String? = nil,
+        accessibilityHint: String? = nil,
         _ action: @escaping () -> Void
     ) -> StableMenuItem {
         StableMenuItem(
@@ -107,7 +120,10 @@ struct StableMenuItem {
             isEnabled: isEnabled,
             isSelected: isSelected,
             imageSystemName: imageSystemName,
-            style: style
+            style: style,
+            accessibilityLabel: accessibilityLabel,
+            accessibilityValue: accessibilityValue,
+            accessibilityHint: accessibilityHint
         )
     }
 
@@ -148,6 +164,9 @@ struct StableMenuItem {
             item.target = actionBox
             item.representedObject = actionBox
             item.isEnabled = isEnabled
+            item.setAccessibilityLabel(accessibilityLabel ?? title)
+            if let accessibilityValue { item.setAccessibilityValue(accessibilityValue) }
+            if let accessibilityHint { item.setAccessibilityHelp(accessibilityHint) }
             item.state = isSelected ? .on : .off
             configureImage(on: item)
             configureTitle(on: item, fontPreset: fontPreset)
@@ -184,8 +203,10 @@ struct StableMenuItem {
         var attributes: [NSAttributedString.Key: Any] = [
             .font: fontPreset.nsFont(sizeAtNormal: CGFloat(NSFont.systemFontSize), rounded: false)
         ]
-        if style == .warning {
-            attributes[.foregroundColor] = NSColor.systemOrange
+        switch style {
+        case .normal: break
+        case .warning: attributes[.foregroundColor] = NSColor.systemOrange
+        case .destructive: attributes[.foregroundColor] = NSColor.systemRed
         }
         item.attributedTitle = NSAttributedString(string: title, attributes: attributes)
     }

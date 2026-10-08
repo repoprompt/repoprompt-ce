@@ -85,6 +85,10 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
     }
 
     func testLaunchIsolatesImportedMCPServersWithoutChangingUserDirectories() throws {
+        let inheritedEnvironment = [
+            "GROK_MAX_MCP_OUTPUT_BYTES": "200000",
+            "MAX_MCP_OUTPUT_BYTES": "300000"
+        ]
         for apiKey in [nil, "xai-test-key-123"] as [String?] {
             let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(apiKey: apiKey))
             let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
@@ -93,6 +97,16 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             XCTAssertEqual(launch.environment["XAI_API_KEY"], apiKey)
             XCTAssertNil(launch.environment["HOME"])
             XCTAssertNil(launch.environment["GROK_HOME"])
+
+            let environment = ProcessEnvironmentBuilder.composedEnvironment(
+                base: inheritedEnvironment,
+                inherited: inheritedEnvironment,
+                overrides: launch.environment
+            )
+            XCTAssertEqual(
+                environment["GROK_MAX_MCP_OUTPUT_BYTES"], "100000",
+                "MCP output cap must override inherited values (storedKey=\(apiKey != nil))"
+            )
         }
     }
 

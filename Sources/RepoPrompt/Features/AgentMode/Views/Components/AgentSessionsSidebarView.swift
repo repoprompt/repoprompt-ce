@@ -566,6 +566,12 @@ struct AgentModeSessionsListView: View {
                                 expectedSessionID: sessionID
                             )
                         } ?? false
+                        let sidebarOversightSummaryResolver: (@MainActor () -> AgentSidebarOversightSummary?)? =
+                            session.sessionID.map { expectedSessionID in
+                                { @MainActor in
+                                    agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: expectedSessionID)
+                                }
+                            }
                         let sidebarOversightMenuResolver: (@MainActor () -> AgentSidebarOversightMenuProps?)? =
                             session.sessionID.map { expectedSessionID in
                                 { @MainActor in
@@ -663,6 +669,7 @@ struct AgentModeSessionsListView: View {
                             },
                             onDismissAttention: dismissAttentionAction,
                             onCopySessionID: copySessionIDAction,
+                            resolveSidebarOversightSummary: sidebarOversightSummaryResolver,
                             resolveSidebarOversightMenu: sidebarOversightMenuResolver,
                             resolveSidebarOversightTargetEndpoint:
                             sidebarOversightTargetEndpointResolver,
@@ -839,6 +846,12 @@ struct AgentModeSessionsListView: View {
                 object: agentModeVM
             )
             .receive(on: DispatchQueue.main)
+        ) { _ in
+            sessionLinkProjectionRevision &+= 1
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange)
+                .receive(on: DispatchQueue.main)
         ) { _ in
             sessionLinkProjectionRevision &+= 1
         }

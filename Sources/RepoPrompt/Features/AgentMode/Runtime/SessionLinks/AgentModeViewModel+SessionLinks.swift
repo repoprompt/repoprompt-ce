@@ -57,26 +57,66 @@ extension AgentModeViewModel {
     ///
     /// - Parameter isWindowClosing: the owning window's `isClosing` flag. A closing window's tabs are
     ///   never offered as endpoints.
-    func agentSessionLinkCandidates(isWindowClosing: Bool) -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidates(isWindowClosing: Bool, includeLocation: Bool = true) -> [AgentSessionLinkEndpointCandidate] {
         guard let workspaceManager else { return [] }
-        var candidates: [AgentSessionLinkEndpointCandidate] = []
-        for workspace in workspaceManager.workspaces {
-            // Only the active workspace of this window has live tab bindings; a background
-            // workspace's tabs are persisted projections, not live endpoints.
-            guard workspace.id == workspaceManager.activeWorkspaceID else { continue }
-            for tab in workspace.composeTabs {
-                guard let sessionID = tab.activeAgentSessionID,
-                      let candidate = agentSessionLinkCandidate(
-                          tabID: tab.id,
-                          sessionID: sessionID,
-                          tabName: tab.name,
-                          isWindowClosing: isWindowClosing
-                      )
-                else { continue }
-                candidates.append(candidate)
+        return workspaceManager.workspaces.filter { $0.id == workspaceManager.activeWorkspaceID }.flatMap { workspace in
+            workspace.composeTabs.compactMap { tab in
+                guard let sessionID = tab.activeAgentSessionID else { return nil }
+                return agentSessionLinkCandidate(
+                    tabID: tab.id, sessionID: sessionID, tabName: tab.name,
+                    isWindowClosing: isWindowClosing, includeLocation: includeLocation
+                )
             }
         }
-        return candidates
+    }
+
+    /// Fresh exact addressing shares the indexed model route, but keeps real presentation fields.
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard endpoint.windowID == windowID,
+              let candidate = agentSessionLinkCandidate(
+                  workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+                  sessionID: endpoint.sessionID, isWindowClosing: false,
+                  includeLocation: includeLocation
+              ), candidate.domainEndpoint == endpoint else { return nil }
+        return candidate
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        guard let workspaceManager, let workspaceID = workspaceManager.activeWorkspaceID else { return result }
+        for sessionID in sessionIDs {
+            result[sessionID] = workspaceManager.agentSessionLifecycleTabs(workspaceID: workspaceID, sessionID: sessionID)
+                .compactMap { tab in
+                    agentSessionLinkCandidate(
+                        tabID: tab.id, sessionID: sessionID,
+                        tabName: tab.name, isWindowClosing: false, includeLocation: includeLocation
+                    )
+                }
+        }
+        return result
+    }
+
+    /// Batch callers already read the name from the current model in this synchronous MainActor
+    /// pass. Reuse that value while retaining the existing indexed identity/incarnation validation.
+    private func agentSessionLinkCandidate(
+        workspaceID: UUID, tabID: UUID, sessionID: UUID,
+        tabName: String? = nil,
+        isWindowClosing: Bool, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let identity = agentSessionLinkModelIdentity(
+            workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+        ), let session = sessions[tabID],
+        let name = tabName ?? workspaceManager?.modelRoutingTab(workspaceID: workspaceID, tabID: tabID)?.name else { return nil }
+        return agentSessionLinkCandidate(
+            session: session, identity: identity, tabName: name,
+            providerDisplayName: session.selectedAgent.displayName,
+            isWindowClosing: isWindowClosing, includeLocation: includeLocation
+        )
     }
 
     // MARK: - Discovery epochs and lazy binding descriptors
@@ -966,18 +1006,19 @@ extension AgentModeViewModel {
         expectedSessionID: UUID
     ) -> AgentSidebarOversightMenuProps? {
         guard let endpoint = agentSidebarOversightTargetEndpoint(
-            tabID: tabID,
-            expectedSessionID: expectedSessionID
-        ),
-            let props = monitorPillPropsByEndpoint[endpoint],
-            props.endpoint == endpoint,
-            let menu = props.sidebarOversightMenu,
-            menu.targetEndpoint == endpoint,
-            menu.targetSessionID == expectedSessionID
-        else {
-            return nil
-        }
-        return menu
+            tabID: tabID, expectedSessionID: expectedSessionID
+        ) else { return nil }
+        return AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint)
+    }
+
+    func agentSidebarOversightSummary(
+        tabID: UUID,
+        expectedSessionID: UUID
+    ) -> AgentSidebarOversightSummary? {
+        guard let endpoint = agentSidebarOversightTargetEndpoint(
+            tabID: tabID, expectedSessionID: expectedSessionID
+        ) else { return nil }
+        return AgentSessionLinkRuntimeBridge.shared.sidebarOversightSummary(for: endpoint)
     }
 
     /// Exact current endpoint behind one active sidebar row, independent of whether its target menu
@@ -1102,7 +1143,6 @@ extension AgentModeViewModel {
         return AgentMonitorPillProps(
             sessionID: overlaid.sessionID,
             endpoint: overlaid.endpoint,
-            sidebarOversightMenu: overlaid.sidebarOversightMenu,
             outbound: outbound,
             inbound: overlaid.inbound,
             recentNotices: overlaid.recentNotices,
@@ -1285,7 +1325,6 @@ extension AgentModeViewModel {
         guard let published else {
             return AgentMonitorPillProps(
                 sessionID: sessionID,
-                sidebarOversightMenu: nil,
                 outbound: [],
                 inbound: [],
                 recentNotices: [],

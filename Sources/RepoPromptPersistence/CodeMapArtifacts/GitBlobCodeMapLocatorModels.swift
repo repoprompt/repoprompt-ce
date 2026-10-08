@@ -409,6 +409,25 @@ private struct GitBlobLocatorCanonicalReader {
     }
 }
 
+/// Shared by the codemap persistence models; one table lookup per nibble instead of a
+/// `String(format:)` call per byte, which dominated manifest decoding.
+extension Data {
+    var lowercaseHex: String {
+        let digits: StaticString = "0123456789abcdef"
+        return String(unsafeUninitializedCapacity: count * 2) { buffer in
+            digits.withUTF8Buffer { table in
+                var index = 0
+                for byte in self {
+                    buffer[index] = table[Int(byte >> 4)]
+                    buffer[index + 1] = table[Int(byte & 0x0F)]
+                    index += 2
+                }
+                return index
+            }
+        }
+    }
+}
+
 private extension Data {
     init(canonicalLowercaseHex value: String) throws {
         guard value.utf8.count.isMultiple(of: 2) else {
@@ -426,10 +445,6 @@ private extension Data {
             result.append((high << 4) | low)
         }
         self = result
-    }
-
-    var lowercaseHex: String {
-        map { String(format: "%02x", $0) }.joined()
     }
 
     mutating func appendBigEndian(_ value: UInt32) {

@@ -3703,7 +3703,6 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: nil,
             outbound: [
                 AgentMonitorPillProps.Outbound(
                     linkID: reference.linkID,

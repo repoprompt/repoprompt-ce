@@ -526,6 +526,15 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendab
     }
 }
 
+/// A single authority turn for sparse presentation and authoritative final clears.
+/// `endpoints` names retained link/notice keys, not the additional empty clear inputs.
+package struct DomainAgentSessionLinkPresentationSnapshot: Sendable {
+    package let authorityRevision: UInt64
+    package let endpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let inputs: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionLinkEndpointProjectionInputs]
+}
+
 // MARK: - Errors
 
 package enum DomainAgentSessionLinkError: String, Error, Equatable, Sendable {

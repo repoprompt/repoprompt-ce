@@ -80,8 +80,9 @@ struct AgentSessionRow: View {
     /// generation-bearing target immediately before writing and returns `false` when it went stale,
     /// so a stale row performs zero clipboard writes and shows no false success.
     var onCopySessionID: (() -> Bool)?
-    /// Re-resolves the exact current target projection whenever SwiftUI materializes either menu.
-    /// A frozen props value would make an available observer actionable after it closed or rebound.
+    /// Bounded current row facts for rendering, never the full available choices.
+    var resolveSidebarOversightSummary: (@MainActor () -> AgentSidebarOversightSummary?)?
+    /// Fresh full choices at activation; action handlers revalidate captured exact identities.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
     /// Resolves the row's current exact target even when lifecycle eligibility makes its menu nil.
     /// This fences feedback from a system menu that stayed open across an in-place rebind.
@@ -582,28 +583,69 @@ struct AgentSessionRow: View {
     }
 
     private func sidebarOversightHoverMenu(
-        _ menu: AgentSidebarOversightMenuProps
+        _ summary: AgentSidebarOversightSummary
     ) -> some View {
-        Menu {
-            sidebarOversightMenuContent(menu)
-        } label: {
+        StableMenuButton(items: {
+            MainActor.assumeIsolated {
+                guard allowsDirectMutations, let menu = presentableSidebarOversightMenu else { return [] }
+                return sidebarOversightStableMenuItems(menu)
+            }
+        }) {
             Image(systemName: "eye")
                 .font(.system(size: 11))
-                .foregroundColor(
-                    isSidebarOversightMenuHovered || !sidebarOversightBusyKeys.isEmpty
-                        ? .accentColor
-                        : .secondary
-                )
+                .foregroundColor(isSidebarOversightMenuHovered || !sidebarOversightBusyKeys.isEmpty ? .accentColor : .secondary)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.borderless)
         .fixedSize()
         .onHover { isSidebarOversightMenuHovered = $0 }
         .hoverTooltip(Self.sidebarOversightManagementHelp)
         .accessibilityLabel(Self.sidebarOversightManagementHelp)
-        .accessibilityValue(sidebarOversightMenuAccessibilityValue(menu))
+        .accessibilityValue(summary.accessibilityValue)
         .accessibilityHint("Choose exact Agent sessions that oversee this session.")
     }
+
+    /// The native menu owns this immutable tree while tracking. Choices are materialized only by
+    /// the click closure above; each action retains the same exact revalidation as the context menu.
+    private func sidebarOversightStableMenuItems(_ menu: AgentSidebarOversightMenuProps) -> [StableMenuItem] {
+        guard !menu.isEmpty else { return [.action("No eligible agents", isEnabled: false) {}] }
+        var items: [StableMenuItem] = []
+        if !menu.linkedObservers.isEmpty {
+            items.append(.header("Overseen by"))
+            items += menu.linkedObservers.compactMap { option in
+                guard case let .linked(reference, _) = option.relationship else { return nil }
+                let busy = sidebarOversightBusyKeys.contains(.unlink(observerEndpoint: option.observerEndpoint, targetEndpoint: menu.targetEndpoint, reference: reference))
+                return .action(
+                    AgentSidebarOversightMenuCopy.stopTitle(observerMenuLabel: option.menuLabel),
+                    isEnabled: !busy, imageSystemName: busy ? "hourglass" : "minus.circle", style: .destructive,
+                    accessibilityLabel: AgentSidebarOversightMenuCopy.stopAccessibilityLabel(observerMenuLabel: option.menuLabel, targetDisplayName: menu.targetDisplayName),
+                    accessibilityValue: busy ? "In progress" : "",
+                    accessibilityHint: option.fullIdentityDescription
+                ) { stopSidebarOversight(option, menu: menu, reference: reference) }
+            }
+        }
+        if !menu.availableObservers.isEmpty {
+            if !items.isEmpty { items.append(.separator) }
+            items.append(.header("Oversee by…"))
+            items += menu.availableObservers.map { option in
+                let busy = sidebarOversightBusyKeys.contains(.add(observerEndpoint: option.observerEndpoint, targetEndpoint: menu.targetEndpoint))
+                return .action(
+                    option.menuLabel,
+                    isEnabled: !busy,
+                    imageSystemName: busy ? "hourglass" : "plus.circle",
+                    accessibilityLabel: "Add \(option.menuLabel) as an overseer of \(menu.targetDisplayName)",
+                    accessibilityValue: busy ? "In progress" : "",
+                    accessibilityHint: option.fullIdentityDescription
+                ) { addSidebarOversight(option, menu: menu) }
+            }
+        }
+        return items
+    }
+
+    #if DEBUG
+        func test_sidebarOversightStableMenuItems(_ menu: AgentSidebarOversightMenuProps) -> [StableMenuItem] {
+            sidebarOversightStableMenuItems(menu)
+        }
+    #endif
 
     private func sidebarOversightContextMenu(
         _ menu: AgentSidebarOversightMenuProps
@@ -637,7 +679,7 @@ struct AgentSessionRow: View {
     }
 
     var body: some View {
-        let sidebarOversightMenu = resolveSidebarOversightMenu?()
+        let sidebarOversightSummary = resolveSidebarOversightSummary?()
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {
             if showsSelectionPresentation {
@@ -688,7 +730,7 @@ struct AgentSessionRow: View {
                         overseerBadge
                     }
 
-                    if let creatorLabel = createdByLabel ?? sidebarOversightMenu?.createdByLabel {
+                    if let creatorLabel = createdByLabel ?? sidebarOversightSummary?.createdByLabel {
                         AgentSessionCreatorBadge(creatorLabel: creatorLabel) {
                             onOpenCreator?()
                         }
@@ -733,12 +775,12 @@ struct AgentSessionRow: View {
                 // Three distinct eye surfaces may coexist: the toolbar dashboard action, the
                 // permanent purple filled observer-role badge, and this neutral outlined target menu.
                 if allowsDirectMutations,
-                   let sidebarOversightMenu,
-                   !sidebarOversightMenu.isEmpty,
+                   let sidebarOversightSummary,
+                   !sidebarOversightSummary.isEmpty,
                    onAddSidebarOversight != nil,
                    onStopSidebarOversight != nil
                 {
-                    sidebarOversightHoverMenu(sidebarOversightMenu)
+                    sidebarOversightHoverMenu(sidebarOversightSummary)
                 }
 
                 if !showsSelectionPresentation, onCopySessionID != nil {

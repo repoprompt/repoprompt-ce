@@ -4028,34 +4028,25 @@ actor ACPAgentSessionController {
             return nil
         }
 
-        let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
-            [
-                .optionID("always"),
-                .optionID("allow_always"),
-                .kind("allow_always"),
-                .optionID("once"),
-                .optionID("allow_once"),
-                .kind("allow_once")
-            ]
-        case .devin:
-            []
+        let selectedOptionID: String? = switch provider.providerID {
         case .grokBuild:
-            // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
-            // session-scoped `allow-edits-session` here.
-            [
-                .optionID("allow-once"),
-                .optionID("once"),
-                .optionID("allow_once"),
-                .kind("allow_once")
-            ]
-        }
-
-        let filteredOptions = safePermissionOptionsForAutoSelection(options)
-        let selectedOptionID: String? = if provider.providerID == .devin {
-            filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
-        } else {
-            optionID(for: filteredOptions, preferences: preferences)
+            // Strict RepoPrompt MCP auto-approval must remain genuinely one-time,
+            // even when Grok mislabels a broader option's ID or kind.
+            preferredAllowOptionID(for: options, sessionScoped: false)
+        case .devin:
+            safePermissionOptionsForAutoSelection(options).first(where: { $0.optionID == "allow_once" })?.optionID
+        case .openCode, .cursor, .antigravity:
+            optionID(
+                for: safePermissionOptionsForAutoSelection(options),
+                preferences: [
+                    .optionID("always"),
+                    .optionID("allow_always"),
+                    .kind("allow_always"),
+                    .optionID("once"),
+                    .optionID("allow_once"),
+                    .kind("allow_once")
+                ]
+            )
         }
         guard let selectedOptionID else { return nil }
         return AutoApprovalSelection(optionID: selectedOptionID, match: match)

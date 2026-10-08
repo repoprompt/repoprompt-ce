@@ -3675,18 +3675,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func installAgentSessionLifecycleProjectionAuthority() {
-        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current in
+        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current, repairBaselines in
             guard let self else {
                 return AgentSessionLifecycleAuthority.ProjectionOutcome(
                     workspaces: projected,
                     protectedWorkspaceIDs: [],
-                    protectedClaimCount: 0
+                    protectedClaimCount: 0,
+                    newlyRequiredRepairWorkspaceIDs: []
                 )
             }
             return sessionLifecycleAuthority.reconcileProjection(
                 projectedWorkspaces: projected,
                 currentWorkspaces: current,
-                claims: agentSessionLifecycleProtectionClaims(in: current)
+                claims: agentSessionLifecycleProtectionClaims(in: current),
+                repairBaselines: repairBaselines
             )
         }
     }

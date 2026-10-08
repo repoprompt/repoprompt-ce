@@ -1030,9 +1030,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             // first exact tab/session match in array order, including across duplicate workspace IDs.
             // These positions are derived alongside the routing indexes, never a second authority.
             lifecycleBindingPositions.removeAll(keepingCapacity: true)
+            lifecycleSessionPositions.removeAll(keepingCapacity: true)
             for (workspaceIndex, workspace) in workspaces.enumerated() {
                 for (tabIndex, tab) in workspace.composeTabs.enumerated() {
                     guard let sessionID = tab.activeAgentSessionID else { continue }
+                    lifecycleSessionPositions[workspace.id, default: [:]][sessionID, default: []].append((workspaceIndex, tabIndex))
                     let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
                     if lifecycleBindingPositions[key] == nil {
                         lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
@@ -1070,6 +1072,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         let tab = workspaces[position.workspace].composeTabs[position.tab]
         guard tab.id == tabID, tab.activeAgentSessionID == sessionID else { return nil }
         return workspaces[position.workspace].id
+    }
+
+    /// Complementary UUID addresses in the lifecycle index. Preserve every metadata occurrence,
+    /// including duplicate workspace/tab IDs: the full lifecycle census retains that multiplicity.
+    /// Generations and runtime eligibility are still read live by the lifecycle adapter.
+    private var lifecycleSessionPositions: [UUID: [UUID: [(workspace: Int, tab: Int)]]] = [:]
+
+    func agentSessionLifecycleTabs(workspaceID: UUID, sessionID: UUID) -> [ComposeTabState] {
+        guard activeWorkspaceID == workspaceID else { return [] }
+        return (lifecycleSessionPositions[workspaceID]?[sessionID] ?? []).compactMap { position in
+            guard workspaces.indices.contains(position.workspace),
+                  workspaces[position.workspace].id == workspaceID,
+                  workspaces[position.workspace].composeTabs.indices.contains(position.tab)
+            else { return nil }
+            let tab = workspaces[position.workspace].composeTabs[position.tab]
+            return tab.activeAgentSessionID == sessionID ? tab : nil
+        }
     }
 
     private var modelRoutingTabIndexes: [UUID: [UUID: Int]] = [:]
@@ -2837,7 +2856,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private let workspaceAgentAdmissionCoordinator: WorkspaceAgentAdmissionCoordinator
     private var agentSessionProjectionReconciler: ((
         _ projectedWorkspaces: [WorkspaceModel],
-        _ currentWorkspaces: [WorkspaceModel]
+        _ currentWorkspaces: [WorkspaceModel],
+        _ repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline]
     ) -> AgentSessionLifecycleAuthority.ProjectionOutcome)?
     private var lastDomainProjectionSequence: UInt64 = 0
     private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
@@ -2862,7 +2882,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     func setAgentSessionProjectionReconciler(
         _ reconciler: @escaping (
             _ projectedWorkspaces: [WorkspaceModel],
-            _ currentWorkspaces: [WorkspaceModel]
+            _ currentWorkspaces: [WorkspaceModel],
+            _ repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline]
         ) -> AgentSessionLifecycleAuthority.ProjectionOutcome
     ) {
         agentSessionProjectionReconciler = reconciler
@@ -3168,6 +3189,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Execute callbacks if any
         let callbacks = initializationCallbacks
         initializationCallbacks.removeAll()
+        StartupPhaseLog.mark(.managerInitialized, window: promptViewModel.windowID, fields: ["callbacks": callbacks.count])
         for callback in callbacks {
             callback()
         }
@@ -3924,6 +3946,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         #if DEBUG
             let indexLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
+        let corpusLoadSpan = StartupPhaseLog.begin(
+            .workspaceCorpusLoad,
+            window: domainWorkspaceAuthorityClient?.windowID
+        )
         let indexEntries = loadWorkspaceIndex()
         #if DEBUG
             let indexLoadDurationMS = indexLoadStartMS.map { restorePerfRecorder.elapsedMS(since: $0) }
@@ -3993,6 +4019,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         #endif
         workspaces = loaded
+        corpusLoadSpan.end(extraFields: ["entries": indexEntries.count, "loaded": loaded.count])
         recordRepoPathBaselines(for: loaded)
 
         startPollTimer()
@@ -4054,9 +4081,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             completeInitialization()
         } else if activeWorkspace == nil {
             Task {
+                let initialSwitchSpan = StartupPhaseLog.begin(.initialDefaultSwitch, window: self.promptViewModel.windowID)
                 if let defaultWS = await findOrCreatePublishedDefaultWorkspace() {
                     await switchWorkspace(to: defaultWS, saveState: false)
                 }
+                initialSwitchSpan.end()
                 self.completeInitialization()
             }
         } else {
@@ -6024,8 +6053,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // The switch operation already owns lifecycle admission. Retire and join the
         // old root flight before any hydration, root teardown, or active-ID change.
+        let reconciliationJoinSpan = StartupPhaseLog.begin(.rootReconciliationJoin, window: promptViewModel.windowID)
         cancelRootReconciliationForLifecycleTransition()
         await awaitRootReconciliationShutdown()
+        reconciliationJoinSpan.end()
         if let cancellation = cancellationResult(operationID: operationID, targetWorkspace: newWorkspace, boundary: "joining root reconciliation") {
             return cancellation
         }
@@ -6125,7 +6156,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await workspaceSwitchReadinessDidInvalidateHandlerForTesting()
             }
         #endif
+        let schedulerStopSpan = StartupPhaseLog.begin(.tokenSchedulerStop, window: promptViewModel.windowID)
         await promptViewModel.stopTokenCountUpdateTimer()
+        schedulerStopSpan.end()
         await workspaceSearchService.reset()
         if let cancellation = cancellationResult(
             operationID: operationID,
@@ -6395,10 +6428,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         // If roots were already unloaded during save/unload, this restore-time refresh is
         // a harmless no-op. Otherwise, defer it until after target root hydration so we
         // do not walk outgoing roots that `loadWorkspaceFolders` will immediately unload.
+        let restoreStateSpan = StartupPhaseLog.begin(.switchRestoreState, window: promptViewModel.windowID)
         await restoreWorkspaceState(
             activeWS,
             refreshExistingRootFolderState: rootsUnloadedBeforeFolderLoad
         )
+        restoreStateSpan.end()
         let restoreDuration = Date().timeIntervalSince(restoreStart)
         logWorkspaceSwitch("restore state END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", restoreDuration))s")
         #if DEBUG
@@ -6437,6 +6472,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // watchers, slices and codemap scans are post-catalog work.
         overlayVisibilityGate.markRestoreStateReady()
         advanceWorkspaceSwitchOperation(operationID, to: .hydratingRoots)
+        let hydrationJoinSpan = StartupPhaseLog.begin(.switchHydrationJoin, window: promptViewModel.windowID)
         if let folderLoadTask {
             await folderLoadTask.value
             folderLoadCompleted = true
@@ -6445,6 +6481,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             logWorkspaceSwitch("catalog hydration BEGIN workspace=\"\(activeWS.name)\" roots=\(activeWS.repoPaths.count)")
             await loadTargetWorkspaceFolders()
         }
+        hydrationJoinSpan.end()
         let folderLoadDuration = folderLoadStart.map { Date().timeIntervalSince($0) } ?? 0
         logWorkspaceSwitch("catalog hydration END workspace=\"\(activeWS.name)\" duration=\(String(format: "%.3f", folderLoadDuration))s")
         #if DEBUG
@@ -6464,7 +6501,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded during root hydration.")
         }
 
+        let selectionReplaySpan = StartupPhaseLog.begin(.switchSelectionReplay, window: promptViewModel.windowID)
         await replayActiveComposeTabHeavyFileStateAfterHydration(restoredHeavyFileState, workspaceID: activeWS.id)
+        selectionReplaySpan.end()
         if let cancellation = cancellationResult(
             operationID: operationID,
             targetWorkspace: newWorkspace,
@@ -6508,12 +6547,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Cancellation observed after this point cannot turn a committed activation into
         // a cancelled result.
         markWorkspaceSwitchCommitted(operationID)
+        let listenerNotifySpan = StartupPhaseLog.begin(.switchListenerNotify, window: promptViewModel.windowID)
 
         // Notify listeners that workspace switched.
         #if DEBUG
             let listenerStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         notifyWorkspaceDidSwitch(activeWorkspace)
+        listenerNotifySpan.end()
         #if DEBUG
             if let listenerStartMS {
                 restorePerfRecorder.event(
@@ -7560,6 +7601,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         let staleWorkspaceIDs = Set(revisionsByWorkspaceID.compactMap { id, revision in
             isOlderDomainRevision(revision, workspaceID: id) ? id : nil
         })
+        var repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline] = [:]
+        for workspaceID in persistedWorkspaceIDs where !staleWorkspaceIDs.contains(workspaceID) {
+            if let revision = revisionsByWorkspaceID[workspaceID], let digest = digestsByWorkspaceID[workspaceID] {
+                repairBaselines[workspaceID] = .working(revision: revision.workingRevision, digest: digest)
+            }
+        }
+        for workspace in workspaces where !workspace.isEphemeral && !persistedWorkspaceIDs.contains(workspace.id) {
+            // A failed decode or a still-publishing creation is not canonical absence.
+            if revisionsByWorkspaceID[workspace.id] == nil, digestsByWorkspaceID[workspace.id] == nil,
+               workspaceCreationTasksByID[workspace.id] == nil,
+               pendingPersistentWorkspaceCreationsByWorkspaceID[workspace.id] == nil
+            {
+                repairBaselines[workspace.id] = .absent
+            }
+        }
         let rootPreparedProjection = persistedProjection.map { presentation in
             if staleWorkspaceIDs.contains(presentation.id), let current = workspace(withID: presentation.id) {
                 return current
@@ -7616,7 +7672,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         let lifecycleProjection = agentSessionProjectionReconciler?(
             localProjection,
-            workspaces
+            workspaces,
+            repairBaselines
         )
         let reconciledWorkspaces = lifecycleProjection?.workspaces ?? localProjection
         workspaces = reconciledWorkspaces
@@ -7674,7 +7731,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if previousActiveWorkspaceID != activeWorkspaceID, let activeWorkspaceID {
             requestRootReconciliation(workspaceID: activeWorkspaceID)
         }
-        if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+        if let protectedWorkspaceIDs = lifecycleProjection?.newlyRequiredRepairWorkspaceIDs {
             for workspaceID in protectedWorkspaceIDs {
                 bumpStateVersion(for: workspaceID)
             }
@@ -8032,7 +8089,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         await applyComposeTabHeavyFileState(refreshedTab)
         guard !Task.isCancelled else { return }
         if performFinalRecount {
-            await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+            await promptViewModel.tokenCountingViewModel.forceImmediateRecount(windowOrdinal: promptViewModel.windowID)
         }
         guard markWorkspaceDirtyAfterApply else { return }
         if markWorkspaceDirtyIfTabStillActive(tabID: tabID) {
@@ -10247,9 +10304,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         if refreshedWorkspace != currentWorkspace {
             var projected = workspaces
             projected[currentIndex] = refreshedWorkspace
-            let lifecycleProjection = agentSessionProjectionReconciler?(projected, workspaces)
+            let lifecycleProjection = agentSessionProjectionReconciler?(
+                projected,
+                workspaces,
+                [workspaceID: .working(revision: snapshot.revisions.workingRevision, digest: snapshot.document.contentDigest)]
+            )
             workspaces = lifecycleProjection?.workspaces ?? projected
-            if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+            if let protectedWorkspaceIDs = lifecycleProjection?.newlyRequiredRepairWorkspaceIDs {
                 for protectedWorkspaceID in protectedWorkspaceIDs {
                     bumpStateVersion(for: protectedWorkspaceID)
                 }
@@ -11311,7 +11372,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 restorePerfRecorder.event("workspaceSwitch.restoreState.tokenRecount.watchdog", fields: fields)
             }
         #endif
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+        let forcedRecountSpan = StartupPhaseLog.begin(.forcedTokenRecount, window: promptViewModel.windowID)
+        await promptViewModel.tokenCountingViewModel.forceImmediateRecount(windowOrdinal: promptViewModel.windowID)
+        forcedRecountSpan.end()
         #if DEBUG
             restoreTokenRecountWatchdogIDs.remove(tokenRecountWatchdogID)
             var tokenRecountEndFields = tokenRecountSelectionFields
@@ -11504,7 +11567,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
                 let lifecycleProjection = agentSessionProjectionReconciler?(
                     localProjection,
-                    workspaces
+                    workspaces,
+                    [:]
                 )
                 workspaces = lifecycleProjection?.workspaces ?? localProjection
             }
@@ -15522,6 +15586,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func findOrCreatePublishedDefaultWorkspace() async -> WorkspaceModel? {
         guard let fallback = findOrCreateDefaultWorkspace() else { return nil }
         guard let domainWorkspaceAuthorityClient else { return fallback }
+        let authorityWaitSpan = StartupPhaseLog.begin(
+            .authorityBootstrapWait,
+            window: domainWorkspaceAuthorityClient.windowID
+        )
+        defer { authorityWaitSpan.end() }
 
         if let creationTask = pendingSystemWorkspaceCreationTasks[fallback.id] {
             await creationTask.value

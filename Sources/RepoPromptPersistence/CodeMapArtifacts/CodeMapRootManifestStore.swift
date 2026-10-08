@@ -519,6 +519,13 @@ package actor CodeMapRootManifestStore {
     private var decodedManifestCache: [ManifestCacheLocation: ManifestCachedSnapshot] = [:]
     private var decodedManifestCacheOrder: [ManifestCacheLocation] = []
     private var decodedManifestCacheByteCount: UInt64 = 0
+    /// Byte-budget-independent scan accounting. Full scans walk every manifest in a fixed order, so
+    /// once the store outgrows the decoded LRU budget every scan would otherwise re-decode the
+    /// whole store. Entries live until explicit invalidation or a complete scan stops observing them.
+    private var manifestScanSummaries: [ManifestCacheLocation: ManifestScanSummary] = [:]
+    #if DEBUG
+        private var debugScanDecodeCount = 0
+    #endif
     private var committedMaintenanceDebt: ManifestCommittedMaintenanceDebt = .idle
     #if DEBUG
         private var debugPublicationMetricsByNamespace: [
@@ -746,6 +753,10 @@ package actor CodeMapRootManifestStore {
 
         package func decodedManifestCacheByteCountForTesting() -> UInt64 {
             decodedManifestCacheByteCount
+        }
+
+        package func scanDecodeCountForTesting() -> Int {
+            debugScanDecodeCount
         }
 
         package func committedMaintenanceRetryStateForTesting() -> (
@@ -2309,17 +2320,17 @@ package actor CodeMapRootManifestStore {
                 )
                 Darwin.close(descriptor)
                 switch inspection {
-                case let .valid(snapshot, identity):
+                case let .valid(summary, identity):
                     result.manifestCount = try Self.adding(result.manifestCount, 1)
                     result.manifestByteCount = try Self.adding(result.manifestByteCount, UInt64(identity.size))
-                    result.recordCount = Self.addingSaturating(result.recordCount, snapshot.records.count)
+                    result.recordCount = Self.addingSaturating(result.recordCount, summary.recordCount)
                     result.validEntries.append(
                         ManifestMaintenanceEntry(
                             shard: shardName,
                             digest: name,
                             byteCount: UInt64(identity.size),
-                            lastAccessEpochSeconds: snapshot.lastAccessEpochSeconds,
-                            manifestGeneration: snapshot.manifestGeneration,
+                            lastAccessEpochSeconds: summary.lastAccessEpochSeconds,
+                            manifestGeneration: summary.manifestGeneration,
                             identity: identity
                         )
                     )
@@ -2413,7 +2424,9 @@ package actor CodeMapRootManifestStore {
             let observedLocations = Set(result.validEntries.map {
                 ManifestCacheLocation(shard: $0.shard, digest: $0.digest)
             })
-            let staleLocations = decodedManifestCache.keys.filter { !observedLocations.contains($0) }
+            let staleLocations = Set(decodedManifestCache.keys)
+                .union(manifestScanSummaries.keys)
+                .subtracting(observedLocations)
             for location in staleLocations {
                 removeDecodedManifestCacheEntry(at: location)
             }
@@ -2457,13 +2470,17 @@ package actor CodeMapRootManifestStore {
                 return .insecure
             }
             let validatedContentChecksum = try CodeMapRootManifestCodec.validatedContentChecksum(data)
-            if let snapshot = cachedManifestSnapshot(
-                at: cacheLocation,
-                identity: identity,
-                checksum: validatedContentChecksum
-            ) {
-                return .valid(snapshot, identity)
+            if let summary = manifestScanSummaries[cacheLocation],
+               summary.identity == identity,
+               summary.validatedContentChecksum == validatedContentChecksum
+            {
+                // Summaries are only recorded for snapshots that already passed the shard and
+                // record-count checks below, and `policy` is immutable.
+                return .valid(summary, identity)
             }
+            #if DEBUG
+                debugScanDecodeCount += 1
+            #endif
             let snapshot = try CodeMapRootManifestCodec.decodeStored(data, filenameDigest: name)
             guard snapshot.namespace.shard == shardName,
                   snapshot.records.count <= policy.maximumRecordCountPerManifest
@@ -2474,7 +2491,14 @@ package actor CodeMapRootManifestStore {
                 snapshot: snapshot,
                 validatedContentChecksum: validatedContentChecksum
             )
-            return .valid(snapshot, identity)
+            return .valid(
+                ManifestScanSummary(
+                    identity: identity,
+                    snapshot: snapshot,
+                    validatedContentChecksum: validatedContentChecksum
+                ),
+                identity
+            )
         } catch CodeMapRootManifestStoreError.insecureLeaf {
             return .insecure
         } catch let failure as CodeMapRootManifestDecodeFailure {
@@ -2513,6 +2537,11 @@ package actor CodeMapRootManifestStore {
         guard identity.size >= 0 else { return }
         removeDecodedManifestCacheEntry(at: location)
         guard snapshot.records.count <= policy.maximumRecordCountPerManifest else { return }
+        manifestScanSummaries[location] = ManifestScanSummary(
+            identity: identity,
+            snapshot: snapshot,
+            validatedContentChecksum: validatedContentChecksum
+        )
         let encodedByteCount = UInt64(identity.size)
         guard encodedByteCount <= policy.maximumDecodedManifestCacheByteCount else { return }
 
@@ -2520,7 +2549,8 @@ package actor CodeMapRootManifestStore {
             guard let leastRecentlyUsed = decodedManifestCacheOrder.first else {
                 preconditionFailure("decoded manifest cache byte accounting lost its eviction order")
             }
-            removeDecodedManifestCacheEntry(at: leastRecentlyUsed)
+            // Budget eviction drops only the decoded snapshot; the scan summary stays valid.
+            evictDecodedManifestSnapshot(at: leastRecentlyUsed)
         }
         decodedManifestCache[location] = ManifestCachedSnapshot(
             identity: identity,
@@ -2539,6 +2569,11 @@ package actor CodeMapRootManifestStore {
     }
 
     private func removeDecodedManifestCacheEntry(at location: ManifestCacheLocation) {
+        manifestScanSummaries.removeValue(forKey: location)
+        evictDecodedManifestSnapshot(at: location)
+    }
+
+    private func evictDecodedManifestSnapshot(at location: ManifestCacheLocation) {
         guard let removed = decodedManifestCache.removeValue(forKey: location) else { return }
         precondition(decodedManifestCacheByteCount >= removed.encodedByteCount)
         decodedManifestCacheByteCount -= removed.encodedByteCount
@@ -3243,8 +3278,24 @@ private struct ManifestReconciliationOutcome {
     let terminalScan: ManifestScanResult
 }
 
+private struct ManifestScanSummary {
+    let identity: ManifestFileIdentity
+    let validatedContentChecksum: Data
+    let recordCount: Int
+    let lastAccessEpochSeconds: UInt64
+    let manifestGeneration: UInt64
+
+    init(identity: ManifestFileIdentity, snapshot: CodeMapRootManifestSnapshot, validatedContentChecksum: Data) {
+        self.identity = identity
+        self.validatedContentChecksum = validatedContentChecksum
+        recordCount = snapshot.records.count
+        lastAccessEpochSeconds = snapshot.lastAccessEpochSeconds
+        manifestGeneration = snapshot.manifestGeneration
+    }
+}
+
 private enum ManifestInspection {
-    case valid(CodeMapRootManifestSnapshot, ManifestFileIdentity)
+    case valid(ManifestScanSummary, ManifestFileIdentity)
     case corrupt
     case insecure
 }

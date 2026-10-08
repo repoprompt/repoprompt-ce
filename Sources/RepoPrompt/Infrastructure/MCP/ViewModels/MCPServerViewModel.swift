@@ -3142,9 +3142,6 @@ final class MCPServerViewModel: ObservableObject {
                 self?.externalClientErrorCount = count
             }
             .store(in: &cancellables)
-
-        // Cleanup old events periodically (once per app launch is enough)
-        monitor.cleanupOldEvents()
     }
 
     /// Updates published properties and sets the overlay visibility.

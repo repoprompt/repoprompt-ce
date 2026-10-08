@@ -319,7 +319,12 @@ final class AgentTabSession: ObservableObject {
 
     var isMCPInstructionDispatchInProgress: Bool = false
     /// Whether this session was originally created by an MCP client.
-    var isMCPOriginated: Bool = false
+    var isMCPOriginated: Bool = false {
+        didSet {
+            if oldValue != isMCPOriginated { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
     /// Lifetime classification for sessions created, controlled, parented, or pending activation through MCP.
     /// A nonzero activation generation remains authoritative after live control is released.
     var isMCPRelated: Bool {
@@ -1309,7 +1314,12 @@ final class AgentTabSession: ObservableObject {
 
     private(set) var persistenceMutationGeneration: UInt64 = 0
     var saveRequestGeneration: UInt64 = 0
-    var parentSessionID: UUID?
+    var parentSessionID: UUID? {
+        didSet {
+            if (oldValue == nil) != (parentSessionID == nil) { AgentSessionLinkCandidateReadinessSignal.didChange() }
+        }
+    }
+
     var createdByOverseerSessionID: UUID?
     var hasLoadedPersistedState: Bool = false {
         didSet {

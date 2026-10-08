@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import threading
 import tempfile
@@ -14,6 +16,34 @@ from unittest import mock
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import conductor  # noqa: E402
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    def test_identity_matches_across_client_and_daemon_locales(self) -> None:
+        canonical_start = 'Fri Oct  3 08:00:00 2026'
+        british_start = 'Fri  3 Oct 08:00:00 2026'
+        pid = 123
+
+        def locale_sensitive_ps(command, **kwargs):
+            env = kwargs.get('env', os.environ)
+            locale = env.get('LC_ALL') or env.get('LC_TIME') or env.get('LANG')
+            start = canonical_start if locale == 'C' else british_start
+            output = start if command[-1] == 'lstart=' else f'{pid} 1 {start}'
+            return subprocess.CompletedProcess(command, 0, stdout=output + '\n')
+
+        with mock.patch.object(conductor.subprocess, 'run', side_effect=locale_sensitive_ps):
+            tokens = {}
+            snapshots = {}
+            for locale in ('en_GB.UTF-8', 'C'):
+                with self.subTest(locale=locale), mock.patch.dict(
+                    os.environ, {'LC_ALL': locale, 'LC_TIME': locale, 'LANG': locale}
+                ):
+                    tokens[locale] = conductor.process_start_token(pid)
+                    snapshots[locale] = conductor.process_table_snapshot()
+                    self.assertEqual(tokens[locale], canonical_start)
+                    self.assertEqual(snapshots[locale], {pid: (1, canonical_start)})
+            self.assertEqual(tokens['en_GB.UTF-8'], snapshots['C'][pid][1])
+            self.assertEqual(tokens['C'], snapshots['en_GB.UTF-8'][pid][1])
 
 
 class ReservationTests(unittest.TestCase):

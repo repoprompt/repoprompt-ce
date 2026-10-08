@@ -430,6 +430,7 @@ def process_rss_snapshot() -> Optional[Dict[int, Tuple[int, int, str]]]:
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,rss=,comm="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2591,6 +2592,7 @@ def process_start_token(pid: int) -> Optional[str]:
     try:
         completed = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2607,6 +2609,7 @@ def process_table_snapshot() -> Optional[Dict[int, Tuple[int, str]]]:
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,lstart="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2637,6 +2640,7 @@ def process_command_snapshot(pids: Sequence[int]) -> Dict[int, str]:
     try:
         completed = subprocess.run(
             ["ps", "-ww", "-p", ",".join(str(pid) for pid in selected), "-o", "pid=,command="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2665,6 +2669,7 @@ def process_command(pid: int) -> str:
     try:
         completed = subprocess.run(
             ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,

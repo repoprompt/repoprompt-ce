@@ -1322,12 +1322,6 @@ struct AgentMonitorPillProps: Equatable {
     /// Notices are recorded per incarnation, so dismissing them needs the identity rather than the
     /// session UUID: a duplicate live incarnation of the same UUID must not clear another's notices.
     var endpoint: DomainAgentSessionLinkEndpointIdentity?
-    /// Target-centric relationship choices for this exact endpoint.
-    ///
-    /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
-    /// placeholder). A non-nil empty value means there is neither an eligible observer to add nor an
-    /// existing relationship to unlink, so the sidebar renders no management surface.
-    let sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
     let recentNotices: [Notice]
@@ -1380,7 +1374,6 @@ struct AgentMonitorPillProps: Equatable {
     init(
         sessionID: UUID?,
         endpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
-        sidebarOversightMenu: AgentSidebarOversightMenuProps?,
         outbound: [Outbound],
         inbound: [Inbound],
         recentNotices: [Notice],
@@ -1397,7 +1390,6 @@ struct AgentMonitorPillProps: Equatable {
     ) {
         self.sessionID = sessionID
         self.endpoint = endpoint
-        self.sidebarOversightMenu = sidebarOversightMenu
         self.outbound = outbound
         self.inbound = inbound
         self.recentNotices = recentNotices
@@ -1415,7 +1407,6 @@ struct AgentMonitorPillProps: Equatable {
 
     static let empty = AgentMonitorPillProps(
         sessionID: nil,
-        sidebarOversightMenu: nil,
         outbound: [],
         inbound: [],
         recentNotices: [],
@@ -1432,7 +1423,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1463,7 +1453,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1836,5 +1825,21 @@ enum AgentMonitorAddOutcome: Equatable {
         case let .rejected(message):
             message
         }
+    }
+}
+
+/// Closed-row presentation only. No available-choice arrays or collision-safe menu labels.
+struct AgentSidebarOversightSummary: Equatable {
+    let linkedObserverCount: Int
+    let availableObserverCount: Int
+    let createdByLabel: String?
+
+    var isEmpty: Bool {
+        linkedObserverCount == 0 && availableObserverCount == 0
+    }
+
+    var accessibilityValue: String {
+        "\(linkedObserverCount) current overseer\(linkedObserverCount == 1 ? "" : "s"); "
+            + "\(availableObserverCount) eligible Agent session\(availableObserverCount == 1 ? "" : "s")"
     }
 }
