@@ -63,42 +63,145 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     func testConfigOptionsOnlyUpdatePreservesLiveDirectEffortSelection() async throws {
+        let cases: [(name: String, order: String, reportedID: String?, afterSelection: String?, afterPrompt: String?)] = [
+            ("model-only control", "before", nil, nil, nil),
+            ("report before response", "before", "eff-low", "low", "low"),
+            ("response before differing report", "after", "eff-high", nil, "high"),
+            ("unresolvable option id", "before", "not-advertised", nil, nil)
+        ]
+        var observedEfforts: [[String?]] = []
+        for testCase in cases {
+            let harness = try makeHarness(advertiseConfigOptions: true)
+            let config = GrokBuildAgentConfig(
+                commandName: harness.scriptPath,
+                additionalPathHints: [],
+                modelString: "grok-4.6-low",
+                includeRepoPromptMCPServer: false
+            )
+            var environment = [
+                "ACP_RECORD_PATH": harness.recordURL.path,
+                "ACP_EFFORT_REPORT_ORDER": testCase.order
+            ]
+            environment["ACP_REPORTED_EFFORT_ID"] = testCase.reportedID
+            let provider = EnvForwardingGrokProvider(config: config, extraEnvironment: environment)
+            let request = ACPRunRequest(
+                agentKind: .grokBuild,
+                modelString: config.modelString,
+                workspacePath: harness.workspace.path,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+            let controller = try ACPAgentSessionController(
+                provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+            )
+
+            do {
+                let bootstrap = try await controller.bootstrap()
+                let initialState = await controller.currentDiscoveredSessionModels()
+                let initial = try XCTUnwrap(initialState, testCase.name)
+                XCTAssertEqual(initial.currentEffortRaw, "xhigh", "initial authority: \(testCase.name)")
+                XCTAssertTrue(initial.options.contains { $0.rawValue == "grok-4.6-low" }, testCase.name)
+                XCTAssertTrue(initial.options.contains { $0.rawValue == "grok-4.6-max" }, testCase.name)
+
+                // Preserve the original model-only update-before-selection regression.
+                try await controller.prompt(AgentMessage(userMessage: "before selection"), request: request)
+                try await controller.setSessionModel("grok-4.6-low")
+                let selected = await controller.currentDiscoveredSessionModels()
+                XCTAssertEqual(selected?.currentModelRaw, "grok-4.6", testCase.name)
+
+                // The peer releases the late report only on this request, which cannot be
+                // dispatched until setSessionModel has returned. Its prompt reply fences processing.
+                try await controller.prompt(AgentMessage(userMessage: "after selection"), request: request)
+                let reported = await controller.currentDiscoveredSessionModels()
+                XCTAssertEqual(reported?.currentModelRaw, "grok-4.6", testCase.name)
+                observedEfforts.append([selected?.currentEffortRaw, reported?.currentEffortRaw])
+                XCTAssertEqual(reported?.options, initial.options, "direct catalog: \(testCase.name)")
+                let mapped = provider.makeDirectModelSelectionRequest(
+                    sessionID: bootstrap.sessionID, baseModelRaw: "grok-4.6", reasoningEffortRaw: "max"
+                )
+                XCTAssertEqual((mapped.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "maximum", "exact wire alias: \(testCase.name)")
+                await controller.shutdown()
+            } catch {
+                await controller.shutdown()
+                throw error
+            }
+
+            let setModelCalls = harness.recordedMethods("session/set_model")
+            XCTAssertEqual(setModelCalls.count, 1, testCase.name)
+            XCTAssertEqual(setModelCalls.first?["modelId"] as? String, "grok-4.6", testCase.name)
+            let meta = setModelCalls.first?["_meta"] as? [String: Any]
+            XCTAssertEqual(meta?["reasoningEffort"] as? String, "low", testCase.name)
+        }
+        // Exercise every row before asserting the red effort outcomes.
+        XCTAssertEqual(observedEfforts, cases.map { [$0.afterSelection, $0.afterPrompt] }, cases.map(\.name).joined(separator: "; "))
+    }
+
+    func testSetModelTimeoutInvalidatesDirectAuthority() async throws {
         let harness = try makeHarness(advertiseConfigOptions: true)
-        let config = GrokBuildAgentConfig(
-            commandName: harness.scriptPath,
-            additionalPathHints: [],
-            modelString: "grok-4.6-low",
-            includeRepoPromptMCPServer: false
-        )
         let provider = EnvForwardingGrokProvider(
-            config: config,
-            extraEnvironment: ["ACP_RECORD_PATH": harness.recordURL.path]
+            config: GrokBuildAgentConfig(
+                commandName: harness.scriptPath,
+                additionalPathHints: [],
+                includeRepoPromptMCPServer: false
+            ),
+            extraEnvironment: [
+                "ACP_RECORD_PATH": harness.recordURL.path,
+                "ACP_WITHHOLD_SET_MODEL_RESPONSE": "1"
+            ]
         )
         let request = ACPRunRequest(
             agentKind: .grokBuild,
-            modelString: config.modelString,
+            modelString: "grok-4.6-low",
             workspacePath: harness.workspace.path,
             resumeSessionID: nil,
             attachments: [],
             taskLabelKind: nil
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
-
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 0.1),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        let initial: ACPDiscoveredSessionModels
         do {
             _ = try await controller.bootstrap()
-            try await controller.prompt(AgentMessage(userMessage: "hi"), request: request)
-            try await controller.setSessionModel("grok-4.6-low")
-            await controller.shutdown()
+            let snapshot = await controller.currentDiscoveredSessionModels()
+            initial = try XCTUnwrap(snapshot)
+            XCTAssertEqual(initial.currentModelRaw, "grok-4.6")
+            XCTAssertEqual(initial.currentEffortRaw, "xhigh")
         } catch {
             await controller.shutdown()
             throw error
         }
 
-        let setModelCalls = harness.recordedMethods("session/set_model")
-        XCTAssertEqual(setModelCalls.count, 1)
-        XCTAssertEqual(setModelCalls.first?["modelId"] as? String, "grok-4.6")
-        let meta = setModelCalls.first?["_meta"] as? [String: Any]
-        XCTAssertEqual(meta?["reasoningEffort"] as? String, "low")
+        let completed = expectation(description: "session/set_model operational timeout")
+        let selectionTask = Task {
+            let failure: String?
+            do {
+                try await controller.setSessionModel("grok-4.6-low")
+                try await controller.prompt(AgentMessage(userMessage: "must not send"), request: request)
+                failure = nil
+            } catch {
+                failure = error.localizedDescription
+            }
+            completed.fulfill()
+            return failure
+        }
+        // Bound the known-bad missing-timeout path, then always release its continuation
+        // and join it. Inspect authority before shutdown, which clears all snapshots.
+        await fulfillment(of: [completed], timeout: 2)
+        let afterTimeout = await controller.currentDiscoveredSessionModels()
+        await controller.shutdown()
+        let failure = await selectionTask.value
+
+        XCTAssertTrue(failure?.hasPrefix("ACP request session/set_model timed out after 0.1s.") == true, "unexpected failure: \(failure ?? "none")")
+        XCTAssertNil(afterTimeout?.currentModelRaw)
+        XCTAssertNil(afterTimeout?.currentEffortRaw)
+        XCTAssertEqual(afterTimeout?.options, initial.options)
+        XCTAssertEqual(harness.recordedMethods("session/set_model").count, 1)
+        XCTAssertTrue(harness.recordedMethods("session/prompt").isEmpty)
     }
 
     func testFullAccessIntentReachesLaunchRequest() {
@@ -410,6 +513,11 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         session_id = "grok-headless-session"
         ADVERTISE_CONFIG_OPTIONS = __ADVERTISE_CONFIG_OPTIONS__
         CLOSE_STDIN_ON_OPEN = __CLOSE_STDIN_ON_OPEN__
+        effort_report_order = os.environ.get("ACP_EFFORT_REPORT_ORDER")
+        reported_effort_id = os.environ.get("ACP_REPORTED_EFFORT_ID")
+        withhold_set_model_response = os.environ.get("ACP_WITHHOLD_SET_MODEL_RESPONSE") == "1"
+        selected_model = "grok-4.6"
+        late_effort_report_pending = False
 
         if "--help" in sys.argv:
             print("Usage: grok agent [OPTIONS] [COMMAND]\n\nCommands:\n  stdio    Run the agent over stdio")
@@ -423,6 +531,16 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
 
         def respond(request_id, result=None):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
+
+        def config_update(effort_id=None):
+            options = [{"id": "model", "category": "model", "type": "select", "currentValue": selected_model,
+                        "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]}]
+            if effort_id is not None:
+                options.append({"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": effort_id,
+                                "options": [{"value": "eff-" + e} for e in ["xhigh", "high", "medium", "low", "maximum"]]})
+            print(json.dumps({"jsonrpc": "2.0", "method": "session/update",
+                              "params": {"sessionId": session_id, "update": {
+                                  "sessionUpdate": "config_option_update", "configOptions": options}}}), flush=True)
 
         record("launchEnvironment", {key: os.environ.get(key) for key in
             ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE",
@@ -464,14 +582,16 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     ]
                 }}
                 if ADVERTISE_CONFIG_OPTIONS:
-                    efforts = [{"id": e, "value": e, "default": e == "high"} for e in ["xhigh", "high", "medium", "low"]]
+                    efforts = [{"id": "eff-" + e, "value": e, "default": e == "high"} for e in ["xhigh", "high", "medium", "low", "maximum"]]
                     result["models"]["availableModels"][0]["_meta"] = {
                         "supportsReasoningEffort": True, "reasoningEffort": "xhigh", "reasoningEfforts": efforts}
+                    result["_meta"] = {"x.ai/sessionConfig": {"options": [
+                        {"id": "eff-xhigh", "category": "mode", "selected": True}]}}
                     result["configOptions"] = [
                         {"id": "model", "category": "model", "type": "select", "currentValue": "grok-4.6",
                          "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]},
-                        {"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": "xhigh",
-                         "options": [{"value": e} for e in ["xhigh", "high", "medium", "low"]]}]
+                        {"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": "eff-xhigh",
+                         "options": [{"value": "eff-" + e} for e in ["xhigh", "high", "medium", "low", "maximum"]]}]
                 if CLOSE_STDIN_ON_OPEN:
                     # Close before replying so the next write fails deterministically; keep
                     # stdout and the process alive until controller shutdown, avoiding exit races.
@@ -481,17 +601,20 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     signal.pause()
                     break
             elif method == "session/set_model":
-                respond(request_id, {"_meta": {"model": {"Ok": params.get("modelId")}}})
+                if withhold_set_model_response:
+                    # Consume the request but leave the peer and both pipes open until shutdown.
+                    continue
+                selected_model = params.get("modelId")
+                if effort_report_order == "before":
+                    config_update(reported_effort_id)
+                elif effort_report_order == "after":
+                    late_effort_report_pending = True
+                respond(request_id, {"_meta": {"model": {"Ok": selected_model}}})
             elif method == "session/prompt":
                 if ADVERTISE_CONFIG_OPTIONS:
-                    # grok may later push a configOptions-only snapshot; it must not demote the direct path.
-                    print(json.dumps({
-                        "jsonrpc": "2.0", "method": "session/update",
-                        "params": {"sessionId": session_id, "update": {
-                            "sessionUpdate": "config_option_update",
-                            "configOptions": [{"id": "model", "category": "model", "type": "select", "currentValue": "grok-4.6",
-                                               "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]}]}}
-                    }), flush=True)
+                    # A subsequent request fences the late report behind selection completion.
+                    config_update(reported_effort_id if late_effort_report_pending else None)
+                    late_effort_report_pending = False
                 print(json.dumps({
                     "jsonrpc": "2.0", "method": "session/update",
                     "params": {"sessionId": session_id, "update": {
