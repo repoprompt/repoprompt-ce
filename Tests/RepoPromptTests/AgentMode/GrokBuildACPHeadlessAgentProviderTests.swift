@@ -140,6 +140,80 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertEqual(observedEfforts, cases.map { [$0.afterSelection, $0.afterPrompt] }, cases.map(\.name).joined(separator: "; "))
     }
 
+    func testNewerDifferentBaseReportAfterAcknowledgementIsKept() async throws {
+        let harness = try makeHarness(advertiseConfigOptions: true)
+        let provider = EnvForwardingGrokProvider(
+            config: GrokBuildAgentConfig(
+                commandName: harness.scriptPath,
+                additionalPathHints: [],
+                includeRepoPromptMCPServer: false
+            ),
+            extraEnvironment: [
+                "ACP_RECORD_PATH": harness.recordURL.path,
+                "ACP_POST_ACK_DIFFERENT_BASE_REPORT": "1"
+            ]
+        )
+        let request = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: "grok-4.5",
+            workspacePath: harness.workspace.path,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let reportProcessed = expectation(description: "newer different-base report processed")
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            diagnosticSink: { event in
+                if case .info("Processed authoritative config_option_update snapshot.") = event {
+                    reportProcessed.fulfill()
+                }
+            },
+            allowsProviderProcessLaunchForTesting: true
+        )
+        let initial: ACPDiscoveredSessionModels
+        do {
+            _ = try await controller.bootstrap()
+            let snapshot = await controller.currentDiscoveredSessionModels()
+            initial = try XCTUnwrap(snapshot)
+            XCTAssertEqual(initial.currentModelRaw, "grok-4.6")
+            XCTAssertEqual(initial.currentEffortRaw, "xhigh")
+        } catch {
+            await controller.debugResumeConfigurationMutationPostcheck()
+            await controller.shutdown()
+            throw error
+        }
+
+        await controller.debugSuspendNextConfigurationMutationPostcheck()
+        let selectionTask = Task { () -> String? in
+            do {
+                try await controller.setSessionModel("grok-4.5")
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        // Fence the applied report before releasing the acknowledgement postcheck; always
+        // release and join the task, even if the bounded expectation records a failure.
+        await fulfillment(of: [reportProcessed], timeout: 5)
+        await controller.debugResumeConfigurationMutationPostcheck()
+        let failure = await selectionTask.value
+        let reported = await controller.currentDiscoveredSessionModels()
+        await controller.shutdown()
+
+        XCTAssertTrue(failure?.contains("no longer confirms requested model 'grok-4.5'") == true, "unexpected failure: \(failure ?? "none")")
+        XCTAssertEqual(reported?.currentModelRaw, "grok-4.6")
+        XCTAssertEqual(reported?.currentEffortRaw, "high")
+        XCTAssertEqual(reported?.options, initial.options)
+        let setModelCalls = harness.recordedMethods("session/set_model")
+        XCTAssertEqual(setModelCalls.count, 1)
+        XCTAssertEqual(setModelCalls.first?["modelId"] as? String, "grok-4.5")
+        let meta = setModelCalls.first?["_meta"] as? [String: Any]
+        XCTAssertNil(meta?["reasoningEffort"])
+        XCTAssertTrue(harness.recordedMethods("session/prompt").isEmpty)
+    }
+
     func testSetModelTimeoutInvalidatesDirectAuthority() async throws {
         let harness = try makeHarness(advertiseConfigOptions: true)
         let provider = EnvForwardingGrokProvider(
@@ -520,6 +594,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         reported_effort_id = os.environ.get("ACP_REPORTED_EFFORT_ID")
         post_selection_effort_id = os.environ.get("ACP_POST_SELECTION_EFFORT_ID")
         withhold_set_model_response = os.environ.get("ACP_WITHHOLD_SET_MODEL_RESPONSE") == "1"
+        post_ack_different_base_report = os.environ.get("ACP_POST_ACK_DIFFERENT_BASE_REPORT") == "1"
         selected_model = "grok-4.6"
         late_effort_report_pending = False
 
@@ -536,8 +611,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         def respond(request_id, result=None):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
 
-        def config_update(effort_id=None):
-            options = [{"id": "model", "category": "model", "type": "select", "currentValue": selected_model,
+        def config_update(effort_id=None, model=None):
+            options = [{"id": "model", "category": "model", "type": "select", "currentValue": model or selected_model,
                         "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]}]
             if effort_id is not None:
                 options.append({"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": effort_id,
@@ -613,6 +688,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     config_update(reported_effort_id)
                 late_effort_report_pending = effort_report_order == "after" or post_selection_effort_id is not None
                 respond(request_id, {"_meta": {"model": {"Ok": selected_model}}})
+                if post_ack_different_base_report:
+                    config_update("eff-high", model="grok-4.6")
             elif method == "session/prompt":
                 if ADVERTISE_CONFIG_OPTIONS:
                     # A subsequent request fences the late report behind selection completion.
