@@ -2517,7 +2517,7 @@ actor ACPAgentSessionController {
         switch method {
         case "initialize", "authenticate", "session/new", "session/load":
             requestTimeouts.bootstrapSeconds
-        case "cursor/list_available_models", "session/set_config_option":
+        case "cursor/list_available_models", "session/set_config_option", "session/set_model":
             requestTimeouts.operationalSeconds
         default:
             nil
