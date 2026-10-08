@@ -8,6 +8,19 @@ import XCTest
     final class WorkspaceProjectionDecodeTests: XCTestCase {
         typealias Diagnostics = WorkspaceProjectionDecodeDiagnostics
 
+        func testWorkspacePresetCodablePreservesComparisonPortFilenameBytes() throws {
+            let paths = ["/repo/file ", "relative\n", " ", "/repo/caf\u{e9}", "/repo/cafe\u{301}"]
+            let preset = WorkspacePreset(name: "Exact stored paths", selectedFilePaths: paths)
+            let restored = try JSONDecoder().decode(WorkspacePreset.self, from: JSONEncoder().encode(preset))
+            XCTAssertEqual(restored.selectedFilePaths.map { Array($0.utf8) }, paths.map { Array($0.utf8) })
+            XCTAssertFalse(WorkspaceManagerViewModel.isPresetSelectionDirty(
+                presetPaths: [restored.selectedFilePaths[0]], selectionPaths: [(absolute: paths[0], relative: "file ")]
+            ))
+            XCTAssertTrue(WorkspaceManagerViewModel.isPresetSelectionDirty(
+                presetPaths: [restored.selectedFilePaths[0]], selectionPaths: [(absolute: "/repo/file", relative: "file")]
+            ))
+        }
+
         func testDirtyBytesAtSameURLProduceCurrentIsolatedValues() throws {
             let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
             let first = try fixture.bytes(revision: 1)

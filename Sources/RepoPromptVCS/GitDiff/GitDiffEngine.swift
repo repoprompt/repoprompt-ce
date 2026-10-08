@@ -346,10 +346,9 @@ package actor GitDiffEngine {
         let discoveryPathspecs = pathspecs.map {
             GitDiffPathNormalization.gitDiscoveryPathspecs(from: $0, repoRootPath: repoURL.path)
         }
-        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { rawPath in
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !(trimmed as NSString).expandingTildeInPath.hasPrefix("/")
-        } ?? false
+        // Match GitDiffPathNormalization: only a raw leading slash denotes an
+        // absolute input. Relative whitespace and tilde are authored Git syntax.
+        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { !$0.hasPrefix("/") } ?? false
         let scope: GitDiffScope = hasPathspecs ? .selected : .all
         let requestedPaths = hasPathspecs ? normalizedPathspecs : nil
 

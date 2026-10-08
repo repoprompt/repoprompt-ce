@@ -8827,35 +8827,17 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated static func normalizedPresetPath(_ rawPath: String) -> String? {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let standardized = StandardizedPath.absolute(trimmed)
-        if standardized.hasPrefix("/") {
-            return standardized
-        }
-        return StandardizedPath.relative(trimmed)
+        WorkspacePresetSelectionComparison.normalizedLegacyComparisonPath(rawPath)
     }
 
     nonisolated static func isPresetSelectionDirty(
         presetPaths: [String],
         selectionPaths: [(absolute: String, relative: String)]
     ) -> Bool {
-        let selAbs = Set(selectionPaths.map(\.absolute))
-        let selRel = Set(selectionPaths.map(\.relative))
-        let presetStd = Set(presetPaths.compactMap(normalizedPresetPath))
-
-        let presetCovered = presetStd.allSatisfy { path in
-            if path.hasPrefix("/") {
-                return selAbs.contains(path)
-            }
-            return selRel.contains(path)
-        }
-
-        let selectionCovered = selectionPaths.allSatisfy { path in
-            presetStd.contains(path.absolute) || presetStd.contains(path.relative)
-        }
-
-        return !(presetCovered && selectionCovered)
+        WorkspacePresetSelectionComparison.isDirty(
+            presetPaths: presetPaths,
+            selectionPaths: selectionPaths
+        )
     }
 
     @MainActor

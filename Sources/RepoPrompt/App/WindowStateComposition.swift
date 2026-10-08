@@ -83,6 +83,7 @@ enum WindowStateCompositionFactory {
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
+        automaticProviderModelDiscoveryEnabled: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) -> WindowStateComposition {
@@ -133,7 +134,7 @@ enum WindowStateCompositionFactory {
         let apiSettingsViewModel = APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
-            loadStoredDataOnInit: loadStoredAPISettingsDataOnInit,
+            loadStoredDataOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService
         )
 
@@ -148,6 +149,7 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             settingsManager: settingsManager,
             storedPromptPersistence: storedPromptPersistence,
+            refreshAvailableModelsOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
@@ -244,6 +246,7 @@ enum WindowStateCompositionFactory {
             settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
             codexModelPollingService: codexModelPollingService,
+            automaticModelPollingEnabled: automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
@@ -257,6 +260,7 @@ enum WindowStateCompositionFactory {
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
             modelRouterRuntime: modelRouterRuntime,
+            usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
             catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
             perfRecorder: AppAgentModePerfRecorder()

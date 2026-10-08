@@ -355,6 +355,145 @@ import XCTest
             XCTAssertLessThanOrEqual(snapshot.retainedUTF8Bytes, maximumBytes)
         }
 
+        func testLeadingSpaceRelativeGlobKeepsGitMatchedSnapshotFiles() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: [
+                    " /file1.swift": "let leadingFirst = 1\n",
+                    " /file2.swift": "let leadingSecond = 1\n",
+                    " /file.txt": "let excludedText = 1\n",
+                    "ordinary.swift": "let ordinary = 1\n"
+                ]
+            )
+            try fixture.write("let leadingFirst = 2\n", to: " /file1.swift", at: repo)
+            try fixture.write("let leadingSecond = 2\n", to: " /file2.swift", at: repo)
+            try fixture.write("let excludedText = 2\n", to: " /file.txt", at: repo)
+            try fixture.write("let ordinary = 2\n", to: "ordinary.swift", at: repo)
+            let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+
+            let result = try await engine.buildSnapshotInputs(
+                compare: .uncommitted(base: "HEAD"),
+                pathspecs: [" /file*.swift"],
+                repoURL: repo,
+                contextLines: 3,
+                detectRenames: false,
+                generateDiffText: true
+            )
+
+            let expectedPaths = Set([Data(" /file1.swift".utf8), Data(" /file2.swift".utf8)])
+            XCTAssertEqual(Set(result.changedFiles.map { Data($0.path.utf8) }), expectedPaths)
+            XCTAssertEqual(result.scope, .selected)
+            XCTAssertEqual(result.requestedPaths?.map { Data($0.utf8) }, [Data(" /file*.swift".utf8)])
+            XCTAssertEqual(result.summary.files, 2)
+            let diff = try XCTUnwrap(result.diffText)
+            XCTAssertTrue(diff.contains("+let leadingFirst = 2"))
+            XCTAssertTrue(diff.contains("+let leadingSecond = 2"))
+            XCTAssertFalse(diff.contains("+let excludedText = 2"))
+            XCTAssertFalse(diff.contains("+let ordinary = 2"))
+            XCTAssertEqual(try Set(XCTUnwrap(result.perFile).keys.map { Data($0.utf8) }), expectedPaths)
+        }
+
+        func testAbsoluteWildcardIsLiteralAndRelativeAndNoPathControlsRemain() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: [
+                    "file*.swift": "let literal = 1\n",
+                    "file1.swift": "let wildcardPeer = 1\n",
+                    "ordinary.swift": "let ordinary = 1\n"
+                ]
+            )
+            try fixture.write("let literal = 2\n", to: "file*.swift", at: repo)
+            try fixture.write("let wildcardPeer = 2\n", to: "file1.swift", at: repo)
+            try fixture.write("let ordinary = 2\n", to: "ordinary.swift", at: repo)
+            let engine = GitDiffEngine(vcsService: VCSService(), gitService: GitService())
+            let requests: [(pathspecs: [String]?, expected: [String], scope: GitDiffScope)] = [
+                ([repo.appendingPathComponent("file*.swift").path], ["file*.swift"], .selected),
+                (["ordinary.swift"], ["ordinary.swift"], .selected),
+                (["file*.swift"], ["file*.swift", "file1.swift"], .selected),
+                (nil, ["file*.swift", "file1.swift", "ordinary.swift"], .all),
+                ([], ["file*.swift", "file1.swift", "ordinary.swift"], .all)
+            ]
+
+            for request in requests {
+                let result = try await engine.buildSnapshotInputs(
+                    compare: .uncommitted(base: "HEAD"),
+                    pathspecs: request.pathspecs,
+                    repoURL: repo,
+                    contextLines: 3,
+                    detectRenames: false,
+                    generateDiffText: true
+                )
+                let expectedPaths = Set(request.expected.map { Data($0.utf8) })
+                XCTAssertEqual(Set(result.changedFiles.map { Data($0.path.utf8) }), expectedPaths)
+                XCTAssertEqual(result.summary.files, request.expected.count)
+                XCTAssertEqual(result.scope, request.scope)
+                let diff = try XCTUnwrap(result.diffText)
+                XCTAssertFalse(diff.isEmpty)
+                XCTAssertEqual(diff.contains("+let literal = 2"), request.expected.contains("file*.swift"))
+                XCTAssertEqual(diff.contains("+let wildcardPeer = 2"), request.expected.contains("file1.swift"))
+                XCTAssertEqual(diff.contains("+let ordinary = 2"), request.expected.contains("ordinary.swift"))
+                XCTAssertEqual(try Set(XCTUnwrap(result.perFile).keys.map { Data($0.utf8) }), expectedPaths)
+                if request.scope == .all {
+                    XCTAssertNil(result.requestedPaths)
+                }
+            }
+        }
+
+        func testGitChangedFileStatsPreserveMachineRecordNamesAndRenames() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let names = [" leading.txt ", "line\nbreak.txt", "tab\tname.txt", "literal => arrow.txt", "dir/{old => new}/file.txt", "caf\u{e9}.txt"]
+            let old = "old\t => {name}\n.txt"
+            let renamed = " renamed\t => {name}\n.txt "
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: Dictionary(uniqueKeysWithValues: (names + [old]).map { ($0, "before\n") })
+            )
+            for name in names {
+                try fixture.write("after\n", to: name, at: repo)
+            }
+            _ = try fixture.runGit(["mv", "--", old, renamed], at: repo)
+            let untracked = " untracked\nfile.txt "
+            try fixture.write("new\n", to: untracked, at: repo)
+            let service = GitService()
+            let expected = Set((names + [renamed, untracked]).map { Data($0.utf8) })
+            let relative = try await service.getChangedFilesStats(relativeTo: .head, at: repo)
+            let scoped = try await service.getChangedFilesStats(
+                compare: .uncommitted(base: "HEAD"),
+                includeUntrackedWhenApplicable: true,
+                detectRenames: true,
+                paths: nil,
+                at: repo
+            )
+            for records in [relative, scoped] {
+                XCTAssertEqual(Set(records.map { Data($0.path.utf8) }), expected)
+                XCTAssertEqual(records.count, expected.count)
+                for record in records where names.contains(record.path) {
+                    XCTAssertEqual(record.status, "M")
+                    XCTAssertEqual(record.additions, 1)
+                    XCTAssertEqual(record.deletions, 1)
+                }
+                XCTAssertEqual(records.first { Data($0.path.utf8) == Data(renamed.utf8) }?.status, "R")
+                XCTAssertEqual(records.first { Data($0.path.utf8) == Data(untracked.utf8) }?.status, "??")
+            }
+        }
+
+        func testDiffChunkJoinKeepsLegacyTextDecodingSeparateFromMachineBytes() {
+            var text = Data()
+            for chunk in [Data("first".utf8), Data([0xFF]), Data("last\n".utf8)] {
+                GitService.appendDiffChunk(chunk, to: &text, legacyTextOutput: true)
+            }
+            XCTAssertEqual(text, Data("first\nlast\n".utf8))
+            XCTAssertTrue(GitService.diffTextChunkBytes(Data([0xFF])).isEmpty)
+
+            var machine = Data()
+            for chunk in [Data([97, 0]), Data([0xFF]), Data([98, 0])] {
+                GitService.appendDiffChunk(chunk, to: &machine, legacyTextOutput: false)
+            }
+            XCTAssertEqual(machine, Data([97, 0, 0xFF, 98, 0]))
+        }
+
         private func makeModifiedRepository(using fixture: ReviewGitRepositoryFixture) throws -> URL {
             let repo = try fixture.makeRepository(
                 named: "repo",

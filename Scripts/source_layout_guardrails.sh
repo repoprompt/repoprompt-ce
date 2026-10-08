@@ -178,7 +178,10 @@ if workspace_core is None:
 else:
     if workspace_core.get("type") != "regular": errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
     if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore": errors.append("RepoPromptWorkspaceCore target path drifted")
-    if workspace_core.get("dependencies", []): errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
+    core_dependencies = workspace_core.get("dependencies", [])
+    core_products = {(dependency["product"][0], dependency["product"][1]) for dependency in core_dependencies if "product" in dependency}
+    if len(core_dependencies) != 1 or core_products != {("SystemPackage", "swift-system")}:
+        errors.append("RepoPromptWorkspaceCore must depend only on the existing Swift System native path package")
     if workspace_core.get("settings", []): errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
 
 workspace_core_tests = targets.get("RepoPromptWorkspaceCoreTests")
@@ -387,7 +390,7 @@ for dir in "${retired_tree_sitter_grammar_dirs[@]}"; do
   fi
 done
 
-# RepoPromptWorkspaceCore is a Foundation-only path-policy boundary.
+# RepoPromptWorkspaceCore imports Foundation and the existing Swift System native path API only.
 workspace_core_source_dir="Sources/RepoPromptWorkspaceCore"
 if [[ -d "$workspace_core_source_dir" ]]; then
   unexpected_workspace_core_files="$(find "$workspace_core_source_dir" -type f ! -name '*.swift' -print)"
@@ -399,8 +402,8 @@ if [[ -d "$workspace_core_source_dir" ]]; then
   if ! workspace_core_imports="$(xcrun swiftc -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
     fail "Swift compiler could not inspect RepoPromptWorkspaceCore imports"
     printf '%s\n' "$workspace_core_imports" >&2
-  elif [[ "$workspace_core_imports" != "Foundation" ]]; then
-    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation only"
+  elif [[ "$workspace_core_imports" != $'Foundation\nSystemPackage' ]]; then
+    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation and SystemPackage only"
     printf '%s\n' "$workspace_core_imports" >&2
   fi
 fi

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
@@ -665,7 +666,7 @@ struct AgentManageMCPToolService {
             name: "include_file_contents",
             defaultValue: false
         )
-        let outputPath = normalizedString(args["output_path"])
+        let outputPath = try AgentHandoffOutputFile.pathArgument(args["output_path"])
         let inline = try parseBool(
             args["inline"],
             name: "inline",
@@ -781,7 +782,12 @@ struct AgentManageMCPToolService {
             result["handoff_xml"] = .string(handoffXML)
         }
         if let outputPath {
-            let writeResult = try await writeHandoffPayload(handoffXML, to: outputPath, overwrite: overwrite)
+            let writeResult = try await AgentHandoffOutputFile.write(
+                handoffXML,
+                to: outputPath,
+                overwrite: overwrite,
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+            )
             result["output_path"] = .string(writeResult.path)
             result["bytes_written"] = .int(writeResult.bytes)
         }
@@ -1859,67 +1865,6 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("\(name) must be an integer.")
         }
         return min(max(parsed, minValue), maxValue)
-    }
-
-    private func writeHandoffPayload(
-        _ payload: String,
-        to rawPath: String,
-        overwrite: Bool
-    ) async throws -> (path: String, bytes: Int) {
-        let url = try resolveSafeOutputURL(rawPath, paramName: "output_path")
-        let data = Data(payload.utf8)
-        let bytes = data.count
-        try await Task.detached(priority: .utility) {
-            let fileManager = FileManager.default
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    throw MCPError.invalidParams("output_path points to a directory: \(url.path)")
-                }
-                if !overwrite {
-                    throw MCPError.invalidParams("output_path already exists and overwrite=false: \(url.path)")
-                }
-            }
-            let parent = url.deletingLastPathComponent()
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-            let options: Data.WritingOptions = overwrite ? [.atomic] : [.withoutOverwriting]
-            do {
-                try data.write(to: url, options: options)
-            } catch {
-                if !overwrite, fileManager.fileExists(atPath: url.path) {
-                    throw MCPError.invalidParams("output_path already exists and overwrite=false: \(url.path)")
-                }
-                throw error
-            }
-        }.value
-        return (url.path, bytes)
-    }
-
-    private func resolveSafeOutputURL(_ rawPath: String, paramName: String) throws -> URL {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw MCPError.invalidParams("\(paramName) must not be empty.")
-        }
-        guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "\0\n\r")) == nil else {
-            throw MCPError.invalidParams("\(paramName) must be a single filesystem path.")
-        }
-
-        let path: String
-        if trimmed == "~" {
-            path = FileManager.default.homeDirectoryForCurrentUser.path
-        } else if trimmed.hasPrefix("~/") {
-            path = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(trimmed.dropFirst(2)))
-                .path
-        } else if trimmed.hasPrefix("~") {
-            throw MCPError.invalidParams("\(paramName) supports '~' or '~/' only; use an absolute path otherwise.")
-        } else {
-            path = trimmed
-        }
-        guard path.hasPrefix("/") else {
-            throw MCPError.invalidParams("\(paramName) must be absolute. CLI shorthand resolves relative paths before calling MCP.")
-        }
-        return URL(fileURLWithPath: path).standardizedFileURL
     }
 
     /// Resolves agent, model, and reasoning effort from pre-resolved selection + raw args.
