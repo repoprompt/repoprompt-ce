@@ -1136,7 +1136,8 @@ actor HistorySessionScanner: HistorySessionScanning {
             let cachedEntry = indexScanCache?.entries[cacheKey]
             let cachedRecord = cachedEntry?.records.first { $0.id == sessionID }
             let identity: (name: String, id: UUID?)
-            if let cachedEntry {
+            // Stale-schema cache entries carry only the storage-directory identity.
+            if let cachedEntry, cachedEntry.indexSchemaVersion == nil {
                 identity = (name: cachedEntry.workspaceName, id: cachedEntry.workspaceID)
                 touchCachedIndexScan(cacheKey)
             } else {
@@ -1530,14 +1531,35 @@ actor HistorySessionScanner: HistorySessionScanning {
             return .result(cachedResult, counters)
         }
 
-        if counters.indexDecodes >= inventoryBudget.maxIndexDecodes {
-            return .stopped(HistoryScanDiagnostic(
+        func indexCountDiagnostic(_ current: InventoryCounters) -> HistoryScanDiagnostic? {
+            guard current.indexDecodes >= inventoryBudget.maxIndexDecodes else { return nil }
+            return HistoryScanDiagnostic(
                 kind: .indexCount,
                 limit: Int64(inventoryBudget.maxIndexDecodes),
-                consumed: Int64(counters.indexDecodes),
+                consumed: Int64(current.indexDecodes),
                 unit: .indexes,
                 phase: "index_decode"
-            ), counters)
+            )
+        }
+
+        // Stale-schema indexes are never decoded, so they must not consume the index
+        // count/byte budgets or the workspace.json identity read ahead of usable ones.
+        // A bounded head read answers the version question for the common writer layout
+        // (`schemaVersion` first); an inconclusive head falls back to the full read below.
+        let headSchemaVersion = headSchemaVersionSniff(of: indexFile)
+        if let headSchemaVersion, headSchemaVersion != AgentSessionMetadataIndex.currentSchemaVersion {
+            rememberStaleIndexScan(
+                cacheKey,
+                indexSignature: indexSignature,
+                workspaceSignature: workspaceSignature,
+                identity: fallbackIdentity,
+                indexSchemaVersion: headSchemaVersion
+            )
+            return .result(result(indexSchemaVersion: headSchemaVersion), counters)
+        }
+
+        if headSchemaVersion != nil, let diagnostic = indexCountDiagnostic(counters) {
+            return .stopped(diagnostic, counters)
         }
         let indexBytes = max(0, indexSignature.fileSize)
         let effectiveFileLimit = min(requestBudget.maxIndexFileBytes, inventoryBudget.maxIndexFileBytes)
@@ -1565,9 +1587,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         }
 
         var updatedCounters = counters
-        updatedCounters.indexDecodes += 1
         updatedCounters.indexBytes += indexBytes
-        indexDecodeCountForTesting += 1
 
         do {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
@@ -1586,6 +1606,22 @@ actor HistorySessionScanner: HistorySessionScanning {
                     phase: "index_decode"
                 )])
             }
+            guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
+                rememberStaleIndexScan(
+                    cacheKey,
+                    indexSignature: indexSignature,
+                    workspaceSignature: workspaceSignature,
+                    identity: fallbackIdentity,
+                    indexSchemaVersion: schemaVersion
+                )
+                return .result(result(indexSchemaVersion: schemaVersion), updatedCounters)
+            }
+            // The decode slot is charged only for current-schema indexes that will be decoded.
+            if let diagnostic = indexCountDiagnostic(updatedCounters) {
+                return .stopped(diagnostic, updatedCounters)
+            }
+            updatedCounters.indexDecodes += 1
+            indexDecodeCountForTesting += 1
 
             let identityResolution = try await resolveWorkspaceNameAndID(
                 from: workspaceDir,
@@ -1597,22 +1633,6 @@ actor HistorySessionScanner: HistorySessionScanning {
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_identity") {
                 return .stopped(diagnostic, updatedCounters)
-            }
-            guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                rememberIndexScan(
-                    cacheKey,
-                    indexSignature: indexSignature,
-                    workspaceSignature: workspaceSignature,
-                    identity: identity,
-                    indexSchemaVersion: schemaVersion,
-                    records: [],
-                    estimatedByteCount: indexBytes
-                )
-                return .result(
-                    result(indexSchemaVersion: schemaVersion, identity: identity),
-                    updatedCounters,
-                    identityDiagnostics
-                )
             }
 
             if case let .insufficient(diagnostic) = requestBudget.remainingTimeDecision(
@@ -1755,6 +1775,26 @@ actor HistorySessionScanner: HistorySessionScanning {
         indexScanCache = cache
     }
 
+    /// Stale-schema entries keep no records and only the storage-directory identity, so they
+    /// are cached at zero estimated bytes: thousands of them must not evict usable entries.
+    private func rememberStaleIndexScan(
+        _ cacheKey: String,
+        indexSignature: FileSignature,
+        workspaceSignature: FileSignature?,
+        identity: (name: String, id: UUID?),
+        indexSchemaVersion: Int
+    ) {
+        rememberIndexScan(
+            cacheKey,
+            indexSignature: indexSignature,
+            workspaceSignature: workspaceSignature,
+            identity: identity,
+            indexSchemaVersion: indexSchemaVersion,
+            records: [],
+            estimatedByteCount: 0
+        )
+    }
+
     private func touchCachedIndexScan(_ cacheKey: String) {
         guard var cache = indexScanCache, var entry = cache.entries[cacheKey] else { return }
         cache.accessOrdinal &+= 1
@@ -1795,10 +1835,33 @@ actor HistorySessionScanner: HistorySessionScanning {
         fileURL.standardizedFileURL.path
     }
 
-    private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
-        guard let text = String(data: data, encoding: .utf8),
-              let keyRange = text.range(of: "\"schemaVersion\"")
+    /// Upper bound for the cheap stale-schema check. The writer emits `schemaVersion` first,
+    /// so a few KB answers the question without reading or charging the full index.
+    static let schemaVersionHeadSniffBytes = 4096
+
+    /// Reads at most ``schemaVersionHeadSniffBytes`` and returns the first `schemaVersion`
+    /// value only when it is complete inside that prefix. Because the full-data sniff also
+    /// uses the first occurrence, a conclusive head answer matches it; `nil` means
+    /// inconclusive and callers fall back to the full read.
+    private nonisolated func headSchemaVersionSniff(of fileURL: URL) -> Int? {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: Self.schemaVersionHeadSniffBytes),
+              !head.isEmpty
         else { return nil }
+        return Self.schemaVersionSniff(
+            in: String(decoding: head, as: UTF8.self),
+            valueMayBeTruncated: head.count >= Self.schemaVersionHeadSniffBytes
+        )
+    }
+
+    private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        return Self.schemaVersionSniff(in: text, valueMayBeTruncated: false)
+    }
+
+    private static func schemaVersionSniff(in text: String, valueMayBeTruncated: Bool) -> Int? {
+        guard let keyRange = text.range(of: "\"schemaVersion\"") else { return nil }
         guard let colon = text[keyRange.upperBound...].firstIndex(of: ":") else { return nil }
         var index = text.index(after: colon)
         while index < text.endIndex, text[index].isWhitespace {
@@ -1809,6 +1872,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             index = text.index(after: index)
         }
         guard start < index else { return nil }
+        if valueMayBeTruncated, index == text.endIndex { return nil }
         return Int(text[start ..< index])
     }
 

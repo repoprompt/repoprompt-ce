@@ -1118,7 +1118,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Manage Git worktrees, per-agent-session worktree bindings, and session-bound worktree merges.\n\n**Management ops**: list | show | create | bind | select | unbind\n**Merge ops**: preview | apply | status | continue | abort\n\n**Selectors**:\n- `repo_root`: Optional loaded root path/name, git-style specifier such as `@main`, or merge source-binding disambiguator.\n- `worktree`: Worktree selector (`@current`, `@main`, `@branch:<name>`, name, branch, path, or `@id:<worktree_id>`).\n- `worktree_id`: Durable worktree ID alternative to `worktree`.\n- `target`: Merge preview target selector; defaults to `@main`.\n- `target_worktree_id`: Durable merge target ID alternative to `target`.\n\n**Session binding and merge source**:\n- `bind` and `select` persist a binding for one Agent session.\n- Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.\n- `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.\n- `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.\n\n**Merge safety**:\n- `preview` is non-mutating and publishes bounded artifacts by default.\n- `apply` requires `operation_id`; plain MCP callers must pass `confirm_preview=true`.\n- Routed Agent Mode apply calls without confirmation request user approval before mutation.\n- `continue` and `abort` require `confirm=true` outside routed UI flows.\n\n**Visual identity**:\n- `label`, `color`, `icon_name`, and `marker_style` are serialized with worktree identity on create/bind.\n- `color` must be `#RRGGBB`; `marker_style` is `dot`, `ring`, or `capsule`.\n\n**Output**:\n- Management op JSON includes repository/worktree IDs, visual identity, bindings, previous_binding on replacement, and graph placeholders.\n- Merge op JSON keeps merge details under the nested `merge` block.\n- Formatted output is compact and stable for humans.",
+      "description" : "Manage Git worktrees, per-agent-session worktree bindings, and session-bound worktree merges.\n\n**Management ops**: list | show | create | bind | select | unbind\n**Merge ops**: preview | apply | status | continue | abort\n\n**Selectors**:\n- `repo_root`: Optional loaded root path/name, git-style specifier such as `@main`, or merge source-binding disambiguator.\n- `worktree`: Worktree selector (`@current`, `@main`, `@branch:<name>`, name, branch, path, or `@id:<worktree_id>`).\n- `worktree_id`: Durable worktree ID alternative to `worktree`.\n- `target`: Merge preview target selector; defaults to `@main`.\n- `target_worktree_id`: Durable merge target ID alternative to `target`.\n\n**Session binding and merge source**:\n- `bind` and `select` persist a binding for one Agent session.\n- Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.\n- `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.\n- `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.\n\n**Merge safety**:\n- `preview` is non-mutating and publishes bounded artifacts by default.\n- `apply` requires `operation_id`; plain MCP callers must pass `confirm_preview=true`.\n- Routed Agent Mode apply calls without confirmation request user approval before mutation.\n- `continue` and `abort` require `confirm=true` outside routed UI flows.\n\n**Visual identity**:\n- `label`, `color`, `icon_name`, and `marker_style` are serialized with worktree identity on create/bind.\n- `color` must be `#RRGGBB`; `marker_style` is `dot`, `ring`, or `capsule`.\n\n**Output**:\n- Management op JSON includes repository/worktree IDs, visual identity, bindings, previous_binding on replacement, and graph placeholders.\n- `list` returns at most `limit` worktrees (default 100, max 200) with `total_count`; when more remain it sets `truncated: true` and `next_offset`.\n- Merge op JSON keeps merge details under the nested `merge` block.\n- Formatted output is compact and stable for humans.",
       "inputSchema" : {
         "properties" : {
           "all" : {
@@ -1193,6 +1193,10 @@
             "description" : "Create/bind: visual label to persist for this worktree.",
             "type" : "string"
           },
+          "limit" : {
+            "description" : "List: maximum worktrees to return. Default 100; clamped to 1...200. Page with offset.",
+            "type" : "integer"
+          },
           "marker_style" : {
             "description" : "Create/bind: visual marker style",
             "enum" : [
@@ -1201,6 +1205,10 @@
               "capsule"
             ],
             "type" : "string"
+          },
+          "offset" : {
+            "description" : "List: zero-based index of the first worktree to return. Default 0. Continue with the reply's next_offset.",
+            "type" : "integer"
           },
           "op" : {
             "description" : "Operation",

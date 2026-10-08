@@ -1120,6 +1120,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
             .map(advertiseOracleImageAttachments)
+            .map(advertiseWorktreeListPagination)
     }
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
@@ -1226,6 +1227,44 @@ package enum MCPDomainCanonicalToolDefinitions {
         let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. `oracle_send` does not accept images; continue image-bearing conversations with `ask_oracle` + `chat_id`. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."
         if !description.contains(imageUsage) {
             description += "\n\n\(imageUsage)"
+        }
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// The vendored `manage_worktree` definition predates bounded `list` pages, so
+    /// canonicalization advertises `limit`/`offset` from ``MCPWorktreeListPagination``.
+    private static func advertiseWorktreeListPagination(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.manageWorktree,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+
+        properties["limit"] = .object([
+            "type": .string("integer"),
+            "description": .string(MCPWorktreeListPagination.limitPropertyDescription)
+        ])
+        properties["offset"] = .object([
+            "type": .string("integer"),
+            "description": .string(MCPWorktreeListPagination.offsetPropertyDescription)
+        ])
+        schema["properties"] = .object(properties)
+
+        var description = definition.description
+        let outputLine = MCPWorktreeListPagination.outputDescriptionLine
+        let anchor = "- Merge op JSON keeps merge details under the nested `merge` block."
+        if !description.contains(outputLine) {
+            description = description.contains(anchor)
+                ? description.replacingOccurrences(of: anchor, with: "\(outputLine)\n\(anchor)")
+                : description + "\n\(outputLine)"
         }
 
         return MCPDomainToolDefinition(

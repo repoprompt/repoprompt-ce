@@ -61,6 +61,138 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertEqual(previous["visual_color_hex"]?.stringValue, "#7C3AED")
     }
 
+    // MARK: - List pagination (#1091)
+
+    func testListPaginationWalksSixHundredWorktreesExactlyOnce() {
+        let total = 600
+        var visited: [Int] = []
+        var offset: Int?
+        var pageCount = 0
+        repeat {
+            let page = MCPWorktreeListPagination.page(totalCount: total, limit: nil, offset: offset)
+            XCTAssertLessThanOrEqual(page.range.count, MCPWorktreeListPagination.defaultLimit)
+            XCTAssertEqual(page.totalCount, total)
+            visited.append(contentsOf: page.range)
+            offset = page.nextOffset
+            XCTAssertEqual(page.hasMore, page.nextOffset != nil)
+            pageCount += 1
+        } while offset != nil && pageCount < 100
+
+        XCTAssertEqual(pageCount, 6)
+        XCTAssertEqual(visited, Array(0 ..< total))
+    }
+
+    func testListPaginationClampsLimitAndOffset() {
+        let minimum = MCPWorktreeListPagination.page(totalCount: 600, limit: 0, offset: -5)
+        XCTAssertEqual(minimum.range, 0 ..< 1)
+        XCTAssertEqual(minimum.nextOffset, 1)
+
+        let maximum = MCPWorktreeListPagination.page(totalCount: 600, limit: 10000, offset: 550)
+        XCTAssertEqual(maximum.limit, MCPWorktreeListPagination.maxLimit)
+        XCTAssertEqual(maximum.range, 550 ..< 600)
+        XCTAssertFalse(maximum.hasMore)
+        XCTAssertNil(maximum.nextOffset)
+
+        let pastEnd = MCPWorktreeListPagination.page(totalCount: 600, limit: nil, offset: 650)
+        XCTAssertTrue(pastEnd.range.isEmpty)
+        XCTAssertFalse(pastEnd.hasMore)
+
+        let small = MCPWorktreeListPagination.page(totalCount: 3, limit: nil, offset: nil)
+        XCTAssertEqual(small.range, 0 ..< 3)
+        XCTAssertNil(small.nextOffset)
+    }
+
+    func testListAcceptsPaginationArgumentsOnlyForList() {
+        let listKeys = MCPWorktreeToolProvider.validArgumentKeys(for: .list)
+        XCTAssertTrue(listKeys.isSuperset(of: ["limit", "offset"]))
+        XCTAssertFalse(MCPWorktreeToolProvider.validArgumentKeys(for: .show).contains("limit"))
+        XCTAssertFalse(MCPWorktreeToolProvider.validArgumentKeys(for: .show).contains("offset"))
+    }
+
+    func testCanonicalManageWorktreeSchemaAdvertisesListPagination() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.manageWorktree))
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        XCTAssertEqual(properties["limit"]?.objectValue?["type"], .string("integer"))
+        XCTAssertEqual(properties["offset"]?.objectValue?["type"], .string("integer"))
+        XCTAssertTrue(definition.description.contains(MCPWorktreeListPagination.outputDescriptionLine))
+    }
+
+    func testPagedListReplyEncodesPaginationFieldsAndStaysBounded() throws {
+        let total = 600
+        let allDTOs = (0 ..< total).map { Self.worktreeDTO(index: $0) }
+        let page = MCPWorktreeListPagination.page(totalCount: total, limit: nil, offset: nil)
+        let paged = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            worktrees: Array(allDTOs[page.range]),
+            totalCount: page.totalCount,
+            truncated: page.hasMore ? true : nil,
+            nextOffset: page.nextOffset
+        )
+        let unpaged = ToolResultDTOs.ManageWorktreeReplyDTO(op: "list", worktrees: allDTOs)
+
+        let object = try XCTUnwrap(Self.value(paged).objectValue)
+        XCTAssertEqual(object["worktrees"]?.arrayValue?.count, MCPWorktreeListPagination.defaultLimit)
+        XCTAssertEqual(object["total_count"]?.intValue, total)
+        XCTAssertEqual(object["truncated"]?.boolValue, true)
+        XCTAssertEqual(object["next_offset"]?.intValue, MCPWorktreeListPagination.defaultLimit)
+        XCTAssertNil(object["totalCount"])
+        XCTAssertNil(object["nextOffset"])
+
+        let pagedBytes = try JSONEncoder().encode(paged).count
+        let unpagedBytes = try JSONEncoder().encode(unpaged).count
+        XCTAssertLessThan(pagedBytes * 5, unpagedBytes)
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(paged)))
+        XCTAssertTrue(text.contains("### Worktrees (\(MCPWorktreeListPagination.defaultLimit) of \(total))"))
+    }
+
+    func testUnpagedListReplyOmitsContinuationFields() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            worktrees: [Self.worktreeDTO()],
+            totalCount: 1
+        )
+
+        let object = try XCTUnwrap(Self.value(dto).objectValue)
+        XCTAssertEqual(object["total_count"]?.intValue, 1)
+        XCTAssertNil(object["truncated"])
+        XCTAssertNil(object["next_offset"])
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(dto)))
+        XCTAssertTrue(text.contains("### Worktrees (1)"))
+    }
+
+    private static func worktreeDTO(index: Int) -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
+        .init(
+            worktreeID: "wt_\(index)",
+            specifier: "@id:wt_\(index)",
+            path: "/tmp/repo-worktrees/wt-\(index)",
+            gitDir: "/tmp/repo/.git/worktrees/wt-\(index)",
+            name: "wt-\(index)",
+            branch: "feature/wt-\(index)",
+            head: "abcdef0",
+            isMain: index == 0,
+            isCurrent: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil,
+            visual: nil,
+            status: nil
+        )
+    }
+
+    private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
+        let first = try XCTUnwrap(blocks.first)
+        guard case let .text(text, _, _) = first else {
+            XCTFail("Expected text content")
+            return ""
+        }
+        return text
+    }
+
     private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
         .init(
             worktreeID: "wt_123",

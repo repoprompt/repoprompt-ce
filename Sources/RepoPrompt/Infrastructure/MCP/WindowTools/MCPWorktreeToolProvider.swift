@@ -78,6 +78,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
             **Output**:
             - Management op JSON includes repository/worktree IDs, visual identity, bindings, previous_binding on replacement, and graph placeholders.
+            \(MCPWorktreeListPagination.outputDescriptionLine)
             - Merge op JSON keeps merge details under the nested `merge` block.
             - Formatted output is compact and stable for humans.
             """,
@@ -92,6 +93,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     "session_id": .string(description: "Target Agent session for bind/select/unbind, or create with bind=true."),
                     "include_status": .boolean(description: "Include a compact dirty summary for each returned worktree. Default false."),
                     "persist_visuals": .boolean(description: "For list/show, persist fallback visual identities instead of returning deterministic fallbacks only."),
+                    "limit": .integer(description: MCPWorktreeListPagination.limitPropertyDescription),
+                    "offset": .integer(description: MCPWorktreeListPagination.offsetPropertyDescription),
                     "branch": .string(description: "Create: branch name to create/check out."),
                     "base_ref": .string(description: "Create: optional base ref/commit for the new worktree."),
                     "path": .string(description: "Create: explicit absolute worktree path. External paths require allow_external_path=true."),
@@ -170,23 +173,38 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let omittedPrunableCount = allWorktrees.count - worktrees.count
         let includeStatus = parseBool(args["include_status"]) ?? false
         let persistVisuals = parseBool(args["persist_visuals"]) ?? false
+        // Page before building DTOs so status/visual work stays bounded by the page size.
+        let requestedLimit = try parseOptionalInteger(args["limit"], name: "limit")
+        let requestedOffset = try parseOptionalInteger(args["offset"], name: "offset")
+        let page = MCPWorktreeListPagination.page(
+            totalCount: worktrees.count,
+            limit: requestedLimit,
+            offset: requestedOffset
+        )
+        let pagedWorktrees = Array(worktrees[page.range])
         if persistVisuals {
-            if !worktrees.isEmpty {
+            if !pagedWorktrees.isEmpty {
                 let logicalRoot = try await logicalRoot(for: context)
                 try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
             }
             try await MCPDomainMutationCommitContext.willCommit()
         }
-        let dtos = try await worktrees.asyncMap { worktree in
+        let dtos = try await pagedWorktrees.asyncMap { worktree in
             try await worktreeDTO(worktree, includeStatus: includeStatus, persistVisuals: persistVisuals)
         }
-        let warning: String? = if dtos.isEmpty {
-            "No worktrees found for repository."
-        } else if omittedPrunableCount > 0 {
-            "Omitted \(omittedPrunableCount) stale (prunable) worktree(s); run `git worktree prune` to remove them."
-        } else {
-            nil
+        var warnings: [String] = []
+        if worktrees.isEmpty {
+            warnings.append("No worktrees found for repository.")
+        } else if dtos.isEmpty {
+            warnings.append("offset \(page.offset) is past the end of \(page.totalCount) worktree(s).")
         }
+        if !worktrees.isEmpty, omittedPrunableCount > 0 {
+            warnings.append("Omitted \(omittedPrunableCount) stale (prunable) worktree(s); run `git worktree prune` to remove them.")
+        }
+        if let nextOffset = page.nextOffset {
+            warnings.append("Showing worktrees \(page.range.lowerBound + 1)-\(page.range.upperBound) of \(page.totalCount); continue with offset=\(nextOffset).")
+        }
+        let warning: String? = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
         return await ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",
             repository: repositoryDTO(
@@ -194,6 +212,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 fallback: context.repo
             ),
             worktrees: dtos,
+            totalCount: page.totalCount,
+            truncated: page.hasMore ? true : nil,
+            nextOffset: page.nextOffset,
             graph: graphDTOIfRequested(args: args, repoURL: context.repo.rootURL),
             warning: warning
         )
@@ -998,9 +1019,21 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     // MARK: - Validation and parsing
 
     private func validateArguments(_ args: [String: Value], for op: Operation) throws {
-        let valid: Set<String> = switch op {
+        let valid = Self.validArgumentKeys(for: op)
+
+        for key in args.keys where !key.hasPrefix("_") && !valid.contains(key) {
+            throw MCPError.invalidParams("`\(key)` is not valid for op=\(op.rawValue).")
+        }
+
+        if trimmedString(args["target"]) != nil, trimmedString(args["target_worktree_id"]) != nil {
+            throw MCPError.invalidParams("target and target_worktree_id are mutually exclusive.")
+        }
+    }
+
+    nonisolated static func validArgumentKeys(for op: Operation) -> Set<String> {
+        switch op {
         case .list:
-            ["op", "operation_id", "repo_root", "repo_key", "include_status", "include_graph", "graph_limit", "persist_visuals"]
+            ["op", "operation_id", "repo_root", "repo_key", "include_status", "include_graph", "graph_limit", "persist_visuals", "limit", "offset"]
         case .show:
             ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "include_status", "include_graph", "graph_limit", "persist_visuals"]
         case .create:
@@ -1019,14 +1052,6 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             ["op", "session_id", "operation_id", "commit_message", "include_graph", "graph_limit", "confirm"]
         case .abort:
             ["op", "session_id", "operation_id", "include_graph", "graph_limit", "confirm"]
-        }
-
-        for key in args.keys where !key.hasPrefix("_") && !valid.contains(key) {
-            throw MCPError.invalidParams("`\(key)` is not valid for op=\(op.rawValue).")
-        }
-
-        if trimmedString(args["target"]) != nil, trimmedString(args["target_worktree_id"]) != nil {
-            throw MCPError.invalidParams("target and target_worktree_id are mutually exclusive.")
         }
     }
 
@@ -1089,6 +1114,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     func parseBool(_ value: Value?) -> Bool? {
         value?.boolValue
+    }
+
+    private func parseOptionalInteger(_ value: Value?, name: String) throws -> Int? {
+        guard let value else { return nil }
+        if case .null = value { return nil }
+        if let integer = value.intValue { return integer }
+        if let raw = trimmedString(value), let integer = Int(raw) { return integer }
+        throw MCPError.invalidParams("`\(name)` must be an integer.")
     }
 
     private func combinedWarnings(_ warnings: [String?]) -> String? {
