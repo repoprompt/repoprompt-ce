@@ -19,6 +19,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             modelString: config.modelString,
             includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
             alwaysApproveTools: config.alwaysApproveTools,
+            discoveryMode: config.discoveryMode,
             apiKey: config.apiKey,
             backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
         )
@@ -406,10 +407,7 @@ extension GrokBuildACPAgentProviderTests {
         let factoryProvider = AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild)
         let headlessProvider = try XCTUnwrap(factoryProvider as? GrokBuildACPHeadlessAgentProvider)
         let config = headlessProvider.test_config
-        // Keep the reproduction compiling before the config gains this field.
-        // Replace reflection with config.discoveryMode when implementing the fix.
-        let discoveryMode = Mirror(reflecting: config).children.first { $0.label == "discoveryMode" }?.value as? Bool
-        XCTAssertEqual(discoveryMode, true, "Context Builder must carry explicit discovery intent")
+        XCTAssertTrue(config.discoveryMode, "Context Builder must carry explicit discovery intent")
         XCTAssertFalse(config.alwaysApproveTools, "Discovery must not inherit the ambient Agent Mode permission preference")
 
         let (provider, directory) = try makeProvider(config: config)
