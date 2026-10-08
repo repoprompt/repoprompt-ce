@@ -258,8 +258,25 @@ extension GlobalSettingsStore {
             subagentProvider: subagentProvider,
             customInstructions: customInstructions,
             validity: validity,
-            revision: modelRouterSettingsRevision
+            revision: modelRouterSettingsRevision,
+            usageBalancing: AgentUsageBalancingConfiguration(
+                enabled: stored?.usageBalancingEnabled == true && AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) != nil,
+                preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace
+            ),
+            allowPaidFastRouting: stored?.allowPaidFastRouting == true
         )
+    }
+
+    func setUsageBalancingEnabled(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingEnabled = enabled }
+    }
+
+    func setUsageBalancingPreset(_ preset: AgentUsageBalancingPreset) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingPreset = preset.rawValue }
+    }
+
+    func setAllowPaidFastRouting(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.allowPaidFastRouting = enabled }
     }
 
     func setModelRouterBackend(_ backendID: AgentTaskRouterBackendID, commit: Bool = true) {

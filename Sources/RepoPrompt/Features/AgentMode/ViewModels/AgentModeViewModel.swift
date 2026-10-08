@@ -762,6 +762,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let outcome: AgentTaskRoutingBackendOutcome
         var judgmentRequested = false
         var effortFallback = false
+        var usageBalancingReason: String?
     }
 
     struct FreshTaskRoutingOwnership {

@@ -112,12 +112,21 @@ struct AgentModelRouterPill: View {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
 
-    private var tooltip: String {
+    private var jevTooltip: String {
         if let reason = props.disabledReason { return reason }
         if props.isRouting { return "Router is choosing a target for this new session" }
         return props.isOn
             ? "Router on: New primary sessions and subagents are routed automatically"
             : "Router off: New sessions use their current or requested target"
+    }
+
+    private var tooltip: String {
+        guard props.usageBalancing else { return jevTooltip }
+        return jevTooltip + "\nUsage balancing on: new sessions may move to a comparable model with more plan quota left. Change in Settings › Router."
+    }
+
+    private var isHighlighted: Bool {
+        props.isOn || props.usageBalancing
     }
 
     var body: some View {
@@ -142,14 +151,14 @@ struct AgentModelRouterPill: View {
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(props.isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: props.isOn ? 0.8 : 0.5)
+                    .stroke(isHighlighted ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isHighlighted ? 0.8 : 0.5)
             )
         }
         .buttonStyle(.plain)
         .disabled(!props.isAvailable || props.isRouting)
         .hoverTooltip(tooltip, .top)
         .accessibilityLabel("Model Router")
-        .accessibilityValue(props.isOn ? "On" : "Off")
+        .accessibilityValue((props.isOn ? "On" : "Off") + (props.usageBalancing ? ", usage balancing on" : ""))
     }
 }
 

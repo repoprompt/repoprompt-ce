@@ -25,11 +25,18 @@ package struct ClaudeCLIUsageGrant: Codable, Equatable {
     package let credentialProfileID: String
     package let grantedAt: Date
     package let consentVersion: Int
+    /// Older connected grants remain readable; a new deferred setup explicitly stores false.
+    package var setupCompleted: Bool?
 
-    package init(credentialProfileID: String, grantedAt: Date, consentVersion: Int = 1) {
+    package init(credentialProfileID: String, grantedAt: Date, consentVersion: Int = 1, setupCompleted: Bool = true) {
         self.credentialProfileID = credentialProfileID
         self.grantedAt = grantedAt
         self.consentVersion = consentVersion
+        self.setupCompleted = setupCompleted
+    }
+
+    package var isReady: Bool {
+        setupCompleted != false
     }
 
     package func applies(toProfileID profileID: String) -> Bool {
@@ -751,6 +758,10 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var primaryProviderRawValue: String?
         package var subagentProviderRawValue: String?
         package var customInstructions: String?
+        package var usageBalancingEnabled: Bool?
+        package var usageBalancingPreset: String?
+        package var usageLargerPlan: String? // Legacy value retained for lossless settings round trips; no longer used.
+        package var allowPaidFastRouting: Bool?
 
         package init(
             enabled: Bool? = nil,
@@ -1022,6 +1033,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         /// Explicit, UI-only consent to read Claude account usage for one config profile.
         package var claudeAccountUsageGrant: ClaudeAccountUsageGrant?
         package var claudeCLIUsageGrant: ClaudeCLIUsageGrant?
+        package var claudeBalancingRefreshGrant: ClaudeCLIUsageGrant?
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?

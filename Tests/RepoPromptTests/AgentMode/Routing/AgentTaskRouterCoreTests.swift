@@ -780,6 +780,45 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(candidates.count, AgentTaskRoutingEnvelopeBuilder.maximumCandidates)
     }
 
+    func testPaidFastNeverEntersAutomaticEffortsWithoutExplicitOptIn() throws {
+        let options = ["gpt-6.1-sol-high", "gpt-6.1-sol-fast", "gpt-6.1-sol-fast-high"].map {
+            AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+        }
+        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
+        let builder = candidateBuilder(codexOptions: options)
+        let models = try builder.build(allowedProviders: [.codexExec], availability: availability)
+        XCTAssertTrue(models.allSatisfy { !AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+        let selected = try XCTUnwrap(models.first)
+        let ordinary = try builder.buildEfforts(for: selected, availability: availability)
+        XCTAssertFalse(ordinary.isEmpty)
+        XCTAssertTrue(ordinary.allSatisfy { !AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+        let optedIn = try builder.buildEfforts(for: selected, availability: availability, allowPaidFast: true)
+        XCTAssertTrue(optedIn.contains { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+    }
+
+    func testStandalonePeersKeepClassAndAdvertisedEffortWithoutFast() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+        let claudeHigh = ClaudeModelSpecifier.encodedRaw(baseModelRaw: "claude-opus-5-5", effort: .high)
+        let builder = candidateBuilder(claudeOptions: Self.advertisedClaudeOptions + [Self.modelOption(claudeHigh, "Opus High")])
+        let input = try XCTUnwrap(builder.usageCandidates(
+            basedOn: .init(agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "gpt-6-sol-high", reasoningEffortRaw: "high", modelParameters: []),
+            allowedProviders: [.claudeCode, .codexExec], availability: availability, surface: .headless
+        ))
+        XCTAssertEqual(input.selected.target.modelRaw, "gpt-6-sol-high")
+        let peer = try XCTUnwrap(input.candidates.first { $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue })
+        XCTAssertEqual(peer.usagePeerClass, input.selected.usagePeerClass)
+        XCTAssertEqual(ClaudeModelSpecifier(raw: peer.target.modelRaw).effortLevel?.rawValue, "high")
+        XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(peer.target))
+        let reverse = try XCTUnwrap(builder.usageCandidates(basedOn: peer.target, allowedProviders: [.claudeCode, .codexExec], availability: availability, surface: .headless))
+        let reversePeer = try XCTUnwrap(reverse.candidates.first { $0.target.agentRaw == AgentProviderKind.codexExec.rawValue })
+        XCTAssertEqual(reversePeer.target.reasoningEffortRaw, "high")
+        let unsupported = try XCTUnwrap(candidateBuilder().usageCandidates(basedOn: input.selected.target, allowedProviders: [.claudeCode, .codexExec], availability: availability, surface: .headless))
+        XCTAssertEqual(unsupported.candidates.count, 1, "No exact advertised effort means no swap—not a provider-default downgrade")
+        let limited = try XCTUnwrap(builder.usageCandidates(basedOn: input.selected.target, allowedProviders: [.codexExec], availability: availability, surface: .general))
+        XCTAssertEqual(limited.candidates.count, 1)
+        XCTAssertNil(builder.usageCandidates(basedOn: .init(agentRaw: "codexExec", modelRaw: "default", reasoningEffortRaw: nil, modelParameters: []), allowedProviders: [.codexExec, .claudeCode], availability: availability, surface: .general))
+    }
+
     func testEffortCandidatesAreBuiltOnlyAfterModelSelection() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,

@@ -202,6 +202,43 @@ final class RouterSettingsViewModel: ObservableObject {
         scheduleRefresh()
     }
 
+    var claudeUsageConnected: Bool {
+        let grant = settingsStore.claudeCLIUsageGrant()
+        return grant?.isReady == true && grant?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true
+    }
+
+    var claudeBackgroundRefreshEnabled: Bool {
+        claudeUsageConnected && settingsStore.scalarPreferences.agentMode?.claudeBalancingRefreshGrant?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true
+    }
+
+    var usageBalancingStatus: String {
+        if !configuration.usageBalancing.enabled { return "Shift new tasks between Claude and Codex. No Jev key required." }
+        if !claudeUsageConnected, !settingsStore.codexUsageQuotaEnabled() { return "Connect plan usage in Models & Providers to use fresh readings." }
+        return "Works independently, or alongside Jev. Stale or missing usage keeps the starting choice."
+    }
+
+    func setUsageBalancingEnabled(_ enabled: Bool) {
+        settingsStore.setUsageBalancingEnabled(enabled)
+        synchronizeConfiguration()
+    }
+
+    func setUsageBalancingPreset(_ preset: AgentUsageBalancingPreset) {
+        settingsStore.setUsageBalancingPreset(preset)
+        synchronizeConfiguration()
+    }
+
+    func setAllowPaidFastRouting(_ enabled: Bool) {
+        settingsStore.setAllowPaidFastRouting(enabled)
+        synchronizeConfiguration()
+    }
+
+    /// This setter is only reachable from the explicit UI disclosure, never MCP settings.
+    func setClaudeBackgroundRefreshEnabled(_ enabled: Bool) {
+        guard !enabled || claudeUsageConnected else { return }
+        settingsStore.setClaudeBalancingRefreshGrant(enabled ? ClaudeCLIUsageGrant(credentialProfileID: ClaudeUsageCredentialProfile.current().id, grantedAt: Date()) : nil)
+        synchronizeConfiguration()
+    }
+
     func setAutoEffortEnabled(_ enabled: Bool) {
         guard !enabled || canEnableAutoEffort else { return }
         settingsStore.setAutoEffortEnabled(enabled)

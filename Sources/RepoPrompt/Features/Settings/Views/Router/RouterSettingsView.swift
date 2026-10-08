@@ -7,11 +7,14 @@ struct RouterSettingsView: View {
     @State private var candidateSecret = ""
     @State private var customInstructionsDraft = ""
     @State private var customInstructionsFeedback: String?
+    @State private var showClaudeRefreshConsent = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
+                usageBalancingCard
+                automaticFastCard
                 statusCard
                 autoEffortCard
                 backendCard
@@ -29,13 +32,54 @@ struct RouterSettingsView: View {
             customInstructionsDraft = viewModel.configuration.customInstructions
         }
         .onChange(of: viewModel.selectedBackendID) { _, _ in candidateSecret = "" }
+        .alert("Refresh Claude usage in the background?", isPresented: $showClaudeRefreshConsent) {
+            Button("Enable") { viewModel.setClaudeBackgroundRefreshEnabled(true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("While RepoPrompt is active and usage balancing is on, routing activity can refresh plan usage through Claude Code’s /usage command and status line. No model prompt is sent. Claude may retain normal session bookkeeping. Background checks are limited to once per 30 minutes and 12 per rolling day for this profile; there is no idle polling. Connected usage also retains its one-time startup check and manual Refresh. This CLI integration is not an official third-party usage API. You can turn it off at any time.")
+        }
+    }
+
+    private var usageBalancingCard: some View {
+        card {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Usage balancing", systemImage: "scale.3d").font(.headline)
+                    Text(viewModel.usageBalancingStatus).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("Usage balancing", isOn: Binding(get: { viewModel.configuration.usageBalancing.enabled }, set: viewModel.setUsageBalancingEnabled))
+                    .labelsHidden().toggleStyle(.switch).accessibilityLabel("Usage balancing")
+            }
+            Picker("Strategy", selection: Binding(get: { viewModel.configuration.usageBalancing.preset }, set: viewModel.setUsageBalancingPreset)) {
+                ForEach(AgentUsageBalancingPreset.allCases) { preset in Text(preset.title).tag(preset) }
+            }.pickerStyle(.segmented)
+            Text(viewModel.configuration.usageBalancing.preset.explanation).foregroundStyle(.secondary)
+            Text("Compares each plan’s own allowance and reset time—not token capacities. Only comparable models are substituted. Explicit MCP model pins and existing sessions are unchanged; usage stays on this Mac.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+            Button("Manage plan usage…") { onNavigate?(.cliProviders) }.buttonStyle(.bordered)
+            Toggle("Refresh Claude usage in the background", isOn: Binding(get: { viewModel.claudeBackgroundRefreshEnabled }, set: { enabled in
+                if enabled { showClaudeRefreshConsent = true } else { viewModel.setClaudeBackgroundRefreshEnabled(false) }
+            }))
+            .disabled(!viewModel.claudeUsageConnected)
+            Text("After task activity while the app is active: Claude at most once per 30 minutes and 12 times per day; Codex at most once per 10 minutes. No idle polling or waiting for a refresh.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var automaticFastCard: some View {
+        card {
+            Toggle("Allow paid Fast tiers in automatic routing", isOn: Binding(get: { viewModel.configuration.allowPaidFastRouting }, set: viewModel.setAllowPaidFastRouting))
+            Text("Off by default. Fast can consume allowance or credits more quickly. Models you explicitly pick yourself are unaffected.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Model Router", systemImage: "arrow.triangle.branch")
+            Label("Routing", systemImage: "arrow.triangle.branch")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 22, weight: .bold))
-            Text("Let Jev choose the best available model, provider, and reasoning effort for each new task.")
+            Text("Balance plan usage locally, let Jev choose models, or use both.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -123,7 +167,7 @@ struct RouterSettingsView: View {
             providerLimitPicker("Subagents", scope: .subagent)
             Divider()
             Text("Custom guidance").font(.headline)
-            Text("Use this for routing directives such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Saved guidance is the highest-priority routing policy within any required provider; Jev receives it before the general quality-and-cost policy on every routing decision.")
+            Text("Give Jev model preferences, such as “Prefer Claude Opus for execution.” Guidance shapes Jev’s starting choice. If usage balancing is also on, it can choose a comparable model on the other plan; provider restrictions remain enforced.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             TextEditor(text: $customInstructionsDraft)
@@ -242,7 +286,7 @@ struct RouterSettingsView: View {
                     }
                 }
             }
-            Text("Pricing and capability evidence is versioned and sent with each candidate. Provider preferences are enforced before routing, saved guidance has highest priority, and Agent Models references remain supporting context.")
+            Text("Pricing and capability evidence is versioned and sent with each candidate. Provider preferences constrain routing; guidance shapes Jev’s recommendation. Usage balancing can then adjust that recommendation locally.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

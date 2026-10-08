@@ -57,6 +57,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     private var blockedUntil: Date?
     private var failureCount = 0
     private var cadenceTask: Task<Void, Never>?
+    private var advisoryAdmissionPending: UUID?
+    private var advisoryRead: (requestID: UUID, readID: UUID)?
 
     package init(
         automaticInterval: TimeInterval = 900,
@@ -89,6 +91,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
 
     package func invalidate() {
         generation &+= 1
+        advisoryAdmissionPending = nil
+        advisoryRead = nil
         hydration?.cancel()
         hydration = nil
         automaticConsumed = false
@@ -126,6 +130,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         observers[id] = nil
         guard observers.isEmpty else { return }
         generation &+= 1
+        advisoryAdmissionPending = nil
+        advisoryRead = nil
         hydration?.cancel()
         hydration = nil
         cadenceTask?.cancel()
@@ -173,6 +179,31 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         await performRead(userInitiated: false)
     }
 
+    /// Activity-driven refresh, independent of the one-startup-read latch. Admission is
+    /// durable and provided by the consumer; ordinary single-flight/backoff still wins.
+    package func refreshForAdvisory(requestID: UUID = UUID(), admission: @Sendable () async -> Bool) async {
+        guard enabled, !observers.isEmpty, inFlight == nil, advisoryAdmissionPending == nil,
+              blockedUntil.map({ now() >= $0 }) ?? true,
+              lastAttempt.map({ now().timeIntervalSince($0) >= automaticInterval }) ?? true else { return }
+        let expected = generation
+        advisoryAdmissionPending = requestID
+        let admitted = await admission()
+        guard advisoryAdmissionPending == requestID else { return }
+        advisoryAdmissionPending = nil
+        guard admitted, generation == expected, !Task.isCancelled else { return }
+        await performRead(userInitiated: false, advisoryRequestID: requestID)
+    }
+
+    package func cancelAdvisoryRefresh(requestID: UUID) {
+        if advisoryAdmissionPending == requestID { advisoryAdmissionPending = nil }
+        guard let advisoryRead, advisoryRead.requestID == requestID, inFlight?.id == advisoryRead.readID else { return }
+        generation &+= 1
+        inFlight?.task.cancel()
+        inFlight = nil
+        self.advisoryRead = nil
+        publish(snapshot.map(ProviderQuotaStatus.loaded) ?? (enabled ? .idle : .disabled))
+    }
+
     private func hydrateIfNeeded() async {
         guard enabled, !observers.isEmpty, snapshot == nil, let cachedRead else { return }
         let expected = generation
@@ -191,10 +222,10 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         }
     }
 
-    private func performRead(userInitiated: Bool) async {
+    private func performRead(userInitiated: Bool, advisoryRequestID: UUID? = nil) async {
         await hydrateIfNeeded()
         guard enabled, !observers.isEmpty, !Task.isCancelled else { return }
-        if !userInitiated, !periodicReads, automaticConsumed { return }
+        if !userInitiated, advisoryRequestID == nil, !periodicReads, automaticConsumed { return }
         if let inFlight { await inFlight.task.value
             return
         }
@@ -206,6 +237,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         if snapshot == nil { publish(.loading) }
         let expectedGeneration = generation
         let id = UUID()
+        advisoryRead = advisoryRequestID.map { (requestID: $0, readID: id) }
         let expectedAccount = snapshot?.accountKey
         let task = Task { [weak self, read] in
             do {
@@ -237,6 +269,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         // Concrete IO has completed. Release admission before publishing a terminal status,
         // so a subscriber's next explicit action cannot coalesce with a finished request.
         inFlight = nil
+        advisoryRead = nil
         publish(.loaded(value))
     }
 
@@ -256,6 +289,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         default: break
         }
         inFlight = nil
+        advisoryRead = nil
         publish(.failed(reason: error.message, previous: snapshot))
     }
 

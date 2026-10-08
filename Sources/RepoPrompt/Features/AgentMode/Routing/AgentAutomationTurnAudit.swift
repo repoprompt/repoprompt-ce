@@ -34,6 +34,9 @@ struct AgentAutomationTurnAudit: Codable, Equatable {
         /// A judged choice was replaced by a deterministic/manual fallback, including effort-only fallback.
         var fallbackApplied = false
         var application: Application = .notObserved
+        /// Local advisory adjustment; contains no account, profile, or quota values.
+        var usageBalancingReason: String?
+        var usageBalancingProviderRaw: String?
 
         func discardedAfterMCPReclassification() -> Self {
             var result = self

@@ -549,6 +549,7 @@ class WindowStatesManager: ObservableObject {
 
     /// Prevent accidental secondary instances
     private init() {
+        modelRouterRuntime.usageBalancer = providerQuotaRuntime.usageAdvisor
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
         GlobalSettingsStore.shared.objectWillChange
             .receive(on: RunLoop.main)

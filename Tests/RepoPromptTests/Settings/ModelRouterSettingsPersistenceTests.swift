@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 import XCTest
 
@@ -184,5 +185,97 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(store.modelRouterConfiguration().allowedProviders, [.codexExec])
         XCTAssertFalse(store.modelRouterConfiguration().allowedProviders.contains(.claudeCode))
+    }
+
+    func testDefaultsPersistenceAndBackgroundConsentDoNotChangeRoutingRevision() throws {
+        try withUsageStore { store, file in
+            XCTAssertFalse(store.modelRouterConfiguration().usageBalancing.enabled)
+            XCTAssertEqual(store.modelRouterConfiguration().usageBalancing.preset, .evenPace)
+            XCTAssertFalse(store.modelRouterConfiguration().allowPaidFastRouting)
+            store.setUsageBalancingEnabled(true)
+            store.setUsageBalancingPreset(.expiringQuota)
+            store.setAllowPaidFastRouting(true)
+            let revision = store.modelRouterSettingsRevision
+            let grant = ClaudeCLIUsageGrant(credentialProfileID: "fixture", grantedAt: Date(timeIntervalSince1970: 2_000_000_000))
+            store.setClaudeBalancingRefreshGrant(grant)
+            XCTAssertEqual(store.modelRouterSettingsRevision, revision, "Acquisition consent is not routing policy")
+            let saved = try file.load()
+            XCTAssertEqual(saved.scalarPreferences?.modelRouter?.usageBalancingPreset, "expiringQuota")
+            XCTAssertEqual(saved.scalarPreferences?.modelRouter?.allowPaidFastRouting, true)
+            for (old, current) in [("qualityFirst", AgentUsageBalancingPreset.nearLimits), ("balanced", .evenPace), ("favorLargerPlan", .expiringQuota)] {
+                store.updateModelRouterScalar(commit: false) { $0.usageBalancingPreset = old }
+                XCTAssertEqual(store.modelRouterConfiguration().usageBalancing.preset, current)
+            }
+            XCTAssertEqual(saved.scalarPreferences?.agentMode?.claudeBalancingRefreshGrant, grant)
+            store.updateModelRouterScalar(commit: false) { $0.usageBalancingPreset = "future-policy" }
+            XCTAssertFalse(store.modelRouterConfiguration().usageBalancing.enabled, "Unknown policies fail closed without discarding their raw values")
+        }
+    }
+
+    func testOldGrantCompatibilityAndDeferredSetupAreExplicit() throws {
+        let old = try JSONDecoder().decode(ClaudeCLIUsageGrant.self, from: Data(#"{"credentialProfileID":"fixture","grantedAt":0,"consentVersion":1}"#.utf8))
+        XCTAssertTrue(old.isReady)
+        let pending = ClaudeCLIUsageGrant(credentialProfileID: "fixture", grantedAt: Date(), setupCompleted: false)
+        XCTAssertFalse(pending.isReady)
+        let decoded = try JSONDecoder().decode(ClaudeCLIUsageGrant.self, from: JSONEncoder().encode(pending))
+        XCTAssertFalse(decoded.isReady, "Pending setup must not become ready on reboot")
+    }
+
+    func testRoutingLeasesAreDefaultOffAndRespectSetupAndProfileConsent() throws {
+        try withUsageStore { store, file in
+            let codex = CodexProviderQuotaService(clientFactory: { UsageNoIOClient() }, accountIDProvider: { nil })
+            let claude = ProviderAccountQuotaService(periodicReads: false, read: { _ in throw ProviderQuotaReadError.needsConsent })
+            let advisor = AgentUsageBalancer()
+            var currentProfile = "fixture"
+            let owner = ProviderUsageRoutingObservation(settings: store, codex: codex, claude: claude, advisor: advisor, accountID: { nil }, profileProvider: { currentProfile }, isAppActive: { false }, budgetURL: file.fileURL.deletingLastPathComponent().appendingPathComponent("budget.json"))
+            XCTAssertFalse(owner.hasObserverDemand)
+            XCTAssertFalse(store.modelRouterConfiguration().enabled)
+            store.setUsageBalancingEnabled(true)
+            XCTAssertTrue(store.setModelRouterCustomInstructions("Prefer Claude for execution"))
+            store.setClaudeCLIUsageGrant(.init(credentialProfileID: "fixture", grantedAt: Date(), setupCompleted: false), commit: false)
+            advisor.onRoutingActivity?()
+            XCTAssertFalse(owner.hasObserverDemand, "Grant alone cannot bypass deferred trust/setup")
+            store.setClaudeCLIUsageGrant(.init(credentialProfileID: "fixture", grantedAt: Date()), commit: false)
+            advisor.onRoutingActivity?()
+            XCTAssertTrue(owner.hasObserverDemand)
+            currentProfile = "different-profile"
+            advisor.onRoutingActivity?()
+            XCTAssertFalse(owner.hasObserverDemand)
+            currentProfile = "fixture"
+            advisor.onRoutingActivity?()
+            XCTAssertTrue(owner.hasObserverDemand)
+            store.setClaudeCLIUsageGrant(nil, commit: false)
+            advisor.onRoutingActivity?()
+            XCTAssertFalse(owner.hasObserverDemand, "Revocation is independent of presentation visibility")
+            withExtendedLifetime(owner) {}
+        }
+    }
+
+    private func withUsageStore(_ body: (GlobalSettingsStore, GlobalSettingsFileStore) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ModelRouterSettingsPersistenceTests.usage.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+        try body(store, file)
+    }
+
+    private actor UsageNoIOClient: CodexQuotaAppServerClient {
+        func startIfNeeded() throws {
+            XCTFail("Default-off observer must never start a provider")
+        }
+
+        func subscribeNotifications() -> AsyncStream<CodexQuotaNotification> {
+            AsyncStream { $0.finish() }
+        }
+
+        func request(method _: String, params _: [String: CodexJSONValue]?, timeout _: TimeInterval?) throws -> [String: CodexJSONValue] {
+            throw ProviderQuotaReadError.transport
+        }
+
+        func stop() {}
     }
 }

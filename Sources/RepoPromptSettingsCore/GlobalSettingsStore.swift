@@ -1120,6 +1120,11 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: commit) { $0.claudeCLIUsageGrant = grant }
     }
 
+    /// UI-only, separately disclosed background acquisition consent. Not routing policy.
+    package func setClaudeBalancingRefreshGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeBalancingRefreshGrant = grant }
+    }
+
     package func claudeAccountUsageGrant() -> ClaudeAccountUsageGrant? {
         scalarPreferences.agentMode?.claudeAccountUsageGrant
     }

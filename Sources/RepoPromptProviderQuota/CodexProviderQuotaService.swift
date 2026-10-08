@@ -139,6 +139,14 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         await performRead()
     }
 
+    /// Activity-triggered advisory demand, not a user click. No timer or automatic retry.
+    package func refreshForAdvisory() async {
+        guard !Task.isCancelled, isEnabled, !continuations.isEmpty, inFlightRead == nil else { return }
+        if let lastReadStartedAt, now().timeIntervalSince(lastReadStartedAt) < 600 { return }
+        startIfPossible()
+        await performRead()
+    }
+
     /// Account switch or sign-out. The prior account's snapshot is discarded rather than
     /// migrated, and the transport is torn down.
     package func handleSignOutOrAccountChange() {
