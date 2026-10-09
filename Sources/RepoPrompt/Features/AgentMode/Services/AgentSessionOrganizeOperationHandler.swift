@@ -318,8 +318,8 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         ) {
             return Self.orderingFailure(error)
         }
-        // The named pins swap their explicit rank values among themselves; no other pin is written,
-        // unless ranks must first be materialized (documented on `DomainAgentSessionPinRanks`).
+        // Only the named pins are ever written (see `DomainAgentSessionPinRanks`): they swap their own
+        // explicit ranks, or, lacking distinct ones, move to the end of the ranked block in order.
         let rankBefore = Dictionary(uniqueKeysWithValues: current.map { ($0, backend.state(of: $0)?.pinnedOrder) })
         let planned = DomainAgentSessionPinRanks.reordered(
             current: current.map { ($0, rankBefore[$0] ?? nil) },
@@ -334,8 +334,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         for id in order {
             context.add(id, changed.contains(id) ? .changed : .unchanged)
         }
-        let materialized = changed.subtracting(named).count
-        if materialized > 0 { context.extra["ranks_materialized"] = .int(materialized) }
+        if !planned.keptSlots { context.extra["moved_to_ordered_block"] = .bool(true) }
         context.extra["workspace_id"] = .string(workspaceID.uuidString)
         context.extra["pinned_order"] = .array(
             (backend.pinnedSessionOrder(workspaceID: workspaceID) ?? [])
@@ -435,9 +434,9 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     private func archive(_ context: Context) async -> AgentSessionOrganizeUndoPayload? {
         let states = currentOnly(context, controlCheckedForStash(context, eligibleStates(context, archived: false) { _ in false }))
-        let changed = await archiveAuthorized(context, states.map(\.sessionID))
-        record(context, attempted: states, changed: changed)
-        return .unarchive(states.map(\.sessionID).filter(changed.contains))
+        let outcome = await archiveAuthorized(context, states.map(\.sessionID))
+        recordArchive(context, attempted: states.map(\.sessionID), outcome: outcome)
+        return .unarchive(states.map(\.sessionID).filter(outcome.archived.contains))
     }
 
     /// Archiving stashes the tab, which cancels a live run and its pending prompts. The authority
@@ -449,17 +448,43 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         _ states: [AgentSessionOrganizeState]
     ) -> [AgentSessionOrganizeState] {
         states.filter { state in
-            guard state.runState != .idle else { return true }
+            guard backend.runState(of: state.sessionID) != .idle else { return true }
             if holdsControl(context.batch.scope) { return true }
             context.add(state.sessionID, .skipped, "requires_control")
             return false
         }
     }
 
-    /// Stash with every target's lease folded into the stash's own mutation-context check.
-    private func archiveAuthorized(_ context: Context, _ ids: [UUID]) async -> Set<UUID> {
-        guard !ids.isEmpty else { return [] }
-        return await backend.archive(ids, isAuthorized: { ids.allSatisfy(context.isCurrent) })
+    /// Stashes each target with its own commit-time check folded into the stash's mutation-context
+    /// check: its lease is current, and it is idle (aggregated across every window) or the scope chain
+    /// still holds `control`. The stash evaluates this after its own suspensions, immediately before
+    /// it commits, so a target that started running in between is refused there.
+    private func archiveAuthorized(_ context: Context, _ ids: [UUID]) async -> AgentSessionArchiveOutcome {
+        guard !ids.isEmpty else { return AgentSessionArchiveOutcome() }
+        let refusals = AgentSessionRunStateRefusals()
+        let backend = backend
+        let holdsControl = holdsControl
+        let scope = context.batch.scope
+        let archived = await backend.archive(ids, isAuthorized: { id in
+            guard context.isCurrent(id) else {
+                refusals.clear(id)
+                return false
+            }
+            return refusals.admit(id, backend.runState(of: id) == .idle || holdsControl(scope))
+        })
+        return AgentSessionArchiveOutcome(archived: archived, requiresControl: refusals.refused.subtracting(archived))
+    }
+
+    private func recordArchive(_ context: Context, attempted: [UUID], outcome: AgentSessionArchiveOutcome) {
+        for id in attempted {
+            if outcome.archived.contains(id) {
+                context.add(id, .changed)
+            } else if outcome.requiresControl.contains(id) {
+                context.add(id, .skipped, "requires_control")
+            } else {
+                context.add(id, .failed, "mutation_rejected")
+            }
+        }
     }
 
     private func unarchive(_ context: Context) -> AgentSessionOrganizeUndoPayload? {
@@ -544,9 +569,12 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 ids.filter(context.isCurrent).compactMap { backend.state(of: $0) }
                     .filter { !$0.isArchived }
             )
-            let changed = await archiveAuthorized(context, states.map(\.sessionID))
-            for id in ids where !context.items.contains(where: { $0.sessionID == id }) {
-                context.add(id, changed.contains(id) ? .changed : .skipped, changed.contains(id) ? nil : "not_archivable")
+            let outcome = await archiveAuthorized(context, states.map(\.sessionID))
+            recordArchive(context, attempted: states.map(\.sessionID), outcome: outcome)
+            // Items the authority set aside are reported once, under `requires_control`.
+            let reported = Set(context.items.map(\.sessionID)).union(batch.itemsRequiringControl)
+            for id in ids where !reported.contains(id) {
+                context.add(id, .skipped, "not_archivable")
             }
         }
         var value = AgentSessionAdminRendering.mutationValue(

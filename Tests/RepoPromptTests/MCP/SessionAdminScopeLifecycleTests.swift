@@ -683,6 +683,10 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var written: [UUID] = []
         /// Archive calls; each re-checks authorization inside the stash's mutation context.
         var archiveAuthorizationChecks = 0
+        /// Run state of the same session in another window (production aggregates every window).
+        var otherWindowRunStates: [UUID: DomainDelegationScopeTargetState] = [:]
+        /// Runs inside each per-session stash, at its suspension point before the commit-time check.
+        var onStashSuspension: (@MainActor (UUID) -> Void)?
 
         func add(
             _ id: UUID, workspace: UUID, name: String, pinned: Bool = false, pinnedOrder: Int? = nil,
@@ -766,11 +770,20 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             return changed
         }
 
-        func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID> {
-            archiveAuthorizationChecks += 1
-            guard isAuthorized() else { return [] }
+        func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState {
+            let observed = [states[sessionID]?.runState ?? .unknown, otherWindowRunStates[sessionID] ?? .idle]
+            if observed.contains(.running) { return .running }
+            return observed.contains(.unknown) ? .unknown : .idle
+        }
+
+        func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> Set<UUID> {
             var changed: Set<UUID> = []
             for id in sessionIDs where states[id]?.isArchived == false {
+                // Like the real stash: a suspension (preflight), then the commit-time context check.
+                onStashSuspension?(id)
+                await Task.yield()
+                archiveAuthorizationChecks += 1
+                guard isAuthorized(id) else { continue }
                 states[id]?.isArchived = true
                 changed.insert(id)
             }
@@ -835,6 +848,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var live: [DomainAgentSessionLinkInventoryItem] = []
         var persisted: [AgentSessionOversightIntent] = []
         var stoppedLinkIDs: [UUID] = []
+        /// Runs after each stop completes (the stop's suspension), before the next step.
+        var afterStop: (@MainActor (DomainAgentSessionLinkInventoryItem) -> Void)?
 
         func link(_ observer: UUID, _ target: UUID) {
             live.append(DomainAgentSessionLinkInventoryItem(
@@ -852,6 +867,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             stoppedLinkIDs.append(item.linkID)
             live.removeAll { $0.linkID == item.linkID }
             persisted.removeAll { $0.observerSessionID == item.observerSessionID && $0.targetSessionID == item.targetSessionID }
+            afterStop?(item)
             return .stopped
         }
     }
@@ -1299,6 +1315,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         fixture.organizer.states[idle]?.runState = .running
         let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
         XCTAssertEqual(undone["requires_control"], ids([idle]))
+        XCTAssertNil(items(undone)[idle.uuidString], "reported once, under requires_control")
         XCTAssertEqual(fixture.organizer.states[idle]?.isArchived, false, "a running session is not stashed without control")
 
         // With control, a running member is archived.
@@ -1445,6 +1462,111 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
         let replay = try await fixture.call(args)
         XCTAssertEqual(replay["idempotent_replay"], .bool(true))
+    }
+
+    /// Named pins without distinct explicit ranks move to the end of the ranked block; no pin outside
+    /// the call is ever written, and undo restores the original sort exactly.
+    func testReorderPinsWithUnrankedPinsNeverWritesOtherPinsAndUndoRestoresTheSort() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", pinned: true)
+        let b = fixture.member("B", pinned: true, pinnedOrder: 0)
+        let x = fixture.outsider("X")
+        fixture.organizer.states[x]?.isPinned = true
+        try fixture.grant()
+        let original = try XCTUnwrap(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace))
+        let reply = try await fixture.call([
+            "op": .string("reorder_pins"), "order": ids([a, b]), "expected_order": ids([b, a])
+        ])
+        XCTAssertEqual(reply["moved_to_ordered_block"], .bool(true))
+        XCTAssertNil(reply["ranks_materialized"])
+        XCTAssertEqual(Array(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace)?.prefix(2) ?? []), [a, b])
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+        XCTAssertNil(fixture.organizer.states[x]?.pinnedOrder)
+
+        let token = try XCTUnwrap(reply["undo_token"]?.stringValue)
+        _ = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
+        XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), original)
+        XCTAssertNil(fixture.organizer.states[a]?.pinnedOrder)
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+    }
+
+    // MARK: - Commit-time run-state races
+
+    private func reason(_ reply: [String: Value], _ id: UUID) -> String? {
+        (reply["items"]?.arrayValue ?? []).compactMap(\.objectValue)
+            .first { $0["session_id"] == .string(id.uuidString) }?["reason"]?.stringValue
+    }
+
+    /// A target that starts running while its stash is suspended is refused at commit time, in this
+    /// or another window; with `control` the same race archives.
+    func testArchiveChecksRunStateAtStashCommitTime() async throws {
+        let fixture = Fixture()
+        let lane = fixture.member("Lane")
+        let other = fixture.member("Other")
+        let elsewhere = fixture.member("Elsewhere")
+        try fixture.grant([.observe, .organize, .restructure])
+        let organizer = fixture.organizer
+        organizer.onStashSuspension = { id in
+            if id == lane { organizer.states[lane]?.runState = .running }
+            if id == elsewhere { organizer.otherWindowRunStates[elsewhere] = .running }
+        }
+        let reply = try await fixture.call(["op": .string("archive"), "targets": ids([lane, other, elsewhere])])
+        XCTAssertEqual(reason(reply, lane), "requires_control")
+        XCTAssertEqual(reason(reply, elsewhere), "requires_control", "running in another window counts")
+        XCTAssertEqual(items(reply)[other.uuidString], "changed")
+        XCTAssertEqual(organizer.states[lane]?.isArchived, false)
+        XCTAssertEqual(organizer.states[elsewhere]?.isArchived, false)
+        XCTAssertEqual(organizer.states[other]?.isArchived, true)
+
+        let full = Fixture()
+        let busy = full.member("Busy")
+        try full.grant()
+        let fullOrganizer = full.organizer
+        fullOrganizer.onStashSuspension = { _ in fullOrganizer.states[busy]?.runState = .running }
+        _ = try await full.call(["op": .string("archive"), "session_id": .string(busy.uuidString)])
+        XCTAssertEqual(fullOrganizer.states[busy]?.isArchived, true, "control covers a target that started running")
+    }
+
+    /// Retire re-checks at stash commit time too.
+    func testRetireArchiveChecksRunStateAtStashCommitTime() async throws {
+        let fixture = Fixture()
+        let lane = fixture.member("Lane")
+        try fixture.grant([.observe, .organize, .restructure])
+        let pending = try await fixture.call([
+            "op": .string("retire"), "session_id": .string(lane.uuidString), "idempotency_key": .string("retire-race-1")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let organizer = fixture.organizer
+        organizer.onStashSuspension = { _ in organizer.states[lane]?.runState = .running }
+        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
+        XCTAssertEqual(reason(result, lane), "requires_control")
+        XCTAssertEqual(organizer.states[lane]?.isArchived, false)
+    }
+
+    /// Retire re-checks run state after each unlink suspension: a target that starts running is
+    /// neither unlinked further nor archived.
+    func testRetireStopsUnlinkingATargetThatStartsRunning() async throws {
+        let fixture = Fixture()
+        let lane = fixture.member("Lane")
+        let first = fixture.member("First")
+        let second = fixture.member("Second")
+        fixture.links.link(first, lane)
+        fixture.links.link(second, lane)
+        try fixture.grant([.observe, .organize, .restructure])
+        let pending = try await fixture.call([
+            "op": .string("retire"), "session_id": .string(lane.uuidString), "idempotency_key": .string("retire-race-2")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let organizer = fixture.organizer
+        fixture.links.afterStop = { _ in organizer.states[lane]?.runState = .running }
+        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
+        XCTAssertEqual(reason(result, lane), "requires_control")
+        XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1, "no link is stopped after the target started running")
+        XCTAssertEqual(fixture.links.live.count, 1)
+        XCTAssertEqual(organizer.states[lane]?.isArchived, false)
+        XCTAssertTrue(organizer.stopped.isEmpty)
     }
 
     /// S1: an index written under another schema leaves the scan incomplete (orphan detection off).

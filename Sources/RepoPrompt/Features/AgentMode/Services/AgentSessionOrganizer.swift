@@ -24,6 +24,31 @@ struct AgentSessionOrganizeState: Equatable {
     var runState: DomainDelegationScopeTargetState
 }
 
+/// Result of an archive whose targets were checked at stash-commit time.
+struct AgentSessionArchiveOutcome {
+    var archived: Set<UUID> = []
+    /// Targets refused at commit time because they were not idle and the scope lacked `control`.
+    var requiresControl: Set<UUID> = []
+}
+
+/// Records which targets a commit-time check last refused on run state. A stash evaluates its check
+/// more than once (before and after its preflight suspension); the last evaluation decides.
+@MainActor
+final class AgentSessionRunStateRefusals {
+    private(set) var refused: Set<UUID> = []
+
+    /// Records the run-state verdict for `sessionID` and returns it.
+    func admit(_ sessionID: UUID, _ allowed: Bool) -> Bool {
+        if allowed { refused.remove(sessionID) } else { refused.insert(sessionID) }
+        return allowed
+    }
+
+    /// The target was refused for another reason (lease), not run state.
+    func clear(_ sessionID: UUID) {
+        refused.remove(sessionID)
+    }
+}
+
 /// The organizing mutations a handler may perform, all on loaded sessions only.
 @MainActor
 protocol AgentSessionOrganizingBackend: AnyObject {
@@ -47,10 +72,14 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     /// Writes group order values, only to sessions that are still grouped and active. Writes nothing
     /// else. Returns the sessions whose value changed.
     func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID>
-    /// Archives (stashes) active sessions. `isAuthorized` is folded into the stash's mutation-context
-    /// check, so authority is re-proved after the stash's own suspensions. Returns the sessions that
-    /// were archived.
-    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID>
+    /// Run state aggregated across every open window: `running` if any window runs the session,
+    /// otherwise `unknown` if any lookup fails, otherwise `idle` (also for sessions with no live run).
+    func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState
+    /// Archives (stashes) active sessions, one stash per session. `isAuthorized(sessionID)` is folded
+    /// into that session's stash mutation-context check, which the stash re-evaluates after its own
+    /// suspensions and immediately before it commits; a session it refuses is not archived. Returns
+    /// the sessions that were archived.
+    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> Set<UUID>
     /// Restores archived sessions to the sidebar without switching the user's current tab.
     func unarchive(_ sessionIDs: [UUID]) -> Set<UUID>
     /// Cancels the session's live run. Returns false when nothing could be cancelled.
@@ -205,22 +234,43 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         }
     }
 
-    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID> {
+    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> Set<UUID> {
         var archived: Set<UUID> = []
         for (window, entries) in activeLocationsByWindow(sessionIDs) {
             let workspaceID = entries[0].location.workspaceID
-            // Only the authorized tabs: an agent never archives children it was not authorized for.
-            let report = await Self.stashTabs(
-                Set(entries.map(\.location.tabID)),
-                promptManager: window.promptManager,
-                expandCascade: false,
-                isMutationContextCurrent: { window.workspaceManager.activeWorkspaceID == workspaceID && isAuthorized() }
-            )
-            for entry in entries where report.removedComposeTabIDs.contains(entry.location.tabID) {
-                archived.insert(entry.sessionID)
+            // One stash per session, each guarded by that session's own check. The stash evaluates
+            // `isMutationContextCurrent` again after its preflight suspension, immediately before it
+            // commits, so a session that started running meanwhile is refused at commit time. Only the
+            // authorized tabs: an agent never archives children it was not authorized for.
+            for entry in entries {
+                let sessionID = entry.sessionID
+                let report = await Self.stashTabs(
+                    [entry.location.tabID],
+                    promptManager: window.promptManager,
+                    expandCascade: false,
+                    isMutationContextCurrent: {
+                        window.workspaceManager.activeWorkspaceID == workspaceID && isAuthorized(sessionID)
+                    }
+                )
+                if report.removedComposeTabIDs.contains(entry.location.tabID) {
+                    archived.insert(sessionID)
+                }
             }
         }
         return archived
+    }
+
+    func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState {
+        var running = false
+        var unknown = false
+        for window in liveWindows() {
+            switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) }) {
+            case let .success(session?): running = running || session.runState.isActive
+            case .success(nil): break
+            case .failure: unknown = true
+            }
+        }
+        return running ? .running : unknown ? .unknown : .idle
     }
 
     func unarchive(_ sessionIDs: [UUID]) -> Set<UUID> {
@@ -304,18 +354,8 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
     }
 
     private func state(sessionID: UUID, location: Location) -> AgentSessionOrganizeState {
-        // Aggregated across every window like the membership projector, and fail closed: running if
-        // any window runs it, otherwise unknown if any lookup throws.
-        var running = false
-        var unknown = false
-        for window in liveWindows() {
-            switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) }) {
-            case let .success(session?): running = running || session.runState.isActive
-            case .success(nil): break
-            case .failure: unknown = true
-            }
-        }
-        let runState: DomainDelegationScopeTargetState = running ? .running : unknown ? .unknown : .idle
+        // Aggregated across every window like the membership projector, and fail closed.
+        let currentRunState = runState(of: sessionID)
         return AgentSessionOrganizeState(
             sessionID: sessionID,
             workspaceID: location.workspaceID,
@@ -326,7 +366,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             pinnedOrder: location.tab.pinnedOrder,
             sidebarGroup: location.tab.sidebarGroup,
             sidebarGroupOrder: location.tab.sidebarGroupOrder,
-            runState: runState
+            runState: currentRunState
         )
     }
 

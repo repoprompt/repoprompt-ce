@@ -536,31 +536,28 @@ package enum DomainAgentSessionSidebarGroup {
 // MARK: - Pin ranks
 
 package enum DomainAgentSessionPinRanks {
-    /// Explicit ranks after reordering `desired` pins within the slots they occupy in `current`
-    /// (displayed order, with each pin's current explicit rank).
+    /// New explicit ranks for the `desired` pins only, in their requested order. Pins outside
+    /// `desired` are never assigned a rank, so a reorder never writes a pin it was not asked to move.
     ///
-    /// When `current` is already backed by distinct, increasing explicit ranks, the named pins swap
-    /// those rank values among themselves and no other pin changes. Otherwise ranks are first
-    /// *materialized* (`0..<count` in displayed order, so no pin moves) and then permuted; that is
-    /// the only case that writes ranks to pins outside `desired`, and it never changes their position.
+    /// - When every named pin already holds a distinct explicit rank, the named pins swap those
+    ///   values among themselves: each one lands in a slot another named pin held, and every other
+    ///   pin keeps its exact position (`keptSlots == true`).
+    /// - Otherwise (a named pin is unranked, or two share a rank) the named pins get fresh ranks after
+    ///   the largest rank in use, in the requested order. Ranked pins sort before unranked ones, so
+    ///   the named pins move to the end of the explicitly ordered block (`keptSlots == false`); every
+    ///   other pin keeps its relative order.
     package static func reordered(
         current: [(id: UUID, rank: Int?)],
         desired: [UUID]
-    ) -> (ranks: [UUID: Int], materialized: Bool) {
-        let ranks = current.map(\.rank)
-        let explicit = ranks.compactMap(\.self)
-        let consistent = explicit.count == ranks.count && zip(explicit, explicit.dropFirst()).allSatisfy { $0 < $1 }
-        var base: [UUID: Int] = [:]
-        for (offset, pin) in current.enumerated() {
-            base[pin.id] = consistent ? (pin.rank ?? offset) : offset
-        }
+    ) -> (ranks: [UUID: Int], keptSlots: Bool) {
         let named = Set(desired)
-        let slots = current.map(\.id).filter(named.contains).compactMap { base[$0] }
-        var result = base
-        for (id, slot) in zip(desired, slots) {
-            result[id] = slot
+        let namedRanks = current.filter { named.contains($0.id) }.map(\.rank)
+        let explicit = namedRanks.compactMap(\.self)
+        if explicit.count == namedRanks.count, Set(explicit).count == explicit.count {
+            return (Dictionary(uniqueKeysWithValues: zip(desired, explicit.sorted())), true)
         }
-        return (result, !consistent)
+        let base = (current.compactMap(\.rank).max() ?? -1) + 1
+        return (Dictionary(uniqueKeysWithValues: desired.enumerated().map { ($0.element, base + $0.offset) }), false)
     }
 }
 

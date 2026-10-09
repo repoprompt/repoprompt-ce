@@ -87,15 +87,23 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
         var released: Set<UUID> = []
         var totalUnlinked = 0
         let retiring = batch.request.operation == .adminRetire
+        let backend = backend
+        let holdsControl = holdsControl
+        let scope = batch.scope
+        /// Retire may act on a target only while it is idle (aggregated across every window) or the
+        /// scope chain holds `control`. Re-read after every suspension, before each step.
+        func runStateAllows(_ id: UUID) -> Bool {
+            !retiring || backend.runState(of: id) == .idle || holdsControl(scope)
+        }
 
         for target in batch.admittedSessionIDs {
             var detail: [String: Value] = [:]
             if retiring {
-                guard let state = backend.state(of: target) else {
+                guard backend.state(of: target) != nil else {
                     items.append(.init(sessionID: target, status: .skipped, reason: "workspace_not_loaded"))
                     continue
                 }
-                if state.runState != .idle {
+                if backend.runState(of: target) != .idle {
                     guard isCurrent(target) else {
                         items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current"))
                         continue
@@ -116,9 +124,14 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                 items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
                 continue
             }
+            guard runStateAllows(target) else {
+                items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                continue
+            }
             var unlinked = 0
             var outsideScope = 0
             var failures: [String] = []
+            var refusedOnRunState = false
             for item in inventory.live where item.observerSessionID == target || item.targetSessionID == target {
                 guard !released.contains(item.linkID) else { continue }
                 let counterpart = item.observerSessionID == target ? item.targetSessionID : item.observerSessionID
@@ -127,6 +140,12 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     continue
                 }
                 guard isCurrent(target) else { break }
+                // Each unlink suspends; a retire target that starts running meanwhile is not unlinked
+                // further (nor archived) without `control`.
+                guard runStateAllows(target) else {
+                    refusedOnRunState = true
+                    break
+                }
                 switch await links.stopLink(item) {
                 case .stopped:
                     unlinked += 1
@@ -147,18 +166,30 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             if outsideScope > 0 { detail["links_outside_scope"] = .int(outsideScope) }
             if dormant > 0 { detail["dormant_intents"] = .int(dormant) }
             if !failures.isEmpty { detail["unlink_failures"] = .array(failures.map(Value.string)) }
+            if refusedOnRunState {
+                items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                continue
+            }
 
             if retiring {
                 guard isCurrent(target) else {
                     items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
                     continue
                 }
-                // Archiving stashes the tab and cancels any run: re-check run state once more.
-                if backend.state(of: target)?.runState ?? .unknown != .idle, !holdsControl(batch.scope) {
+                // Archiving stashes the tab and cancels any run. The run-state + control check runs
+                // inside the stash's commit-time context check, after the stash's own suspensions.
+                let refusals = AgentSessionRunStateRefusals()
+                let archived = await backend.archive([target], isAuthorized: { id in
+                    guard isCurrent(id) else {
+                        refusals.clear(id)
+                        return false
+                    }
+                    return refusals.admit(id, runStateAllows(id))
+                }).contains(target)
+                if !archived, refusals.refused.contains(target) {
                     items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
                     continue
                 }
-                let archived = await backend.archive([target], isAuthorized: { isCurrent(target) }).contains(target)
                 detail["archived"] = .bool(archived)
                 let status: AgentSessionAdminItemResult.Status = archived ? .changed : (unlinked > 0 ? .changed : .failed)
                 items.append(.init(sessionID: target, status: status, reason: archived ? nil : "archive_rejected", detail: detail))

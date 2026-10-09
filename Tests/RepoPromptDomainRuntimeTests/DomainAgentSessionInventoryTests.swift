@@ -224,12 +224,16 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         let x = UUID()
         let b = UUID()
         let swapped = DomainAgentSessionPinRanks.reordered(current: [(a, 0), (x, 4), (b, 9)], desired: [b, a])
-        XCTAssertFalse(swapped.materialized)
-        XCTAssertEqual(swapped.ranks, [b: 0, x: 4, a: 9], "x keeps its rank; a and b swap theirs")
+        XCTAssertTrue(swapped.keptSlots)
+        XCTAssertEqual(swapped.ranks, [b: 0, a: 9], "a and b swap their own values; x is never assigned")
 
         let legacy = DomainAgentSessionPinRanks.reordered(current: [(a, nil), (x, nil), (b, 3)], desired: [b, a])
-        XCTAssertTrue(legacy.materialized)
-        XCTAssertEqual(legacy.ranks, [b: 0, x: 1, a: 2], "materialized in displayed order, so x does not move")
+        XCTAssertFalse(legacy.keptSlots)
+        XCTAssertEqual(legacy.ranks, [b: 4, a: 5], "fresh ranks after the largest in use; x is never assigned")
+
+        let tied = DomainAgentSessionPinRanks.reordered(current: [(a, 2), (b, 2), (x, 7)], desired: [b, a])
+        XCTAssertFalse(tied.keptSlots, "shared ranks cannot be swapped")
+        XCTAssertEqual(tied.ranks, [b: 8, a: 9])
     }
 
     func testRestrictedSnapshotHidesOutsideSessionsWithoutMarkingThemMissing() {
