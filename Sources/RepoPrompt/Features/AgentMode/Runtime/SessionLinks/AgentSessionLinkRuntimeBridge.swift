@@ -1105,6 +1105,15 @@ final class AgentSessionLinkRuntimeBridge {
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
     }
 
+    /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
+    /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
+    let delegationScopes = DelegationScopeRuntime()
+    /// The single shared administration service behind `session_admin` and future UI dispatchers.
+    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore(
+        scopes: delegationScopes,
+        projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
+    )
+
     /// Durable oversight intent, installed by app composition.
     ///
     /// Deliberately not constructed here. The bridge is a process singleton, so a self-bootstrapping

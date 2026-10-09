@@ -678,8 +678,11 @@ class WindowStatesManager: ObservableObject {
             autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
         )
         let store = AgentSessionOversightIntentStore.production(mode: mode, restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
+        // Delegation scopes share the oversight persistence mode: suppressed launches touch no file.
+        let scopeStore = DelegationScopeStore.production(mode: mode)
         Task { @MainActor in
             await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
+            await AgentSessionLinkRuntimeBridge.shared.delegationScopes.bootstrap(store: scopeStore)
         }
     }
 
