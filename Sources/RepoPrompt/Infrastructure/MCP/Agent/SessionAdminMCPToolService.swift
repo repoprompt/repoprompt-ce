@@ -360,8 +360,9 @@ struct SessionAdminMCPToolService {
         ]
         if let card {
             value["confirmation_id"] = .string(card.id.uuidString)
+            // `adopt` cards list descendants outside the scope; the agent sees approved adoptees only.
             value["approved_session_ids"] = .array(
-                card.items.map(\.sessionID).filter(card.approvedSessionIDs.contains).map { .string($0.uuidString) }
+                SessionAdminAdoptCardProjection.agentApprovedSessionIDs(card).map { .string($0.uuidString) }
             )
             value["state"] = confirmationValue(card).objectValue?["result"] ?? .null
         }
@@ -474,7 +475,9 @@ struct SessionAdminMCPToolService {
         if !itemsRequiringControl.isEmpty {
             value["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
         }
-        return .object(value)
+        // Agent-facing only: an `adopt` card is projected to adoptee IDs and counts (the user's card
+        // keeps the full subtree).
+        return SessionAdminAdoptCardProjection.agentCardValue(card, rendered: .object(value))
     }
 
     private static func capabilitiesValue(_ capabilities: Set<DomainDelegationScopeCapability>) -> Value {

@@ -143,6 +143,7 @@ the user's card.
 - **Leases are re-checked after every suspension** before the next mutation; a revocation that
   lands mid-batch stops the remaining items (`scope_revoked`). Worktree binds, unbinds, and unlinks
   re-check the lease and the target's membership synchronously at the write itself.
+- **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).

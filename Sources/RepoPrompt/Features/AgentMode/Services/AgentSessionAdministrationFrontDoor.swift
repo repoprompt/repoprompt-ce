@@ -533,6 +533,15 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         if !batch.itemsRequiringControl.isEmpty {
             object["requires_control"] = .array(batch.itemsRequiringControl.map { .string($0.uuidString) })
         }
+        if request.operation == .adminAdopt, let grantee = request.caller.agentSessionID {
+            // The adopt card's descendants are outside the scope: the agent sees adoptees and counts.
+            let layout = SessionAdminAdoptCardProjection.layout(
+                granteeSessionID: grantee, idempotencyKey: request.idempotencyKey, itemSessionIDs: Set(items.map(\.sessionID))
+            )
+            object["items"] = .array(SessionAdminAdoptCardProjection.agentItems(items, layout: layout, approved: nil))
+            object["item_count"] = .int(layout?.visibleSessionIDs.count ?? 0)
+            object.merge(SessionAdminAdoptCardProjection.aggregates(items, layout: layout)) { _, new in new }
+        }
         return .completed(.object(object))
     }
 

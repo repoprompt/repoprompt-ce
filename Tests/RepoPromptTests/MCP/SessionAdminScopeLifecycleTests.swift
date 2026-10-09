@@ -1820,6 +1820,136 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(worktreeHost.created.count, 1)
     }
 
+    /// The user's adopt card lists the whole subtree; every agent-facing reply (preview,
+    /// pending_confirmation, confirmation_status before and after apply, confirmation_mismatch) shows
+    /// only the adoptee the caller named, its descendant count, and aggregates — never an outside
+    /// descendant's ID or title.
+    func testAgentFacingAdoptRepliesNeverRevealOutsideDescendants() async throws {
+        typealias Organizing = SessionAdminOrganizingOperationTests
+        let overseer = UUID(), adoptee = UUID(), child = UUID(), grandchild = UUID(), other = UUID(), workspace = UUID()
+        let provenance = Provenance()
+        let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        let organizer = Organizing.FakeOrganizer()
+        let links = Organizing.FakeLinks()
+        let tree: [(UUID, UUID?, DomainDelegationScopeTargetState, String)] = [
+            (overseer, nil, .idle, "Overseer"), (adoptee, nil, .idle, "Research"),
+            (child, adoptee, .running, "SecretWorker"), (grandchild, child, .idle, "SecretGrandchild"),
+            (other, nil, .idle, "Other")
+        ]
+        let names = Names()
+        for (id, parent, state, name) in tree {
+            provenance.add(id, parent: parent, workspace: workspace, state: state)
+            inventoryProvenance.add(id, parent: parent, workspace: workspace, state: state)
+            organizer.add(id, workspace: workspace, name: name)
+            names.map[id] = name
+        }
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core, scopes: runtime, projector: projector,
+            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date())
+        )
+        var context = SessionAdminHandlerContext(scopes: runtime, projector: projector)
+        context.displayName = { names.map[$0] }
+        let host = StructureHost(provenance: provenance)
+        frontDoor.register(SessionAdminRestructureHandler(context: context, host: host))
+        let request = try runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: DomainDelegationScopeCapability.manageTreePreset, guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try runtime.approve(requestID: request.id).get()
+
+        let window = WindowState()
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: window.windowID, workspaceID: workspace, tabID: UUID(), sessionID: overseer,
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+        )
+        let service = SessionAdminMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "adopt-projection-test", windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveObserverEndpoint: { _, _ in endpoint },
+            scopes: { runtime },
+            administration: { frontDoor }
+        )
+        var replies: [Value] = []
+        func call(_ args: [String: Value]) async throws -> [String: Value] {
+            let value = try await service.execute(args: args)
+            replies.append(value)
+            return try XCTUnwrap(value.objectValue)
+        }
+
+        let preview = try await call(["op": .string("adopt"), "session_id": .string(adoptee.uuidString), "preview": .bool(true)])
+        XCTAssertEqual(preview["result"], .string("preview"))
+        let pending = try await call(["op": .string("adopt"), "session_id": .string(adoptee.uuidString), "idempotency_key": .string("adopt-1")])
+        XCTAssertEqual(pending["result"], .string("pending_confirmation"))
+        for reply in [preview, pending] {
+            let rows = try XCTUnwrap(reply["items"]?.arrayValue?.compactMap(\.objectValue))
+            XCTAssertEqual(rows.map { $0["session_id"] }, [.string(adoptee.uuidString)], "only the adoptee the caller named")
+            XCTAssertEqual(rows.first?["descendant_count"], .int(2))
+            XCTAssertEqual(reply["total_session_count"], .int(3))
+            XCTAssertEqual(reply["running_session_count"], .int(1))
+        }
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let card = try XCTUnwrap(runtime.confirmations.confirmation(id: cardID, granteeSessionID: overseer))
+        XCTAssertEqual(card.items.map(\.sessionID), [adoptee, child, grandchild], "the user's card keeps the whole subtree")
+        XCTAssertEqual(card.items.map(\.title), ["Research", "SecretWorker (running)", "SecretGrandchild"])
+        _ = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
+
+        // A mismatching repeat of an approved card reports approved adoptees only.
+        let second = try await call(["op": .string("adopt"), "session_id": .string(adoptee.uuidString), "idempotency_key": .string("adopt-2")])
+        let secondID = try XCTUnwrap(second["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertNotNil(runtime.confirmations.approve(confirmationID: secondID))
+        let mismatch = try await call([
+            "op": .string("adopt"), "targets": .array([.string(adoptee.uuidString), .string(other.uuidString)]),
+            "idempotency_key": .string("adopt-2"), "confirmation_id": .string(secondID.uuidString)
+        ])
+        XCTAssertEqual(mismatch["code"], .string("confirmation_mismatch"))
+        XCTAssertEqual(mismatch["approved_session_ids"], .array([.string(adoptee.uuidString)]))
+
+        // After the user approves (with a descendant unticked), the applied result names the adoptee only.
+        runtime.confirmations.setItem(child, ticked: false, confirmationID: cardID)
+        await frontDoor.approveAndApply(confirmationID: cardID)
+        let applied = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
+        XCTAssertNotNil(applied["applied_result"])
+
+        let rendered = replies.map { String(describing: $0) }.joined(separator: "\n")
+        for secret in [child.uuidString, grandchild.uuidString, "SecretWorker", "SecretGrandchild"] {
+            XCTAssertFalse(rendered.contains(secret), "agent-facing adopt replies must not reveal \(secret)")
+        }
+        XCTAssertTrue(rendered.contains(adoptee.uuidString))
+    }
+
+    /// A descendant already in the caller's scope is shown normally; one outside it is only counted.
+    func testAdoptProjectionShowsMemberDescendantsAndCountsOutsideOnes() {
+        let adoptee = UUID(), member = UUID(), outside = UUID()
+        let items = [
+            BatchConfirmationItem(sessionID: adoptee, title: "Research", effect: "Bring into this delegation scope under Overseer"),
+            BatchConfirmationItem(sessionID: member, title: "KnownWorker", effect: "Moves with Research (descendant)"),
+            BatchConfirmationItem(sessionID: outside, title: "SecretWorker", effect: "Moves with Research (descendant)")
+        ]
+        let layout = SessionAdminAdoptCardProjection.Layout(
+            adoptees: [adoptee], descendantsByAdoptee: [adoptee: [member, outside]],
+            runningSessionIDs: [outside], memberDescendants: [member]
+        )
+        let rows = SessionAdminAdoptCardProjection.agentItems(items, layout: layout, approved: [adoptee, member])
+            .compactMap(\.objectValue)
+        XCTAssertEqual(rows.map { $0["session_id"] }, [.string(adoptee.uuidString), .string(member.uuidString)])
+        XCTAssertEqual(rows[0]["descendant_count"], .int(2))
+        XCTAssertEqual(rows[0]["all_descendants_approved"], .bool(false))
+        XCTAssertNil(rows[0]["title"], "the adoptee's title is not the caller's to see")
+        XCTAssertEqual(rows[1]["title"], .string("KnownWorker"))
+        XCTAssertEqual(rows[1]["moves_with_session_id"], .string(adoptee.uuidString))
+        XCTAssertEqual(layout.visibleSessionIDs, [adoptee, member])
+        let aggregates = SessionAdminAdoptCardProjection.aggregates(items, layout: layout)
+        XCTAssertEqual(aggregates["total_session_count"], .int(3))
+        XCTAssertEqual(aggregates["running_session_count"], .int(1))
+        let rendered = String(describing: Value.array(rows.map(Value.object)))
+        XCTAssertFalse(rendered.contains(outside.uuidString))
+        XCTAssertFalse(rendered.contains("SecretWorker"))
+        XCTAssertFalse(rendered.contains("Research"))
+    }
+
     func testWorktreeOwnershipStoreRoundTripsAndMarksReleased() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-ownership-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }

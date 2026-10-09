@@ -32,7 +32,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
 
     func confirmationItems(
         for request: AgentSessionAdministrationRequest,
-        scope _: DomainDelegationScopeRecord
+        scope: DomainDelegationScopeRecord
     ) -> [BatchConfirmationItem] {
         guard request.operation == .adminAdopt else {
             return request.targetSessionIDs.map {
@@ -46,15 +46,50 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         // user sees the whole subtree the scope will gain.
         var items: [BatchConfirmationItem] = []
         var listed: Set<UUID> = []
+        var adoptees: [UUID] = []
+        var descendantsByAdoptee: [UUID: [UUID]] = [:]
         for adoptee in request.targetSessionIDs {
+            if listed.contains(adoptee) {
+                // Named by the caller but already listed under an earlier adoptee: it stays visible
+                // to the agent as a named adoptee, not as that adoptee's descendant.
+                adoptees.append(adoptee)
+                for key in descendantsByAdoptee.keys {
+                    descendantsByAdoptee[key]?.removeAll { $0 == adoptee }
+                }
+                continue
+            }
             let nodes = context.projector.organizationalSubtree(of: adoptee)
                 ?? [DomainDelegationSubtreeNode(sessionID: adoptee, depth: 0)]
             for node in nodes where listed.insert(node.sessionID).inserted {
-                let effect = node.sessionID == adoptee
+                let isAdoptee = node.sessionID == adoptee
+                let effect = isAdoptee
                     ? "Bring into this delegation scope under \(destinationName)"
                     : "Moves with \(title(of: adoptee)) (descendant)"
                 items.append(BatchConfirmationItem(sessionID: node.sessionID, title: title(of: node.sessionID), effect: effect))
+                if isAdoptee {
+                    adoptees.append(adoptee)
+                } else {
+                    descendantsByAdoptee[adoptee, default: []].append(node.sessionID)
+                }
             }
+        }
+        // The agent-facing replies render this card through the projection: adoptee IDs and counts
+        // only, never the ID or title of a descendant outside the scope (one already in the scope is
+        // shown normally).
+        if let grantee = request.caller.agentSessionID {
+            SessionAdminAdoptCardProjection.record(
+                SessionAdminAdoptCardProjection.Layout(
+                    adoptees: adoptees,
+                    descendantsByAdoptee: descendantsByAdoptee,
+                    runningSessionIDs: Set(items.map(\.sessionID).filter { context.projector.targetState(for: $0) == .running }),
+                    memberDescendants: Set(descendantsByAdoptee.values.joined().filter {
+                        context.isMember($0, ofChainFrom: scope)
+                    })
+                ),
+                granteeSessionID: grantee,
+                idempotencyKey: request.idempotencyKey,
+                itemSessionIDs: Set(items.map(\.sessionID))
+            )
         }
         return items
     }
