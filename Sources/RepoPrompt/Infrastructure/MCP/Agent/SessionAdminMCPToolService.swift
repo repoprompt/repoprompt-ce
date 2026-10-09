@@ -8,9 +8,10 @@ import RepoPromptDomainRuntime
 /// argument can name or substitute it. Administrative principals and unresolved Agent runs never get
 /// past caller resolution, independently of the catalog gate in `ServerNetworkManager`.
 ///
-/// Lane A implements the scope lifecycle (`request_scope`, `scope_status`, `release_scope`) and
-/// `confirmation_status`. Every other operation goes through `AgentSessionAdministrationService`,
-/// which returns `not_implemented` until a later lane registers its handler.
+/// The scope lifecycle (`request_scope`, `scope_status`, `release_scope`) and `confirmation_status`
+/// are handled here. `undo` and every other operation go through the administration service (in
+/// production `AgentSessionAdministrationFrontDoor`), which returns `not_implemented` for operations
+/// no handler has registered.
 @MainActor
 struct SessionAdminMCPToolService {
     typealias Endpoint = DomainAgentSessionLinkEndpointIdentity
@@ -34,7 +35,15 @@ struct SessionAdminMCPToolService {
         "request_scope": ["op", "kind", "workspace", "capabilities", "guardrails", "reason", "idempotency_key"],
         "scope_status": ["op", "scope_id", "request_id"],
         "release_scope": ["op", "scope_id"],
-        "confirmation_status": ["op", "confirmation_id"]
+        "confirmation_status": ["op", "confirmation_id"],
+        "undo": ["op", "undo_token"]
+    ]
+
+    /// Target selectors a scope-level operation reads (never authorized per target).
+    private static let scopeLevelSelectorKeys: [String: Set<String>] = [
+        "inventory": ["filter"],
+        "tree": ["session_id"],
+        "links": ["session_id"]
     ]
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -61,6 +70,8 @@ struct SessionAdminMCPToolService {
             return try releaseScope(args: args, caller: caller)
         case "confirmation_status":
             return try confirmationStatus(args: args, callerSessionID: endpoint.sessionID)
+        case "undo":
+            return try await undo(args: args, caller: caller)
         default:
             return try await administer(op: op, args: args, caller: caller, endpoint: endpoint)
         }
@@ -234,7 +245,33 @@ struct SessionAdminMCPToolService {
         guard let card = scopes().confirmations.confirmation(id: confirmationID, granteeSessionID: callerSessionID) else {
             throw Self.unavailableError
         }
-        return Self.confirmationValue(card)
+        return withAppliedResult(Self.confirmationValue(card), confirmationID: card.id)
+    }
+
+    /// Adds the result of an apply-on-approval card, when the front door applied it.
+    private func withAppliedResult(_ value: Value, confirmationID: UUID) -> Value {
+        guard case var .object(object) = value,
+              let frontDoor = administration() as? AgentSessionAdministrationFrontDoor,
+              let result = frontDoor.appliedResult(forConfirmation: confirmationID)
+        else { return value }
+        object["applied_result"] = result
+        return .object(object)
+    }
+
+    // MARK: - undo
+
+    private func undo(args: [String: Value], caller: DomainAgentSessionCallerIdentity) async throws -> Value {
+        guard let token = AgentMCPToolHelpers.normalizedString(args["undo_token"]) else {
+            throw MCPError.invalidParams("session_admin undo requires undo_token.")
+        }
+        guard let frontDoor = administration() as? AgentSessionAdministrationFrontDoor else {
+            throw Self.notImplemented("undo")
+        }
+        return try await render(
+            frontDoor.undo(token: token, caller: caller),
+            confirmationID: nil,
+            callerSessionID: caller.agentSessionID ?? UUID()
+        )
     }
 
     // MARK: - Administration ops
@@ -249,12 +286,13 @@ struct SessionAdminMCPToolService {
             throw Self.notImplemented(op)
         }
         if operation.isScopeLevel {
-            for key in ["targets", "session_id", "filter"] where args[key] != nil {
+            // Scope-level ops name no target. The only selectors they read are an inventory `filter`
+            // and an optional `session_id` focus for `tree`/`links`, which their handlers check
+            // against scope visibility; nothing is authorized per target.
+            let allowed = Self.scopeLevelSelectorKeys[op] ?? []
+            for key in ["targets", "session_id", "filter"] where args[key] != nil && !allowed.contains(key) {
                 throw MCPError.invalidParams("session_admin \(op) names no target; '\(key)' is not supported.")
             }
-        }
-        if args["filter"] != nil {
-            throw MCPError.invalidParams("session_admin filter is not supported yet; pass targets or session_id.")
         }
         let request = try AgentSessionAdministrationRequest(
             operation: operation,
@@ -267,11 +305,26 @@ struct SessionAdminMCPToolService {
             preview: Self.parsePreview(args["preview"]),
             arguments: args
         )
-        switch try await administration().perform(request) {
+        return try await render(
+            administration().perform(request),
+            confirmationID: request.confirmationID,
+            callerSessionID: endpoint.sessionID
+        )
+    }
+
+    private func render(
+        _ outcome: AgentSessionAdministrationOutcome,
+        confirmationID: UUID?,
+        callerSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
         case let .completed(value):
             return value
         case let .pendingConfirmation(card, itemsRequiringControl):
-            return Self.confirmationValue(card, itemsRequiringControl: itemsRequiringControl)
+            return withAppliedResult(
+                Self.confirmationValue(card, itemsRequiringControl: itemsRequiringControl),
+                confirmationID: card.id
+            )
         case let .scopeSelectionRequired(scopeIDs):
             return Self.scopeSelectionRequiredValue(scopeIDs)
         case .idempotencyConflict:
@@ -288,8 +341,8 @@ struct SessionAdminMCPToolService {
             throw Self.notImplemented(operation.rawValue)
         case .denied(.confirmationMismatch, _):
             // Recoverable for the card's own grantee: report what the user actually approved.
-            let card = request.confirmationID.flatMap {
-                scopes().confirmations.confirmation(id: $0, granteeSessionID: endpoint.sessionID)
+            let card = confirmationID.flatMap {
+                scopes().confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)
             }
             return Self.confirmationMismatchValue(card)
         case let .denied(denial, sessionID):

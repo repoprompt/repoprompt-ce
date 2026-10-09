@@ -1113,6 +1113,24 @@ final class AgentSessionLinkRuntimeBridge {
         scopes: delegationScopes,
         projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
     )
+    /// `session_admin`'s entry point: filters, preview, idempotency, undo, and apply-on-approval over
+    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops.
+    private(set) lazy var sessionAdministrationFrontDoor = AgentSessionAdministrationFrontDoor.production(
+        core: sessionAdministration,
+        scopes: delegationScopes
+    )
+
+    /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
+    /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
+    /// `stopMonitorLink`, so the link authority stays the sole owner of link lifecycle.
+    func oversightInventory() async -> (
+        live: [DomainAgentSessionLinkInventoryItem],
+        persisted: [AgentSessionOversightIntent]
+    ) {
+        let live = await authority.allLinkItems()
+        let persisted = await intentStore?.allIntents() ?? []
+        return (live, persisted)
+    }
 
     /// Durable oversight intent, installed by app composition.
     ///

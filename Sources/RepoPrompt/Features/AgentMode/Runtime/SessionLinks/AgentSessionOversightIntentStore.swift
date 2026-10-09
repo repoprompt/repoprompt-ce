@@ -618,6 +618,12 @@ actor AgentSessionOversightIntentStore {
         )
     }
 
+    /// Every durable intent, canonically ordered. Read-only inventory (`session_admin links`); it
+    /// does not load the file, so it is empty until the launch load has run.
+    func allIntents() -> [AgentSessionOversightIntent] {
+        tokenByPair.keys.sorted(by: AgentSessionOversightIntent.canonicallyOrdered)
+    }
+
     func isCurrent(_ token: AgentSessionOversightIntentToken) -> Bool {
         tokenByPair[token.pair] == token
     }

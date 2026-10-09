@@ -17,7 +17,7 @@ extension MCPServerViewModel {
                 await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
             },
             scopes: { scopes },
-            administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministration }
+            administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor }
         )
     }
 }

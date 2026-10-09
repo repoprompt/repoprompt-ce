@@ -415,6 +415,20 @@ and follows the same preserve-first rules:
   `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
   and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
 
+## Sidebar groups on compose tabs
+
+`ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
+beside `pinnedOrder`:
+
+- `sidebarGroup`: the tab's sidebar group label (trimmed, at most 64 characters, one line); absent
+  means ungrouped.
+- `sidebarGroupOrder`: the group's position among the workspace's groups, mirrored on every tab in
+  that group (`reorder_groups` rewrites the mirror on each).
+
+Both are encoded only when present and decoded leniently: an absent or malformed value decodes as
+ungrouped, so older files load unchanged and no workspace schema bump or migration is needed. Older
+builds ignore the keys. Stashed (archived) tabs keep their group, so unarchiving restores it.
+
 ## Non-goals and migration notes
 
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.

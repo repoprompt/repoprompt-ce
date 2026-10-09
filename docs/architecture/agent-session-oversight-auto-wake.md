@@ -87,6 +87,17 @@ Rules that hold the scope design together:
   Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or
   admitted for administrative principals, and fails closed in direct-headless.
 
+- **Release goes through the link owner.** `session_admin release`/`retire` unlink only links whose
+  other endpoint is also a scope member, and only through the bridge's `stopMonitorLink`, so the link
+  authority keeps sole ownership: durable-intent removal and Auto-wake target cleanup happen inside
+  that path. Durable intents with no live link are reported (`dormant_intents`), never removed by a
+  scope. Inventory reads links through `oversightInventory()` (live links plus durable intents) and
+  grants nothing.
+- **Batch cards apply on approval.** `AgentSessionAdministrationFrontDoor` keeps the exact request
+  behind each card and, when the user approves, applies it with identical arguments narrowed to the
+  ticked items; the outcome is reported by `confirmation_status` (`applied_result`). Undo tokens
+  are re-authorized as the original operation over the original targets at redemption.
+
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
 
