@@ -423,8 +423,10 @@ and follows the same preserve-first rules:
   build from dropping the fields on its own re-save. An older file decodes with no explicit
   placement and falls back to spawn provenance (`parentSessionID`, then
   `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
-  (`reparent`, `adopt`, scoped creation, `fork`) writes placement; writes are serialized per
-  session, and a hydrate prefers the index's placement over the file's so it cannot revert.
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement. The index entry and live tab are
+  updated synchronously; only the placement-only file rewrite of a session with no live tab is
+  queued, serialized per session in the order placements were applied. A hydrate prefers the
+  index's placement over the file's so it cannot revert.
 - **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
   fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
   a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
