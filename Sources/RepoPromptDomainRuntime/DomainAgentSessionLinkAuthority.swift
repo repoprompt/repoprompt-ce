@@ -51,7 +51,7 @@ package actor DomainAgentSessionLinkAuthority {
     /// This is deliberately not `DomainAgentSessionLinkLease`: that lease represents an
     /// observer-origin monitor operation and carries a monitor capability. An attention request runs in
     /// the inverse direction, and the exact active grant is its whole authority.
-    package struct RequestAttentionAuthorization: Hashable {
+    package struct RequestAttentionAuthorization: Hashable, Sendable {
         package let runtimeID: UUID
         package let runtimeGeneration: UInt64
         package let reference: DomainAgentSessionLinkReference
@@ -87,7 +87,7 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
-    package enum RequestAttentionAuthorizationError: Error, Equatable {
+    package enum RequestAttentionAuthorizationError: Error, Equatable, Sendable {
         /// Indistinguishable absence, stale routing, or authorization denial.
         case denied
         /// More than one exact live grant can satisfy the request.
@@ -188,7 +188,6 @@ package actor DomainAgentSessionLinkAuthority {
         let observer: DomainAgentSessionLinkEndpointIdentity
         let targetSessionID: UUID
     }
-
     // Derived at activation/revocation, never discovered during authorization. A duplicate pair
     // fails closed until ordinary lifecycle removal resolves it.
     private var authorizationLinks: [AuthorizationKey: Set<UUID>] = [:]
@@ -527,19 +526,6 @@ package actor DomainAgentSessionLinkAuthority {
             forObserver: observerSessionID,
             matching: { $0.grant.observer.sessionID == observerSessionID }
         )
-    }
-
-    /// Every active link, for read-only inventory (`session_admin links`/`tree`). Grants no
-    /// authority: unlinking still goes through the exact `revoke(linkID:generation:)` owner path.
-    package func allLinkItems() -> [DomainAgentSessionLinkInventoryItem] {
-        links.values
-            .map { inventoryItem($0, outbound: true) }
-            .sorted {
-                if $0.observerSessionID != $1.observerSessionID {
-                    return $0.observerSessionID.uuidString < $1.observerSessionID.uuidString
-                }
-                return Self.orderedByTarget($0, $1)
-            }
     }
 
     /// Cap accounting is UUID-scoped, unlike caller authorization. Keep the grant's exact target
@@ -912,8 +898,7 @@ package actor DomainAgentSessionLinkAuthority {
         let key = AuthorizationKey(observer: observerEndpoint, targetSessionID: targetSessionID)
         guard let ids = authorizationLinks[key], ids.count == 1, let id = ids.first,
               let record = links[id], record.grant.observer == observerEndpoint,
-              record.grant.target.sessionID == targetSessionID
-        else {
+              record.grant.target.sessionID == targetSessionID else {
             return .failure(.noActiveLink)
         }
         guard record.grant.capabilities.contains(capability) else {

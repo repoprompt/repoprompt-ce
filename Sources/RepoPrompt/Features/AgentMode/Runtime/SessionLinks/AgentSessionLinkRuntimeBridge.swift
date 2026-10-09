@@ -1127,7 +1127,10 @@ final class AgentSessionLinkRuntimeBridge {
         live: [DomainAgentSessionLinkInventoryItem],
         persisted: [AgentSessionOversightIntent]
     ) {
-        let live = await authority.allLinkItems()
+        // Every live link's observer is a tracked observer endpoint or a current candidate.
+        let observers = Set(knownObserverEndpoints.map(\.sessionID))
+            .union(host?.agentSessionLinkCandidates().map(\.sessionID) ?? [])
+        let live = await authority.linkItems(forObservers: observers)
         let persisted = await intentStore?.allIntents() ?? []
         return (live, persisted)
     }
