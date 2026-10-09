@@ -100,13 +100,13 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         let binding = try XCTUnwrap(candidate).binding
         let securityContext = standaloneAskOracleSecurityContext(identity: runtime.identity)
 
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding(["message": .string("start")])
         }
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding(["message": .string("continue"), "chat_id": .string("chat-1")])
         }
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding([
                 "message": .string("restart"),
                 "chat_id": .string("chat-1"),
@@ -155,7 +155,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         ]
         for (label, arguments, expectedMessage) in malformedCases {
             do {
-                _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+                _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
                     try await binding(arguments)
                 }
                 XCTFail("Expected invalid params for malformed \(label)")

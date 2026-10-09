@@ -591,6 +591,15 @@ else
   if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
     fail "M2 workspace presentation bridge declaration missing"
   fi
+  # Scope each readiness check to its owner: another guard elsewhere cannot cover its removal.
+  if ! awk '/^    private func projectInitial\(/ { scoped=1 } /^    private func consume\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep -q 'if initial.isBootstrapped, initial.workspaces.isEmpty,'; then
+    fail "M2 initial Default creation must be gated by authority bootstrap readiness"
+  fi
+  if ! awk '/^    private func project\(/ { scoped=1 } /^    private func commitAccepted\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep -q 'guard snapshot.isBootstrapped else'; then
+    fail "M2 catalog projection must reject unbootstrapped authority snapshots"
+  fi
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"

@@ -893,7 +893,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                         let debugMutationClock = ContinuousClock()
                         let debugMutationStartedAt = debugMutationClock.now
                     #endif
-                    let result = await EditFlowPerf.$currentLifecycleCorrelation.withValue(queued.lifecycleCorrelation) {
+                    let result = await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(queued.lifecycleCorrelation) {
                         await EditFlowPerf.measure(
                             EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalMutation,
                             EditFlowPerf.Dimensions(status: key.route.diagnosticScope)
@@ -1164,7 +1164,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 EditFlowPerf.Lifecycle.ReadFileAutoSelect.mirrorApplyBegan,
                 correlation: queued.lifecycleCorrelation
             )
-            let mirrorOutcome = await EditFlowPerf.$currentLifecycleCorrelation.withValue(queued.lifecycleCorrelation) {
+            let mirrorOutcome = await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(queued.lifecycleCorrelation) {
                 await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.mirrorApply) {
                     await applyMirror(key)
                 }

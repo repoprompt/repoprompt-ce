@@ -285,7 +285,7 @@ struct WorkspaceChooserResultsView: View {
             let unavailableText = if case let .authority(stamp) = source, !stamp.isComplete {
                 "No workspaces available in this incomplete list"
             } else {
-                "No workspaces available in the retained list"
+                "No workspaces available in the last loaded list"
             }
             Text(hasFailure ? unavailableText : "No existing workspaces")
                 .font(fontScale.preset.font)

@@ -1,4 +1,6 @@
-import Combine
+#if DEBUG
+    import Combine
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -574,7 +576,7 @@ final class DomainWorkspacePresentationBridge {
         let projectionSpan = StartupPhaseLog.begin(.bridgeInitialProjection, window: client.windowID)
         defer { projectionSpan.end() }
         var initial = snapshot
-        if initial.workspaces.isEmpty,
+        if initial.isBootstrapped, initial.workspaces.isEmpty,
            let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()
         {
             let fileURL = workspaceManager?.workspaceFileURL(for: candidate)
@@ -749,29 +751,34 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
-        // An untrusted cache is rebuilt completely; a trusted one decodes only changed documents.
-        // A failed decode keeps the previous digests, so the next snapshot retries that document.
+        // Decode failures degrade only their authoritative member. Keep all-record digests below:
+        // missing model keys force the next snapshot to retry even an unchanged failed document.
         var nextModels: [UUID: WorkspaceModel] = [:]
-        do {
-            for record in records {
-                let workspaceID = record.document.workspaceID
-                if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
-                   let cached = projectedModels[workspaceID]
-                {
-                    nextModels[workspaceID] = cached
-                } else {
+        var failedIDs: Set<UUID> = []
+        for record in records {
+            let workspaceID = record.document.workspaceID
+            if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
+               let cached = projectedModels[workspaceID]
+            {
+                nextModels[workspaceID] = cached
+            } else {
+                do {
                     nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)
+                } catch {
+                    failedIDs.insert(workspaceID)
                 }
             }
-        } catch {
-            if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
-            manager.reportDomainCatalogFailure(
-                .modelProjection(error.localizedDescription), error: error, snapshot: snapshot, attempt: attempt
-            )
-            return .invalidCatalog("model_decode_failed")
         }
+        // Presentation-only availability, never a write to authoritative membership. The existing
+        // incomplete-catalog warning carries the failed IDs and keeps valid rows usable.
+        let available = DomainWorkspaceCatalogSnapshot(
+            runtimeIdentity: snapshot.runtimeIdentity, isBootstrapped: snapshot.isBootstrapped,
+            publicationSequence: snapshot.publicationSequence, catalogRevision: snapshot.catalogRevision,
+            health: snapshot.health, workspaces: records.filter { !failedIDs.contains($0.document.workspaceID) },
+            unavailableWorkspaceIDs: snapshot.unavailableWorkspaceIDs.union(failedIDs)
+        )
         let result = manager.applyDomainWorkspaceCatalog(
-            snapshot,
+            available,
             projection: .full(records.compactMap { nextModels[$0.document.workspaceID] }),
             preferredActiveWorkspaceID: manager.activeWorkspaceID,
             rootMapPolicy: .snapshotMetadata,

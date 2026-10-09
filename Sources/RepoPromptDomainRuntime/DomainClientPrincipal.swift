@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 package enum DomainClientPrincipalKind: String, Codable, CaseIterable, Sendable {
     case appProxy = "app_proxy"
@@ -139,5 +140,7 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
 }
 
 package enum MCPDomainInvocationSecurityContext {
-    @TaskLocal package static var current: DomainToolInvocationSecurityContext?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    package static let currentTaskLocal = BoxedTaskLocal<DomainToolInvocationSecurityContext?>(nil)
+    package static var current: DomainToolInvocationSecurityContext? { currentTaskLocal.get() }
 }

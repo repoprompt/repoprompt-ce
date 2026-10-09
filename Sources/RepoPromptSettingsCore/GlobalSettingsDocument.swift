@@ -1011,6 +1011,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var maxBackgroundAgentComposeTabs: Int?
         package var showBuiltInWorkflowCleanupGuidance: Bool?
         package var codexGoalSupportEnabled: Bool?
+        package var codexComputerUseEnabled: Bool?
         package var codexReasoningSummariesEnabled: Bool?
         package var autoEffortEnabled: Bool?
         package var codexMemoriesEnabled: Bool?
@@ -1050,6 +1051,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             maxBackgroundAgentComposeTabs: Int? = nil,
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
+            codexComputerUseEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             autoEffortEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
@@ -1078,6 +1080,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.maxBackgroundAgentComposeTabs = maxBackgroundAgentComposeTabs
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
+            self.codexComputerUseEnabled = codexComputerUseEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.autoEffortEnabled = autoEffortEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled

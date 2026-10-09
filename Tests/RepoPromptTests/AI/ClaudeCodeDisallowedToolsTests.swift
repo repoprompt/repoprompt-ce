@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 import XCTest
 
@@ -84,6 +85,40 @@ final class ClaudeCodeProviderCancellationTests: XCTestCase {
         XCTAssertEqual(response.cost, 0.01)
         XCTAssertFalse(fixture.childExists, "Runner completion must follow owned-child exit/reap")
     }
+
+    /// #803: the CLI prints nothing until it exits, so a live child must still renew
+    /// the Context Builder inactivity budget, and must stop doing so once it exits.
+    func testLiveSilentChildReportsTransportActivityOnlyUntilItExits() async throws {
+        let fixture = try OracleCancellationFixture(livenessHeartbeatInterval: 0.05)
+        addTeardownBlock { await fixture.cleanup() }
+        fixture.start()
+        let ready = await fixture.waitForReadiness()
+        XCTAssertTrue(ready, "Controlled child must reach its gate; outcome=\(String(describing: fixture.outcome))")
+        guard ready else { return }
+
+        let renewed = await fixture.wait(timeout: 3) { fixture.observed.transportActivityCount >= 2 }
+        XCTAssertTrue(renewed, "A live, silent child produced no transport activity")
+        XCTAssertEqual(fixture.observed.text, "", "Liveness must not be reported as content")
+        XCTAssertNil(fixture.outcome, "Liveness must not settle the request")
+        XCTAssertTrue(fixture.childExists)
+        let activity = AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)
+        let output = try XCTUnwrap(AIQueriesService.transportActivityOutput(for: activity))
+        XCTAssertEqual(OracleViewModel.lifecycleActivityKind(for: output), .streamActivity)
+
+        try fixture.send("finish")
+        let completed = await fixture.wait(timeout: 3) { fixture.outcome != nil }
+        XCTAssertTrue(completed, "Normal completion control did not settle")
+        guard case let .success(response)? = fixture.outcome else {
+            XCTFail("Normal completion failed: \(String(describing: fixture.outcome))")
+            return
+        }
+        XCTAssertEqual(response.text, "fixture answer")
+        XCTAssertEqual(response.stopCount, 1)
+        XCTAssertFalse(fixture.childExists)
+        // Liveness strictly precedes the answer: nothing renews the budget after exit.
+        let answerTypes = Array(response.eventTypes.drop { $0 == AIStreamResult.transportActivityType })
+        XCTAssertEqual(answerTypes, ["content", "message_stop"])
+    }
 }
 
 /// Test-local protocol: the shell publishes its own PID only after opening the
@@ -97,6 +132,8 @@ private final class OracleCancellationFixture {
         var promptTokens: Int?
         var completionTokens: Int?
         var cost: Double?
+        var transportActivityCount = 0
+        var eventTypes: [String] = []
     }
 
     enum Outcome {
@@ -112,8 +149,11 @@ private final class OracleCancellationFixture {
     private var task: Task<Void, Never>?
     private(set) var pid: pid_t?
     private(set) var outcome: Outcome?
+    private(set) var observed = Response()
 
-    init() throws {
+    init(
+        livenessHeartbeatInterval: TimeInterval = ProviderTransportActivity.pendingCompletionHeartbeatInterval
+    ) throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("oracle-cancellation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -157,7 +197,7 @@ private final class OracleCancellationFixture {
         ))
         // Only the runner configuration is substituted. Production provider timeout,
         // retries, prompt construction, buffered run and parsing stay intact.
-        provider = ClaudeCodeProvider(runner: runner)
+        provider = ClaudeCodeProvider(runner: runner, livenessHeartbeatInterval: livenessHeartbeatInterval)
     }
 
     var childExists: Bool {
@@ -175,17 +215,21 @@ private final class OracleCancellationFixture {
                     disabledPromptSections: []
                 )
                 let stream = try await provider.streamMessage(message, model: .claudeCode)
-                var response = Response()
                 for try await event in stream {
-                    response.text += event.text ?? ""
+                    observed.eventTypes.append(event.type)
+                    if event.type == AIStreamResult.transportActivityType {
+                        observed.transportActivityCount += 1
+                        continue
+                    }
+                    observed.text += event.text ?? ""
                     if event.type == "message_stop" {
-                        response.stopCount += 1
-                        response.promptTokens = event.promptTokens
-                        response.completionTokens = event.completionTokens
-                        response.cost = event.cost
+                        observed.stopCount += 1
+                        observed.promptTokens = event.promptTokens
+                        observed.completionTokens = event.completionTokens
+                        observed.cost = event.cost
                     }
                 }
-                outcome = .success(response)
+                outcome = .success(observed)
             } catch {
                 outcome = .failure(error)
             }

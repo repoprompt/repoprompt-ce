@@ -307,7 +307,15 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     }
 }
 
+struct AgentComputerUseComposerProps: Equatable {
+    let isVisible: Bool
+    let isOn: Bool
+    let isBusy: Bool
+    static let hidden = Self(isVisible: false, isOn: false, isBusy: false)
+}
+
 struct AgentComposerProps: Equatable {
+    var computerUse: AgentComputerUseComposerProps = .hidden
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
     let attachments: AgentAttachmentStripSnapshot

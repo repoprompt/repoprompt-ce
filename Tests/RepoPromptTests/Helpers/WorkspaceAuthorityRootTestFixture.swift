@@ -210,8 +210,8 @@ import XCTest
         }
 
         /// Seed an additional real canonical workspace without starting manager-owned create tasks.
-        func createAdditionalWorkspace(name: String, repoPaths: [String]) async throws -> WorkspaceModel {
-            let model = WorkspaceModel(name: name, repoPaths: repoPaths)
+        func createAdditionalWorkspace(name: String, repoPaths: [String], isSystemWorkspace: Bool = false) async throws -> WorkspaceModel {
+            let model = WorkspaceModel(name: name, repoPaths: repoPaths, isSystemWorkspace: isSystemWorkspace)
             let url = manager.workspaceFileURL(for: model)
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -945)
             _ = try await client.create(model, fileURL: url, operationID: UUID())

@@ -2134,7 +2134,16 @@ final class MCPServerViewModel: ObservableObject {
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities,
                 context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities
+                selection: windowToolSelectionCapabilities,
+                resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
+                    await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                },
+                resolveObserverEndpoint: { [weak self] metadata, targetWindow in
+                    await self?.resolveAgentSessionLinkObserverEndpoint(
+                        metadata: metadata,
+                        targetWindow: targetWindow
+                    )
+                }
             ),
             MCPContextBuilderToolProvider(
                 runtime: windowToolRuntime,
@@ -3847,11 +3856,11 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
+                        try await AgentSelfMCPCallOrigin.currentTaskLocal.withValue(selfCallOrigin) {
                             // Explicitly captured before this Task/start-gate hop; compatibility
                             // helpers project this same packet rather than a successor live route.
                             try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                                try await AgentSessionLinkWaitCallOrigin.$current.withValue(waitCallOrigin) {
+                                try await AgentSessionLinkWaitCallOrigin.currentTaskLocal.withValue(waitCallOrigin) {
                                     try await body()
                                 }
                             }

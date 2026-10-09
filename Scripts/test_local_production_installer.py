@@ -122,6 +122,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertEqual(
             entitlements,
             {
+                "com.apple.security.automation.apple-events": True,
                 "com.apple.security.cs.allow-jit": True,
                 "com.apple.security.cs.disable-library-validation": True,
                 "com.apple.security.files.bookmarks.app-scope": True,

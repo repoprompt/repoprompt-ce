@@ -294,6 +294,11 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
     }
 
+    func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
+        await viewModel.agentSessionLinkWillActivate(endpoint)
+    }
+
     func agentSessionLinkWithholdPromptInventory(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64? {

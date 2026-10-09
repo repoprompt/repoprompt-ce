@@ -22,6 +22,10 @@ struct ACPDiscoveredSessionModels: Equatable {
     /// The session's active reasoning effort (e.g. Grok's `_meta.reasoningEffort`), when the
     /// provider advertises one. Lets the controller skip redundant effort mutations.
     var currentEffortRaw: String?
+    /// Ephemeral provenance copied from the controller's existing inbound sequence for an
+    /// applicable direct effort report (including an unresolvable report). Bootstrap/warmed
+    /// effort has no report provenance and cannot confirm a subsequent mutation.
+    var currentEffortInboundSequence: UInt64?
     var modelParameterSets: [ACPModelParameterSet]
     /// False only for persisted model-only records written before parameter discovery.
     var hasModelParameterMetadata: Bool
@@ -309,6 +313,13 @@ struct ACPDirectModelSelectionRequest {
     var expectedConfirmationModelRaw: String
 }
 
+/// A report applies to the advertised base named in the same update. A nil effort means
+/// the report was applicable but unresolvable; a nil report means no applicable update.
+struct ACPDirectSessionEffortReport {
+    let baseModelRaw: String
+    let effortRaw: String?
+}
+
 /// Bounded capability for ACP providers that advertise session models outside the
 /// modern `configOptions` contract (e.g. Grok's top-level `SessionModelState`) and
 /// apply selections through a provider-specific RPC instead of
@@ -320,6 +331,12 @@ protocol ACPDirectSessionModelProvider: Sendable {
     func parseDirectSessionModelSnapshot(
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult
+
+    func parseDirectSessionEffortReport(
+        from configOptions: [[String: Any]],
+        sessionID: String,
+        options: [AgentModelOption]
+    ) -> ACPDirectSessionEffortReport?
 
     /// Builds the provider's selection RPC from STRUCTURED parts. The controller
     /// decomposes and validates the selection against the advertised snapshot; the

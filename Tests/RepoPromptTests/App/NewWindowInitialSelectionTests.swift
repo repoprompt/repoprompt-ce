@@ -792,26 +792,57 @@ import XCTest
 
         // MARK: 8. Non-System namesake is never automatically activated
 
-        func testInitialDefaultRejectsNonSystemNamesake() async throws {
-            try await Fixture.run(seeds: Fixture.namesakeSeeds) { f in
-                let window = f.makeWindow()
-                let manager = window.workspaceManager
-                await manager.awaitInitialWorkspaceActivationCompletion()
-                await manager.awaitInitialized()
-                try await f.awaitCaughtUpWithCatalogBaseline(window)
-                XCTAssertNil(manager.activeWorkspaceID)
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "initial_default_selection")
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.workspaceID, Fixture.namesakeID)
-                let namesake = try XCTUnwrap(manager.workspace(withID: Fixture.namesakeID))
-                XCTAssertFalse(namesake.isSystemWorkspace, "Namesake is not reclassified")
-                XCTAssertEqual(namesake.name, "Default")
-                let canonical = await f.runtime.workspaceStore.snapshot()
-                XCTAssertEqual(
-                    canonical.workspaces.first { $0.document.workspaceID == Fixture.namesakeID }?.document.metadata.isSystemWorkspace,
-                    false
-                )
-                let result = await manager.requestWorkspaceSwitch(to: namesake)
-                XCTAssertTrue(result.didSwitch, "Explicit activation of the user namesake stays allowed: \(result)")
+        func testInitialDefaultUsesSystemIdentityInsteadOfNamesake() async throws {
+            // Cover both creation beside a user namesake and reuse of a differently named System.
+            for seeds in [
+                Fixture.namesakeSeeds,
+                Fixture.namesakeSeeds + [Fixture.model(id: Fixture.defaultID, name: "System", isSystem: true)]
+            ] {
+                try await Fixture.run(seeds: seeds) { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let system = try XCTUnwrap(manager.activeWorkspace)
+                    XCTAssertTrue(system.isSystemWorkspace)
+                    XCTAssertNotEqual(system.id, Fixture.namesakeID)
+                    XCTAssertNil(manager.domainWorkspaceAuthorityIssue, "A user namesake is not an authority failure")
+                    if seeds.contains(where: \.isSystemWorkspace) {
+                        XCTAssertEqual(system.id, Fixture.defaultID, "Reuse System regardless of its display name")
+                        XCTAssertEqual(manager.workspaces.count, seeds.count, "Do not create a duplicate System")
+                    } else {
+                        XCTAssertEqual(manager.workspaces.count, seeds.count + 1, "Create System without replacing the user namesake")
+                    }
+                    let namesake = try XCTUnwrap(manager.workspace(withID: Fixture.namesakeID))
+                    XCTAssertFalse(namesake.isSystemWorkspace, "Namesake is not reclassified")
+                    XCTAssertEqual(namesake.name, "Default")
+                    let canonical = await f.runtime.workspaceStore.snapshot()
+                    XCTAssertEqual(
+                        canonical.workspaces.first { $0.document.workspaceID == Fixture.namesakeID }?.document.metadata.isSystemWorkspace,
+                        false
+                    )
+                    let result = await manager.requestWorkspaceSwitch(to: namesake)
+                    XCTAssertTrue(result.didSwitch, "Explicit activation of the user namesake stays allowed: \(result)")
+                }
+            }
+
+            // The bridge's initial catalog candidate uses the same identity rule and supplied order.
+            try await Fixture.run(seeds: []) { f in
+                let namesake = Fixture.model(id: Fixture.namesakeID, name: "Default")
+                let system = Fixture.model(id: Fixture.defaultID, name: "System", isSystem: true)
+                for hasSystem in [false, true] {
+                    let manager = f.makeManager()
+                    manager.workspaces = hasSystem ? [namesake, system] : [namesake]
+                    let candidate = try XCTUnwrap(manager.runtimeOwnedDefaultWorkspaceCandidate())
+                    XCTAssertTrue(candidate.isSystemWorkspace)
+                    XCTAssertNotEqual(candidate.id, namesake.id)
+                    XCTAssertEqual(manager.workspaces.count, 2)
+                    XCTAssertEqual(manager.workspace(withID: namesake.id), namesake, "User namesake stays unchanged")
+                    if hasSystem {
+                        XCTAssertEqual(candidate.id, system.id)
+                    }
+                }
             }
 
             // A gate-time classification change is caught by the publication recheck.
@@ -896,6 +927,7 @@ import XCTest
             try await Fixture.run(seeds: Fixture.twoSystemSeeds) { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
+                let resolution = f.holdInitialResolution(manager)
                 let hydration = f.holdHydrationSpawn(manager, of: Fixture.defaultID)
                 let recoveryGate = f.makeGate()
                 let recoveryEntered = Signal("startup recovery began")
@@ -904,9 +936,20 @@ import XCTest
                     await recoveryGate.wait()
                 }
                 let recorder = f.makeRecorder(manager: manager)
+                try await f.wait(resolution.entered)
+                try await f.awaitCatalogProjection(window)
+                // Startup now uses the first System, not the name "Default". Supply Default first
+                // for startup, then move the other System first to keep recovery discriminating.
+                let defaultIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.defaultID })
+                let startupSystem = manager.workspaces.remove(at: defaultIndex)
+                manager.workspaces.insert(startupSystem, at: 0)
+                resolution.gate.release()
                 try await f.wait(hydration.entered)
                 try await f.awaitCaughtUpWithCatalogBaseline(window)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID, "startup published before recovery")
+                let otherIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.earlierSystemID })
+                let recoverySystem = manager.workspaces.remove(at: otherIndex)
+                manager.workspaces.insert(recoverySystem, at: 0)
 
                 let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                 let closeCompleted = Signal("pending restore completed by close during recovery")
@@ -1182,6 +1225,7 @@ import XCTest
                     )
                     XCTAssertNil(f.projectionState(for: window).catalogCheckpoint)
                     XCTAssertEqual(chooser.emitted, [.loading])
+                    XCTAssertTrue(window.workspaceManager.workspacesForMenu().isEmpty, "picker hides unaccepted constructor rows")
                     for query in [WorkspaceChooserQuery.compact(maxRecent: 5), .expanded(collection: .saved, searchText: "")] {
                         let value = try chooser.consume(query)
                         XCTAssertEqual(value.kind, .loading)
@@ -1575,6 +1619,7 @@ import XCTest
                 let token = manager.$workspaceChooserPresentation.sink { emitted.append($0) }
                 defer { token.cancel() }
                 XCTAssertEqual(emitted, [.loading], "Constructor-loaded legacy rows are not accepted membership")
+                XCTAssertTrue(manager.workspacesForMenu().isEmpty)
                 f.project(manager, Fixture.standardSeeds)
                 XCTAssertEqual(emitted.last, .loading, "Direct low-level reconciliation cannot promote the chooser")
 
@@ -1821,6 +1866,11 @@ import XCTest
                 XCTAssertNotNil(manager.workspace(withID: ghost.id), "the internal assignment is unchanged")
                 XCTAssertEqual(manager.workspaceChooserPresentation, presented, "unaccepted rows never reach the chooser")
                 XCTAssertFalse(manager.admitsDomainSelfEcho(baselineGeneration: accepted.reconciliationGeneration))
+                XCTAssertEqual(
+                    Set(manager.workspacesForMenu(.init(includeSystem: true, includeTemporary: true)).map(\.id)),
+                    Fixture.standardIDs,
+                    "picker also hides imported ghost until acceptance"
+                )
                 XCTAssertEqual(apply(6, .metadata(baselineGeneration: accepted.reconciliationGeneration)), .rejected(.fullProjectionRequired))
                 manager.workspaces[0].currentPromptText = "local edit after import"
                 XCTAssertEqual(manager.workspaceChooserPresentation, presented, "the fence also holds local mirroring")
@@ -1839,35 +1889,82 @@ import XCTest
 
         // MARK: #1142 Failure identity and explicit recovery
 
-        func testInitialDecodeFailurePublishesFailureWithoutLegacyOrPartialRows() async throws {
+        func testInitialDecodeFailureKeepsValidRowsAndReportsFailedMember() async throws {
             try await Fixture.run { f in
                 let (window, manager, chooser, events) = await f.makeWindowWithHeldInitialProjection()
-                manager.setCatalogRecordDecodeFailureForTesting { $0 == Fixture.aardvarkID ? InjectedDecodeFailure() : nil }
-                window.restartDomainWorkspaceProjectionForTesting()
-                let snapshot = await f.runtime.workspaceStore.snapshot()
-                try await f.wait(events.resolution(through: snapshot.publicationSequence))
-                XCTAssertTrue(events.catalogCheckpoints.isEmpty, "a rejected initial decode is never accepted")
-                XCTAssertEqual(Set(manager.workspaces.map(\.id)), Fixture.standardIDs, "constructor rows stay internal")
-                guard case let .failed(failure) = manager.workspaceChooserPresentation else {
-                    return XCTFail("initial decode failure must not stay loading: \(manager.workspaceChooserPresentation)")
+                var attempts = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    guard id == Fixture.aardvarkID else { return nil }
+                    attempts += 1
+                    return InjectedDecodeFailure()
                 }
-                XCTAssertEqual(failure.kind, .modelProjection(InjectedDecodeFailure.diagnostic))
+                window.restartDomainWorkspaceProjectionForTesting()
+                let checkpoint = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(checkpoint.catalogReceipt?.kind, .full)
+                XCTAssertEqual(Set(manager.workspaces.map(\.id)), [Fixture.defaultID, Fixture.requestedID])
+                let failure = try XCTUnwrap(manager.workspaceChooserPresentation.failure)
+                XCTAssertEqual(failure.kind, .unavailableMembers([Fixture.aardvarkID]))
                 XCTAssertEqual(failure.recovery, .idle)
-                XCTAssertEqual(failure.publicationSequence, snapshot.publicationSequence)
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .projectionFailure)
-                XCTAssertEqual(failure.legacyIssue?.issueID, manager.domainWorkspaceAuthorityIssue?.id, "actual published issue ID")
+                XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
                 for query in [WorkspaceChooserQuery.compact(maxRecent: 5), .expanded(collection: .saved, searchText: "")] {
                     let value = try chooser.consume(query)
-                    XCTAssertEqual(value.kind, .failed)
-                    XCTAssertEqual(value.orderedIDs, [])
-                    XCTAssertNil(value.source)
+                    XCTAssertEqual(value.kind, .ready)
+                    XCTAssertEqual(value.orderedIDs, [Fixture.requestedID])
                     XCTAssertEqual(value.failureID, failure.id)
-                    XCTAssertEqual(value.recovery, .idle)
+                    guard case let .authority(stamp) = value.source else { return XCTFail("authority subset") }
+                    XCTAssertFalse(stamp.isComplete)
                 }
-                XCTAssertFalse(chooser.emitted.contains {
-                    if case .ready = $0 { return true }
-                    return false
-                }, "neither legacy rows nor the decoded part of a rejected batch are salvaged")
+                let before = attempts
+                manager.retryWorkspaceChooser()
+                await f.awaitCatalogRefresh(window)
+                XCTAssertGreaterThan(attempts, before, "unchanged failed digest must not take the metadata fast path")
+                XCTAssertEqual(events.catalogCheckpoints.last?.catalogReceipt?.kind, .full)
+                XCTAssertEqual(manager.workspaceChooserPresentation.failure?.kind, failure.kind)
+                let durable = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(Set(durable.workspaces.map(\.document.workspaceID)), Fixture.standardIDs)
+            }
+        }
+
+        func testCorruptWorkspaceFileAmongValidMembersKeepsAvailableChooserRows() async throws {
+            try await Fixture.run(unavailableSeedIDs: [Fixture.aardvarkID], beforeRuntimeStart: { f in
+                let url = f.workspaceURL(for: Fixture.standardSeeds[1])
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("{broken workspace".utf8).write(to: url, options: .atomic)
+            }) { f in
+                let (window, manager, chooser, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                let checkpoint = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(checkpoint.catalogReceipt?.completeness.failure?.kind, .unavailableMembers([Fixture.aardvarkID]))
+                XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).orderedIDs, [Fixture.requestedID])
+                XCTAssertEqual(try chooser.consume(.expanded(collection: .saved, searchText: "")).orderedIDs, [Fixture.requestedID])
+                try f.writeSeedDocument(Fixture.aardvarkID)
+                manager.retryWorkspaceChooser()
+                await f.awaitCatalogRefresh(window)
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).orderedIDs, [Fixture.aardvarkID, Fixture.requestedID])
+            }
+        }
+
+        func testAllModelDecodesFailAsIncompleteEmptyWithoutCreatingDefault() async throws {
+            try await Fixture.run { f in
+                let (window, manager, chooser, _) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                var defaultCreations = 0
+                XCTAssertTrue(bridge.setInitialDefaultCreateOutcomeForTesting(.init(
+                    operationID: UUID(), disposition: .failed, before: nil, after: nil,
+                    catalogRevision: 0, resultingDigest: nil
+                )) { _ in defaultCreations += 1 })
+                manager.setCatalogRecordDecodeFailureForTesting { _ in InjectedDecodeFailure() }
+                window.restartDomainWorkspaceProjectionForTesting()
+                let checkpoint = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(checkpoint.catalogReceipt?.completeness.failure?.kind, .unavailableMembers(Fixture.standardIDs))
+                let value = try chooser.consume(.compact(maxRecent: 5))
+                XCTAssertEqual(value.kind, .ready)
+                XCTAssertEqual(value.orderedIDs, [])
+                XCTAssertEqual(value.failure?.kind, .unavailableMembers(Fixture.standardIDs))
+                XCTAssertEqual(defaultCreations, 0)
+                let durable = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(Set(durable.workspaces.map(\.document.workspaceID)), Fixture.standardIDs)
             }
         }
 
@@ -1882,22 +1979,22 @@ import XCTest
 
                 manager.setCatalogRecordDecodeFailureForTesting(nil)
                 manager.retryWorkspaceChooser()
-                guard case let .failed(retrying) = manager.workspaceChooserPresentation,
+                guard case let .ready(_, .failed(retrying)) = manager.workspaceChooserPresentation,
                       case let .retrying(retryID) = retrying.recovery
                 else { return XCTFail("Retry must mark the failure retrying: \(manager.workspaceChooserPresentation)") }
                 XCTAssertEqual(retrying.id, failure.id, "retrying keeps the failure identity")
                 let consumed = try chooser.consume(.expanded(collection: .saved, searchText: ""))
-                XCTAssertEqual(consumed.kind, .failed)
-                XCTAssertEqual(consumed.orderedIDs, [])
+                XCTAssertEqual(consumed.kind, .ready)
+                XCTAssertEqual(consumed.orderedIDs, [Fixture.requestedID])
                 XCTAssertEqual(consumed.recovery, .retrying(retryID))
                 manager.retryWorkspaceChooser()
                 XCTAssertEqual(manager.workspaceChooserPresentation.failure?.recovery, .retrying(retryID), "a repeated click coalesces")
 
                 await f.awaitCatalogRefresh(window)
                 let receipts = events.catalogCheckpoints.compactMap(\.catalogReceipt)
-                XCTAssertEqual(receipts.count, 1, "one coalesced refresh, one accepted reconciliation: \(receipts)")
-                XCTAssertEqual(receipts.first?.kind, .full)
-                XCTAssertEqual(receipts.first?.completeness, .complete)
+                XCTAssertEqual(receipts.count, 2, "initial incomplete plus one coalesced repair: \(receipts)")
+                XCTAssertEqual(receipts.last?.kind, .full)
+                XCTAssertEqual(receipts.last?.completeness, .complete)
                 guard case let .ready(catalog, .current) = manager.workspaceChooserPresentation else {
                     return XCTFail("repaired retry reaches accepted membership: \(manager.workspaceChooserPresentation)")
                 }
@@ -2262,11 +2359,12 @@ import XCTest
                 window.restartDomainWorkspaceProjectionForTesting()
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 try await f.wait(events.resolution(through: snapshot.publicationSequence))
-                let failure = try XCTUnwrap(manager.workspaceChooserPresentation.failure)
+                let idle = manager.workspaceChooserPresentation
+                XCTAssertNotNil(idle.failure)
                 manager.retryWorkspaceChooser()
                 XCTAssertEqual(manager.workspaceChooserPresentation.failure?.recovery.isRetrying, true)
                 await window.joinDomainWorkspaceBridgeForTesting()
-                XCTAssertEqual(manager.workspaceChooserPresentation, .failed(failure), "cancellation preserves prior state")
+                XCTAssertEqual(manager.workspaceChooserPresentation, idle, "cancellation preserves prior rows, warning, and witnesses")
                 XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).recovery, .idle)
             }
             // Close: cancellation runs after closing is marked; nothing publishes afterwards.
@@ -2469,18 +2567,25 @@ import XCTest
             for closes in [true, false] {
                 try await Fixture.run { f in
                     let (window, manager, chooser, events) = await f.makeWindowWithHeldInitialProjection()
-                    let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let snapshot = await f.runtime.workspaceStore.snapshot()
                     let interrupted = Signal("failure legacy issue reentered lifetime")
                     var emissionsAtInterruption: Int?
                     let observation = manager.$domainWorkspaceAuthorityIssue.sink { issue in
                         guard issue != nil else { return }
-                        if closes { window.beginClose() } else { bridge.stop() }
+                        if closes { window.beginClose() } else { withUnsafeCurrentTask { $0?.cancel() } }
                         emissionsAtInterruption = chooser.emitted.count
                         interrupted.fire()
                     }
                     defer { observation.cancel() }
-                    manager.setCatalogRecordDecodeFailureForTesting { _ in InjectedDecodeFailure() }
-                    bridge.start()
+                    let report = Task { @MainActor in
+                        manager.reportDomainCatalogFailure(
+                            .modelProjection("catalog-wide failure"),
+                            snapshot: snapshot,
+                            attempt: manager.beginDomainCatalogAttempt()
+                        )
+                    }
+                    let reported = await report.value
+                    XCTAssertFalse(reported)
                     try await f.wait(interrupted)
                     await window.joinDomainWorkspaceBridgeForTesting()
                     XCTAssertEqual(chooser.emitted.count, emissionsAtInterruption)
@@ -2587,7 +2692,7 @@ import XCTest
                 let changed = await f.runtime.workspaceStore.snapshot()
                 try await f.wait(events.resolution(through: changed.publicationSequence))
                 XCTAssertGreaterThan(fencedDecodes, 0, "the independent full-required fence must invalidate unchanged cached records")
-                XCTAssertEqual(events.catalogCheckpoints.count, applications)
+                XCTAssertEqual(events.catalogCheckpoints.count, applications + 1, "available subset is accepted with a warning")
                 XCTAssertNotNil(manager.workspaceChooserPresentation.failure)
                 XCTAssertFalse(try chooser.consume(.compact(maxRecent: 10)).orderedIDs.contains(unrelated.id))
                 manager.setCatalogRecordDecodeFailureForTesting(nil)
@@ -2630,6 +2735,9 @@ import XCTest
                     let models = try f.decoded(snapshot)
                     XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .decodedModels).receipt)
                     XCTAssertTrue(manager.reportDomainCatalogFailure(.modelProjection("same failure"), snapshot: snapshot, attempt: manager.beginDomainCatalogAttempt()))
+                    var issueEmissions: [DomainWorkspaceAuthorityIssue?] = []
+                    let issueObserver = manager.$domainWorkspaceAuthorityIssue.sink { issueEmissions.append($0) }
+                    defer { issueObserver.cancel() }
                     let recovery = manager.beginDomainCatalogAttempt()
                     let intermediate = manager.beginDomainCatalogAttempt()
                     let generation = manager.domainCatalogReconciliationGeneration
@@ -2658,6 +2766,8 @@ import XCTest
                     XCTAssertEqual(manager.workspaceChooserPresentation.failure, newer)
                     XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.id, issueID)
                     XCTAssertNotNil(issueID)
+                    let finalEmission = issueEmissions.last ?? nil
+                    XCTAssertEqual(finalEmission?.id, issueID, "clearance must replay the nested same-payload report")
                     XCTAssertFalse(manager.reportDomainCatalogFailure(.modelProjection("intermediate must remain superseded"), snapshot: snapshot, attempt: intermediate))
                     XCTAssertEqual(manager.workspaceChooserPresentation.failure, newer)
                     XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.id, issueID)
@@ -2674,7 +2784,8 @@ import XCTest
                 window.restartDomainWorkspaceProjectionForTesting()
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 try await f.wait(events.resolution(through: snapshot.publicationSequence))
-                let failure = try XCTUnwrap(manager.workspaceChooserPresentation.failure)
+                let idle = manager.workspaceChooserPresentation
+                XCTAssertNotNil(idle.failure)
                 let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                 let gate = f.makeGate()
                 let entered = Signal("real retry reload returned; completion held")
@@ -2687,12 +2798,12 @@ import XCTest
                 try await f.wait(entered)
                 XCTAssertTrue(manager.workspaceChooserPresentation.failure?.recovery.isRetrying == true)
                 bridge.cancelCatalogRefresh()
-                XCTAssertEqual(manager.workspaceChooserPresentation, .failed(failure), "idle must publish before held I/O returns")
+                XCTAssertEqual(manager.workspaceChooserPresentation, idle, "idle must publish before held I/O returns")
                 XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).recovery, .idle)
                 bridge.afterCatalogReloadForTesting = nil
                 gate.release()
                 await window.joinDomainWorkspaceBridgeForTesting()
-                XCTAssertEqual(manager.workspaceChooserPresentation, .failed(failure))
+                XCTAssertEqual(manager.workspaceChooserPresentation, idle)
             }
         }
 
@@ -2739,7 +2850,7 @@ import XCTest
                 XCTAssertEqual(bridge.projectionObservationStateForTesting.generation, generationAtClose)
                 XCTAssertEqual(manager.activeWorkspaceID, activeAtClose)
                 XCTAssertFalse(manager.test_isPollTimerActive)
-                XCTAssertEqual(try chooser.consume(.expanded(collection: .saved, searchText: "")).kind, .failed)
+                XCTAssertEqual(try chooser.consume(.expanded(collection: .saved, searchText: "")).kind, .ready)
                 f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "closed held retry")
             }
         }
@@ -2898,7 +3009,14 @@ import XCTest
                 window.restartDomainWorkspaceProjectionForTesting()
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 try await f.wait(events.resolution(through: snapshot.publicationSequence))
+                XCTAssertTrue(manager.reportDomainCatalogFailure(
+                    .modelProjection("catalog-wide failure"),
+                    snapshot: snapshot,
+                    attempt: manager.beginDomainCatalogAttempt()
+                ))
                 XCTAssertNotNil(manager.domainWorkspaceAuthorityIssue)
+                let acceptedCount = events.catalogCheckpoints.count
+                let generation = f.projectionState(for: window).generation
                 let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                 let closed = Signal("close reentered during covered issue clearance")
                 var emissionsAtClose: Int?
@@ -2917,11 +3035,11 @@ import XCTest
                 await window.joinDomainWorkspaceBridgeForTesting()
                 XCTAssertEqual(chooser.emitted.count, emissionsAtClose)
                 XCTAssertEqual(manager.workspaceChooserPresentation, presentationAtClose)
-                XCTAssertTrue(events.catalogCheckpoints.isEmpty, "close must fence the returning caller's acceptance checkpoint")
-                XCTAssertEqual(bridge.projectionObservationStateForTesting.generation, 0)
+                XCTAssertEqual(events.catalogCheckpoints.count, acceptedCount, "close must fence the returning caller's acceptance checkpoint")
+                XCTAssertEqual(bridge.projectionObservationStateForTesting.generation, generation)
                 XCTAssertNil(manager.activeWorkspaceID)
                 XCTAssertFalse(manager.test_isPollTimerActive)
-                XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).kind, .failed)
+                XCTAssertEqual(try chooser.consume(.compact(maxRecent: 5)).kind, .ready)
             }
         }
 
@@ -3231,7 +3349,7 @@ import XCTest
             }
         }
 
-        func testImportFenceSuppressesLocalMirroringUntilRetryAcceptsFullCatalog() async throws {
+        func testImportFenceSuppressesLocalMirroringUntilAvailableCatalogAcceptance() async throws {
             try await Fixture.run { f in
                 let (window, manager, chooser, events) = await f.makeWindowWithHeldInitialProjection()
                 window.restartDomainWorkspaceProjectionForTesting()
@@ -3253,10 +3371,10 @@ import XCTest
                 XCTAssertEqual(try chooser.consume(saved), before, "subsequent local mutations stay fenced")
                 XCTAssertEqual(try chooser.consume(.expanded(collection: .temporary, searchText: "")).orderedIDs, [])
                 await f.awaitCatalogRefresh(window)
-                XCTAssertEqual(events.catalogCheckpoints.count, acceptedCount, "decode failure cannot credit a catalog application")
-                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, generation)
+                XCTAssertEqual(events.catalogCheckpoints.count, acceptedCount + 1, "valid members are accepted independently of a decode failure")
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, generation + 1)
                 let failure = try XCTUnwrap(manager.workspaceChooserPresentation.failure)
-                XCTAssertEqual(failure.kind, .modelProjection(InjectedDecodeFailure.diagnostic))
+                XCTAssertEqual(failure.kind, .unavailableMembers([Fixture.aardvarkID]))
                 let snapshot = await f.runtime.workspaceStore.snapshot()
                 XCTAssertEqual(manager.applyDomainWorkspaceCatalog(
                     snapshot, projection: .metadata(baselineGeneration: generation), preferredActiveWorkspaceID: nil,
@@ -3274,7 +3392,7 @@ import XCTest
                 XCTAssertTrue(manager.workspaceChooserPresentation.failure?.recovery.isRetrying == true)
                 await f.awaitCatalogRefresh(window)
                 let applications = events.catalogCheckpoints.dropFirst(acceptedCount).compactMap(\.catalogReceipt)
-                XCTAssertEqual(applications.map(\.kind), [.full], "Retry must force full, not reuse Bridge metadata caches")
+                XCTAssertEqual(applications.map(\.kind), [.full, .full], "Retry must force full, not reuse Bridge metadata caches")
                 XCTAssertNil(manager.workspace(withID: ghost.id))
                 XCTAssertEqual(manager.workspace(withID: Fixture.aardvarkID)?.name, "Aardvark")
                 for query in [saved, compact] {
@@ -3314,6 +3432,91 @@ import XCTest
                 XCTAssertNil(reloaded.failure)
                 XCTAssertEqual(reloaded.orderedIDs, [Fixture.requestedID])
                 XCTAssertEqual(try chooser.consume(temp).orderedIDs, [local.id, Fixture.aardvarkID])
+            }
+        }
+
+        func testDegradedAcceptedCatalogsAdmitSelfEchoWithoutClearingWarnings() async throws {
+            for state in 0 ..< 3 {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    XCTAssertFalse(manager.admitsDomainSelfEcho(baselineGeneration: 0))
+                    let base = await f.runtime.workspaceStore.snapshot()
+                    let snapshot = f.catalog(
+                        base, sequence: 5, catalogRevision: 5,
+                        health: state == 1 ? .degradedReadOnly(reason: "aggregate_unavailable") : .writable,
+                        dropping: state == 0 ? [Fixture.requestedID] : [],
+                        unavailable: state == 0 ? [Fixture.requestedID] : []
+                    )
+                    let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                        snapshot, projection: .full(f.decoded(snapshot)), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .decodedModels
+                    ).receipt)
+                    if state == 2 {
+                        XCTAssertTrue(manager.reportDomainCatalogFailure(.catalogChangedDuringRefresh, snapshot: snapshot, attempt: manager.beginDomainCatalogAttempt()))
+                    }
+                    let presented = manager.workspaceChooserPresentation
+                    XCTAssertNotNil(presented.failure)
+                    let record = try XCTUnwrap(snapshot.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                    XCTAssertTrue(manager.admitsDomainSelfEcho(baselineGeneration: receipt.reconciliationGeneration))
+                    XCTAssertFalse(manager.admitsDomainSelfEcho(baselineGeneration: receipt.reconciliationGeneration + 1))
+                    XCTAssertTrue(manager.acceptDomainAuthoritySelfEchoBaseline(
+                        workspaceID: Fixture.aardvarkID, revisions: record.revisions, digest: record.document.contentDigest,
+                        health: record.health, catalogRevision: 6, publicationSequence: 6,
+                        baselineGeneration: receipt.reconciliationGeneration
+                    ))
+                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, receipt.reconciliationGeneration, "an echo is not a catalog reconciliation")
+                    XCTAssertEqual(manager.workspaceChooserPresentation, presented, "an echo cannot erase degradation or certify freshness")
+                    let recovered = f.catalog(base, sequence: 7, catalogRevision: 7)
+                    XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                        recovered, projection: .full(f.decoded(recovered)), preferredActiveWorkspaceID: nil,
+                        rootMapPolicy: .decodedModels
+                    ).receipt)
+                    XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                    manager.prepareForWindowClose()
+                    XCTAssertFalse(manager.admitsDomainSelfEcho(baselineGeneration: manager.domainCatalogReconciliationGeneration))
+                }
+            }
+        }
+
+        func testRealSelfEchoWithUnavailableMemberAndFailedRefreshAvoidsCatalogReconciliation() async throws {
+            try await Fixture.run(unavailableSeedIDs: [Fixture.requestedID]) { f in
+                let (window, manager, _, events) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                var checkpoint = try await f.awaitCatalogProjection(window)
+                let initial = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(manager.workspaceChooserPresentation.failure?.kind, .unavailableMembers([Fixture.requestedID]))
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                for failRefresh in [false, true] {
+                    if failRefresh {
+                        let snapshot = await client.snapshot()
+                        XCTAssertTrue(manager.reportDomainCatalogFailure(.catalogChangedDuringRefresh, snapshot: snapshot, attempt: manager.beginDomainCatalogAttempt()))
+                    }
+                    let failure = manager.workspaceChooserPresentation.failure
+                    let generation = manager.domainCatalogReconciliationGeneration
+                    let applications = events.catalogCheckpoints.count
+                    let canonical = await client.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                    let record = try XCTUnwrap(canonical)
+                    var edited = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    edited.name = failRefresh ? "Echo after failed refresh" : "Echo with missing peer"
+                    let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == edited.id })
+                    manager.workspaces[index] = edited
+                    _ = try await client.replaceWorking(
+                        edited,
+                        fileURL: record.document.fileURL,
+                        expectedWorkspaceRevision: record.revisions.workingRevision,
+                        operationID: UUID()
+                    )
+                    let current = await client.snapshot()
+                    let echo = await f.projectionObserver(for: window).waitForProjection(
+                        afterGeneration: checkpoint.generation, through: current.publicationSequence
+                    )
+                    checkpoint = try XCTUnwrap(echo)
+                    XCTAssertEqual(checkpoint.application, .selfEchoBaseline)
+                    XCTAssertEqual(events.catalogCheckpoints.count, applications)
+                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, generation)
+                    XCTAssertEqual(manager.workspaceChooserPresentation.failure, failure)
+                }
+                XCTAssertEqual(initial.unavailableWorkspaceIDs, [Fixture.requestedID])
             }
         }
 

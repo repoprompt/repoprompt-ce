@@ -161,6 +161,18 @@ extension GlobalSettingsStore {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func codexComputerUseEnabled() -> Bool {
+        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+    }
+
     func codexReasoningSummariesEnabled() -> Bool {
         CodexReasoningSummaries.isEnabled(persistedValue: scalarPreferences.agentMode?.codexReasoningSummariesEnabled)
     }

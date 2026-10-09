@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import RepoPromptFoundation
+import RepoPromptShared
 
 enum OracleSendOrigin: String {
     case askOracle
@@ -113,7 +114,11 @@ enum OracleSendOrigin: String {
     }
 
     enum OracleReviewPackagingDiagnostics {
-        @TaskLocal static var current: OracleReviewPackagingTraceContext?
+        // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+        static let currentTaskLocal = BoxedTaskLocal<OracleReviewPackagingTraceContext?>(nil)
+        static var current: OracleReviewPackagingTraceContext? {
+            currentTaskLocal.get()
+        }
 
         @MainActor
         static func makeTraceContext(
@@ -164,7 +169,7 @@ enum OracleSendOrigin: String {
             operation: () async throws -> T
         ) async rethrows -> T {
             guard let trace else { return try await operation() }
-            return try await $current.withValue(trace) {
+            return try await currentTaskLocal.withValue(trace) {
                 trace.observer(.contextFrozen(
                     correlationID: trace.correlationID,
                     snapshot: trace.frozenSnapshot

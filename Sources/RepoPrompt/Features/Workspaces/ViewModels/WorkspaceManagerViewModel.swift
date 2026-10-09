@@ -2991,7 +2991,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let candidate = await findOrCreatePublishedDefaultWorkspace(),
               initialDefaultActivationMayProceed(attempt)
         else { return }
-        // The Default lookup is name-based; never automatically activate a user namesake.
+        // Recheck System identity after the awaited authority lookup before activation.
         guard candidate.isSystemWorkspace,
               workspace(withID: candidate.id)?.isSystemWorkspace == true
         else {
@@ -7523,7 +7523,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func runtimeOwnedDefaultWorkspaceCandidate() -> WorkspaceModel? {
-        if let existing = workspaces.first(where: { $0.name == "Default" || $0.isSystemWorkspace }) {
+        if let existing = workspaces.first(where: { $0.isSystemWorkspace }) {
             return existing
         }
         var workspace = WorkspaceModel(name: "Default", repoPaths: [])
@@ -7652,9 +7652,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             || domainWorkspaceAuthorityIssue?.kind != issue?.kind
             || domainWorkspaceAuthorityIssue?.reason != issue?.reason
             || domainWorkspaceAuthorityIssue?.diagnostic != issue?.diagnostic
-        domainAuthorityIssuePublicationGeneration += 1
         // Preserve the actual deduplicated ID, including a newer same-payload report during clearance.
-        latestDomainAuthorityIssuePublication = changed ? issue : domainWorkspaceAuthorityIssue
+        let nextIssue = changed ? issue : domainWorkspaceAuthorityIssue
+        let targetChanged = latestDomainAuthorityIssuePublication != nextIssue
+        latestDomainAuthorityIssuePublication = nextIssue
+        guard changed || targetChanged else { return }
+        // An ordinary no-op needs no generation. A reentrant same-payload report can still change
+        // the pending clearance target and must advance replay, even before @Published assigns nil.
+        domainAuthorityIssuePublicationGeneration += 1
         guard changed else { return }
         var generation: UInt64
         repeat {
@@ -8343,15 +8348,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     #endif
 
-    /// Self-echo may refresh one record's baseline only over this run's complete, current catalog.
+    /// An accepted reconciliation, not chooser health, proves the one-record baseline. A healthy
+    /// projected member can echo while other members or a refresh are unavailable; this never clears
+    /// their warnings or certifies catalog completeness. Import/uncertain-save fences still require
+    /// full reconciliation, and the Bridge separately validates event origin and canonical health.
     func admitsDomainSelfEcho(baselineGeneration: UInt64) -> Bool {
         guard !isPreparingForWindowClose,
+              baselineGeneration > 0,
               baselineGeneration == domainCatalogReconciliationGeneration,
               !requiresFullCatalogReconciliation,
-              case let .ready(catalog, .current) = workspaceChooserPresentation,
-              case let .authority(stamp) = catalog.source
+              case let .ready(catalog, _) = workspaceChooserPresentation,
+              case .authority = catalog.source
         else { return false }
-        return stamp.isComplete
+        return true
     }
 
     /// Accepts a self-echo's one-record baseline; never certifies or replaces catalog membership.
@@ -16271,7 +16280,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func workspacesForMenu(_ query: WorkspaceMenuQuery = .init()) -> [WorkspaceModel] {
-        WorkspaceMenuPolicy.items(in: workspaces, query: query)
+        guard case let .ready(catalog, _) = workspaceChooserPresentation else { return [] }
+        return WorkspaceMenuPolicy.items(in: catalog.workspaces, query: query)
     }
 
     /// Only explicit UI opens advance library recency; autosave and MCP activity do not.
@@ -16647,7 +16657,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func findOrCreateDefaultWorkspace() -> WorkspaceModel? {
-        if let existing = workspaces.first(where: { $0.name == "Default" }) {
+        if let existing = workspaces.first(where: { $0.isSystemWorkspace }) {
             return existing
         }
         var ws = WorkspaceModel(name: "Default", repoPaths: [])

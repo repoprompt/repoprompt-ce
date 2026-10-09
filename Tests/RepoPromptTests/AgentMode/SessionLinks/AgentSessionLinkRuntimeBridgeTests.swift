@@ -19,6 +19,110 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    func testComputerUseOrdinaryStopBlocksLinkAuthorityUntilRetirementCompletes() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Stop must not install a controller") }
+        )
+        let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: fixture.target.tabID, name: "Stop ownership barrier"
+        )
+        let session = viewModel.session(for: fixture.target.tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        session.runState = .running
+        session.beginRunAttempt(source: "armed-stop-test")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: []
+        )
+        let gate = TestReleaseFence(name: "ordinary Stop companion retirement before Link")
+        controller.shutdownGate = gate
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.codexConversationID = "armed-thread"
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        let coordinator = viewModel.test_codexCoordinator
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "armed-turn"), session: session, sourceController: controller)
+        addTeardownBlock { @MainActor in
+            gate.release()
+            await coordinator.shutdownCodexSession(session)
+            withExtendedLifetime(workspace) {}
+        }
+        await viewModel.cancelAgentRun(tabID: session.tabID)
+        let entered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.codexControllerFeatureState)
+        XCTAssertNotNil(session.pendingCodexComputerUseActivation, "Per-chat arming survives ordinary Stop")
+        var retirementBegan = false
+        var retirementCompleted = false
+        fixture.host.beforeActivation = { endpoint in
+            guard endpoint == fixture.target.domainEndpoint else { return }
+            retirementBegan = true
+            await coordinator.awaitCodexComputerUseRetirement(for: session.tabID)
+            retirementCompleted = true
+        }
+        let acquisition = Task { await addLink(fixture) }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            _ = await acquisition.value
+        }
+        try await AsyncTestWait.waitUntil("Link acquisition joins retirement", timeout: 4) { retirementBegan }
+        XCTAssertFalse(retirementCompleted)
+        let linkedWhileRetiring = await fixture.authority.hasActiveLink(endpoint: fixture.target.domainEndpoint)
+        XCTAssertFalse(linkedWhileRetiring, "Authority must not publish before the armed controller stops")
+        gate.release()
+        guard case .added = await acquisition.value else { return XCTFail("Link acquisition must complete after retirement") }
+        XCTAssertTrue(retirementCompleted)
+        XCTAssertTrue(session.isCodexComputerUseArmed)
+        let linkedAfterRetirement = await fixture.authority.hasActiveLink(endpoint: fixture.target.domainEndpoint)
+        XCTAssertTrue(linkedAfterRetirement)
+        XCTAssertEqual(controller.shutdownCount, 1)
+        XCTAssertEqual(controller.interruptedTurnIDs, ["armed-turn"])
+    }
+
+    func testLinkedChatCanArmAndLinkUnlinkPreserveConsent() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture()
+        let vm = AgentModeViewModel(
+            testWindowID: 1, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Arming must not launch") },
+            testCodexComputerUseCompanionReady: { true }, testCodexComputerUseReservedEntryExists: { false }
+        )
+        let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: fixture.target.tabID, name: "Consent test")
+        let session = vm.session(for: fixture.target.tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        session.runState = .idle
+        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
+        fixture.host.beforeActivation = { activating in
+            if activating == fixture.target.domainEndpoint { await vm.agentSessionLinkWillActivate(endpoint) }
+        }
+        guard case .added = await addLink(fixture) else { return XCTFail("Link must activate") }
+        let armed = await vm.armComputerUseForLocalUser(session: session)
+        XCTAssertNil(armed)
+        let activation = try XCTUnwrap(session.pendingCodexComputerUseActivation?.id)
+        let admitted = await vm.test_codexCoordinator.test_computerUseForNextTurn(session: session)
+        XCTAssertTrue(admitted)
+        for _ in 0 ..< 2 {
+            let currentReference = await linkReference(fixture)
+            let reference = try XCTUnwrap(currentReference)
+            await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+            XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
+            guard case .added = await addLink(fixture) else { return XCTFail("Relink must activate") }
+            XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
+        }
+        await vm.test_codexCoordinator.shutdownCodexSession(session)
+        withExtendedLifetime(workspace) {}
+    }
+
     func testBindingInvalidationRetiresInputStateEvenWithoutOversightLinks() async {
         let fixture = makeFixture()
         let endpoint = fixture.observer.domainEndpoint
@@ -85,6 +189,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     // MARK: - Fake host
 
     private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
+        var beforeActivation: ((DomainAgentSessionLinkEndpointIdentity) async -> Void)?
+        func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+            await beforeActivation?(endpoint)
+        }
+
         var candidates: [AgentSessionLinkEndpointCandidate] = [] {
             didSet {
                 candidatesByEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
