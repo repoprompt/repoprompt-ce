@@ -528,6 +528,19 @@ package actor DomainAgentSessionLinkAuthority {
         )
     }
 
+    /// Every active link, for read-only inventory (`session_admin links`/`tree`). Grants no
+    /// authority: unlinking still goes through the exact `revoke(linkID:generation:)` owner path.
+    package func allLinkItems() -> [DomainAgentSessionLinkInventoryItem] {
+        links.values
+            .map { inventoryItem($0, outbound: true) }
+            .sorted {
+                if $0.observerSessionID != $1.observerSessionID {
+                    return $0.observerSessionID.uuidString < $1.observerSessionID.uuidString
+                }
+                return Self.orderedByTarget($0, $1)
+            }
+    }
+
     /// Cap accounting is UUID-scoped, unlike caller authorization. Keep the grant's exact target
     /// incarnation so a second live binding with the same session UUID cannot hide its slot.
     package func linkedTargetEndpoints(
