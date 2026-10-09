@@ -269,6 +269,117 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(batchResult.outcomes?.map(\.status), ["success", "success"])
     }
 
+    // MARK: - Issue #1262: a mixed batch matches each edit against the text its predecessors left
+
+    private static let notFound = "search block not found in file (matches are exact, including whitespace/indentation)"
+
+    private struct BatchCase {
+        let name: String
+        var path = "file.txt"
+        let original: String
+        let edits: [ApplyEditsOperation]
+        let expectedText: String
+        let expectedStatus: ApplyEditsStatus
+        let expectedApplied: Int
+        let expectedOutcomes: [EditOutcome]?
+    }
+
+    private static func edit(_ search: String, _ replace: String, all: Bool = false) -> ApplyEditsOperation {
+        ApplyEditsOperation(search: search, replace: replace, replaceAll: all)
+    }
+
+    private static func outcome(_ index: Int, failure: String? = nil) -> EditOutcome {
+        EditOutcome(index: index, status: failure == nil ? "success" : "failed", error: failure)
+    }
+
+    private func assertBatchCases(_ cases: [BatchCase]) async throws {
+        for testCase in cases {
+            let request = ApplyEditsRequest(path: testCase.path, mode: .batch(testCase.edits), verbose: false)
+            let result = try await engine.apply(request: request, to: testCase.original)
+            XCTAssertEqual(result.updatedText, testCase.expectedText, testCase.name)
+            XCTAssertEqual(result.status, testCase.expectedStatus, testCase.name)
+            XCTAssertEqual(result.editsRequested, testCase.edits.count, testCase.name)
+            XCTAssertEqual(result.editsApplied, testCase.expectedApplied, testCase.name)
+            XCTAssertEqual(result.outcomes, testCase.expectedOutcomes, testCase.name)
+        }
+    }
+
+    func testMixedBatchAppliesEditsInRequestOrder() async throws {
+        try await assertBatchCases([
+            BatchCase(
+                name: "a stale edit does not land on text a later sibling wrote",
+                original: "seed\n",
+                edits: [Self.edit("target", "earlier"), Self.edit("seed", "target")],
+                expectedText: "target\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "exact edits still chain in request order",
+                original: "seed\n",
+                edits: [Self.edit("seed", "target"), Self.edit("target", "earlier")],
+                expectedText: "earlier\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: nil
+            ),
+            BatchCase(
+                name: "a fallback replace-all does not rewrite a line a later sibling wrote",
+                original: "Foo\nbar\n",
+                edits: [Self.edit("foo", "baz", all: true), Self.edit("bar", "foo")],
+                expectedText: "baz\nfoo\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "a later sibling's duplicate does not make a fallback edit ambiguous",
+                original: "alpha\nTarget\n",
+                edits: [Self.edit("target", "done"), Self.edit("alpha", "target")],
+                expectedText: "target\ndone\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "repeated identical searches take successive occurrences",
+                original: "a\na\nb\n",
+                edits: [Self.edit("a", "x"), Self.edit("a", "y"), Self.edit("b", "c")],
+                expectedText: "x\ny\nc\n",
+                expectedStatus: .success,
+                expectedApplied: 3,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1), Self.outcome(2)]
+            )
+        ])
+    }
+
+    func testMixedBatchDecidesTabPromotionOverWholeBatch() async throws {
+        // A LaTeX marker in an exact sibling keeps `\t` literal in the fallback edit too.
+        try await assertBatchCases([
+            BatchCase(
+                name: "replacement keeps \\tau beside an exact \\begin sibling",
+                path: "notes.md",
+                original: "\\begin{x}\nvalue  =  1\n",
+                edits: [Self.edit("\\begin{x}", "\\begin{y}"), Self.edit("value = 1", "\\tau = 2")],
+                expectedText: "\\begin{y}\n\\tau = 2\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "search keeps \\theta beside an exact \\begin sibling",
+                path: "notes.md",
+                original: "\\begin{x}\n\\theta  =  1\n",
+                edits: [Self.edit("\\begin{x}", "\\begin{y}"), Self.edit("\\theta = 1", "\\tau = 2")],
+                expectedText: "\\begin{y}\n\\tau = 2\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            )
+        ])
+    }
+
     func testEmptyGeneratedChunksFailThroughApplyEditsInternalError() async throws {
         let engine = ApplyEditsEngine(
             diffEngine: EmptyDiffChunkGenerator(),
