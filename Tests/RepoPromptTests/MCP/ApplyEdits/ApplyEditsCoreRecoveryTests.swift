@@ -269,6 +269,80 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(batchResult.outcomes?.map(\.status), ["success", "success"])
     }
 
+    func testLongExactPrefixAloneKeepsTextOutsideSpan() async throws {
+        let expected = "| id | changed | keep |\n"
+        let single = ApplyEditsRequest(
+            path: "table.md",
+            mode: .single(search: Self.longPrefix, replace: "| id | changed", replaceAll: false),
+            verbose: false
+        )
+        let singleResult = try await engine.apply(request: single, to: Self.longLineFile)
+        XCTAssertEqual(singleResult.status, .success)
+        XCTAssertEqual(singleResult.updatedText, expected)
+        XCTAssertEqual(singleResult.editsApplied, 1)
+
+        try await assertBatchCases([
+            BatchCase(
+                name: "batch of one",
+                path: "table.md",
+                original: Self.longLineFile,
+                edits: [Self.edit(Self.longPrefix, "| id | changed")],
+                expectedText: expected,
+                expectedStatus: .success,
+                expectedApplied: 1,
+                expectedOutcomes: nil
+            )
+        ])
+    }
+
+    /// Two six-line blocks: the first differs from the search in its middle lines.
+    private static let blockFile =
+        "start one\nstart two\nkeep a\nkeep b\nend one\nend two\nstart one\nstart two\nmiddle x\nmiddle y\nend one\nend two\n"
+    private static let blockSearch = "START ONE\nSTART TWO\nMIDDLE X\nMIDDLE Y\nEND ONE\nEND TWO"
+
+    func testWholeLineGuardSkipsBlocksWithDifferentMiddleLines() async throws {
+        let single = ApplyEditsRequest(
+            path: "probe.swift",
+            mode: .single(
+                search: "alpha()\nbeta()\nwrongMiddle()\ndelta()\nepsilon()\nzeta()",
+                replace: "replaced()",
+                replaceAll: false
+            ),
+            verbose: false
+        )
+        do {
+            let result = try await engine.apply(
+                request: single,
+                to: "alpha()\nbeta()\nkeepThisLine()\ndelta()\nepsilon()\nzeta()\n"
+            )
+            XCTFail("Expected refusal, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+
+        let nearMissesOnly = Self.blockFile.replacingOccurrences(of: "middle x\nmiddle y\n", with: "middle q\nmiddle r\n")
+        try await assertBatchCases([
+            BatchCase(
+                name: "replace-all skips the near-miss block and replaces the genuine one",
+                original: Self.blockFile,
+                edits: [Self.edit(Self.blockSearch, "replaced", all: true)],
+                expectedText: "start one\nstart two\nkeep a\nkeep b\nend one\nend two\nreplaced\n",
+                expectedStatus: .success,
+                expectedApplied: 1,
+                expectedOutcomes: [Self.outcome(0)]
+            ),
+            BatchCase(
+                name: "replace-all with only near-miss blocks fails unchanged",
+                original: nearMissesOnly,
+                edits: [Self.edit(Self.blockSearch, "replaced", all: true)],
+                expectedText: nearMissesOnly,
+                expectedStatus: .failed,
+                expectedApplied: 0,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound)]
+            )
+        ])
+    }
+
     // MARK: - Issue #1262: a mixed batch matches each edit against the text its predecessors left
 
     private static let notFound = "search block not found in file (matches are exact, including whitespace/indentation)"
