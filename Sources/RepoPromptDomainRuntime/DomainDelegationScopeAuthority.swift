@@ -40,6 +40,8 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
     /// App-presented run state per target, for state-dependent requirements (`retire`). A missing
     /// entry is `unknown`, which is treated as `running`.
     package let targetStates: [UUID: DomainDelegationScopeTargetState]
+    /// `DomainDelegationScopeArgumentsDigest` of this call's arguments; a presented card must match.
+    package let argumentsDigest: String
     package let idempotencyKey: String?
     package let confirmation: DomainDelegationScopeConfirmation?
 
@@ -52,9 +54,11 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
         memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:],
         usageByScopeID: [UUID: DomainDelegationScopeUsage] = [:],
         targetStates: [UUID: DomainDelegationScopeTargetState] = [:],
+        argumentsDigest: String = "",
         idempotencyKey: String? = nil,
         confirmation: DomainDelegationScopeConfirmation? = nil
     ) {
+        self.argumentsDigest = argumentsDigest
         self.operation = operation
         self.caller = caller
         self.scopeID = scopeID
@@ -222,6 +226,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         ) {
             return .failure(denial)
         }
+        guard records[scopeID] == nil else { return .failure(.duplicateScopeID) }
         let grant = DomainDelegationScopeGrant(
             id: scopeID,
             granteeSessionID: request.granteeSessionID,
@@ -280,6 +285,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         if let denial = Self.validate(kind: kind, capabilities: capabilities, guardrails: guardrails, now: now) {
             return .failure(denial)
         }
+        guard records[childScopeID] == nil else { return .failure(.duplicateScopeID) }
         let grant = DomainDelegationScopeGrant(
             id: childScopeID,
             granteeSessionID: newGrantee,
@@ -330,16 +336,41 @@ package struct DomainDelegationScopeAuthority: Sendable {
         return transition(ids, to: .expired)
     }
 
+    /// Revokes every scope granted to `sessionID` or rooted at it (and their descendants). Used when
+    /// the session is durably deleted: nothing may keep acting for or over a session that is gone.
+    @discardableResult
+    package mutating func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        let ids = records.values
+            .filter { record in
+                guard record.isActive else { return false }
+                if record.grant.granteeSessionID == sessionID { return true }
+                if case let .tree(rootSessionID) = record.grant.kind { return rootSessionID == sessionID }
+                return false
+            }
+            .map(\.id)
+            .sorted { $0.uuidString < $1.uuidString }
+        var changed: [DomainDelegationScopeRecord] = []
+        for id in ids {
+            changed.append(contentsOf: revoke(scopeID: id))
+        }
+        return changed
+    }
+
     /// Launch reload: installs persisted grants under fresh generations.
     ///
-    /// Grants whose expiry has passed are not reactivated, and an attenuated grant whose parent is
-    /// missing or not active is dropped, so a cascade can never be undone by a reload.
+    /// Grants whose expiry has passed, grants named by a revocation tombstone, and attenuated grants
+    /// whose parent is missing, inactive, or tombstoned are dropped, so neither a cascade nor a
+    /// revocation can be undone by a reload — even if a stale file still lists the grant. An
+    /// attenuated row must also still satisfy the attenuation invariants against its parent (a tree
+    /// rooted at its grantee, capabilities a subset, guardrails no looser), so a tampered or corrupted
+    /// child row can never come back wider than its parent.
     @discardableResult
     package mutating func reactivate(
         _ grants: [DomainDelegationScopeGrant],
+        revokedScopeIDs: Set<UUID> = [],
         now: Date
     ) -> [DomainDelegationScopeRecord] {
-        var pending = grants.filter { records[$0.id] == nil }
+        var pending = grants.filter { records[$0.id] == nil && !revokedScopeIDs.contains($0.id) }
         var installed: [DomainDelegationScopeRecord] = []
         var progressed = true
         while progressed {
@@ -351,7 +382,11 @@ package struct DomainDelegationScopeAuthority: Sendable {
                         remaining.append(grant)
                         continue
                     }
-                    guard parent.isActive else { continue }
+                    guard parent.isActive,
+                          grant.kind == .tree(rootSessionID: grant.granteeSessionID),
+                          grant.capabilities.isSubset(of: parent.grant.capabilities),
+                          grant.guardrails.isNoLooserThan(parent.grant.guardrails)
+                    else { continue }
                 }
                 guard Self.validate(
                     kind: grant.kind,
@@ -391,11 +426,16 @@ package struct DomainDelegationScopeAuthority: Sendable {
         guard !operation.isScopeLevel, let capability = operation.requiredScopeCapability else {
             return .failure(.operationNotScopeAuthorizable)
         }
+        // Every ancestor must still be live: an attenuated scope never outlives its parents.
+        if let denial = ancestorLivenessDenial(of: live, now: now) {
+            return .failure(denial)
+        }
         // The idle-state requirement does not depend on the target, so it is checked before
         // membership: a capability denial is identical for members and non-members and probes nothing.
+        // It is checked against the whole chain, so a child can never exercise what a parent lacks.
         let baseline = operation.requiredScopeCapabilities(for: .idle)
         if let missing = DomainDelegationScopeCapability.allCases.first(where: {
-            baseline.contains($0) && !Self.holds($0, in: live.grant)
+            baseline.contains($0) && !chainHolds($0, from: live)
         }) {
             return .failure(.capabilityMissing(missing))
         }
@@ -416,7 +456,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         // State-dependent extras (stopping a running target needs `control`) are checked only for an
         // established member, and are never granted implicitly.
         let extra = operation.requiredScopeCapabilities(for: targetState).subtracting(baseline)
-        if extra.contains(where: { !Self.holds($0, in: live.grant) }) {
+        if extra.contains(where: { !chainHolds($0, from: live) }) {
             return .failure(.requiresControl)
         }
         return .success(DomainDelegationScopeLease(
@@ -516,12 +556,14 @@ package struct DomainDelegationScopeAuthority: Sendable {
         scope: DomainDelegationScopeRecord,
         operation: DomainAgentSessionTargetOperation,
         idempotencyKey: String?,
+        argumentsDigest: String = "",
         targetSessionIDs: [UUID]
     ) -> Bool {
         confirmation.scopeID == scope.id
             && confirmation.scopeGeneration == scope.generation
             && confirmation.operation == operation
             && confirmation.idempotencyKey == idempotencyKey
+            && confirmation.argumentsDigest == argumentsDigest
             && !targetSessionIDs.isEmpty
             && Set(targetSessionIDs).isSubset(of: confirmation.approvedSessionIDs)
     }
@@ -552,7 +594,10 @@ package struct DomainDelegationScopeAuthority: Sendable {
             guard let capability = operation.requiredScopeCapability else {
                 return .denied(.operationNotScopeAuthorizable, sessionID: nil)
             }
-            guard Self.holds(capability, in: live.grant) else {
+            if let denial = ancestorLivenessDenial(of: live, now: now) {
+                return .denied(denial, sessionID: nil)
+            }
+            guard chainHolds(capability, from: live) else {
                 return .denied(.capabilityMissing(capability), sessionID: nil)
             }
             return .authorized(DomainDelegationScopeAuthorizedItems())
@@ -635,6 +680,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
                 scope: live,
                 operation: operation,
                 idempotencyKey: request.idempotencyKey,
+                argumentsDigest: request.argumentsDigest,
                 targetSessionIDs: admitted
             ) else {
                 return .denied(.confirmationMismatch, sessionID: nil)
@@ -656,9 +702,37 @@ package struct DomainDelegationScopeAuthority: Sendable {
         guard let callerSessionID = caller.agentSessionID else { return .failure(.callerNotAgentSession) }
         guard let record = records[scopeID] else { return .failure(.unknownScope) }
         guard record.grant.granteeSessionID == callerSessionID else { return .failure(.granteeMismatch) }
-        guard record.isActive, !record.grant.guardrails.isExpired(at: now) else { return .failure(.expired) }
+        if let denial = Self.inactiveDenial(record, now: now) { return .failure(denial) }
         guard record.generation == presentedGeneration else { return .failure(.generationStale) }
         return .success(record)
+    }
+
+    /// Why a record no longer authorizes: revoked (or released) is reported as such, everything else
+    /// that stopped being live as expired.
+    private static func inactiveDenial(_ record: DomainDelegationScopeRecord, now: Date) -> DomainDelegationScopeDenial? {
+        switch record.state {
+        case .revoked:
+            .revoked
+        case .expired:
+            .expired
+        case .active:
+            record.grant.guardrails.isExpired(at: now) ? .expired : nil
+        }
+    }
+
+    /// The first ancestor that is no longer live, as a denial. Cascades normally keep this in step;
+    /// it is re-checked so no ordering of events can let a child act after its parent stopped.
+    private func ancestorLivenessDenial(of record: DomainDelegationScopeRecord, now: Date) -> DomainDelegationScopeDenial? {
+        for ancestor in scopeChain(from: record.id).dropFirst() {
+            if let denial = Self.inactiveDenial(ancestor, now: now) { return denial }
+        }
+        if let parentID = record.grant.parentScopeID, records[parentID] == nil { return .revoked }
+        return nil
+    }
+
+    /// A capability is usable only if the scope and every ancestor hold it.
+    private func chainHolds(_ capability: DomainDelegationScopeCapability, from record: DomainDelegationScopeRecord) -> Bool {
+        scopeChain(from: record.id).allSatisfy { Self.holds(capability, in: $0.grant) }
     }
 
     /// The `.allSessions` restriction is re-checked here, not only at grant time, so no record that

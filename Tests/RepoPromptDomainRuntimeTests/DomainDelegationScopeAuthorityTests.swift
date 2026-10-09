@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptDomainRuntime
 import XCTest
 
@@ -273,7 +274,12 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         XCTAssertTrue(revoked.allSatisfy { $0.state == .revoked })
         XCTAssertGreaterThan(authority.record(id: parent.id)?.generation ?? 0, parent.generation)
         XCTAssertFalse(authority.isCurrent(issued, now: now))
-        XCTAssertEqual(denial(lease(authority, parent, .adminRename, target: child, proof: treeProof(parent, [child, overseer]))), .expired)
+        XCTAssertEqual(
+            denial(lease(authority, parent, .adminRename, target: child, proof: treeProof(parent, [child, overseer]))),
+            .revoked,
+            "a revoked scope is reported as revoked, not expired"
+        )
+        XCTAssertEqual(DomainDelegationScopeDenial.revoked.publicCode, "scope_revoked")
         XCTAssertTrue(authority.activeGrants.isEmpty)
         // Revoking again changes nothing.
         XCTAssertTrue(authority.revoke(scopeID: parent.id).isEmpty)
@@ -321,6 +327,75 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         // Past expiry: nothing reactivates.
         var late = DomainDelegationScopeAuthority()
         XCTAssertTrue(late.reactivate([parent.grant], now: now.addingTimeInterval(7200)).isEmpty)
+    }
+
+    func testReactivateHonorsTombstonesAndCascadesThemToChildren() throws {
+        var original = DomainDelegationScopeAuthority()
+        let parent = try grantTree(&original)
+        let childScope = try original.attenuate(
+            parentScopeID: parent.id, presentedGeneration: parent.generation, caller: caller,
+            newGranteeSessionID: child, newGranteeMemberships: [treeProof(parent, [child, overseer])],
+            capabilities: [.observe], guardrails: .init(), childScopeID: UUID(), now: now
+        ).get()
+        // A stale file still lists both rows, but the parent's revocation was tombstoned.
+        var relaunched = DomainDelegationScopeAuthority()
+        let installed = relaunched.reactivate([parent.grant, childScope.grant], revokedScopeIDs: [parent.id], now: now)
+        XCTAssertTrue(installed.isEmpty)
+        XCTAssertNil(relaunched.record(id: parent.id))
+        XCTAssertNil(relaunched.record(id: childScope.id), "a tombstoned parent's child never comes back")
+    }
+
+    func testReactivateDropsChildRowsThatBreakAttenuationInvariants() throws {
+        var original = DomainDelegationScopeAuthority()
+        let parent = try grantTree(&original, capabilities: [.observe, .organize, .spawn], guardrails: .init(maxLiveSessions: 5))
+        func childRow(
+            kind: DomainDelegationScopeKind? = nil,
+            capabilities: Set<DomainDelegationScopeCapability> = [.observe],
+            guardrails: DomainDelegationScopeGuardrails = .init(maxLiveSessions: 5)
+        ) -> DomainDelegationScopeGrant {
+            DomainDelegationScopeGrant(
+                id: UUID(), granteeSessionID: child, kind: kind ?? .tree(rootSessionID: child),
+                capabilities: capabilities, guardrails: guardrails,
+                origin: .attenuatedFrom(scopeID: parent.id), grantedAt: now
+            )
+        }
+        let valid = childRow()
+        let wrongRoot = childRow(kind: .tree(rootSessionID: overseer))
+        let notATree = childRow(kind: .workspace(workspaceID: workspaceID))
+        let wider = childRow(capabilities: [.observe, .control])
+        let looser = childRow(guardrails: .init(maxLiveSessions: 50))
+        var relaunched = DomainDelegationScopeAuthority()
+        let installed = relaunched.reactivate([parent.grant, valid, wrongRoot, notATree, wider, looser], now: now)
+        XCTAssertEqual(Set(installed.map(\.id)), [parent.id, valid.id])
+    }
+
+    func testGrantAndAttenuateRefuseAnExistingScopeID() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try grantTree(&authority)
+        let again = authority.grant(
+            .init(granteeSessionID: outsider, kind: .tree(rootSessionID: outsider), capabilities: [.observe], guardrails: .init()),
+            scopeID: scope.id, now: now
+        )
+        XCTAssertEqual(denial(again), .duplicateScopeID)
+        XCTAssertEqual(authority.record(id: scope.id)?.grant.granteeSessionID, overseer, "the original grant is untouched")
+        let attenuated = authority.attenuate(
+            parentScopeID: scope.id, presentedGeneration: scope.generation, caller: caller,
+            newGranteeSessionID: child, newGranteeMemberships: [treeProof(scope, [child, overseer])],
+            capabilities: [.observe], guardrails: .init(), childScopeID: scope.id, now: now
+        )
+        XCTAssertEqual(denial(attenuated), .duplicateScopeID)
+    }
+
+    func testRevokeAllInvolvingASessionCoversGranteeAndTreeRoot() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let granted = try grantTree(&authority)
+        let other = try authority.grant(
+            .init(granteeSessionID: outsider, kind: .allSessions, capabilities: [.observe], guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        let revoked = authority.revokeAll(involving: overseer)
+        XCTAssertEqual(revoked.map(\.id), [granted.id])
+        XCTAssertTrue(authority.liveRecord(id: other.id, now: now) != nil)
     }
 
     // MARK: - Attenuation
@@ -505,6 +580,27 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
             targetSessionIDs: targets, memberships: memberships, idempotencyKey: "k1", confirmation: unticked
         )
         XCTAssertEqual(authority.authorize(overreach, now: now).denial, .confirmationMismatch)
+        XCTAssertEqual(DomainDelegationScopeDenial.confirmationMismatch.publicCode, "confirmation_mismatch")
+
+        // The card binds the call's arguments: the same key with different arguments applies nothing.
+        let boundCard = DomainDelegationScopeConfirmation(
+            confirmationID: UUID(), scopeID: scope.id, scopeGeneration: scope.generation,
+            operation: .adminSetPin, idempotencyKey: "k1", approvedSessionIDs: Set(targets),
+            argumentsDigest: DomainDelegationScopeArgumentsDigest.digest(["pinned": .bool(true)])
+        )
+        func call(_ arguments: [String: Value]) -> DomainDelegationScopeAuthorizationRequest {
+            .init(
+                operation: .adminSetPin, caller: caller, scopeID: scope.id, presentedGeneration: scope.generation,
+                targetSessionIDs: targets, memberships: memberships,
+                argumentsDigest: DomainDelegationScopeArgumentsDigest.digest(arguments),
+                idempotencyKey: "k1", confirmation: boundCard
+            )
+        }
+        XCTAssertTrue(
+            authority.authorize(call(["pinned": .bool(true), "targets": .array([]), "confirmation_id": .string("x")]), now: now).isAuthorized,
+            "selectors and handles are not bound"
+        )
+        XCTAssertEqual(authority.authorize(call(["pinned": .bool(false)]), now: now).denial, .confirmationMismatch)
     }
 
     func testAuthorizeReportsTheFailingTargetAndScopeLevelOperations() throws {

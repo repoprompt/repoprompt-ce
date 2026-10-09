@@ -427,7 +427,8 @@ package struct DomainDelegationScopeUsage: Hashable, Sendable {
     }
 }
 
-/// A user-approved batch card, bound to the exact scope generation, operation, item set, and key.
+/// A user-approved batch card, bound to the exact scope generation, operation, item set, key, and
+/// operation arguments.
 package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
     package let confirmationID: UUID
     package let scopeID: UUID
@@ -436,6 +437,9 @@ package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
     package let idempotencyKey: String
     /// The items the user left ticked. A real call may act on these and nothing else.
     package let approvedSessionIDs: Set<UUID>
+    /// `DomainDelegationScopeArgumentsDigest` of the arguments the card was raised for. The applying
+    /// call must present the same digest, so changed arguments under the same key apply nothing.
+    package let argumentsDigest: String
 
     package init(
         confirmationID: UUID,
@@ -443,7 +447,8 @@ package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
         scopeGeneration: UInt64,
         operation: DomainAgentSessionTargetOperation,
         idempotencyKey: String,
-        approvedSessionIDs: Set<UUID>
+        approvedSessionIDs: Set<UUID>,
+        argumentsDigest: String = ""
     ) {
         self.confirmationID = confirmationID
         self.scopeID = scopeID
@@ -451,6 +456,7 @@ package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
         self.operation = operation
         self.idempotencyKey = idempotencyKey
         self.approvedSessionIDs = approvedSessionIDs
+        self.argumentsDigest = argumentsDigest
     }
 }
 
@@ -484,10 +490,12 @@ package struct DomainDelegationScopeLease: Hashable, Sendable {
 
 /// Why a scope request or authorization failed.
 ///
-/// Four cases carry stable, caller-visible batch codes (design §2.7), and `requiresControl` is a
-/// caller-visible per-item code. Every other case is diagnostic only: callers must render it with the
-/// uniform "not found / not available" text so an Agent caller cannot probe whether an unrelated
-/// session or scope exists.
+/// The design §2.7 codes (`scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`,
+/// `confirmation_required`) plus `scope_revoked`, `confirmation_mismatch`, and the per-item
+/// `requires_control` are caller-visible. Each is reachable only after grantee identity is
+/// established, so it discloses nothing about another session's scopes. Every other case is
+/// diagnostic only: callers must render it with the uniform "not found / not available" text so an
+/// Agent caller cannot probe whether an unrelated session or scope exists.
 package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     /// Caller-visible and recoverable: the scope does not hold this capability.
     case capabilityMissing(DomainDelegationScopeCapability)
@@ -496,7 +504,12 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     case requiresControl
     case guardrailExceeded(guardrail: DomainDelegationScopeGuardrail, limit: Int, current: Int)
     case expired
+    /// The caller's own scope was revoked or released (reported only to its grantee).
+    case revoked
     case confirmationRequired(reason: DomainDelegationScopeConfirmationReason)
+    /// The presented card does not cover this call (different items, arguments, key, or scope
+    /// generation). Reported only to the card's grantee, with the approved items.
+    case confirmationMismatch
 
     // Uniform (diagnostic only).
     case callerNotAgentSession
@@ -508,7 +521,10 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     case usageProofMissing
     case selfTarget
     case operationNotScopeAuthorizable
-    case confirmationMismatch
+    /// A grant or attenuation reused an existing scope ID.
+    case duplicateScopeID
+    /// The user's approval asked for capabilities the request never did.
+    case approvalExceedsRequest
 
     // Grant-time validation (user or attenuation requests).
     case capabilitiesEmpty
@@ -527,7 +543,9 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .requiresControl: "requires_control"
         case .guardrailExceeded: "scope_guardrail_exceeded"
         case .expired: "scope_expired"
+        case .revoked: "scope_revoked"
         case .confirmationRequired: "confirmation_required"
+        case .confirmationMismatch: "confirmation_mismatch"
         default: nil
         }
     }
@@ -539,6 +557,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .requiresControl: "requires_control"
         case .guardrailExceeded: "guardrail_exceeded"
         case .expired: "expired"
+        case .revoked: "revoked"
         case .confirmationRequired: "confirmation_required"
         case .callerNotAgentSession: "caller_not_agent_session"
         case .unknownScope: "unknown_scope"
@@ -550,6 +569,8 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .selfTarget: "self_target"
         case .operationNotScopeAuthorizable: "operation_not_scope_authorizable"
         case .confirmationMismatch: "confirmation_mismatch"
+        case .duplicateScopeID: "duplicate_scope_id"
+        case .approvalExceedsRequest: "approval_exceeds_request"
         case .capabilitiesEmpty: "capabilities_empty"
         case .capabilityNotPermittedForKind: "capability_not_permitted_for_kind"
         case .guardrailsMalformed: "guardrails_malformed"
