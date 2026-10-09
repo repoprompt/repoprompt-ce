@@ -683,6 +683,7 @@ class WindowStatesManager: ObservableObject {
         Task { @MainActor in
             await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
             await AgentSessionLinkRuntimeBridge.shared.delegationScopes.bootstrap(store: scopeStore)
+            await AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.bootstrapProduction(mode: mode)
         }
     }
 

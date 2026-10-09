@@ -70,6 +70,8 @@ extension AgentModeViewModel {
         else {
             throw MCPError.invalidParams("The destination workspace is not active.")
         }
+        // Scope-only: spawn guardrails and auto-join for a creator holding a live `spawn` scope.
+        let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
         let target: MCPSessionTarget
         do {
             target = try await mcpResolveOrCreateSessionTarget(
@@ -109,6 +111,11 @@ extension AgentModeViewModel {
               session.mcpControlContext == nil
         else { return incomplete }
 
+        if let spawnAdmission, AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(spawnAdmission.lease) {
+            // Auto-join before the first save so the lane's placement is durable with it.
+            session.organizationalParentID = creatorSessionID
+            session.delegationScopeID = spawnAdmission.scopeID
+        }
         // Provenance was installed by the fresh-session seam before this first dirty marking.
         session.isDirty = true
         #if DEBUG

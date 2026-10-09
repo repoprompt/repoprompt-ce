@@ -623,6 +623,11 @@ struct AgentRunMCPToolService {
         let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
             && !worktreeStartRequest.hasExplicitWorktreeArgs
         let usesRoutedParentSource = parentSourceTabID != nil
+        // Scope-only: spawn guardrails and auto-join for a creator holding a live `spawn` scope.
+        // `nil` for every other caller, whose start is unchanged.
+        let spawnAdmission = resolvedTabID == nil
+            ? try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: spawnParentSessionID)
+            : nil
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
@@ -637,6 +642,9 @@ struct AgentRunMCPToolService {
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
+        }
+        if target.origin == .createdNewTab {
+            await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
         }
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {

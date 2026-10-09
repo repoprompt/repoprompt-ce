@@ -4,19 +4,22 @@ import RepoPromptDomainRuntime
 /// Persisted placement facts for one session, read from app-owned state only.
 ///
 /// Spawn provenance (`parentSessionID`, `createdByOverseerSessionID`) is immutable; the operation
-/// authorizer depends on it. `organizationalParentID` is the mutable tree placement Lane C adds for
-/// re-parenting; until then it is always `nil` and placement falls back to spawn provenance.
+/// authorizer depends on it. `organizationalParentID` is the mutable, persisted tree placement written
+/// only by scope administration (`reparent`, `adopt`, scoped creation); `nil` falls back to spawn
+/// provenance.
 struct DelegationSessionProvenance: Hashable {
     let sessionID: UUID
     let workspaceID: UUID?
     let parentSessionID: UUID?
     let createdByOverseerSessionID: UUID?
-    /// Seam for Lane C's mutable organizational parent. When set it wins over spawn provenance.
+    /// Mutable organizational parent. When set it wins over spawn provenance.
     let organizationalParentID: UUID?
     /// Counts toward `maxLiveSessions`.
     let isLive: Bool
-    /// Counts toward `maxWorktrees`.
+    /// Counts toward `maxWorktrees` when `boundWorktreeIDs` is empty (sources without identities).
     let worktreeCount: Int
+    /// Distinct worktrees this session binds. Shared worktrees count once per scope.
+    let boundWorktreeIDs: Set<String>
     /// Run state for state-dependent requirements (`retire` of a running target needs `control`).
     let runState: DomainDelegationScopeTargetState
 
@@ -28,6 +31,7 @@ struct DelegationSessionProvenance: Hashable {
         organizationalParentID: UUID? = nil,
         isLive: Bool,
         worktreeCount: Int = 0,
+        boundWorktreeIDs: Set<String> = [],
         runState: DomainDelegationScopeTargetState = .unknown
     ) {
         self.sessionID = sessionID
@@ -37,6 +41,7 @@ struct DelegationSessionProvenance: Hashable {
         self.organizationalParentID = organizationalParentID
         self.isLive = isLive
         self.worktreeCount = worktreeCount
+        self.boundWorktreeIDs = boundWorktreeIDs
         self.runState = runState
     }
 
@@ -66,6 +71,15 @@ protocol DelegationMembershipProjector {
     func usage(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage
     /// App-observed run state; `unknown` (treated as running) when it cannot be established.
     func targetState(for sessionID: UUID) -> DomainDelegationScopeTargetState
+    /// Target-first organizational ancestry, or `nil` when cyclic, too long, or unknown.
+    func organizationalAncestry(of sessionID: UUID) -> [UUID]?
+}
+
+extension DelegationMembershipProjector {
+    /// Fails closed for projectors that cannot walk placement: every placement change is refused.
+    func organizationalAncestry(of _: UUID) -> [UUID]? {
+        nil
+    }
 }
 
 /// Membership from spawn provenance, with the organizational-parent seam.
@@ -75,6 +89,16 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     static let maxChainLength = 256
 
     let source: any DelegationProvenanceSource
+    /// Worktrees created by any of the given sessions under a scope and not yet released
+    /// (`WorktreeOwnershipStore`). Counted toward `maxWorktrees` even while unbound.
+    var ownedUnreleasedWorktreeIDs: @MainActor (_ createdBy: Set<UUID>) -> Set<String> = { _ in [] }
+
+    /// Target-first organizational ancestry over this source, or `nil` when cyclic or too long.
+    func organizationalAncestry(of sessionID: UUID) -> [UUID]? {
+        DomainDelegationOrganizationalChain.ancestry(of: sessionID) {
+            source.provenance(for: $0)?.effectiveOrganizationalParentID
+        }
+    }
 
     func membershipProof(
         for targetSessionID: UUID,
@@ -121,10 +145,15 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         let parentDepth = spawnParentSessionID
             .flatMap { membershipProof(for: $0, in: scope) }?
             .treeDepth
+        let distinct = DomainDelegationWorktreeStaleness.guardrailCount(
+            boundWorktreeIDs: members.reduce(into: Set<String>()) { $0.formUnion($1.boundWorktreeIDs) },
+            ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs(memberIDs)
+        )
+        let anonymous = members.filter(\.boundWorktreeIDs.isEmpty).reduce(0) { $0 + $1.worktreeCount }
         return DomainDelegationScopeUsage(
             scopeID: scope.id,
             liveSessionCount: members.filter(\.isLive).count,
-            worktreeCount: members.reduce(0) { $0 + $1.worktreeCount },
+            worktreeCount: distinct + anonymous,
             spawnParentDepth: parentDepth
         )
     }
@@ -185,8 +214,10 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             workspaceID: workspaceID,
             parentSessionID: entry.parentSessionID,
             createdByOverseerSessionID: entry.createdByOverseerSessionID,
+            organizationalParentID: entry.organizationalParentID,
             isLive: isLive,
             worktreeCount: entry.worktreeBindingSummaries.count,
+            boundWorktreeIDs: Set(entry.worktreeBindingSummaries.map(\.worktreeID)),
             runState: runState
         )
     }

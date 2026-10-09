@@ -186,7 +186,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         }
 
         if shaped.preview, mutating {
-            return preview(shaped)
+            return try preview(shaped)
         }
 
         var outcome = try await core.perform(shaped)
@@ -321,7 +321,9 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             switch try await core.perform(request) {
             case let .completed(value):
                 result = value
-                succeeded = true
+                // A handler preflight refusal (state changed since the card) completes without
+                // applying anything; the card must not be settled as applied.
+                succeeded = value.objectValue?["result"]?.stringValue != "denied"
             case let .denied(denial, sessionID):
                 result = (try? SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID))
                     ?? .object(["result": .string("denied")])
@@ -491,7 +493,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
     }
 
     /// Dry run: exact items and effects, the confirmation requirement, and `requires_control`.
-    private func preview(_ request: AgentSessionAdministrationRequest) -> AgentSessionAdministrationOutcome {
+    private func preview(_ request: AgentSessionAdministrationRequest) throws -> AgentSessionAdministrationOutcome {
         let batch: AgentSessionAdministrationAuthorizedBatch
         var reason: DomainDelegationScopeConfirmationReason?
         switch core.authorize(request) {
@@ -504,6 +506,10 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             return .denied(denial, sessionID: sessionID)
         case let .scopeSelectionRequired(scopeIDs):
             return .scopeSelectionRequired(scopeIDs: scopeIDs)
+        }
+        // A dry run reports the same structural refusal a real call would, before listing items.
+        if let refusal = try handlers[request.operation]?.preflight(batch) {
+            return .completed(refusal)
         }
         let narrowed = request.rebuilt(targets: batch.admittedSessionIDs)
         let items = handlers[request.operation].map { $0.confirmationItems(for: narrowed, scope: batch.scope) }

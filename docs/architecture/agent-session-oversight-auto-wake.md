@@ -43,8 +43,8 @@ Rules that hold the scope design together:
 
 - **Membership is projected, never argued.** `DelegationMembershipProjector` computes membership
   proofs from persisted provenance (`parentSessionID`, `createdByOverseerSessionID`, and the
-  future `organizationalParentID`) and presents them to the authority, the same way link leases are
-  presented. Tool arguments only name targets.
+  mutable `organizationalParentID`, which wins when set) and presents them to the authority, the
+  same way link leases are presented. Tool arguments only name targets.
 - **One authority check.** `DomainDelegationScopeAuthority.authorize` runs, in order: scope live
   (grantee, active, unexpired, generation), capability held (target-independent, so checked first
   and it cannot probe membership), membership proofs valid for the scope *and every ancestor* (an
@@ -111,6 +111,28 @@ Rules that hold the scope design together:
   brought the batch to or below the threshold) by the front door, so a successful application
   always ends `applied` and a failed one returns the card to `approved`. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
+
+Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
+door, so their cards apply on approval too; each handler's `preflight` runs before a card is raised,
+before an approved card is claimed, and in `preview`, so a structurally refused call never reaches
+the user's card.
+
+- **Links under a scope.** `link`/`unlink` go through the bridge's ordinary durable Add/Stop, so
+  link authority stays the sole owner. Both endpoints must be members (management never chains).
+  A new link's capabilities must be within the scope's ceiling (`poll`/`wait`/`read` need
+  `observe`; `send_when_idle`/`manage` need `control`). The bridge mints only the default managed set
+  and durable intent restores it as such, so a scope without `observe` + `control` cannot create a
+  link at all. An existing link is reported as-is and never upgraded.
+- **Placement never moves membership elsewhere.** `reparent` needs the source and destination both
+  in the caller's scope chain; `adopt` needs a user card and a user-granted (not nested) scope. Both
+  are refused (`placement_affects_other_scopes`, listing the scope IDs) if the move would make the
+  moved subtree join or leave any live scope outside the caller's own chain. Only
+  `organizationalParentID` changes; spawn provenance is immutable.
+- **Spawn under scope** adds guardrails and auto-join to `agent_run start`,
+  `agent_manage create_session`, and `create_lane` only for a creator holding a live `spawn` scope;
+  every other caller is unchanged. A scope `fork` never inherits oversight links.
+- **Leases are re-checked after every suspension** before the next mutation; a revocation that
+  lands mid-batch stops the remaining items (`scope_revoked`).
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).

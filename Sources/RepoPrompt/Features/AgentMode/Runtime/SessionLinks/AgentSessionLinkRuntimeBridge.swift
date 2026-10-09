@@ -1108,17 +1108,21 @@ final class AgentSessionLinkRuntimeBridge {
     /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
     /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
     let delegationScopes = DelegationScopeRuntime()
+    /// Durable worktree ownership for delegated worktree creation/release; installed at launch.
+    let worktreeOwnership = WorktreeOwnershipStore()
     /// The single shared administration service behind `session_admin` and future UI dispatchers.
-    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore(
+    private(set) lazy var sessionAdministration = AgentSessionAdministrationCore.makeProduction(
         scopes: delegationScopes,
-        projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource())
+        worktreeOwnership: worktreeOwnership
     )
     /// `session_admin`'s entry point: filters, preview, idempotency, undo, and apply-on-approval over
-    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops.
-    private(set) lazy var sessionAdministrationFrontDoor = AgentSessionAdministrationFrontDoor.production(
-        core: sessionAdministration,
-        scopes: delegationScopes
-    )
+    /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops
+    /// and the structure/lifecycle/worktree ops.
+    private(set) lazy var sessionAdministrationFrontDoor: AgentSessionAdministrationFrontDoor = {
+        let frontDoor = AgentSessionAdministrationFrontDoor.production(core: sessionAdministration, scopes: delegationScopes)
+        frontDoor.registerStructureHandlers(scopes: delegationScopes, worktreeOwnership: worktreeOwnership)
+        return frontDoor
+    }()
 
     /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
     /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
@@ -6249,6 +6253,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// paths above, and `request_attention` continues to authorize through its exact inverse proof.
     func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
         await authority.hasActiveLink(endpoint: endpoint)
+    }
+
+    /// Exact-pair active link for delegation-scope `link` (report as-is, never upgrade) and `unlink`
+    /// (reference for the ordinary Stop). Bookkeeping only: the scope authority already authorized
+    /// the operation, and Add/Stop below remain the only mutation paths.
+    func delegationActiveLink(observerSessionID: UUID, targetSessionID: UUID) async -> DomainAgentSessionLinkInventoryItem? {
+        await authority.links(forObserver: observerSessionID).items.first { $0.targetSessionID == targetSessionID }
     }
 
     // MARK: - Sanitized read

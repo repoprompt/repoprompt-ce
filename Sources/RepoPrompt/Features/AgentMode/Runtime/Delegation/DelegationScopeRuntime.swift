@@ -190,6 +190,15 @@ final class DelegationScopeRuntime: ObservableObject {
             .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
     }
 
+    /// Roots of every live `.tree` scope, for placement decisions (`reparent`, `adopt`).
+    func liveTreeScopeRoots() -> [DomainDelegationTreeScopeRoot] {
+        expireDueScopes()
+        return authority.liveRecords(now: now()).compactMap { record in
+            guard case let .tree(rootSessionID) = record.grant.kind else { return nil }
+            return DomainDelegationTreeScopeRoot(scopeID: record.id, rootSessionID: rootSessionID)
+        }
+    }
+
     /// The request, but only for the session that made it.
     func request(id: UUID, requesterSessionID: UUID) -> DelegationScopeRequest? {
         guard let request = requests[id], request.requesterSessionID == requesterSessionID else { return nil }

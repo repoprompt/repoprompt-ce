@@ -415,6 +415,32 @@ and follows the same preserve-first rules:
   `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
   and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
 
+### Organizational placement and delegated worktree ownership
+
+- **Session placement.** `AgentSession` serialization version 10 adds `organizationalParentID` and
+  `delegationScopeID`. Both are additive and decoded with `decodeIfPresent`; an older file decodes
+  with no explicit placement and falls back to spawn provenance (`parentSessionID`, then
+  `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement.
+- **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
+  fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
+  a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
+  `history` scan until rebuilt, changing external `history` output. A record missing the fields
+  falls back to spawn provenance, and placement only exists after this build writes it.
+- **Worktree ownership.**
+
+  ```text
+  ~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json
+  ```
+
+  Owner: `WorktreeOwnershipStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the oversight persistence mode (suppressed launches stay in memory).
+  A versioned document (`version`, `worktrees`) recording, per worktree created under a scope,
+  `created_by_session_id`, `delegation_scope_id`, `created_at`, and, after `worktree_release`,
+  `released_at` / `released_by_session_id` (the stale mark). It never authorizes and never removes a
+  worktree; removing or pruning worktrees stays human-only. A future `version` is preserved and
+  blocks writes; malformed bytes move to `Backups/delegationWorktreeOwnership.corrupt.<uuid>.json`.
+
 ## Sidebar groups on compose tabs
 
 `ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
