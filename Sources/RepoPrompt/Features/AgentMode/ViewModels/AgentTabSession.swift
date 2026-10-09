@@ -1338,6 +1338,9 @@ final class AgentTabSession: ObservableObject {
     }
 
     var createdByOverseerSessionID: UUID?
+    /// Mutable organizational placement (see `AgentSession.organizationalParentID`).
+    var organizationalParentID: UUID?
+    var delegationScopeID: UUID?
     var hasLoadedPersistedState: Bool = false {
         didSet {
             if oldValue != hasLoadedPersistedState {

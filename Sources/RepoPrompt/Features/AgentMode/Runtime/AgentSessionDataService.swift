@@ -274,6 +274,8 @@ actor AgentSessionDataService {
         let codexMcpSessionKey: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
+        let organizationalParentID: UUID?
+        let delegationScopeID: UUID?
         let worktreeBindings: [AgentSessionWorktreeBinding]?
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffPayload: String?
@@ -1501,6 +1503,8 @@ actor AgentSessionDataService {
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
+                organizationalParentID: header.organizationalParentID,
+                delegationScopeID: header.delegationScopeID,
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
