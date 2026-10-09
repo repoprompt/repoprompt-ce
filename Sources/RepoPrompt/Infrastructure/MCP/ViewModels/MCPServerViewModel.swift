@@ -2134,7 +2134,16 @@ final class MCPServerViewModel: ObservableObject {
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities,
                 context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities
+                selection: windowToolSelectionCapabilities,
+                resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
+                    await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                },
+                resolveObserverEndpoint: { [weak self] metadata, targetWindow in
+                    await self?.resolveAgentSessionLinkObserverEndpoint(
+                        metadata: metadata,
+                        targetWindow: targetWindow
+                    )
+                }
             ),
             MCPContextBuilderToolProvider(
                 runtime: windowToolRuntime,
