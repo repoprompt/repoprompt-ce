@@ -32,6 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
+    package static let sessionAdmin = "session_admin"
     package static let agentSelf = "self_compact"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
@@ -72,6 +73,9 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     /// an oversight link.
     case agentSessionLinkControl = "agent_session_link_control"
     case agentSelfControl = "agent_self_control"
+    /// Delegation-scope administration (`session_admin`). Agent-session only: granted live from the
+    /// exact caller's scope state, never by a static profile, and never to administrative principals.
+    case agentSessionAdmin = "agent_session_admin"
     case agentReasoningControl = "agent_reasoning_control"
     case fileContentEdit = "file_content_edit"
     case fileManagement = "file_management"
@@ -310,6 +314,10 @@ package enum MCPDomainToolCatalog {
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
                 "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane", "set_model"
             ],
+            normalization: .trimmedLowercased
+        )),
+        .init(name: MCPWindowToolName.sessionAdmin, scope: .window, capability: .agentSessionAdmin, admissionClass: .control, operationPolicy: .init(
+            operations: MCPDomainSessionAdminToolDefinition.operations,
             normalization: .trimmedLowercased
         )),
         .init(name: MCPWindowToolName.agentSelf, scope: .window, capability: .agentSelfControl, admissionClass: .control, operationPolicy: .init(

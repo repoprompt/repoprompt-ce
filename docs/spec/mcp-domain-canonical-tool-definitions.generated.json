@@ -1999,6 +1999,160 @@
       "annotations" : {
         "destructiveHint" : true,
         "idempotentHint" : false,
+        "openWorldHint" : false,
+        "readOnlyHint" : false
+      },
+      "description" : "Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.\n\nA scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree, destructive. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.\n\n**Scope ops**\n- `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.\n- `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).\n- `release_scope`: give up one of your scopes; revokes its nested scopes too.\n\nOther ops are reserved and may return `not_implemented`.\n\n**Rules**: destructive ops and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+          "capabilities" : {
+            "description" : "[request_scope] Requested capabilities; the user may narrow them.",
+            "items" : {
+              "enum" : [
+                "observe",
+                "organize",
+                "control",
+                "restructure",
+                "spawn",
+                "worktree",
+                "destructive"
+              ],
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "confirmation_id" : {
+            "description" : "[confirmation_status] Confirmation UUID from pending_confirmation.",
+            "type" : "string"
+          },
+          "filter" : {
+            "description" : "[bulk ops] Inventory filter; exclusive with targets.",
+            "type" : "object"
+          },
+          "guardrails" : {
+            "additionalProperties" : false,
+            "description" : "[request_scope] Proposed guardrails; the user may tighten them.",
+            "properties" : {
+              "bulk_confirmation_threshold" : {
+                "minimum" : 1,
+                "type" : "integer"
+              },
+              "expires_in_seconds" : {
+                "minimum" : 60,
+                "type" : "integer"
+              },
+              "max_depth" : {
+                "minimum" : 0,
+                "type" : "integer"
+              },
+              "max_live_sessions" : {
+                "minimum" : 0,
+                "type" : "integer"
+              },
+              "max_worktrees" : {
+                "minimum" : 0,
+                "type" : "integer"
+              }
+            },
+            "type" : "object"
+          },
+          "idempotency_key" : {
+            "description" : "[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes.",
+            "type" : "string"
+          },
+          "kind" : {
+            "description" : "[request_scope] Scope kind; default tree rooted at this session.",
+            "enum" : [
+              "tree",
+              "workspace",
+              "all_sessions"
+            ],
+            "type" : "string"
+          },
+          "op" : {
+            "description" : "Required operation.",
+            "enum" : [
+              "request_scope",
+              "scope_status",
+              "release_scope",
+              "attenuate",
+              "inventory",
+              "get",
+              "tree",
+              "links",
+              "rename",
+              "set_pin",
+              "reorder_pins",
+              "set_group",
+              "reorder_groups",
+              "archive",
+              "unarchive",
+              "link",
+              "unlink",
+              "reparent",
+              "adopt",
+              "release",
+              "retire",
+              "fork",
+              "set_model",
+              "set_effort",
+              "worktree_create",
+              "worktree_bind",
+              "worktree_unbind",
+              "worktree_release",
+              "worktree_inventory",
+              "merge_preview",
+              "merge_apply",
+              "confirmation_status",
+              "undo"
+            ],
+            "type" : "string"
+          },
+          "preview" : {
+            "description" : "[mutating ops] Dry run listing exact items and effects.",
+            "type" : "boolean"
+          },
+          "reason" : {
+            "description" : "[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes.",
+            "type" : "string"
+          },
+          "request_id" : {
+            "description" : "[scope_status] Request UUID returned by request_scope.",
+            "type" : "string"
+          },
+          "scope_id" : {
+            "description" : "[scope_status, release_scope, other ops] Scope UUID; optional when you hold exactly one live scope.",
+            "type" : "string"
+          },
+          "session_id" : {
+            "description" : "[target ops] One target session UUID.",
+            "type" : "string"
+          },
+          "targets" : {
+            "description" : "[bulk ops] Target session UUIDs; exclusive with filter.",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "workspace" : {
+            "description" : "[request_scope] Workspace UUID for kind=workspace; default this session's workspace.",
+            "type" : "string"
+          }
+        },
+        "required" : [
+          "op"
+        ],
+        "type" : "object"
+      },
+      "isEnabledByDefault" : true,
+      "name" : "session_admin"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : true,
+        "idempotentHint" : false,
         "openWorldHint" : true,
         "readOnlyHint" : false
       },

@@ -33,8 +33,8 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 29)
-        XCTAssertEqual(Set(canonicalNames).count, 29)
+        XCTAssertEqual(canonicalNames.count, 30)
+        XCTAssertEqual(Set(canonicalNames).count, 30)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
@@ -46,8 +46,22 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         }
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 29)
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 30)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
+
+        // Delegation scopes are app-owned Agent-session authority: direct-headless keeps the canonical
+        // catalog complete but fails closed even when a caller names the tool.
+        let sessionAdminCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.sessionAdmin,
+            scope: .standalone(id: scopeID)
+        )
+        let sessionAdminResolution = try XCTUnwrap(sessionAdminCandidate)
+        do {
+            _ = try await sessionAdminResolution.binding(["op": .string("request_scope")])
+            XCTFail("Standalone session_admin must fail closed")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("session_admin is not available"), "\(error)")
+        }
 
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,
