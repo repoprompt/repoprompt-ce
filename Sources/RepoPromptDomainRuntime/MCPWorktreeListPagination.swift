@@ -8,11 +8,15 @@ package enum MCPWorktreeListPagination {
     package static let maxLimit = 200
 
     package static let limitPropertyDescription =
-        "List: maximum worktrees to return. Default \(defaultLimit); clamped to 1...\(maxLimit). Page with offset."
+        "List (app-backed only): maximum worktrees to return. Default \(defaultLimit); clamped to 1...\(maxLimit). Page with offset. The direct headless backend rejects it."
     package static let offsetPropertyDescription =
-        "List: zero-based index of the first worktree to return. Default 0. Continue with the reply's next_offset."
+        "List (app-backed only): zero-based index of the first worktree to return. Default 0. Continue with the reply's next_offset. The direct headless backend rejects it."
     package static let outputDescriptionLine =
-        "- `list` returns at most `limit` worktrees (default \(defaultLimit), max \(maxLimit)) with `total_count`; when more remain it sets `truncated: true` and `next_offset`."
+        "- App-backed `list` returns at most `limit` worktrees (default \(defaultLimit), max \(maxLimit)) with `total_count`; when more remain it sets `truncated: true` and `next_offset`. The direct headless backend returns raw porcelain output and rejects `limit`/`offset`."
+
+    /// Error the direct headless backend raises when a caller supplies app-only page controls.
+    package static let headlessUnsupportedMessage =
+        "`limit`/`offset` are supported only by the app-backed manage_worktree list; the direct headless backend returns the full porcelain listing."
 
     package struct Page: Equatable {
         package let offset: Int

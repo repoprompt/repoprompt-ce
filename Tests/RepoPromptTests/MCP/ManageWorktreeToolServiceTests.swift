@@ -644,9 +644,8 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 var offset = 0
                 var pages = 0
                 while pages < 10 {
-                    let reply = try XCTUnwrap(try await fixture.listCall([
-                        "limit": .int(2), "offset": .int(offset)
-                    ]).objectValue)
+                    let value = try await fixture.listCall(["limit": .int(2), "offset": .int(offset)])
+                    let reply = try XCTUnwrap(value.objectValue)
                     pages += 1
                     XCTAssertEqual(reply["total_count"]?.intValue, expected.count)
                     XCTAssertTrue(reply["warning"]?.stringValue?.contains("Omitted 1 stale (prunable)") == true)
@@ -676,16 +675,17 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 let extras = try fixture.addWorktrees(["visual-a", "visual-b"])
                 let roots = [fixture.logical, fixture.physical] + extras
                 let identities = try roots.map { try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: $0)) }
-                func persisted(_ identity: GitWorktreeIdentitySnapshot) -> Bool {
+                @MainActor func persisted(_ identity: GitWorktreeIdentitySnapshot) -> Bool {
                     GlobalSettingsStore.shared.worktreeVisualIdentity(
                         repositoryID: identity.repository.repositoryID, worktreeID: identity.worktreeID
                     ) != nil
                 }
-                XCTAssertFalse(identities.contains(where: persisted))
+                XCTAssertFalse(identities.contains { persisted($0) })
 
-                let reply = try XCTUnwrap(try await fixture.listCall([
+                let value = try await fixture.listCall([
                     "limit": .int(1), "offset": .int(1), "persist_visuals": .bool(true)
-                ]).objectValue)
+                ])
+                let reply = try XCTUnwrap(value.objectValue)
                 let page = try XCTUnwrap(reply["worktrees"]?.arrayValue)
                 XCTAssertEqual(page.count, 1)
                 let pageID = try XCTUnwrap(page.first?.objectValue?["worktree_id"]?.stringValue)
@@ -761,7 +761,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     authorizedCanonicalRoots: security.authorizedCanonicalRoots,
                     hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
                 )
-                return try await MCPDomainInvocationSecurityContext.$current.withValue(requestSecurity) {
+                return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {
                     try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
                 }
             }

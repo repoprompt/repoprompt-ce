@@ -609,7 +609,7 @@ actor HistoryInventoryScanGate {
 actor HistorySessionScanner: HistorySessionScanning {
     private static let defaultScanCacheTTL: TimeInterval = 90
 
-    private struct FileSignature: Equatable {
+    struct FileSignature: Equatable {
         let fileSize: Int64
         let modificationTime: TimeInterval
     }
@@ -1764,7 +1764,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         )
     }
 
-    private func rememberIndexScan(
+    func rememberIndexScan(
         _ cacheKey: String,
         indexSignature: FileSignature,
         workspaceSignature: FileSignature?,
@@ -1809,26 +1809,6 @@ actor HistorySessionScanner: HistorySessionScanning {
             cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
         }
         indexScanCache = cache
-    }
-
-    /// Stale-schema entries keep no records and only the storage-directory identity, so they
-    /// are cached at zero estimated bytes: thousands of them must not evict usable entries.
-    private func rememberStaleIndexScan(
-        _ cacheKey: String,
-        indexSignature: FileSignature,
-        workspaceSignature: FileSignature?,
-        identity: (name: String, id: UUID?),
-        indexSchemaVersion: Int
-    ) {
-        rememberIndexScan(
-            cacheKey,
-            indexSignature: indexSignature,
-            workspaceSignature: workspaceSignature,
-            identity: identity,
-            indexSchemaVersion: indexSchemaVersion,
-            records: [],
-            estimatedByteCount: 0
-        )
     }
 
     private func touchCachedIndexScan(_ cacheKey: String) {
@@ -1919,47 +1899,6 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func indexScanCacheKey(for fileURL: URL) -> String {
         fileURL.standardizedFileURL.path
-    }
-
-    /// Upper bound for the cheap stale-schema check. The writer emits `schemaVersion` first,
-    /// so a few KB answers the question without reading or charging the full index.
-    static let schemaVersionHeadSniffBytes = 4096
-
-    /// Reads at most ``schemaVersionHeadSniffBytes`` and returns the first `schemaVersion`
-    /// value only when it is complete inside that prefix. Because the full-data sniff also
-    /// uses the first occurrence, a conclusive head answer matches it; `nil` means
-    /// inconclusive and callers fall back to the full read.
-    private nonisolated func headSchemaVersionSniff(of fileURL: URL) -> Int? {
-        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
-        defer { try? handle.close() }
-        guard let head = try? handle.read(upToCount: Self.schemaVersionHeadSniffBytes),
-              !head.isEmpty
-        else { return nil }
-        return Self.schemaVersionSniff(
-            in: String(decoding: head, as: UTF8.self),
-            valueMayBeTruncated: head.count >= Self.schemaVersionHeadSniffBytes
-        )
-    }
-
-    private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
-        guard let text = String(data: data, encoding: .utf8) else { return nil }
-        return Self.schemaVersionSniff(in: text, valueMayBeTruncated: false)
-    }
-
-    private static func schemaVersionSniff(in text: String, valueMayBeTruncated: Bool) -> Int? {
-        guard let keyRange = text.range(of: "\"schemaVersion\"") else { return nil }
-        guard let colon = text[keyRange.upperBound...].firstIndex(of: ":") else { return nil }
-        var index = text.index(after: colon)
-        while index < text.endIndex, text[index].isWhitespace {
-            index = text.index(after: index)
-        }
-        let start = index
-        while index < text.endIndex, text[index].isNumber || text[index] == "-" {
-            index = text.index(after: index)
-        }
-        guard start < index else { return nil }
-        if valueMayBeTruncated, index == text.endIndex { return nil }
-        return Int(text[start ..< index])
     }
 
     private nonisolated func minimumTranscriptDecodeRemaining(for bytes: Int64) -> Duration {
