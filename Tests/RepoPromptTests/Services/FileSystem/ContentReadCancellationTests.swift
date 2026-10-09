@@ -2807,8 +2807,9 @@ final class ContentReadCancellationTests: XCTestCase {
     }
 }
 
-/// Polls are bounded by wall-clock time, not a `Task.yield()` count, because runner load can
-/// delay the awaited work (#1301). Sleeping between checks frees the executor for that work.
+/// Polls use an elapsed-time budget rather than a `Task.yield()` count, because runner load can
+/// delay the awaited work (#1301). A short sleep between checks keeps a failing wait from spinning;
+/// the deadline is checked between reads and doesn't time out an individual read.
 private let contentReadCancellationPollTimeout: Duration = .seconds(30)
 private let contentReadCancellationPollInterval: Duration = .milliseconds(1)
 
