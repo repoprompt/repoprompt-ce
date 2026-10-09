@@ -22,8 +22,13 @@ struct DelegationScopeRequest: Identifiable, Equatable {
 
     let id: UUID
     let requesterSessionID: UUID
-    /// The tab whose Agent Mode view shows the card.
+    /// The tab whose Agent Mode view shows the card. The card is shown only while this tab is still
+    /// bound to `requesterSessionID`; a session change cancels the request.
     let requesterTabID: UUID?
+    /// The requesting session's title at request time, for the card.
+    var requesterTitle: String?
+    /// Resolved name of a `.workspace` scope's workspace, for the card.
+    var workspaceName: String?
     let kind: DomainDelegationScopeKind
     let capabilities: Set<DomainDelegationScopeCapability>
     /// Requested limits. `expiresAt` is always `nil` here; see `expiresInSeconds`.
@@ -67,15 +72,24 @@ final class DelegationScopeRuntime: ObservableObject {
     static let maxPendingRequestsPerSession = 4
     static let maxReasonUTF8Bytes = 500
     static let minimumExpirySeconds = 60
+    /// Agent-proposed lifetimes are capped at 30 days.
+    static let maximumExpirySeconds = 30 * 24 * 60 * 60
+    /// Revocation tombstones kept in memory and on disk.
+    static let maxRevokedScopeIDs = DelegationScopeDocument.maxRevokedScopeIDs
     /// Bounded retention of decided requests so `scope_status` can still report them.
     static let maxRetainedRequests = 256
 
     @Published private(set) var requests: [UUID: DelegationScopeRequest] = [:]
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
-    /// Last durable write outcome. A failed write is retried on the next change; until then a
-    /// revocation is enforced in memory but not yet on disk.
-    private(set) var lastPersistenceOutcome: DelegationScopeWriteOutcome?
+    /// Last durable write outcome, published so the delegations list can surface a failure. A
+    /// failed write is retried on the next change; until then a revocation is enforced in memory and
+    /// by its tombstone at the next successful write, but not yet on disk.
+    @Published private(set) var lastPersistenceOutcome: DelegationScopeWriteOutcome?
+
+    var persistenceFailed: Bool {
+        lastPersistenceOutcome == .writeFailed
+    }
 
     let confirmations: BatchConfirmationCoordinator
 
@@ -84,6 +98,8 @@ final class DelegationScopeRuntime: ObservableObject {
     private var requestOrder: [UUID] = []
     private var requestIDByKey: [String: UUID] = [:]
     private var persistChain: Task<Void, Never>?
+    /// Revoked/released scope IDs, newest last. Persisted as tombstones honored by `reactivate`.
+    private var revokedScopeIDs: [UUID] = []
     private let now: () -> Date
     private let makeUUID: () -> UUID
     private let notifyCatalogChanged: (UUID) -> Void
@@ -93,7 +109,9 @@ final class DelegationScopeRuntime: ObservableObject {
         makeUUID: @escaping () -> UUID = UUID.init,
         confirmations: BatchConfirmationCoordinator? = nil,
         notifyCatalogChanged: @escaping (UUID) -> Void = { sessionID in
-            Task { await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID) }
+            // Forced: a scope change alters `session_admin` eligibility without changing any link
+            // fact, so the link-only change detection would otherwise skip the relist.
+            Task { await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID, forceRelist: true) }
         }
     ) {
         self.now = now
@@ -108,8 +126,9 @@ final class DelegationScopeRuntime: ObservableObject {
     func bootstrap(store: DelegationScopeStore) async {
         guard self.store == nil else { return }
         self.store = store
-        guard case let .ready(_, grants) = await store.loadForLaunch() else { return }
-        let installed = authority.reactivate(grants, now: now())
+        guard case let .ready(_, grants, revoked) = await store.loadForLaunch() else { return }
+        revokedScopeIDs = revoked
+        let installed = authority.reactivate(grants, revokedScopeIDs: Set(revoked), now: now())
         // A reload may drop expired or orphaned rows; persisting keeps the file equal to authority.
         didChange(grantees: Set(installed.map(\.grant.granteeSessionID)), invalidated: [])
     }
@@ -117,6 +136,24 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Waits for every queued write. Tests and shutdown use this as a linearization point.
     func flushPersistence() async {
         await persistChain?.value
+    }
+
+    /// Synchronous, bounded write of the current grants and tombstones for `applicationWillTerminate`.
+    ///
+    /// Queued main-actor writes cannot run while the main thread is terminating, so this writes the
+    /// latest state straight through the store actor (which runs off the main thread) and waits at
+    /// most `timeout`. The store serializes it after any write already in flight, so the newest state
+    /// lands last.
+    func flushForTermination(timeout: TimeInterval = 2) {
+        guard let store else { return }
+        let grants = authority.activeGrants
+        let revoked = revokedScopeIDs
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await store.replace(with: grants, revokedScopeIDs: revoked)
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + timeout)
     }
 
     // MARK: - Queries
@@ -145,14 +182,38 @@ final class DelegationScopeRuntime: ObservableObject {
         authority.scopeChain(from: scopeID)
     }
 
+    /// Every live scope, for the user's "Active delegations" list. A pure query (safe from a view
+    /// body): expired-by-time scopes are filtered out without mutating state.
+    func allLiveScopes() -> [DomainDelegationScopeRecord] {
+        authority.activeGrants
+            .compactMap { authority.liveRecord(id: $0.id, now: now()) }
+            .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
+    }
+
     /// The request, but only for the session that made it.
     func request(id: UUID, requesterSessionID: UUID) -> DelegationScopeRequest? {
         guard let request = requests[id], request.requesterSessionID == requesterSessionID else { return nil }
         return request
     }
 
-    func pendingRequests(forTab tabID: UUID) -> [DelegationScopeRequest] {
-        requestOrder.compactMap { requests[$0] }.filter { $0.requesterTabID == tabID && $0.state == .pending }
+    /// Pending cards for one tab, shown only while the tab is still bound to the requesting session.
+    func pendingRequests(forTab tabID: UUID, sessionID: UUID?) -> [DelegationScopeRequest] {
+        guard let sessionID else { return [] }
+        return requestOrder.compactMap { requests[$0] }.filter {
+            $0.requesterTabID == tabID && $0.requesterSessionID == sessionID && $0.state == .pending
+        }
+    }
+
+    /// Cancels pending requests raised in `tabID` by a session that is no longer the tab's session, so
+    /// a card can never be approved on behalf of the wrong session.
+    func cancelStaleRequests(tabID: UUID, currentSessionID: UUID?) {
+        for id in requestOrder {
+            guard var request = requests[id], request.state == .pending, request.requesterTabID == tabID,
+                  request.requesterSessionID != currentSessionID
+            else { continue }
+            request.state = .cancelled(reason: "The tab's session changed before approval.")
+            requests[id] = request
+        }
     }
 
     // MARK: - Single authority check
@@ -182,11 +243,21 @@ final class DelegationScopeRuntime: ObservableObject {
         guardrails requestedGuardrails: DomainDelegationScopeGuardrails,
         expiresInSeconds: Int? = nil,
         reason: String?,
-        idempotencyKey: String?
+        idempotencyKey: String?,
+        requesterTitle: String? = nil,
+        workspaceName: String? = nil
     ) -> Result<DelegationScopeRequest, DelegationScopeRequestError> {
         var guardrails = requestedGuardrails
         guardrails.expiresAt = nil
-        if let expiresInSeconds, expiresInSeconds < Self.minimumExpirySeconds {
+        // An agent may only propose guardrails at least as strict as the defaults; loosening the bulk
+        // card threshold is the user's call alone.
+        guardrails.bulkConfirmationThreshold = min(
+            guardrails.bulkConfirmationThreshold,
+            DomainDelegationScopeGuardrails.defaultBulkConfirmationThreshold
+        )
+        if let expiresInSeconds,
+           expiresInSeconds < Self.minimumExpirySeconds || expiresInSeconds > Self.maximumExpirySeconds
+        {
             return .failure(.invalid(.expiryInPast))
         }
         if let denial = DomainDelegationScopeAuthority.validate(
@@ -217,6 +288,8 @@ final class DelegationScopeRuntime: ObservableObject {
             id: makeUUID(),
             requesterSessionID: requesterSessionID,
             requesterTabID: requesterTabID,
+            requesterTitle: requesterTitle,
+            workspaceName: workspaceName,
             kind: kind,
             capabilities: capabilities,
             guardrails: guardrails,
@@ -232,10 +305,12 @@ final class DelegationScopeRuntime: ObservableObject {
         return .success(request)
     }
 
-    /// The user approved the grant card, optionally narrowing capabilities or tightening guardrails.
+    /// The user approved the grant card, optionally narrowing capabilities or adjusting guardrails.
     ///
-    /// A requested lifetime starts now. If the approved values fail validation the request is
-    /// closed as denied rather than left pending, so the card can never get stuck.
+    /// Approved capabilities must be a subset of the requested ones (refused otherwise, request left
+    /// pending). The requested lifetime starts now and is kept unless the user sets a stricter expiry.
+    /// If the approved values fail validation the request is closed as denied rather than left
+    /// pending, so the card can never get stuck.
     @discardableResult
     func approve(
         requestID: UUID,
@@ -243,15 +318,22 @@ final class DelegationScopeRuntime: ObservableObject {
         guardrails: DomainDelegationScopeGuardrails? = nil
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard var request = requests[requestID], request.state == .pending else { return .failure(.unknownScope) }
+        let approvedCapabilities = capabilities ?? request.capabilities
+        guard approvedCapabilities.isSubset(of: request.capabilities) else {
+            return .failure(.approvalExceedsRequest)
+        }
         let approvedAt = now()
         var approvedGuardrails = guardrails ?? request.guardrails
-        if guardrails == nil, let seconds = request.expiresInSeconds {
-            approvedGuardrails.expiresAt = approvedAt.addingTimeInterval(TimeInterval(seconds))
+        let requestedExpiry = request.expiresInSeconds.map { approvedAt.addingTimeInterval(TimeInterval($0)) }
+        approvedGuardrails.expiresAt = switch (requestedExpiry, guardrails?.expiresAt) {
+        case let (requested?, chosen?): min(requested, chosen)
+        case let (requested?, nil): requested
+        case let (nil, chosen): chosen
         }
         let grantRequest = DomainDelegationScopeGrantRequest(
             granteeSessionID: request.requesterSessionID,
             kind: request.kind,
-            capabilities: capabilities ?? request.capabilities,
+            capabilities: approvedCapabilities,
             guardrails: approvedGuardrails
         )
         let result = authority.grant(grantRequest, scopeID: makeUUID(), now: approvedAt)
@@ -279,7 +361,15 @@ final class DelegationScopeRuntime: ObservableObject {
     @discardableResult
     func revoke(scopeID: UUID) -> [DomainDelegationScopeRecord] {
         let changed = authority.revoke(scopeID: scopeID)
-        didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
+        recordRevocations(changed)
+        return changed
+    }
+
+    /// Revokes every scope granted to, or rooted at, a durably deleted session.
+    @discardableResult
+    func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        let changed = authority.revokeAll(involving: sessionID)
+        recordRevocations(changed)
         return changed
     }
 
@@ -290,7 +380,7 @@ final class DelegationScopeRuntime: ObservableObject {
     ) -> Result<[DomainDelegationScopeRecord], DomainDelegationScopeDenial> {
         let result = authority.release(scopeID: scopeID, caller: caller)
         if case let .success(changed) = result {
-            didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
+            recordRevocations(changed)
         }
         return result
     }
@@ -331,6 +421,15 @@ final class DelegationScopeRuntime: ObservableObject {
         didChange(grantees: Set(expired.map(\.grant.granteeSessionID)), invalidated: expired.map(\.id))
     }
 
+    private func recordRevocations(_ changed: [DomainDelegationScopeRecord]) {
+        guard !changed.isEmpty else { return }
+        revokedScopeIDs.append(contentsOf: changed.map(\.id))
+        if revokedScopeIDs.count > Self.maxRevokedScopeIDs {
+            revokedScopeIDs.removeFirst(revokedScopeIDs.count - Self.maxRevokedScopeIDs)
+        }
+        didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
+    }
+
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {
         revision &+= 1
         for scopeID in invalidated {
@@ -350,12 +449,13 @@ final class DelegationScopeRuntime: ObservableObject {
     private func persist() {
         guard let store else { return }
         let grants = authority.activeGrants
+        let revoked = revokedScopeIDs
         let previous = persistChain
         persistChain = Task { @MainActor [weak self] in
             await previous?.value
-            var outcome = await store.replace(with: grants)
+            var outcome = await store.replace(with: grants, revokedScopeIDs: revoked)
             if outcome == .writeFailed {
-                outcome = await store.replace(with: grants)
+                outcome = await store.replace(with: grants, revokedScopeIDs: revoked)
             }
             self?.lastPersistenceOutcome = outcome
         }

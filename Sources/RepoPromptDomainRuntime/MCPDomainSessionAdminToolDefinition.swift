@@ -41,7 +41,7 @@ package enum MCPDomainSessionAdminToolDefinition {
 
         Other ops are reserved and may return `not_implemented`.
 
-        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
+        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. After the user approves, repeat the same call unchanged (same op, arguments, and `idempotency_key`) with `confirmation_id`; changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -99,7 +99,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "description": .string("[mutating ops] Dry run listing exact items and effects.")
                 ]),
                 "idempotency_key": .stringSchema("[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes."),
-                "confirmation_id": .stringSchema("[confirmation_status] Confirmation UUID from pending_confirmation.")
+                "confirmation_id": .stringSchema("[confirmation_status, applying call] Confirmation UUID from pending_confirmation; pass it on the unchanged repeat of the carded call.")
             ]),
             "required": .array([.string("op")])
         ]),

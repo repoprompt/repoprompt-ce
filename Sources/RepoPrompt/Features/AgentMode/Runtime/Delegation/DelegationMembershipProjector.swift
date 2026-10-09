@@ -155,10 +155,12 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
 @MainActor
 struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
     func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
+        // The entry's workspace is the workspace that owns the index it came from, never the
+        // window's currently active workspace; only owner-validated (current) indexes are read.
         for window in WindowStatesManager.shared.allWindows {
-            let viewModel = window.agentModeViewModel
-            guard let entry = viewModel.sessionIndex[sessionID] else { continue }
-            return Self.provenance(entry: entry, window: window)
+            let store = window.agentModeViewModel.sessionIndexStore
+            guard let entry = store.ownerValidatedSessionIndex[sessionID] else { continue }
+            return Self.provenance(entry: entry, workspaceID: store.sessionIndexOwner?.workspaceID)
         }
         return nil
     }
@@ -167,38 +169,67 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         var seen: Set<UUID> = []
         var result: [DelegationSessionProvenance] = []
         for window in WindowStatesManager.shared.allWindows {
-            for entry in window.agentModeViewModel.sessionIndex.values where seen.insert(entry.id).inserted {
-                result.append(Self.provenance(entry: entry, window: window))
+            let store = window.agentModeViewModel.sessionIndexStore
+            let workspaceID = store.sessionIndexOwner?.workspaceID
+            for entry in store.ownerValidatedSessionIndex.values where seen.insert(entry.id).inserted {
+                result.append(Self.provenance(entry: entry, workspaceID: workspaceID))
             }
         }
         return result
     }
 
-    private static func provenance(entry: AgentSessionIndexEntry, window: WindowState) -> DelegationSessionProvenance {
-        // Both facts fail closed: a lookup that throws counts the session as live (stricter
-        // `maxLiveSessions`) and its run state as unknown (treated as running, so stopping it needs
-        // `control`). A session with no live tab is idle or finished.
-        let isLive: Bool
-        let runState: DomainDelegationScopeTargetState
-        switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: entry.id) }) {
-        case let .success(session?):
-            isLive = true
-            runState = session.runState.isActive ? .running : .idle
-        case .success(nil):
-            isLive = false
-            runState = .idle
-        case .failure:
-            isLive = true
-            runState = .unknown
-        }
+    private static func provenance(entry: AgentSessionIndexEntry, workspaceID: UUID?) -> DelegationSessionProvenance {
+        let (isLive, runState) = liveness(of: entry.id)
         return DelegationSessionProvenance(
             sessionID: entry.id,
-            workspaceID: window.workspaceManager.activeWorkspace?.id,
+            workspaceID: workspaceID,
             parentSessionID: entry.parentSessionID,
             createdByOverseerSessionID: entry.createdByOverseerSessionID,
             isLive: isLive,
             worktreeCount: entry.worktreeBindingSummaries.count,
             runState: runState
         )
+    }
+
+    /// Aggregated across every window, because one session can be live in more than one. Both facts
+    /// fail closed: running if any window runs it; otherwise unknown (treated as running) if any
+    /// lookup throws; a lookup failure also counts as live, so `maxLiveSessions` only gets stricter.
+    private static func liveness(of sessionID: UUID) -> (isLive: Bool, runState: DomainDelegationScopeTargetState) {
+        var isLive = false
+        var running = false
+        var unknown = false
+        for window in WindowStatesManager.shared.allWindows {
+            switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) }) {
+            case let .success(session?):
+                isLive = true
+                running = running || session.runState.isActive
+            case .success(nil):
+                break
+            case .failure:
+                isLive = true
+                unknown = true
+            }
+        }
+        return (isLive, running ? .running : unknown ? .unknown : .idle)
+    }
+}
+
+/// Display names for delegation cards and the "Active delegations" list. Presentation only.
+@MainActor
+enum DelegationDisplayNames {
+    static func sessionTitle(_ sessionID: UUID) -> String? {
+        for window in WindowStatesManager.shared.allWindows {
+            if let name = window.agentModeViewModel.sessionIndex[sessionID]?.name, !name.isEmpty { return name }
+        }
+        return nil
+    }
+
+    static func workspaceName(_ workspaceID: UUID) -> String? {
+        for window in WindowStatesManager.shared.allWindows {
+            if let workspace = window.workspaceManager.workspaces.first(where: { $0.id == workspaceID }) {
+                return workspace.name
+            }
+        }
+        return nil
     }
 }

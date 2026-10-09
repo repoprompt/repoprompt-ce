@@ -41,6 +41,12 @@ struct AgentSessionAdministrationRequest {
         self.arguments = arguments
     }
 
+    /// Canonical digest of `arguments` that a batch card binds (targets, key, confirmation ID, scope,
+    /// op, and preview excluded). Changed arguments under the same key can never ride an approval.
+    var argumentsDigest: String {
+        DomainDelegationScopeArgumentsDigest.digest(arguments)
+    }
+
     /// The same request narrowed to `targets` (the admitted subset).
     func narrowed(to targets: [UUID]) -> AgentSessionAdministrationRequest {
         AgentSessionAdministrationRequest(
@@ -206,6 +212,7 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             memberships: memberships,
             usageByScopeID: usage,
             targetStates: targetStates,
+            argumentsDigest: request.argumentsDigest,
             idempotencyKey: request.idempotencyKey,
             confirmation: confirmation
         ))
@@ -248,7 +255,8 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
                 idempotencyKey: idempotencyKey,
                 granteeTabID: request.callerTabID,
                 reason: reason,
-                items: handler.confirmationItems(for: request.narrowed(to: pending.admittedSessionIDs), scope: pending.scope)
+                items: handler.confirmationItems(for: request.narrowed(to: pending.admittedSessionIDs), scope: pending.scope),
+                argumentsDigest: request.argumentsDigest
             ) {
             case let .created(card), let .existing(card):
                 return .pendingConfirmation(card, itemsRequiringControl: pending.itemsRequiringControl)
@@ -260,12 +268,27 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)
         case let .authorized(batch):
-            // An approved card authorizes exactly one application; replays need a new card. The
-            // handler re-checks `DelegationScopeRuntime.isCurrent(_:)` after its own suspensions.
-            if let confirmationID = batch.confirmation?.confirmationID {
-                scopes.confirmations.consume(confirmationID: confirmationID)
+            // Only a card the authority actually required is claimed: an approved card authorizes
+            // exactly one application, claimed before the handler suspends (so a concurrent replay
+            // cannot double-apply) and marked applied only after the handler succeeds. The handler
+            // re-checks `DelegationScopeRuntime.isCurrent(_:)` after its own suspensions.
+            let cardRequired = DomainDelegationScopeAuthority.confirmationRequirement(
+                operation: request.operation,
+                itemCount: batch.admittedSessionIDs.count,
+                guardrails: batch.scope.grant.guardrails
+            ) != nil && !batch.admittedSessionIDs.isEmpty
+            let claimedCard = cardRequired ? batch.confirmation?.confirmationID : nil
+            if let claimedCard, !scopes.confirmations.beginApplying(confirmationID: claimedCard) {
+                return .denied(.confirmationMismatch, sessionID: nil)
             }
-            return try await .completed(handler.perform(batch))
+            do {
+                let value = try await handler.perform(batch)
+                if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: true) }
+                return .completed(value)
+            } catch {
+                if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: false) }
+                throw error
+            }
         }
     }
 }

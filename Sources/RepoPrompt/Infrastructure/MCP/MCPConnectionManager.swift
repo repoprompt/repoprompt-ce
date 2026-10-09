@@ -3231,7 +3231,10 @@ actor ServerNetworkManager {
     /// at session UUID scope because one UUID can own several live runs, but every candidate connection
     /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
     /// incarnation therefore receives no catalog grant from the incarnation the user linked.
-    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+    ///
+    /// - Parameter forceRelist: relist even when every link fact is unchanged. Delegation-scope
+    ///   changes alter `session_admin` eligibility without touching any link fact.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID, forceRelist: Bool = false) async {
         let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
             guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
             return (runID, state.windowID, tabID)
@@ -3256,7 +3259,8 @@ actor ServerNetworkManager {
             let routeToken = snapshot?.routeToken
             let hasAnyActiveLink = snapshot?.hasAnyActiveLink
             let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
-            if observation?.routeToken == routeToken,
+            if !forceRelist,
+               observation?.routeToken == routeToken,
                observation?.hasAgentSessionLink == hasAnyActiveLink,
                observation?.hasAnyActiveLink == hasAnyActiveLink,
                observation?.hasActiveOutboundLink == hasActiveOutboundLink

@@ -53,8 +53,21 @@ Rules that hold the scope design together:
   re-bound by `DomainAgentSessionOperationAuthorizer` to the exact operation, caller, and target
   under the `.delegationScope(scopeID, generation, capability)` basis.
 - **Uniform denials.** Only `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`,
-  and `confirmation_required` are caller-visible. Unknown scopes, non-grantees, non-members, and
-  unresolved callers all receive the existing uniform "not available / not found" text.
+  `scope_revoked`, `confirmation_required`, `confirmation_mismatch` (with the approved item IDs),
+  and the per-item `requires_control` are caller-visible, and each only after the caller is known
+  to be the scope's grantee. Unknown scopes, non-grantees, non-members, and unresolved callers all
+  receive the existing uniform "not available / not found" text.
+- **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
+  idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
+  the same key conflict instead of riding the approval, and an approval applies once.
+- **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
+  granted to a session UUID, so every live incarnation of that session (for example the same session
+  open in two windows) holds it. The caller is still resolved only from exact server-owned run
+  routing, and the grant card is bound to the requesting tab *and* session (a session change
+  cancels it).
+- **The user can always revoke.** The oversight popover lists every active delegation with a Revoke
+  control; revocation is immediate (generation bump), cascades, and is durable through a tombstone.
+  Deleting a session revokes every scope granted to or rooted at it.
 - **`.allSessions` scopes** hold only `observe`, `organize`, and `restructure`. They can `retire`
   (stop + release + archive) idle or finished members, which needs `organize` + `restructure`;
   stopping a running (or unknown-state) member additionally needs `control`, so such members are

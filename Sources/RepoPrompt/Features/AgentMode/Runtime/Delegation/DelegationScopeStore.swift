@@ -14,13 +14,29 @@ import RepoPromptDomainRuntime
 /// Versioned on-disk envelope.
 struct DelegationScopeDocument: Codable, Equatable {
     static let currentVersion = 1
+    /// Bounded tombstone list; the oldest entries drop first.
+    static let maxRevokedScopeIDs = 1024
 
     let version: Int
     let scopes: [DomainDelegationScopeGrant]
+    /// Revocation tombstones. A grant listed here is never reactivated, even if a stale or restored
+    /// copy of the file still lists it. Optional so older v1 files (without the key) still decode.
+    let revokedScopeIDs: [UUID]?
 
-    init(version: Int = DelegationScopeDocument.currentVersion, scopes: [DomainDelegationScopeGrant]) {
+    init(
+        version: Int = DelegationScopeDocument.currentVersion,
+        scopes: [DomainDelegationScopeGrant],
+        revokedScopeIDs: [UUID]? = nil
+    ) {
         self.version = version
         self.scopes = scopes
+        self.revokedScopeIDs = revokedScopeIDs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case scopes
+        case revokedScopeIDs = "revoked_scope_ids"
     }
 }
 
@@ -35,7 +51,7 @@ enum DelegationScopeLoadResult: Equatable {
         case quarantined
     }
 
-    case ready(source: Source, grants: [DomainDelegationScopeGrant])
+    case ready(source: Source, grants: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID])
     case blocked(AgentSessionOversightPersistenceBlockReason)
     case suppressed
 }
@@ -74,6 +90,7 @@ actor DelegationScopeStore {
     private var settledSource: DelegationScopeLoadResult.Source?
     private var blockReason: AgentSessionOversightPersistenceBlockReason?
     private var grants: [DomainDelegationScopeGrant] = []
+    private var revokedScopeIDs: [UUID] = []
 
     init(
         fileURL: URL,
@@ -122,7 +139,7 @@ actor DelegationScopeStore {
         guard mode.performsProductionFileIO else { return .suppressed }
         if didLoad {
             if let blockReason { return .blocked(blockReason) }
-            return .ready(source: settledSource ?? .loaded, grants: grants)
+            return .ready(source: settledSource ?? .loaded, grants: grants, revokedScopeIDs: revokedScopeIDs)
         }
         didLoad = true
 
@@ -157,12 +174,13 @@ actor DelegationScopeStore {
         // Duplicate IDs collapse onto the first row; a load never writes.
         var seen: Set<UUID> = []
         grants = document.scopes.filter { seen.insert($0.id).inserted }
+        revokedScopeIDs = Array((document.revokedScopeIDs ?? []).suffix(DelegationScopeDocument.maxRevokedScopeIDs))
         return settle(.loaded)
     }
 
     private func settle(_ source: DelegationScopeLoadResult.Source) -> DelegationScopeLoadResult {
         settledSource = source
-        return .ready(source: source, grants: grants)
+        return .ready(source: source, grants: grants, revokedScopeIDs: revokedScopeIDs)
     }
 
     private func block(_ reason: AgentSessionOversightPersistenceBlockReason) -> DelegationScopeLoadResult {
@@ -195,16 +213,26 @@ actor DelegationScopeStore {
 
     // MARK: - Mutation
 
-    /// Replaces the durable set with exactly `newGrants` (the authority's active grants).
-    func replace(with newGrants: [DomainDelegationScopeGrant]) -> DelegationScopeWriteOutcome {
+    /// Replaces the durable set with exactly `newGrants` (the authority's active grants) and the
+    /// given revocation tombstones (bounded, oldest dropped first).
+    func replace(
+        with newGrants: [DomainDelegationScopeGrant],
+        revokedScopeIDs newRevoked: [UUID] = []
+    ) -> DelegationScopeWriteOutcome {
         guard mode.performsProductionFileIO, didLoad, blockReason == nil else { return .blocked }
         let ordered = newGrants.sorted { $0.id.uuidString < $1.id.uuidString }
-        guard ordered != grants.sorted(by: { $0.id.uuidString < $1.id.uuidString }) else { return .unchanged }
+        let tombstones = Array(newRevoked.suffix(DelegationScopeDocument.maxRevokedScopeIDs))
+        guard ordered != grants.sorted(by: { $0.id.uuidString < $1.id.uuidString }) || tombstones != revokedScopeIDs else {
+            return .unchanged
+        }
         guard ordered.count <= maxDecodedRowCount else { return .blocked }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
-            let data = try encoder.encode(DelegationScopeDocument(scopes: ordered))
+            let data = try encoder.encode(DelegationScopeDocument(
+                scopes: ordered,
+                revokedScopeIDs: tombstones.isEmpty ? nil : tombstones
+            ))
             guard data.count <= maxFileByteCount else { return .blocked }
             try? fileManager.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
@@ -215,6 +243,7 @@ actor DelegationScopeStore {
             return .writeFailed
         }
         grants = ordered
+        revokedScopeIDs = tombstones
         return .applied
     }
 

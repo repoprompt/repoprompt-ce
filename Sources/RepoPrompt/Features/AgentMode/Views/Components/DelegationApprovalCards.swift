@@ -11,65 +11,142 @@ import SwiftUI
 // SEARCH-HELPER: delegate scope approval card, batch confirmation card, session_admin cards.
 
 /// Hosts every pending scope request and batch confirmation for one tab.
+///
+/// A scope card is bound to the tab *and* the session that requested it: it renders only while the
+/// tab is still bound to that session, and a session change cancels the request so it can never be
+/// approved on behalf of whatever session the tab shows next.
 struct DelegationApprovalSlot: View {
     let tabID: UUID?
+    /// The tab's currently bound Agent session.
+    let sessionID: UUID?
     @ObservedObject var runtime: DelegationScopeRuntime
     @ObservedObject var confirmations: BatchConfirmationCoordinator
 
-    init(tabID: UUID?, runtime: DelegationScopeRuntime) {
+    init(tabID: UUID?, sessionID: UUID?, runtime: DelegationScopeRuntime) {
         self.tabID = tabID
+        self.sessionID = sessionID
         self.runtime = runtime
         confirmations = runtime.confirmations
     }
 
     var body: some View {
-        if let tabID {
-            let requests = runtime.pendingRequests(forTab: tabID)
-            let cards = confirmations.pendingConfirmations(forTab: tabID)
-            if !requests.isEmpty || !cards.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(requests) { request in
-                        DelegationScopeApprovalCard(
-                            request: request,
-                            onApprove: { capabilities in
-                                _ = runtime.approve(requestID: request.id, capabilities: capabilities)
-                            },
-                            onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") }
-                        )
-                    }
-                    ForEach(cards) { card in
-                        BatchConfirmationCard(
-                            confirmation: card,
-                            onToggle: { sessionID, ticked in
-                                confirmations.setItem(sessionID, ticked: ticked, confirmationID: card.id)
-                            },
-                            onApprove: { _ = confirmations.approve(confirmationID: card.id) },
-                            onDeny: { confirmations.deny(confirmationID: card.id, reason: "Denied by user") }
-                        )
-                    }
+        Group {
+            if let tabID {
+                content(tabID: tabID)
+            }
+        }
+        .task(id: "\(tabID?.uuidString ?? "-")|\(sessionID?.uuidString ?? "-")") {
+            guard let tabID else { return }
+            runtime.cancelStaleRequests(tabID: tabID, currentSessionID: sessionID)
+        }
+    }
+
+    @ViewBuilder
+    private func content(tabID: UUID) -> some View {
+        let requests = runtime.pendingRequests(forTab: tabID, sessionID: sessionID)
+        let cards = confirmations.pendingConfirmations(forTab: tabID)
+        if !requests.isEmpty || !cards.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(requests) { request in
+                    DelegationScopeApprovalCard(
+                        request: request,
+                        onApprove: { capabilities, threshold in
+                            var guardrails = request.guardrails
+                            guardrails.bulkConfirmationThreshold = threshold
+                            _ = runtime.approve(requestID: request.id, capabilities: capabilities, guardrails: guardrails)
+                        },
+                        onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") }
+                    )
+                }
+                ForEach(cards) { card in
+                    BatchConfirmationCard(
+                        confirmation: card,
+                        onToggle: { sessionID, ticked in
+                            confirmations.setItem(sessionID, ticked: ticked, confirmationID: card.id)
+                        },
+                        onApprove: { _ = confirmations.approve(confirmationID: card.id) },
+                        onDeny: { confirmations.deny(confirmationID: card.id, reason: "Denied by user") }
+                    )
                 }
             }
         }
     }
 }
 
+/// The user's list of every live delegation scope, with a Revoke control for each. Hosted in the
+/// oversight monitor popover; renders nothing when no scope is live.
+struct DelegationActiveScopesSection: View {
+    @ObservedObject var runtime: DelegationScopeRuntime
+
+    var body: some View {
+        let scopes = runtime.allLiveScopes()
+        if !scopes.isEmpty || runtime.persistenceFailed {
+            VStack(alignment: .leading, spacing: 6) {
+                Divider()
+                Text("Active delegations")
+                    .font(.headline)
+                if runtime.persistenceFailed {
+                    Label("Delegation changes could not be saved; they apply until RepoPrompt quits.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                ForEach(scopes, id: \.id) { scope in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(DelegationDisplayNames.sessionTitle(scope.grant.granteeSessionID) ?? "Session \(scope.grant.granteeSessionID.uuidString.prefix(8))")
+                                .lineLimit(1)
+                            Text(Self.summary(scope))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                        Button("Revoke") { runtime.revoke(scopeID: scope.id) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    static func summary(_ scope: DomainDelegationScopeRecord) -> String {
+        let kind = switch scope.grant.kind {
+        case .tree: "its own tree"
+        case let .workspace(workspaceID): "workspace \(DelegationDisplayNames.workspaceName(workspaceID) ?? workspaceID.uuidString.prefix(8).description)"
+        case .allSessions: "all sessions"
+        }
+        let capabilities = DomainDelegationScopeCapability.allCases
+            .filter(scope.grant.capabilities.contains)
+            .map(\.rawValue)
+            .joined(separator: ", ")
+        let expiry = scope.grant.guardrails.expiresAt
+            .map { " · expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
+        return "\(kind) · \(capabilities)\(expiry)"
+    }
+}
+
 /// One-time approval of a delegation scope requested by an Agent session.
 struct DelegationScopeApprovalCard: View {
     let request: DelegationScopeRequest
-    let onApprove: (Set<DomainDelegationScopeCapability>) -> Void
+    /// Approved capabilities (a subset of the request) and the user's bulk-card threshold.
+    let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Void
     let onDeny: () -> Void
 
     @State private var selected: Set<DomainDelegationScopeCapability>
+    /// Only the user may loosen the agent's (already clamped) threshold.
+    @State private var threshold: Int
 
     init(
         request: DelegationScopeRequest,
-        onApprove: @escaping (Set<DomainDelegationScopeCapability>) -> Void,
+        onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Void,
         onDeny: @escaping () -> Void
     ) {
         self.request = request
         self.onApprove = onApprove
         self.onDeny = onDeny
         _selected = State(initialValue: request.capabilities)
+        _threshold = State(initialValue: request.guardrails.bulkConfirmationThreshold)
     }
 
     var body: some View {
@@ -119,6 +196,11 @@ struct DelegationScopeApprovalCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            Stepper(value: $threshold, in: 1 ... 500) {
+                Text("Ask me before bulk changes over \(threshold) items")
+                    .font(.caption)
+            }
+
             Text("Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -127,7 +209,7 @@ struct DelegationScopeApprovalCard: View {
                 Button("Deny", action: onDeny)
                     .buttonStyle(.bordered)
                 Spacer()
-                Button("Grant") { onApprove(selected) }
+                Button("Grant") { onApprove(selected, threshold) }
                     .buttonStyle(.borderedProminent)
                     .disabled(selected.isEmpty)
             }
@@ -151,11 +233,13 @@ struct DelegationScopeApprovalCard: View {
     }
 
     private var kindDescription: String {
-        switch request.kind {
-        case .tree: "Scope: this session and the sessions it creates"
-        case .workspace: "Scope: every session in one workspace"
-        case .allSessions: "Scope: every session you own"
+        let requester = request.requesterTitle.map { "\"\($0)\" asks for " } ?? "Asks for "
+        let scope = switch request.kind {
+        case .tree: "this session and the sessions it creates"
+        case .workspace: "every session in workspace \"\(request.workspaceName ?? "this workspace")\""
+        case .allSessions: "every session you own"
         }
+        return requester + scope
     }
 
     private var guardrailSummary: String {
@@ -168,8 +252,7 @@ struct DelegationScopeApprovalCard: View {
             let lifetime = Duration.seconds(seconds).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
             parts.append("expires \(lifetime) after you grant it")
         }
-        parts.append("bulk changes over \(guardrails.bulkConfirmationThreshold) items ask you first")
-        return "Guardrails: " + parts.joined(separator: " · ")
+        return parts.isEmpty ? "Guardrails: none beyond the bulk-change check" : "Guardrails: " + parts.joined(separator: " · ")
     }
 
     static func summary(for capability: DomainDelegationScopeCapability) -> String {

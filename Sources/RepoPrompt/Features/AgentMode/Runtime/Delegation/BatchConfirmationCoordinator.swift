@@ -23,7 +23,10 @@ struct PendingBatchConfirmation: Identifiable, Equatable {
     enum State: Equatable {
         case pending
         case approved
-        /// The approval authorized one application and cannot be replayed.
+        /// The approval is being applied right now. It authorizes nothing further, so a concurrent
+        /// replay cannot double-apply; a failed application returns the card to `approved`.
+        case applying
+        /// The approval was applied successfully and cannot be replayed.
         case consumed
         case denied(reason: String?)
         /// The bound scope was revoked, expired, or re-generated before a decision.
@@ -40,6 +43,8 @@ struct PendingBatchConfirmation: Identifiable, Equatable {
     let granteeTabID: UUID?
     let reason: DomainDelegationScopeConfirmationReason
     let items: [BatchConfirmationItem]
+    /// `DomainDelegationScopeArgumentsDigest` of the arguments the card was raised for.
+    let argumentsDigest: String
     let createdAt: Date
     var untickedSessionIDs: Set<UUID> = []
     var state: State = .pending
@@ -61,14 +66,16 @@ struct PendingBatchConfirmation: Identifiable, Equatable {
             scopeGeneration: scopeGeneration,
             operation: operation,
             idempotencyKey: idempotencyKey,
-            approvedSessionIDs: approvedSessionIDs
+            approvedSessionIDs: approvedSessionIDs,
+            argumentsDigest: argumentsDigest
         )
     }
 }
 
 enum BatchConfirmationRequestResult: Equatable {
     case created(PendingBatchConfirmation)
-    /// An identical retry under the same key: same scope generation, operation, and item set.
+    /// An identical retry under the same key: same scope generation, operation, item set, and
+    /// arguments.
     case existing(PendingBatchConfirmation)
     /// The key is already bound to a different request.
     case idempotencyConflict
@@ -106,13 +113,16 @@ final class BatchConfirmationCoordinator: ObservableObject {
         idempotencyKey: String,
         granteeTabID: UUID?,
         reason: DomainDelegationScopeConfirmationReason,
-        items: [BatchConfirmationItem]
+        items: [BatchConfirmationItem],
+        argumentsDigest: String = ""
     ) -> BatchConfirmationRequestResult {
         let key = Key(granteeSessionID: scope.grant.granteeSessionID, idempotencyKey: idempotencyKey)
         if let existingID = confirmationIDByKey[key], let existing = confirmations[existingID] {
+            // Same key with different arguments is a conflict, never the earlier card.
             let sameRequest = existing.scopeID == scope.id
                 && existing.scopeGeneration == scope.generation
                 && existing.operation == operation
+                && existing.argumentsDigest == argumentsDigest
                 && existing.itemSessionIDs == Set(items.map(\.sessionID))
             return sameRequest ? .existing(existing) : .idempotencyConflict
         }
@@ -130,6 +140,7 @@ final class BatchConfirmationCoordinator: ObservableObject {
             granteeTabID: granteeTabID,
             reason: reason,
             items: items,
+            argumentsDigest: argumentsDigest,
             createdAt: now()
         )
         confirmations[confirmation.id] = confirmation
@@ -167,11 +178,21 @@ final class BatchConfirmationCoordinator: ObservableObject {
         return confirmation.domainConfirmation
     }
 
-    /// Marks an approved card as used. Called once its approval authorized an application, so the
-    /// same card cannot re-authorize the operation again.
-    func consume(confirmationID: UUID) {
-        guard var confirmation = confirmations[confirmationID], confirmation.state == .approved else { return }
-        confirmation.state = .consumed
+    /// Claims an approved card for one application before the handler runs. Returns `false` if the
+    /// card is not (or no longer) approved, so a concurrent replay cannot apply it twice.
+    @discardableResult
+    func beginApplying(confirmationID: UUID) -> Bool {
+        guard var confirmation = confirmations[confirmationID], confirmation.state == .approved else { return false }
+        confirmation.state = .applying
+        confirmations[confirmationID] = confirmation
+        return true
+    }
+
+    /// Settles a claimed card: `consumed` only after the handler succeeded; a failure returns it to
+    /// `approved` so the same approval can be retried.
+    func finishApplying(confirmationID: UUID, succeeded: Bool) {
+        guard var confirmation = confirmations[confirmationID], confirmation.state == .applying else { return }
+        confirmation.state = succeeded ? .consumed : .approved
         confirmations[confirmationID] = confirmation
     }
 
@@ -181,9 +202,12 @@ final class BatchConfirmationCoordinator: ObservableObject {
         confirmations[confirmationID] = confirmation
     }
 
-    /// Invalidates every undecided card bound to the scope (revocation, expiry, re-generation).
+    /// Invalidates every undecided or approved-but-unused card bound to the scope (revocation,
+    /// expiry, re-generation). An approval for a generation that no longer exists authorizes nothing.
     func invalidate(scopeID: UUID) {
-        for (id, confirmation) in confirmations where confirmation.scopeID == scopeID && confirmation.state == .pending {
+        for (id, confirmation) in confirmations
+            where confirmation.scopeID == scopeID && (confirmation.state == .pending || confirmation.state == .approved)
+        {
             var updated = confirmation
             updated.state = .invalidated
             confirmations[id] = updated

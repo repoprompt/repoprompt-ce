@@ -260,6 +260,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
         // bounded `.terminateLater` settlement above, never from work attempted here.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+        // Bounded synchronous write so a revocation made just before quitting is durable.
+        AgentSessionLinkRuntimeBridge.shared.delegationScopes.flushForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }

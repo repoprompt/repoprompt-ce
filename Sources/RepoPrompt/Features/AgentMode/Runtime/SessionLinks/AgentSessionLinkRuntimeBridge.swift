@@ -2084,6 +2084,8 @@ final class AgentSessionLinkRuntimeBridge {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         await invalidateSession(sessionID, reason: .sessionDeleted)
+        // No scope may keep acting for, or over a tree rooted at, a session that no longer exists.
+        delegationScopes.revokeAll(involving: sessionID)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
         // actor turn as the write. A separate read would leave a hop where an intervening row could be

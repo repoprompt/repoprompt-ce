@@ -97,10 +97,16 @@ struct SessionAdminMCPToolService {
                 guard let text = raw.stringValue, let workspaceID = UUID(uuidString: text) else {
                     throw MCPError.invalidParams("session_admin request_scope workspace must be a workspace UUID.")
                 }
-                kind = .workspace(workspaceID: workspaceID)
-            } else {
-                kind = .workspace(workspaceID: endpoint.workspaceID)
+                // Conservative default: a session may only ask for its own workspace.
+                guard workspaceID == endpoint.workspaceID else {
+                    return .object([
+                        "result": .string("invalid_request"),
+                        "code": .string("workspace_not_own"),
+                        "detail": .string("A workspace scope can only cover this session's own workspace.")
+                    ])
+                }
             }
+            kind = .workspace(workspaceID: endpoint.workspaceID)
         case "all_sessions":
             guard args["workspace"] == nil else {
                 throw MCPError.invalidParams("session_admin request_scope workspace applies only to kind=workspace.")
@@ -115,6 +121,11 @@ struct SessionAdminMCPToolService {
         let reason = try Self.parseReason(args["reason"])
         let idempotencyKey = try Self.parseIdempotencyKey(args["idempotency_key"], required: false)
 
+        let workspaceName: String? = if case let .workspace(workspaceID) = kind {
+            DelegationDisplayNames.workspaceName(workspaceID)
+        } else {
+            nil
+        }
         switch scopes().requestScope(
             requesterSessionID: endpoint.sessionID,
             requesterTabID: endpoint.tabID,
@@ -123,7 +134,9 @@ struct SessionAdminMCPToolService {
             guardrails: guardrails,
             expiresInSeconds: expiresInSeconds,
             reason: reason,
-            idempotencyKey: idempotencyKey
+            idempotencyKey: idempotencyKey,
+            requesterTitle: DelegationDisplayNames.sessionTitle(endpoint.sessionID),
+            workspaceName: workspaceName
         ) {
         case let .success(request):
             var value = Self.requestValue(request)
@@ -235,6 +248,11 @@ struct SessionAdminMCPToolService {
         guard let operation = DomainAgentSessionTargetOperation(rawValue: "session_admin.\(op)") else {
             throw Self.notImplemented(op)
         }
+        if operation.isScopeLevel {
+            for key in ["targets", "session_id", "filter"] where args[key] != nil {
+                throw MCPError.invalidParams("session_admin \(op) names no target; '\(key)' is not supported.")
+            }
+        }
         if args["filter"] != nil {
             throw MCPError.invalidParams("session_admin filter is not supported yet; pass targets or session_id.")
         }
@@ -268,9 +286,33 @@ struct SessionAdminMCPToolService {
             ])
         case let .notImplemented(operation):
             throw Self.notImplemented(operation.rawValue)
+        case .denied(.confirmationMismatch, _):
+            // Recoverable for the card's own grantee: report what the user actually approved.
+            let card = request.confirmationID.flatMap {
+                scopes().confirmations.confirmation(id: $0, granteeSessionID: endpoint.sessionID)
+            }
+            return Self.confirmationMismatchValue(card)
         case let .denied(denial, sessionID):
             return try Self.deniedValue(denial, sessionID: sessionID)
         }
+    }
+
+    static func confirmationMismatchValue(_ card: PendingBatchConfirmation?) -> Value {
+        var value: [String: Value] = [
+            "result": .string("denied"),
+            "code": .string("confirmation_mismatch"),
+            "detail": .string(
+                "The approved card does not cover this call. Repeat the original call unchanged (same op, arguments, and idempotency_key) with confirmation_id, limited to approved_session_ids; changed arguments need a new card."
+            )
+        ]
+        if let card {
+            value["confirmation_id"] = .string(card.id.uuidString)
+            value["approved_session_ids"] = .array(
+                card.items.map(\.sessionID).filter(card.approvedSessionIDs.contains).map { .string($0.uuidString) }
+            )
+            value["state"] = confirmationValue(card).objectValue?["result"] ?? .null
+        }
+        return .object(value)
     }
 
     // MARK: - Rendering
@@ -357,6 +399,7 @@ struct SessionAdminMCPToolService {
         let state = switch card.state {
         case .pending: "pending_confirmation"
         case .approved: "approved"
+        case .applying: "applying"
         case .consumed: "applied"
         case .denied: "denied"
         case .invalidated: "invalidated"
@@ -449,6 +492,11 @@ struct SessionAdminMCPToolService {
                 ?? DomainDelegationScopeGuardrails.defaultBulkConfirmationThreshold
         )
         let expiresInSeconds = try integer("expires_in_seconds", minimum: DelegationScopeRuntime.minimumExpirySeconds)
+        if let expiresInSeconds, expiresInSeconds > DelegationScopeRuntime.maximumExpirySeconds {
+            throw MCPError.invalidParams(
+                "session_admin guardrails.expires_in_seconds must be at most \(DelegationScopeRuntime.maximumExpirySeconds)."
+            )
+        }
         return (guardrails, expiresInSeconds)
     }
 
