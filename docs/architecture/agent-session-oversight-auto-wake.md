@@ -55,7 +55,13 @@ Rules that hold the scope design together:
 - **Uniform denials.** Only `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`,
   and `confirmation_required` are caller-visible. Unknown scopes, non-grantees, non-members, and
   unresolved callers all receive the existing uniform "not available / not found" text.
-- **`.allSessions` scopes** hold only `observe`, `organize`, and `restructure`.
+- **`.allSessions` scopes** hold only `observe`, `organize`, and `restructure`. They can `retire`
+  (stop + release + archive) idle or finished members, which needs `organize` + `restructure`;
+  stopping a running (or unknown-state) member additionally needs `control`, so such members are
+  reported per item as `requires_control` and never stopped. The requirement depends on the target's
+  app-presented run state and is never granted implicitly.
+- **`destructive` is a reserved flag.** No operation requires it. `retire` and `worktree_release`
+  (unbind + mark stale, needs `worktree`) always raise a batch card regardless of the threshold.
 - **Human-only stays human-only.** Deleting sessions, removing or pruning worktrees, keys and
   providers, permission modes, MCP approvals and server control, settings writes, app quit/update,
   and handoff instructions are not capabilities. `agent_manage.cleanup_sessions` refuses the scope

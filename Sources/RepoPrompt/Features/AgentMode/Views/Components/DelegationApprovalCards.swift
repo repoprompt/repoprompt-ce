@@ -180,7 +180,7 @@ struct DelegationScopeApprovalCard: View {
         case .restructure: "Link, unlink, re-parent, release"
         case .spawn: "Start sessions and nested overseers"
         case .worktree: "Create and bind worktrees, merge preview"
-        case .destructive: "Bulk retire and worktree release (always asks you)"
+        case .destructive: "Reserved; retire and worktree release always ask you regardless"
         }
     }
 }
@@ -247,7 +247,7 @@ struct BatchConfirmationCard: View {
 
     private var reasonText: String {
         switch confirmation.reason {
-        case .destructive: "destructive change"
+        case .destructive: "always confirmed"
         case .adoption: "adds sessions to the scope"
         case .bulkThreshold: "large bulk change"
         }

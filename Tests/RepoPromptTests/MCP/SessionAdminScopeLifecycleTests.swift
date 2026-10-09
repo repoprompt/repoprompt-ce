@@ -83,10 +83,16 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
     final class FakeProvenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
 
-        func add(_ id: UUID, parent: UUID?, workspace: UUID? = nil, live: Bool = true) {
+        func add(
+            _ id: UUID,
+            parent: UUID?,
+            workspace: UUID? = nil,
+            live: Bool = true,
+            state: DomainDelegationScopeTargetState = .idle
+        ) {
             sessions[id] = DelegationSessionProvenance(
                 sessionID: id, workspaceID: workspace, parentSessionID: parent,
-                createdByOverseerSessionID: nil, isLive: live
+                createdByOverseerSessionID: nil, isLive: live, runState: state
             )
         }
 
@@ -332,13 +338,13 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             )
         }
 
-        guard case let .pendingConfirmation(card) = try await fixture.core.perform(request([a, b, c])) else {
+        guard case let .pendingConfirmation(card, _) = try await fixture.core.perform(request([a, b, c])) else {
             return XCTFail("three items over a threshold of two must raise a card")
         }
         XCTAssertEqual(card.reason, .bulkThreshold)
         XCTAssertEqual(card.scopeID, scope.id)
         XCTAssertEqual(fixture.runtime.confirmations.pendingConfirmations(forTab: tab).map(\.id), [card.id])
-        guard case let .pendingConfirmation(replayed) = try await fixture.core.perform(request([a, b, c])) else {
+        guard case let .pendingConfirmation(replayed, _) = try await fixture.core.perform(request([a, b, c])) else {
             return XCTFail("an identical retry returns the same card")
         }
         XCTAssertEqual(replayed.id, card.id)
@@ -358,7 +364,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(handler.batches.single?.confirmation?.approvedSessionIDs, [a, b])
 
         // The approval was consumed: replaying the carded request cannot re-authorize it.
-        guard case let .pendingConfirmation(spent) = try await fixture.core.perform(request([a, b, c], confirmation: card.id)) else {
+        guard case let .pendingConfirmation(spent, _) = try await fixture.core.perform(request([a, b, c], confirmation: card.id)) else {
             return XCTFail("a consumed card authorizes nothing")
         }
         XCTAssertEqual(spent.id, card.id)
@@ -386,9 +392,9 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertNil(denial.publicCode, "non-membership is never disclosed with a specific code")
         XCTAssertThrowsError(try SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID))
 
-        guard case let .pendingConfirmation(card) = try await fixture.core.perform(.init(
+        guard case let .pendingConfirmation(card, _) = try await fixture.core.perform(.init(
             operation: .adminRetire, caller: .agentSession(overseer), targetSessionIDs: [member], idempotencyKey: "retire-1"
-        )) else { return XCTFail("destructive ops always raise a card") }
+        )) else { return XCTFail("retire always raises a card") }
         XCTAssertEqual(card.reason, .destructive)
         fixture.runtime.revoke(scopeID: scope.id)
         XCTAssertEqual(fixture.runtime.confirmations.confirmation(id: card.id, granteeSessionID: overseer)?.state, .invalidated)
@@ -397,6 +403,45 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             operation: .adminRename, caller: .agentSession(overseer), targetSessionIDs: [member]
         )) else { return XCTFail("no live scope remains") }
         XCTAssertTrue(handler.batches.isEmpty)
+    }
+
+    func testCoreRetireCardsIdleMembersAndReportsRunningOnesWithoutControl() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        let idle = UUID()
+        let running = UUID()
+        fixture.source.add(overseer, parent: nil)
+        fixture.source.add(idle, parent: overseer, state: .idle)
+        fixture.source.add(running, parent: overseer, state: .running)
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.organize, .restructure], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try fixture.runtime.approve(requestID: request.id).get()
+        let handler = RecordingHandler([.adminRetire])
+        fixture.core.register(handler)
+        func retire(_ confirmation: UUID? = nil, targets: [UUID]) -> AgentSessionAdministrationRequest {
+            .init(
+                operation: .adminRetire, caller: .agentSession(overseer), targetSessionIDs: targets,
+                idempotencyKey: "retire-mixed", confirmationID: confirmation
+            )
+        }
+
+        guard case let .pendingConfirmation(card, requiresControl) = try await fixture.core.perform(retire(targets: [idle, running])) else {
+            return XCTFail("the idle member is carded")
+        }
+        XCTAssertEqual(card.items.map(\.sessionID), [idle], "running members are never carded")
+        XCTAssertEqual(requiresControl, [running])
+        let rendered = try XCTUnwrap(SessionAdminMCPToolService.confirmationValue(card, itemsRequiringControl: requiresControl).objectValue)
+        XCTAssertEqual(rendered["requires_control"], .array([.string(running.uuidString)]))
+
+        XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+        guard case .completed = try await fixture.core.perform(retire(card.id, targets: [idle, running])) else {
+            return XCTFail("the approved idle member is retired")
+        }
+        let batch = try XCTUnwrap(handler.batches.single)
+        XCTAssertEqual(batch.admittedSessionIDs, [idle])
+        XCTAssertEqual(batch.itemsRequiringControl, [running], "the handler reports it and must not stop it")
     }
 
     func testCoreRefusesAdministrativeAndUnresolvedCallers() async throws {

@@ -37,6 +37,9 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
     package let memberships: [UUID: [DomainDelegationScopeMembershipProof]]
     /// Usage of the scope and every ancestor, keyed by scope ID. Needed only for guardrail operations.
     package let usageByScopeID: [UUID: DomainDelegationScopeUsage]
+    /// App-presented run state per target, for state-dependent requirements (`retire`). A missing
+    /// entry is `unknown`, which is treated as `running`.
+    package let targetStates: [UUID: DomainDelegationScopeTargetState]
     package let idempotencyKey: String?
     package let confirmation: DomainDelegationScopeConfirmation?
 
@@ -48,6 +51,7 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
         targetSessionIDs: [UUID] = [],
         memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:],
         usageByScopeID: [UUID: DomainDelegationScopeUsage] = [:],
+        targetStates: [UUID: DomainDelegationScopeTargetState] = [:],
         idempotencyKey: String? = nil,
         confirmation: DomainDelegationScopeConfirmation? = nil
     ) {
@@ -58,14 +62,19 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
         self.targetSessionIDs = targetSessionIDs
         self.memberships = memberships
         self.usageByScopeID = usageByScopeID
+        self.targetStates = targetStates
         self.idempotencyKey = idempotencyKey
         self.confirmation = confirmation
     }
 }
 
 package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
-    /// Every target is authorized. Scope-level operations return an empty lease list.
-    case authorized(leases: [DomainDelegationScopeLease], basis: [DomainAgentSessionAuthorityBasis])
+    /// Every admitted target is authorized; `requires_control` items are set aside, not failed.
+    /// Scope-level operations return no leases.
+    case authorized(DomainDelegationScopeAuthorizedItems)
+    /// Steps 1–4 passed for the admitted items, but a batch card must be approved first. The card
+    /// lists exactly the admitted items.
+    case confirmationRequired(DomainDelegationScopeConfirmationReason, DomainDelegationScopeAuthorizedItems)
     /// The first failing check. `sessionID` names the failing target when there is one.
     case denied(DomainDelegationScopeDenial, sessionID: UUID?)
 
@@ -75,8 +84,14 @@ package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
     }
 
     package var denial: DomainDelegationScopeDenial? {
-        guard case let .denied(denial, _) = self else { return nil }
-        return denial
+        switch self {
+        case .authorized:
+            nil
+        case let .confirmationRequired(reason, _):
+            .confirmationRequired(reason: reason)
+        case let .denied(denial, _):
+            denial
+        }
     }
 }
 
@@ -89,11 +104,14 @@ package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
 ///
 /// Decision order for a target-bearing operation (design §2.7):
 /// 1. the caller's scope is live (granted to this caller, active, not expired, generation matches);
-/// 2. the required capability is held — checked before membership because it does not depend on
-///    the target, so a capability denial reveals nothing about whether a session is a member;
+/// 2. the state-independent capabilities are held — checked before membership because they do
+///    not depend on the target, so a capability denial reveals nothing about membership;
 /// 3. each target's app-presented membership proofs are valid for the scope and every ancestor;
+///    a member whose run state demands more (`retire` of a running target needs `control`) is set
+///    aside as `requires_control` rather than failing the batch, and is never granted implicitly;
 /// 4. guardrails allow the operation (spawn and worktree creation);
-/// 5. a batch confirmation card is not required, or a matching approved one is presented.
+/// 5. a batch confirmation card is not required for the admitted items, or a matching approved
+///    one is presented.
 package struct DomainDelegationScopeAuthority: Sendable {
     private var records: [UUID: DomainDelegationScopeRecord] = [:]
     private var lastGeneration: UInt64 = 0
@@ -352,6 +370,9 @@ package struct DomainDelegationScopeAuthority: Sendable {
     // MARK: - Leases
 
     /// Issues a lease for one target after decision steps 1–3.
+    ///
+    /// - Parameter targetState: the target's app-presented run state; only state-dependent
+    ///   operations read it. `unknown` (the default) is treated as `running`.
     package func lease(
         scopeID: UUID,
         presentedGeneration: UInt64,
@@ -359,6 +380,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         operation: DomainAgentSessionTargetOperation,
         targetSessionID: UUID,
         memberships: [DomainDelegationScopeMembershipProof],
+        targetState: DomainDelegationScopeTargetState = .unknown,
         now: Date
     ) -> Result<DomainDelegationScopeLease, DomainDelegationScopeDenial> {
         let live: DomainDelegationScopeRecord
@@ -369,10 +391,13 @@ package struct DomainDelegationScopeAuthority: Sendable {
         guard !operation.isScopeLevel, let capability = operation.requiredScopeCapability else {
             return .failure(.operationNotScopeAuthorizable)
         }
-        // The capability does not depend on the target, so it is checked before membership: a
-        // capability denial is then identical for members and non-members and probes nothing.
-        guard Self.holds(capability, in: live.grant) else {
-            return .failure(.capabilityMissing(capability))
+        // The idle-state requirement does not depend on the target, so it is checked before
+        // membership: a capability denial is identical for members and non-members and probes nothing.
+        let baseline = operation.requiredScopeCapabilities(for: .idle)
+        if let missing = DomainDelegationScopeCapability.allCases.first(where: {
+            baseline.contains($0) && !Self.holds($0, in: live.grant)
+        }) {
+            return .failure(.capabilityMissing(missing))
         }
         if operation.requiresScopeMembership || operation.family != .delegation {
             // An attenuated scope covers only sessions that are members of every ancestor too.
@@ -387,6 +412,12 @@ package struct DomainDelegationScopeAuthority: Sendable {
         }
         if operation.deniesScopeSelfTarget, targetSessionID == caller.agentSessionID {
             return .failure(.selfTarget)
+        }
+        // State-dependent extras (stopping a running target needs `control`) are checked only for an
+        // established member, and are never granted implicitly.
+        let extra = operation.requiredScopeCapabilities(for: targetState).subtracting(baseline)
+        if extra.contains(where: { !Self.holds($0, in: live.grant) }) {
+            return .failure(.requiresControl)
         }
         return .success(DomainDelegationScopeLease(
             scopeID: live.id,
@@ -469,7 +500,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         switch operation.scopeConfirmationClass {
         case .none:
             nil
-        case .destructive:
+        case .alwaysCarded:
             .destructive
         case .adoption:
             .adoption
@@ -524,7 +555,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
             guard Self.holds(capability, in: live.grant) else {
                 return .denied(.capabilityMissing(capability), sessionID: nil)
             }
-            return .authorized(leases: [], basis: [])
+            return .authorized(DomainDelegationScopeAuthorizedItems())
         }
 
         guard !request.targetSessionIDs.isEmpty else {
@@ -532,6 +563,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         }
         var leases: [DomainDelegationScopeLease] = []
         var bases: [DomainAgentSessionAuthorityBasis] = []
+        var itemsRequiringControl: [UUID] = []
         for targetSessionID in request.targetSessionIDs {
             let issued = lease(
                 scopeID: request.scopeID,
@@ -540,9 +572,13 @@ package struct DomainDelegationScopeAuthority: Sendable {
                 operation: operation,
                 targetSessionID: targetSessionID,
                 memberships: request.memberships[targetSessionID] ?? [],
+                targetState: request.targetStates[targetSessionID] ?? .unknown,
                 now: now
             )
             switch issued {
+            case .failure(.requiresControl):
+                // A member the operation would have to stop: reported per item, never granted.
+                itemsRequiringControl.append(targetSessionID)
             case let .failure(denial):
                 return .denied(denial, sessionID: targetSessionID)
             case let .success(lease):
@@ -577,25 +613,34 @@ package struct DomainDelegationScopeAuthority: Sendable {
             }
         }
 
-        if let reason = Self.confirmationRequirement(
-            operation: operation,
-            itemCount: request.targetSessionIDs.count,
-            guardrails: live.grant.guardrails
-        ) {
+        let items = DomainDelegationScopeAuthorizedItems(
+            leases: leases,
+            bases: bases,
+            itemsRequiringControl: itemsRequiringControl
+        )
+        // Only admitted items are carded or applied; with none admitted there is nothing to confirm.
+        let admitted = items.admittedSessionIDs
+        if !admitted.isEmpty,
+           let reason = Self.confirmationRequirement(
+               operation: operation,
+               itemCount: admitted.count,
+               guardrails: live.grant.guardrails
+           )
+        {
             guard let confirmation = request.confirmation else {
-                return .denied(.confirmationRequired(reason: reason), sessionID: nil)
+                return .confirmationRequired(reason, items)
             }
             guard Self.confirmationMatches(
                 confirmation,
                 scope: live,
                 operation: operation,
                 idempotencyKey: request.idempotencyKey,
-                targetSessionIDs: request.targetSessionIDs
+                targetSessionIDs: admitted
             ) else {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }
         }
-        return .authorized(leases: leases, basis: bases)
+        return .authorized(items)
     }
 
     // MARK: - Private

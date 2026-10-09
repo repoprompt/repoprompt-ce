@@ -252,8 +252,8 @@ struct SessionAdminMCPToolService {
         switch try await administration().perform(request) {
         case let .completed(value):
             return value
-        case let .pendingConfirmation(card):
-            return Self.confirmationValue(card)
+        case let .pendingConfirmation(card, itemsRequiringControl):
+            return Self.confirmationValue(card, itemsRequiringControl: itemsRequiringControl)
         case let .scopeSelectionRequired(scopeIDs):
             return Self.scopeSelectionRequiredValue(scopeIDs)
         case .idempotencyConflict:
@@ -351,7 +351,9 @@ struct SessionAdminMCPToolService {
         return .object(value)
     }
 
-    static func confirmationValue(_ card: PendingBatchConfirmation) -> Value {
+    /// Renders a card. `itemsRequiringControl` are running (or unknown-state) targets the operation
+    /// would have to stop without `control`; they are reported per item and never carded or applied.
+    static func confirmationValue(_ card: PendingBatchConfirmation, itemsRequiringControl: [UUID] = []) -> Value {
         let state = switch card.state {
         case .pending: "pending_confirmation"
         case .approved: "approved"
@@ -359,7 +361,7 @@ struct SessionAdminMCPToolService {
         case .denied: "denied"
         case .invalidated: "invalidated"
         }
-        return .object([
+        var value: [String: Value] = [
             "result": .string(state),
             "confirmation_id": .string(card.id.uuidString),
             "op": .string(card.operation.rawValue),
@@ -372,7 +374,11 @@ struct SessionAdminMCPToolService {
                     "approved": .bool(card.approvedSessionIDs.contains(item.sessionID))
                 ])
             })
-        ])
+        ]
+        if !itemsRequiringControl.isEmpty {
+            value["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
+        }
+        return .object(value)
     }
 
     private static func capabilitiesValue(_ capabilities: Set<DomainDelegationScopeCapability>) -> Value {

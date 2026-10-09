@@ -26,9 +26,13 @@ package enum DomainDelegationScopeCapability: String, CaseIterable, Codable, Has
     case restructure
     /// Start sessions and lanes, fork, and create nested overseers with attenuated sub-scopes.
     case spawn
-    /// Create/bind/unbind worktrees for members and merge preview.
+    /// Create/bind/unbind/release worktrees for members and merge preview.
     case worktree
-    /// Bulk retire and worktree release. Always routed through a batch confirmation card.
+    /// **Reserved flag.** No operation requires this capability. Deleting sessions and removing
+    /// worktrees are human-only, so nothing grantable is destructive in the deletion sense; the
+    /// operations that always force a batch confirmation card (`retire`, `worktree_release`) do so
+    /// through `DomainDelegationScopeConfirmationClass.alwaysCarded`, regardless of whether this
+    /// flag is held. Kept so presets and persisted grants remain stable.
     case destructive
 
     /// The only capabilities an `.allSessions` scope may hold (design §6 default 2).
@@ -65,6 +69,18 @@ package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashabl
     package var isGrantable: Bool {
         false
     }
+}
+
+// MARK: - Target state
+
+/// App-presented run state of one target, for operations whose requirement depends on it.
+///
+/// `unknown` is treated exactly like `running`, so an uncertain state can only demand more authority.
+package enum DomainDelegationScopeTargetState: String, Hashable, Sendable {
+    /// Idle or finished: nothing to stop.
+    case idle
+    case running
+    case unknown
 }
 
 // MARK: - Kind
@@ -468,12 +484,16 @@ package struct DomainDelegationScopeLease: Hashable, Sendable {
 
 /// Why a scope request or authorization failed.
 ///
-/// Four cases carry stable, caller-visible codes (design §2.7). Every other case is diagnostic only:
-/// callers must render it with the uniform "not found / not available" text so an Agent caller
-/// cannot probe whether an unrelated session or scope exists.
+/// Four cases carry stable, caller-visible batch codes (design §2.7), and `requiresControl` is a
+/// caller-visible per-item code. Every other case is diagnostic only: callers must render it with the
+/// uniform "not found / not available" text so an Agent caller cannot probe whether an unrelated
+/// session or scope exists.
 package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
-    // Caller-visible, recoverable.
+    /// Caller-visible and recoverable: the scope does not hold this capability.
     case capabilityMissing(DomainDelegationScopeCapability)
+    /// Per item, not per batch: the target is running (or its state is unknown) and the operation
+    /// would have to stop it, which needs `control`. Reported alongside the authorized items.
+    case requiresControl
     case guardrailExceeded(guardrail: DomainDelegationScopeGuardrail, limit: Int, current: Int)
     case expired
     case confirmationRequired(reason: DomainDelegationScopeConfirmationReason)
@@ -504,6 +524,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     package var publicCode: String? {
         switch self {
         case .capabilityMissing: "scope_capability_missing"
+        case .requiresControl: "requires_control"
         case .guardrailExceeded: "scope_guardrail_exceeded"
         case .expired: "scope_expired"
         case .confirmationRequired: "confirmation_required"
@@ -515,6 +536,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     package var diagnosticLabel: String {
         switch self {
         case .capabilityMissing: "capability_missing"
+        case .requiresControl: "requires_control"
         case .guardrailExceeded: "guardrail_exceeded"
         case .expired: "expired"
         case .confirmationRequired: "confirmation_required"
@@ -540,9 +562,34 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     }
 }
 
+/// The items one authorization admitted, and the items it set aside as needing `control`.
+package struct DomainDelegationScopeAuthorizedItems: Equatable, Sendable {
+    /// One lease per admitted target, in request order. Empty for scope-level operations.
+    package let leases: [DomainDelegationScopeLease]
+    package let bases: [DomainAgentSessionAuthorityBasis]
+    /// Running (or unknown-state) targets an operation would have to stop without `control`.
+    /// They are excluded from the batch and reported as `requires_control`, never failing it.
+    package let itemsRequiringControl: [UUID]
+
+    package init(
+        leases: [DomainDelegationScopeLease] = [],
+        bases: [DomainAgentSessionAuthorityBasis] = [],
+        itemsRequiringControl: [UUID] = []
+    ) {
+        self.leases = leases
+        self.bases = bases
+        self.itemsRequiringControl = itemsRequiringControl
+    }
+
+    package var admittedSessionIDs: [UUID] {
+        leases.map(\.targetSessionID)
+    }
+}
+
 /// Why an operation needs a batch confirmation card.
 package enum DomainDelegationScopeConfirmationReason: String, Hashable, Sendable {
-    /// Every `destructive` operation.
+    /// An operation that always forces a card (`retire`, `worktree_release`). The raw value is kept
+    /// stable for callers; it does not mean anything is deleted.
     case destructive
     /// Bringing sessions from outside the scope into it always needs the user's consent.
     case adoption

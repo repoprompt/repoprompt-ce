@@ -6,8 +6,9 @@ package enum DomainDelegationScopeConfirmationClass: String, Hashable, Sendable 
     case none
     /// Reversible; carded only when it affects more items than the scope threshold.
     case reversible
-    /// Always carded, regardless of item count.
-    case destructive
+    /// Always carded, regardless of item count (`retire`, `worktree_release`). This is the meaning
+    /// of the reserved `destructive` capability flag; it imposes no capability requirement.
+    case alwaysCarded
     /// Always carded: brings sessions from outside the scope into it.
     case adoption
 }
@@ -21,7 +22,9 @@ package enum DomainDelegationScopeGuardrailUse: String, Hashable, Sendable {
 }
 
 package extension DomainAgentSessionTargetOperation {
-    /// The single scope capability this operation requires, or `nil` when no scope may authorize it.
+    /// The primary scope capability this operation requires — the one its lease carries — or `nil`
+    /// when no scope may authorize it. Operations whose full requirement depends on the target's
+    /// run state (`retire`) also declare `requiredScopeCapabilities(for:)`.
     ///
     /// `nil` covers two different things: scope-lifecycle operations that are decided by the scope
     /// authority itself (`request_scope`, `scope_status`, `release_scope`), and human-only operations
@@ -50,17 +53,35 @@ package extension DomainAgentSessionTargetOperation {
             .organize
         case .adminLink, .adminUnlink, .adminReparent, .adminAdopt, .adminRelease:
             .restructure
+        case .adminRetire:
+            // Stop + release + archive. Its lease carries `restructure`; the full, state-dependent
+            // set is `requiredScopeCapabilities(for:)`.
+            .restructure
         case .adminSetModel, .adminSetEffort:
             .control
         case .adminSpawn, .adminFork, .adminAttenuate:
             .spawn
-        case .adminWorktreeCreate, .adminWorktreeBind, .adminWorktreeUnbind, .adminMergePreview, .adminMergeApply:
+        case .adminWorktreeCreate, .adminWorktreeBind, .adminWorktreeUnbind, .adminWorktreeRelease,
+             .adminMergePreview, .adminMergeApply:
+            // `worktree_release` unbinds and marks stale; it never deletes. Removing or pruning a
+            // worktree is human-only and has no operation identity at all.
             .worktree
-        case .adminRetire, .adminWorktreeRelease:
-            // Retire = stop + release + archive; worktree release = unbind + mark stale. Both are the
-            // design's `destructive` capability and are always carded. Deleting a session or removing
-            // a worktree is human-only and has no operation identity at all.
-            .destructive
+        }
+    }
+
+    /// Every scope capability this operation requires against a target in `state`.
+    ///
+    /// No operation ever requires the reserved `destructive` flag. `retire` needs `organize` +
+    /// `restructure` for an idle or finished target, so an `.allSessions` scope can retire idle
+    /// members; stopping a running (or unknown-state) target additionally needs `control`, and the
+    /// authority reports such items as `requires_control` instead of granting it implicitly.
+    func requiredScopeCapabilities(for state: DomainDelegationScopeTargetState) -> Set<DomainDelegationScopeCapability> {
+        guard let primary = requiredScopeCapability else { return [] }
+        switch self {
+        case .adminRetire:
+            return state == .idle ? [.organize, .restructure] : [.organize, .restructure, .control]
+        default:
+            return [primary]
         }
     }
 
@@ -97,7 +118,7 @@ package extension DomainAgentSessionTargetOperation {
     var scopeConfirmationClass: DomainDelegationScopeConfirmationClass {
         switch self {
         case .adminRetire, .adminWorktreeRelease:
-            .destructive
+            .alwaysCarded
         case .adminAdopt:
             .adoption
         case .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
@@ -109,15 +130,10 @@ package extension DomainAgentSessionTargetOperation {
         }
     }
 
-    /// Acting on oneself under `control` or `destructive` would let an agent answer its own prompt or
-    /// stop/retire itself through delegated authority; the scope basis refuses it.
+    /// Acting on oneself under `control`, or retiring oneself, would let an agent answer its own
+    /// prompt or stop/archive itself through delegated authority; the scope basis refuses it.
     var deniesScopeSelfTarget: Bool {
-        switch requiredScopeCapability {
-        case .control, .destructive:
-            true
-        default:
-            false
-        }
+        self == .adminRetire || requiredScopeCapability == .control
     }
 
     var scopeGuardrailUse: DomainDelegationScopeGuardrailUse? {

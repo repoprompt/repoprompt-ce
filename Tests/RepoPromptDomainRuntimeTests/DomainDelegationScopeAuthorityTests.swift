@@ -482,11 +482,12 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
             operation: .adminSetPin, caller: caller, scopeID: scope.id, presentedGeneration: scope.generation,
             targetSessionIDs: targets, memberships: memberships, idempotencyKey: "k1", confirmation: approved
         )
-        guard case let .authorized(leases, bases) = authority.authorize(withCard, now: now) else {
+        guard case let .authorized(items) = authority.authorize(withCard, now: now) else {
             return XCTFail("approved card must authorize")
         }
-        XCTAssertEqual(leases.map(\.targetSessionID), targets)
-        XCTAssertEqual(bases, Array(repeating: .delegationScope(scopeID: scope.id, generation: scope.generation, capability: .organize), count: 2))
+        XCTAssertEqual(items.admittedSessionIDs, targets)
+        XCTAssertEqual(items.bases, Array(repeating: .delegationScope(scopeID: scope.id, generation: scope.generation, capability: .organize), count: 2))
+        XCTAssertTrue(items.itemsRequiringControl.isEmpty)
 
         let wrongKey = DomainDelegationScopeAuthorizationRequest(
             operation: .adminSetPin, caller: caller, scopeID: scope.id, presentedGeneration: scope.generation,
@@ -518,13 +519,153 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         let inventory = authority.authorize(.init(
             operation: .adminInventory, caller: caller, scopeID: scope.id, presentedGeneration: scope.generation
         ), now: now)
-        XCTAssertEqual(inventory, .authorized(leases: [], basis: []))
+        XCTAssertEqual(inventory, .authorized(DomainDelegationScopeAuthorizedItems()))
 
         let worktreeInventoryWithoutCapability = authority.authorize(.init(
             operation: .adminWorktreeInventory, caller: .agentSession(outsider), scopeID: scope.id,
             presentedGeneration: scope.generation
         ), now: now)
         XCTAssertEqual(worktreeInventoryWithoutCapability.denial, .granteeMismatch)
+    }
+
+    // MARK: - Retire and worktree release
+
+    private func retireRequest(
+        _ scope: DomainDelegationScopeRecord,
+        targets: [UUID: DomainDelegationScopeTargetState?],
+        order: [UUID],
+        basis: (UUID) -> DomainDelegationScopeMembershipProof.Basis,
+        confirmation: DomainDelegationScopeConfirmation? = nil,
+        operation: DomainAgentSessionTargetOperation = .adminRetire
+    ) -> DomainDelegationScopeAuthorizationRequest {
+        var states: [UUID: DomainDelegationScopeTargetState] = [:]
+        for (id, state) in targets {
+            if let state { states[id] = state }
+        }
+        return .init(
+            operation: operation, caller: caller, scopeID: scope.id, presentedGeneration: scope.generation,
+            targetSessionIDs: order,
+            memberships: Dictionary(uniqueKeysWithValues: order.map {
+                ($0, [DomainDelegationScopeMembershipProof(scopeID: scope.id, targetSessionID: $0, basis: basis($0))])
+            }),
+            targetStates: states, idempotencyKey: "retire-key", confirmation: confirmation
+        )
+    }
+
+    private func approval(
+        _ scope: DomainDelegationScopeRecord,
+        _ ids: Set<UUID>,
+        operation: DomainAgentSessionTargetOperation = .adminRetire
+    ) -> DomainDelegationScopeConfirmation {
+        .init(
+            confirmationID: UUID(), scopeID: scope.id, scopeGeneration: scope.generation,
+            operation: operation, idempotencyKey: "retire-key", approvedSessionIDs: ids
+        )
+    }
+
+    func testAllSessionsScopeCanRetireIdleMembers() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(granteeSessionID: overseer, kind: .allSessions, capabilities: DomainDelegationScopeCapability.organizeEverythingPreset, guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        let request = retireRequest(scope, targets: [child: .idle], order: [child], basis: { _ in .allSessions })
+        // Always carded, even for one item under the threshold.
+        XCTAssertEqual(
+            authority.authorize(request, now: now),
+            .confirmationRequired(.destructive, .init(
+                leases: [DomainDelegationScopeLease(scopeID: scope.id, generation: scope.generation, capability: .restructure, granteeSessionID: overseer, targetSessionID: child)],
+                bases: [.delegationScope(scopeID: scope.id, generation: scope.generation, capability: .restructure)]
+            ))
+        )
+        let approved = retireRequest(scope, targets: [child: .idle], order: [child], basis: { _ in .allSessions }, confirmation: approval(scope, [child]))
+        guard case let .authorized(items) = authority.authorize(approved, now: now) else {
+            return XCTFail("an .allSessions scope retires idle members")
+        }
+        XCTAssertEqual(items.admittedSessionIDs, [child])
+        XCTAssertTrue(items.itemsRequiringControl.isEmpty)
+    }
+
+    func testAllSessionsScopeReportsRunningMembersAsRequiresControl() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(granteeSessionID: overseer, kind: .allSessions, capabilities: DomainDelegationScopeCapability.organizeEverythingPreset, guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        // A mixed batch: the idle member is carded, the running and unknown-state ones are set aside.
+        let mixed = retireRequest(
+            scope, targets: [child: .idle, grandchild: .running, outsider: nil],
+            order: [child, grandchild, outsider], basis: { _ in .allSessions }
+        )
+        guard case let .confirmationRequired(reason, items) = authority.authorize(mixed, now: now) else {
+            return XCTFail("the idle member still needs its card")
+        }
+        XCTAssertEqual(reason, .destructive)
+        XCTAssertEqual(items.admittedSessionIDs, [child])
+        XCTAssertEqual(items.itemsRequiringControl, [grandchild, outsider], "unknown state counts as running")
+
+        // All running: nothing to confirm or apply, every item is reported, the batch does not fail.
+        let running = retireRequest(scope, targets: [grandchild: .running], order: [grandchild], basis: { _ in .allSessions })
+        XCTAssertEqual(authority.authorize(running, now: now), .authorized(.init(itemsRequiringControl: [grandchild])))
+        XCTAssertEqual(DomainDelegationScopeDenial.requiresControl.publicCode, "requires_control")
+    }
+
+    func testTreeScopeWithControlRetiresRunningMembersAndWithoutItDoesNot() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let withControl = try grantTree(&authority, capabilities: [.organize, .restructure, .control])
+        let request = retireRequest(
+            withControl, targets: [child: .running], order: [child], basis: { _ in .treePath([self.child, self.overseer]) },
+            confirmation: approval(withControl, [child])
+        )
+        guard case let .authorized(items) = authority.authorize(request, now: now) else {
+            return XCTFail("control authorizes stopping a running member")
+        }
+        XCTAssertEqual(items.admittedSessionIDs, [child])
+        XCTAssertTrue(items.itemsRequiringControl.isEmpty)
+
+        var other = DomainDelegationScopeAuthority()
+        let withoutControl = try grantTree(&other, capabilities: [.organize, .restructure])
+        let refused = retireRequest(
+            withoutControl, targets: [child: .running], order: [child], basis: { _ in .treePath([self.child, self.overseer]) }
+        )
+        XCTAssertEqual(other.authorize(refused, now: now), .authorized(.init(itemsRequiringControl: [child])))
+
+        // `organize` + `restructure` are both required even for idle targets.
+        var partial = DomainDelegationScopeAuthority()
+        let restructureOnly = try grantTree(&partial, capabilities: [.restructure])
+        let missing = retireRequest(
+            restructureOnly, targets: [child: .idle], order: [child], basis: { _ in .treePath([self.child, self.overseer]) }
+        )
+        XCTAssertEqual(partial.authorize(missing, now: now).denial, .capabilityMissing(.organize))
+    }
+
+    func testWorktreeReleaseNeedsWorktreeAndAlwaysConfirms() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try grantTree(&authority, capabilities: [.worktree], guardrails: .init(bulkConfirmationThreshold: 25))
+        let one = retireRequest(
+            scope, targets: [child: .running], order: [child], basis: { _ in .treePath([self.child, self.overseer]) },
+            operation: .adminWorktreeRelease
+        )
+        guard case let .confirmationRequired(reason, items) = authority.authorize(one, now: now) else {
+            return XCTFail("worktree_release is always carded")
+        }
+        XCTAssertEqual(reason, .destructive)
+        XCTAssertEqual(items.admittedSessionIDs, [child], "run state does not matter for worktree_release")
+        let approved = retireRequest(
+            scope, targets: [child: .running], order: [child], basis: { _ in .treePath([self.child, self.overseer]) },
+            confirmation: approval(scope, [child], operation: .adminWorktreeRelease), operation: .adminWorktreeRelease
+        )
+        XCTAssertTrue(authority.authorize(approved, now: now).isAuthorized)
+
+        var everything = DomainDelegationScopeAuthority()
+        let allSessions = try everything.grant(
+            .init(granteeSessionID: overseer, kind: .allSessions, capabilities: DomainDelegationScopeCapability.organizeEverythingPreset, guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        let refused = retireRequest(
+            allSessions, targets: [child: .idle], order: [child], basis: { _ in .allSessions }, operation: .adminWorktreeRelease
+        )
+        XCTAssertEqual(everything.authorize(refused, now: now).denial, .capabilityMissing(.worktree))
     }
 
     // MARK: - Operation authorizer integration
@@ -541,8 +682,8 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
             .adminSetModel: .control, .adminSetEffort: .control,
             .adminSpawn: .spawn, .adminFork: .spawn, .adminAttenuate: .spawn,
             .adminWorktreeCreate: .worktree, .adminWorktreeBind: .worktree, .adminWorktreeUnbind: .worktree,
-            .adminMergePreview: .worktree, .adminMergeApply: .worktree,
-            .adminRetire: .destructive, .adminWorktreeRelease: .destructive
+            .adminMergePreview: .worktree, .adminMergeApply: .worktree, .adminWorktreeRelease: .worktree,
+            .adminRetire: .restructure
         ]
         let delegation = DomainAgentSessionTargetOperation.allCases.filter { $0.family == .delegation }
         XCTAssertEqual(Set(delegation), Set(expected.keys))
@@ -551,7 +692,19 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
             XCTAssertNil(operation.requiredMonitorCapability, operation.rawValue)
             XCTAssertFalse(operation.isObserverScoped, operation.rawValue)
             XCTAssertTrue(operation.rawValue.hasPrefix("session_admin."), operation.rawValue)
+            // `destructive` is a reserved always-card flag: no operation requires it in any state.
+            for state in [DomainDelegationScopeTargetState.idle, .running, .unknown] {
+                XCTAssertFalse(operation.requiredScopeCapabilities(for: state).contains(.destructive), operation.rawValue)
+            }
         }
+        for operation in DomainAgentSessionTargetOperation.allCases {
+            XCTAssertNotEqual(operation.requiredScopeCapability, .destructive, operation.rawValue)
+        }
+        XCTAssertEqual(DomainAgentSessionTargetOperation.adminRetire.requiredScopeCapabilities(for: .idle), [.organize, .restructure])
+        XCTAssertEqual(DomainAgentSessionTargetOperation.adminRetire.requiredScopeCapabilities(for: .running), [.organize, .restructure, .control])
+        XCTAssertEqual(DomainAgentSessionTargetOperation.adminRetire.requiredScopeCapabilities(for: .unknown), [.organize, .restructure, .control])
+        XCTAssertEqual(DomainAgentSessionTargetOperation.adminRetire.scopeConfirmationClass, .alwaysCarded)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.adminWorktreeRelease.scopeConfirmationClass, .alwaysCarded)
     }
 
     func testDelegationOperationsAcceptOnlyAnExactScopeLease() {

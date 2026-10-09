@@ -40,21 +40,40 @@ struct AgentSessionAdministrationRequest {
         self.preview = preview
         self.arguments = arguments
     }
+
+    /// The same request narrowed to `targets` (the admitted subset).
+    func narrowed(to targets: [UUID]) -> AgentSessionAdministrationRequest {
+        AgentSessionAdministrationRequest(
+            operation: operation, caller: caller, callerTabID: callerTabID, scopeID: scopeID,
+            targetSessionIDs: targets, idempotencyKey: idempotencyKey, confirmationID: confirmationID,
+            preview: preview, arguments: arguments
+        )
+    }
 }
 
 /// Everything a handler needs after the single authority check passed.
 struct AgentSessionAdministrationAuthorizedBatch {
     let request: AgentSessionAdministrationRequest
     let scope: DomainDelegationScopeRecord
-    /// One lease per target, in request order. Empty for scope-level operations.
+    /// One lease per admitted target, in request order. Empty for scope-level operations. A handler
+    /// acts on these targets only.
     let leases: [DomainDelegationScopeLease]
     let bases: [DomainAgentSessionAuthorityBasis]
+    /// Targets the operation would have to stop without `control` (running or unknown state). The
+    /// handler reports them per item as `requires_control` and must not act on them.
+    let itemsRequiringControl: [UUID]
     /// The approved card when one was required.
     let confirmation: DomainDelegationScopeConfirmation?
+
+    var admittedSessionIDs: [UUID] {
+        leases.map(\.targetSessionID)
+    }
 }
 
 enum AgentSessionAdministrationAuthorization {
     case authorized(AgentSessionAdministrationAuthorizedBatch)
+    /// Steps 1–4 passed for the batch's admitted items; a card must be approved first.
+    case confirmationRequired(DomainDelegationScopeConfirmationReason, AgentSessionAdministrationAuthorizedBatch)
     case denied(DomainDelegationScopeDenial, sessionID: UUID?)
     /// The caller holds more than one live scope and named none.
     case scopeSelectionRequired(scopeIDs: [UUID])
@@ -62,7 +81,8 @@ enum AgentSessionAdministrationAuthorization {
 
 enum AgentSessionAdministrationOutcome {
     case completed(Value)
-    case pendingConfirmation(PendingBatchConfirmation)
+    /// One card for the admitted items; `itemsRequiringControl` were set aside, not carded.
+    case pendingConfirmation(PendingBatchConfirmation, itemsRequiringControl: [UUID])
     case denied(DomainDelegationScopeDenial, sessionID: UUID?)
     case scopeSelectionRequired(scopeIDs: [UUID])
     case idempotencyConflict
@@ -161,6 +181,10 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         for target in request.targetSessionIDs {
             memberships[target] = chain.compactMap { projector.membershipProof(for: target, in: $0.grant) }
         }
+        var targetStates: [UUID: DomainDelegationScopeTargetState] = [:]
+        for target in request.targetSessionIDs {
+            targetStates[target] = projector.targetState(for: target)
+        }
         var usage: [UUID: DomainDelegationScopeUsage] = [:]
         if request.operation.scopeGuardrailUse != nil {
             for record in chain {
@@ -181,18 +205,25 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             targetSessionIDs: request.targetSessionIDs,
             memberships: memberships,
             usageByScopeID: usage,
+            targetStates: targetStates,
             idempotencyKey: request.idempotencyKey,
             confirmation: confirmation
         ))
-        switch outcome {
-        case let .authorized(leases, bases):
-            return .authorized(AgentSessionAdministrationAuthorizedBatch(
+        func batch(_ items: DomainDelegationScopeAuthorizedItems) -> AgentSessionAdministrationAuthorizedBatch {
+            AgentSessionAdministrationAuthorizedBatch(
                 request: request,
                 scope: scope,
-                leases: leases,
-                bases: bases,
+                leases: items.leases,
+                bases: items.bases,
+                itemsRequiringControl: items.itemsRequiringControl,
                 confirmation: confirmation
-            ))
+            )
+        }
+        switch outcome {
+        case let .authorized(items):
+            return .authorized(batch(items))
+        case let .confirmationRequired(reason, items):
+            return .confirmationRequired(reason, batch(items))
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)
         }
@@ -205,23 +236,22 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         switch authorize(request) {
         case let .scopeSelectionRequired(scopeIDs):
             return .scopeSelectionRequired(scopeIDs: scopeIDs)
-        case let .denied(.confirmationRequired(reason), _) where !request.preview:
-            guard let idempotencyKey = request.idempotencyKey,
-                  let callerSessionID = request.caller.agentSessionID,
-                  let scope = resolvedScope(for: request, callerSessionID: callerSessionID)
-            else {
+        case let .confirmationRequired(reason, pending):
+            // Lane B owns preview rendering; until then a preview reports the requirement only.
+            guard !request.preview, let idempotencyKey = request.idempotencyKey else {
                 return .denied(.confirmationRequired(reason: reason), sessionID: nil)
             }
+            // The card lists exactly the admitted items; `requires_control` items are reported, not carded.
             switch scopes.confirmations.request(
-                scope: scope,
+                scope: pending.scope,
                 operation: request.operation,
                 idempotencyKey: idempotencyKey,
                 granteeTabID: request.callerTabID,
                 reason: reason,
-                items: handler.confirmationItems(for: request, scope: scope)
+                items: handler.confirmationItems(for: request.narrowed(to: pending.admittedSessionIDs), scope: pending.scope)
             ) {
             case let .created(card), let .existing(card):
-                return .pendingConfirmation(card)
+                return .pendingConfirmation(card, itemsRequiringControl: pending.itemsRequiringControl)
             case .idempotencyConflict:
                 return .idempotencyConflict
             case .tooManyPending:
@@ -237,14 +267,5 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             }
             return try await .completed(handler.perform(batch))
         }
-    }
-
-    private func resolvedScope(
-        for request: AgentSessionAdministrationRequest,
-        callerSessionID: UUID
-    ) -> DomainDelegationScopeRecord? {
-        if let scopeID = request.scopeID { return scopes.record(id: scopeID) }
-        let live = scopes.liveScopes(grantedTo: callerSessionID)
-        return live.count == 1 ? live[0] : nil
     }
 }

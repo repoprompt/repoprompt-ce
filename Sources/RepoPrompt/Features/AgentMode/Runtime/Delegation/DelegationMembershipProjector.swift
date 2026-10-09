@@ -17,6 +17,8 @@ struct DelegationSessionProvenance: Hashable {
     let isLive: Bool
     /// Counts toward `maxWorktrees`.
     let worktreeCount: Int
+    /// Run state for state-dependent requirements (`retire` of a running target needs `control`).
+    let runState: DomainDelegationScopeTargetState
 
     init(
         sessionID: UUID,
@@ -25,7 +27,8 @@ struct DelegationSessionProvenance: Hashable {
         createdByOverseerSessionID: UUID?,
         organizationalParentID: UUID? = nil,
         isLive: Bool,
-        worktreeCount: Int = 0
+        worktreeCount: Int = 0,
+        runState: DomainDelegationScopeTargetState = .unknown
     ) {
         self.sessionID = sessionID
         self.workspaceID = workspaceID
@@ -34,6 +37,7 @@ struct DelegationSessionProvenance: Hashable {
         self.organizationalParentID = organizationalParentID
         self.isLive = isLive
         self.worktreeCount = worktreeCount
+        self.runState = runState
     }
 
     /// Tree placement: organizational parent, else spawn parent, else lane creator.
@@ -60,6 +64,8 @@ protocol DelegationMembershipProjector {
     ) -> DomainDelegationScopeMembershipProof?
     func members(of scope: DomainDelegationScopeGrant) -> [UUID]
     func usage(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage
+    /// App-observed run state; `unknown` (treated as running) when it cannot be established.
+    func targetState(for sessionID: UUID) -> DomainDelegationScopeTargetState
 }
 
 /// Membership from spawn provenance, with the organizational-parent seam.
@@ -97,6 +103,10 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
                 basis: .allSessions
             )
         }
+    }
+
+    func targetState(for sessionID: UUID) -> DomainDelegationScopeTargetState {
+        source.provenance(for: sessionID)?.runState ?? .unknown
     }
 
     func members(of scope: DomainDelegationScopeGrant) -> [UUID] {
@@ -165,11 +175,21 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
     }
 
     private static func provenance(entry: AgentSessionIndexEntry, window: WindowState) -> DelegationSessionProvenance {
-        // Guardrails must fail closed: a lookup that throws counts the session as live, so an
-        // uncertain census can only make `maxLiveSessions` stricter, never looser.
-        let isLive: Bool = switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: entry.id) }) {
-        case let .success(session): session != nil
-        case .failure: true
+        // Both facts fail closed: a lookup that throws counts the session as live (stricter
+        // `maxLiveSessions`) and its run state as unknown (treated as running, so stopping it needs
+        // `control`). A session with no live tab is idle or finished.
+        let isLive: Bool
+        let runState: DomainDelegationScopeTargetState
+        switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: entry.id) }) {
+        case let .success(session?):
+            isLive = true
+            runState = session.runState.isActive ? .running : .idle
+        case .success(nil):
+            isLive = false
+            runState = .idle
+        case .failure:
+            isLive = true
+            runState = .unknown
         }
         return DelegationSessionProvenance(
             sessionID: entry.id,
@@ -177,7 +197,8 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             parentSessionID: entry.parentSessionID,
             createdByOverseerSessionID: entry.createdByOverseerSessionID,
             isLive: isLive,
-            worktreeCount: entry.worktreeBindingSummaries.count
+            worktreeCount: entry.worktreeBindingSummaries.count,
+            runState: runState
         )
     }
 }
