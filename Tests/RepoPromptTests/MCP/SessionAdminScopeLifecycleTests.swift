@@ -1645,7 +1645,8 @@ final class SessionAdminStructureTests: XCTestCase {
         let row = try XCTUnwrap(inventory["worktrees"]?.arrayValue?.compactMap(\.objectValue).first { $0["worktree_id"] == .string("wt-1") })
         XCTAssertEqual(row["stale_flags"], .array([]), "bound elsewhere: neither unbound nor released")
         XCTAssertEqual(row["bound_session_ids"], .array([]), "a non-member is never named")
-        XCTAssertEqual(row["bound_outside_scope_count"], .int(1))
+        XCTAssertNil(row["bound_outside_scope_count"], "scope-restricted: sessions outside the scope are not counted either")
+        XCTAssertFalse(String(describing: inventory).contains(elsewhere.uuidString))
     }
 
     func testUnlinkStopsThroughTheBridgeAndRechecksBeforeTheStop() async throws {
@@ -1766,9 +1767,10 @@ final class SessionAdminStructureTests: XCTestCase {
         )
         frontDoor.registerOrganizingHandlers(backend: organizer, links: links)
         let host = StructureHost(provenance: provenance)
+        let worktreeHost = WorktreeHost()
         frontDoor.registerStructureHandlers(
             scopes: runtime, worktreeOwnership: WorktreeOwnershipStore(), projector: projector,
-            structureHost: host, worktreeHost: WorktreeHost()
+            structureHost: host, worktreeHost: worktreeHost
         )
         let request = try runtime.requestScope(
             requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
@@ -1808,6 +1810,14 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(host.placements.single?.session, outsider)
         XCTAssertEqual(host.placements.single?.parent, overseer)
         XCTAssertNotNil(frontDoor.appliedResult(forConfirmation: card.id))
+
+        // The front door's idempotency ledger replays a changed result: a retry never creates twice.
+        guard case let .completed(created) = try await perform(.adminWorktreeCreate, targets: [a], key: "wc"),
+              case let .completed(replayed) = try await perform(.adminWorktreeCreate, targets: [a], key: "wc")
+        else { return XCTFail("worktree_create completes") }
+        XCTAssertEqual(created.objectValue?["changed_count"], .int(1))
+        XCTAssertEqual(replayed.objectValue?["idempotent_replay"], .bool(true))
+        XCTAssertEqual(worktreeHost.created.count, 1)
     }
 
     func testWorktreeOwnershipStoreRoundTripsAndMarksReleased() async throws {

@@ -164,7 +164,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         ownership.recordCreation(info, createdBySessionID: caller, delegationScopeID: batch.scope.id, at: now())
         var reply: [String: Value] = [
             "result": .string("created"), "op": .string("worktree_create"),
-            "session_id": .string(target.uuidString), "worktree": info.value
+            "session_id": .string(target.uuidString), "worktree": info.value,
+            // Replayable by the front door's ledger: a retry with the same key never creates twice.
+            "changed_count": .int(1)
         ]
         if bindAfter {
             guard context.scopes.isCurrent(lease) else {
@@ -396,6 +398,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         }()
         let members = context.projector.members(of: batch.scope.grant)
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
+        let memberSet = Set(members)
+        let chainScopeIDs = Set(context.scopeChain(of: batch.scope).map(\.id))
         struct Row {
             var summary: AgentSessionWorktreeBindingSummary?
         }
@@ -408,7 +412,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // `unbound` and `released` are judged against bindings across every loaded session, not only
         // members: a worktree some other session still binds is in use.
         let boundEverywhere = host.allBoundWorktrees()
-        let owned = ownership.records(createdBy: Set(members))
+        let owned = ownership.records(createdBy: memberSet)
         for record in owned where rows[record.worktreeID] == nil {
             rows[record.worktreeID] = Row()
         }
@@ -421,8 +425,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             let lastActivity = [record?.createdAt, record?.releasedAt, row.summary?.boundAt].compactMap(\.self).max()
             let repoRoot = record?.repoRootPath ?? row.summary?.logicalRootPath
             let isPrunable = if path.isEmpty { true } else { await host.isWorktreePrunable(path: path, repoRoot: repoRoot) }
-            let boundSessionIDs = (boundEverywhere[worktreeID] ?? []).sorted { $0.uuidString < $1.uuidString }
-            let visibleBoundSessionIDs = boundSessionIDs.filter(Set(members).contains)
+            let boundSessionIDs = boundEverywhere[worktreeID] ?? []
+            let memberBindings = boundSessionIDs.filter(memberSet.contains).sorted { $0.uuidString < $1.uuidString }
+            // `unbound`/`released` consider every loaded session's bindings, so a worktree in use
+            // elsewhere is never offered as free; nothing below names or counts those sessions.
             let flags = DomainDelegationWorktreeStaleness.flags(
                 isReleased: record?.releasedAt != nil,
                 boundSessionCount: boundSessionIDs.count,
@@ -434,15 +440,19 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             var entry: [String: Value] = [
                 "worktree_id": .string(worktreeID),
                 "path": .string(path),
-                // Only members are named; sessions outside the scope are a count.
-                "bound_session_ids": .array(visibleBoundSessionIDs.map { .string($0.uuidString) }),
-                "bound_outside_scope_count": .int(boundSessionIDs.count - visibleBoundSessionIDs.count),
+                // Scope-restricted like `inventory`: only members are named, and no session outside
+                // the scope is identified or counted.
+                "bound_session_ids": .array(memberBindings.map { .string($0.uuidString) }),
                 "stale_flags": .array(flags.map { .string($0.rawValue) })
             ]
             if let branch = row.summary?.branch ?? record?.branch { entry["branch"] = .string(branch) }
             if let record {
-                if let creator = record.createdBySessionID { entry["created_by_session_id"] = .string(creator.uuidString) }
-                if let scope = record.delegationScopeID { entry["delegation_scope_id"] = .string(scope.uuidString) }
+                if let creator = record.createdBySessionID, memberSet.contains(creator) {
+                    entry["created_by_session_id"] = .string(creator.uuidString)
+                }
+                if let scope = record.delegationScopeID, chainScopeIDs.contains(scope) {
+                    entry["delegation_scope_id"] = .string(scope.uuidString)
+                }
                 entry["created_at"] = .string(ISO8601DateFormatter().string(from: record.createdAt))
             }
             entries.append(.object(entry))
@@ -492,7 +502,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         let result = try await host.applyMerge(sessionID: lease.targetSessionID, operationID: operationID)
         return .object([
             "result": .string("reviewed"), "op": .string("merge_apply"),
-            "session_id": .string(lease.targetSessionID.uuidString), "merge": result
+            "session_id": .string(lease.targetSessionID.uuidString), "merge": result,
+            // A retry replays this outcome instead of prompting the user again.
+            "changed_count": .int(1)
         ])
     }
 }

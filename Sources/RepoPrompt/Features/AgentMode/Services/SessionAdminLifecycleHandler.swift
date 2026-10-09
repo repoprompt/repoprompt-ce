@@ -178,7 +178,8 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
             "op": .string("fork"),
             "session_id": .string(source.uuidString),
             "forked_session_id": .string(forked.uuidString),
-            "joined_scope": .bool(joinedScope)
+            "joined_scope": .bool(joinedScope),
+            "changed_count": .int(replayed ? 0 : 1)
         ])
     }
 }

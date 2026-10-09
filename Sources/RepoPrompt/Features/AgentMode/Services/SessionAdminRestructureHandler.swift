@@ -476,7 +476,8 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         case let .success(record):
             return .object([
                 "result": .string("attenuated"),
-                "scope": SessionAdminMCPToolService.scopeValue(record, now: now())
+                "scope": SessionAdminMCPToolService.scopeValue(record, now: now()),
+                "changed_count": .int(1)
             ])
         case let .failure(denial) where denial.publicCode != nil:
             return try SessionAdminMCPToolService.deniedValue(denial, sessionID: grantee)

@@ -107,11 +107,35 @@ struct SessionAdminItemResult {
     var code: String?
     var fields: [String: Value] = [:]
 
+    /// The organizing ops' per-item vocabulary (`changed` / `unchanged` / `skipped` / `failed`), so one
+    /// `items` array reads the same whichever lane produced a row (the front door appends its own
+    /// `workspace_not_loaded` rows to these replies).
+    var status: String {
+        switch result {
+        case "linked", "unlinked", "moved", "applied", "bound", "unbound", "released", "queued":
+            "changed"
+        case "already_linked", "not_linked", "nothing_bound", "unchanged":
+            "unchanged"
+        case "not_applied":
+            (code?.hasSuffix("_failed") ?? false) ? "failed" : "skipped"
+        default:
+            result
+        }
+    }
+
+    var isChange: Bool {
+        status == "changed"
+    }
+
     var value: Value {
         var object = fields
         object["session_id"] = .string(sessionID.uuidString)
         object["result"] = .string(result)
-        if let code { object["code"] = .string(code) }
+        object["status"] = .string(status)
+        if let code {
+            object["code"] = .string(code)
+            object["reason"] = .string(code)
+        }
         return .object(object)
     }
 
@@ -132,6 +156,8 @@ enum SessionAdminReply {
         object["result"] = .string(preview ? "preview" : "applied")
         object["op"] = .string(op)
         object["items"] = .array(items.map(\.value))
+        // The front door's idempotency ledger records (and replays) only calls that changed something.
+        object["changed_count"] = .int(preview ? 0 : items.count(where: \.isChange))
         if !requiresControl.isEmpty {
             object["requires_control"] = .array(requiresControl.map { .string($0.uuidString) })
         }
