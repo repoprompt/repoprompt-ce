@@ -1353,8 +1353,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             argumentsJSON: JSONEncoder().encode(arguments),
             securityContext: security
         )
-        let result = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
-            try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
+        let result = try await DomainChildLaunchContext.bundleTaskLocal.withValue(bundle) {
+            try await DomainChildLaunchContext.currentTaskLocal.withValue(bundle.singleCarrier) {
                 switch toolName {
                 case "ask_oracle":
                     try await backend.startOracleConversation(request)

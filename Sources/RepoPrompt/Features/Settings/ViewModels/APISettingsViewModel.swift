@@ -2927,6 +2927,7 @@ public class APISettingsViewModel: ObservableObject {
     // MARK: - Claude Code
 
     func testClaudeCodeConnection() async throws -> Bool {
+        let wasConnected = isClaudeCodeConnected
         let previousStatus = claudeCodeCLIStatus
         let collector = CLIProcessLogCollector()
         collector.append("Claude Code connection test started")
@@ -2945,6 +2946,9 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             collector.append("Claude Code provider disposed")
             isClaudeCodeConnected = ok
+            if !ok || !wasConnected {
+                await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
+            }
             setContextBuilderProviderVerified(.claudeCode, verified: ok)
             if ok {
                 claudeCodeCLIStatus = .binaryPresent
@@ -2968,6 +2972,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Disposing Claude Code provider resources after failure")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
+            await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
             isClaudeCodeConnected = false
             setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)

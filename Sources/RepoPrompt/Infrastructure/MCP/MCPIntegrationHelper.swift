@@ -298,6 +298,18 @@ enum MCPIntegrationHelper {
         return nil
     }
 
+    /// Only the reserved, app-provisioned companion may borrow the armed chat's policy.
+    /// Reuse the same structured provenance extraction and contradictory-origin vetoes as host tools.
+    static func isComputerUseCompanionPermissionRequest(_ payload: [String: Any]) -> Bool {
+        let servers = permissionRequestServerCandidates(input: payload)
+        guard !servers.isEmpty,
+              servers.allSatisfy({ $0.caseInsensitiveCompare("computer-use") == .orderedSame }) else { return false }
+        return permissionRequestToolNameCandidates(input: payload).allSatisfy { tool in
+            let lower = tool.lowercased()
+            return !lower.hasPrefix("mcp__") || lower.hasPrefix("mcp__computer-use__")
+        }
+    }
+
     static func repoPromptPermissionServerIdentifier(in requestPayload: [String: Any]) -> String? {
         for serverName in permissionRequestServerCandidates(input: requestPayload) {
             guard isRepoPromptServerIdentifier(serverName) else { continue }

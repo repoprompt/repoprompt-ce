@@ -28,6 +28,7 @@ extension AgentModeViewModel {
             && (selectedAgent == .cursor || !acpControls.isEmpty)
         let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
         return AgentComposerProps(
+            computerUse: computerUseComposerProps(session: session),
             currentTabID: tabID,
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
@@ -62,6 +63,21 @@ extension AgentModeViewModel {
             stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
             draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
+        )
+    }
+
+    /// Pure presentation: no companion lookup, configuration IO, or permission probing.
+    func computerUseComposerProps(session: AgentTabSession?) -> AgentComputerUseComposerProps {
+        guard let session, session.selectedAgent == .codexExec,
+              !session.isMCPRelated, session.createdByOverseerSessionID == nil,
+              !session.bindingTransitionInProgress else { return .hidden }
+        if let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+           let links = monitorPillPropsByEndpoint[endpoint],
+           !links.inbound.isEmpty || !links.outbound.isEmpty { return .hidden }
+        return .init(
+            isVisible: true,
+            isOn: session.isCodexComputerUseArmed,
+            isBusy: session.codexComputerUseArmingRequestID != nil || !session.codexComputerUseOwnershipTransitionHolds.isEmpty
         )
     }
 

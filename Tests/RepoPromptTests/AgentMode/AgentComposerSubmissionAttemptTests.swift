@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 import XCTest
 
@@ -521,6 +522,84 @@ extension AgentComposerSubmissionAttemptTests {
         await Task.yield()
         XCTAssertTrue(sourceSession.items.isEmpty)
         XCTAssertTrue(destinationSession.items.isEmpty)
+    }
+
+    func testUsageBalancingRoutesFreshComposerAndSubagentWithoutJev() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast, readiness: .needsConfiguration(generation: 1, reason: "No key"))
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setModelRouterEnabled(false)
+        store.setUsageBalancingEnabled(true)
+        XCTAssertTrue(store.setModelRouterCustomInstructions("Prefer Claude for execution"))
+        let advisor = AgentUsageBalancer()
+        viewModel.modelRouterRuntime?.usageBalancer = advisor
+        let now = Date(), reset = ISO8601DateFormatter().string(from: now.addingTimeInterval(18000))
+        for (provider, used) in [(AgentProviderKind.codexExec, 95), (.claudeCode, 10)] {
+            let value = try ClaudeAccountUsageMapper.snapshot(data: Data("{\"five_hour\":{\"utilization\":\(used),\"resets_at\":\"\(reset)\"}}".utf8), account: .init(lineage: .anthropicFirstParty, opaqueAccountID: nil, credentialProfileID: "test"), observedAt: now)
+            advisor.update(value, provider: provider.rawValue)
+        }
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-6.1-sol-high"
+        let baseline = viewModel.executableTarget(for: session)
+        let peer = try XCTUnwrap(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general))
+        XCTAssertEqual(peer.candidate.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertTrue(viewModel.makeStatusPillsSnapshot().modelRouter.usageBalancing)
+        XCTAssertFalse(viewModel.makeComposerProps(tabID: tabID).areModelControlsDisabled)
+        let subagent = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline)
+        XCTAssertEqual(subagent?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        let pinned = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline, allowUsageBalance: false)
+        XCTAssertNil(pinned)
+        store.setModelRouterEnabled(true) // Configured but unavailable Jev must remain visible in the audit.
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement parser")
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(text: "Implement parser", claim: claim, session: session, destinationTabID: tabID)
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.selectedAgent, .claudeCode)
+        let audit = try XCTUnwrap(session.automationTurnAudit.last?.router)
+        XCTAssertTrue(audit.configured)
+        XCTAssertEqual(audit.decision, .unavailable)
+        XCTAssertFalse(audit.judgmentRequested)
+        XCTAssertNotNil(audit.usageBalancingReason)
+        XCTAssertEqual(audit.usageBalancingProviderRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(viewModel.executableTarget(for: session)))
+        XCTAssertFalse(viewModel.freshTaskRoutingEligibility(session: session, text: "Follow up"))
+        store.setUsageBalancingEnabled(false)
+        XCTAssertNil(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general), "Disabled balancing keeps the starting model")
+        let requests = await backend.requests
+        XCTAssertTrue(requests.isEmpty, "Independent balancing must not request Jev or require a credential")
+    }
+
+    func testUsageBalancedAuditCannotDispatchAfterModelOrProviderChange() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast, readiness: .needsConfiguration(generation: 1, reason: "No key"))
+        let (viewModel, store) = try await makeRoutingViewModel(backend: backend)
+        store.setModelRouterEnabled(false)
+        store.setUsageBalancingEnabled(true)
+        store.setAutoEffortEnabled(true)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-6.1-sol-high"
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement parser")
+        let staleAudit = AgentAutomationTurnAudit.Feature(
+            configured: false,
+            eligible: true,
+            judgmentRequested: false,
+            decision: .selected,
+            chosenModelRaw: "claude-opus-5-5-high",
+            usageBalancingReason: "usage_balance_evenPace",
+            usageBalancingProviderRaw: "claudeCode"
+        )
+        let result = await viewModel.submitUserTurnAfterAutoEffort(text: "Implement parser", claim: claim, session: session, destinationTabID: tabID, routerAudit: staleAudit)
+        guard case .blocked = result else { return XCTFail("A changed balancing target must never silently dispatch") }
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(session.automationTurnAudit.isEmpty)
+        XCTAssertEqual(session.selectedAgent, .codexExec)
+        let baseline = viewModel.executableTarget(for: session)
+        session.selectedAgent = .claudeCode
+        viewModel.restoreUsageStartingTarget(baseline, on: session)
+        XCTAssertEqual(viewModel.executableTarget(for: session), baseline)
     }
 
     private func makeRoutingViewModel(

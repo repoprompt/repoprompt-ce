@@ -2,59 +2,11 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 import RepoPromptProcess
+import RepoPromptProviderQuota
 
-enum CodexJSONValue: Equatable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: CodexJSONValue])
-    case array([CodexJSONValue])
-    case null
-
-    func toAny() -> Any {
-        switch self {
-        case let .string(value):
-            value
-        case let .number(value):
-            value
-        case let .bool(value):
-            value
-        case let .object(value):
-            value.mapValues { $0.toAny() }
-        case let .array(value):
-            value.map { $0.toAny() }
-        case .null:
-            NSNull()
-        }
-    }
-
-    static func from(_ value: Any) -> CodexJSONValue? {
-        switch value {
-        case let string as String:
-            return .string(string)
-        case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                return .bool(number.boolValue)
-            }
-            return .number(number.doubleValue)
-        case let dict as [String: Any]:
-            var output: [String: CodexJSONValue] = [:]
-            for (key, value) in dict {
-                if let converted = CodexJSONValue.from(value) {
-                    output[key] = converted
-                }
-            }
-            return .object(output)
-        case let array as [Any]:
-            let converted = array.compactMap { CodexJSONValue.from($0) }
-            return .array(converted)
-        case _ as NSNull:
-            return .null
-        default:
-            return nil
-        }
-    }
-}
+/// Preserve the app's transport vocabulary while sharing the same typed boundary value
+/// with the app-free quota runtime. Encoding/decoding behavior is unchanged.
+typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
 
 enum CodexAppServerRequestID: Hashable {
     case int(Int)
@@ -1608,6 +1560,21 @@ actor CodexAppServerClient {
         }
     }
 
+    static func computerUseProcessConfigArgs(
+        computerUseEnabled: Bool,
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry]
+    ) throws -> [String] {
+        let reserved = serverEntries.filter { $0.normalizedName.caseInsensitiveCompare("computer-use") == .orderedSame }
+        guard !computerUseEnabled || reserved.isEmpty else {
+            throw ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+        }
+        var args = reserved.flatMap { ["-c", "mcp_servers.\($0.cliPathComponent).enabled=false"] }
+        if computerUseEnabled {
+            args += ["-c", "approval_policy=\"on-request\"", "-c", "approvals_reviewer=\"user\""]
+        }
+        return args
+    }
+
     private func startProcess(startupAuthority: UInt64) async throws {
         try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
@@ -1624,22 +1591,38 @@ actor CodexAppServerClient {
                 )
             }
         }
-        let processOverrides = CodexOverrides.cliConfigArgs(
+        var processOverrides = CodexOverrides.cliConfigArgs(
             toolPolicy: .init(
                 toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
                 modelReasoningSummary: config.processModelReasoningSummary
             ),
             featurePolicy: config.processFeaturePolicy
         )
+        try await processSpawnPreparation()
+        try Task.checkCancellation()
+        try ensureStartupAuthority(startupAuthority)
+        if config.processFeaturePolicy.computerUseEnabled {
+            // No suspension between presence-dependent overrides and spawn. This does not
+            // claim atomicity against independent writers of the owned configuration.
+            // Read the actual armed launch runtime, not a personal/default home. A reserved
+            // saved definition cannot be safely cleared through recursively merged overrides.
+            let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+            let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
+                try String(contentsOf: runtimeConfigURL, encoding: .utf8)
+            } else {
+                ""
+            }
+            processOverrides += try Self.computerUseProcessConfigArgs(
+                computerUseEnabled: true,
+                serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
+            )
+        }
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
         let spawned: SpawnedProcess
         do {
-            try await processSpawnPreparation()
-            try Task.checkCancellation()
-            try ensureStartupAuthority(startupAuthority)
             spawned = try ProcessLauncher.spawn(
                 command: resolution.resolvedCommand,
                 arguments: args,

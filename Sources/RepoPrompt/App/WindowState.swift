@@ -548,6 +548,19 @@ class WindowState: ObservableObject {
 
     #if DEBUG
         convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
+        convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime,
             keyManager: KeyManager,
@@ -620,7 +633,8 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -634,6 +648,7 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
+        let compositionSpan = StartupPhaseLog.begin(.windowComposition, window: windowID)
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
@@ -644,8 +659,10 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
+        compositionSpan.end()
 
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
@@ -692,7 +709,9 @@ class WindowState: ObservableObject {
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
+            StartupPhaseLog.mark(.initCallbackEnqueue, window: windowID)
             Task {
+                StartupPhaseLog.mark(.initCallbackStart, window: self.windowID)
                 self.applyPendingRestoreEntryIfPossible()
                 await self.processCommands()
             }
@@ -839,6 +858,7 @@ class WindowState: ObservableObject {
         requestWindowTitleUpdate(reason: .windowAttached)
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
+        StartupPhaseLog.mark(.windowAttached, window: windowID)
     }
 
     private func configureWindowChrome(for window: NSWindow) {
@@ -1566,6 +1586,7 @@ class WindowState: ObservableObject {
         pendingRestoreCompletion?()
         pendingRestoreEntry = entry
         pendingRestoreCompletion = completion
+        StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
     }
 
@@ -1576,6 +1597,7 @@ class WindowState: ObservableObject {
         let completion = pendingRestoreCompletion
         pendingRestoreCompletion = nil
 
+        StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
             await restoreWorkspace(from: entry)
             completion?()
@@ -1583,6 +1605,16 @@ class WindowState: ObservableObject {
     }
 
     private func restoreWorkspace(from entry: WindowSessionEntry) async {
+        let restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: windowID)
+        var resolvedTarget = 0
+        var switchOutcome: StartupPhaseLog.SwitchOutcome?
+        defer {
+            var fields = ["resolved": resolvedTarget]
+            if let switchOutcome {
+                fields["switch_result"] = switchOutcome.rawValue
+            }
+            restoreSpan.end(extraFields: fields)
+        }
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
@@ -1591,6 +1623,7 @@ class WindowState: ObservableObject {
         // refused switch persist the Default fallback over the snapshot.
         unresolvedRestoreEntry = entry
         if let target = resolveWorkspace(for: entry) {
+            resolvedTarget = 1
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
@@ -1603,7 +1636,9 @@ class WindowState: ObservableObject {
                 // the observer below only fires for non-system workspaces.
                 unresolvedRestoreEntry = nil
             }
-            _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            switchOutcome = await StartupPhaseLog.SwitchOutcome(
+                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            )
             #if DEBUG
                 if let restoreStartMS {
                     WorkspaceRestorePerfLog.log(

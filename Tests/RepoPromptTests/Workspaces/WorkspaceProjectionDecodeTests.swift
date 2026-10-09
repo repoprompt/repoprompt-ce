@@ -39,11 +39,11 @@ import XCTest
                 recorder: recorder, contentOrdinal: 1, consumerOrdinal: 1,
                 revision: 1, schemaVersion: 1, onMainActor: true
             )
-            XCTAssertThrowsError(try Diagnostics.$context.withValue(context) {
+            XCTAssertThrowsError(try Diagnostics.contextTaskLocal.withValue(context) {
                 try fixture.decode(Data("{PRIVATE_PAYLOAD_AND_PATH".utf8))
             })
             XCTAssertNil(Diagnostics.context, "Throwing must restore the task-local scope")
-            try Diagnostics.$context.withValue(context) {
+            try Diagnostics.contextTaskLocal.withValue(context) {
                 for _ in 0 ..< Diagnostics.Recorder.maximumSamples + 1 {
                     // The digest cache must not turn repeat decodes into hits:
                     // this test measures per-decode work, so decode fresh.
@@ -79,7 +79,7 @@ import XCTest
             legacy.activeComposeTabID = nil
             let bytes = try JSONEncoder().encode(legacy)
             let recorder = Diagnostics.Recorder()
-            let decoded = try Diagnostics.$context.withValue(.init(
+            let decoded = try Diagnostics.contextTaskLocal.withValue(.init(
                 recorder: recorder, contentOrdinal: 1, consumerOrdinal: 1,
                 revision: 1, schemaVersion: 1, onMainActor: true
             )) { try fixture.decode(bytes) }

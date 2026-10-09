@@ -33,6 +33,45 @@ production builds, release-candidate ad-hoc builds, UI-test launches, and stress
 Local DEBUG builds may use `REPOPROMPT_SENTRY_DSN` only for integration testing; official release
 telemetry uses the signed bundle's `RepoPromptSentryDSN` instead.
 
+## Account usage limits (separate from diagnostic telemetry)
+
+The optional usage-limit display is controlled by **Settings → Agent Mode → Overview →
+Show usage limits when available**. This presentation preference does not authorize credential
+access or change model selection. Codex usage must be enabled separately; it uses a dedicated
+Codex app-server account read and account notifications without creating a conversation.
+
+Claude usage requires explicit **Connect Claude usage** consent in CLI Providers for one Claude
+Code config-folder profile. Prior OAuth consent does not authorize this changed method. A short-lived,
+hidden terminal process runs the user's unmodified Claude Code, opens its built-in `/usage`, and
+consumes its documented status-line JSON. RepoPrompt does not read Claude login tokens or call
+account endpoints itself. Claude Code owns authentication, including any refresh it performs, and
+may update its own ordinary session bookkeeping. RepoPrompt writes only per-run settings in a
+private app-owned directory, never user/project Claude settings. User/project setting sources are
+excluded, explicit hooks are empty, and tools/MCP servers are disabled; managed policy is not
+bypassed. `disableAllHooks` is deliberately omitted because Claude also uses it to suppress the
+status-line collector. No model prompt is submitted and no trust or login prompt is approved
+automatically. If CLI setup prevents startup, the read fails closed.
+The first **Connect and open setup** confirmation opens Terminal for the user to approve the
+helper folder or sign in themselves. A clearly styled **Finish Claude setup…** action is also
+available beside unavailable readings, with another setup action under Details. Each uses that
+same isolated folder/configuration, sends no model message, and opens Terminal only after an
+explicit user confirmation. The first Connect defers collection until the user chooses
+**Check usage after setup**; setup completion starts a new generation so a pre-setup failure
+cannot consume the ordinary Refresh cooldown. Normal refreshes remain hidden.
+
+Claude checks once when usage is first demanded after launch/enable, plus manual Refresh with a
+60-second minimum gap. There is no periodic Claude polling or permanent helper. Hidden surfaces or
+the master preference being off cancel active collection. The local statistics cache is loaded before
+the startup refresh and retains the original observation date; expired/aged values remain stale.
+Only percentages, reset times and non-secret cache/profile metadata are persisted in private files.
+Account identity is unknown, so these readings cannot supply routing eligibility or account-balancing
+signals. Disconnect removes the statistics cache. Codex snapshots remain in memory in this change.
+
+The Claude-only opt-in disclosure explains this method and that Anthropic has not explicitly approved
+automated usage monitoring; using documented CLI features is not a compliance guarantee. Account
+identities, credentials and raw terminal output are not logged or sent to diagnostic telemetry. Legacy
+Claude run-event telemetry remains separate and cannot authorize usage collection.
+
 ## What is collected
 
 When active, RepoPrompt can send:

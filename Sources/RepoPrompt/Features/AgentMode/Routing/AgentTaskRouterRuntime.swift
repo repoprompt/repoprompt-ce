@@ -8,6 +8,7 @@ final class AgentTaskRouterRuntime: ObservableObject {
     let registry: AgentTaskRouterRegistry
     let coordinator: AgentFreshTaskRoutingCoordinator
     let objectWillChange = ObservableObjectPublisher()
+    @MainActor var usageBalancer: AgentUsageBalancer?
 
     private let readinessLock = NSLock()
     private var readinessByBackendID: [AgentTaskRouterBackendID: AgentTaskRouterBackendReadiness] = [:]

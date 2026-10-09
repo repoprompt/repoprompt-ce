@@ -538,6 +538,121 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertTrue(manager.modelRoutingWindow(withID: second.windowID) === second)
         }
 
+        func testProductionHostQueriesRetainDuplicateUUIDsAndFailClosedForAmbiguousWindows() async throws {
+            let manager = WindowStatesManager.shared
+            let originalWindows = manager.allWindows
+            defer { manager.allWindows = originalWindows }
+            let first = makeWindow()
+            let second = makeWindow()
+            addTeardownBlock { @MainActor in
+                await first.tearDown()
+                await second.tearDown()
+            }
+            await first.workspaceManager.awaitInitialized()
+            await second.workspaceManager.awaitInitialized()
+            let sessionID = UUID()
+            let absentID = UUID()
+            for window in [first, second] {
+                // Reuse this suite's headless window fixture; no registration, NSWindow, workspace
+                // activation, provider startup or live application is needed for these queries.
+                XCTAssertNil(window.nsWindow)
+                let tabID = UUID()
+                let workspace = WorkspaceModel(
+                    name: "Host query parity", repoPaths: [], ephemeralFlag: true,
+                    composeTabs: [ComposeTabState(id: tabID, name: "Shared UUID", activeAgentSessionID: sessionID)],
+                    activeComposeTabID: tabID
+                )
+                window.workspaceManager.workspaces = [workspace]
+                window.workspaceManager.activeWorkspace = workspace
+                let session = window.agentModeViewModel.session(for: tabID)
+                session.selectedAgent = .claudeCode
+                session.hasLoadedPersistedState = true
+                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                    sessionID: sessionID, on: session
+                ))
+            }
+            manager.allWindows = [first, second]
+            let firstCandidate = try XCTUnwrap(first.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
+            let secondCandidate = try XCTUnwrap(second.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
+
+            func assertQueries(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+                let full = manager.agentSessionLinkCandidates()
+                let cheap = manager.agentSessionLinkCandidates(includeLocation: false)
+                let expectedCheap = try full.map { candidate in
+                    try XCTUnwrap(manager.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false))
+                }
+                XCTAssertEqual(cheap, expectedCheap, "Cheap discovery keeps every non-location field: \(label)", file: file, line: line)
+                let census = manager.agentSessionLinkCandidates(forSessionIDs: [sessionID, absentID], includeLocation: true)
+                XCTAssertEqual(census[sessionID], full, label, file: file, line: line)
+                XCTAssertEqual(census[absentID], [], "Known absence stays explicit: \(label)", file: file, line: line)
+                for candidate in full {
+                    XCTAssertEqual(manager.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: true), candidate, label, file: file, line: line)
+                    let narrow = try XCTUnwrap(manager.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false))
+                    XCTAssertNil(narrow.locationLabel)
+                    XCTAssertEqual(narrow.displayName, candidate.displayName)
+                    XCTAssertEqual(narrow.providerDisplayName, candidate.providerDisplayName)
+                    XCTAssertEqual(narrow.restorationReadiness, candidate.restorationReadiness)
+                }
+                for old in [firstCandidate, secondCandidate] where !full.contains(where: { $0.domainEndpoint == old.domainEndpoint }) {
+                    XCTAssertNil(manager.agentSessionLinkCandidate(for: old.domainEndpoint, includeLocation: true), label)
+                }
+            }
+
+            try assertQueries("Both routable windows retain the shared UUID")
+            XCTAssertEqual(manager.agentSessionLinkCandidates().count, 2)
+            manager.allWindows = [first, first, second]
+            try assertQueries("Ambiguous window ID fails closed without hiding the other window")
+            XCTAssertEqual(manager.agentSessionLinkCandidates(), [secondCandidate])
+            manager.allWindows = [first, second]
+            try assertQueries("Removing ambiguity restores both exact incarnations")
+            XCTAssertEqual(manager.agentSessionLinkCandidates(), [firstCandidate, secondCandidate])
+            let vm = first.agentModeViewModel
+            let workspace = first.workspaceManager
+            let session = try XCTUnwrap(vm.sessions[firstCandidate.tabID])
+            let duplicateTabID = UUID()
+            workspace.workspaces[0].composeTabs.append(ComposeTabState(id: duplicateTabID, name: "Duplicate", activeAgentSessionID: sessionID))
+            let duplicate = vm.session(for: duplicateTabID)
+            _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate)
+            duplicate.hasLoadedPersistedState = true
+            try assertQueries("Duplicate UUID in distinct tabs and windows")
+            XCTAssertEqual(manager.agentSessionLinkCandidates().count, 3)
+            workspace.workspaces[0].composeTabs[0].name = "Renamed real tab"
+            try assertQueries("Metadata rename")
+            XCTAssertEqual(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: false)?.displayName, "Renamed real tab")
+            session.hasLoadedPersistedState = false
+            try assertQueries("Unloaded runtime remains in discovery")
+            XCTAssertEqual(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: false)?.hasLoadedPersistedState, false)
+            session.hasLoadedPersistedState = true
+            let transition = session.beginPersistentBindingTransition()
+            try assertQueries("Current pending binding generation")
+            XCTAssertNil(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: false))
+            session.finishPersistentBindingTransition(generation: transition)
+            _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            try assertQueries("Same-UUID rebind rejects old endpoint")
+            vm.test_removeSession(tabID: duplicateTabID)
+            try assertQueries("Metadata without runtime manufactures no candidate")
+            workspace.workspaces[0].composeTabs.removeAll { $0.id == duplicateTabID }
+            try assertQueries("Removed tab")
+            let active = workspace.activeWorkspace
+            workspace.activeWorkspace = nil
+            try assertQueries("Inactive workspace")
+            XCTAssertEqual(manager.agentSessionLinkCandidates(), [secondCandidate])
+            workspace.activeWorkspace = active
+            try assertQueries("Reactivation")
+            workspace.workspaces[0].composeTabs.append(workspace.workspaces[0].composeTabs[0])
+            let duplicateTabs = manager.agentSessionLinkCandidates()
+            XCTAssertEqual(duplicateTabs.count, 3)
+            XCTAssertEqual(manager.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: true)[sessionID], duplicateTabs)
+            XCTAssertNil(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: true), "Exact model routing remains strict while census preserves ambiguity")
+            workspace.workspaces[0].composeTabs.removeLast()
+            try assertQueries("Repair tab ambiguity")
+            workspace.workspaces.append(workspace.workspaces[0])
+            let duplicateWorkspaces = manager.agentSessionLinkCandidates()
+            XCTAssertEqual(duplicateWorkspaces.count, 3)
+            XCTAssertEqual(manager.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: true)[sessionID], duplicateWorkspaces, "A discarded corrupt occurrence must never turn the other window into unique provenance")
+            XCTAssertNil(manager.agentSessionLinkCandidate(for: firstCandidate.domainEndpoint, includeLocation: true))
+        }
+
         func testModelCallerUsesInstalledRouteAndNeverRepairsColdOrStaleContext() async throws {
             let fixture = try await makeRoutedObserver(assertModelRoutePending: true)
             let server = fixture.window.mcpServer

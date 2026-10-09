@@ -35,7 +35,8 @@ package enum DiffBatchGenerator {
         edits: [Edit],
         precision prec: DiffPrecision,
         mcpAmbiguityCheck: Bool = false,
-        tabPromotionEnabled: Bool = true
+        tabPromotionEnabled: Bool = true,
+        requireWholeLineMatch: Bool = false
     ) async throws -> (chunks: [DiffChunk], outcomes: [EditOutcome], previews: [String]) {
         var cursor = DiffEditCursor()
         var outcomes: [EditOutcome] = []
@@ -71,7 +72,8 @@ package enum DiffBatchGenerator {
                     searchStartLine: start,
                     mcpAmbiguityCheck: edit.replaceAll ? false : mcpAmbiguityCheck,
                     replaceAll: edit.replaceAll,
-                    tabPromotionEnabled: tabPromotionEnabled
+                    tabPromotionEnabled: tabPromotionEnabled,
+                    requireWholeLineMatch: requireWholeLineMatch
                 )
 
                 guard !diff.isEmpty else {

@@ -71,6 +71,7 @@ final actor ClaudeNativeProcessSessionController {
 
     enum Event {
         case stream(AIStreamResult)
+        case rateLimit(ClaudeCompatiblePluginRateLimitInfo)
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
@@ -750,10 +751,17 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
-        let arguments = buildArguments(
+        var arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil
         )
+        #if DEBUG
+            arguments += ClaudeStatusLineCompatibilityProbe.claimSettingsArguments(
+                launchArguments: ProcessInfo.processInfo.arguments,
+                isFirstParty: launchEnvironment.backend == .defaultClaude,
+                providerArguments: arguments
+            )
+        #endif
 
         let workingDirectory = resolvedWorkingDirectory()
         let spawned = try ProcessLauncher.spawn(
@@ -1492,6 +1500,13 @@ final actor ClaudeNativeProcessSessionController {
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
             return
+        }
+        // Preserve quota telemetry separately from transcript events, including routine
+        // "allowed" events that the transcript translator intentionally suppresses.
+        if payload["type"] as? String == "rate_limit_event",
+           let rateLimit = ClaudeCompatiblePluginRateLimitInfo.decodeEvent(data)
+        {
+            emit(.rateLimit(rateLimit))
         }
         let streamResults = translator.parseNDJSONLine(data)
         #if DEBUG

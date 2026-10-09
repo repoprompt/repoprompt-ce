@@ -893,6 +893,47 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexReasoningSummariesEnabled()) },
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "agent_mode.claude_usage_quota_enabled",
+            group: "agent_mode",
+            label: "Claude Run Rate-Limit Telemetry (Passive)",
+            description: "Default-off passive diagnostics: records rate-limit events reported during new first-party Claude runs. Starts no request or polling and never reads Claude credentials. This setting does NOT authorize Claude account usage reads; that requires an explicit Connect in Settings, which is not available over MCP. Does not affect routing.",
+            read: { .bool($0.claudeUsageQuotaEnabled()) },
+            write: { try $0.setClaudeUsageQuotaEnabled(requiredBool(from: $1)) },
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                ClaudeUsageQuotaRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
+        boolSetting(
+            key: "agent_mode.usage_limits_display_enabled",
+            group: "agent_mode",
+            label: "Show Usage Limits When Available",
+            description: "Presentation only: shows provider plan usage in Settings and a compact Agent Mode indicator for sources that are already enabled or connected. Does not enable any source, read credentials, or authorize account requests by itself, and never affects routing. When unset, follows the legacy Codex/Claude usage opt-ins. Quota values are not exposed over MCP.",
+            read: { .bool($0.usageLimitsDisplayEnabled()) },
+            write: { try $0.setUsageLimitsDisplayEnabled(requiredBool(from: $1)) },
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                UsageLimitsDisplayRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
+        boolSetting(
+            key: "agent_mode.codex_usage_quota_enabled",
+            group: "agent_mode",
+            label: "Codex Usage Quota (Observe-Only)",
+            description: "Opt-in, observe-only display of Codex account usage limits in Settings. Defaults off. When off, RepoPrompt starts no quota app-server client, process, subscription, or polling. This setting only controls visibility: quota readings never influence model routing, candidate selection, or Agent Mode behavior. Quota values themselves are not exposed over MCP.",
+            read: { .bool($0.codexUsageQuotaEnabled()) },
+            write: { try $0.setCodexUsageQuotaEnabled(requiredBool(from: $1)) },
+            // Persisting the flag is not the same as applying it. Without this, disabling
+            // over MCP would leave an already-visible pane observing, so the service would
+            // keep its app-server process alive until the pane happened to close. Enabling
+            // still creates no transport on its own: the service only starts once a surface
+            // actually subscribes.
+            afterWrite: { _, value, _ in
+                guard let enabled = value.boolValue else { return }
+                CodexUsageQuotaRuntimeBridge.applyEnabled(enabled)
+            }
+        ),
         stringEnumSetting(
             key: "agent_mode.provider_conversation_cleanup_action",
             group: "agent_mode",

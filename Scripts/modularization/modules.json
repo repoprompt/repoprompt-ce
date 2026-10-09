@@ -28,6 +28,7 @@
         "RepoPromptVCS",
         "RepoPromptPersistence",
         "RepoPromptSettingsCore",
+        "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
         "Sparkle"
@@ -52,6 +53,16 @@
       "allowed_dependencies": [
         "RepoPromptCodeMapCore"
       ]
+    },
+    "RepoPromptProviderQuota": {
+      "source_root": "Sources/RepoPromptProviderQuota",
+      "allowed_dependencies": [],
+      "test_target": "RepoPromptProviderQuotaTests",
+      "app_free_tests": true
+    },
+    "RepoPromptProviderQuotaTests": {
+      "source_root": "Tests/RepoPromptProviderQuotaTests",
+      "allowed_dependencies": ["RepoPromptProviderQuota"]
     },
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",
@@ -208,6 +219,7 @@
       "allowed_dependencies": [
         "RepoPromptFoundation",
         "RepoPromptDomainRuntime",
+        "RepoPromptProviderQuota",
         "RepoPromptShared"
       ],
       "test_target": "RepoPromptSettingsCoreTests",
@@ -249,6 +261,7 @@
         "RepoPromptVCS",
         "RepoPromptPersistence",
         "RepoPromptSettingsCore",
+        "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptTestSupport",
         "RepoPromptWorkspaceCore"
@@ -289,7 +302,8 @@
     "RepoPromptSettingsCoreTests": {
       "source_root": "Tests/RepoPromptSettingsCoreTests",
       "allowed_dependencies": [
-        "RepoPromptSettingsCore"
+        "RepoPromptSettingsCore",
+        "RepoPromptProviderQuota"
       ]
     }
   },

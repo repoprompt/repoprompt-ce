@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -10,27 +11,6 @@ import RepoPromptDomainRuntime
 // Invariants: props are an exact-endpoint projection, never a session-UUID lookup, so a rebind
 // cannot inherit a predecessor's role or rows; and nothing here reads the passive queue or wake
 // state directly — snooze and selection arrive already projected.
-
-// MARK: - Identifier formatting
-
-/// Short display form for an Agent session ID.
-///
-/// The full canonical UUID remains available through the row's tooltip, accessibility value, and
-/// Copy Session ID actions. The compact form is retained for fallback task names, previews, inbound
-/// labels, notices, and attribution.
-enum AgentMonitorSessionIDFormatter {
-    private static let baseTokenLength = 4
-
-    static func short(_ sessionID: UUID) -> String {
-        token(sessionID, endLength: baseTokenLength)
-    }
-
-    private static func token(_ sessionID: UUID, endLength: Int) -> String {
-        let raw = sessionID.uuidString
-        guard raw.count > endLength * 2 else { return raw }
-        return "\(raw.prefix(endLength))…\(raw.suffix(endLength))"
-    }
-}
 
 // MARK: - Status
 
@@ -260,7 +240,7 @@ enum AgentMonitorAutoWakeCopy {
     routine status and overflow remains governed by selection and snooze. To stop those routine wakes, \
     switch off and deselect or snooze the lane. To prevent purposeful attention from that link, \
     unlink it; revocation and all other safety and admission gates still apply. The setting applies \
-    to this session rather than to individual links. Off by default, and saved with this session even \
+    to this session rather than to individual links. On by default, and saved with this session even \
     when it oversees nothing.
     """
     static let accessibilityLabel = "Auto-wake on all updates"
@@ -982,6 +962,9 @@ struct AgentMonitorPillProps: Equatable {
         let targetSessionID: UUID
         /// Exact target incarnation recorded by the authority for this generation-qualified row.
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+        /// Grant creation time — drives "first overseer by link creation" ordering for the
+        /// sidebar marks and the palette slot allocator. Never reaches agent-facing payloads.
+        let linkCreatedAt: Date?
         let displayName: String
         let providerDisplayName: String?
         let locationLabel: String?
@@ -1010,6 +993,7 @@ struct AgentMonitorPillProps: Equatable {
             generation: UInt64,
             targetSessionID: UUID,
             targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            linkCreatedAt: Date? = nil,
             displayName: String,
             providerDisplayName: String?,
             locationLabel: String?,
@@ -1024,6 +1008,7 @@ struct AgentMonitorPillProps: Equatable {
             self.generation = generation
             self.targetSessionID = targetSessionID
             self.targetEndpoint = targetEndpoint
+            self.linkCreatedAt = linkCreatedAt
             self.displayName = displayName
             self.providerDisplayName = providerDisplayName
             self.locationLabel = locationLabel
@@ -1054,6 +1039,7 @@ struct AgentMonitorPillProps: Equatable {
                 generation: generation,
                 targetSessionID: targetSessionID,
                 targetEndpoint: targetEndpoint,
+                linkCreatedAt: linkCreatedAt,
                 displayName: displayName,
                 providerDisplayName: providerDisplayName,
                 locationLabel: locationLabel,
@@ -1226,8 +1212,29 @@ struct AgentMonitorPillProps: Equatable {
         let observerSessionID: UUID
         /// Exact observer incarnation recorded by the authority for this generation-qualified row.
         let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        /// Grant creation time — orders a row's overseers by link creation so the mark always
+        /// wears the first overseer's group colour. Never reaches agent-facing payloads.
+        let linkCreatedAt: Date?
         let displayName: String
         let providerDisplayName: String?
+
+        init(
+            linkID: UUID,
+            generation: UInt64,
+            observerSessionID: UUID,
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            linkCreatedAt: Date? = nil,
+            displayName: String,
+            providerDisplayName: String?
+        ) {
+            self.linkID = linkID
+            self.generation = generation
+            self.observerSessionID = observerSessionID
+            self.observerEndpoint = observerEndpoint
+            self.linkCreatedAt = linkCreatedAt
+            self.displayName = displayName
+            self.providerDisplayName = providerDisplayName
+        }
 
         var id: UUID {
             linkID
@@ -1322,12 +1329,6 @@ struct AgentMonitorPillProps: Equatable {
     /// Notices are recorded per incarnation, so dismissing them needs the identity rather than the
     /// session UUID: a duplicate live incarnation of the same UUID must not clear another's notices.
     var endpoint: DomainAgentSessionLinkEndpointIdentity?
-    /// Target-centric relationship choices for this exact endpoint.
-    ///
-    /// `nil` means the endpoint is not currently an eligible target (or this is a synthesized local
-    /// placeholder). A non-nil empty value means there is neither an eligible observer to add nor an
-    /// existing relationship to unlink, so the sidebar renders no management surface.
-    let sidebarOversightMenu: AgentSidebarOversightMenuProps?
     let outbound: [Outbound]
     let inbound: [Inbound]
     let recentNotices: [Notice]
@@ -1380,7 +1381,6 @@ struct AgentMonitorPillProps: Equatable {
     init(
         sessionID: UUID?,
         endpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
-        sidebarOversightMenu: AgentSidebarOversightMenuProps?,
         outbound: [Outbound],
         inbound: [Inbound],
         recentNotices: [Notice],
@@ -1397,7 +1397,6 @@ struct AgentMonitorPillProps: Equatable {
     ) {
         self.sessionID = sessionID
         self.endpoint = endpoint
-        self.sidebarOversightMenu = sidebarOversightMenu
         self.outbound = outbound
         self.inbound = inbound
         self.recentNotices = recentNotices
@@ -1415,7 +1414,6 @@ struct AgentMonitorPillProps: Equatable {
 
     static let empty = AgentMonitorPillProps(
         sessionID: nil,
-        sidebarOversightMenu: nil,
         outbound: [],
         inbound: [],
         recentNotices: [],
@@ -1432,7 +1430,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1463,7 +1460,6 @@ struct AgentMonitorPillProps: Equatable {
         return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: recentNotices,
@@ -1579,6 +1575,50 @@ enum AgentMonitorNoticeFormatter {
 }
 
 // MARK: - Resolved preview
+
+/// Presentation only: readiness and explicit retry re-resolve unchanged input; Add still authorizes.
+@MainActor
+final class AgentMonitorSessionIDEditor: ObservableObject {
+    @Published var identifierText = ""
+    @Published var preview: AgentMonitorResolvedPreview?
+    @Published var validationMessage: String?
+    private var resolve: ((String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>)?
+    private var readinessSubscription: AnyCancellable?
+
+    init(readinessChanges: AnyPublisher<Void, Never>) {
+        readinessSubscription = readinessChanges.receive(on: DispatchQueue.main).sink { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func updateIdentifier(_ text: String) {
+        identifierText = text
+        refresh()
+    }
+
+    func refresh(using resolve: @escaping (String) -> Result<AgentMonitorResolvedPreview, AgentSessionLinkResolveFailure>) {
+        self.resolve = resolve
+        refresh()
+    }
+
+    func refresh() {
+        let trimmed = identifierText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            preview = nil
+            validationMessage = nil
+            return
+        }
+        guard let resolve else { return }
+        switch resolve(trimmed) {
+        case let .success(resolved):
+            preview = resolved
+            validationMessage = nil
+        case let .failure(failure):
+            preview = nil
+            validationMessage = failure.uiMessage
+        }
+    }
+}
 
 /// Preview shown after a UUID resolves but before the user authorizes the link.
 ///
@@ -1836,5 +1876,34 @@ enum AgentMonitorAddOutcome: Equatable {
         case let .rejected(message):
             message
         }
+    }
+}
+
+/// Closed-row summary only: bounded linked names and counts, never available-choice arrays.
+struct AgentSidebarOversightSummary: Equatable {
+    let linkedObserverCount: Int
+    let availableObserverCount: Int
+    let inboundObserverNames: [String]
+    let inboundObserverSessionIDs: [UUID]
+    let outboundTargetNames: [String]
+    let createdByLabel: String?
+    let creatorSessionID: UUID?
+    let targetIneligibleReason: String?
+    var observerIneligibleReason: String?
+
+    var creatorIsOverseer: Bool {
+        creatorSessionID.map { inboundObserverSessionIDs.contains($0) } ?? false
+    }
+
+    var creatorIsSoleOverseer: Bool {
+        creatorIsOverseer && linkedObserverCount == 1
+    }
+
+    var showsCreatedBySection: Bool {
+        createdByLabel != nil && creatorSessionID != nil && !creatorIsOverseer
+    }
+
+    var accessibilityValue: String {
+        AgentOversightUICopy.overseeByMenuAccessibilityValue(overseenByCount: linkedObserverCount, availableCount: availableObserverCount)
     }
 }

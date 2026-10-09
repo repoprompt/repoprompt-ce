@@ -154,6 +154,121 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(outcomes[1], EditOutcome(index: 1, status: "success", error: nil))
     }
 
+    // MARK: - Issue #1262: fallback must never drop text outside the search span
+
+    private static let longPrefix = "| id | " + String(repeating: "a", count: 160)
+    private static let longLineFile = longPrefix + " | keep |\n"
+
+    func testBatchLiteralSuccessKeepsTextOutsideSpanBesideFailingSibling() async throws {
+        let literal = ApplyEditsOperation(search: Self.longPrefix, replace: "| id | changed", replaceAll: false)
+        let missing = ApplyEditsOperation(search: "absent\nabsent\nabsent", replace: "unused", replaceAll: false)
+        let orders: [(label: String, edits: [ApplyEditsOperation], literalIndex: Int, missingIndex: Int)] = [
+            ("literal first", [literal, missing], 0, 1),
+            ("literal second", [missing, literal], 1, 0)
+        ]
+
+        for order in orders {
+            for verbose in [false, true] {
+                let label = "\(order.label), verbose=\(verbose)"
+                let request = ApplyEditsRequest(path: "table.md", mode: .batch(order.edits), verbose: verbose)
+
+                let result = try await engine.apply(request: request, to: Self.longLineFile)
+
+                XCTAssertEqual(result.updatedText, "| id | changed | keep |\n", label)
+                XCTAssertEqual(result.status, .partial, label)
+                XCTAssertEqual(result.editsRequested, 2, label)
+                XCTAssertEqual(result.editsApplied, 1, label)
+                let outcomes = try XCTUnwrap(result.outcomes, label)
+                XCTAssertEqual(outcomes.map(\.index), [0, 1], label)
+                XCTAssertEqual(outcomes[order.literalIndex], EditOutcome(index: order.literalIndex, status: "success", error: nil), label)
+                XCTAssertEqual(outcomes[order.missingIndex].status, "failed", label)
+                XCTAssertNotNil(outcomes[order.missingIndex].error, label)
+                XCTAssertNotNil(result.stats, label)
+            }
+        }
+    }
+
+    func testNonLiteralSubLineSearchBeyondKeyCapIsRefused() async throws {
+        var chars = Array(Self.longPrefix)
+        chars[156] = "b"
+        let nearMiss = String(chars)
+        XCTAssertFalse(Self.longLineFile.contains(nearMiss))
+
+        let singleRequest = ApplyEditsRequest(
+            path: "table.md",
+            mode: .single(search: nearMiss, replace: "| id | changed", replaceAll: false),
+            verbose: false
+        )
+        do {
+            let result = try await engine.apply(request: singleRequest, to: Self.longLineFile)
+            XCTFail("Expected sub-line near miss to be refused, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+
+        let batchRequest = ApplyEditsRequest(
+            path: "table.md",
+            mode: .batch([ApplyEditsOperation(search: nearMiss, replace: "| id | changed", replaceAll: false)]),
+            verbose: false
+        )
+        let result = try await engine.apply(request: batchRequest, to: Self.longLineFile)
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(result.updatedText, Self.longLineFile)
+        XCTAssertEqual(result.editsApplied, 0)
+        XCTAssertEqual(result.outcomes?.map(\.status), ["failed"])
+    }
+
+    func testNonLiteralFuzzyNearMissLineIsRefused() async throws {
+        let original = "let total = computeTotal(items)\nreturn total\n"
+        let request = ApplyEditsRequest(
+            path: "file.swift",
+            mode: .single(search: "let total = computeTotals(items)", replace: "let total = 0", replaceAll: false),
+            verbose: false
+        )
+
+        do {
+            let result = try await engine.apply(request: request, to: original)
+            XCTFail("Expected fuzzy near miss to be refused, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+    }
+
+    func testNormalizedWholeLineMatchesStillApply() async throws {
+        let longBody = "let value = " + String(repeating: "x", count: 180)
+        let original = "func f() {\n    \(longBody)\n    return\n}\n"
+
+        // Case drift on a line longer than the 150-char key cap still matches whole-line.
+        let single = ApplyEditsRequest(
+            path: "file.swift",
+            mode: .single(
+                search: "    \(longBody.uppercased())\n    return",
+                replace: "    let value = 1\n    return",
+                replaceAll: false
+            ),
+            verbose: false
+        )
+        let singleResult = try await engine.apply(request: single, to: original)
+        XCTAssertEqual(singleResult.status, .success)
+        XCTAssertEqual(singleResult.updatedText, "func f() {\n    let value = 1\n    return\n}\n")
+
+        // Case drift in a batch beside a literal sibling: both apply, untouched text survives.
+        let batch = ApplyEditsRequest(
+            path: "file.swift",
+            mode: .batch([
+                ApplyEditsOperation(search: "func f() {", replace: "func g() {", replaceAll: false),
+                ApplyEditsOperation(search: "    RETURN", replace: "    return nil", replaceAll: false)
+            ]),
+            verbose: false
+        )
+        let batchResult = try await engine.apply(request: batch, to: original)
+        XCTAssertEqual(batchResult.status, .success)
+        XCTAssertEqual(batchResult.editsApplied, 2)
+        XCTAssertEqual(batchResult.updatedText, "func g() {\n    \(longBody)\n    return nil\n}\n")
+        XCTAssertEqual(batchResult.outcomes?.map(\.status), ["success", "success"])
+    }
+
     func testEmptyGeneratedChunksFailThroughApplyEditsInternalError() async throws {
         let engine = ApplyEditsEngine(
             diffEngine: EmptyDiffChunkGenerator(),

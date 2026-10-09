@@ -60,6 +60,8 @@ struct RepoPromptFileLogHandler: LogHandler {
 
 struct RepoPromptSwiftUIApp: App {
     init() {
+        let appInitSpan = StartupPhaseLog.begin(.appInit)
+        defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
             #if DEBUG
@@ -203,6 +205,8 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
@@ -228,6 +232,7 @@ public enum RepoPromptApplication {
         SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
         GlobalSettingsStore.installProcessApplicationEventBridge()
         FileSystemAppIntegration.installHooks()
+        bootstrapSpan.end()
         RepoPromptSwiftUIApp.main()
     }
 }

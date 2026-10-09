@@ -170,6 +170,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providersLinkRow
 
+            usageLimitsCard
+
             providerCleanupActionCard
 
             codexHookApprovalStrictModeCard
@@ -189,6 +191,52 @@ struct AgentModeGeneralSettingsView: View {
 
             agentChatsCard
         }
+    }
+
+    // MARK: - Usage limits (presentation only)
+
+    /// Master presentation switch. Enabling it shows usage only for sources that are already
+    /// enabled or connected per provider (CLI Providers); it never enables a source or reads
+    /// credentials by itself.
+    private var usageLimitsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "gauge.with.dots.needle.33percent")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Usage Limits")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Toggle("Show usage limits when available", isOn: usageLimitsDisplayBinding)
+                    .toggleStyle(.switch)
+
+                Text("Shows provider plan usage in Settings and a compact indicator in Agent Mode. Read-only; never changes which model runs. Turn on each source in CLI Providers.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let onNavigate {
+                    Button("Usage sources in CLI Providers…") { onNavigate(.cliProviders) }
+                        .buttonStyle(.link)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var usageLimitsDisplayBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.usageLimitsDisplayEnabled() },
+            set: { enabled in
+                globalSettings.setUsageLimitsDisplayEnabled(enabled)
+                UsageLimitsDisplayRuntimeBridge.applyEnabled(enabled)
+            }
+        )
     }
 
     // MARK: - Agent Chats

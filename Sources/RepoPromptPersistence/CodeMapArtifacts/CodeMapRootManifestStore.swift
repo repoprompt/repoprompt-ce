@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptFileSystem
+import RepoPromptShared
 
 package enum CodeMapRootManifestStoreError: Error, Equatable {
     case invalidRoot
@@ -187,7 +188,11 @@ package enum CodeMapRootManifestWriteResult: Equatable {
 
 #if DEBUG
     private enum CodeMapRootManifestDebugOperationContext {
-        @TaskLocal static var operationID: UUID?
+        // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+        static let operationIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
+        static var operationID: UUID? {
+            operationIDTaskLocal.get()
+        }
     }
 
     package struct CodeMapRootManifestDebugAttemptMetrics: Hashable {
@@ -1117,7 +1122,7 @@ package actor CodeMapRootManifestStore {
             lastAccessEpochSeconds: UInt64,
             operationID: UUID
         ) async throws -> CodeMapRootManifestWriteResult {
-            try await CodeMapRootManifestDebugOperationContext.$operationID.withValue(operationID) {
+            try await CodeMapRootManifestDebugOperationContext.operationIDTaskLocal.withValue(operationID) {
                 try await mergeCurrentManifest(
                     namespace: namespace,
                     authority: authority,

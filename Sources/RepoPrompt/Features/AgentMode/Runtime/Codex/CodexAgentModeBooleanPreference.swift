@@ -5,6 +5,7 @@ import RepoPromptSettingsCore
 /// app-standard contexts and legacy UserDefaults shims in injected-defaults tests.
 enum CodexAgentModeBooleanPreference {
     case goalSupport
+    case computerUse
     case reasoningSummaries
     case memories
     case apps
@@ -20,6 +21,8 @@ enum CodexAgentModeBooleanPreference {
         switch self {
         case .goalSupport:
             return CodexGoalSupport.isEnabled(defaults: defaults)
+        case .computerUse:
+            return CodexComputerUseWorkflow.isEnabled(defaults: defaults)
         case .reasoningSummaries:
             return CodexReasoningSummaries.isEnabled(defaults: defaults)
         case .memories:
@@ -44,6 +47,8 @@ enum CodexAgentModeBooleanPreference {
         switch self {
         case .goalSupport:
             CodexGoalSupport.setEnabled(enabled, defaults: defaults)
+        case .computerUse:
+            CodexComputerUseWorkflow.setEnabled(enabled, defaults: defaults)
         case .reasoningSummaries:
             CodexReasoningSummaries.setEnabled(enabled, defaults: defaults)
         case .memories:
@@ -64,6 +69,8 @@ enum CodexAgentModeBooleanPreference {
         switch self {
         case .goalSupport:
             GlobalSettingsStore.shared.codexGoalSupportEnabled()
+        case .computerUse:
+            GlobalSettingsStore.shared.codexComputerUseEnabled()
         case .reasoningSummaries:
             GlobalSettingsStore.shared.codexReasoningSummariesEnabled()
         case .memories:
@@ -84,6 +91,8 @@ enum CodexAgentModeBooleanPreference {
         switch self {
         case .goalSupport:
             GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
+        case .computerUse:
+            GlobalSettingsStore.shared.setCodexComputerUseEnabled(enabled)
         case .reasoningSummaries:
             GlobalSettingsStore.shared.setCodexReasoningSummariesEnabled(enabled)
         case .memories:

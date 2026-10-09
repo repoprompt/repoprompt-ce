@@ -7,6 +7,135 @@ import XCTest
 
 @MainActor
 final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
+    private let quotaSettingKey = "agent_mode.codex_usage_quota_enabled"
+
+    private func makeQuotaService() throws -> (AppSettingsMCPService, GlobalSettingsStore, () -> Void) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexUsageQuotaAppSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let suiteName = "CodexUsageQuotaAppSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        let cleanup = {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        return (AppSettingsMCPService(store: store), store, cleanup)
+    }
+
+    /// Quota opt-in writes must apply immediately, not merely persist until Settings closes.
+    func testWriteAppliesTheRuntimeTransitionInBothDirections() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = CodexUsageQuotaRuntimeBridge.applyEnabled
+        defer { CodexUsageQuotaRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        CodexUsageQuotaRuntimeBridge.applyEnabled = { transitions.append($0) }
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "production default is off")
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(quotaSettingKey), "value": .bool(true)
+        ])
+        XCTAssertTrue(store.codexUsageQuotaEnabled(), "the flag persists")
+        XCTAssertEqual(transitions, [true], "and is applied immediately")
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(quotaSettingKey), "value": .bool(false)
+        ])
+        XCTAssertFalse(store.codexUsageQuotaEnabled())
+        XCTAssertEqual(transitions, [true, false], "disabling tears down without waiting for the pane to close")
+    }
+
+    func testClaudeSettingDefaultsOffAndAppliesBothTransitions() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = ClaudeUsageQuotaRuntimeBridge.applyEnabled
+        defer { ClaudeUsageQuotaRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        ClaudeUsageQuotaRuntimeBridge.applyEnabled = { transitions.append($0) }
+        XCTAssertFalse(store.claudeUsageQuotaEnabled())
+        for enabled in [true, false] {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string("agent_mode.claude_usage_quota_enabled"), "value": .bool(enabled)
+            ])
+            XCTAssertEqual(store.claudeUsageQuotaEnabled(), enabled)
+        }
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "provider opt-ins are independent")
+    }
+
+    func testUsageLimitsDisplayIsPresentationOnlyAndAppliesBothTransitions() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = UsageLimitsDisplayRuntimeBridge.applyEnabled
+        defer { UsageLimitsDisplayRuntimeBridge.applyEnabled = original }
+        var transitions: [Bool] = []
+        UsageLimitsDisplayRuntimeBridge.applyEnabled = { transitions.append($0) }
+        let key = "agent_mode.usage_limits_display_enabled"
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let entry = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(entry.objectValue?["type"]?.stringValue, "boolean")
+        XCTAssertEqual(entry.objectValue?["value"]?.boolValue, false, "no legacy opt-in means hidden")
+
+        for enabled in [true, false] {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string(key), "value": .bool(enabled)
+            ])
+            XCTAssertEqual(store.usageLimitsDisplayEnabled(), enabled)
+        }
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertFalse(store.codexUsageQuotaEnabled(), "presentation never enables a source")
+        XCTAssertNil(store.claudeAccountUsageGrant(), "presentation never grants account consent")
+    }
+
+    func testLegacyClaudeOptInNeverCreatesAccountConsentAndNoGrantKeyExists() async throws {
+        let (service, store, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = ClaudeUsageQuotaRuntimeBridge.applyEnabled
+        defer { ClaudeUsageQuotaRuntimeBridge.applyEnabled = original }
+        ClaudeUsageQuotaRuntimeBridge.applyEnabled = { _ in }
+
+        _ = try await service.handleForTesting([
+            "op": .string("set"), "key": .string("agent_mode.claude_usage_quota_enabled"), "value": .bool(true)
+        ])
+        XCTAssertNil(store.claudeAccountUsageGrant())
+        XCTAssertTrue(store.usageLimitsDisplayEnabled(), "legacy opt-in users keep a visible surface")
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let keys = settings.compactMap { $0.objectValue?["key"]?.stringValue }
+        XCTAssertFalse(keys.contains { $0.localizedCaseInsensitiveContains("grant") || $0.localizedCaseInsensitiveContains("account_usage") })
+        let claudeEntry = try XCTUnwrap(settings.first {
+            $0.objectValue?["key"]?.stringValue == "agent_mode.claude_usage_quota_enabled"
+        })
+        let description = try XCTUnwrap(claudeEntry.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(description.contains("does NOT authorize Claude account usage reads"), description)
+    }
+
+    func testSettingIsReadableAndDefaultsOffInTheCatalog() async throws {
+        let (service, _, cleanup) = try makeQuotaService()
+        defer { cleanup() }
+        let original = CodexUsageQuotaRuntimeBridge.applyEnabled
+        defer { CodexUsageQuotaRuntimeBridge.applyEnabled = original }
+        CodexUsageQuotaRuntimeBridge.applyEnabled = { _ in }
+        let listed = try await service.handleForTesting([
+            "op": .string("list"), "group": .string("agent_mode"), "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let entry = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == quotaSettingKey })
+        XCTAssertEqual(entry.objectValue?["type"]?.stringValue, "boolean")
+        XCTAssertEqual(entry.objectValue?["value"]?.boolValue, false, "observe-only feature ships off")
+        let description = try XCTUnwrap(entry.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(description.contains("observe-only"))
+    }
+
     func testOracleRosterSettingIsOrderedValidatedAndPersistedAsSchemaV7() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceOracleRosterTests-\(UUID().uuidString)", isDirectory: true)
