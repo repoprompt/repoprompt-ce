@@ -98,7 +98,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                         items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current"))
                         continue
                     }
-                    detail["stopped"] = .bool(await backend.stopRun(target))
+                    detail["stopped"] = await .bool(backend.stopRun(target))
                 }
             }
 
@@ -129,9 +129,11 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     failures.append(message)
                 }
             }
-            let liveTouching = Set(inventory.live.filter { $0.observerSessionID == target || $0.targetSessionID == target }
-                .map { AgentSessionOversightIntent(observerSessionID: $0.observerSessionID, targetSessionID: $0.targetSessionID) })
-            let dormant = inventory.persisted.filter { $0.touches(sessionID: target) && !liveTouching.contains($0) }.count
+            let liveTouching = Set(
+                inventory.live.filter { $0.observerSessionID == target || $0.targetSessionID == target }
+                    .map { AgentSessionOversightIntent(observerSessionID: $0.observerSessionID, targetSessionID: $0.targetSessionID) }
+            )
+            let dormant = inventory.persisted.count(where: { $0.touches(sessionID: target) && !liveTouching.contains($0) })
             totalUnlinked += unlinked
             detail["unlinked"] = .int(unlinked)
             if outsideScope > 0 { detail["links_outside_scope"] = .int(outsideScope) }

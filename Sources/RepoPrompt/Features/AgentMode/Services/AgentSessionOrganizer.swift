@@ -10,7 +10,7 @@ import RepoPromptDomainRuntime
 // SEARCH-HELPER: session organizer, sidebar groups, pin order, archive/unarchive without switching.
 
 /// Organizing-relevant state of one loaded session (its workspace is a window's active workspace).
-struct AgentSessionOrganizeState: Equatable, Sendable {
+struct AgentSessionOrganizeState: Equatable {
     let sessionID: UUID
     let workspaceID: UUID
     let tabID: UUID

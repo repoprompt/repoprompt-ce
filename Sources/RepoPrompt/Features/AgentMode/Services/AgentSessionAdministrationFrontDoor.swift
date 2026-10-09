@@ -308,7 +308,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             let now = Date()
             let excludeCaller = request.operation.deniesScopeSelfTarget
             let matches = snapshot.records.values
-                .filter { $0.isLoaded }
+                .filter(\.isLoaded)
                 .filter { filter.matchesStructured($0, in: snapshot, now: now) }
                 .filter { AgentSessionInventoryRendering.matchesQuery(filter.query, record: $0) }
                 .filter { !(excludeCaller && $0.sessionID == callerSessionID) }

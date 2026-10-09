@@ -87,10 +87,24 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         let stranger = UUID()
         let snapshot = DomainAgentSessionInventorySnapshot(
             records: [
-                record(root, workspace: workspace, pinned: true, group: "Lanes", state: .running,
-                       createdAt: now.addingTimeInterval(-10 * 86400), idleDays: 1),
-                record(child, parent: root, workspace: workspace, archived: true, state: .waiting,
-                       createdAt: now.addingTimeInterval(-2 * 86400), idleDays: 9),
+                record(
+                    root,
+                    workspace: workspace,
+                    pinned: true,
+                    group: "Lanes",
+                    state: .running,
+                    createdAt: now.addingTimeInterval(-10 * 86400),
+                    idleDays: 1
+                ),
+                record(
+                    child,
+                    parent: root,
+                    workspace: workspace,
+                    archived: true,
+                    state: .waiting,
+                    createdAt: now.addingTimeInterval(-2 * 86400),
+                    idleDays: 9
+                ),
                 record(stranger, workspace: UUID(), state: .completed, idleDays: 30, loaded: false)
             ],
             edges: DomainAgentSessionInventoryEdge.merge(live: [(root, child, UUID(), 1)], persisted: []),
@@ -107,8 +121,11 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         XCTAssertEqual(matching(.init(group: DomainAgentSessionInventoryFilter.GroupMatch.none)), [child, stranger])
         XCTAssertEqual(matching(.init(idleDaysGreaterThan: 8)), [child, stranger])
         XCTAssertEqual(matching(.init(createdBefore: now.addingTimeInterval(-5 * 86400))), [root])
-        XCTAssertEqual(matching(.init(createdAfter: now.addingTimeInterval(-5 * 86400))), [child],
-                       "a record with no creation date never matches a creation bound")
+        XCTAssertEqual(
+            matching(.init(createdAfter: now.addingTimeInterval(-5 * 86400))),
+            [child],
+            "a record with no creation date never matches a creation bound"
+        )
         XCTAssertEqual(matching(.init(hasLinks: false)), [stranger])
         XCTAssertEqual(matching(.init(role: .overseer)), [root])
         XCTAssertEqual(matching(.init(role: .overseen)), [child])
@@ -203,8 +220,15 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
     func testUndoLedgerIsSingleUseGranteeBoundAndExpires() {
         var ledger = DomainAgentSessionAdministrationUndoLedger<Int>(lifetime: 60)
         let grantee = UUID()
-        _ = ledger.issue(token: "t", granteeSessionID: grantee, scopeID: UUID(), operation: .adminSetPin,
-                         targetSessionIDs: [UUID()], payload: 1, now: now)
+        _ = ledger.issue(
+            token: "t",
+            granteeSessionID: grantee,
+            scopeID: UUID(),
+            operation: .adminSetPin,
+            targetSessionIDs: [UUID()],
+            payload: 1,
+            now: now
+        )
         guard case .unavailable = ledger.redeem(token: "t", granteeSessionID: UUID(), now: now) else {
             return XCTFail("another grantee cannot redeem")
         }
@@ -215,8 +239,15 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         guard case .unavailable = ledger.redeem(token: "t", granteeSessionID: grantee, now: now) else {
             return XCTFail("tokens are single use")
         }
-        _ = ledger.issue(token: "late", granteeSessionID: grantee, scopeID: UUID(), operation: .adminSetPin,
-                         targetSessionIDs: [], payload: 2, now: now)
+        _ = ledger.issue(
+            token: "late",
+            granteeSessionID: grantee,
+            scopeID: UUID(),
+            operation: .adminSetPin,
+            targetSessionIDs: [],
+            payload: 2,
+            now: now
+        )
         guard case .expired = ledger.redeem(token: "late", granteeSessionID: grantee, now: now.addingTimeInterval(61)) else {
             return XCTFail("tokens expire")
         }

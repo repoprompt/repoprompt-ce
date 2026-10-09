@@ -184,7 +184,7 @@ enum AgentSessionAdminRendering {
         object["result"] = .string("applied")
         object["op"] = .string(operation.adminOperationName)
         object["items"] = .array(items.map(\.value))
-        object["changed_count"] = .int(items.filter { $0.status == .changed }.count)
+        object["changed_count"] = .int(items.count(where: { $0.status == .changed }))
         if !itemsRequiringControl.isEmpty {
             object["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
         }
@@ -359,9 +359,11 @@ enum AgentSessionInventoryRendering {
             "last_activity_at": .string(AgentSessionAdminRendering.iso(record.lastActivityAt)),
             "idle_days": .int(snapshot.idleDays(record.sessionID, now: now) ?? 0),
             "worktree_count": .int(record.worktreeCount),
-            "roles": .array(DomainAgentSessionInventoryRole.allCases
-                .filter(snapshot.roles(of: record.sessionID).contains)
-                .map { .string($0.rawValue) }),
+            "roles": .array(
+                DomainAgentSessionInventoryRole.allCases
+                    .filter(snapshot.roles(of: record.sessionID).contains)
+                    .map { .string($0.rawValue) }
+            ),
             "link_count": .int(snapshot.edges(touching: record.sessionID).count)
         ]
         if let workspaceID = record.workspaceID { object["workspace_id"] = .string(workspaceID.uuidString) }

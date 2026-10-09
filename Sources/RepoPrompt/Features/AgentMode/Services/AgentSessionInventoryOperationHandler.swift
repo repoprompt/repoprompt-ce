@@ -77,10 +77,12 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             row["links"] = .array(snapshot.edges(touching: target).map {
                 AgentSessionInventoryRendering.edge($0, snapshot: snapshot)
             })
-            row["children"] = .array(snapshot.records.values
-                .filter { $0.effectiveParentID == target && visibility.isVisible($0, in: snapshot) }
-                .sorted { $0.lastActivityAt > $1.lastActivityAt }
-                .map { .string($0.sessionID.uuidString) })
+            row["children"] = .array(
+                snapshot.records.values
+                    .filter { $0.effectiveParentID == target && visibility.isVisible($0, in: snapshot) }
+                    .sorted { $0.lastActivityAt > $1.lastActivityAt }
+                    .map { .string($0.sessionID.uuidString) }
+            )
             return .object(["result": .string("ok"), "session": .object(row)])
 
         case .adminTree:
@@ -103,9 +105,11 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     "state": .string(record.runState.rawValue),
                     "archived": .bool(record.isArchived),
                     "pinned": .bool(record.isPinned),
-                    "observes": .array(snapshot.edges(touching: record.sessionID)
-                        .filter { $0.observerSessionID == record.sessionID }
-                        .map { .string($0.targetSessionID.uuidString) })
+                    "observes": .array(
+                        snapshot.edges(touching: record.sessionID)
+                            .filter { $0.observerSessionID == record.sessionID }
+                            .map { .string($0.targetSessionID.uuidString) }
+                    )
                 ]
                 if let group = record.sidebarGroup { object["group"] = .string(group) }
                 let children = (childrenByParent[record.sessionID] ?? [])

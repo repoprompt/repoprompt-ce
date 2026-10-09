@@ -7,7 +7,7 @@ import Foundation
 // MARK: - Run state
 
 /// Coarse run state used for inventory filters and rendering.
-package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable, Sendable {
+package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable {
     case idle
     case running
     /// Waiting on the user: an approval, a question, or input.
@@ -40,7 +40,7 @@ package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable
 }
 
 /// A session's oversight role, mirroring the HUD role filter.
-package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable, Sendable {
+package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable {
     /// Observes at least one session (live link or persisted intent).
     case overseer
     /// Is observed by at least one session.
@@ -48,7 +48,7 @@ package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable, Se
 }
 
 /// Why a session counts as orphaned (design §4.2).
-package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable, Sendable {
+package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable {
     /// A persisted oversight intent touching this session names a session that no longer exists.
     case linkIntentMissingSession = "link_intent_missing_session"
     /// An observer of this session is archived or deleted.
@@ -62,7 +62,7 @@ package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable, Sen
 // MARK: - Records
 
 /// One session as inventory sees it. Projected by the app; never built from tool arguments.
-package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
+package struct DomainAgentSessionInventoryRecord: Hashable {
     package let sessionID: UUID
     package let name: String
     package let workspaceID: UUID?
@@ -130,7 +130,7 @@ package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
 }
 
 /// One directed observer → target relationship: a live link, a persisted intent, or both.
-package struct DomainAgentSessionInventoryEdge: Hashable, Sendable {
+package struct DomainAgentSessionInventoryEdge: Hashable {
     package let observerSessionID: UUID
     package let targetSessionID: UUID
     /// A live link currently exists in the link authority.
@@ -198,7 +198,7 @@ package struct DomainAgentSessionInventoryEdge: Hashable, Sendable {
 // MARK: - Snapshot
 
 /// Every known session plus the oversight edges among them, at one moment.
-package struct DomainAgentSessionInventorySnapshot: Sendable {
+package struct DomainAgentSessionInventorySnapshot {
     package let records: [UUID: DomainAgentSessionInventoryRecord]
     package let edges: [DomainAgentSessionInventoryEdge]
     /// The history scan covered every workspace. Absence-based orphan reasons ("missing") are only
@@ -297,8 +297,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
 
 /// Structured inventory filter (design §3.1). `query` is free text and is evaluated by the app with
 /// the shared session search matcher, so it is carried here but not interpreted.
-package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
-    package enum GroupMatch: Hashable, Sendable {
+package struct DomainAgentSessionInventoryFilter: Hashable {
+    package enum GroupMatch: Hashable {
         case named(String)
         /// Sessions with no sidebar group.
         case none
@@ -398,7 +398,7 @@ package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
 
 // MARK: - Ordering (compare-and-swap)
 
-package enum DomainAgentSessionOrderingError: Error, Hashable, Sendable {
+package enum DomainAgentSessionOrderingError: Error, Hashable {
     /// `order` and `expected_order` must name the same items, each once.
     case orderSetMismatch
     /// An item in `order` is not currently in the ordered set.
@@ -478,19 +478,19 @@ package enum DomainAgentSessionSidebarGroup {
 
 /// Idempotency for direct (uncarded) administration calls: a key replays its first result for the
 /// identical request and conflicts for any other. Bounded; oldest entries are evicted first.
-package struct DomainAgentSessionAdministrationIdempotencyLedger<Result>: Sendable where Result: Sendable {
-    package enum Lookup: Sendable {
+package struct DomainAgentSessionAdministrationIdempotencyLedger<Result: Sendable> {
+    package enum Lookup {
         case miss
         case replay(Result)
         case conflict
     }
 
-    private struct Key: Hashable, Sendable {
+    private struct Key: Hashable {
         let granteeSessionID: UUID
         let idempotencyKey: String
     }
 
-    private struct Entry: Sendable {
+    private struct Entry {
         let fingerprint: String
         let result: Result
     }
@@ -526,8 +526,8 @@ package struct DomainAgentSessionAdministrationIdempotencyLedger<Result>: Sendab
 
 /// Undo tokens for reversible bulk operations (design §2.5): one token per applied call, bound to
 /// its grantee and scope, valid for a bounded window, consumed at most once.
-package struct DomainAgentSessionAdministrationUndoLedger<Payload>: Sendable where Payload: Sendable {
-    package struct Entry: Sendable {
+package struct DomainAgentSessionAdministrationUndoLedger<Payload: Sendable> {
+    package struct Entry {
         package let token: String
         package let granteeSessionID: UUID
         package let scopeID: UUID
@@ -537,7 +537,7 @@ package struct DomainAgentSessionAdministrationUndoLedger<Payload>: Sendable whe
         package let expiresAt: Date
     }
 
-    package enum Redeem: Sendable {
+    package enum Redeem {
         case redeemed(Entry)
         /// Unknown token, another grantee's token, or already consumed. Deliberately one case.
         case unavailable

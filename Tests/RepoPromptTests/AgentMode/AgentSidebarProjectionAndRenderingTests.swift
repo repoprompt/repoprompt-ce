@@ -366,7 +366,7 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
 
         let paged = result.pagedSessions
         XCTAssertEqual(paged.filter(\.isPinned).count, 20, "every pin is visible")
-        XCTAssertEqual(paged.filter { !$0.isPinned }.count, AgentModeViewModel.sessionSidebarPageSize)
+        XCTAssertEqual(paged.count(where: { !$0.isPinned }), AgentModeViewModel.sessionSidebarPageSize)
         XCTAssertEqual(result.effectiveVisibleSessionCount, paged.count)
     }
 
@@ -390,7 +390,7 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         XCTAssertEqual(groupA.count, 1, "a collapsed group keeps one header carrier")
         XCTAssertEqual(groupA.first?.hidesRow, true)
 
-        let ungroupedOnly = [rows.first { $0.tabID == id(1) }].compactMap { $0 }
+        let ungroupedOnly = [rows.first { $0.tabID == id(1) }].compactMap(\.self)
         XCTAssertEqual(
             AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(for: ungroupedOnly, collapsedGroups: []).map(\.id),
             AgentSidebarDateSectionBuilder.renderedActiveRows(

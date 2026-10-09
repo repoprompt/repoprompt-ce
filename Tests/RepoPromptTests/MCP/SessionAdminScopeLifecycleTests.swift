@@ -879,8 +879,16 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         ) -> UUID {
             let id = UUID()
             provenance.add(id, parent: parent ?? overseer, workspace: workspace, state: run)
-            organizer.add(id, workspace: workspace, name: name, pinned: pinned, pinnedOrder: pinnedOrder,
-                          group: group, archived: archived, run: run)
+            organizer.add(
+                id,
+                workspace: workspace,
+                name: name,
+                pinned: pinned,
+                pinnedOrder: pinnedOrder,
+                group: group,
+                archived: archived,
+                run: run
+            )
             return id
         }
 
@@ -1013,8 +1021,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "op": .string("reorder_pins"), "order": ids([b, a]), "expected_order": ids([a, b])
         ])
         XCTAssertEqual(applied["result"], .string("applied"))
-        XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), [b, x, a],
-                       "the outsider keeps its slot")
+        XCTAssertEqual(
+            fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace),
+            [b, x, a],
+            "the outsider keeps its slot"
+        )
 
         let token = try XCTUnwrap(applied["undo_token"]?.stringValue)
         let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])

@@ -3,7 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 
 /// What `undo` restores for one reversible organize call.
-enum AgentSessionOrganizeUndoPayload: Sendable {
+enum AgentSessionOrganizeUndoPayload {
     /// Exact prior name/pin/order/group state.
     case restore([AgentSessionOrganizeState])
     /// Undo of `archive`.
@@ -102,7 +102,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let args = request.arguments
         switch request.operation {
         case .adminRename:
-            return "Rename to \u{201C}\(try AgentSessionAdminArguments.string(args, "name") ?? "")\u{201D}"
+            return try "Rename to \u{201C}\(AgentSessionAdminArguments.string(args, "name") ?? "")\u{201D}"
         case .adminSetPin:
             return try AgentSessionAdminArguments.bool(args, "pinned") == false ? "Unpin" : "Pin"
         case .adminReorderPins:
@@ -226,8 +226,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     private func record(_ context: Context, attempted: [AgentSessionOrganizeState], changed: Set<UUID>) {
         for state in attempted {
-            context.add(state.sessionID, changed.contains(state.sessionID) ? .changed : .failed,
-                        changed.contains(state.sessionID) ? nil : "mutation_rejected")
+            context.add(
+                state.sessionID,
+                changed.contains(state.sessionID) ? .changed : .failed,
+                changed.contains(state.sessionID) ? nil : "mutation_rejected"
+            )
         }
     }
 

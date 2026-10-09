@@ -409,6 +409,7 @@ struct AgentModeSessionsListView: View {
             }
         ))
     }
+
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
     private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared

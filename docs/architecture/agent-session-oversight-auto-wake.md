@@ -95,8 +95,12 @@ Rules that hold the scope design together:
   grants nothing.
 - **Batch cards apply on approval.** `AgentSessionAdministrationFrontDoor` keeps the exact request
   behind each card and, when the user approves, applies it with identical arguments narrowed to the
-  ticked items; the outcome is reported by `confirmation_status` (`applied_result`). Undo tokens
-  are re-authorized as the original operation over the original targets at redemption.
+  ticked items (so the arguments digest the card is bound to matches); the outcome is reported by
+  `confirmation_status` (`applied_result`). The card is claimed with `beginApplying` and settled with
+  `finishApplying`: by the core when the authority still requires the card, otherwise (unticking
+  brought the batch to or below the threshold) by the front door, so a successful application
+  always ends `applied` and a failed one returns the card to `approved`. Undo tokens are
+  re-authorized as the original operation over the original targets at redemption.
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
