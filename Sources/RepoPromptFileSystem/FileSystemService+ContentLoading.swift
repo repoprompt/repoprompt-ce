@@ -1805,7 +1805,7 @@ extension FileSystemService {
                             }
                             return try await operation()
                         }
-                        let value = try await EditFlowPerf.$currentLifecycleCorrelation.withValue(lifecycleCorrelation) {
+                        let value = try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(lifecycleCorrelation) {
                             #if DEBUG
                                 try await FileSystemReadMetrics.$currentContext
                                     .withValue(benchmarkMetricTag) {

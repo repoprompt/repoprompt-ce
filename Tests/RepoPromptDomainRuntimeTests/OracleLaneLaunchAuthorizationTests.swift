@@ -86,7 +86,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             return .string("ok")
         }
         let security = makeSecurityContext(identity: runtime.identity, toolName: "ask_oracle")
-        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+        let value = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
             try await provider.wrapping(binding)(["message": .string("hello")])
         }
 
@@ -127,7 +127,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         let security = makeSecurityContext(identity: runtime.identity, toolName: "ask_oracle")
 
         await XCTAssertOracleLaunchThrowsErrorAsync {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
                 try await provider.wrapping(binding)([:])
             }
         } verify: {
@@ -179,7 +179,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         let security = makeSecurityContext(identity: runtime.identity, toolName: "ask_oracle")
 
         await XCTAssertOracleLaunchThrowsErrorAsync {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
                 try await provider.wrapping(binding)([:])
             }
         } verify: {

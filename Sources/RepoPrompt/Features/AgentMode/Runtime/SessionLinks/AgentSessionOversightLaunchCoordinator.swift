@@ -989,7 +989,13 @@ final class AgentSessionOversightLaunchCoordinator {
             // authority hops. That refusal grants nothing, but is not proof the saved pair is gone.
             if case .failed(.rebinding) = outcome,
                let host = delegate.launchCoordinatorHost,
-               transientHydrationDrift(from: proof, candidates: host.agentSessionLinkCandidates())
+               transientHydrationDrift(
+                   from: proof,
+                   candidates: host.agentSessionLinkCandidates(
+                       forSessionIDs: [proof.observerEndpoint.sessionID, proof.targetEndpoint.sessionID],
+                       includeLocation: true
+                   ).values.flatMap(\.self)
+               )
             {
                 // The launch reservation budget is spent; retain intent for the next launch.
                 settled.state = .waiting

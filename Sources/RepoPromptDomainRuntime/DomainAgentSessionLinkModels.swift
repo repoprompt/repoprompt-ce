@@ -365,6 +365,9 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
     package let targetSessionID: UUID
     package let displayName: String?
     package let capabilities: Set<DomainAgentSessionLinkCapability>
+    /// Grant creation time — host-side ordering input only (e.g. "first overseer by link
+    /// creation"); inventories keep their deterministic UUID ordering regardless.
+    package let createdAt: Date
 
     package init(
         linkID: UUID,
@@ -372,7 +375,8 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
         observerSessionID: UUID,
         targetSessionID: UUID,
         displayName: String?,
-        capabilities: Set<DomainAgentSessionLinkCapability>
+        capabilities: Set<DomainAgentSessionLinkCapability>,
+        createdAt: Date
     ) {
         self.linkID = linkID
         self.generation = generation
@@ -383,6 +387,7 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
             maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
         )
         self.capabilities = capabilities
+        self.createdAt = createdAt
     }
 
     package var capabilityNames: [String] {
@@ -524,6 +529,15 @@ package struct DomainAgentSessionLinkEndpointProjectionInputs: Equatable, Sendab
         self.activeOutboundObserverEndpoints = activeOutboundObserverEndpoints
         self.notices = notices
     }
+}
+
+/// A single authority turn for sparse presentation and authoritative final clears.
+/// `endpoints` names retained link/notice keys, not the additional empty clear inputs.
+package struct DomainAgentSessionLinkPresentationSnapshot: Sendable {
+    package let authorityRevision: UInt64
+    package let endpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let activeOutboundObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+    package let inputs: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionLinkEndpointProjectionInputs]
 }
 
 // MARK: - Errors

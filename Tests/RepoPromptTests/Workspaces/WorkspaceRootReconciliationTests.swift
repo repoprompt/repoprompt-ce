@@ -311,7 +311,9 @@ import XCTest
                     revisionsByWorkspaceID: [fixture.workspace.id: before.canonical.revisions],
                     digestsByWorkspaceID: [fixture.workspace.id: before.canonical.document.contentDigest],
                     healthByWorkspaceID: [fixture.workspace.id: before.canonical.health],
-                    catalogRevision: oldCatalog.catalogRevision, publicationSequence: oldCatalog.publicationSequence
+                    catalogRevision: oldCatalog.catalogRevision,
+                    publicationSequence: oldCatalog.publicationSequence,
+                    canonicalSystemWorkspaceIDs: []
                 )
                 XCTAssertEqual(fixture.manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).revisions, newer?.revisions)
             }

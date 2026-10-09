@@ -35,6 +35,20 @@ final class SettingsCoreContractTests: XCTestCase {
         }
     }
 
+    func testComputerUseOptInIsAdditiveAndRoundTripsBothValues() throws {
+        let decoder = JSONDecoder()
+        let oldSettings = try decoder.decode(GlobalScalarPreferences.AgentModeSettings.self, from: Data("{}".utf8))
+        XCTAssertNil(oldSettings.codexComputerUseEnabled)
+        for enabled in [false, true] {
+            var preferences = GlobalScalarPreferences()
+            preferences.agentMode = .init(codexComputerUseEnabled: enabled)
+            let document = GlobalSettingsDocument(scalarPreferences: preferences)
+            let bytes = try JSONEncoder().encode(document)
+            let decoded = try decoder.decode(GlobalSettingsDocument.self, from: bytes)
+            XCTAssertEqual(decoded.scalarPreferences?.agentMode?.codexComputerUseEnabled, enabled)
+        }
+    }
+
     func testIgnoreFacetPreservesEmptyOverrideAndReflectsDeferredWrites() throws {
         try withStore { store, fileStore in
             let reader: any GlobalIgnoreSettingsProviding = store

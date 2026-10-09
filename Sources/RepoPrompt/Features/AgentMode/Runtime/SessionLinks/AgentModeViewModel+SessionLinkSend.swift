@@ -309,11 +309,15 @@ extension AgentModeViewModel {
         //    additionally leaves any staged handoff untouched, so the target's next *local* send
         //    still receives the continuity it was staged for. Nothing focuses, activates, or
         //    switches the target window.
+        // Local arming authorizes this tab's turns, including attributed remote input.
+        let dispatchedProviderMessage = liveSession.isCodexComputerUseArmed
+            ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage)
+            : providerMessage
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
         if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
             var dispatchedRow = liveSession.items[index]
-            dispatchedRow.dispatchedProviderText = providerMessage
+            dispatchedRow.dispatchedProviderText = dispatchedProviderMessage
             liveSession.replaceItem(at: index, with: dispatchedRow)
             scheduleSave(for: candidate.tabID)
         }
@@ -322,7 +326,7 @@ extension AgentModeViewModel {
         let startRecorder = AgentRunStartOutcomeRecorder()
         _ = await startAgentRun(
             tabID: candidate.tabID,
-            initialMessage: providerMessage,
+            initialMessage: dispatchedProviderMessage,
             directStartOptions: AgentDirectRunStartOptions(
                 ignoresPendingHandoff: true, stopFence: stopFence
             ),

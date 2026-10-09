@@ -1,14 +1,19 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
+// Boxed task-locals: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
 package enum DomainChildLaunchContext {
     /// Exact N=1 compatibility carrier. Group execution uses `bundle` and leaves this nil.
-    @TaskLocal package static var current: DomainChildLaunchCarrier?
-    @TaskLocal package static var bundle: DomainChildLaunchCarrierBundle?
+    package static let currentTaskLocal = BoxedTaskLocal<DomainChildLaunchCarrier?>(nil)
+    package static var current: DomainChildLaunchCarrier? { currentTaskLocal.get() }
+    package static let bundleTaskLocal = BoxedTaskLocal<DomainChildLaunchCarrierBundle?>(nil)
+    package static var bundle: DomainChildLaunchCarrierBundle? { bundleTaskLocal.get() }
 }
 
 package enum DomainInteractionPresentationContext {
-    @TaskLocal package static var requestID: UUID?
+    package static let requestIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    package static var requestID: UUID? { requestIDTaskLocal.get() }
 }
 
 package struct DomainLongRunningInteractionAdapter: Sendable {
@@ -223,8 +228,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                         try await policyStore.revalidate(authorization)
                     }
                     try Task.checkCancellation()
-                    value = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
-                        try await DomainChildLaunchContext.$current.withValue(carrier) {
+                    value = try await DomainChildLaunchContext.bundleTaskLocal.withValue(bundle) {
+                        try await DomainChildLaunchContext.currentTaskLocal.withValue(carrier) {
                             try await binding(arguments)
                         }
                     }
@@ -298,7 +303,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 kind: .appUI,
                 isAvailable: adapter.isAvailable,
                 present: { request in
-                    try await DomainInteractionPresentationContext.$requestID.withValue(request.id) {
+                    try await DomainInteractionPresentationContext.requestIDTaskLocal.withValue(request.id) {
                         try await binding(arguments)
                     }
                 },

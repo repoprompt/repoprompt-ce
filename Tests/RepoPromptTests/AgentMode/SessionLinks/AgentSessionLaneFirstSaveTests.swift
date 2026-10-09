@@ -431,7 +431,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     return XCTFail("published lane missing a session")
                 }
                 XCTAssertNil(viewModel.test_ownerValidatedSessionIndex[sessionID])
-                capturedLabel = viewModel.agentSessionLinkLaneCreatorLabel(for: sessionID)
+                capturedLabel = viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.label
             }
             defer { viewModel.test_afterOversightLaneProvision = nil }
             _ = try await viewModel.mcpCreateOversightLane(

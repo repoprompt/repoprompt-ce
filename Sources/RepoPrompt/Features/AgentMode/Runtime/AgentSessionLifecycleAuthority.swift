@@ -202,7 +202,41 @@ final class AgentSessionLifecycleAuthority {
         let workspaces: [WorkspaceModel]
         let protectedWorkspaceIDs: Set<UUID>
         let protectedClaimCount: Int
+        /// Newly owed dirty/diagnostic notifications, not all applied repairs.
+        let newlyRequiredRepairWorkspaceIDs: Set<UUID>
     }
+
+    enum ProjectionRepairBaseline: Equatable {
+        case working(revision: UInt64, digest: String)
+        case absent
+    }
+
+    private struct ProjectionTabState: Equatable {
+        let composeTabs: [ComposeTabState]
+        let stashedTabs: [StashedTab]
+        let activeComposeTabID: UUID?
+
+        init(_ workspace: WorkspaceModel) {
+            composeTabs = workspace.composeTabs
+            stashedTabs = workspace.stashedTabs
+            activeComposeTabID = workspace.activeComposeTabID
+        }
+    }
+
+    private enum RepairedProjectionState: Equatable {
+        case tabs(ProjectionTabState)
+        case restoredWorkspace(WorkspaceModel)
+    }
+
+    private struct RepairNotificationState {
+        let baseline: ProjectionRepairBaseline
+        var lastNotifiedRepair: RepairedProjectionState?
+    }
+
+    /// Notification bookkeeping, not save acknowledgment. Local/self-echo no-ops
+    /// cannot prove canonical convergence. Retain one target per protected workspace
+    /// until its baseline changes or protection expires; failed saves remain dirty.
+    private var repairNotificationsByWorkspaceID: [UUID: RepairNotificationState] = [:]
 
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
@@ -311,25 +345,49 @@ final class AgentSessionLifecycleAuthority {
     func reconcileProjection(
         projectedWorkspaces: [WorkspaceModel],
         currentWorkspaces: [WorkspaceModel],
-        claims: [ProtectionClaim]
+        claims: [ProtectionClaim],
+        repairBaselines: [UUID: ProjectionRepairBaseline] = [:]
     ) -> ProjectionOutcome {
         let protectedClaims = claims.filter(\.isProtected)
-        guard !protectedClaims.isEmpty else {
-            return ProjectionOutcome(
-                workspaces: projectedWorkspaces,
-                protectedWorkspaceIDs: [],
-                protectedClaimCount: 0
-            )
-        }
-
-        let claimsByWorkspace = Dictionary(grouping: protectedClaims, by: { $0.identity.workspaceID })
         let currentByID = Dictionary(
             currentWorkspaces.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+        let protectedIDs = Set(protectedClaims.map(\.identity.workspaceID))
+        repairNotificationsByWorkspaceID = repairNotificationsByWorkspaceID.filter {
+            protectedIDs.contains($0.key) && currentByID[$0.key]?.isEphemeral == false
+        }
+        for (workspaceID, baseline) in repairBaselines
+            where protectedIDs.contains(workspaceID) && currentByID[workspaceID]?.isEphemeral == false
+        {
+            // Canonical working revisions advance monotonically; a replay of an
+            // older observation must not re-arm an already-notified repair.
+            if let previous = repairNotificationsByWorkspaceID[workspaceID]?.baseline,
+               case let .working(previousRevision, _) = previous,
+               case let .working(revision, _) = baseline,
+               revision < previousRevision
+            {
+                continue
+            }
+            // Re-arm even on a no-op: absent -> present -> absent is new damage.
+            if repairNotificationsByWorkspaceID[workspaceID]?.baseline != baseline {
+                repairNotificationsByWorkspaceID[workspaceID] = RepairNotificationState(baseline: baseline)
+            }
+        }
+        guard !protectedClaims.isEmpty else {
+            return ProjectionOutcome(
+                workspaces: projectedWorkspaces,
+                protectedWorkspaceIDs: [],
+                protectedClaimCount: 0,
+                newlyRequiredRepairWorkspaceIDs: []
+            )
+        }
+
+        let claimsByWorkspace = Dictionary(grouping: protectedClaims, by: { $0.identity.workspaceID })
         var reconciled = projectedWorkspaces
         var protectedWorkspaceIDs = Set<UUID>()
         var protectedClaimCount = 0
+        var newlyRequiredRepairWorkspaceIDs = Set<UUID>()
 
         for (workspaceID, workspaceClaims) in claimsByWorkspace {
             guard let currentWorkspace = currentByID[workspaceID] else { continue }
@@ -341,11 +399,18 @@ final class AgentSessionLifecycleAuthority {
                 projectedIndex = reconciled.index(before: reconciled.endIndex)
                 protectedWorkspaceIDs.insert(workspaceID)
                 protectedClaimCount += workspaceClaims.count
-                recordProjectionProtection(
-                    claims: workspaceClaims,
-                    previousTabs: [],
-                    reason: "workspace_missing_from_projection"
-                )
+                if requiresRepairNotification(
+                    workspaceID: workspaceID,
+                    baseline: repairBaselines[workspaceID],
+                    repairedState: .restoredWorkspace(currentWorkspace)
+                ) {
+                    newlyRequiredRepairWorkspaceIDs.insert(workspaceID)
+                    recordProjectionProtection(
+                        claims: workspaceClaims,
+                        previousTabs: [],
+                        reason: "workspace_missing_from_projection"
+                    )
+                }
                 continue
             }
 
@@ -389,18 +454,43 @@ final class AgentSessionLifecycleAuthority {
                     || (claim.isActive && previous.activeComposeTabID != claim.identity.tabID)
             }
             protectedClaimCount += changedClaims.count
-            recordProjectionProtection(
-                claims: changedClaims,
-                previousTabs: previous.composeTabs,
-                reason: "stale_projection_reconciled"
-            )
+            if requiresRepairNotification(
+                workspaceID: workspaceID,
+                baseline: repairBaselines[workspaceID],
+                repairedState: .tabs(ProjectionTabState(next))
+            ) {
+                newlyRequiredRepairWorkspaceIDs.insert(workspaceID)
+                recordProjectionProtection(
+                    claims: changedClaims,
+                    previousTabs: previous.composeTabs,
+                    reason: "stale_projection_reconciled"
+                )
+            }
         }
 
         return ProjectionOutcome(
             workspaces: reconciled,
             protectedWorkspaceIDs: protectedWorkspaceIDs,
-            protectedClaimCount: protectedClaimCount
+            protectedClaimCount: protectedClaimCount,
+            newlyRequiredRepairWorkspaceIDs: newlyRequiredRepairWorkspaceIDs
         )
+    }
+
+    private func requiresRepairNotification(
+        workspaceID: UUID,
+        baseline: ProjectionRepairBaseline?,
+        repairedState: RepairedProjectionState
+    ) -> Bool {
+        // Legacy disk/hybrid projections without canonical evidence keep their
+        // existing behavior and cannot overwrite revisioned notification state.
+        guard let baseline else { return true }
+        guard var notification = repairNotificationsByWorkspaceID[workspaceID],
+              notification.baseline == baseline
+        else { return false }
+        guard notification.lastNotifiedRepair != repairedState else { return false }
+        notification.lastNotifiedRepair = repairedState
+        repairNotificationsByWorkspaceID[workspaceID] = notification
+        return true
     }
 
     func record(_ event: Event) {

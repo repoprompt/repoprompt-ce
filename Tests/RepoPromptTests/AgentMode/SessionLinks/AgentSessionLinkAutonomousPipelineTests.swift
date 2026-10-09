@@ -536,7 +536,27 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         viewModelsByWindowID[windowID] = viewModel
     }
 
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        viewModelsByWindowID[endpoint.windowID]?.agentSessionLinkCandidate(for: endpoint, includeLocation: includeLocation)
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        for windowID in viewModelsByWindowID.keys.sorted() {
+            guard let viewModel = viewModelsByWindowID[windowID] else { continue }
+            let local = viewModel.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: includeLocation)
+            for sessionID in sessionIDs {
+                result[sessionID, default: []] += local[sessionID] ?? []
+            }
+        }
+        return result
+    }
+
+    func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
         viewModelsByWindowID.keys.sorted().flatMap { windowID in
             viewModelsByWindowID[windowID]?.agentSessionLinkCandidates(isWindowClosing: false) ?? []
         }

@@ -161,6 +161,18 @@ extension GlobalSettingsStore {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func codexComputerUseEnabled() -> Bool {
+        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+    }
+
     func codexReasoningSummariesEnabled() -> Bool {
         CodexReasoningSummaries.isEnabled(persistedValue: scalarPreferences.agentMode?.codexReasoningSummariesEnabled)
     }
@@ -171,6 +183,19 @@ extension GlobalSettingsStore {
             settings.codexReasoningSummariesEnabled = enabled
         }
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
+    }
+
+    /// App-global UI preference for the oversight-link confirmation. Nil reads as false; the flag
+    /// only skips the dialog and never relaxes runtime authorization or approval restrictions.
+    func suppressOversightLinkConfirmation() -> Bool {
+        scalarPreferences.agentMode?.suppressOversightLinkConfirmation == true
+    }
+
+    func setSuppressOversightLinkConfirmation(_ suppressed: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.suppressOversightLinkConfirmation = suppressed ? true : nil
+        }
     }
 
     func codexMemoriesEnabled() -> Bool {
@@ -258,8 +283,25 @@ extension GlobalSettingsStore {
             subagentProvider: subagentProvider,
             customInstructions: customInstructions,
             validity: validity,
-            revision: modelRouterSettingsRevision
+            revision: modelRouterSettingsRevision,
+            usageBalancing: AgentUsageBalancingConfiguration(
+                enabled: stored?.usageBalancingEnabled == true && AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) != nil,
+                preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace
+            ),
+            allowPaidFastRouting: stored?.allowPaidFastRouting == true
         )
+    }
+
+    func setUsageBalancingEnabled(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingEnabled = enabled }
+    }
+
+    func setUsageBalancingPreset(_ preset: AgentUsageBalancingPreset) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingPreset = preset.rawValue }
+    }
+
+    func setAllowPaidFastRouting(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.allowPaidFastRouting = enabled }
     }
 
     func setModelRouterBackend(_ backendID: AgentTaskRouterBackendID, commit: Bool = true) {

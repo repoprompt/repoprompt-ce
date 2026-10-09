@@ -98,7 +98,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     }
 
     private func makeProps(
-        sidebarOversightMenu: AgentSidebarOversightMenuProps? = nil,
         outbound: [AgentMonitorPillProps.Outbound] = [],
         inbound: [AgentMonitorPillProps.Inbound] = [],
         notices: [AgentMonitorPillProps.Notice] = [],
@@ -108,7 +107,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     ) -> AgentMonitorPillProps {
         AgentMonitorPillProps(
             sessionID: observerID,
-            sidebarOversightMenu: sidebarOversightMenu,
             outbound: outbound,
             inbound: inbound,
             recentNotices: notices,
@@ -480,14 +478,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         // Only eligibility is recomputed; link membership, unread, and notices stay authority-owned.
         // A copy helper that dropped unread would silently clear a signal the user has not acknowledged.
         let notice = AgentMonitorPillProps.Notice(linkID: UUID(), generation: 3, message: "ended")
-        let menu = AgentSidebarOversightMenuProps(
-            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID),
-            targetSessionID: observerID,
-            targetDisplayName: "Planning",
-            observerOptions: []
-        )
         let published = makeProps(
-            sidebarOversightMenu: menu,
             outbound: [outbound(status: .running, hasUnreadActivity: true)],
             inbound: [inbound()],
             notices: [notice],
@@ -506,7 +497,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(overlaid.outbound.allSatisfy(\.hasUnreadActivity))
         XCTAssertEqual(overlaid.inbound, published.inbound)
         XCTAssertEqual(overlaid.recentNotices, published.recentNotices)
-        XCTAssertEqual(overlaid.sidebarOversightMenu, menu)
         XCTAssertNil(overlaid.canAddReason)
         XCTAssertTrue(
             overlaid.autoWakeOnUpdatesEnabled,
@@ -521,12 +511,10 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(withPersistence.outbound, published.outbound)
         XCTAssertEqual(withPersistence.inbound, published.inbound)
         XCTAssertEqual(withPersistence.recentNotices, published.recentNotices)
-        XCTAssertEqual(withPersistence.sidebarOversightMenu, menu)
         XCTAssertTrue(withPersistence.autoWakeOnUpdatesEnabled)
         XCTAssertEqual(withPersistence.autoWakeTargetSessionIDs, [targetID])
         XCTAssertTrue(published.withCanAddReason("changed").autoWakeOnUpdatesEnabled)
         XCTAssertEqual(published.withCanAddReason("changed").autoWakeTargetSessionIDs, [targetID])
-        XCTAssertEqual(published.withCanAddReason("changed").sidebarOversightMenu, menu)
     }
 
     /// The switch is the only place the user learns what Auto-wake does, so its copy has to carry the
@@ -576,8 +564,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             "the scope is the observer session, not a link and not a global preference"
         )
         XCTAssertTrue(
-            tooltip.contains("Off by default"),
-            "the default has to be visible where the control is"
+            tooltip.contains("On by default"),
+            "the default has to be visible where the control is — and it is enabled by default"
         )
         let accessibilityHint = AgentMonitorAutoWakeCopy.accessibilityHint
         XCTAssertTrue(
@@ -1562,7 +1550,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testObserverPreferencesSurvivePropsCopies() {
         let props = AgentMonitorPillProps(
             sessionID: observerID,
-            sidebarOversightMenu: nil,
             outbound: [],
             inbound: [],
             recentNotices: [],

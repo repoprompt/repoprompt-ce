@@ -2,10 +2,12 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -21,7 +23,11 @@ struct AgentContextUsage: Codable, Equatable {
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
 final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownParticipant {
-    @TaskLocal private static var mcpRunEpochTransitionToken: UUID?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    private nonisolated static let mcpRunEpochTransitionTokenTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    private nonisolated static var mcpRunEpochTransitionToken: UUID? {
+        mcpRunEpochTransitionTokenTaskLocal.get()
+    }
 
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
@@ -602,6 +608,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Written only by `AgentModeViewModel+SessionLinks`; nothing else should mutate it.
     var monitorPillPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
 
+    /// In-memory palette-slot assignments for overseer sessions, reconciled inside the
+    /// projection mutation boundary so a row re-rendered by the oversight-change notification
+    /// always reads a settled map. Stores slots only; roles stay live via the projections.
+    let agentOversightColourAllocator = AgentOversightColourAllocator()
+
+    var sidebarCreatorDisplayNames: [UUID: String] = [:]
+
     /// Latest process-wide durable-oversight level, broadcast by the bridge.
     ///
     /// Stored per window rather than read on demand so a link-free tab — which never receives an
@@ -762,6 +775,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let outcome: AgentTaskRoutingBackendOutcome
         var judgmentRequested = false
         var effortFallback = false
+        var usageBalancingReason: String?
     }
 
     struct FreshTaskRoutingOwnership {
@@ -2580,6 +2594,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         codexCoordinator.attach(viewModel: self)
+        observeCodexComputerUseSetting()
         claudeCoordinator.installHostCapabilities(
             makeClaudeCoordinatorHostCapabilities(),
             providerBindingService: providerBindingService
@@ -2673,6 +2688,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexComputerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
+            testCodexComputerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
             testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
@@ -2752,6 +2769,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 routeOwnerValidator: testCodexRouteOwnerValidator,
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
+                computerUseCompanionReady: testCodexComputerUseCompanionReady,
+                computerUseReservedEntryExists: testCodexComputerUseReservedEntryExists,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
@@ -2806,6 +2825,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             providerBindingService = AgentModeProviderBindingService()
             codexCoordinator.attach(viewModel: self)
+            observeCodexComputerUseSetting()
             claudeCoordinator.installHostCapabilities(
                 makeClaudeCoordinatorHostCapabilities(),
                 providerBindingService: providerBindingService
@@ -3564,6 +3584,104 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    func toggleComputerUse(tabID: UUID, expectedSessionIdentity: ObjectIdentifier) async {
+        guard let session = sessions[tabID], ObjectIdentifier(session) == expectedSessionIdentity,
+              currentTabID == tabID, computerUseComposerProps(session: session).isVisible else { return }
+        if session.isCodexComputerUseArmed {
+            await codexCoordinator.revokeCodexComputerUse(session: session, reason: "user-off")
+        } else if let message = await armComputerUseForLocalUser(session: session), !message.isEmpty {
+            guard sessions[tabID] === session else { return }
+            session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        }
+        requestUIRefresh(tabID: tabID, urgent: true)
+    }
+
+    /// No activation is published until consent and asynchronous eligibility both succeed.
+    func armComputerUseForLocalUser(
+        session: TabSession,
+        confirmOptIn: (() async -> Bool)? = nil
+    ) async -> String? {
+        guard sessions[session.tabID] === session, currentTabID == session.tabID,
+              computerUseComposerProps(session: session).isVisible else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if session.isCodexComputerUseArmed { return nil }
+        guard session.codexComputerUseArmingRequestID == nil, !session.runState.isActive else {
+            return "Wait for the current Codex operation to finish before enabling Computer Use."
+        }
+        let requestID = UUID()
+        let binding = session.persistentSessionBindingIdentity
+        let generation = session.bindingTransitionGeneration
+        session.codexComputerUseArmingRequestID = requestID
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+        defer {
+            if session.codexComputerUseArmingRequestID == requestID { session.codexComputerUseArmingRequestID = nil }
+            requestUIRefresh(tabID: session.tabID, urgent: true)
+        }
+        func stillCurrent() -> Bool {
+            !Task.isCancelled && sessions[session.tabID] === session && currentTabID == session.tabID
+                && session.codexComputerUseArmingRequestID == requestID
+                && session.persistentSessionBindingIdentity == binding && session.bindingTransitionGeneration == generation
+                && computerUseComposerProps(session: session).isVisible
+        }
+        if !CodexComputerUseWorkflow.isEnabled {
+            let accepted: Bool = if let confirmOptIn { await confirmOptIn() }
+            else { await presentComputerUseOptIn() }
+            guard accepted else { return "" }
+            guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
+            GlobalSettingsStore.shared.setCodexComputerUseEnabled(true)
+        }
+        guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
+        let hydrated = await ensureSessionReady(tabID: session.tabID)
+        guard hydrated === session, stillCurrent(), ensureSessionBoundToTab(session) != nil else {
+            return CodexComputerUseWorkflow.ineligibleMessage
+        }
+        do {
+            try await codexCoordinator.armCodexComputerUse(session: session, requestID: requestID)
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    private func presentComputerUseOptIn() async -> Bool {
+        guard let window = WindowStatesManager.shared.window(withID: windowID)?.nsWindow,
+              window.attachedSheet == nil else { return false }
+        let alert = NSAlert()
+        alert.messageText = "Turn on Computer Use?"
+        alert.informativeText = "Codex can control apps on your Mac in this chat when you ask. macOS may ask you to allow RepoPrompt CE to use Apple Events."
+        alert.addButton(withTitle: "Turn On")
+        alert.addButton(withTitle: "Cancel")
+        return await withCheckedContinuation { continuation in
+            alert.beginSheetModal(for: window) { response in
+                continuation.resume(returning: response == .alertFirstButtonReturn)
+            }
+        }
+    }
+
+    private func observeCodexComputerUseSetting() {
+        NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange, object: self)
+            .sink { [weak self] _ in self?.syncComposerUIState() }
+            .store(in: &cancellables)
+        // This notification is emitted synchronously by the MainActor settings setters. Take
+        // admission holds now, so a rapid off/on cannot re-arm while teardown is suspended.
+        NotificationCenter.default.publisher(for: .codexComputerUseDidChange)
+            .sink { [weak self] _ in
+                guard let self, !CodexComputerUseWorkflow.isEnabled else { return }
+                for session in sessions.values where session.isCodexComputerUseArmed || session.codexComputerUseArmingRequestID != nil
+                    || session.codexControllerFeatureState?.computerUseEnabled == true
+                {
+                    session.codexController?.revokeComputerUseAutoApproval()
+                    session.codexComputerUseArmingRequestID = nil
+                    let releaseAdmission = session.holdCodexComputerUseAdmission()
+                    Task { @MainActor [weak self] in
+                        defer {
+                            releaseAdmission()
+                            self?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                        }
+                        await self?.codexCoordinator.revokeCodexComputerUse(session: session, reason: "setting-off")
+                    }
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     private func setupObservers() {
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
@@ -3677,18 +3795,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func installAgentSessionLifecycleProjectionAuthority() {
-        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current in
+        workspaceManager?.setAgentSessionProjectionReconciler { [weak self] projected, current, repairBaselines in
             guard let self else {
                 return AgentSessionLifecycleAuthority.ProjectionOutcome(
                     workspaces: projected,
                     protectedWorkspaceIDs: [],
-                    protectedClaimCount: 0
+                    protectedClaimCount: 0,
+                    newlyRequiredRepairWorkspaceIDs: []
                 )
             }
             return sessionLifecycleAuthority.reconcileProjection(
                 projectedWorkspaces: projected,
                 currentWorkspaces: current,
-                claims: agentSessionLifecycleProtectionClaims(in: current)
+                claims: agentSessionLifecycleProtectionClaims(in: current),
+                repairBaselines: repairBaselines
             )
         }
     }
@@ -5141,6 +5261,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?
     ) {
+        // Native row providers capture the UUID from the sidebar's cached row.
+        // Publish identity changes even when no index refresh is in flight.
+        syncSidebarUIState(refresh: true, reason: .sessionList)
         guard let token = activeSessionIndexRefreshToken,
               sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
@@ -5162,6 +5285,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         refreshSessionListCache(for: workspace, owner: token.owner)
+    }
+
+    /// Identity-only preparation of already-loaded state. Never mounts, hydrates, or resumes.
+    /// A repaired binding remains pending: menu activity cannot earn restoration authority.
+    func prepareSidebarOversightSession(tabID: UUID, sessionID: UUID, workspaceID: UUID) {
+        guard let session = sessions[tabID], session.activeAgentSessionID == nil,
+              session.hasLoadedPersistedState, session.persistedLoadTask == nil,
+              !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session), !session.isDirty,
+              !Task.isCancelled, workspaceManager?.activeWorkspaceID == workspaceID,
+              agentSessionLinkComposeTabDescriptors().contains(where: {
+                  $0.tabID == tabID && $0.sessionID == sessionID && $0.workspaceID == workspaceID
+              }),
+              AgentSessionLinkRuntimeBridge.shared.canPrepareSidebarSession(.init(
+                  windowID: windowID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID
+              )),
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return }
+        _ = installPersistentSessionBinding(
+            sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+        )
+        if currentTabID == session.tabID {
+            publishTranscriptPresentation(from: session)
+        }
     }
 
     private enum PersistentSessionBindingMutationTarget {
@@ -6763,7 +6910,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
         do {
-            return try await Self.$mcpRunEpochTransitionToken.withValue(token) {
+            return try await Self.mcpRunEpochTransitionTokenTaskLocal.withValue(token) {
                 try await operation()
             }
         } catch {
@@ -9914,6 +10061,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await mcpDeactivateControlContext(
                 sessionID: existingSessionID,
                 cleanupSessionStore: true
+            )
+        }
+        let controlGenerationBeforeRetirement = session.mcpControlActivationGeneration
+        await codexCoordinator.awaitCodexComputerUseRetirement(for: session.tabID)
+        guard sessions[tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              !session.bindingTransitionInProgress,
+              session.mcpControlActivationGeneration == controlGenerationBeforeRetirement
+        else {
+            throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
+        }
+        if requireInactiveRunState, session.runState.isActive {
+            throw MCPError.invalidParams(
+                "The requested agent session became active before MCP control activation."
             )
         }
         session.mcpControlCleanupTask?.cancel()
@@ -16197,7 +16358,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = await submitUserTurnAfterFreshTaskRouting(
+                let result = await submitClaimedComposerUserTurn(
                     text: text,
                     claim: claim,
                     session: preparedSession,
@@ -16265,7 +16426,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = await submitUserTurnAfterFreshTaskRouting(
+            let result = await submitClaimedComposerUserTurn(
                 text: text,
                 claim: claim,
                 session: preparedSession,
@@ -16404,7 +16565,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = await submitUserTurnAfterFreshTaskRouting(
+            let result = await submitClaimedComposerUserTurn(
                 text: text,
                 claim: claim,
                 session: destinationSession,
@@ -16422,6 +16583,34 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             clearComposerDraftIfUnchanged(for: claim)
             return result
         }
+    }
+
+    /// Local consent belongs to the validated destination, not the source tab that
+    /// supplied the draft. Raw MCP/delivered submissions never pass through this seam.
+    private func submitClaimedComposerUserTurn(
+        text: String,
+        claim: AgentComposerSubmitClaim,
+        session: TabSession,
+        destinationTabID: UUID
+    ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
+        if let invocation = resolvedNativeSlashCommand(in: text, session: session),
+           invocation.command == .computerUse,
+           !CodexComputerUseWorkflow.isOffCommand(argumentsText: invocation.argumentsText)
+        {
+            if let message = await armComputerUseForLocalUser(session: session) { return .blocked(message: message) }
+            guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+        }
+        return await submitUserTurnAfterFreshTaskRouting(
+            text: text,
+            claim: claim,
+            session: session,
+            destinationTabID: destinationTabID
+        )
     }
 
     @discardableResult
@@ -16752,6 +16941,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
+        if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session),
+           nativeSlashCommand.command == .computerUse,
+           CodexComputerUseWorkflow.isOffCommand(argumentsText: nativeSlashCommand.argumentsText)
+        {
+            guard isLocalComposerInput, codexAttemptID == nil else {
+                return .blocked(message: "Computer Use accepts only local-user input.")
+            }
+            guard attachmentsToSend.isEmpty, taggedFilesToSend.isEmpty else {
+                return .blocked(message: "/computer-use off does not accept attachments or tagged files.")
+            }
+            session.codexController?.revokeComputerUseAutoApproval()
+            // Off is local control: no hydration, provider input, or companion availability
+            // is required. Fence immediately, including while native startup is suspended.
+            let releaseAdmission = session.holdCodexComputerUseAdmission()
+            Task { @MainActor [weak self] in
+                defer { releaseAdmission() }
+                guard let self else { return }
+                await codexCoordinator.revokeCodexComputerUse(session: session, reason: "user-off")
+                guard sessions[tabID] === session else { return }
+                session.appendItem(AgentChatItem.system("Computer Use is off for this chat.", sequenceIndex: session.nextSequenceIndex))
+                requestUIRefresh(tabID: tabID, urgent: true)
+                scheduleSave(for: tabID)
+            }
+            return .submitted
+        }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
         }
@@ -17069,7 +17283,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         taggedFiles: [AgentTaggedFileAttachment],
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        stagedCodexComputerUseActivationID: UUID?,
         managedTurn: AgentSessionLinkManagedTurn? = nil,
         message: String
     ) {
@@ -17084,10 +17297,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             reason: "waiting instruction was not accepted by the provider"
         )
         rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
-        clearPendingCodexComputerUseActivationIfMatched(
-            session: session,
-            activationID: stagedCodexComputerUseActivationID
-        )
         // A managed steer reports the withdrawal to its overseer and leaves the target user's
         // composer exactly as it was.
         if let managedTurn {
@@ -17117,7 +17326,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         draftText: String,
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        stagedCodexComputerUseActivationID: UUID?,
         managedTurn: AgentSessionLinkManagedTurn? = nil
     ) {
         let expectedWaitID = session.instructionWaitID
@@ -17159,7 +17367,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17184,7 +17391,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17204,7 +17410,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: waitingInstructionReadinessErrorMessage(readiness)
                 )
@@ -17222,7 +17427,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "RepoPrompt MCP routing changed before provider dispatch. Your instruction was restored."
                 )
@@ -17240,7 +17444,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17264,7 +17467,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "RepoPrompt MCP catalog input was unavailable. Your instruction was restored."
                 )
@@ -17288,7 +17490,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
@@ -17446,6 +17647,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard stopFence?.permitsStart(of: session) ?? true else {
             return .blocked(message: "This scheduled run was cancelled by Stop.")
         }
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true, !session.isCodexComputerUseArmed {
+            return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
+        }
+        if nativePreparedTurn?.shouldEnableCodexComputerUse == true {
+            guard isLocalComposerInput, managedTurn == nil, codexAttemptID == nil else {
+                return .blocked(message: "Enable Computer Use in this tab before submitting /computer-use.")
+            }
+        }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
         // A managed cross-session steer has no composer draft and must never restore one: an empty
@@ -17475,18 +17684,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
         }
-        if nativePreparedTurn?.shouldEnableCodexComputerUse == true {
-            session.pendingCodexComputerUseActivation = CodexComputerUseActivation(
-                id: UUID(),
-                createdAt: Date()
-            )
-        }
-        let stagedCodexComputerUseActivationID = session.pendingCodexComputerUseActivation?.id
-
         // Prepend interview instruction to the user message if enabled (first message only).
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
         var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
+        if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
+            effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
+        }
         if managedTurn == nil,
            interviewFirst,
            session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })
@@ -17545,7 +17749,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
             crossSessionAttribution: managedTurn?.attribution,
-            dispatchedProviderText: managedTurn?.providerText
+            dispatchedProviderText: managedTurn != nil ? wrappedText : nil
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
@@ -17654,7 +17858,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorationDraftText,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                 managedTurn: managedTurn
             )
             return UserTurnSubmissionResult.submitted
@@ -17672,7 +17875,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 optimisticUserItemID: userItem.id,
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket,
-                stopFence: producerStopFence
+                stopFence: producerStopFence,
+                isLocalUserInput: isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
             )
             // The exact run a managed steer was classified to steer. If it settles before dispatch,
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
@@ -17733,10 +17937,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
                 if sendOutcome?.didSend != true {
-                    self.clearPendingCodexComputerUseActivationIfMatched(
-                        session: session,
-                        activationID: stagedCodexComputerUseActivationID
-                    )
                     if codexAttemptID != nil {
                         self.removeUnconfirmedOptimisticCodexUserItem(
                             session: session,
@@ -17888,7 +18088,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     draftText: restorationDraftText,
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
                     managedTurn: managedTurn
                 )
                 return UserTurnSubmissionResult.submitted
@@ -18299,18 +18498,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 shouldEnableCodexComputerUse: false
             )
         }
-    }
-
-    private func clearPendingCodexComputerUseActivationIfMatched(
-        session: TabSession,
-        activationID: UUID?
-    ) {
-        guard let activationID,
-              session.pendingCodexComputerUseActivation?.id == activationID
-        else {
-            return
-        }
-        session.pendingCodexComputerUseActivation = nil
     }
 
     private func validateNativeSlashCommandUsage(
@@ -19363,7 +19550,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 optimisticUserItemID: context.optimisticUserItemID,
                 origin: context.origin,
                 dispatchTicket: context.dispatchTicket,
-                stopFence: context.stopFence ?? stopFence
+                stopFence: context.stopFence ?? stopFence,
+                isLocalUserInput: context.isLocalUserInput
             )
         }
 
@@ -21189,7 +21377,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return
         }
-        codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response)
+        guard codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response) else { return }
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()

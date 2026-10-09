@@ -1,8 +1,255 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
+    func testCLIUsageConfigurationDoesNotDisableItsOwnStatusLine() throws {
+        let data = try ClaudeCLIUsageSource.collectionSettings(collector: "/fixture/collector --private-output")
+        let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(settings["disableAllHooks"], "This flag suppresses the status-line collector too; managed policy must not be overridden with false")
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        XCTAssertTrue(hooks.isEmpty)
+        let statusLine = try XCTUnwrap(settings["statusLine"] as? [String: String])
+        XCTAssertEqual(statusLine["type"], "command")
+        XCTAssertEqual(statusLine["command"], "/fixture/collector --private-output")
+    }
+
+    func testCLIUsageSetupIsExplicitAndDoesNotPinDefaultCredentialsOrSendInput() {
+        let root = URL(fileURLWithPath: "/fixture/helper's folder")
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/.claude"), isDefault: true)
+        let script = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: profile, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(script.contains("helper'\\''s folder"), "shell-quote paths containing apostrophes")
+        XCTAssertTrue(script.contains("'-u' 'CLAUDE_CONFIG_DIR'"))
+        XCTAssertFalse(script.contains("CLAUDE_CONFIG_DIR="), "default profile must retain Claude's normal Keychain/config identity")
+        XCTAssertTrue(script.contains("'--setting-sources' ''"))
+        XCTAssertTrue(script.contains("'--tools' ''"))
+        XCTAssertTrue(script.contains("'--strict-mcp-config'"))
+        XCTAssertFalse(script.contains("--dangerously-skip-permissions"))
+        XCTAssertFalse(script.contains("--print"))
+        XCTAssertTrue(script.contains("/exit or Ctrl-C twice"))
+        XCTAssertTrue(script.contains("Check usage after setup"))
+        XCTAssertFalse(script.contains("osascript"))
+        let custom = ClaudeUsageCredentialProfile(directory: root, isDefault: false)
+        let customScript = ClaudeCLIUsageSource.setupScript(command: "/fixture/claude", profile: custom, workdir: root, settings: root.appendingPathComponent("settings.json"), mcp: root.appendingPathComponent("mcp.json"))
+        XCTAssertTrue(customScript.contains("CLAUDE_CONFIG_DIR=/fixture/helper'\\''s folder"))
+    }
+
+    func testCLIUsageCommandAdmissionRequiresReadinessAndKeepsDeadlineAndFreshReceipt() throws {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let ready = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data("{}".utf8), now: date))
+        let reading = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date.addingTimeInterval(1)))
+        var state = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(state.next(record: nil, elapsed: 5, now: date), .wait, "never type into trust/login setup")
+        XCTAssertEqual(state.next(record: ready, elapsed: 6, now: date), .usage)
+        XCTAssertEqual(state.next(record: ready, elapsed: 7, now: date), .wait, "do not submit /usage twice")
+        XCTAssertEqual(state.next(record: ready, elapsed: 15, now: date), .wait, "slow usage fetch is not dismissed at 3 seconds")
+        XCTAssertEqual(state.next(record: ready, elapsed: 16, now: date), .escape)
+        XCTAssertEqual(state.next(record: ready, elapsed: 17, now: date), .wait, "escape is one-shot")
+        XCTAssertEqual(state.next(record: reading, elapsed: 18, now: date), .complete(reading))
+        var startup = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(startup.next(record: nil, elapsed: 30, now: date), .failed(.cliUnavailable))
+        var empty = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(empty.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(empty.next(record: ready, elapsed: 30, now: date), .failed(.invalidResponse))
+        var early = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(early.next(record: ready, elapsed: 0, now: date), .usage)
+        XCTAssertEqual(early.next(record: reading, elapsed: 1, now: date), .complete(reading), "accept JSON before Escape if CLI already reported it")
+        var stale = ClaudeCLIUsageCollectionState()
+        XCTAssertEqual(stale.next(record: reading, elapsed: 0, now: date.addingTimeInterval(2)), .usage)
+        XCTAssertEqual(stale.next(record: reading, elapsed: 1, now: date.addingTimeInterval(3)), .wait, "startup retained JSON is not a refreshed reading")
+    }
+
+    func testOnlyFirstPartyAgentsHaveAUsageTarget() {
+        XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .codexExec), .codex)
+        XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .claudeCode), .claude)
+        for agent in AgentProviderKind.allCases where agent != .codexExec && agent != .claudeCode {
+            XCTAssertNil(ProviderQuotaSettingsTarget(agent: agent), agent.rawValue)
+        }
+    }
+
+    func testCLIUsageRequiresConsentBeforeCollection() async {
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let source = ClaudeCLIUsageSource(profileProvider: { profile }, collect: { _, _ in
+            XCTFail("Collection without consent")
+            throw ProviderQuotaReadError.transport
+        }, consentProvider: { nil })
+        do {
+            _ = try await source.read(.init(userInitiated: true))
+            XCTFail("Read without consent")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+    }
+
+    func testCLIUsageWhitelistsStatisticsAndKeepsPercentUnitsAndUnknownAccount() throws {
+        let payload = Data(#"{"session_id":"secret-session","token":"secret-token","rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1900000300},"seven_day":{"used_percentage":23},"unexpected":{"used_percentage":99}}}"#.utf8)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload))
+        XCTAssertEqual(record.windows["five_hour"]?.used, 1)
+        XCTAssertEqual(record.windows.count, 2)
+        let encoded = try JSONEncoder().encode(record)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("secret"))
+        let snapshot = record.snapshot(profileID: "profile")
+        XCTAssertFalse(snapshot.accountKey.isIdentified)
+        XCTAssertEqual(snapshot.source, .claudeCLIUsage)
+        XCTAssertEqual(snapshot.coverage, .accountWideAggregateOnly)
+        XCTAssertNil(snapshot.buckets.first?.planType)
+    }
+
+    private func cliPlanUsageSnapshot(observedAt date: Date) throws -> ProviderQuotaSnapshot {
+        let payload = Data(#"{"rate_limits":{"five_hour":{"used_percentage":6,"resets_at":1900010000},"seven_day":{"used_percentage":5,"resets_at":1900300000}}}"#.utf8)
+        return try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload, now: date)).snapshot(profileID: "profile")
+    }
+
+    func testCLIUsageSnapshotDeclaresPlanWindowDurationsAndFriendlyTitles() throws {
+        let snapshot = try cliPlanUsageSnapshot(observedAt: Date(timeIntervalSince1970: 1_900_000_000))
+        let windows = try XCTUnwrap(snapshot.buckets.first?.windows)
+        XCTAssertEqual(windows.map(\.nativeRole), ["five_hour", "seven_day"])
+        XCTAssertEqual(windows.map(\.windowDuration), [18000, 604_800])
+        XCTAssertEqual(windows.map(ProviderQuotaPresenter.windowTitle(for:)), ["5-hour limit", "Weekly limit"], "raw role names must not leak into Settings rows")
+    }
+
+    func testCLIUsageIndicatorStaysVisibleBeyondDefaultStaleHorizon() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let hourOld = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(60 * 60)), "an hour-old 5-hour reading is within 25% of its window")
+        XCTAssertEqual(hourOld.usedPercent, 6)
+        let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
+        XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
+    }
+
+    func testCLIUsageWeeklyReadingInformsBalancingWithinOneHour() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let recent = ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(40 * 60))
+        XCTAssertTrue(recent.known)
+        XCTAssertNotNil(recent.weeklyPace)
+        XCTAssertEqual(recent.weeklyHeadroom, 95)
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(3601)).known, "weekly routing evidence is capped at one hour")
+    }
+
+    func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {
+        for raw in [
+            #"{"rate_limits":{"five_hour":{"used_percentage":true}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":-1}}}"#,
+            #"{"rate_limits":{"five_hour":{"used_percentage":101}}}"#,
+            #"{"rate_limits":{"five_hour":{"resets_at":1900000300}}}"#
+        ] {
+            XCTAssertTrue(try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(raw.utf8))).windows.isEmpty)
+        }
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data(repeating: 32, count: 65537)))
+        XCTAssertNil(ClaudeCLIUsageRecord.extract(Data("invalid".utf8)))
+    }
+
+    func testCLIUsageCacheIsPrivateProfileScopedAndRetainsObservationDate() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = ClaudeCLIUsageCache(root: root)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8), now: date))
+        try cache.save(record, profileID: "profile-a")
+        XCTAssertEqual(cache.load(profileID: "profile-a")?.receivedAt, date)
+        XCTAssertNil(cache.load(profileID: "profile-b"))
+        let mode = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("cache.json").path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: root.appendingPathComponent("cache.json").path)
+        XCTAssertNil(cache.load(profileID: "profile-a"))
+    }
+
+    func testCLIUsageProfileChangeOrCancellationNeverCachesReading() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile-a"), isDefault: false)
+        let profiles = UsageProfileFixture(profile)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let source = ClaudeCLIUsageSource(root: root, profileProvider: { profiles.current() }, collect: { _, _ in
+            profiles.replace(.init(directory: URL(fileURLWithPath: "/fixture/profile-b"), isDefault: false))
+            return record
+        }, consentProvider: { profile.id })
+        do { _ = try await source.read(.init(userInitiated: true))
+            XCTFail("Adopted changed profile")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+        let cancelled = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in throw CancellationError() }, consentProvider: { profile.id })
+        do { _ = try await cancelled.read(.init(userInitiated: true))
+            XCTFail("Ignored cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("cache.json").path))
+    }
+
+    func testCLIUsagePersistsAndHydratesWithoutAnotherCollection() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile(directory: URL(fileURLWithPath: "/fixture/profile"), isDefault: false)
+        let record = try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+        let first = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in record }, consentProvider: { profile.id })
+        let value = try await first.read(.init(userInitiated: true))
+        let restarted = ClaudeCLIUsageSource(root: root, profileProvider: { profile }, collect: { _, _ in XCTFail("Hydration launches CLI")
+            return record
+        }, consentProvider: { profile.id })
+        let cached = await restarted.cachedSnapshot()
+        XCTAssertEqual(cached, value)
+        await restarted.clearCache()
+        let cleared = await restarted.cachedSnapshot()
+        XCTAssertNil(cleared)
+    }
+
+    func testCLIUsageDisclosureExplainsMethodAndUncertaintyWithoutCredentialAccess() {
+        let copy = ProviderUsageSectionConfiguration.claudeConsent.message
+        XCTAssertTrue(copy.contains("/usage"))
+        XCTAssertTrue(copy.contains("does not read login tokens"))
+        XCTAssertTrue(copy.contains("One-time setup opens Claude Code in Terminal"))
+        XCTAssertTrue(copy.contains("Check usage after setup"))
+        XCTAssertTrue(ProviderUsageSectionConfiguration.claudeConsent.confirmTitle.contains("open setup"))
+        XCTAssertTrue(copy.contains("has not explicitly approved automated usage monitoring"))
+        XCTAssertFalse(copy.lowercased().contains("ban"))
+    }
+
+    private final class UsageProfileFixture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: ClaudeUsageCredentialProfile
+        init(_ value: ClaudeUsageCredentialProfile) {
+            self.value = value
+        }
+
+        func current() -> ClaudeUsageCredentialProfile {
+            lock.withLock { value }
+        }
+
+        func replace(_ value: ClaudeUsageCredentialProfile) {
+            lock.withLock { self.value = value }
+        }
+    }
+
+    func testNativeControllerPreservesAllowedTelemetryOutsideTranscript() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
+            config: .discovery(commandName: "/usr/bin/false")
+        )
+        await controller.ensureEventsStreamReady()
+        let stream = await controller.events
+        let wire = #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1900000300}}"# + "\n"
+        await controller.test_handleConfigurationStdoutChunk(Data(wire.utf8))
+        await controller.shutdown()
+        var received: [ClaudeCompatiblePluginRateLimitInfo] = []
+        for await event in stream {
+            switch event {
+            case let .rateLimit(info): received.append(info)
+            case .stream: XCTFail("Routine allowed telemetry must not clutter the transcript")
+            default: break
+            }
+        }
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.status, .allowed)
+        XCTAssertNil(received.first?.utilization)
+        if let info = received.first {
+            let observation = ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info)
+            XCTAssertEqual(observation.status, .allowed)
+            XCTAssertEqual(observation.resetsAt, 1_900_000_300)
+            XCTAssertNil(observation.utilization)
+        }
+    }
+
     enum ResolverError: Error {
         case unsupportedModel
     }

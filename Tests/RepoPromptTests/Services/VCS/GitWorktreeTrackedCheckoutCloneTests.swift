@@ -323,7 +323,7 @@ final class GitWorktreeTrackedCheckoutCloneTests: XCTestCase {
             physicalMutationGuard: { physicalGuard },
             willCommit: {}
         )
-        let result = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+        let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
             try await GitService().createWorktreeWithResult(request: plan.createRequest, at: source)
         }
 

@@ -110,7 +110,8 @@ final class AgentSidebarSessionIDCopyActionTests: XCTestCase {
             onSelectionGesture: { _ in .ignored },
             onRestore: {},
             onDelete: {},
-            sessionIDCopyAction: sessionIDCopyAction
+            sessionIDCopyAction: sessionIDCopyAction,
+            metrics: AgentStashedSessionRowMetrics(fontPreset: .normal)
         )
     }
 }

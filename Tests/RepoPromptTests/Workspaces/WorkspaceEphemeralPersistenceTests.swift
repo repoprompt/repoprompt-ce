@@ -75,6 +75,13 @@ import XCTest
             }
             XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 4)
             XCTAssertNil(manager.agentSessionLifecycleWorkspaceID(tabID: laterTab.id, sessionID: UUID()))
+            // Selecting only changes activeWorkspaceID; it never rebuilds metadata indexes.
+            // Query before any await or workspaces/tab mutation can repair an initialization gap.
+            manager.activeWorkspace = first
+            XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: first.id, sessionID: sessionID), [sharedTab])
+            manager.activeWorkspace = second
+            XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: second.id, sessionID: sessionID), [laterTab, sharedTab])
+            XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
         }
 
         func testLibraryRecencyIgnoresBackgroundSavesAndGroupsTemporaryWork() throws {

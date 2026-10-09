@@ -1077,6 +1077,62 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func codexUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexUsageQuotaEnabled ?? false
+    }
+
+    package func setCodexUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.codexUsageQuotaEnabled = enabled }
+    }
+
+    package func claudeUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.claudeUsageQuotaEnabled ?? false
+    }
+
+    package func setClaudeUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeUsageQuotaEnabled = enabled }
+    }
+
+    /// Master presentation switch. An explicit choice wins; otherwise users who opted into
+    /// either legacy per-provider surface keep seeing usage. This is a pure read: it neither
+    /// persists the derived value nor authorizes any acquisition source.
+    package func usageLimitsDisplayEnabled() -> Bool {
+        Self.resolvedUsageLimitsDisplayEnabled(scalarPreferences.agentMode)
+    }
+
+    package nonisolated static func resolvedUsageLimitsDisplayEnabled(
+        _ settings: GlobalScalarPreferences.AgentModeSettings?
+    ) -> Bool {
+        if let explicit = settings?.usageLimitsDisplayEnabled { return explicit }
+        return settings?.codexUsageQuotaEnabled == true || settings?.claudeUsageQuotaEnabled == true
+    }
+
+    package func setUsageLimitsDisplayEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.usageLimitsDisplayEnabled = enabled }
+    }
+
+    /// UI-only consent record. Deliberately has no MCP writer.
+    package func claudeCLIUsageGrant() -> ClaudeCLIUsageGrant? {
+        scalarPreferences.agentMode?.claudeCLIUsageGrant
+    }
+
+    package func setClaudeCLIUsageGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeCLIUsageGrant = grant }
+    }
+
+    /// UI-only, separately disclosed background acquisition consent. Not routing policy.
+    package func setClaudeBalancingRefreshGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeBalancingRefreshGrant = grant }
+    }
+
+    package func claudeAccountUsageGrant() -> ClaudeAccountUsageGrant? {
+        scalarPreferences.agentMode?.claudeAccountUsageGrant
+    }
+
+    package func setClaudeAccountUsageGrant(_ grant: ClaudeAccountUsageGrant?, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.claudeAccountUsageGrant = grant }
+    }
+
     package func globalCodexHookApprovalStrictModeEnabled() -> Bool {
         scalarPreferences.agentMode?.codexHookApprovalStrictModeEnabled ?? false
     }

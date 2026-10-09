@@ -9,6 +9,10 @@ import Foundation
 // queue, or Auto-wake admission.
 
 extension Notification.Name {
+    /// Shared choice availability, posted after coherent catalog installation or candidate readiness.
+    /// No payload; rendered rows reread bounded summaries through the existing sidebar revision.
+    static let agentSessionLinkCandidatesDidChange = Notification.Name("agentSessionLinkCandidatesDidChange")
+
     /// Presentation-only invalidation for exact Agent session oversight projections.
     ///
     /// The owning `AgentModeViewModel` is posted as `object`; consumers re-read current exact

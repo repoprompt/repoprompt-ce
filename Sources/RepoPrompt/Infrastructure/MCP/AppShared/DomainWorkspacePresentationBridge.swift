@@ -1,3 +1,6 @@
+#if DEBUG
+    import Combine
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -312,6 +315,9 @@ final class DomainWorkspacePresentationBridge {
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let client: DomainWorkspaceAuthorityClient
     private var subscriptionTask: Task<Void, Never>?
+    /// Subscription incarnation created by `start()` and invalidated by `stop()`. An authority read
+    /// that returns after stop must neither apply a stale snapshot nor credit a newer run.
+    private var subscriptionRunID: UUID?
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
     private var projectedHealth: [UUID: DomainAuthorityHealth] = [:]
@@ -327,63 +333,125 @@ final class DomainWorkspacePresentationBridge {
     }
 
     func stop() {
+        #if DEBUG
+            let stoppedRunID = subscriptionRunID
+        #endif
+        subscriptionRunID = nil
         subscriptionTask?.cancel()
+        #if DEBUG
+            // Cancellation alone is not a join; keep stopped incarnations joinable.
+            if let subscriptionTask {
+                retiredSubscriptionTasks.append(subscriptionTask)
+            }
+        #endif
         subscriptionTask = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedHealth.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
+        #if DEBUG
+            projectionCheckpoint = nil
+            if let stoppedRunID {
+                projectionObservationSubject.send(.stopped(runID: stoppedRunID))
+            }
+        #endif
+    }
+
+    private func isCurrentRun(_ runID: UUID) -> Bool {
+        subscriptionRunID == runID && !Task.isCancelled
     }
 
     #if DEBUG
+        /// A completed manager application by one subscription incarnation.
+        struct ProjectionCheckpoint: Equatable {
+            let runID: UUID
+            /// Monotonic across stop/start; zero means no application has completed.
+            let generation: UInt64
+            let publicationSequence: UInt64
+        }
+
+        struct ProjectionObservationState: Equatable {
+            let runID: UUID?
+            let generation: UInt64
+            let checkpoint: ProjectionCheckpoint?
+        }
+
+        enum ProjectionObservationEvent: Equatable {
+            case applied(ProjectionCheckpoint)
+            case stopped(runID: UUID)
+        }
+
+        private var projectionCheckpoint: ProjectionCheckpoint?
+        private var projectionGeneration: UInt64 = 0
+        private let projectionObservationSubject = PassthroughSubject<ProjectionObservationEvent, Never>()
+        private var retiredSubscriptionTasks: [Task<Void, Never>] = []
+
         /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
+        /// Joins the current and every previously stopped subscription incarnation.
         func stopAndJoinForTesting() async {
-            let task = subscriptionTask
             stop()
-            await task?.value
+            let retired = retiredSubscriptionTasks
+            retiredSubscriptionTasks.removeAll()
+            for task in retired {
+                await task.value
+            }
         }
 
         var hasActiveSubscriptionForTesting: Bool {
             subscriptionTask != nil
         }
 
-        func waitUntilProjected(
-            through publicationSequence: UInt64,
-            timeout: Duration = .seconds(5)
-        ) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            repeat {
-                if lastPublicationSequence >= publicationSequence { return true }
-                do {
-                    try await Task.sleep(nanoseconds: 10_000_000)
-                } catch {
-                    return false
-                }
-            } while clock.now < deadline
-            return lastPublicationSequence >= publicationSequence
+        var projectionObservationStateForTesting: ProjectionObservationState {
+            ProjectionObservationState(
+                runID: subscriptionRunID,
+                generation: projectionGeneration,
+                checkpoint: projectionCheckpoint
+            )
+        }
+
+        var projectionObservationPublisherForTesting: AnyPublisher<ProjectionObservationEvent, Never> {
+            projectionObservationSubject.eraseToAnyPublisher()
         }
 
         func suppressSelfEchoForTesting(_ event: DomainWorkspaceEvent) async -> Bool {
-            await suppressSelfEcho(for: event)
+            await suppressSelfEcho(for: event, runID: nil)
         }
     #endif
 
+    /// Records a completed manager application for the still-current incarnation (DEBUG only).
+    private func didApplyProjection(runID: UUID?, publicationSequence: UInt64) {
+        #if DEBUG
+            guard let runID, subscriptionRunID == runID, workspaceManager != nil else { return }
+            projectionGeneration += 1
+            let checkpoint = ProjectionCheckpoint(
+                runID: runID,
+                generation: projectionGeneration,
+                publicationSequence: publicationSequence
+            )
+            projectionCheckpoint = checkpoint
+            projectionObservationSubject.send(.applied(checkpoint))
+        #endif
+    }
+
     func start() {
         guard subscriptionTask == nil else { return }
+        let runID = UUID()
+        subscriptionRunID = runID
         subscriptionTask = Task { [weak self, client] in
             let subscription = await client.store.subscribe()
             guard subscription.snapshot.isBootstrapped else { return }
-            if let self {
-                await projectInitial(subscription.snapshot)
+            if let self, isCurrentRun(runID) {
+                await projectInitial(subscription.snapshot, runID: runID)
             }
             for await event in subscription.events {
-                guard !Task.isCancelled, let self else { return }
-                await self.consume(event)
+                guard !Task.isCancelled, let self, isCurrentRun(runID) else { return }
+                await self.consume(event, runID: runID)
             }
         }
     }
 
-    private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot) async {
+    private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot, runID: UUID) async {
+        let projectionSpan = StartupPhaseLog.begin(.bridgeInitialProjection, window: client.windowID)
+        defer { projectionSpan.end() }
         var initial = snapshot
         if initial.workspaces.isEmpty,
            let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()
@@ -405,17 +473,20 @@ final class DomainWorkspacePresentationBridge {
                 initial = await client.snapshot()
             }
         }
-        project(initial, force: true)
+        guard isCurrentRun(runID) else { return }
+        project(initial, force: true, runID: runID)
     }
 
-    private func consume(_ event: DomainWorkspaceEvent) async {
+    private func consume(_ event: DomainWorkspaceEvent, runID: UUID) async {
         guard event.sequence > lastPublicationSequence else { return }
         let gap = lastPublicationSequence != 0 && event.sequence != lastPublicationSequence &+ 1
-        if !gap, await suppressSelfEcho(for: event) { return }
+        if !gap, await suppressSelfEcho(for: event, runID: runID) { return }
         let snapshot = await client.snapshot()
+        guard isCurrentRun(runID) else { return }
         project(
             snapshot,
-            force: gap || event.kind == .externalReloaded
+            force: gap || event.kind == .externalReloaded,
+            runID: runID
         )
     }
 
@@ -423,7 +494,7 @@ final class DomainWorkspacePresentationBridge {
     /// `applyDomainAuthorityOutcome`, so echoing its own commit back through a full catalog
     /// snapshot plus a MainActor document decode would only amplify every capture by W windows.
     /// Bookkeeping is refreshed from a single-workspace snapshot instead.
-    private func suppressSelfEcho(for event: DomainWorkspaceEvent) async -> Bool {
+    private func suppressSelfEcho(for event: DomainWorkspaceEvent, runID: UUID?) async -> Bool {
         let suppressibleKinds: Set<DomainWorkspaceEventKind> = [
             .workingStateCommitted, .savedDocumentCommitted, .operationDeduplicated
         ]
@@ -437,6 +508,7 @@ final class DomainWorkspacePresentationBridge {
               workspace.health.acceptsMutations,
               let model = workspaceManager?.workspace(withID: workspaceID)
         else { return false }
+        if let runID, !isCurrentRun(runID) { return false }
         // A same-window commit can be accepted just before a newer local edit is captured. Keep the
         // local model in both the manager and bridge cache: advancing the baseline below lets the
         // newer edit commit from the accepted revision, and explicit failed-save reconciliation
@@ -453,10 +525,11 @@ final class DomainWorkspacePresentationBridge {
             catalogRevision: event.catalogRevision
         )
         lastPublicationSequence = event.sequence
+        didApplyProjection(runID: runID, publicationSequence: event.sequence)
         return true
     }
 
-    private func project(_ snapshot: DomainWorkspaceCatalogSnapshot, force: Bool) {
+    private func project(_ snapshot: DomainWorkspaceCatalogSnapshot, force: Bool, runID: UUID) {
         guard snapshot.isBootstrapped,
               snapshot.publicationSequence >= lastPublicationSequence
         else { return }
@@ -487,8 +560,14 @@ final class DomainWorkspacePresentationBridge {
                 digestsByWorkspaceID: nextDigests,
                 healthByWorkspaceID: nextHealth,
                 catalogRevision: snapshot.catalogRevision,
-                publicationSequence: snapshot.publicationSequence
+                publicationSequence: snapshot.publicationSequence,
+                canonicalSystemWorkspaceIDs: Set(snapshot.workspaces.compactMap { workspace in
+                    workspace.document.metadata.isSystemWorkspace && !workspace.document.metadata.isEphemeral
+                        ? workspace.document.workspaceID
+                        : nil
+                })
             )
+            didApplyProjection(runID: runID, publicationSequence: snapshot.publicationSequence)
             return
         }
 
@@ -534,6 +613,7 @@ final class DomainWorkspacePresentationBridge {
             preferredActiveWorkspaceID: workspaceManager?.activeWorkspaceID,
             publicationSequence: snapshot.publicationSequence
         )
+        didApplyProjection(runID: runID, publicationSequence: snapshot.publicationSequence)
     }
 }
 

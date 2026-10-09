@@ -169,6 +169,8 @@ struct AgentTaskRouterConfiguration: Equatable {
     let customInstructions: String
     let validity: Validity
     let revision: UInt64
+    var usageBalancing = AgentUsageBalancingConfiguration()
+    var allowPaidFastRouting = false
 }
 
 private extension String {

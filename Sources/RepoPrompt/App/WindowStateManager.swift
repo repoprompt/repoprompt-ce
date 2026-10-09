@@ -536,6 +536,9 @@ class WindowStatesManager: ObservableObject {
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
 
+    /// Default-off, app-scoped usage observers; construction starts no provider process.
+    let providerQuotaRuntime = ProviderQuotaRuntime()
+
     /// Serializes workspace activation and deletion claims across every app window.
     let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
@@ -546,6 +549,7 @@ class WindowStatesManager: ObservableObject {
 
     /// Prevent accidental secondary instances
     private init() {
+        modelRouterRuntime.usageBalancer = providerQuotaRuntime.usageAdvisor
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
         GlobalSettingsStore.shared.objectWillChange
             .receive(on: RunLoop.main)
@@ -1207,38 +1211,10 @@ class WindowStatesManager: ObservableObject {
         updateAgentSessionOversightTopologyState()
     }
 
+    /// Each window supplies its own capture decision (restore protection included); explicit-close
+    /// exclusion stays here, in `WindowSessionSnapshotBuilder`.
     private func captureCurrentSession() -> WindowSessionSnapshot {
-        let candidates = allWindows.map { window -> WindowSessionCaptureCandidate in
-            guard let workspace = window.workspaceManager.activeWorkspace else {
-                return WindowSessionCaptureCandidate(windowID: window.windowID, entry: nil)
-            }
-            guard !workspace.isEphemeral else {
-                return WindowSessionCaptureCandidate(windowID: window.windowID, entry: nil)
-            }
-            // A window whose restore target could not be resolved sits on the system Default
-            // workspace. Persisting that observed state would overwrite the snapshot with a
-            // layout the user never chose, so re-emit the entry we failed to restore. Any
-            // later switch to a real workspace clears the flag and captures normally.
-            if let unresolved = window.unresolvedRestoreEntry, workspace.isSystemWorkspace {
-                return WindowSessionCaptureCandidate(windowID: window.windowID, entry: unresolved)
-            }
-
-            let primaryPath = workspace.repoPaths.first.map { repoPath in
-                (repoPath as NSString).expandingTildeInPath
-            }
-
-            let entry = WindowSessionEntry(
-                windowKind: window.kind,
-                workspaceID: workspace.id,
-                workspaceName: workspace.name,
-                isSystemWorkspace: workspace.isSystemWorkspace,
-                isEphemeral: workspace.isEphemeral,
-                primaryRepoPath: primaryPath,
-                lastFocused: window.isCurrentlyFocused,
-                workspaceInstanceNumber: window.workspaceInstanceNumber
-            )
-            return WindowSessionCaptureCandidate(windowID: window.windowID, entry: entry)
-        }
+        let candidates = allWindows.map { $0.sessionCaptureCandidate() }
 
         return WindowSessionSnapshotBuilder.build(
             version: 4,
@@ -1365,9 +1341,11 @@ class WindowStatesManager: ObservableObject {
             participants: participants,
             additionalTeardown: {
                 await CodexModelPollingService.shared.suspendForManagedSignOut()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.handleSignOutOrAccountChange()
             },
             failedLogoutRecovery: {
                 await CodexModelPollingService.shared.resumeAfterManagedAuthentication()
+                await WindowStatesManager.shared.providerQuotaRuntime.codex.resumeAfterManagedAuthentication()
             }
         )
     }
@@ -1399,6 +1377,9 @@ class WindowStatesManager: ObservableObject {
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
+        await providerQuotaRuntime.codex.shutdown()
+        await providerQuotaRuntime.claude.shutdown()
+        await providerQuotaRuntime.claudeTelemetry.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()

@@ -318,6 +318,22 @@ extension AgentModeViewModel {
             && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
     }
 
+    /// Evaluation can release a stale parked note without requiring a send that the note itself
+    /// blocks. SelfCompact remains the lifecycle owner; an attempted note is never settled here.
+    func agentSelfCompactSettleStaleParkedNote(_ session: TabSession) {
+        guard let attempt = session.selfCompactState.active,
+              attempt.phase == .parked, !attempt.noteDispatchStarted
+        else { return }
+        var state = session.selfCompactState
+        if state.cancelStaleParkedNote(for: session) {
+            session.selfCompactState = state
+            scheduleSave(for: session)
+            return
+        }
+        let completion = session.selfCompactNativeCompletion ?? agentSelfCompactNativeCompletion(for: session)
+        completion.cancelUnattemptedNoteIfOwnerLost(.init(requestID: attempt.id, stage: .note))
+    }
+
     /// Only event-driven wakes can carry this note; periodic prompting remains excluded.
     func agentSelfCompactBlocksNotificationWake(_ session: TabSession) -> Bool {
         guard session.selfCompactState.blocksAutomaticWake else { return false }

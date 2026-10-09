@@ -30,6 +30,18 @@ class ContentViewModel: ObservableObject {
     /// Using Combine for notification handling
     private var cancellables = Set<AnyCancellable>()
 
+    #if DEBUG
+        private var workspaceRouteConsumptionHandlerForTesting: ((UUID?) -> Void)?
+
+        func setWorkspaceRouteConsumptionHandlerForTesting(_ handler: ((UUID?) -> Void)?) {
+            precondition(
+                workspaceRouteConsumptionHandlerForTesting == nil || handler == nil,
+                "Workspace route consumption supports only one test recorder"
+            )
+            workspaceRouteConsumptionHandlerForTesting = handler
+        }
+    #endif
+
     /// Instead of storing each manager individually, store a reference to the whole window's state.
     let state: WindowState
 
@@ -49,11 +61,18 @@ class ContentViewModel: ObservableObject {
     init(state: WindowState) {
         self.state = state
 
-        // Sync workspace changes to drive routing
+        // Sync workspace changes to drive routing. The consumer deliberately rereads current
+        // manager state after scheduling rather than trusting the emitted ID.
         state.workspaceManager.$activeWorkspaceID
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                self?.syncRouteWithWorkspaceState()
+                guard let self else { return }
+                let readID = synchronizeRouteWithCapturedSelection()
+                #if DEBUG
+                    workspaceRouteConsumptionHandlerForTesting?(readID)
+                #else
+                    _ = readID
+                #endif
             }
             .store(in: &cancellables)
 
@@ -75,8 +94,17 @@ class ContentViewModel: ObservableObject {
 
     /// Whether the active workspace is the system fallback (i.e. no real workspace selected).
     var isInSystemFallback: Bool {
-        guard let ws = state.workspaceManager.activeWorkspace else { return true }
-        return ws.isSystemWorkspace
+        capturedSelectionRouteState().isSystemFallback
+    }
+
+    /// Reads the active ID exactly once and resolves that same ID, so one evaluation cannot
+    /// mix two different selections.
+    private func capturedSelectionRouteState() -> (activeID: UUID?, isSystemFallback: Bool) {
+        let activeID = state.workspaceManager.activeWorkspaceID
+        guard let workspace = state.workspaceManager.workspace(withID: activeID) else {
+            return (activeID, true)
+        }
+        return (activeID, workspace.isSystemWorkspace)
     }
 
     /// Called on first appear to determine initial route and optionally show onboarding.
@@ -101,13 +129,15 @@ class ContentViewModel: ObservableObject {
         }
     }
 
-    /// Keeps route in sync when workspace changes (e.g. exit to fallback, or open workspace).
-    func syncRouteWithWorkspaceState() {
+    /// Shared route body; returns the active ID it actually evaluated.
+    @discardableResult
+    private func synchronizeRouteWithCapturedSelection() -> UUID? {
+        let selection = capturedSelectionRouteState()
         if AppLaunchConfiguration.current.forcedRootRoute == .main {
             rootRoute = .main
-            return
+            return selection.activeID
         }
-        if isInSystemFallback {
+        if selection.isSystemFallback {
             if rootRoute != .workspaceEntry {
                 rootRoute = .workspaceEntry
                 workspaceEntryTab = .workspaces
@@ -117,6 +147,7 @@ class ContentViewModel: ObservableObject {
                 rootRoute = .main
             }
         }
+        return selection.activeID
     }
 
     /// Shows the workspace entry flow with the setup guide tab (user-invoked from Help menu / notification).

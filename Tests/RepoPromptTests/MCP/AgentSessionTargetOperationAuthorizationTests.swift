@@ -34,7 +34,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
     func testInvocationBridgeMissingContextFailsClosedWithInjectedDiagnostic() throws {
         let diagnostics = InvocationDiagnostics()
         try MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
-            try MCPInvocationContextBridge.$current.withValue(nil) {
+            try MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
                 XCTAssertThrowsError(try MCPInvocationContextBridge.require(toolName: "ask_oracle")) { error in
                     XCTAssertEqual(error as? MCPInvocationContextFailure, .missingExpectedContext)
                 }
@@ -62,7 +62,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
                 lifecycleGeneration: 1, windowIdentity: nil
             )
         )
-        try MCPInvocationContextBridge.$current.withValue(context) {
+        try MCPInvocationContextBridge.currentTaskLocal.withValue(context) {
             XCTAssertThrowsError(try MCPInvocationContextBridge.require(toolName: "ask_oracle")) { error in
                 XCTAssertEqual(error as? MCPInvocationContextFailure, .connectionMismatch)
             }
@@ -82,7 +82,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             ),
             dispatchAuthorization: nil
         )
-        try MCPInvocationContextBridge.$current.withValue(context) {
+        try MCPInvocationContextBridge.currentTaskLocal.withValue(context) {
             XCTAssertThrowsError(try MCPInvocationContextBridge.require(toolName: "ask_user")) { error in
                 XCTAssertEqual(error as? MCPInvocationContextFailure, .toolMismatch)
             }

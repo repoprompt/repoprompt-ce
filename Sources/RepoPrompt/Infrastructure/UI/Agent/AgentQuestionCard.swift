@@ -334,6 +334,7 @@ struct AgentRequestUserInputCard: View {
     private static let otherOptionDescription = "Optionally, add details below."
 
     let request: AgentRequestUserInputRequest
+    let allowsRememberedDecision: Bool
     let onSubmit: (AgentRequestUserInputResponse) -> Void
     let onStop: () -> Void
 
@@ -341,10 +342,12 @@ struct AgentRequestUserInputCard: View {
 
     init(
         request: AgentRequestUserInputRequest,
+        allowsRememberedDecision: Bool = true,
         onSubmit: @escaping (AgentRequestUserInputResponse) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.request = request
+        self.allowsRememberedDecision = allowsRememberedDecision
         self.onSubmit = onSubmit
         self.onStop = onStop
         _draftsByQuestionID = State(initialValue: Self.makeDrafts(for: request))
@@ -424,13 +427,16 @@ struct AgentRequestUserInputCard: View {
                 }
             }
 
-            if question.isSecret {
-                SecureField(notePlaceholder(for: question), text: noteBinding(for: question))
-                    .textFieldStyle(.roundedBorder)
-            } else {
-                TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(2 ... 6)
+            // CU legacy approval answers are literal one-shot choices, never arbitrary scope text.
+            if allowsRememberedDecision || !question.isLegacyMCPToolApproval {
+                if question.isSecret {
+                    SecureField(notePlaceholder(for: question), text: noteBinding(for: question))
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(2 ... 6)
+                }
             }
         }
         .padding(12)
@@ -488,7 +494,23 @@ struct AgentRequestUserInputCard: View {
                 Label("Submit Answers", systemImage: "checkmark.circle.fill")
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!Self.canSubmit(
+                request: request,
+                drafts: draftsByQuestionID,
+                allowsRememberedDecision: allowsRememberedDecision
+            ))
         }
+    }
+
+    /// Armed CU chats only accept the same one-shot answers the coordinator enforces;
+    /// disabling Submit avoids a silent no-op when the draft would be rejected.
+    static func canSubmit(
+        request: AgentRequestUserInputRequest,
+        drafts: [String: AgentRequestUserInputQuestionDraft],
+        allowsRememberedDecision: Bool
+    ) -> Bool {
+        guard !allowsRememberedDecision else { return true }
+        return request.allowsComputerUseResponse(request.buildResponse(from: drafts))
     }
 
     private func notePlaceholder(for question: AgentRequestUserInputQuestion) -> String {
