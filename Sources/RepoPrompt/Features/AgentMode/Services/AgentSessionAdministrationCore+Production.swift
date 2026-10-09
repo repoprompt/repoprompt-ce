@@ -32,9 +32,11 @@ extension AgentSessionAdministrationFrontDoor {
     func registerStructureHandlers(
         scopes: DelegationScopeRuntime,
         worktreeOwnership: WorktreeOwnershipStore,
-        structureHost: any SessionAdminStructureHost = SessionAdminWindowsStructureHost(),
-        worktreeHost: any SessionAdminWorktreeHost = SessionAdminWindowsWorktreeHost()
+        structureHost: (any SessionAdminStructureHost)? = nil,
+        worktreeHost: (any SessionAdminWorktreeHost)? = nil
     ) {
+        let structureHost = structureHost ?? SessionAdminWindowsStructureHost()
+        let worktreeHost = worktreeHost ?? SessionAdminWindowsWorktreeHost()
         let context = SessionAdminHandlerContext(
             scopes: scopes,
             projector: SpawnProvenanceDelegationMembershipProjector.production(worktreeOwnership: worktreeOwnership)

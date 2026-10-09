@@ -149,7 +149,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(.revoked(target))
                 continue
             }
-            items.append(Self.linkItem(target, await host.addLink(observer: observer, target: target)))
+            await items.append(Self.linkItem(target, host.addLink(observer: observer, target: target)))
         }
         return SessionAdminReply.batch(
             op: "link", items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview,
@@ -173,7 +173,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
                 continue
             }
-            items.append(Self.linkItem(target, await host.stopLink(observer: observer, target: target)))
+            await items.append(Self.linkItem(target, host.stopLink(observer: observer, target: target)))
         }
         return SessionAdminReply.batch(
             op: "unlink", items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview,
@@ -379,7 +379,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         now: Date
     ) throws -> DomainDelegationScopeGuardrails {
         let (requested, expiresInSeconds) = try SessionAdminMCPToolService.parseGuardrails(raw)
-        let provided = Set(raw?.objectValue?.keys.map { $0 } ?? [])
+        let provided = Set(raw?.objectValue?.keys.map(\.self) ?? [])
         var result = parent
         if provided.contains("max_live_sessions") { result.maxLiveSessions = requested.maxLiveSessions }
         if provided.contains("max_depth") { result.maxDepth = requested.maxDepth }

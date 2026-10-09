@@ -15,17 +15,16 @@ extension AgentModeViewModel {
         guard !session.runState.isActive, !session.isComposerSubmissionInFlight else {
             return .blocked("The target is running; change effort when it is idle.")
         }
-        let allowed: [String]
-        if session.selectedAgent.usesClaudeTooling {
-            allowed = AgentModelCatalog.supportedClaudeEfforts(
+        let allowed: [String] = if session.selectedAgent.usesClaudeTooling {
+            AgentModelCatalog.supportedClaudeEfforts(
                 forSelectedModelRaw: session.selectedModelRaw, agentKind: session.selectedAgent
             ).map(\.rawValue)
         } else if session.selectedAgent == .codexExec {
-            allowed = codexCoordinator.reasoningEffortOptions(
+            codexCoordinator.reasoningEffortOptions(
                 forModelRaw: session.selectedModelRaw, agentKind: session.selectedAgent
             ).map(\.rawValue)
         } else {
-            allowed = []
+            []
         }
         guard !allowed.isEmpty else {
             return .invalid("The target's provider/model has no selectable effort.")
