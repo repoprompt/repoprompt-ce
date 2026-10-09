@@ -47,7 +47,7 @@ struct ClaudeCLIUsageRecord: Codable, Equatable {
             return ProviderQuotaWindow(
                 key: .init(bucketID: id, nativeRole: role),
                 percent: ProviderQuotaPercent(rawValue: value.used, sense: .used, declaredUpperBound: 100),
-                windowDuration: nil,
+                windowDuration: role == "five_hour" ? 5 * 60 * 60 : 7 * 24 * 60 * 60,
                 resetsAt: value.resetsAt.map { Date(timeIntervalSince1970: $0) },
                 observedAt: receivedAt
             )

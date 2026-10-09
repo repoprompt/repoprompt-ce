@@ -86,6 +86,15 @@ final class ClaudeIntegratedAgentModeRunner {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async {
+        let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
+        var handedToRunTask = false
+        defer {
+            if let dedicatedNoteID, !handedToRunTask {
+                AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                    hooks.persistence.scheduleSave(session)
+                }
+            }
+        }
         guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
@@ -124,9 +133,18 @@ final class ClaudeIntegratedAgentModeRunner {
         if let dispatchID = providerControlCommand?.selfCompactDispatchID,
            dispatchID.stage == .compact
         {
-            _ = session.selfCompactNativeCompletion?.bindCompact(
-                dispatchID, runID: runID, runAttemptID: runAttemptID
-            )
+            guard session.selfCompactDispatchIsCurrent?() != false,
+                  session.selfCompactNativeCompletion?.bindCompact(
+                      dispatchID, runID: runID, runAttemptID: runAttemptID
+                  ) == true
+            else {
+                await finalize(
+                    session: session, runID: runID, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID, terminalState: .failed,
+                    errorText: nil, notifyTurnComplete: false
+                )
+                return
+            }
         }
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -139,8 +157,16 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
-        session.agentTask = Task { [weak self, weak session] in
-            guard let self, let session else { return }
+        session.agentTask = Task { [weak self, weak session, hooks] in
+            guard let session else { return }
+            defer {
+                if let dedicatedNoteID {
+                    AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                        hooks.persistence.scheduleSave(session)
+                    }
+                }
+            }
+            guard let self else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
                 guard acquired else {
@@ -178,16 +204,10 @@ final class ClaudeIntegratedAgentModeRunner {
                         providerControlCommand: providerControlCommand,
                         selfCompactDispatchID: selfCompactDispatchID
                     )
-                    if let selfCompactDispatchID,
-                       selfCompactDispatchID.stage == .note,
-                       sendOutcome != .sent,
-                       session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
-                       session.selfCompactState.active?.noteDispatchStarted == false
-                    {
-                        var state = session.selfCompactState
-                        _ = state.noteDefinitivelyNotAttempted(selfCompactDispatchID)
-                        session.selfCompactState = state
-                        self.hooks.persistence.scheduleSave(session)
+                    if let dedicatedNoteID, sendOutcome != .sent {
+                        AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                            self.hooks.persistence.scheduleSave(session)
+                        }
                     }
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:
@@ -288,6 +308,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
             } onCancel: {}
         }
+        handedToRunTask = true
     }
 
     private func consumeEvents(

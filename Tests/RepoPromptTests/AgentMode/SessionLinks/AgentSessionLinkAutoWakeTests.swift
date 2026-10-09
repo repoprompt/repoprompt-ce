@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -178,7 +179,201 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
     }
 
-    func testNotificationWakeRetainsUnverifiedAttemptedAndForeignOwnerCompactGates() throws {
+    func testClaudeVerifiedCompactPreSendExitReparksAndPendingWakeCarriesNote() async throws {
+        for exit in ["entryStop", "leaseFailure", "leaseCancellation"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .claudeCode
+            session.claudeController = fixture.nativeController
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
+            )
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            let noteID = try installVerifiedParkedNote(fixture)
+            session.selfCompactState.active?.phase = .dispatchingCompact
+            session.selfCompactState.active?.compactTurnSucceeded = nil
+            session.selfCompactState.active?.admittedSupport = .claudeCode
+            let compactRunID = try XCTUnwrap(session.runID)
+            let compactAttemptID = UUID()
+            let leaseGate = TestReleaseFence(name: "dedicated Claude note bootstrap")
+            defer { leaseGate.release() }
+            let completion = AgentSelfCompactNativeCompletionCoordinator(
+                load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
+                isCurrentOwner: { _ in true },
+                dispatchNote: { requestID, admissible in
+                    guard admissible() else { return false }
+                    session.selfCompactState.active?.phase = .dispatchingNote
+                    let fence = AgentRunStartStopFence(session: session)
+                    if exit == "entryStop" { session.stopState.invalidateScheduledStarts() }
+                    await runner.startRun(
+                        tabID: fixture.tabID, session: session,
+                        initialUserMessage: "", initialMessageForRun: AgentSelfCompactNoteEnvelope.frame("continue safely"),
+                        attachments: [], makeLease: { runID in
+                            MCPBootstrapLease(
+                                spec: .agentMode(tabID: fixture.tabID, runID: runID, gateID: UUID(), windowID: 1, agent: .claudeCode),
+                                mcpServerEnabler: { await leaseGate.enterAndWait()
+                                    return exit == "leaseCancellation"
+                                },
+                                policyInstaller: { spec in await MCPRoutingWaiter.notifyRouted(runID: spec.runID) },
+                                policyClearer: { _ in }
+                            )
+                        },
+                        selfCompactDispatchID: .init(requestID: requestID, stage: .note), stopFence: fence
+                    )
+                    return true
+                }
+            )
+            session.selfCompactNativeCompletion = completion
+            defer { completion.cancelRuntimeWork() }
+            XCTAssertTrue(completion.bindCompact(
+                .init(requestID: noteID.requestID, stage: .compact), runID: compactRunID, runAttemptID: compactAttemptID
+            ))
+            var publishedParked = false
+            let observation = session.monitorReadinessChangePublisher.sink { _ in
+                MainActor.assumeIsolated {
+                    if session.selfCompactState.active?.phase == .parked { publishedParked = true }
+                }
+            }
+            defer { observation.cancel() }
+            // Keep the wake behind an independent gate until the instruction carrier is installed.
+            session.isChangingExecutionLocation = true
+            session.oversight.autoWakeOnUpdates = true
+            try publishInventory(fixture, revision: 1)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            try await AsyncTestWait.waitUntil("pending lane edge awaits readiness") {
+                session.oversight.pendingAutoWake?.phase == .awaitingSettlement
+            }
+            completion.compactTurnSettled(
+                revision: AgentRunTerminalCommitRevision(
+                    commitID: UUID(), ownership: .init(attemptID: compactAttemptID, binding: .init(tabID: fixture.tabID, persistentSessionID: fixture.sessionID)),
+                    terminalState: .completed, failureReason: nil, expectedRunID: compactRunID,
+                    sourceItemsRevision: 0, assistantDeltaFlushGeneration: 0, providerDrainGeneration: 0,
+                    mcpPublicationEnvelope: nil, successorKind: nil, providerSuccessorID: nil
+                ),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            if exit != "entryStop" {
+                guard await leaseGate.waitUntilEntered(timeout: 3, failOnTimeout: false) else {
+                    XCTFail("Dedicated note never entered the lease gate: \(exit)")
+                    continue
+                }
+                let task = try XCTUnwrap(session.agentTask)
+                if exit == "leaseCancellation" { task.cancel() }
+                leaseGate.release()
+                await task.value
+            }
+            try await AsyncTestWait.waitUntil("verified unattempted note reparks and publishes readiness") {
+                session.selfCompactState.active?.phase == .parked && publishedParked
+            }
+            XCTAssertEqual(session.selfCompactState.active?.id, noteID.requestID)
+            XCTAssertEqual(session.selfCompactState.active?.compactTurnSucceeded, true)
+            XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+            let sentCount = await fixture.nativeController.sentCount
+            XCTAssertEqual(sentCount, 0)
+            let waiting = Task { @MainActor in
+                try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5)
+            }
+            try await AsyncTestWait.waitUntil("instruction carrier installed") { session.instructionContinuation != nil }
+            session.isChangingExecutionLocation = false
+            let response = try await waiting.value
+            guard case .laneUpdateAutoWake = response.origin else { return XCTFail("Expected the pending edge to wake") }
+            let text = try XCTUnwrap(response.text)
+            XCTAssertTrue(text.hasPrefix(AgentSelfCompactNoteEnvelope.frame("continue safely") + "\n\n"))
+            XCTAssertTrue(text.contains("<repoprompt_session_oversight_status_changes"))
+            XCTAssertEqual(text.components(separatedBy: "<note>").count - 1, 1)
+            XCTAssertEqual(session.selfCompactState.latest?.requestID, noteID.requestID)
+            XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+            XCTAssertEqual(session.selfCompactState.latest?.completionVerified, true)
+            XCTAssertNil(session.selfCompactState.active)
+            XCTAssertNil(session.oversight.pendingAutoWake)
+        }
+    }
+
+    func testClaudeCompactBindRefusalNeverReachesProviderTransport() async throws {
+        for refusal in ["staleDispatch", "bindRejected", "missingCoordinator"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .claudeCode
+            session.claudeController = fixture.nativeController
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            let noteID = try installVerifiedParkedNote(fixture)
+            session.selfCompactState.active?.phase = .dispatchingCompact
+            session.selfCompactState.active?.compactTurnSucceeded = nil
+            session.selfCompactState.active?.admittedSupport = .claudeCode
+            session.selfCompactDispatchIsCurrent = { refusal != "staleDispatch" }
+            let completion = AgentSelfCompactNativeCompletionCoordinator(
+                load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
+                isCurrentOwner: { _ in true }, dispatchNote: { _, _ in XCTFail("No note may dispatch")
+                    return false
+                }
+            )
+            defer { completion.cancelRuntimeWork() }
+            session.selfCompactNativeCompletion = refusal == "missingCoordinator" ? nil : completion
+            let dispatchID = AgentSelfCompactionDispatchID(requestID: refusal == "bindRejected" ? UUID() : noteID.requestID, stage: .compact)
+            try await runner.startRun(
+                tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "/compact",
+                attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) },
+                providerControlCommand: .compact(
+                    expectedBinding: XCTUnwrap(session.persistentSessionBindingIdentity),
+                    expectedProviderConversation: "monitor-native-session", selfCompactDispatchID: dispatchID
+                ),
+                selfCompactDispatchID: dispatchID
+            )
+            // Drain any task created by a broken runner so the zero-transport oracle is meaningful.
+            if let task = session.agentTask {
+                XCTFail("Bind refusal installed a transport task: \(refusal)")
+                task.cancel()
+                await task.value
+            }
+            let sentCount = await fixture.nativeController.sentCount
+            XCTAssertEqual(sentCount, 0, refusal)
+            XCTAssertEqual(session.runState, .failed, refusal)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertNil(session.selfCompactState.active?.compactRunAttemptID)
+        }
+    }
+
+    func testCodexDedicatedNoteEarlyExitReparksWithoutProviderTransport() async throws {
+        for exit in ["entryStop", "mcpFailure", "stopAfterMCP"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .codexExec
+            let noteID = try installVerifiedParkedNote(fixture)
+            session.selfCompactState.active?.phase = .dispatchingNote
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let fence = AgentRunStartStopFence(session: session)
+            if exit == "entryStop" { session.stopState.invalidateScheduledStarts() }
+            var mcpCalls = 0
+            let runner = CodexIntegratedAgentModeRunner(
+                mcpServerEnabler: {
+                    mcpCalls += 1
+                    if exit == "stopAfterMCP" { session.stopState.invalidateScheduledStarts() }
+                    return exit != "mcpFailure"
+                },
+                codexCoordinator: fixture.viewModel.test_codexCoordinator, hooks: harness.hooks
+            )
+            let outcome = await runner.startRun(
+                tabID: fixture.tabID, session: session, initialMessageForRun: AgentSelfCompactNoteEnvelope.frame("continue safely"),
+                attachments: [], fallbackContext: nil, selfCompactDispatchID: noteID, stopFence: fence
+            )
+            XCTAssertFalse(outcome.didSend)
+            XCTAssertEqual(mcpCalls, exit == "entryStop" ? 0 : 1)
+            XCTAssertNil(session.codexController)
+            XCTAssertEqual(session.selfCompactState.active?.id, noteID.requestID)
+            XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+            XCTAssertEqual(session.selfCompactState.active?.compactTurnSucceeded, true)
+            XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+        }
+    }
+
+    func testNotificationWakeRetainsUnverifiedAttemptedAndOwnerlessCompactGates() throws {
         let fixture = try makeFixture(fenceProviderLaunch: true)
         _ = try installVerifiedParkedNote(fixture)
         let verified = fixture.session.selfCompactState
@@ -199,19 +394,49 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.selfCompactState = state
             XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
         }
-        // A valid-looking parked record belonging to another binding never opens admission.
-        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
-        let foreign = AgentSelfCompactOwner(
-            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
-            sessionID: endpoint.sessionID, persistentBindingGeneration: UUID(),
-            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
-            runID: UUID(), runAttemptID: UUID()
-        )
-        var attempt = try XCTUnwrap(verified.active)
-        attempt = AgentSelfCompactAttempt(idempotencyKey: "foreign", note: attempt.note, owner: foreign, phase: .parked)
-        attempt.compactTurnSucceeded = true
-        fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
-        XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
+    }
+
+    func testWakeEvaluationSettlesStaleParkedNoteWithoutSend() throws {
+        for loss in ["localGeneration", "windowIncarnation", "competingWriter", "currentOwner", "attemptedForeign"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            _ = try installVerifiedParkedNote(fixture)
+            let original = try XCTUnwrap(fixture.session.selfCompactState.active)
+            let currentOwner = try XCTUnwrap(original.owner)
+            let owner = AgentSelfCompactOwner(
+                windowID: loss == "windowIncarnation" || loss == "attemptedForeign" ? currentOwner.windowID + 1 : currentOwner.windowID,
+                workspaceID: currentOwner.workspaceID, tabID: currentOwner.tabID,
+                sessionID: currentOwner.sessionID,
+                persistentBindingGeneration: loss == "localGeneration" ? UUID() : currentOwner.persistentBindingGeneration,
+                bindingTransitionGeneration: currentOwner.bindingTransitionGeneration,
+                runID: currentOwner.runID, runAttemptID: currentOwner.runAttemptID
+            )
+            var attempt = AgentSelfCompactAttempt(idempotencyKey: "owner-loss", note: original.note, owner: owner, phase: .parked)
+            attempt.compactTurnSucceeded = true
+            attempt.noteDispatchStarted = loss == "attemptedForeign"
+            fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+            let competingWriter = loss == "competingWriter" ? fixture.viewModel.session(for: UUID()) : nil
+            competingWriter?.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
+            defer { competingWriter?.testInstallPersistentSessionBinding(sessionID: nil) }
+            XCTAssertEqual(owner.matchesLocalBinding(fixture.session), loss != "localGeneration", loss)
+            XCTAssertEqual(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session), loss != "currentOwner", loss)
+            try publishInventory(fixture, revision: 1)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            if loss == "currentOwner" || loss == "attemptedForeign" {
+                XCTAssertEqual(fixture.session.selfCompactState.active, attempt, loss)
+                XCTAssertNil(fixture.session.selfCompactState.latest, loss)
+            } else {
+                XCTAssertNil(fixture.session.selfCompactState.active, loss)
+                XCTAssertEqual(fixture.session.selfCompactState.latest?.requestID, attempt.id, loss)
+                XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled, loss)
+                XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .notSent, loss)
+                let settled = fixture.session.selfCompactState
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+                XCTAssertEqual(fixture.session.selfCompactState, settled, "Repeated evaluation must be inert")
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, loss)
+            XCTAssertNotNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID], loss)
+        }
     }
 
     private func installVerifiedParkedNote(_ fixture: Fixture) throws -> AgentSelfCompactionDispatchID {
@@ -4773,15 +4998,21 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let tabID: UUID
         /// Retained: the view model holds its workspace manager weakly.
         let workspaceManager: WorkspaceManagerViewModel
+        let nativeController: MonitorFakeNativeController
     }
 
     private func makeFixture(catalogReady: Bool = true, fenceProviderLaunch: Bool = false) throws -> Fixture {
         let tabID = UUID()
+        let nativeController = MonitorFakeNativeController()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            claudeControllerFactory: { _, _, _, _ in
+                if fenceProviderLaunch { XCTFail("This fixture must not initialize a Claude provider") }
+                return nativeController
             },
             headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in
@@ -4821,7 +5052,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session: session,
             sessionID: sessionID,
             tabID: tabID,
-            workspaceManager: workspaceManager
+            workspaceManager: workspaceManager,
+            nativeController: nativeController
         )
         if catalogReady {
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)

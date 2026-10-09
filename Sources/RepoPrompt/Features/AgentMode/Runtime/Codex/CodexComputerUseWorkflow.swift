@@ -135,7 +135,7 @@ enum CodexComputerUseWorkflow {
     static let disabledMessage = "Computer Use is turned off. Enable Computer Use in Codex Direct Agent permissions, then submit /computer-use. macOS permissions must be granted manually."
     static let unavailableMessage = "Computer Use requires the installed SkyComputerUseClient companion from Codex or ChatGPT. No companion is available; this turn cannot use computer-use tools."
     static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
-    static let ineligibleMessage = "Computer Use is only available in user-created, top-level native Codex sessions without MCP control or active session links."
+    static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
 
     @MainActor
     static var isEnabled: Bool {
@@ -216,7 +216,7 @@ enum CodexComputerUseWorkflow {
 
         return """
         <computer_use_workflow>
-        The user explicitly armed Computer Use for this chat in RepoPrompt Agent Mode. It remains available for later local-user turns until /computer-use off or the session ends.
+        The user explicitly armed Computer Use for this chat in RepoPrompt Agent Mode. It remains available for later turns in this chat until /computer-use off or the session ends.
 
         Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.
 

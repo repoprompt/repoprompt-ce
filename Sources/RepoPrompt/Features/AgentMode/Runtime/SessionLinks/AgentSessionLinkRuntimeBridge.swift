@@ -352,11 +352,7 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     )
 
-    /// Captures a scoped local-only admission fence. The release is tied to the captured session,
-    /// not a later endpoint lookup, and is held through every suspension and activation exit.
-    func agentSessionLinkHoldComputerUseAdmission(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)?
-
-    /// Retires incompatible local-only operations before authority can activate either endpoint.
+    /// Waits for an already-retiring controller without revoking local Computer Use consent.
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async
 
     /// Fences one incarnation's published inventory, so nothing can be claimed against a membership
@@ -529,10 +525,6 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkHoldComputerUseAdmission(_: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)? {
-        nil
-    }
-
     func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
 
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
@@ -3186,14 +3178,6 @@ final class AgentSessionLinkRuntimeBridge {
             return EstablishmentResult(outcome: .failed(.closing))
         }
 
-        // Fence both endpoints synchronously before either retirement hop: the first endpoint
-        // must not re-arm while the second retires or while token/deletion/authority checks await.
-        let releaseObserverComputerUseAdmission = host.agentSessionLinkHoldComputerUseAdmission(observerEndpoint)
-        let releaseTargetComputerUseAdmission = host.agentSessionLinkHoldComputerUseAdmission(targetEndpoint)
-        defer {
-            releaseTargetComputerUseAdmission?()
-            releaseObserverComputerUseAdmission?()
-        }
         await host.agentSessionLinkWillActivate(observerEndpoint)
         await host.agentSessionLinkWillActivate(targetEndpoint)
 

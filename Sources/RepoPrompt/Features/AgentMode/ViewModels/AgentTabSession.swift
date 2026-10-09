@@ -1220,7 +1220,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     // In-memory authority for this chat, never written to AgentSession persistence. Runtime
-    // reconnects may reuse it; session shutdown, explicit off and ownership drift revoke it.
+    // reconnects and ownership transitions may reuse it; session shutdown and explicit off revoke it.
     var codexComputerUseArmingRequestID: UUID?
     var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?
     var codexControllerFeatureState: CodexControllerFeatureState?

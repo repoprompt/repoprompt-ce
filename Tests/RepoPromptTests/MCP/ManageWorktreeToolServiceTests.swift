@@ -241,6 +241,180 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
     }
 }
 
+/// Execution-time authority for `manage_worktree` binding mutations that name a session explicitly.
+///
+/// A full session UUID plus same-window routing must not let an Agent run redirect an unrelated
+/// session's execution checkout. External MCP clients keep their existing administrative access.
+@MainActor
+final class ManageWorktreeSessionAuthorityTests: XCTestCase {
+    private let callerSessionID = UUID()
+    private let targetSessionID = UUID()
+
+    private final class Probe {
+        var provenanceLookups: [UUID] = []
+        var grantChecks: [UUID] = []
+    }
+
+    func testAdministrativePrincipalKeepsExistingExternalAccess() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(window: window, runPurpose: nil, caller: nil, probe: probe)
+        }
+        XCTAssertTrue(probe.provenanceLookups.isEmpty, "external clients are not re-classified by provenance")
+        XCTAssertTrue(probe.grantChecks.isEmpty, "external clients never need an oversight grant")
+    }
+
+    func testAgentSessionMayRebindItsOwnSession() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(window: window, caller: self.targetSessionID, probe: probe)
+        }
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    func testSpawnParentMayRebindItsDirectChild() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(
+                window: window, caller: self.callerSessionID, targetParent: self.callerSessionID, probe: probe
+            )
+        }
+        XCTAssertEqual(probe.provenanceLookups, [targetSessionID])
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    func testManageGrantedOverseerMayRebindTarget() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(
+                window: window,
+                caller: self.callerSessionID,
+                observer: self.endpoint(sessionID: self.callerSessionID),
+                managedTargets: [self.targetSessionID],
+                probe: probe
+            )
+        }
+        XCTAssertEqual(probe.grantChecks, [targetSessionID])
+    }
+
+    func testUnrelatedAgentSessionIsDeniedWithUniformNotFound() async throws {
+        try await withWindow { window in
+            // Linked without management (or not linked at all), and not the spawn parent.
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: self.callerSessionID,
+                    targetParent: UUID(),
+                    observer: self.endpoint(sessionID: self.callerSessionID)
+                )
+            }
+        }
+    }
+
+    func testObserverEndpointForAnotherSessionDoesNotCarryItsGrant() async throws {
+        try await withWindow { window in
+            let otherObserver = self.endpoint(sessionID: UUID())
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: self.callerSessionID,
+                    observer: otherObserver,
+                    managedTargets: [self.targetSessionID]
+                )
+            }
+        }
+    }
+
+    func testUnresolvedAgentRunFailsClosedBeforeConsultingProvenanceOrGrants() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: nil,
+                    targetParent: nil,
+                    observer: self.endpoint(sessionID: self.callerSessionID),
+                    managedTargets: [self.targetSessionID],
+                    probe: probe
+                )
+            }
+        }
+        XCTAssertTrue(probe.provenanceLookups.isEmpty)
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    private func authorize(
+        window: WindowState,
+        runPurpose: MCPRunPurpose? = .agentModeRun,
+        caller: UUID?,
+        targetParent: UUID? = nil,
+        observer: DomainAgentSessionLinkEndpointIdentity? = nil,
+        managedTargets: Set<UUID> = [],
+        probe: Probe = Probe()
+    ) async throws {
+        try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+            targetSessionID: targetSessionID,
+            metadata: MCPRequestMetadata(
+                connectionID: nil,
+                clientName: "manage-worktree-authority-tests",
+                windowID: window.windowID,
+                runPurpose: runPurpose
+            ),
+            targetWindow: window,
+            resolveSpawnParentSessionID: { _, _ in caller },
+            resolveObserverEndpoint: { _, _ in observer },
+            resolveTargetProvenance: { sessionID in
+                probe.provenanceLookups.append(sessionID)
+                return .known(targetSessionID: sessionID, parentSessionID: targetParent)
+            },
+            hasManageGrant: { endpoint, sessionID in
+                probe.grantChecks.append(sessionID)
+                return endpoint == observer && managedTargets.contains(sessionID)
+            }
+        )
+    }
+
+    private func endpoint(sessionID: UUID) -> DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: sessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+    }
+
+    private func assertUniformDenial(
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            XCTFail("Expected a worktree binding authorization denial", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                "\(error)",
+                "\(AgentSessionTargetOperationGuard.denialError(sessionID: targetSessionID))",
+                "Denial must be indistinguishable from a missing session",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    private func withWindow(_ body: (WindowState) async throws -> Void) async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        try await body(window)
+    }
+}
+
 // Provider-boundary regressions use the real protected mutation and window tool path.
 #if DEBUG
     @MainActor
@@ -408,6 +582,33 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             }
         }
 
+        func testAgentRunWithoutAuthorityCannotBindAnExplicitSession() async throws {
+            try await withProvider { fixture in
+                do {
+                    _ = try await fixture.call(["op": .string("bind")], runPurpose: .agentModeRun)
+                    XCTFail("An Agent run without authority over the session must not rebind it")
+                } catch {
+                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                }
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+            }
+        }
+
+        func testAgentRunWithoutAuthorityCannotUnbindAnExplicitSession() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let original = fixture.session.worktreeBindings
+                XCTAssertFalse(original.isEmpty)
+                do {
+                    _ = try await fixture.call(["op": .string("unbind")], includeWorktree: false, runPurpose: .agentModeRun)
+                    XCTFail("An Agent run without authority over the session must not unbind it")
+                } catch {
+                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                }
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+            }
+        }
+
         func testRequiredSaveFailureSettlesIndeterminateWithBindingActuallyChanged() async throws {
             try await withProvider { fixture in
                 struct SaveFailure: Error {}
@@ -514,13 +715,19 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             let binding: MCPDomainToolBinding
             let security: DomainToolInvocationSecurityContext
 
-            func call(_ extra: [String: Value], includeWorktree: Bool = true, projectSession: Bool = false) async throws -> Value {
+            func call(
+                _ extra: [String: Value],
+                includeWorktree: Bool = true,
+                projectSession: Bool = false,
+                runPurpose: MCPRunPurpose? = nil
+            ) async throws -> Value {
                 var args = extra
                 args["repo_root"] = .string(logical.path)
                 args["session_id"] = .string(sessionID.uuidString)
                 if includeWorktree { args["worktree"] = .string(physical.path) }
                 let metadata = MCPRequestMetadata(
                     connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    runPurpose: runPurpose,
                     tabContextHint: projectSession ? MCPTabContextHint(
                         tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID
                     ) : nil

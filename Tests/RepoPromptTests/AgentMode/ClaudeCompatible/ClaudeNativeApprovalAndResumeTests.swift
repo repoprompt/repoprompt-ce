@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
@@ -93,6 +94,38 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(snapshot.source, .claudeCLIUsage)
         XCTAssertEqual(snapshot.coverage, .accountWideAggregateOnly)
         XCTAssertNil(snapshot.buckets.first?.planType)
+    }
+
+    private func cliPlanUsageSnapshot(observedAt date: Date) throws -> ProviderQuotaSnapshot {
+        let payload = Data(#"{"rate_limits":{"five_hour":{"used_percentage":6,"resets_at":1900010000},"seven_day":{"used_percentage":5,"resets_at":1900300000}}}"#.utf8)
+        return try XCTUnwrap(ClaudeCLIUsageRecord.extract(payload, now: date)).snapshot(profileID: "profile")
+    }
+
+    func testCLIUsageSnapshotDeclaresPlanWindowDurationsAndFriendlyTitles() throws {
+        let snapshot = try cliPlanUsageSnapshot(observedAt: Date(timeIntervalSince1970: 1_900_000_000))
+        let windows = try XCTUnwrap(snapshot.buckets.first?.windows)
+        XCTAssertEqual(windows.map(\.nativeRole), ["five_hour", "seven_day"])
+        XCTAssertEqual(windows.map(\.windowDuration), [18000, 604_800])
+        XCTAssertEqual(windows.map(ProviderQuotaPresenter.windowTitle(for:)), ["5-hour limit", "Weekly limit"], "raw role names must not leak into Settings rows")
+    }
+
+    func testCLIUsageIndicatorStaysVisibleBeyondDefaultStaleHorizon() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let hourOld = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(60 * 60)), "an hour-old 5-hour reading is within 25% of its window")
+        XCTAssertEqual(hourOld.usedPercent, 6)
+        let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
+        XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
+    }
+
+    func testCLIUsageWeeklyReadingInformsBalancingWithinOneHour() throws {
+        let date = Date(timeIntervalSince1970: 1_900_000_000)
+        let snapshot = try cliPlanUsageSnapshot(observedAt: date)
+        let recent = ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(40 * 60))
+        XCTAssertTrue(recent.known)
+        XCTAssertNotNil(recent.weeklyPace)
+        XCTAssertEqual(recent.weeklyHeadroom, 95)
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(snapshot, now: date.addingTimeInterval(3601)).known, "weekly routing evidence is capped at one hour")
     }
 
     func testCLIUsageRejectsInvalidOrMissingNumbersRatherThanShowingZero() throws {

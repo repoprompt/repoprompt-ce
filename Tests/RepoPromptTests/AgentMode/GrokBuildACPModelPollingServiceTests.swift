@@ -53,7 +53,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
                 for (usage, environment, expected) in [
                     ("Agent Mode", agentModeEnvironment, managedEnvironment),
                     ("model polling", config.backgroundFeatureEnvironment, managedEnvironment),
-                    ("Context Builder", contextBuilderEnvironment, [:])
+                    ("Context Builder", contextBuilderEnvironment, managedEnvironment)
                 ] {
                     XCTAssertEqual(environment, expected, "Background-feature policy for \(usage)")
                 }

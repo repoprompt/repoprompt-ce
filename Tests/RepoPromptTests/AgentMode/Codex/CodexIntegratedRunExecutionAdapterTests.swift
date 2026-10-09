@@ -422,80 +422,30 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         XCTAssertNil(session.codexControllerFeatureState)
     }
 
-    func testAdmissionExcludesLifetimeMCPChildAndLinkedSessions() async {
-        CodexComputerUseWorkflow.setEnabledForTesting(true)
-        let coordinator = makeCoordinator()
-        let session = AgentTabSession(tabID: UUID())
-        session.selectedAgent = .codexExec
-        func stage() {
-            session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        }
-        stage()
-        let admitted = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertTrue(admitted)
-        session.parentSessionID = UUID()
-        stage()
-        let child = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(child)
-        session.parentSessionID = nil
-        session.isMCPOriginated = true
-        stage()
-        let originated = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(originated)
-        session.isMCPOriginated = false
-        session.mcpControlActivationGeneration = 1
-        stage()
-        let releasedControl = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(releasedControl)
-        session.mcpControlActivationGeneration = 0
-        stage()
-        let linked = await makeCoordinator(linked: { _ in true }).test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(linked)
-        XCTAssertNil(session.pendingCodexComputerUseActivation)
-    }
-
-    func testAdmissionRechecksControlAndOptInAfterSuspension() async {
-        CodexComputerUseWorkflow.setEnabledForTesting(true)
-        for disableSetting in [false, true] {
-            let session = AgentTabSession(tabID: UUID())
-            session.selectedAgent = .codexExec
-            session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-            let coordinator = makeCoordinator(linked: { session in
-                if disableSetting { CodexComputerUseWorkflow.setEnabledForTesting(false) }
-                else { session.mcpControlActivationGeneration = 1 }
-                await Task.yield()
-                return false
-            })
-            let admitted = await coordinator.test_computerUseForNextTurn(session: session)
-            XCTAssertFalse(admitted)
-            XCTAssertNil(session.pendingCodexComputerUseActivation)
-        }
-    }
-
     func testMissingCompanionAndOrdinaryTurnNeverAdmit() async {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
-        let session = AgentTabSession(tabID: UUID())
-        session.selectedAgent = .codexExec
+        let (viewModel, session) = makeAdmissionFixture(ready: false)
         let ordinary = await makeCoordinator().test_computerUseForNextTurn(session: session)
         XCTAssertFalse(ordinary)
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        let missing = await makeCoordinator(ready: false).test_computerUseForNextTurn(session: session)
+        let missing = await viewModel.test_codexCoordinator.test_computerUseForNextTurn(session: session)
         XCTAssertFalse(missing)
         XCTAssertNil(session.pendingCodexComputerUseActivation)
+        withExtendedLifetime(viewModel) {}
     }
 
     func testReservedCollisionFailsClosedWithoutMutatingSavedDefinition() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
-        let session = AgentTabSession(tabID: UUID())
-        session.selectedAgent = .codexExec
+        let (viewModel, session) = makeAdmissionFixture(collision: true)
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        let admitted = await makeCoordinator(collision: true).test_computerUseForNextTurn(session: session)
+        let admitted = await viewModel.test_codexCoordinator.test_computerUseForNextTurn(session: session)
         XCTAssertFalse(admitted)
         XCTAssertNil(session.pendingCodexComputerUseActivation)
         let saved: [String: Any] = ["command": "/user/custom", "env": ["TOKEN": "not-a-secret-fixture"], "tools": ["click": ["approval_mode": "approve"]]]
         let effective: [String: Any] = ["config": ["mcp_servers": ["computer-use": saved]]]
         XCTAssertThrowsError(try CodexNativeSessionController.validateComputerUseConfiguration(effective))
         XCTAssertEqual((effective["config"] as? NSDictionary)?["mcp_servers"] as? NSDictionary, ["computer-use": saved] as NSDictionary)
+        withExtendedLifetime(viewModel) {}
         XCTAssertNoThrow(try CodexNativeSessionController.validateComputerUseConfiguration(["config": [:]]))
         XCTAssertThrowsError(try CodexNativeSessionController.validateComputerUseConfiguration([:]))
     }
@@ -653,7 +603,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        await makeCoordinator(linked: nil).ensureCodexNativeSession(session: session)
+        await makeCoordinator().ensureCodexNativeSession(session: session)
         XCTAssertEqual(session.runState, .failed)
         XCTAssertNil(session.codexController)
         XCTAssertEqual(session.items.last?.kind, .error)
@@ -664,13 +614,25 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        let admitted = await makeCoordinator(linked: nil).test_computerUseForNextTurn(session: session)
+        let admitted = await makeCoordinator().test_computerUseForNextTurn(session: session)
         XCTAssertFalse(admitted)
         XCTAssertNil(session.pendingCodexComputerUseActivation)
     }
 
-    private func makeCoordinator(ready: Bool = true, collision: Bool = false, linked: ((AgentTabSession) async -> Bool)? = { _ in false }) -> CodexAgentModeCoordinator {
-        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, computerUseHasActiveLink: linked, codexHookApprovalSettings: GlobalSettingsStore.shared)
+    private func makeAdmissionFixture(ready: Bool = true, collision: Bool = false) -> (AgentModeViewModel, AgentTabSession) {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Admission must not launch") },
+            testCodexComputerUseCompanionReady: { ready }, testCodexComputerUseReservedEntryExists: { collision }
+        )
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        return (viewModel, session)
+    }
+
+    private func makeCoordinator(ready: Bool = true, collision: Bool = false) -> CodexAgentModeCoordinator {
+        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
     }
 }
 

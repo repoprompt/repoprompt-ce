@@ -20,19 +20,48 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     let dependencies: Dependencies
     private let vcsService: VCSService
     private let resolver: GitRepoTargetResolver
+    private let resolveSpawnParentSessionID: AgentSessionTargetOperationGuard.SpawnParentSessionResolver
+    private let resolveObserverEndpoint: AgentSessionTargetOperationGuard.ObserverEndpointResolver
+    private let hasManageGrant: AgentSessionTargetOperationGuard.ManageGrantResolver
 
     init(
         runtime: MCPAppToolBinder,
         execution: MCPAppPhysicalCapabilityAdapters.Execution,
         context: MCPAppPhysicalCapabilityAdapters.Context,
         selection: MCPAppPhysicalCapabilityAdapters.Selection,
+        resolveSpawnParentSessionID: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver,
+        resolveObserverEndpoint: @escaping AgentSessionTargetOperationGuard.ObserverEndpointResolver,
+        hasManageGrant: @escaping AgentSessionTargetOperationGuard.ManageGrantResolver = { observerEndpoint, targetSessionID in
+            await MCPWorktreeToolProvider.sessionLinkManageGrant(
+                observerEndpoint: observerEndpoint,
+                targetSessionID: targetSessionID
+            )
+        },
         vcsService: VCSService = .shared,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver()
     ) {
         self.runtime = runtime
         dependencies = (execution: execution, context: context, selection: selection)
+        self.resolveSpawnParentSessionID = resolveSpawnParentSessionID
+        self.resolveObserverEndpoint = resolveObserverEndpoint
+        self.hasManageGrant = hasManageGrant
         self.vcsService = vcsService
         self.resolver = resolver
+    }
+
+    /// Live Manage-grant proof from the session-link authority, revalidated against both endpoints.
+    static func sessionLinkManageGrant(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) async -> Bool {
+        if case .success = await AgentSessionLinkRuntimeBridge.shared.authorizeTarget(
+            operation: .monitorWorktreeBinding,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        ) {
+            return true
+        }
+        return false
     }
 
     func buildTools() -> [Tool] {
@@ -365,6 +394,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func executeBind(op: Operation, args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        // Authorize the target session before any repository or worktree resolution.
+        let bindingRequest = try await resolveBindingRequest(args: args, invocationContext: invocationContext)
+        let sessionID = bindingRequest.sessionID
         let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
         let worktree = try await resolveWorktree(
             args: args,
@@ -373,8 +405,6 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             visibleRoots: context.visibleRoots,
             requireExplicit: true
         )
-        let bindingRequest = try await resolveBindingRequest(args: args, invocationContext: invocationContext)
-        let sessionID = bindingRequest.sessionID
         try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
         let repositoryRoot = try await logicalRoot(for: context)
         let worktreeRoot = try await logicalRoot(for: worktree, context: context)
@@ -665,6 +695,25 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         }
         guard let sessionID = explicitSessionID ?? resolved?.snapshot.activeAgentSessionID else {
             throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")
+        }
+        if let explicitSessionID {
+            // A caller-supplied session UUID is a target reference, not authority over that session.
+            let targetWindow = try dependencies.execution.requireTargetWindow()
+            try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+                targetSessionID: explicitSessionID,
+                metadata: metadata,
+                targetWindow: targetWindow,
+                resolveSpawnParentSessionID: resolveSpawnParentSessionID,
+                resolveObserverEndpoint: resolveObserverEndpoint,
+                resolveTargetProvenance: { targetSessionID in
+                    await AgentSessionTargetOperationGuard.provenance(
+                        for: targetSessionID,
+                        agentModeVM: targetWindow.agentModeViewModel,
+                        workspace: targetWindow.workspaceManager.activeWorkspace
+                    )
+                },
+                hasManageGrant: hasManageGrant
+            )
         }
 
         let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if metadata.runPurpose == .agentModeRun,

@@ -154,6 +154,74 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(outcomes[1], EditOutcome(index: 1, status: "success", error: nil))
     }
 
+    /// Batch fallback with no unique literal match. Same-start chunks and a repeat of a
+    /// replace-all's search must keep unrelated lines and report accurate outcomes.
+    func testBatchDiffFallbackKeepsLinesBesideSameLineChunks() async throws {
+        struct Row {
+            let name: String
+            let original: String
+            let edits: [ApplyEditsOperation]
+            let text: String
+            let status: ApplyEditsStatus
+            let applied: Int
+            let outcomeStatuses: [String]
+        }
+
+        let block = "A\nb\nc\nd\n"
+        let rows = [
+            Row(
+                name: "replace-all removal, then a sibling on the removed lines",
+                original: "FOO\nFOO\ntail\n",
+                edits: [
+                    ApplyEditsOperation(search: "foo", replace: "", replaceAll: true),
+                    ApplyEditsOperation(search: "foo", replace: "baz", replaceAll: false)
+                ],
+                text: "tail\n",
+                status: .partial,
+                applied: 1,
+                outcomeStatuses: ["success", "failed"]
+            ),
+            Row(
+                name: "one replace-all over adjacent blocks",
+                original: block + block,
+                edits: [ApplyEditsOperation(search: "a\nb\nc\nd", replace: "A2\nb\nc\nd\nY", replaceAll: true)],
+                text: "A2\nb\nc\nd\nY\nA2\nb\nc\nd\nY\n",
+                status: .success,
+                applied: 1,
+                outcomeStatuses: ["success"]
+            ),
+            Row(
+                name: "repeated multi-line search, first edit inserts a line",
+                original: block + block,
+                edits: [
+                    ApplyEditsOperation(search: "A\nb\nc\nd", replace: "A2\nb\nc\nd\nY", replaceAll: false),
+                    ApplyEditsOperation(search: "A\nb\nc\nd", replace: "A3\nb\nc\nd", replaceAll: false)
+                ],
+                text: "A2\nb\nc\nd\nY\nA3\nb\nc\nd\n",
+                status: .success,
+                applied: 2,
+                outcomeStatuses: ["success", "success"]
+            )
+        ]
+
+        for row in rows {
+            let request = ApplyEditsRequest(path: "file.txt", mode: .batch(row.edits), verbose: false)
+
+            let result = try await engine.apply(request: request, to: row.original)
+
+            XCTAssertEqual(result.updatedText, row.text, row.name)
+            XCTAssertEqual(result.status, row.status, row.name)
+            XCTAssertEqual(result.editsRequested, row.edits.count, row.name)
+            XCTAssertEqual(result.editsApplied, row.applied, row.name)
+            let outcomes = try XCTUnwrap(result.outcomes, row.name)
+            XCTAssertEqual(outcomes.map(\.index), Array(row.edits.indices), row.name)
+            XCTAssertEqual(outcomes.map(\.status), row.outcomeStatuses, row.name)
+            for outcome in outcomes {
+                XCTAssertEqual(outcome.error == nil, outcome.status == "success", "\(row.name), edit \(outcome.index)")
+            }
+        }
+    }
+
     // MARK: - Issue #1262: fallback must never drop text outside the search span
 
     private static let longPrefix = "| id | " + String(repeating: "a", count: 160)
@@ -267,6 +335,314 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(batchResult.editsApplied, 2)
         XCTAssertEqual(batchResult.updatedText, "func g() {\n    \(longBody)\n    return nil\n}\n")
         XCTAssertEqual(batchResult.outcomes?.map(\.status), ["success", "success"])
+    }
+
+    func testLongExactPrefixAloneKeepsTextOutsideSpan() async throws {
+        let expected = "| id | changed | keep |\n"
+        let single = ApplyEditsRequest(
+            path: "table.md",
+            mode: .single(search: Self.longPrefix, replace: "| id | changed", replaceAll: false),
+            verbose: false
+        )
+        let singleResult = try await engine.apply(request: single, to: Self.longLineFile)
+        XCTAssertEqual(singleResult.status, .success)
+        XCTAssertEqual(singleResult.updatedText, expected)
+        XCTAssertEqual(singleResult.editsApplied, 1)
+
+        try await assertBatchCases([
+            BatchCase(
+                name: "batch of one",
+                path: "table.md",
+                original: Self.longLineFile,
+                edits: [Self.edit(Self.longPrefix, "| id | changed")],
+                expectedText: expected,
+                expectedStatus: .success,
+                expectedApplied: 1,
+                expectedOutcomes: nil
+            )
+        ])
+    }
+
+    /// Two six-line blocks: the first differs from the search in its middle lines.
+    private static let blockFile =
+        "start one\nstart two\nkeep a\nkeep b\nend one\nend two\nstart one\nstart two\nmiddle x\nmiddle y\nend one\nend two\n"
+    private static let blockSearch = "START ONE\nSTART TWO\nMIDDLE X\nMIDDLE Y\nEND ONE\nEND TWO"
+
+    func testWholeLineGuardSkipsBlocksWithDifferentMiddleLines() async throws {
+        let single = ApplyEditsRequest(
+            path: "probe.swift",
+            mode: .single(
+                search: "alpha()\nbeta()\nwrongMiddle()\ndelta()\nepsilon()\nzeta()",
+                replace: "replaced()",
+                replaceAll: false
+            ),
+            verbose: false
+        )
+        do {
+            let result = try await engine.apply(
+                request: single,
+                to: "alpha()\nbeta()\nkeepThisLine()\ndelta()\nepsilon()\nzeta()\n"
+            )
+            XCTFail("Expected refusal, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+
+        let nearMissesOnly = Self.blockFile.replacingOccurrences(of: "middle x\nmiddle y\n", with: "middle q\nmiddle r\n")
+        try await assertBatchCases([
+            BatchCase(
+                name: "replace-all skips the near-miss block and replaces the genuine one",
+                original: Self.blockFile,
+                edits: [Self.edit(Self.blockSearch, "replaced", all: true)],
+                expectedText: "start one\nstart two\nkeep a\nkeep b\nend one\nend two\nreplaced\n",
+                expectedStatus: .success,
+                expectedApplied: 1,
+                expectedOutcomes: [Self.outcome(0)]
+            ),
+            BatchCase(
+                name: "replace-all with only near-miss blocks fails unchanged",
+                original: nearMissesOnly,
+                edits: [Self.edit(Self.blockSearch, "replaced", all: true)],
+                expectedText: nearMissesOnly,
+                expectedStatus: .failed,
+                expectedApplied: 0,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound)]
+            )
+        ])
+    }
+
+    // MARK: - Issue #1262: a mixed batch matches each edit against the text its predecessors left
+
+    private static let notFound = "search block not found in file (matches are exact, including whitespace/indentation)"
+    private static let repeatRefused =
+        "search repeats in this batch and has no unique exact match; use a distinct search for each edit"
+
+    private struct BatchCase {
+        let name: String
+        var path = "file.txt"
+        let original: String
+        let edits: [ApplyEditsOperation]
+        let expectedText: String
+        let expectedStatus: ApplyEditsStatus
+        let expectedApplied: Int
+        let expectedOutcomes: [EditOutcome]?
+    }
+
+    private static func edit(_ search: String, _ replace: String, all: Bool = false) -> ApplyEditsOperation {
+        ApplyEditsOperation(search: search, replace: replace, replaceAll: all)
+    }
+
+    private static func outcome(_ index: Int, failure: String? = nil) -> EditOutcome {
+        EditOutcome(index: index, status: failure == nil ? "success" : "failed", error: failure)
+    }
+
+    private func assertBatchCases(_ cases: [BatchCase]) async throws {
+        for testCase in cases {
+            let request = ApplyEditsRequest(path: testCase.path, mode: .batch(testCase.edits), verbose: false)
+            let result = try await engine.apply(request: request, to: testCase.original)
+            XCTAssertEqual(result.updatedText, testCase.expectedText, testCase.name)
+            XCTAssertEqual(result.status, testCase.expectedStatus, testCase.name)
+            XCTAssertEqual(result.editsRequested, testCase.edits.count, testCase.name)
+            XCTAssertEqual(result.editsApplied, testCase.expectedApplied, testCase.name)
+            XCTAssertEqual(result.outcomes, testCase.expectedOutcomes, testCase.name)
+        }
+    }
+
+    func testMixedBatchAppliesEditsInRequestOrder() async throws {
+        try await assertBatchCases([
+            BatchCase(
+                name: "a stale edit does not land on text a later sibling wrote",
+                original: "seed\n",
+                edits: [Self.edit("target", "earlier"), Self.edit("seed", "target")],
+                expectedText: "target\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "exact edits still chain in request order",
+                original: "seed\n",
+                edits: [Self.edit("seed", "target"), Self.edit("target", "earlier")],
+                expectedText: "earlier\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: nil
+            ),
+            BatchCase(
+                name: "a fallback replace-all does not rewrite a line a later sibling wrote",
+                original: "Foo\nbar\n",
+                edits: [Self.edit("foo", "baz", all: true), Self.edit("bar", "foo")],
+                expectedText: "baz\nfoo\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "a later sibling's duplicate does not make a fallback edit ambiguous",
+                original: "alpha\nTarget\n",
+                edits: [Self.edit("target", "done"), Self.edit("alpha", "target")],
+                expectedText: "target\ndone\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "a repeated search without a unique exact match is refused",
+                original: "a\na\nb\n",
+                edits: [Self.edit("a", "x"), Self.edit("a", "y"), Self.edit("b", "c")],
+                expectedText: "a\na\nc\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated search without an exact hit is refused, not matched by line",
+                original: "anchor\nFOO\n",
+                edits: [Self.edit("anchor", "header"), Self.edit("foo", "FoO"), Self.edit("foo", "bar")],
+                expectedText: "header\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated search with an exact hit applies before repeats are refused",
+                original: "x = foo()\ny = foo()\n",
+                edits: [Self.edit("foo", "bar"), Self.edit("foo", "baz", all: true)],
+                expectedText: "x = baz()\ny = baz()\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [Self.outcome(0, failure: Self.repeatRefused), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "repeats with an ambiguous literal hit are refused beside an exact sibling",
+                original: "x = foo()\nfoo\nFOO\n",
+                edits: [
+                    Self.edit("foo", "Foo"),
+                    Self.edit("foo", "baz"),
+                    Self.edit("foo", "qux"),
+                    Self.edit("x =", "y =")
+                ],
+                expectedText: "y = foo()\nfoo\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused),
+                    Self.outcome(3)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated replace-all without an exact hit is refused",
+                original: "anchor\nFOO\nFOO\n",
+                edits: [Self.edit("anchor", "header"), Self.edit("foo", "foo2"), Self.edit("foo", "bar", all: true)],
+                expectedText: "header\nFOO\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "identical searches separated by another edit are refused",
+                original: "a\nb\na\n",
+                edits: [Self.edit("a", "x"), Self.edit("b", "c"), Self.edit("a", "y")],
+                expectedText: "a\nc\na\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "repeated multi-line searches are refused without losing an inserted line",
+                original: "anchor\nA\nb\nc\nd\nA\nb\nc\nd\n",
+                edits: [
+                    Self.edit("anchor", "header"),
+                    Self.edit("A\nb\nc\nd", "A2\nb\nc\nd\nY"),
+                    Self.edit("A\nb\nc\nd", "A3\nb\nc\nd")
+                ],
+                expectedText: "header\nA\nb\nc\nd\nA\nb\nc\nd\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            )
+        ])
+    }
+
+    func testMixedBatchDecidesTabPromotionOverWholeBatch() async throws {
+        // A LaTeX marker in an exact sibling keeps `\t` literal in the fallback edit too.
+        try await assertBatchCases([
+            BatchCase(
+                name: "replacement keeps \\tau beside an exact \\begin sibling",
+                path: "notes.md",
+                original: "\\begin{x}\nvalue  =  1\n",
+                edits: [Self.edit("\\begin{x}", "\\begin{y}"), Self.edit("value = 1", "\\tau = 2")],
+                expectedText: "\\begin{y}\n\\tau = 2\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            ),
+            BatchCase(
+                name: "search keeps \\theta beside an exact \\begin sibling",
+                path: "notes.md",
+                original: "\\begin{x}\n\\theta  =  1\n",
+                edits: [Self.edit("\\begin{x}", "\\begin{y}"), Self.edit("\\theta = 1", "\\tau = 2")],
+                expectedText: "\\begin{y}\n\\tau = 2\n",
+                expectedStatus: .success,
+                expectedApplied: 2,
+                expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
+            )
+        ])
+    }
+
+    func testWholeLineMatchKeepsTrailingDelimiter() async throws {
+        // A fallback match must not equate a line with one that lacks its trailing `:` or `=`.
+        let single = ApplyEditsRequest(
+            path: "probe.py",
+            mode: .single(
+                search: "def run(self)\n    return 1",
+                replace: "def run(self, x)\n    return x",
+                replaceAll: false
+            ),
+            verbose: false
+        )
+        do {
+            let result = try await engine.apply(request: single, to: "def run(self):\n    return 1\n")
+            XCTFail("Expected refusal, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+
+        let original = "let x =\n    compute()\nprint(\"let x\")\n"
+        try await assertBatchCases([
+            BatchCase(
+                name: "a search without the line's trailing `=` is refused",
+                path: "probe.swift",
+                original: original,
+                edits: [Self.edit("let x", "let y")],
+                expectedText: original,
+                expectedStatus: .failed,
+                expectedApplied: 0,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound)]
+            )
+        ])
     }
 
     func testEmptyGeneratedChunksFailThroughApplyEditsInternalError() async throws {

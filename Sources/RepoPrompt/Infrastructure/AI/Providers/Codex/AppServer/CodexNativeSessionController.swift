@@ -296,7 +296,7 @@ final class CodexNativeSessionController {
     private static let maxPendingTurnFailures = 64
     private static let hookTrustWriteMutex = AsyncMutex()
     private static let maxHookTrustWriteSettlementDeadline: TimeInterval = 30
-    private static let computerUseMCPServerName = "computer-use"
+    private static let computerUseMCPServerName = MCPIntegrationHelper.computerUseMCPServerName
     // Controller-scoped: never follows a live settings toggle while requests are outstanding.
     private var computerUseRequiresUserReview = false
     private var computerUseAutoApprovalRevoked = false
@@ -8618,6 +8618,22 @@ final class CodexNativeSessionController {
         return false
     }
 
+    /// Server identity attested by the provider payload. Populated aliases must agree:
+    /// a conflicting payload yields multiple names and fails closed downstream.
+    private func attestedMCPServerNames(in candidate: [String: Any]) -> Set<String> {
+        var names = Set<String>()
+        for key in [
+            "server", "serverName", "server_name", "mcpServer", "mcp_server", "mcpServerName", "mcp_server_name"
+        ] {
+            guard let value = stringValue(from: candidate, keys: [key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else { continue }
+            names.insert(value.lowercased().replacingOccurrences(of: "_", with: "-"))
+        }
+        return names
+    }
+
     private func normalizedToolName(from candidate: [String: Any]) -> String? {
         let explicitName = stringValue(from: candidate, keys: [
             "name", "toolName", "tool_name", "functionName", "function_name", "callName", "call_name"
@@ -8625,6 +8641,21 @@ final class CodexNativeSessionController {
         let typeRaw = normalizedTypeString(from: candidate)
         let raw = (explicitName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         let lowered = raw.lowercased()
+
+        // The provider-attested server outranks generic action aliases, so companion
+        // calls keep provenance even when the action name resembles a shell or web tool.
+        let attestedServers = attestedMCPServerNames(in: candidate)
+        if !raw.isEmpty, attestedServers == [Self.computerUseMCPServerName] {
+            // Already-qualified names carry their own provenance.
+            if lowered.hasPrefix("mcp__") { return raw }
+            return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
+        }
+        // Anything short of an exact companion attestation — foreign, conflicting, or
+        // absent — carrying a companion-looking name must never group: strip the
+        // claimed prefix and fail closed.
+        if let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw) {
+            return stripped
+        }
 
         if lowered == "local_shell"
             || lowered == "shell"
