@@ -474,6 +474,39 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         ])
     }
 
+    func testWholeLineMatchKeepsTrailingDelimiter() async throws {
+        // A fallback match must not equate a line with one that lacks its trailing `:` or `=`.
+        let single = ApplyEditsRequest(
+            path: "probe.py",
+            mode: .single(
+                search: "def run(self)\n    return 1",
+                replace: "def run(self, x)\n    return x",
+                replaceAll: false
+            ),
+            verbose: false
+        )
+        do {
+            let result = try await engine.apply(request: single, to: "def run(self):\n    return 1\n")
+            XCTFail("Expected refusal, got \(result.updatedText.debugDescription)")
+        } catch let error as ApplyEditsError {
+            XCTAssertEqual(error, .invalidParams("search block not found in file"))
+        }
+
+        let original = "let x =\n    compute()\nprint(\"let x\")\n"
+        try await assertBatchCases([
+            BatchCase(
+                name: "a search without the line's trailing `=` is refused",
+                path: "probe.swift",
+                original: original,
+                edits: [Self.edit("let x", "let y")],
+                expectedText: original,
+                expectedStatus: .failed,
+                expectedApplied: 0,
+                expectedOutcomes: [Self.outcome(0, failure: Self.notFound)]
+            )
+        ])
+    }
+
     func testEmptyGeneratedChunksFailThroughApplyEditsInternalError() async throws {
         let engine = ApplyEditsEngine(
             diffEngine: EmptyDiffChunkGenerator(),
