@@ -280,9 +280,9 @@ final class DelegationScopeRuntime: ObservableObject {
                 ? .success(existing)
                 : .failure(.idempotencyConflict)
         }
-        let pendingCount = requests.values.filter {
+        let pendingCount = requests.values.count(where: {
             $0.requesterSessionID == requesterSessionID && $0.state == .pending
-        }.count
+        })
         guard pendingCount < Self.maxPendingRequestsPerSession else { return .failure(.tooManyPending) }
         let request = DelegationScopeRequest(
             id: makeUUID(),

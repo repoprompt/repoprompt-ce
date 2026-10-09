@@ -1397,8 +1397,11 @@ final class MCPServerViewModel: ObservableObject {
         },
         executeSessionAdmin: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
-            return try await sessionAdminToolService(requireTargetWindow: { [self] in try self.requireTargetWindow() })
-                .execute(args: args)
+            return try await sessionAdminToolService(requireTargetWindow: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                return try requireTargetWindow()
+            })
+            .execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }

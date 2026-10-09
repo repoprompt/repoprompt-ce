@@ -126,9 +126,9 @@ final class BatchConfirmationCoordinator: ObservableObject {
                 && existing.itemSessionIDs == Set(items.map(\.sessionID))
             return sameRequest ? .existing(existing) : .idempotencyConflict
         }
-        let pendingForGrantee = confirmations.values.filter {
+        let pendingForGrantee = confirmations.values.count(where: {
             $0.granteeSessionID == scope.grant.granteeSessionID && $0.state == .pending
-        }.count
+        })
         guard pendingForGrantee < Self.maxPendingPerGrantee else { return .tooManyPending }
         let confirmation = PendingBatchConfirmation(
             id: makeUUID(),
