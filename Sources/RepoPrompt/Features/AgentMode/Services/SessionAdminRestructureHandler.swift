@@ -34,16 +34,38 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         for request: AgentSessionAdministrationRequest,
         scope _: DomainDelegationScopeRecord
     ) -> [BatchConfirmationItem] {
+        guard request.operation == .adminAdopt else {
+            return request.targetSessionIDs.map {
+                BatchConfirmationItem(sessionID: $0, title: title(of: $0), effect: request.operation.rawValue)
+            }
+        }
         let destination = (try? SessionAdminArguments.uuid(request.arguments, "parent_session_id", op: "adopt"))
             ?? request.caller.agentSessionID
-        let effect = switch request.operation {
-        case .adminAdopt:
-            "Bring into this delegation scope under \(destination?.uuidString ?? "the overseer")"
-        default:
-            request.operation.rawValue
+        let destinationName = destination.map(title(of:)) ?? "the overseer"
+        // Every session that moves is listed: each adoptee and every organizational descendant, so the
+        // user sees the whole subtree the scope will gain.
+        var items: [BatchConfirmationItem] = []
+        var listed: Set<UUID> = []
+        for adoptee in request.targetSessionIDs {
+            let nodes = context.projector.organizationalSubtree(of: adoptee)
+                ?? [DomainDelegationSubtreeNode(sessionID: adoptee, depth: 0)]
+            for node in nodes where listed.insert(node.sessionID).inserted {
+                let effect = node.sessionID == adoptee
+                    ? "Bring into this delegation scope under \(destinationName)"
+                    : "Moves with \(title(of: adoptee)) (descendant)"
+                items.append(BatchConfirmationItem(sessionID: node.sessionID, title: title(of: node.sessionID), effect: effect))
+            }
         }
-        return request.targetSessionIDs.map {
-            BatchConfirmationItem(sessionID: $0, title: $0.uuidString, effect: effect)
+        return items
+    }
+
+    /// Display title with run state, for cards.
+    private func title(of sessionID: UUID) -> String {
+        let name = context.displayName(sessionID) ?? sessionID.uuidString
+        return switch context.projector.targetState(for: sessionID) {
+        case .running: "\(name) (running)"
+        case .unknown: "\(name) (state unknown)"
+        case .idle: name
         }
     }
 
@@ -54,6 +76,14 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         switch batch.request.operation {
         case .adminLink:
             try SessionAdminArguments.requireOnly(["observer_session_id"], in: args, op: "link")
+            // A scope only mints links its own grantee observes; links between two other members are
+            // the user's to create (links are durable and outlive the scope).
+            if let caller = batch.request.caller.agentSessionID, try observer(of: batch) != caller {
+                return SessionAdminReply.refused(
+                    code: "observer_must_be_caller",
+                    detail: "Under a delegation scope you can only create links you observe yourself; omit observer_session_id."
+                )
+            }
             try context.requireMember(observer(of: batch), of: batch)
             let minted = host.mintedLinkCapabilities
             for record in context.scopeChain(of: batch.scope) {
@@ -70,12 +100,12 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             try SessionAdminArguments.requireOnly(["parent_session_id"], in: args, op: "reparent")
             let destination = try destination(of: batch, required: true)
             try context.requireMember(destination, of: batch)
-            return reparentRefusal(batch, destination: destination)
+            return try reparentRefusal(batch, destination: destination)
         case .adminAdopt:
             try SessionAdminArguments.requireOnly(["parent_session_id"], in: args, op: "adopt")
             let destination = try destination(of: batch, required: false)
             try context.requireMember(destination, of: batch)
-            return adoptRefusal(batch, destination: destination)
+            return try adoptRefusal(batch, destination: destination)
         case .adminAttenuate:
             try SessionAdminArguments.requireOnly(["capabilities", "guardrails"], in: args, op: "attenuate")
             guard batch.admittedSessionIDs.count == 1 else {
@@ -173,7 +203,9 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
                 continue
             }
-            await items.append(Self.linkItem(target, host.stopLink(observer: observer, target: target)))
+            let scopes = context.scopes
+            let outcome = await host.stopLink(observer: observer, target: target) { scopes.isCurrent(lease) }
+            items.append(Self.linkItem(target, outcome))
         }
         return SessionAdminReply.batch(
             op: "unlink", items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview,
@@ -209,34 +241,76 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         return caller
     }
 
+    /// `maxDepth` of every tree scope on the caller's chain that sets one.
+    private func depthLimits(_ batch: AgentSessionAdministrationAuthorizedBatch) -> [DomainDelegationTreeDepthLimit] {
+        context.scopeChain(of: batch.scope).compactMap { record in
+            guard case let .tree(root) = record.grant.kind, let maxDepth = record.grant.guardrails.maxDepth else { return nil }
+            return DomainDelegationTreeDepthLimit(rootSessionID: root, maxDepth: maxDepth)
+        }
+    }
+
+    /// Depth after moving `sessionID`'s subtree under `destination`; `nil` when within every limit.
+    private func depthRefusal(
+        _ batch: AgentSessionAdministrationAuthorizedBatch,
+        moving sessionID: UUID,
+        destinationAncestry: DomainDelegationOrganizationalAncestry?
+    ) throws -> Value? {
+        let limits = depthLimits(batch)
+        guard !limits.isEmpty else { return nil }
+        guard let destinationAncestry,
+              let height = context.projector.organizationalSubtree(of: sessionID)?.map(\.depth).max()
+        else { return SessionAdminReply.placementRefusal(.unresolved, sessionID: sessionID) }
+        guard let denial = DomainDelegationScopePlacementPolicy.depthViolation(
+            destinationAncestry: destinationAncestry, movedSubtreeHeight: height, limits: limits
+        ) else { return nil }
+        return try SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID)
+    }
+
     private func reparentRefusal(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         destination: UUID,
         sources: [UUID]? = nil
-    ) -> Value? {
+    ) throws -> Value? {
         let roots = context.scopes.liveTreeScopeRoots()
         let chain = Set(context.scopeChain(of: batch.scope).map(\.id))
+        let destinationAncestry = context.projector.organizationalAncestry(of: destination)
         for source in sources ?? batch.admittedSessionIDs {
             if let denial = DomainDelegationScopePlacementPolicy.validateReparent(
                 source: source,
                 destination: destination,
                 sourceAncestry: context.projector.organizationalAncestry(of: source),
-                destinationAncestry: context.projector.organizationalAncestry(of: destination),
+                destinationAncestry: destinationAncestry,
                 liveTreeScopes: roots,
                 callerScopeChain: chain
             ) {
                 return SessionAdminReply.placementRefusal(denial, sessionID: source)
             }
+            if let refusal = try depthRefusal(batch, moving: source, destinationAncestry: destinationAncestry) {
+                return refusal
+            }
         }
         return nil
+    }
+
+    /// Grantees and tree roots of every live scope: never adoptable.
+    private func scopeAnchors() -> Set<UUID> {
+        var anchors: Set<UUID> = []
+        for record in context.scopes.allLiveScopes() {
+            anchors.insert(record.grant.granteeSessionID)
+            if case let .tree(root) = record.grant.kind { anchors.insert(root) }
+        }
+        return anchors
     }
 
     private func adoptRefusal(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         destination: UUID,
         adoptees: [UUID]? = nil
-    ) -> Value? {
+    ) throws -> Value? {
         let roots = context.scopes.liveTreeScopeRoots()
+        let anchors = scopeAnchors()
+        let destinationAncestry = context.projector.organizationalAncestry(of: destination)
+        var moved: Set<UUID> = []
         for adoptee in adoptees ?? batch.admittedSessionIDs {
             if context.isMember(adoptee, ofChainFrom: batch.scope) {
                 return SessionAdminReply.refused(
@@ -245,15 +319,48 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                     fields: ["session_id": .string(adoptee.uuidString)]
                 )
             }
+            let subtree = context.projector.organizationalSubtree(of: adoptee).map { Set($0.map(\.sessionID)) }
             if let denial = DomainDelegationScopePlacementPolicy.validateAdopt(
                 adoptee: adoptee,
                 destination: destination,
                 adopteeAncestry: context.projector.organizationalAncestry(of: adoptee),
-                destinationAncestry: context.projector.organizationalAncestry(of: destination),
+                destinationAncestry: destinationAncestry,
+                adopteeSubtree: subtree,
+                scopeAnchors: anchors,
                 liveTreeScopes: roots,
                 callerScope: batch.scope.grant
             ) {
                 return SessionAdminReply.placementRefusal(denial, sessionID: adoptee)
+            }
+            if let refusal = try depthRefusal(batch, moving: adoptee, destinationAncestry: destinationAncestry) {
+                return refusal
+            }
+            moved.formUnion(subtree ?? [adoptee])
+        }
+        return try adoptionGuardrailRefusal(batch, moved: moved)
+    }
+
+    /// `maxLiveSessions` / `maxWorktrees` against post-adopt membership: the scope's current usage
+    /// (with in-flight reservations) plus every session that would join. Unknown liveness counts as
+    /// live so the check only gets stricter.
+    private func adoptionGuardrailRefusal(
+        _ batch: AgentSessionAdministrationAuthorizedBatch,
+        moved: Set<UUID>
+    ) throws -> Value? {
+        let joining = moved.filter { !context.isMember($0, ofChainFrom: batch.scope) }
+        let addedLive = joining.count { context.projector.knownProvenance(for: $0)?.isLive ?? true }
+        let addedWorktrees = joining.reduce(into: Set<String>()) {
+            $0.formUnion(context.projector.knownProvenance(for: $1)?.boundWorktreeIDs ?? [])
+        }.count
+        for record in context.scopeChain(of: batch.scope) {
+            let usage = context.scopes.usageIncludingReservations(
+                context.projector.usage(of: record.grant, spawnParentSessionID: nil)
+            )
+            if let denial = DomainDelegationScopePlacementPolicy.adoptionGuardrailViolation(
+                guardrails: record.grant.guardrails, usage: usage,
+                addedLiveSessions: addedLive, addedWorktrees: addedWorktrees
+            ) {
+                return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
             }
         }
         return nil
@@ -262,7 +369,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
     private func reparent(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let destination = try destination(of: batch, required: true)
         return try await applyPlacement(batch, destination: destination, stampScope: nil, op: "reparent") { source in
-            self.reparentRefusal(batch, destination: destination, sources: [source])
+            try self.reparentRefusal(batch, destination: destination, sources: [source])
         }
     }
 
@@ -270,8 +377,16 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         let destination = try destination(of: batch, required: false)
         return try await applyPlacement(batch, destination: destination, stampScope: batch.scope.id, op: "adopt") { adoptee in
             // The card was approved against this state; anything that changed since is re-decided,
-            // one item at a time (an earlier item of this batch is a member by now).
-            self.adoptRefusal(batch, destination: destination, adoptees: [adoptee])
+            // one item at a time (an earlier item of this batch is a member by now), including the
+            // guardrails against the membership the earlier items already produced.
+            if let approved = batch.confirmation?.approvedSessionIDs,
+               let subtree = self.context.projector.organizationalSubtree(of: adoptee),
+               !Set(subtree.map(\.sessionID)).isSubset(of: approved)
+            {
+                // A descendant the user unticked would still move with its parent: refuse the item.
+                return SessionAdminReply.refused(code: "subtree_not_approved", detail: "A descendant that moves with this session was not approved.")
+            }
+            return try self.adoptRefusal(batch, destination: destination, adoptees: [adoptee])
         }
     }
 
@@ -280,7 +395,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         destination: UUID,
         stampScope: UUID?,
         op: String,
-        revalidate: (UUID) -> Value?
+        revalidate: (UUID) throws -> Value?
     ) async throws -> Value {
         var items: [SessionAdminItemResult] = []
         var authorityLost = false
@@ -304,7 +419,12 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "destination_unavailable"))
                 continue
             }
-            if let refusal = revalidate(source), let code = refusal.objectValue?["code"]?.stringValue {
+            // A re-parent source must still be a member at the write (an adoptee is not one yet).
+            if stampScope == nil, !context.isMember(source, ofChainFrom: batch.scope) {
+                items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "source_unavailable"))
+                continue
+            }
+            if let refusal = try revalidate(source), let code = refusal.objectValue?["code"]?.stringValue {
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: code))
                 continue
             }

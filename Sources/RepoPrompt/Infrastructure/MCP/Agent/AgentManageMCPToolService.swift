@@ -807,8 +807,9 @@ struct AgentManageMCPToolService {
             workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
-        // Scope-only: spawn guardrails and auto-join for a creator holding a live `spawn` scope.
+        // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
         let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: spawnParentSessionID)
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,

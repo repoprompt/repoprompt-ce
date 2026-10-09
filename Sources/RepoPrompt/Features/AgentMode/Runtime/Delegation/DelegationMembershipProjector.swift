@@ -71,13 +71,27 @@ protocol DelegationMembershipProjector {
     func usage(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage
     /// App-observed run state; `unknown` (treated as running) when it cannot be established.
     func targetState(for sessionID: UUID) -> DomainDelegationScopeTargetState
-    /// Target-first organizational ancestry, or `nil` when cyclic, too long, or unknown.
-    func organizationalAncestry(of sessionID: UUID) -> [UUID]?
+    /// Target-first organizational ancestry (truncated where provenance is not loaded), or `nil` when
+    /// cyclic or too long.
+    func organizationalAncestry(of sessionID: UUID) -> DomainDelegationOrganizationalAncestry?
+    /// The session and every organizational descendant this projector knows (root at depth 0), or
+    /// `nil` when it cannot be enumerated.
+    func organizationalSubtree(of sessionID: UUID) -> [DomainDelegationSubtreeNode]?
+    /// The loaded provenance of one session (liveness, bound worktrees, placement), if any.
+    func knownProvenance(for sessionID: UUID) -> DelegationSessionProvenance?
 }
 
 extension DelegationMembershipProjector {
     /// Fails closed for projectors that cannot walk placement: every placement change is refused.
-    func organizationalAncestry(of _: UUID) -> [UUID]? {
+    func organizationalAncestry(of _: UUID) -> DomainDelegationOrganizationalAncestry? {
+        nil
+    }
+
+    func organizationalSubtree(of _: UUID) -> [DomainDelegationSubtreeNode]? {
+        nil
+    }
+
+    func knownProvenance(for _: UUID) -> DelegationSessionProvenance? {
         nil
     }
 }
@@ -93,11 +107,27 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     /// (`WorktreeOwnershipStore`). Counted toward `maxWorktrees` even while unbound.
     var ownedUnreleasedWorktreeIDs: @MainActor (_ createdBy: Set<UUID>) -> Set<String> = { _ in [] }
 
-    /// Target-first organizational ancestry over this source, or `nil` when cyclic or too long.
-    func organizationalAncestry(of sessionID: UUID) -> [UUID]? {
-        DomainDelegationOrganizationalChain.ancestry(of: sessionID) {
-            source.provenance(for: $0)?.effectiveOrganizationalParentID
+    /// Target-first organizational ancestry over this source. A session with no loaded provenance is
+    /// `.unknown` (the chain is truncated there), never mistaken for a root.
+    func organizationalAncestry(of sessionID: UUID) -> DomainDelegationOrganizationalAncestry? {
+        DomainDelegationOrganizationalChain.ancestry(of: sessionID) { id in
+            guard let provenance = source.provenance(for: id) else { return .unknown }
+            return provenance.effectiveOrganizationalParentID.map { .parent($0) } ?? .root
         }
+    }
+
+    func knownProvenance(for sessionID: UUID) -> DelegationSessionProvenance? {
+        source.provenance(for: sessionID)
+    }
+
+    func organizationalSubtree(of sessionID: UUID) -> [DomainDelegationSubtreeNode]? {
+        var children: [UUID: [UUID]] = [:]
+        for session in source.allKnownSessions() {
+            if let parent = session.effectiveOrganizationalParentID {
+                children[parent, default: []].append(session.sessionID)
+            }
+        }
+        return DomainDelegationOrganizationalChain.subtree(of: sessionID) { children[$0] ?? [] }
     }
 
     func membershipProof(

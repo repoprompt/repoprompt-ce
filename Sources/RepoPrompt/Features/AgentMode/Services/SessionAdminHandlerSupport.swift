@@ -11,6 +11,14 @@ import RepoPromptDomainRuntime
 struct SessionAdminHandlerContext {
     let scopes: DelegationScopeRuntime
     let projector: any DelegationMembershipProjector
+    /// Presentation-only session titles for card items.
+    var displayName: @MainActor (UUID) -> String? = { _ in nil }
+
+    /// The write-time authority check for one target: the lease is current **and** the target is
+    /// still a member of the whole scope chain (placement may have changed since the lease).
+    func isStillAuthorized(_ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.isCurrent(lease) && isMember(lease.targetSessionID, ofChainFrom: scope)
+    }
 
     /// The caller's scope and every ancestor scope.
     func scopeChain(of scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeRecord] {
@@ -142,14 +150,19 @@ enum SessionAdminReply {
         let detail = switch denial {
         case .cycle:
             "The destination is the session itself or one of its descendants."
+        case .unresolved:
+            "Part of an organizational chain is in a workspace no open window has loaded, so the move cannot be checked. Open that workspace first."
         case .affectsOtherScopes:
             "The move would change the membership of other delegation scopes; ask the user to restructure those sessions."
         case .adoptionRequiresUserGrantedScope:
             "Only a user-granted (not nested) scope may adopt sessions."
+        case .adopteeAnchorsScope:
+            "The session or one of its descendants holds or roots another delegation scope and cannot be adopted."
         }
         var fields: [String: Value] = ["session_id": .string(sessionID.uuidString)]
-        if !denial.affectedScopeIDs.isEmpty {
-            fields["affected_scope_ids"] = .array(denial.affectedScopeIDs.map { .string($0.uuidString) })
+        if let count = denial.affectedScopeCount {
+            // A count only: other scopes' identities are never disclosed to this caller.
+            fields["affected_scope_count"] = .int(count)
         }
         return refused(code: denial.publicCode, detail: detail, fields: fields)
     }

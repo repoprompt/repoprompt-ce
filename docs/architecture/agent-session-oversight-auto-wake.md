@@ -118,21 +118,31 @@ before an approved card is claimed, and in `preview`, so a structurally refused 
 the user's card.
 
 - **Links under a scope.** `link`/`unlink` go through the bridge's ordinary durable Add/Stop, so
-  link authority stays the sole owner. Both endpoints must be members (management never chains).
+  link authority stays the sole owner. A scope only mints links its own grantee observes
+  (`observer_must_be_caller`); `unlink` needs both endpoints to be members (management never chains).
   A new link's capabilities must be within the scope's ceiling (`poll`/`wait`/`read` need
   `observe`; `send_when_idle`/`manage` need `control`). The bridge mints only the default managed set
   and durable intent restores it as such, so a scope without `observe` + `control` cannot create a
   link at all. An existing link is reported as-is and never upgraded.
 - **Placement never moves membership elsewhere.** `reparent` needs the source and destination both
   in the caller's scope chain; `adopt` needs a user card and a user-granted (not nested) scope. Both
-  are refused (`placement_affects_other_scopes`, listing the scope IDs) if the move would make the
-  moved subtree join or leave any live scope outside the caller's own chain. Only
-  `organizationalParentID` changes; spawn provenance is immutable.
-- **Spawn under scope** adds guardrails and auto-join to `agent_run start`,
-  `agent_manage create_session`, and `create_lane` only for a creator holding a live `spawn` scope;
-  every other caller is unchanged. A scope `fork` never inherits oversight links.
+  are refused (`placement_affects_other_scopes`, with a count, never other scopes' IDs) if the move
+  would make the moved subtree join or leave any live scope outside the caller's own chain. A chain
+  that runs into a session whose provenance is not loaded is `placement_unresolved` unless both
+  chains stop at the same unknown session. `adopt` lists every session that moves (the adoptee's
+  whole subtree) on its card, never adopts a scope's grantee or root, and checks `maxLiveSessions`,
+  `maxWorktrees`, and `maxDepth` against post-adopt membership before the card and again at apply;
+  `reparent` enforces `maxDepth` on the moved subtree. Only `organizationalParentID` changes; spawn
+  provenance is immutable.
+- **Spawn under scope.** `agent_run start` (including an empty or parentless `tab_id`),
+  `agent_manage create_session`, and `create_lane` evaluate the guardrails of every live tree or
+  workspace scope the creator is a member of, with its ancestors, because the new session joins
+  them; in-flight spawns, forks, and worktree creations are reserved so concurrent calls cannot
+  overshoot. Auto-join stamping happens for a creator holding a live `spawn` scope. A session in no
+  scope is unchanged. A scope `fork` never inherits oversight links.
 - **Leases are re-checked after every suspension** before the next mutation; a revocation that
-  lands mid-batch stops the remaining items (`scope_revoked`).
+  lands mid-batch stops the remaining items (`scope_revoked`). Worktree binds, unbinds, and unlinks
+  re-check the lease and the target's membership synchronously at the write itself.
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).

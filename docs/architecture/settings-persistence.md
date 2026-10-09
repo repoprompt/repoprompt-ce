@@ -417,11 +417,14 @@ and follows the same preserve-first rules:
 
 ### Organizational placement and delegated worktree ownership
 
-- **Session placement.** `AgentSession` serialization version 10 adds `organizationalParentID` and
-  `delegationScopeID`. Both are additive and decoded with `decodeIfPresent`; an older file decodes
-  with no explicit placement and falls back to spawn provenance (`parentSessionID`, then
+- **Session placement.** `AgentSession` carries `organizationalParentID` and `delegationScopeID`,
+  additive and decoded with `decodeIfPresent`, **without** a serialization-version bump (still 9): a
+  bump would make this build rewrite every older session file on load and would not stop an older
+  build from dropping the fields on its own re-save. An older file decodes with no explicit
+  placement and falls back to spawn provenance (`parentSessionID`, then
   `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
-  (`reparent`, `adopt`, scoped creation, `fork`) writes placement.
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement; writes are serialized per
+  session, and a hydrate prefers the index's placement over the file's so it cannot revert.
 - **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
   fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
   a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace

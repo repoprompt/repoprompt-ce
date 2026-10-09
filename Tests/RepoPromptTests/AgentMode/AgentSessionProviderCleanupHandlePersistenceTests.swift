@@ -20,7 +20,7 @@ final class AgentSessionProviderCleanupHandlePersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 10)
+        XCTAssertEqual(decoded.serializationVersion, 9)
         XCTAssertEqual(decoded.providerCleanupHandle, handle)
         XCTAssertEqual(decoded.resolvedProviderCleanupHandle, handle)
     }

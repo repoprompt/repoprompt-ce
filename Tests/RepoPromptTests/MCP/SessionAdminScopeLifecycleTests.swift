@@ -684,10 +684,19 @@ final class SessionAdminStructureTests: XCTestCase {
     final class Provenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
 
-        func add(_ id: UUID, parent: UUID?, org: UUID? = nil, live: Bool = true, state: DomainDelegationScopeTargetState = .idle) {
+        func add(
+            _ id: UUID,
+            parent: UUID?,
+            org: UUID? = nil,
+            workspace: UUID? = nil,
+            live: Bool = true,
+            state: DomainDelegationScopeTargetState = .idle,
+            worktrees: Set<String> = []
+        ) {
             sessions[id] = DelegationSessionProvenance(
-                sessionID: id, workspaceID: nil, parentSessionID: parent, createdByOverseerSessionID: nil,
-                organizationalParentID: org, isLive: live, runState: state
+                sessionID: id, workspaceID: workspace, parentSessionID: parent, createdByOverseerSessionID: nil,
+                organizationalParentID: org, isLive: live, worktreeCount: worktrees.count, boundWorktreeIDs: worktrees,
+                runState: state
             )
         }
 
@@ -722,9 +731,9 @@ final class SessionAdminStructureTests: XCTestCase {
             placements.append((sessionID, parentID, delegationScopeID))
             let old = provenance.sessions[sessionID]
             provenance.sessions[sessionID] = DelegationSessionProvenance(
-                sessionID: sessionID, workspaceID: nil, parentSessionID: old?.parentSessionID,
+                sessionID: sessionID, workspaceID: old?.workspaceID, parentSessionID: old?.parentSessionID,
                 createdByOverseerSessionID: nil, organizationalParentID: parentID, isLive: old?.isLive ?? true,
-                runState: old?.runState ?? .idle
+                boundWorktreeIDs: old?.boundWorktreeIDs ?? [], runState: old?.runState ?? .idle
             )
             return true
         }
@@ -744,9 +753,16 @@ final class SessionAdminStructureTests: XCTestCase {
             return .linked
         }
 
-        func stopLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome {
+        func stopLink(
+            observer: UUID,
+            target: UUID,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> SessionAdminLinkOutcome {
             let pair = Pair(observer: observer, target: target)
-            guard links.removeValue(forKey: pair) != nil else { return .notLinked }
+            guard links[pair] != nil else { return .notLinked }
+            onActiveLink?()
+            guard isStillAuthorized() else { return .failed("authority ended") }
+            links.removeValue(forKey: pair)
             stopped.append(pair)
             return .stopped
         }
@@ -778,12 +794,21 @@ final class SessionAdminStructureTests: XCTestCase {
     }
 
     @MainActor
+    final class Names {
+        var map: [UUID: String] = [:]
+    }
+
+    @MainActor
     final class WorktreeHost: SessionAdminWorktreeHost {
         var idle: [UUID: Bool] = [:]
         var bound: [UUID: [AgentSessionWorktreeBindingSummary]] = [:]
         var created: [UUID] = []
         var bindCalls: [(UUID, String)] = []
         var unbindCalls: [UUID] = []
+        /// Runs inside a bind/unbind just before the write-time authority check (a revocation or a
+        /// membership change landing mid-transition).
+        var beforeWrite: (@MainActor () -> Void)?
+        var boundElsewhere: [String: Set<UUID>] = [:]
         private var waiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
 
         func becomeIdle(_ sessionID: UUID) {
@@ -806,8 +831,15 @@ final class SessionAdminStructureTests: XCTestCase {
             )
         }
 
-        func bindWorktree(sessionID: UUID, worktree: String, repoRoot _: String?) async throws -> SessionAdminWorktreeInfo {
+        func bindWorktree(
+            sessionID: UUID,
+            worktree: String,
+            repoRoot _: String?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async throws -> SessionAdminWorktreeInfo {
             guard idle[sessionID] ?? true else { throw SessionAdminHostError.notIdle }
+            beforeWrite?()
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             bindCalls.append((sessionID, worktree))
             bound[sessionID] = [Self.summary(worktree)]
             return SessionAdminWorktreeInfo(
@@ -816,8 +848,14 @@ final class SessionAdminStructureTests: XCTestCase {
             )
         }
 
-        func unbindWorktrees(sessionID: UUID, worktreeID: String?) async throws -> [String] {
+        func unbindWorktrees(
+            sessionID: UUID,
+            worktreeID: String?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async throws -> [String] {
             guard idle[sessionID] ?? true else { throw SessionAdminHostError.notIdle }
+            beforeWrite?()
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             unbindCalls.append(sessionID)
             let removed = (bound[sessionID] ?? []).filter { worktreeID == nil || $0.worktreeID == worktreeID }
             bound[sessionID] = (bound[sessionID] ?? []).filter { !removed.contains($0) }
@@ -837,7 +875,17 @@ final class SessionAdminStructureTests: XCTestCase {
             await withCheckedContinuation { waiters[sessionID, default: []].append($0) }
         }
 
-        func isWorktreePrunable(path _: String) async -> Bool {
+        func allBoundWorktrees() -> [String: Set<UUID>] {
+            var result = boundElsewhere
+            for (sessionID, summaries) in bound {
+                for summary in summaries {
+                    result[summary.worktreeID, default: []].insert(sessionID)
+                }
+            }
+            return result
+        }
+
+        func isWorktreePrunable(path _: String, repoRoot _: String?) async -> Bool {
             false
         }
 
@@ -866,14 +914,19 @@ final class SessionAdminStructureTests: XCTestCase {
         let ownership = WorktreeOwnershipStore()
         let core: AgentSessionAdministrationCore
         let worktreeHandler: SessionAdminWorktreeHandler
+        let projector: SpawnProvenanceDelegationMembershipProjector
+        let names = Names()
 
         init() {
             structure = StructureHost(provenance: provenance)
             var projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
             let ownership = ownership
             projector.ownedUnreleasedWorktreeIDs = { ownership.ownedUnreleasedWorktreeIDs(createdBy: $0) }
+            self.projector = projector
             core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
-            let context = SessionAdminHandlerContext(scopes: runtime, projector: projector)
+            var context = SessionAdminHandlerContext(scopes: runtime, projector: projector)
+            let names = names
+            context.displayName = { names.map[$0] }
             worktreeHandler = SessionAdminWorktreeHandler(context: context, host: worktrees, ownership: ownership)
             core.register(SessionAdminRestructureHandler(context: context, host: structure))
             core.register(SessionAdminLifecycleHandler(context: context, host: structure))
@@ -906,6 +959,10 @@ final class SessionAdminStructureTests: XCTestCase {
                 operation: operation, caller: .agentSession(caller), callerTabID: UUID(),
                 targetSessionIDs: targets, idempotencyKey: key, confirmationID: confirmation, arguments: args
             ))
+        }
+
+        func admit(_ creator: UUID?) -> DelegationSpawnAdmission.Outcome {
+            DelegationSpawnAdmission.admit(creatorSessionID: creator, scopes: runtime, administration: core, projector: projector)
         }
 
         func value(
@@ -990,12 +1047,15 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.structure.added, [Pair(observer: overseer, target: b)])
         XCTAssertEqual(fixture.structure.links[Pair(observer: overseer, target: a)], [.poll], "never upgraded")
 
-        // Management never chains: the observer must itself be in scope.
-        await assertUniformDenial {
-            _ = try await fixture.perform(
-                .adminLink, caller: overseer, targets: [b], args: ["observer_session_id": .string(outsider.uuidString)]
+        // A scope only mints links its own grantee observes (S6); links between two other sessions,
+        // members or not, are the user's to create.
+        for observer in [outsider, a] {
+            let refused = try await fixture.value(
+                .adminLink, caller: overseer, targets: [b], args: ["observer_session_id": .string(observer.uuidString)]
             )
+            XCTAssertEqual(refused["code"], .string("observer_must_be_caller"))
         }
+        XCTAssertEqual(fixture.structure.added.count, 1)
         guard case .denied = try await fixture.perform(.adminLink, caller: overseer, targets: [outsider]) else {
             return XCTFail("a non-member target is refused by the core")
         }
@@ -1066,7 +1126,9 @@ final class SessionAdminStructureTests: XCTestCase {
             .adminReparent, caller: overseer, targets: [a], args: ["parent_session_id": .string(other.uuidString)]
         )
         XCTAssertEqual(reply["code"], .string("placement_affects_other_scopes"))
-        XCTAssertEqual(reply["affected_scope_ids"], .array([.string(otherScope.id.uuidString)]))
+        XCTAssertEqual(reply["affected_scope_count"], .int(1))
+        XCTAssertNil(reply["affected_scope_ids"], "other scopes' identities are never disclosed")
+        _ = otherScope
         XCTAssertTrue(fixture.structure.placements.isEmpty)
     }
 
@@ -1114,7 +1176,8 @@ final class SessionAdminStructureTests: XCTestCase {
         let otherScope = try fixture.grant(otherRoot, [.observe])
         let foreign = try await fixture.value(.adminAdopt, caller: overseer, targets: [claimed], key: "o-adopt")
         XCTAssertEqual(foreign["code"], .string("placement_affects_other_scopes"))
-        XCTAssertEqual(foreign["affected_scope_ids"], .array([.string(otherScope.id.uuidString)]))
+        XCTAssertEqual(foreign["affected_scope_count"], .int(1))
+        _ = otherScope
         XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty, "no card was raised")
     }
 
@@ -1157,19 +1220,19 @@ final class SessionAdminStructureTests: XCTestCase {
             fixture.provenance.add(id, parent: nil)
         }
         fixture.provenance.add(member, parent: overseer)
-        func admit(_ creator: UUID?) -> DelegationSpawnAdmission.Outcome {
-            DelegationSpawnAdmission.admit(creatorSessionID: creator, scopes: fixture.runtime, administration: fixture.core)
-        }
+        let admit = { (creator: UUID?) in fixture.admit(creator) }
         XCTAssertEqual(admit(unscoped), .unscoped, "agent_run/agent_manage/create_lane are unchanged without a scope")
         XCTAssertEqual(admit(nil), .unscoped)
         try fixture.grant(observer, [.observe])
-        XCTAssertEqual(admit(observer), .unscoped, "a scope without spawn adds nothing")
+        guard case let .admitted(observed) = admit(observer) else { return XCTFail("a member is admitted") }
+        XCTAssertNil(observed.stampScopeID, "a scope without spawn checks guardrails but stamps nothing")
+        fixture.runtime.release(observed.reservation)
 
         let scope = try fixture.grant(overseer, [.spawn, .observe], guardrails: .init(maxLiveSessions: 2))
         XCTAssertEqual(admit(overseer), .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2)))
         fixture.provenance.add(member, parent: overseer, live: false)
         guard case let .admitted(admission) = admit(overseer) else { return XCTFail("room under the limit admits") }
-        XCTAssertEqual(admission.scopeID, scope.id)
+        XCTAssertEqual(admission.stampScopeID, scope.id)
         XCTAssertEqual(admission.creatorSessionID, overseer)
         XCTAssertTrue(
             DelegationSpawnAdmission.error(for: .guardrailExceeded(guardrail: .maxDepth, limit: 1, current: 2))
@@ -1185,10 +1248,7 @@ final class SessionAdminStructureTests: XCTestCase {
         try fixture.grant(overseer, [.spawn, .observe], guardrails: .init(maxDepth: 1))
         let attenuated = try await fixture.value(.adminAttenuate, caller: overseer, targets: [nested])
         XCTAssertEqual(attenuated["result"], .string("attenuated"))
-        XCTAssertEqual(
-            DelegationSpawnAdmission.admit(creatorSessionID: nested, scopes: fixture.runtime, administration: fixture.core),
-            .denied(.guardrailExceeded(guardrail: .maxDepth, limit: 1, current: 2))
-        )
+        XCTAssertEqual(fixture.admit(nested), .denied(.guardrailExceeded(guardrail: .maxDepth, limit: 1, current: 2)))
     }
 
     // MARK: - Lifecycle
@@ -1373,12 +1433,12 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(decoded.parentSessionID, parent)
         XCTAssertEqual(decoded.organizationalParentID, org)
         XCTAssertEqual(decoded.delegationScopeID, scope)
-        XCTAssertEqual(decoded.serializationVersion, 10)
+        XCTAssertEqual(decoded.serializationVersion, 9)
 
         var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
         legacy.removeValue(forKey: "organizationalParentID")
         legacy.removeValue(forKey: "delegationScopeID")
-        legacy["serializationVersion"] = 9
+        legacy["serializationVersion"] = 8
         let migrated = try JSONDecoder().decode(AgentSession.self, from: JSONSerialization.data(withJSONObject: legacy))
         XCTAssertNil(migrated.organizationalParentID)
         XCTAssertEqual(migrated.parentSessionID, parent)
@@ -1398,6 +1458,356 @@ final class SessionAdminStructureTests: XCTestCase {
             organizationalParentID: nil, isLive: true
         )
         XCTAssertEqual(provenance.effectiveOrganizationalParentID, parent, "no placement follows spawn provenance")
+    }
+
+    // MARK: - Review fixes (M1, S2, M2, M3, S1, S3, S6, nits)
+
+    /// M1: a worker inside an overseer's tree is bounded by the overseer's guardrails, whatever the
+    /// worker's own capabilities, and a session in no scope is untouched.
+    func testWorkerOfAnOverseerCannotBypassSpawnGuardrails() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), worker = UUID(), stranger = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(worker, parent: overseer)
+        fixture.provenance.add(stranger, parent: nil)
+        try fixture.grant(overseer, [.observe], guardrails: .init(maxLiveSessions: 2))
+        XCTAssertEqual(
+            fixture.admit(worker),
+            .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2)),
+            "the worker's spawn joins the overseer's tree, so the overseer's limit applies"
+        )
+        XCTAssertEqual(fixture.admit(stranger), .unscoped)
+        let error = DelegationSpawnAdmission.error(for: .guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2))
+        XCTAssertTrue(error.localizedDescription.contains("\"code\":\"scope_guardrail_exceeded\""), "\(error)")
+        XCTAssertTrue(error.localizedDescription.contains("\"guardrail\":\"max_live_sessions\""), "\(error)")
+    }
+
+    /// S2: an in-flight creation is reserved until it settles, so two concurrent spawns (or forks or
+    /// worktree creations) cannot both pass a limit with room for one.
+    func testConcurrentCreationsCannotOvershootAGuardrail() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        let scope = try fixture.grant(overseer, guardrails: .init(maxLiveSessions: 3, maxWorktrees: 1))
+        guard case let .admitted(first) = fixture.admit(overseer) else { return XCTFail("room for one") }
+        XCTAssertEqual(fixture.admit(overseer), .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 3, current: 3)))
+        let forkWhileReserved = try await fixture.value(.adminFork, caller: overseer, targets: [member], key: "f")
+        XCTAssertEqual(forkWhileReserved["code"], .string("scope_guardrail_exceeded"), "a fork counts the pending spawn too")
+        DelegationSpawnAdmission.finish(first, scopes: fixture.runtime)
+        guard case .admitted = fixture.admit(overseer) else { return XCTFail("released reservations free the slot") }
+
+        let held = fixture.runtime.reserve(scopeIDs: [scope.id], worktrees: 1)
+        let blocked = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member])
+        XCTAssertEqual(blocked["guardrail"], .string("max_worktrees"))
+        fixture.runtime.release(held)
+    }
+
+    /// M1: `agent_run start` with a `tab_id` adds a member unless the tab's session already has a
+    /// spawn parent; an empty or unknown tab always does.
+    func testSpawnIntoAnEmptyTabIsANewMember() {
+        let viewModel = WindowState().agentModeViewModel
+        XCTAssertTrue(viewModel.delegationSpawnTargetJoinsAsNewMember(tabID: nil))
+        XCTAssertTrue(viewModel.delegationSpawnTargetJoinsAsNewMember(tabID: UUID()), "a tab with no bound session")
+    }
+
+    /// M2: a `.workspace` caller cannot re-parent a session whose organizational parent lives in a
+    /// closed workspace: a scope could be rooted there.
+    func testWorkspaceCallerCannotReparentAcrossAnUnloadedWorkspace() async throws {
+        let fixture = Fixture()
+        let workspace = UUID(), caller = UUID(), source = UUID(), destination = UUID(), closedParent = UUID()
+        fixture.provenance.add(caller, parent: nil, workspace: workspace)
+        fixture.provenance.add(source, parent: closedParent, workspace: workspace)
+        fixture.provenance.add(destination, parent: nil, workspace: workspace)
+        try fixture.grant(caller, [.observe, .restructure], kind: .workspace(workspaceID: workspace))
+        let reply = try await fixture.value(
+            .adminReparent, caller: caller, targets: [source], args: ["parent_session_id": .string(destination.uuidString)]
+        )
+        XCTAssertEqual(reply["code"], .string("placement_unresolved"))
+        XCTAssertTrue(fixture.structure.placements.isEmpty)
+    }
+
+    func testAdoptThroughAnUnloadedSessionIsUnresolved() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), adoptee = UUID(), unloadedParent = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(adoptee, parent: unloadedParent)
+        try fixture.grant(overseer)
+        let reply = try await fixture.value(.adminAdopt, caller: overseer, targets: [adoptee], key: "a")
+        XCTAssertEqual(reply["code"], .string("placement_unresolved"))
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty, "refused before any card")
+    }
+
+    /// M3: the card lists every session that moves, with names and run state; a descendant the user
+    /// unticks keeps its parent from moving.
+    func testAdoptCardListsTheWholeSubtreeAndHonorsUnticks() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), adoptee = UUID(), child = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(adoptee, parent: nil)
+        fixture.provenance.add(child, parent: adoptee, state: .running)
+        fixture.names.map = [adoptee: "Research", child: "Worker"]
+        try fixture.grant(overseer)
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminAdopt, caller: overseer, targets: [adoptee], key: "adopt-tree"
+        ) else { return XCTFail("adopt is carded") }
+        XCTAssertEqual(card.items.map(\.sessionID), [adoptee, child])
+        XCTAssertEqual(card.items.map(\.title), ["Research", "Worker (running)"])
+        XCTAssertTrue(card.items[1].effect.contains("Moves with Research"))
+
+        fixture.runtime.confirmations.setItem(child, ticked: false, confirmationID: card.id)
+        XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+        let reply = try await fixture.value(.adminAdopt, caller: overseer, targets: [adoptee], key: "adopt-tree", confirmation: card.id)
+        XCTAssertEqual(items(reply)[adoptee.uuidString]?["code"], .string("subtree_not_approved"))
+        XCTAssertTrue(fixture.structure.placements.isEmpty)
+    }
+
+    func testAdoptRefusesScopeAnchorsAndPostAdoptGuardrailsBeforeAnyCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID(), otherOverseer = UUID(), adoptee = UUID(), adopteeChild = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        fixture.provenance.add(otherOverseer, parent: nil)
+        fixture.provenance.add(adoptee, parent: nil)
+        fixture.provenance.add(adopteeChild, parent: adoptee)
+        try fixture.grant(overseer, guardrails: .init(maxLiveSessions: 3))
+        try fixture.grant(otherOverseer, [.observe])
+
+        let anchor = try await fixture.value(.adminAdopt, caller: overseer, targets: [otherOverseer], key: "anchor")
+        XCTAssertEqual(anchor["code"], .string("adopt_target_anchors_scope"))
+
+        // Two live members plus a live adoptee and its live child would be four.
+        let limited = try await fixture.value(.adminAdopt, caller: overseer, targets: [adoptee], key: "limit")
+        XCTAssertEqual(limited["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertEqual(limited["guardrail"], .string("max_live_sessions"))
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+    }
+
+    func testReparentEnforcesMaxDepthOnTheMovedSubtree() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), a = UUID(), a1 = UUID(), b = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(a, parent: overseer)
+        fixture.provenance.add(a1, parent: a)
+        fixture.provenance.add(b, parent: overseer)
+        try fixture.grant(overseer, guardrails: .init(maxDepth: 2))
+        let reply = try await fixture.value(.adminReparent, caller: overseer, targets: [a], args: ["parent_session_id": .string(b.uuidString)])
+        XCTAssertEqual(reply["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertEqual(reply["guardrail"], .string("max_depth"))
+        XCTAssertEqual(reply["current"], .int(3))
+        XCTAssertTrue(fixture.structure.placements.isEmpty)
+    }
+
+    /// S1: authority (lease and membership) is re-checked at the write itself, for immediate and
+    /// deferred binds.
+    func testBindsRecheckLeaseAndMembershipAtTheWrite() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID(), queued = UUID(), outsideRoot = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        fixture.provenance.add(queued, parent: overseer)
+        fixture.provenance.add(outsideRoot, parent: nil)
+        let scope = try fixture.grant(overseer)
+
+        // A deferred bind whose target leaves the scope before its idle boundary never applies.
+        fixture.worktrees.idle[queued] = false
+        _ = try await fixture.value(
+            .adminWorktreeBind, caller: overseer, targets: [queued], args: ["worktree": .string("w-q"), "apply": .string("next_boundary")]
+        )
+        fixture.provenance.add(queued, parent: overseer, org: outsideRoot)
+        fixture.worktrees.becomeIdle(queued)
+        await fixture.worktreeHandler.settleDeferredBinds()
+        XCTAssertEqual(fixture.worktreeHandler.deferredOutcomes[queued], .revoked)
+
+        // A revocation landing mid-await (inside the host, before the write) stops the bind.
+        fixture.worktrees.beforeWrite = { fixture.runtime.revoke(scopeID: scope.id) }
+        let reply = try await fixture.value(.adminWorktreeBind, caller: overseer, targets: [member], args: ["worktree": .string("w1")])
+        XCTAssertEqual(items(reply)[member.uuidString]?["code"], .string("scope_revoked"))
+        XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty)
+    }
+
+    /// S3: binding a released worktree clears its stale mark, and inventory judges `unbound` and
+    /// `released` against every loaded session's bindings.
+    func testBindClearsTheStaleMarkAndInventoryCountsBindingsOutsideTheScope() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID(), elsewhere = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        try fixture.grant(overseer)
+        fixture.ownership.markReleased([WorktreeHost.summary("w-old")], bySessionID: overseer, at: Date())
+        _ = try await fixture.value(.adminWorktreeBind, caller: overseer, targets: [member], args: ["worktree": .string("w-old")])
+        XCTAssertNil(fixture.ownership.record(worktreeID: "w-old")?.releasedAt)
+
+        _ = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member])
+        fixture.ownership.markReleased([WorktreeHost.summary("wt-1")], bySessionID: overseer, at: Date())
+        fixture.worktrees.boundElsewhere["wt-1"] = [elsewhere]
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: overseer)
+        let row = try XCTUnwrap(inventory["worktrees"]?.arrayValue?.compactMap(\.objectValue).first { $0["worktree_id"] == .string("wt-1") })
+        XCTAssertEqual(row["stale_flags"], .array([]), "bound elsewhere: neither unbound nor released")
+        XCTAssertEqual(row["bound_session_ids"], .array([]), "a non-member is never named")
+        XCTAssertEqual(row["bound_outside_scope_count"], .int(1))
+    }
+
+    func testUnlinkStopsThroughTheBridgeAndRechecksBeforeTheStop() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), a = UUID(), b = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(a, parent: overseer)
+        fixture.provenance.add(b, parent: overseer)
+        let scope = try fixture.grant(overseer)
+        fixture.structure.links[Pair(observer: overseer, target: a)] = DomainAgentSessionLinkCapability.managed
+        fixture.structure.links[Pair(observer: overseer, target: b)] = DomainAgentSessionLinkCapability.managed
+        let first = try await fixture.value(.adminUnlink, caller: overseer, targets: [a])
+        XCTAssertEqual(items(first)[a.uuidString]?["result"], .string("unlinked"))
+        XCTAssertEqual(fixture.structure.stopped, [Pair(observer: overseer, target: a)])
+
+        fixture.structure.onActiveLink = { fixture.runtime.revoke(scopeID: scope.id) }
+        let second = try await fixture.value(.adminUnlink, caller: overseer, targets: [b])
+        XCTAssertEqual(items(second)[b.uuidString]?["code"], .string("link_failed"))
+        XCTAssertNotNil(fixture.structure.links[Pair(observer: overseer, target: b)], "nothing was stopped")
+    }
+
+    func testLinkAboveTheThresholdRaisesOneCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), a = UUID(), b = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(a, parent: overseer)
+        fixture.provenance.add(b, parent: overseer)
+        try fixture.grant(overseer, guardrails: .init(bulkConfirmationThreshold: 1))
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminLink, caller: overseer, targets: [a, b], key: "bulk-link"
+        ) else { return XCTFail("two links over a threshold of one are carded") }
+        XCTAssertEqual(card.reason, .bulkThreshold)
+        XCTAssertEqual(Set(card.items.map(\.sessionID)), [a, b])
+        XCTAssertTrue(fixture.structure.added.isEmpty)
+    }
+
+    func testForkReplayIsBoundToTheCutoffAndReportsJoinedScope() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID(), cutoff = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        try fixture.grant(overseer)
+        let args: [String: Value] = ["up_to_item_id": .string(cutoff.uuidString)]
+        _ = try await fixture.value(.adminFork, caller: overseer, targets: [member], args: args, key: "k")
+        let replay = try await fixture.value(.adminFork, caller: overseer, targets: [member], args: args, key: "k")
+        XCTAssertEqual(replay["result"], .string("replayed"))
+        XCTAssertEqual(replay["joined_scope"], .bool(true))
+        let other = try await fixture.value(.adminFork, caller: overseer, targets: [member], key: "k")
+        XCTAssertEqual(other["result"], .string("idempotency_conflict"), "a different cutoff is a different fork")
+        XCTAssertEqual(fixture.structure.forkCalls.count, 1)
+    }
+
+    func testWorktreeOwnershipStoreBlocksFutureSchemaAndQuarantinesCorruptFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-ownership-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent(WorktreeOwnershipStore.filename)
+        let backups = directory.appendingPathComponent("Backups")
+
+        try Data(#"{"version": 99, "worktrees": []}"#.utf8).write(to: fileURL)
+        let future = WorktreeOwnershipStore()
+        await future.bootstrap(fileURL: fileURL, backupsDirectoryURL: backups)
+        XCTAssertEqual(future.loadState, .blocked("unsupported_future_schema"))
+        future.markReleased([WorktreeHost.summary("w")], bySessionID: UUID(), at: Date())
+        await future.flushPersistence()
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), #"{"version": 99, "worktrees": []}"#, "a future file is preserved")
+
+        try Data("not json".utf8).write(to: fileURL)
+        let corrupt = WorktreeOwnershipStore()
+        await corrupt.bootstrap(fileURL: fileURL, backupsDirectoryURL: backups)
+        XCTAssertEqual(corrupt.loadState, .ready)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: backups.path).count, 1)
+    }
+
+    /// The pre-load stale mark is merged onto the durable ownership row, never lost.
+    func testWorktreeOwnershipStoreMergesAPreLoadReleaseOntoTheDurableRow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-ownership-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(WorktreeOwnershipStore.filename)
+        let creator = UUID()
+        let first = WorktreeOwnershipStore()
+        await first.bootstrap(fileURL: fileURL, backupsDirectoryURL: nil)
+        first.recordCreation(
+            SessionAdminWorktreeInfo(worktreeID: "w1", repositoryID: "r", repoRootPath: "/r", path: "/m/w1", branch: nil, isPrunable: false),
+            createdBySessionID: creator, delegationScopeID: UUID(), at: Date(timeIntervalSince1970: 100)
+        )
+        await first.flushPersistence()
+
+        let second = WorktreeOwnershipStore()
+        second.markReleased([WorktreeHost.summary("w1")], bySessionID: creator, at: Date(timeIntervalSince1970: 200))
+        await second.bootstrap(fileURL: fileURL, backupsDirectoryURL: nil)
+        let row = try XCTUnwrap(second.record(worktreeID: "w1"))
+        XCTAssertEqual(row.createdBySessionID, creator, "the durable creator survives")
+        XCTAssertEqual(row.releasedAt, Date(timeIntervalSince1970: 200), "the pre-load release survives")
+    }
+
+    /// Production wiring: structure ops registered through Lane B's front door get filter targeting,
+    /// preview (which runs preflight), and apply-on-approval.
+    func testStructureOpsThroughTheProductionFrontDoor() async throws {
+        typealias Organizing = SessionAdminOrganizingOperationTests
+        let overseer = UUID(), a = UUID(), b = UUID(), outsider = UUID(), workspace = UUID()
+        let provenance = Provenance()
+        let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        let organizer = Organizing.FakeOrganizer()
+        let links = Organizing.FakeLinks()
+        for (id, parent) in [(overseer, nil), (a, overseer), (b, overseer), (outsider, nil)] as [(UUID, UUID?)] {
+            provenance.add(id, parent: parent, workspace: workspace)
+            inventoryProvenance.add(id, parent: parent, workspace: workspace)
+            organizer.add(id, workspace: workspace, name: id == outsider ? "Outsider" : "Member")
+        }
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core, scopes: runtime, projector: projector,
+            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date())
+        )
+        frontDoor.registerOrganizingHandlers(backend: organizer, links: links)
+        let host = StructureHost(provenance: provenance)
+        frontDoor.registerStructureHandlers(
+            scopes: runtime, worktreeOwnership: WorktreeOwnershipStore(), projector: projector,
+            structureHost: host, worktreeHost: WorktreeHost()
+        )
+        let request = try runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: DomainDelegationScopeCapability.manageTreePreset, guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try runtime.approve(requestID: request.id).get()
+        func perform(
+            _ operation: DomainAgentSessionTargetOperation,
+            targets: [UUID] = [],
+            args: [String: Value] = [:],
+            key: String? = nil,
+            preview: Bool = false
+        ) async throws -> AgentSessionAdministrationOutcome {
+            try await frontDoor.perform(.init(
+                operation: operation, caller: .agentSession(overseer), targetSessionIDs: targets,
+                idempotencyKey: key, preview: preview, arguments: args
+            ))
+        }
+
+        // Preview runs the handler preflight: the refusal a real call would return.
+        guard case let .completed(previewed) = try await perform(
+            .adminLink, targets: [b], args: ["observer_session_id": .string(a.uuidString)], preview: true
+        ) else { return XCTFail("preview completes") }
+        XCTAssertEqual(previewed.objectValue?["code"], .string("observer_must_be_caller"))
+
+        // Filter targeting: every loaded member except the caller (control never targets itself).
+        guard case .completed = try await perform(
+            .adminSetModel, args: ["filter": .object(["workspace": .string(workspace.uuidString)]), "model_id": .string("claudeCode:opus")]
+        ) else { return XCTFail("filtered set_model completes") }
+        XCTAssertEqual(Set(host.modelCalls.map(\.0)), [a, b])
+
+        // Apply-on-approval: the approved adopt card applies without a second call.
+        guard case let .pendingConfirmation(card, _) = try await perform(.adminAdopt, targets: [outsider], key: "adopt") else {
+            return XCTFail("adopt is carded")
+        }
+        await frontDoor.approveAndApply(confirmationID: card.id)
+        XCTAssertEqual(host.placements.single?.session, outsider)
+        XCTAssertEqual(host.placements.single?.parent, overseer)
+        XCTAssertNotNil(frontDoor.appliedResult(forConfirmation: card.id))
     }
 
     func testWorktreeOwnershipStoreRoundTripsAndMarksReleased() async throws {

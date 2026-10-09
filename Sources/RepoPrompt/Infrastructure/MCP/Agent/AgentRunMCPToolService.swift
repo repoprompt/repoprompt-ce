@@ -623,11 +623,14 @@ struct AgentRunMCPToolService {
         let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
             && !worktreeStartRequest.hasExplicitWorktreeArgs
         let usesRoutedParentSource = parentSourceTabID != nil
-        // Scope-only: spawn guardrails and auto-join for a creator holding a live `spawn` scope.
-        // `nil` for every other caller, whose start is unchanged.
-        let spawnAdmission = resolvedTabID == nil
+        // Scope-only: when this start adds a member to a delegation scope (a new tab, or an empty or
+        // parentless `tab_id` that will take this spawn parent), the scope's guardrails apply and the
+        // session auto-joins. `nil` for every other caller, whose start is unchanged.
+        let spawnAdmission = spawnParentSessionID != nil
+            && agentModeVM.delegationSpawnTargetJoinsAsNewMember(tabID: resolvedTabID)
             ? try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: spawnParentSessionID)
             : nil
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
@@ -643,9 +646,7 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
-        if target.origin == .createdNewTab {
-            await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
-        }
+        await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
                 do {

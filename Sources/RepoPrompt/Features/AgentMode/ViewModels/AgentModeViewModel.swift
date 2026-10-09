@@ -6061,8 +6061,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
-        session.organizationalParentID = agentSession.organizationalParentID
-        session.delegationScopeID = agentSession.delegationScopeID
+        // Placement written while the file was being read lands in the index first; prefer it so a
+        // hydrate can never revert a newer placement to the file's older value.
+        let indexedPlacement = ownerValidatedSessionIndex[agentSession.id]
+        session.organizationalParentID = indexedPlacement?.organizationalParentID ?? agentSession.organizationalParentID
+        session.delegationScopeID = indexedPlacement?.delegationScopeID ?? agentSession.delegationScopeID
         session.isMCPOriginated = agentSession.isMCPOriginated
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations

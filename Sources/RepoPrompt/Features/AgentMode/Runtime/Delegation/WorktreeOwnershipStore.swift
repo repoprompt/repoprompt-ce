@@ -54,7 +54,12 @@ private struct WorktreeOwnershipDocumentHeader: Decodable {
 @MainActor
 final class WorktreeOwnershipStore {
     static let filename = "delegationWorktreeOwnership.json"
+    /// Rows this store ever writes. Kept well below `maxDecodedRecords`, so a file this store wrote can
+    /// never trip the decode guard and be quarantined.
     static let maxRecords = 4096
+    /// Released (stale-marked) rows kept for cleanup visibility; the oldest are pruned first.
+    static let maxReleasedRecords = 1024
+    static let maxDecodedRecords = 8192
     static let maxFileByteCount = 4 * 1024 * 1024
 
     enum LoadState: Equatable {
@@ -104,12 +109,25 @@ final class WorktreeOwnershipStore {
         let result = await Task.detached { Self.read(fileURL: fileURL, backupsDirectoryURL: backups) }.value
         switch result {
         case let .loaded(rows):
-            // Rows recorded before load completed win over stale disk rows for the same worktree.
-            for row in rows where records[row.worktreeID] == nil {
-                records[row.worktreeID] = row
+            let preLoad = records
+            records = Dictionary(rows.map { ($0.worktreeID, $0) }, uniquingKeysWith: { first, _ in first })
+            for (worktreeID, pending) in preLoad {
+                guard var stored = records[worktreeID] else {
+                    records[worktreeID] = pending
+                    continue
+                }
+                if pending.createdBySessionID != nil {
+                    // A creation recorded this launch describes the current worktree.
+                    stored = pending
+                } else {
+                    // A pre-load release mark is merged onto the durable ownership row, never lost.
+                    stored.releasedAt = pending.releasedAt ?? stored.releasedAt
+                    stored.releasedBySessionID = pending.releasedBySessionID ?? stored.releasedBySessionID
+                }
+                records[worktreeID] = stored
             }
             loadState = .ready
-            if !records.isEmpty, records.count != rows.count { persist() }
+            if !preLoad.isEmpty { trimAndPersist() }
         case let .blocked(reason):
             loadState = .blocked(reason)
         }
@@ -133,7 +151,7 @@ final class WorktreeOwnershipStore {
             return .blocked("unsupported_future_schema")
         }
         if let document = try? decoder.decode(WorktreeOwnershipDocument.self, from: data),
-           document.worktrees.count <= maxRecords
+           document.worktrees.count <= maxDecodedRecords
         {
             return .loaded(document.worktrees)
         }
@@ -217,11 +235,31 @@ final class WorktreeOwnershipStore {
         await persistChain?.value
     }
 
+    /// A worktree bound again is in use: its stale mark is cleared (a row that existed only for the
+    /// mark is dropped).
+    func clearReleased(worktreeID: String) {
+        guard var row = records[worktreeID], row.releasedAt != nil else { return }
+        if row.createdBySessionID == nil {
+            records.removeValue(forKey: worktreeID)
+        } else {
+            row.releasedAt = nil
+            row.releasedBySessionID = nil
+            records[worktreeID] = row
+        }
+        persist()
+    }
+
     private func trimAndPersist() {
+        // Oldest released rows go first, then (only past the hard cap) the oldest owned rows: losing
+        // a very old ownership row only makes `maxWorktrees` less strict for that worktree.
+        let released = records.values.filter { $0.releasedAt != nil }
+            .sorted { ($0.releasedAt ?? $0.createdAt) < ($1.releasedAt ?? $1.createdAt) }
+        for row in released.prefix(max(0, released.count - Self.maxReleasedRecords)) {
+            records.removeValue(forKey: row.worktreeID)
+        }
         if records.count > Self.maxRecords {
-            // Drop the oldest released rows first; live ownership is never evicted for space.
-            let evictable = records.values.filter { $0.releasedAt != nil }.sorted { $0.createdAt < $1.createdAt }
-            for row in evictable.prefix(records.count - Self.maxRecords) {
+            let oldest = records.values.sorted { $0.createdAt < $1.createdAt }
+            for row in oldest.prefix(records.count - Self.maxRecords) {
                 records.removeValue(forKey: row.worktreeID)
             }
         }

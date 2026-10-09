@@ -59,11 +59,17 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         }
     }
 
-    func stopLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome {
+    func stopLink(
+        observer: UUID,
+        target: UUID,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
         let bridge = bridge()
         guard let link = await bridge.delegationActiveLink(observerSessionID: observer, targetSessionID: target) else {
             return .notLinked
         }
+        // The lookup suspended: authority is re-checked right before the ordinary Stop.
+        guard isStillAuthorized() else { return .failed("Delegated authority ended before the unlink.") }
         switch await bridge.stopMonitorLink(
             observerSessionID: observer, targetSessionID: target, linkID: link.linkID, generation: link.generation
         ) {
@@ -216,18 +222,21 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             copyWorktreeIncludeUntrackedFiles: false,
             purpose: .standaloneCreate(now: Date())
         ))
-        try FileManager.default.createDirectory(at: plan.appManagedContainer, withIntermediateDirectories: true)
-        // Authorized roots: the target workspace's roots, the repositories resolved from exactly those
-        // roots (a root may sit inside its repository), and the app-managed container. This is the
-        // on-behalf admission only; `manage_worktree` keeps its own policy unchanged.
-        let authorizedRoots = Set(
-            context.roots.map(\.standardizedFullPath)
-                + context.repos.map(\.rootURL.standardizedFileURL.path)
-                + [plan.appManagedContainer.standardizedFileURL.path]
+        // Authorized roots: the target workspace's roots and the repositories resolved from exactly
+        // those roots (a root may sit inside its repository), then the app-managed container. This is
+        // the on-behalf admission only; `manage_worktree` keeps its own policy unchanged.
+        let workspaceRoots = Set(context.roots.map(\.standardizedFullPath) + context.repos.map(\.rootURL.standardizedFileURL.path))
+        // Step 1: the source repository must be admitted before anything is created on disk.
+        _ = try await DomainMutationPathFence.admit(
+            requestedPaths: [context.repo.rootURL.standardizedFileURL.path],
+            authorizedRoots: workspaceRoots
         )
+        // Step 2: the container is derived from that admitted repository (never from arguments), so it
+        // is created only now, then the destination is admitted under it.
+        try FileManager.default.createDirectory(at: plan.appManagedContainer, withIntermediateDirectories: true)
         let snapshot = try await DomainMutationPathFence.admit(
             requestedPaths: [context.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
-            authorizedRoots: authorizedRoots
+            authorizedRoots: workspaceRoots.union([plan.appManagedContainer.standardizedFileURL.path])
         )
         let physicalGuard = DomainMutationPhysicalCommitGuard(snapshot: snapshot)
         let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
@@ -249,7 +258,12 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
 
     // MARK: - Bind / unbind
 
-    func bindWorktree(sessionID: UUID, worktree selector: String, repoRoot: String?) async throws -> SessionAdminWorktreeInfo {
+    func bindWorktree(
+        sessionID: UUID,
+        worktree selector: String,
+        repoRoot: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> SessionAdminWorktreeInfo {
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         guard isIdle(context.viewModel, context.session) else { throw SessionAdminHostError.notIdle }
         let worktree: GitWorktreeDescriptor
@@ -286,7 +300,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                 source: "session_admin.worktree_bind"
             ))
         }
-        try await transition(desired, sessionID: sessionID, viewModel: context.viewModel)
+        try await transition(desired, sessionID: sessionID, viewModel: context.viewModel, isStillAuthorized: isStillAuthorized)
         return SessionAdminWorktreeInfo(
             worktreeID: worktree.worktreeID,
             repositoryID: worktree.repository.repositoryID,
@@ -297,7 +311,11 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         )
     }
 
-    func unbindWorktrees(sessionID: UUID, worktreeID: String?) async throws -> [String] {
+    func unbindWorktrees(
+        sessionID: UUID,
+        worktreeID: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> [String] {
         guard let (viewModel, session) = SessionAdminWindows.liveSession(sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
@@ -306,13 +324,27 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         guard !removed.isEmpty else { return [] }
         guard isIdle(viewModel, session) else { throw SessionAdminHostError.notIdle }
         let remaining = existing.filter { worktreeID != nil && $0.worktreeID != worktreeID }
-        try await transition(remaining, sessionID: sessionID, viewModel: viewModel)
+        try await transition(remaining, sessionID: sessionID, viewModel: viewModel, isStillAuthorized: isStillAuthorized)
         return removed.map(\.worktreeID)
     }
 
-    private func transition(_ desired: [AgentSessionWorktreeBinding], sessionID: UUID, viewModel: AgentModeViewModel) async throws {
+    /// Authority is evaluated synchronously right before the transition and again at its commit
+    /// fence (`beforeCommit`), after its own suspensions, so a revocation or a membership change that
+    /// lands mid-transition aborts it before anything is published.
+    private func transition(
+        _ desired: [AgentSessionWorktreeBinding],
+        sessionID: UUID,
+        viewModel: AgentModeViewModel,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws {
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         do {
-            _ = try await viewModel.transitionWorktreeBindings(desired, forSessionID: sessionID, intent: .externalManagement)
+            _ = try await viewModel.transitionWorktreeBindings(
+                desired, forSessionID: sessionID, intent: .externalManagement,
+                beforeCommit: { guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded } }
+            )
+        } catch SessionAdminHostError.authorityEnded {
+            throw SessionAdminHostError.authorityEnded
         } catch {
             // A run that started during preparation refuses the transition; that is "not idle".
             if let session = try? viewModel.authoritativeLiveSession(for: sessionID), !isIdle(viewModel, session) {
@@ -351,8 +383,29 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         }
     }
 
-    func isWorktreePrunable(path: String) async -> Bool {
-        !FileManager.default.fileExists(atPath: path)
+    func allBoundWorktrees() -> [String: Set<UUID>] {
+        var result: [String: Set<UUID>] = [:]
+        for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+            for entry in window.agentModeViewModel.ownerValidatedSessionIndex.values {
+                for summary in entry.worktreeBindingSummaries {
+                    result[summary.worktreeID, default: []].insert(entry.id)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Git's own prunable status (the same `git worktree list` the `manage_worktree list` op reads).
+    /// A worktree git no longer lists at all is reported prunable.
+    func isWorktreePrunable(path: String, repoRoot: String?) async -> Bool {
+        guard let repoRoot,
+              let worktrees = try? await vcsService.listGitWorktrees(at: URL(fileURLWithPath: repoRoot))
+        else { return !FileManager.default.fileExists(atPath: path) }
+        let target = GitRepoRootAuthorization.canonicalPath(path)
+        guard let match = worktrees.first(where: { GitRepoRootAuthorization.canonicalPath($0.path) == target }) else {
+            return true
+        }
+        return match.isPrunable
     }
 
     // MARK: - Merge
@@ -371,7 +424,30 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         guard let (viewModel, _) = SessionAdminWindows.liveSession(sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
-        let result = try await viewModel.requestWorktreeMergeReviewAndApply(sessionID: sessionID, operationID: operationID)
+        // Fence the merge's source and target worktrees to the target session's workspace roots and
+        // their repositories, as `createWorktree` does; the user still decides in the review prompt.
+        let operation = try viewModel.statusWorktreeMerge(sessionID: sessionID, operationID: operationID)
+        let context = try await targetContext(sessionID, repoRoot: nil)
+        var authorizedRoots = Set(context.roots.map(\.standardizedFullPath) + context.repos.map(\.rootURL.standardizedFileURL.path))
+        for endpoint in [operation.source, operation.target] {
+            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: endpoint.path)),
+               context.repos.contains(where: {
+                   GitRepoRootAuthorization.canonicalPath($0.rootPath) == GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path)
+               })
+            {
+                // A linked worktree of an admitted repository lives outside the workspace roots.
+                authorizedRoots.insert(URL(fileURLWithPath: endpoint.path).standardizedFileURL.path)
+            }
+        }
+        let snapshot = try await DomainMutationPathFence.admit(
+            requestedPaths: [operation.source.path, operation.target.path],
+            authorizedRoots: authorizedRoots
+        )
+        let physicalGuard = DomainMutationPhysicalCommitGuard(snapshot: snapshot)
+        let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
+        let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
+            try await viewModel.requestWorktreeMergeReviewAndApply(sessionID: sessionID, operationID: operationID)
+        }
         return try SessionAdminReply.encoded(result)
     }
 }

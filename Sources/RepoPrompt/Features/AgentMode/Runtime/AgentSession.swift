@@ -139,10 +139,12 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     // 9 adds the granular observer-session Auto-wake target UUID set.
-    // 10 adds mutable organizational placement (`organizationalParentID`, `delegationScopeID`).
-    // Both are additive and `decodeIfPresent`: an older file decodes with no explicit placement,
-    // which falls back to spawn provenance.
-    static let currentSerializationVersion = 10
+    //
+    // Organizational placement (`organizationalParentID`, `delegationScopeID`) is additive and
+    // `decodeIfPresent` *without* a bump, matching the metadata index: a bump would make this build
+    // rewrite every older session file on load and would not stop an older build from dropping the
+    // fields on its own re-save. An older file decodes with no placement (spawn provenance applies).
+    static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID

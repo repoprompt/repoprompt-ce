@@ -18,7 +18,9 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
 
     private struct ForkReceipt {
         let sourceSessionID: UUID
+        let upToItemID: UUID?
         let forkedSessionID: UUID
+        let joinedScope: Bool
     }
 
     private let context: SessionAdminHandlerContext
@@ -121,15 +123,16 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
               let key = batch.request.idempotencyKey
         else { throw MCPError.invalidParams("session_admin fork requires session_id and idempotency_key.") }
         let source = lease.targetSessionID
+        let upToItemID = try SessionAdminArguments.uuid(batch.request.arguments, "up_to_item_id", op: "fork")
         let ledgerKey = "\(caller.uuidString)|\(key)"
         if let receipt = forkReceipts[ledgerKey] {
-            guard receipt.sourceSessionID == source else {
+            guard receipt.sourceSessionID == source, receipt.upToItemID == upToItemID else {
                 return .object([
                     "result": .string("idempotency_conflict"),
                     "detail": .string("This idempotency_key is bound to a different fork; use a new key.")
                 ])
             }
-            return Self.forkValue(source: source, forked: receipt.forkedSessionID, replayed: true)
+            return Self.forkValue(source: source, forked: receipt.forkedSessionID, replayed: true, joinedScope: receipt.joinedScope)
         }
         if batch.request.preview {
             return .object(["result": .string("preview"), "op": .string("fork"), "session_id": .string(source.uuidString)])
@@ -138,18 +141,27 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
             return .object(["result": .string("in_progress"), "detail": .string("This fork is already being created.")])
         }
         defer { forksInFlight.remove(ledgerKey) }
-        guard context.scopes.isCurrent(lease) else { return SessionAdminReply.batch(op: "fork", items: [.revoked(source)]) }
-        let upToItemID = try SessionAdminArguments.uuid(batch.request.arguments, "up_to_item_id", op: "fork")
-        let forked = try await host.fork(sessionID: source, upToItemID: upToItemID)
-        recordForkReceipt(ForkReceipt(sourceSessionID: source, forkedSessionID: forked), key: ledgerKey)
-        // The fork exists either way; only joining the scope needs live authority.
-        guard context.scopes.isCurrent(lease) else {
-            return Self.forkValue(source: source, forked: forked, replayed: false, joinedScope: false)
-        }
-        let joined = try await host.setOrganizationalPlacement(
-            sessionID: forked, parentID: caller, delegationScopeID: batch.scope.id
+        // Reserved before the first suspension, right after the core's guardrail check, so concurrent
+        // forks and spawns cannot overshoot `maxLiveSessions`.
+        let reservation = context.scopes.reserve(
+            scopeIDs: context.scopeChain(of: batch.scope).map(\.id), sessions: 1
         )
-        return Self.forkValue(source: source, forked: forked, replayed: false, joinedScope: joined)
+        defer { context.scopes.release(reservation) }
+        guard context.scopes.isCurrent(lease) else { return SessionAdminReply.batch(op: "fork", items: [.revoked(source)]) }
+        let forked = try await host.fork(sessionID: source, upToItemID: upToItemID)
+        // Recorded as soon as the fork exists, so a retry after a later failure replays it instead
+        // of forking twice; `joined_scope` is updated once placement settles.
+        var receipt = ForkReceipt(sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: false)
+        recordForkReceipt(receipt, key: ledgerKey)
+        // The fork exists either way; only joining the scope needs live authority.
+        if context.scopes.isCurrent(lease) {
+            let joined = try await host.setOrganizationalPlacement(
+                sessionID: forked, parentID: caller, delegationScopeID: batch.scope.id
+            )
+            receipt = ForkReceipt(sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: joined)
+            if forkReceipts[ledgerKey] != nil { forkReceipts[ledgerKey] = receipt }
+        }
+        return Self.forkValue(source: source, forked: forked, replayed: false, joinedScope: receipt.joinedScope)
     }
 
     private func recordForkReceipt(_ receipt: ForkReceipt, key: String) {
@@ -160,7 +172,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         }
     }
 
-    private static func forkValue(source: UUID, forked: UUID, replayed: Bool, joinedScope: Bool = true) -> Value {
+    private static func forkValue(source: UUID, forked: UUID, replayed: Bool, joinedScope: Bool) -> Value {
         .object([
             "result": .string(replayed ? "replayed" : "forked"),
             "op": .string("fork"),

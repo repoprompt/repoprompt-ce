@@ -38,7 +38,13 @@ protocol SessionAdminStructureHost: AnyObject {
     /// Capabilities every link minted through the bridge carries.
     var mintedLinkCapabilities: Set<DomainAgentSessionLinkCapability> { get }
     func addLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome
-    func stopLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome
+    /// Stops the active link through the bridge's ordinary Stop. `isStillAuthorized` is evaluated
+    /// synchronously after the link lookup and right before the Stop.
+    func stopLink(
+        observer: UUID,
+        target: UUID,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     func setModel(
         sessionID: UUID,
         modelID: String,
@@ -86,16 +92,30 @@ protocol SessionAdminWorktreeHost: AnyObject {
         baseRef: String?
     ) async throws -> SessionAdminWorktreeInfo
     /// Binds `worktree` (selector: `@id:`, path, branch, or name) for the target now. Throws when the
-    /// target is not idle; the handler decides whether to defer.
-    func bindWorktree(sessionID: UUID, worktree: String, repoRoot: String?) async throws -> SessionAdminWorktreeInfo
+    /// target is not idle; the handler decides whether to defer. `isStillAuthorized` is evaluated
+    /// synchronously right before the binding transition and again at its commit fence; `false`
+    /// throws `SessionAdminHostError.authorityEnded` and nothing changes.
+    func bindWorktree(
+        sessionID: UUID,
+        worktree: String,
+        repoRoot: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> SessionAdminWorktreeInfo
     /// Removes the binding for `worktreeID`, or every binding when `nil`. Returns removed IDs.
-    func unbindWorktrees(sessionID: UUID, worktreeID: String?) async throws -> [String]
+    func unbindWorktrees(
+        sessionID: UUID,
+        worktreeID: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> [String]
     func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary]
+    /// Every worktree bound by any session in any loaded workspace, with its binding sessions.
+    func allBoundWorktrees() -> [String: Set<UUID>]
     /// Whether a binding transition would be admitted right now (no active run or queued work).
     func isIdleForWorktreeTransition(sessionID: UUID) -> Bool
     /// Suspends until the target next reaches an idle boundary (or disappears). Never mutates.
     func waitForIdleBoundary(sessionID: UUID) async
-    func isWorktreePrunable(path: String) async -> Bool
+    /// Git's own prunable status for the worktree at `path` in `repoRoot` (the `list` logic).
+    func isWorktreePrunable(path: String, repoRoot: String?) async -> Bool
     func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?) async throws -> Value
     /// Routes through the existing user merge-review prompt in the target's tab.
     func applyMerge(sessionID: UUID, operationID: String) async throws -> Value
@@ -104,6 +124,8 @@ protocol SessionAdminWorktreeHost: AnyObject {
 enum SessionAdminHostError: LocalizedError, Equatable {
     case sessionUnavailable
     case notIdle
+    /// Delegated authority (lease or membership) ended before the write; nothing changed.
+    case authorityEnded
     case invalid(String)
 
     var errorDescription: String? {
@@ -112,6 +134,8 @@ enum SessionAdminHostError: LocalizedError, Equatable {
             "The target session is not loaded in any open window."
         case .notIdle:
             "The target session is busy; worktree bindings change only at an idle boundary."
+        case .authorityEnded:
+            "Delegated authority over the target ended before the change; nothing was changed."
         case let .invalid(message):
             message
         }

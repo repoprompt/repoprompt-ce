@@ -154,6 +154,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 "session_id": .string(target.uuidString), "bind": .bool(bindAfter)
             ])
         }
+        // Reserved before the first suspension, right after the core's `maxWorktrees` check, so two
+        // concurrent creations cannot both pass; the ownership record takes over once it exists.
+        let reservation = context.scopes.reserve(scopeIDs: context.scopeChain(of: batch.scope).map(\.id), worktrees: 1)
+        defer { context.scopes.release(reservation) }
         let info = try await host.createWorktree(forSession: target, repoRoot: repoRoot, branch: branch, baseRef: baseRef)
         // Ownership is recorded even if authority lapsed during creation: the worktree exists, and
         // the record is what lets the user find and clean it up.
@@ -168,7 +172,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 return .object(reply)
             }
             reply["binding"] = await bindOne(
-                lease: lease, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
+                lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
             ).value
         }
         return .object(reply)
@@ -198,13 +202,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 ))
                 continue
             }
-            await items.append(bindOne(lease: lease, caller: caller, worktree: worktree, repoRoot: repoRoot, mode: mode))
+            await items.append(bindOne(
+                lease: lease, scope: batch.scope, caller: caller, worktree: worktree, repoRoot: repoRoot, mode: mode
+            ))
         }
         return SessionAdminReply.batch(op: "worktree_bind", items: items, preview: batch.request.preview)
     }
 
     private func bindOne(
         lease: DomainDelegationScopeLease,
+        scope: DomainDelegationScopeRecord,
         caller: UUID,
         worktree: String,
         repoRoot: String?,
@@ -212,14 +219,20 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     ) async -> SessionAdminItemResult {
         let target = lease.targetSessionID
         if mode == .nextBoundary, !host.isIdleForWorktreeTransition(sessionID: target) {
-            return enqueueDeferredBind(lease: lease, caller: caller, worktree: worktree, repoRoot: repoRoot)
+            return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
         }
+        let context = context
         do {
-            let info = try await host.bindWorktree(sessionID: target, worktree: worktree, repoRoot: repoRoot)
+            let info = try await host.bindWorktree(sessionID: target, worktree: worktree, repoRoot: repoRoot) {
+                context.isStillAuthorized(lease, scope: scope)
+            }
+            ownership.clearReleased(worktreeID: info.worktreeID)
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
+        } catch SessionAdminHostError.authorityEnded {
+            return .revoked(target)
         } catch SessionAdminHostError.notIdle {
             if mode == .nextBoundary {
-                return enqueueDeferredBind(lease: lease, caller: caller, worktree: worktree, repoRoot: repoRoot)
+                return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
             }
             return SessionAdminItemResult(
                 sessionID: target, result: "not_applied", code: "target_busy",
@@ -236,6 +249,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     /// One pending bind per target; a newer request replaces an older one.
     private func enqueueDeferredBind(
         lease: DomainDelegationScopeLease,
+        scope: DomainDelegationScopeRecord,
         caller: UUID,
         worktree: String,
         repoRoot: String?
@@ -250,25 +264,36 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         pendingBinds[target] = pending
         deferredOutcomes.removeValue(forKey: target)
         deferredTasks[target] = Task { [weak self] in
-            await self?.runDeferredBind(pending, lease: lease)
+            await self?.runDeferredBind(pending, lease: lease, scope: scope)
         }
         var fields: [String: Value] = ["apply": .string(ApplyMode.nextBoundary.rawValue)]
         if replaced { fields["replaced_pending_bind"] = .bool(true) }
         return SessionAdminItemResult(sessionID: target, result: "queued", fields: fields)
     }
 
-    private func runDeferredBind(_ pending: DeferredBind, lease: DomainDelegationScopeLease) async {
+    private func runDeferredBind(
+        _ pending: DeferredBind,
+        lease: DomainDelegationScopeLease,
+        scope: DomainDelegationScopeRecord
+    ) async {
+        let context = context
+        let isStillAuthorized: @MainActor () -> Bool = { context.isStillAuthorized(lease, scope: scope) }
         for _ in 0 ..< Self.maxDeferredAttempts {
             await host.waitForIdleBoundary(sessionID: pending.sessionID)
             guard !Task.isCancelled, pendingBinds[pending.sessionID]?.id == pending.id else { return }
-            guard context.scopes.isCurrent(lease) else {
+            // Lease and membership: the target may have left the scope while the bind was queued.
+            guard isStillAuthorized() else {
                 return finishDeferredBind(pending, .revoked)
             }
             do {
                 let info = try await host.bindWorktree(
-                    sessionID: pending.sessionID, worktree: pending.worktree, repoRoot: pending.repoRoot
+                    sessionID: pending.sessionID, worktree: pending.worktree, repoRoot: pending.repoRoot,
+                    isStillAuthorized: isStillAuthorized
                 )
+                ownership.clearReleased(worktreeID: info.worktreeID)
                 return finishDeferredBind(pending, .applied(worktreeID: info.worktreeID))
+            } catch SessionAdminHostError.authorityEnded {
+                return finishDeferredBind(pending, .revoked)
             } catch SessionAdminHostError.notIdle {
                 continue
             } catch is CancellationError {
@@ -324,7 +349,11 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 continue
             }
             do {
-                let removed = try await host.unbindWorktrees(sessionID: target, worktreeID: worktreeID)
+                let context = context
+                let scope = batch.scope
+                let removed = try await host.unbindWorktrees(sessionID: target, worktreeID: worktreeID) {
+                    context.isStillAuthorized(lease, scope: scope)
+                }
                 if release {
                     // The stale mark is recorded for whatever was actually unbound, even if authority
                     // ended during the await: it only ever makes cleanup more visible.
@@ -334,6 +363,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     sessionID: target, result: release ? "released" : "unbound",
                     fields: ["worktree_ids": .array(removed.map(Value.string))]
                 ))
+            } catch SessionAdminHostError.authorityEnded {
+                items.append(.revoked(target))
             } catch SessionAdminHostError.notIdle {
                 items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "target_busy"))
             } catch {
@@ -367,14 +398,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
         struct Row {
             var summary: AgentSessionWorktreeBindingSummary?
-            var boundSessionIDs: [UUID] = []
         }
         var rows: [String: Row] = [:]
         for member in members {
-            for summary in host.boundWorktrees(sessionID: member) {
-                rows[summary.worktreeID, default: Row(summary: summary)].boundSessionIDs.append(member)
+            for summary in host.boundWorktrees(sessionID: member) where rows[summary.worktreeID] == nil {
+                rows[summary.worktreeID] = Row(summary: summary)
             }
         }
+        // `unbound` and `released` are judged against bindings across every loaded session, not only
+        // members: a worktree some other session still binds is in use.
+        let boundEverywhere = host.allBoundWorktrees()
         let owned = ownership.records(createdBy: Set(members))
         for record in owned where rows[record.worktreeID] == nil {
             rows[record.worktreeID] = Row()
@@ -386,10 +419,13 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             let record = ownership.record(worktreeID: worktreeID)
             let path = row.summary?.worktreeRootPath ?? record?.path ?? ""
             let lastActivity = [record?.createdAt, record?.releasedAt, row.summary?.boundAt].compactMap(\.self).max()
-            let isPrunable = if path.isEmpty { true } else { await host.isWorktreePrunable(path: path) }
+            let repoRoot = record?.repoRootPath ?? row.summary?.logicalRootPath
+            let isPrunable = if path.isEmpty { true } else { await host.isWorktreePrunable(path: path, repoRoot: repoRoot) }
+            let boundSessionIDs = (boundEverywhere[worktreeID] ?? []).sorted { $0.uuidString < $1.uuidString }
+            let visibleBoundSessionIDs = boundSessionIDs.filter(Set(members).contains)
             let flags = DomainDelegationWorktreeStaleness.flags(
                 isReleased: record?.releasedAt != nil,
-                boundSessionCount: row.boundSessionIDs.count,
+                boundSessionCount: boundSessionIDs.count,
                 isPrunable: isPrunable,
                 lastActivityAt: lastActivity,
                 idleThresholdDays: idleDays,
@@ -398,7 +434,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             var entry: [String: Value] = [
                 "worktree_id": .string(worktreeID),
                 "path": .string(path),
-                "bound_session_ids": .array(row.boundSessionIDs.map { .string($0.uuidString) }),
+                // Only members are named; sessions outside the scope are a count.
+                "bound_session_ids": .array(visibleBoundSessionIDs.map { .string($0.uuidString) }),
+                "bound_outside_scope_count": .int(boundSessionIDs.count - visibleBoundSessionIDs.count),
                 "stale_flags": .array(flags.map { .string($0.rawValue) })
             ]
             if let branch = row.summary?.branch ?? record?.branch { entry["branch"] = .string(branch) }

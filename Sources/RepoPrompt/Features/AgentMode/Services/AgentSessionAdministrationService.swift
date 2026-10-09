@@ -202,10 +202,11 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         var usage: [UUID: DomainDelegationScopeUsage] = [:]
         if request.operation.scopeGuardrailUse != nil {
             for record in chain {
-                usage[record.id] = projector.usage(
+                // In-flight creations (spawn, fork, worktree_create) count until they settle.
+                usage[record.id] = scopes.usageIncludingReservations(projector.usage(
                     of: record.grant,
                     spawnParentSessionID: request.targetSessionIDs.first
-                )
+                ))
             }
         }
         let confirmation = request.confirmationID.flatMap {

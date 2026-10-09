@@ -56,8 +56,8 @@ package enum MCPDomainSessionAdminToolDefinition {
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
 
         **Structure ops** (members only; membership never grows by moving sessions)
-        - `link` / `unlink`: oversight link from `observer_session_id` (default you) to each target, both in scope. New links need observe + control; existing links are never upgraded.
-        - `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions under a member (user card; user-granted scopes only). Refused with `placement_affects_other_scopes` if another scope's membership would change.
+        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). New links need observe + control; existing links are never upgraded. `unlink`: from `observer_session_id` (default you), both in scope.
+        - `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions and their subtrees under a member (user card; user-granted scopes only; never another scope's overseer). Refused with `placement_affects_other_scopes` if another scope's membership would change, `placement_unresolved` if a chain runs through an unloaded workspace.
         - `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.
         - `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.
         - `worktree_create` (`repo_root`, `branch`, `base_ref`, `bind`), `worktree_bind` (`worktree`, `apply`: now|next_boundary), `worktree_unbind`, `worktree_release` (card; unbind + mark stale), `worktree_inventory` (`idle_days`), `merge_preview` (`merge_target`), `merge_apply` (`operation_id`; the user reviews it).
@@ -147,7 +147,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "idempotency_key": .stringSchema("[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes."),
                 "confirmation_id": .stringSchema("[confirmation_status, applying call] Confirmation UUID from pending_confirmation; its applied_result appears once the user approves. Pass it on an unchanged repeat of the carded call."),
-                "observer_session_id": .stringSchema("[link, unlink] Observer session UUID; default you."),
+                "observer_session_id": .stringSchema("[unlink] Observer session UUID; default you. [link] Only you."),
                 "parent_session_id": .stringSchema("[reparent, adopt] Destination member session UUID; adopt defaults to you."),
                 "model_id": .stringSchema("[set_model] Same-agent model_id from agent_manage.list_agents."),
                 "effort": .stringSchema("[set_effort] Effort supported by the target's model."),
