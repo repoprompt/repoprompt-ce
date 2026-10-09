@@ -2019,7 +2019,7 @@ import XCTest
                     try await MCPDomainProtectedMutationSettlementContext.$observer.withValue(
                         { settlementProbe.record($0) }
                     ) {
-                        try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                        try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                             try await protectedBinding([
                                 "op": .string("export"),
                                 "operation_id": .string(operationID)

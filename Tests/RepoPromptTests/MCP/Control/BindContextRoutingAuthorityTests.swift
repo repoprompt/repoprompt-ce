@@ -596,7 +596,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
 
             // Invoke the production materialized binding, not require() in isolation.
             // No network packet and no trusted-local scope may manufacture authority.
-            await MCPInvocationContextBridge.$current.withValue(nil) {
+            await MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
                 await MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
                     do {
                         _ = try await tool(["op": .string("snapshot")])

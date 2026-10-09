@@ -50,8 +50,8 @@ import XCTest
                 windowID: fixture.window.windowID
             )
             do {
-                _ = try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
-                    try await MCPInvocationContextBridge.$current.withValue(nil) {
+                _ = try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(fixture.connectionID) {
+                    try await MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
                         try await fixture.window.mcpServer.requireCurrentTabContext(toolName: "metadata_test")
                     }
                 }
@@ -414,12 +414,12 @@ import XCTest
                 WindowStatesManager.shared.allWindows = previousWindows
                 await network.debugRemoveConnection(prior.connectionID)
             }
-            try await ServerNetworkManager.$currentConnectionID.withValue(prior.connectionID) {
+            try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(prior.connectionID) {
                 try await network.setActiveWindowForCurrentConnection(prior.window.windowID)
             }
             let service = WindowRoutingService(windowStates: WindowStatesManager.shared, networkMgr: network)
             let bind = Task { @MainActor in
-                try await ServerNetworkManager.$currentConnectionID.withValue(prior.connectionID) {
+                try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(prior.connectionID) {
                     try await service.test_bindTarget(
                         windowID: replacement.window.windowID, workspaceID: replacement.workspace.id,
                         tabID: replacement.contextID, repoPaths: replacement.workspace.repoPaths,
@@ -448,7 +448,7 @@ import XCTest
             let refreshed = try await replacement.window.mcpServer.resolveFileToolAuthority(
                 tabID: replacement.contextID, workspaceID: replacement.workspace.id
             )
-            let changed = try await ServerNetworkManager.$currentConnectionID.withValue(prior.connectionID) {
+            let changed = try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(prior.connectionID) {
                 try await service.test_bindTarget(
                     windowID: replacement.window.windowID, workspaceID: replacement.workspace.id,
                     tabID: replacement.contextID, repoPaths: replacement.workspace.repoPaths,
@@ -472,7 +472,7 @@ import XCTest
                 await network.debugRemoveConnection(connectionID)
             }
             let first = Task { @MainActor in
-                try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
+                try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
                     try await network.withValidatedWindowBinding(windowID: 101, connectionID: connectionID) {
                         await gate.hold()
                         try Task.checkCancellation()
@@ -490,7 +490,7 @@ import XCTest
             let cancelled = Task { @MainActor in
                 defer { cancelledSettled.fulfill() }
                 do {
-                    try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
+                    try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
                         try await network.setActiveWindowForCurrentConnection(202)
                     }
                     XCTFail("Canceled queued transaction must not publish")
@@ -511,12 +511,12 @@ import XCTest
             try await cancelled.value
             let predecessorSelection = await network.selectedWindow(for: connectionID)
             XCTAssertEqual(predecessorSelection, 101)
-            try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
+            try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
                 try await network.setActiveWindowForCurrentConnection(303)
             }
             let selected = await network.selectedWindow(for: connectionID)
             XCTAssertEqual(selected, 303)
-            try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
+            try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
                 try await network.clearActiveWindowForCurrentConnection()
             }
             let cleared = await network.selectedWindow(for: connectionID)

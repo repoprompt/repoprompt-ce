@@ -1794,8 +1794,8 @@ final class ContentReadCancellationTests: XCTestCase {
         }
         MCPToolWorkCountDiagnostics.resetForTesting()
 
-        try await EditFlowPerf.$currentLifecycleCorrelation.withValue(lifecycleCorrelation) {
-            try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
+        try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(lifecycleCorrelation) {
+            try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(benchmarkMetricTag) {
                 try await MCPToolWorkCountDiagnostics.withReadFileInvocation {
                     let fingerprint = try await service.contentFingerprint(ofRelativePath: "Target.swift")
                     let snapshot = try await service.loadValidatedContent(

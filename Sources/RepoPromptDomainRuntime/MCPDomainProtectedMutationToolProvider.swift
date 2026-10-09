@@ -285,7 +285,7 @@ package struct MCPDomainProtectedMutationToolProvider {
                 }
             )
             do {
-                let result = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+                let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
                     try await binding(effectiveArguments)
                 }
                 let didBeginCommit = await commitState.hasBegunCommit()

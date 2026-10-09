@@ -85,7 +85,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(unverified) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(unverified) {
                 try await binding(["op": .string("set")])
             }
             XCTFail("Expected unverified-principal denial")
@@ -98,7 +98,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             assurance: .verifiedProcess,
             ephemeralGrantedToolNames: []
         )
-        let result = try await MCPDomainInvocationSecurityContext.$current.withValue(verified) {
+        let result = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(verified) {
             try await binding(["op": .string("set")])
         }
         XCTAssertEqual(result.stringValue, "ok")
@@ -119,7 +119,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(replacedHelper) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(replacedHelper) {
                 try await binding(["op": .string("set")])
             }
             XCTFail("Expected replaced-helper denial")
@@ -144,7 +144,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(denied) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(denied) {
                 try await binding(["op": .string("bind")])
             }
             XCTFail("Expected missing-grant denial")
@@ -157,7 +157,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             assurance: .verifiedProcess,
             ephemeralGrantedToolNames: ["bind_context"]
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
             try await binding(["op": .string("bind")])
         }
         let runCallCount = await calls.value
@@ -209,7 +209,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await protectedBinding([
                     "action": .string("delete"),
                     "path": .string(target.path)
@@ -290,7 +290,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await protectedBinding([
                     "op": .string("export"),
                     "path": .string("export.md")
@@ -322,11 +322,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedOperations: ["prompt.set"]
         )
 
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(exactOperation) {
             try await binding(["op": .string("set")])
         }
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(exactOperation) {
                 try await binding(["op": .string("append")])
             }
         ) { error in
@@ -366,7 +366,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             stableKey: "client:test",
             ephemeralGrantedToolNames: []
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
             try await binding(["op": .string("set")])
         }
         let grantedCallCount = await calls.value
@@ -381,7 +381,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
         XCTAssertEqual(revoked.revision, 2)
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
                 try await binding(["op": .string("set")])
             }
             XCTFail("Expected revoked-grant denial")
@@ -401,7 +401,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             expectedRevision: 2,
             administrator: administrator
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
             try await binding(["op": .string("set")])
         }
         let replacementCallCount = await calls.value
@@ -436,7 +436,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(spoofed) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(spoofed) {
                 try await binding(["op": .string("set")])
             }
         ) { error in
@@ -450,7 +450,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             verifiedIdentityFingerprint: "verified:fingerprint:one",
             ephemeralGrantedToolNames: []
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(verified) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(verified) {
             try await binding(["op": .string("set")])
         }
         let callCount = await calls.value
@@ -473,11 +473,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             authorizedCanonicalRoots: [allowedRoot],
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
             try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
         }
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(outside)])
             }
         ) { error in
@@ -493,7 +493,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(unavailableBinding) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(unavailableBinding) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
             }
         ) { error in
@@ -539,7 +539,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await binding(["op": .string("set")])
             }
         ) { error in
@@ -607,7 +607,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: ["bind_context"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(runScopedUnavailable) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(runScopedUnavailable) {
                 try await binding(["op": .string("bind")])
             }
         ) { error in
@@ -626,7 +626,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(appProxyNoRouting) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(appProxyNoRouting) {
                 try await binding(["op": .string("bind")])
             }
         ) { error in
@@ -668,7 +668,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
                 settlementState.withLock { $0 = settlement.state }
             }) {
-                try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                     try await protectedBinding(["op": .string("select"), "name": .string("main")])
                 }
             }
@@ -718,7 +718,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
         let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await protectedBinding(["op": .string("select"), "name": .string("main")])
             }
         ) { error in

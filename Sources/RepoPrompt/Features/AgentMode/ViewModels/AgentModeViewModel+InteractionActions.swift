@@ -63,6 +63,17 @@ extension AgentModeViewModel {
         codexCoordinator.isCodexHookApprovalStrictModeEnabled()
     }
 
+    func codexRememberedApprovalAllowed(for tabID: UUID?) -> Bool {
+        guard let tabID else { return true }
+        return sessions[tabID]?.codexControllerFeatureState?.computerUseEnabled != true
+    }
+
+    func submitPermissionsDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) {
+        guard let session = sessions[tabID], let request = session.pendingPermissionsRequest,
+              request.id == requestID else { return }
+        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
+    }
+
     func submitMCPElicitationResponse(
         tabID: UUID,
         requestID: UUID,

@@ -602,6 +602,15 @@ enum AgentJSONValue: Hashable {
 struct AgentRequestUserInputOption: Hashable {
     let label: String
     let description: String
+
+    /// Legacy MCP approval answers have only display labels, not typed permission scopes.
+    /// CU therefore accepts known one-shot/refusal labels only; unknown scopes fail closed.
+    var isComputerUseOneShotApprovalOption: Bool {
+        switch label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "allow", "allow once", "deny", "decline", "reject", "cancel": true
+        default: false
+        }
+    }
 }
 
 struct AgentRequestUserInputQuestion: Hashable {
@@ -616,6 +625,10 @@ struct AgentRequestUserInputQuestion: Hashable {
 
     var isOtherOptionEnabled: Bool {
         isOther && !options.isEmpty
+    }
+
+    var isLegacyMCPToolApproval: Bool {
+        id.hasPrefix("mcp_tool_call_approval")
     }
 }
 
@@ -644,6 +657,9 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
     let itemID: String
     let askedAt: Date
     let questions: [AgentRequestUserInputQuestion]
+    /// Established from structured provider metadata, never the displayed question or bare tool name.
+    let computerUseCompanionVerified: Bool
+    let repoPromptAutoApprovalVerified: Bool
 
     init(
         id: UUID? = nil,
@@ -653,7 +669,9 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         turnID: String,
         itemID: String,
         askedAt: Date = Date(),
-        questions: [AgentRequestUserInputQuestion]
+        questions: [AgentRequestUserInputQuestion],
+        repoPromptAutoApprovalVerified: Bool = false,
+        computerUseCompanionVerified: Bool = false
     ) {
         self.id = id ?? Self.stableID(
             requestID: requestID,
@@ -669,6 +687,8 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         self.itemID = itemID
         self.askedAt = askedAt
         self.questions = questions
+        self.repoPromptAutoApprovalVerified = repoPromptAutoApprovalVerified
+        self.computerUseCompanionVerified = computerUseCompanionVerified
     }
 
     static func stableID(
@@ -681,6 +701,61 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         StableUserInteractionIdentity.uuid(
             from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
+    }
+
+    /// Preserve request identity while removing persistent/unknown answers from CU consent UI
+    /// and from other pending-interaction projections. Ordinary requests are never transformed.
+    var computerUseReviewRequest: AgentRequestUserInputRequest {
+        guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
+        return .init(
+            id: id, requestID: requestID, method: method, threadID: threadID,
+            turnID: turnID, itemID: itemID, askedAt: askedAt,
+            questions: questions.map { question in
+                guard question.isLegacyMCPToolApproval else { return question }
+                return .init(
+                    id: question.id, header: question.header, question: question.question,
+                    isOther: false, isSecret: question.isSecret,
+                    options: question.options.filter(\.isComputerUseOneShotApprovalOption)
+                )
+            },
+            repoPromptAutoApprovalVerified: repoPromptAutoApprovalVerified,
+            computerUseCompanionVerified: computerUseCompanionVerified
+        )
+    }
+
+    /// Armed chats may retain normal approval of verified host tools, but never remember consent.
+    var repoPromptOneShotAutoApprovalResponse: AgentRequestUserInputResponse? {
+        guard repoPromptAutoApprovalVerified else { return nil }
+        return oneShotMCPApprovalResponse
+    }
+
+    var companionOneShotAutoApprovalResponse: AgentRequestUserInputResponse? {
+        guard computerUseCompanionVerified else { return nil }
+        return oneShotMCPApprovalResponse
+    }
+
+    private var oneShotMCPApprovalResponse: AgentRequestUserInputResponse? {
+        guard !questions.isEmpty, questions.allSatisfy(\.isLegacyMCPToolApproval) else { return nil }
+        var answers: [String: [String]] = [:]
+        for question in questions {
+            guard let option = question.options.first(where: {
+                ["allow", "allow once"].contains($0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            }) else { return nil }
+            answers[question.id] = [option.label]
+        }
+        return .init(answersByQuestionID: answers)
+    }
+
+    func allowsComputerUseResponse(_ response: AgentRequestUserInputResponse) -> Bool {
+        let approvals = questions.filter(\.isLegacyMCPToolApproval)
+        guard !approvals.isEmpty else { return true }
+        guard Set(response.answersByQuestionID.keys).isSubset(of: Set(questions.map(\.id))) else { return false }
+        return approvals.allSatisfy { question in
+            guard let answers = response.answersByQuestionID[question.id], answers.count == 1 else { return false }
+            return question.options.contains { option in
+                option.isComputerUseOneShotApprovalOption && option.label == answers[0]
+            }
+        }
     }
 
     func buildResponse(from drafts: [String: AgentRequestUserInputQuestionDraft]) -> AgentRequestUserInputResponse {

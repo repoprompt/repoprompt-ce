@@ -478,9 +478,16 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                         }
 
                         // Successfully connected - process the stream
+                        var transportActivity = ProviderTransportActivityThrottle()
                         for try await line in bytes.lines {
                             if Task.isCancelled {
                                 throw CancellationError()
+                            }
+
+                            // Keepalive comments and content-less deltas are dropped below;
+                            // any received line still proves the response is alive (#803).
+                            if transportActivity.shouldEmit(at: .now) {
+                                continuation.yield(ProviderTransportActivity.result())
                             }
 
                             // Check for SSE error events

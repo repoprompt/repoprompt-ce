@@ -2841,7 +2841,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let candidate = await findOrCreatePublishedDefaultWorkspace(),
               initialDefaultActivationMayProceed(attempt)
         else { return }
-        // The Default lookup is name-based; never automatically activate a user namesake.
+        // Recheck System identity after the awaited authority lookup before activation.
         guard candidate.isSystemWorkspace,
               workspace(withID: candidate.id)?.isSystemWorkspace == true
         else {
@@ -7381,7 +7381,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func runtimeOwnedDefaultWorkspaceCandidate() -> WorkspaceModel? {
-        if let existing = workspaces.first(where: { $0.name == "Default" || $0.isSystemWorkspace }) {
+        if let existing = workspaces.first(where: { $0.isSystemWorkspace }) {
             return existing
         }
         var workspace = WorkspaceModel(name: "Default", repoPaths: [])
@@ -16072,7 +16072,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func findOrCreateDefaultWorkspace() -> WorkspaceModel? {
-        if let existing = workspaces.first(where: { $0.name == "Default" }) {
+        if let existing = workspaces.first(where: { $0.isSystemWorkspace }) {
             return existing
         }
         var ws = WorkspaceModel(name: "Default", repoPaths: [])

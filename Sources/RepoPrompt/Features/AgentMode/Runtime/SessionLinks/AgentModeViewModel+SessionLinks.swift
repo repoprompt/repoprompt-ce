@@ -888,6 +888,18 @@ extension AgentModeViewModel {
         }
     }
 
+    func agentSessionLinkHoldComputerUseAdmission(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)? {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID] else { return nil }
+        return session.holdCodexComputerUseAdmission()
+    }
+
+    func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = sessions[endpoint.tabID] else { return }
+        await codexCoordinator.revokeCodexComputerUse(session: session, reason: "session-link")
+    }
+
     /// Names also invalidate archived/unlinked consumers whose exact projection props are equal.
     func agentSessionLinkPublishCreatorNames(_ names: [UUID: String]) {
         guard names != sidebarCreatorDisplayNames else { return }

@@ -196,10 +196,13 @@ protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
+    func revokeComputerUseAutoApproval()
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
 }
 
 extension CodexSessionControlling {
+    func revokeComputerUseAutoApproval() {}
+
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
         nil
     }
@@ -294,6 +297,12 @@ final class CodexNativeSessionController {
     private static let hookTrustWriteMutex = AsyncMutex()
     private static let maxHookTrustWriteSettlementDeadline: TimeInterval = 30
     private static let computerUseMCPServerName = "computer-use"
+    // Controller-scoped: never follows a live settings toggle while requests are outstanding.
+    private var computerUseRequiresUserReview = false
+    private var computerUseAutoApprovalRevoked = false
+    private var computerUseScopePrepared = false
+    private var computerUseAcceptedClientPath: String?
+    private var effectiveComputerUseServerNames: [String] = []
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -699,6 +708,8 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        var computerUseClientPathProvider: () -> String? = { CodexNativeSessionController.computerUseClientPath() }
+        var mcpServerEntriesProvider: () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
@@ -730,7 +741,9 @@ final class CodexNativeSessionController {
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
+            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -751,7 +764,9 @@ final class CodexNativeSessionController {
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        computerUseClientPath: computerUseClientPathProvider(),
+                        serverEntries: mcpServerEntriesProvider()
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -764,6 +779,8 @@ final class CodexNativeSessionController {
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider,
+                computerUseClientPathProvider: computerUseClientPathProvider,
+                mcpServerEntriesProvider: mcpServerEntriesProvider,
                 skillExtraRootsProvider: {
                     [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
                 }
@@ -1258,7 +1275,12 @@ final class CodexNativeSessionController {
             }
         }
 
-        let configOverrides = await options.configOverridesProvider()
+        // Armed scopes must re-detect effective collisions on the recovered transport before
+        // re-binding, rather than trusting server names captured by the original start.
+        if computerUseRequiresUserReview {
+            try await inspectComputerUseEffectiveConfiguration()
+        }
+        let configOverrides = try await runtimeConfigOverrides()
         let result: [String: Any]
         var startedFreshReplacement = false
         do {
@@ -1787,9 +1809,9 @@ final class CodexNativeSessionController {
                 timeout: timeout
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
                 requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 return requestParams
             }
         }
@@ -1813,9 +1835,9 @@ final class CodexNativeSessionController {
             timeout: timeout
         ) { requestValueStyle in
             var requestParams = params
-            requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+            requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
             requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-            requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+            requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
             return requestParams
         }
     }
@@ -1931,7 +1953,7 @@ final class CodexNativeSessionController {
                 )
             }
             await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
-            await updateClientProcessLaunchPolicy()
+            try await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
             #if DEBUG
@@ -1958,6 +1980,11 @@ final class CodexNativeSessionController {
                 #endif
                 throw error
             }
+            // Armed scopes must reject effective collisions before thread creation initializes MCP.
+            // Ordinary starts retain their existing configuration path without an extra RPC.
+            if computerUseRequiresUserReview {
+                try await inspectComputerUseEffectiveConfiguration()
+            }
             await ensureInboundStreamsStarted()
 
             let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
@@ -1983,7 +2010,7 @@ final class CodexNativeSessionController {
                 }
             }
 
-            let configOverrides = await options.configOverridesProvider()
+            let configOverrides = try await runtimeConfigOverrides()
             let result: [String: Any]
             #if DEBUG
                 let threadPhase: AgentPerfCodexLifecyclePhase = resumeThreadID == nil
@@ -2112,7 +2139,7 @@ final class CodexNativeSessionController {
     }
 
     func getThreadGoal() async throws -> ThreadGoal? {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/get",
@@ -2128,7 +2155,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalObjective(_ objective: String) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedObjective.isEmpty else {
@@ -2147,7 +2174,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalStatus(_ status: ThreadGoalStatus) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/set",
@@ -2161,7 +2188,7 @@ final class CodexNativeSessionController {
     }
 
     func clearThreadGoal() async throws -> Bool {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/clear",
@@ -2226,8 +2253,8 @@ final class CodexNativeSessionController {
                 useDefaultTimeout: false
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                     mode: sandboxMode,
                     executionDirectory: workspacePaths.executionDirectory
@@ -2610,7 +2637,12 @@ final class CodexNativeSessionController {
         return nil
     }
 
+    func revokeComputerUseAutoApproval() {
+        withEventsStateLock { computerUseAutoApprovalRevoked = true }
+    }
+
     func shutdown() async {
+        revokeComputerUseAutoApproval()
         withEventsStateLock {
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
@@ -2809,11 +2841,26 @@ final class CodexNativeSessionController {
         )
     }
 
-    private func updateClientProcessFeaturePolicy() async {
-        await updateClientProcessLaunchPolicy()
+    private func updateClientProcessFeaturePolicy() async throws {
+        try await updateClientProcessLaunchPolicy()
     }
 
-    private func updateClientProcessLaunchPolicy() async {
+    private func updateClientProcessLaunchPolicy() async throws {
+        if !computerUseScopePrepared {
+            // Admission is immutable for this controller. Readiness must never downgrade its
+            // approval policy to a permissive ordinary-turn preference.
+            computerUseRequiresUserReview = await MainActor.run { options.computerUseEnabledProvider() }
+            if computerUseRequiresUserReview {
+                guard !Self.hasReservedComputerUseEntry(options.mcpServerEntriesProvider()) else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+                }
+                guard let path = options.computerUseClientPathProvider() else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+                }
+                computerUseAcceptedClientPath = path
+            }
+            computerUseScopePrepared = true
+        }
         let featurePolicy = await currentFeaturePolicy()
         await client.updateProcessLaunchPolicy(
             featurePolicy: featurePolicy,
@@ -2826,10 +2873,37 @@ final class CodexNativeSessionController {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
-                computerUseEnabled: options.computerUseEnabledProvider(),
-                capabilities: options.capabilitiesProvider()
+                computerUseEnabled: computerUseRequiresUserReview && computerUseAcceptedClientPath != nil,
+                capabilities: computerUseRequiresUserReview ? .computerUse : options.capabilitiesProvider()
             )
         }
+    }
+
+    private func inspectComputerUseEffectiveConfiguration() async throws {
+        guard computerUseRequiresUserReview else { return }
+        var params: [String: Any] = ["includeLayers": false]
+        if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
+        let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)
+        effectiveComputerUseServerNames = try Self.reservedComputerUseServerNames(config)
+        if computerUseRequiresUserReview { try Self.validateComputerUseConfiguration(config) }
+    }
+
+    private func runtimeConfigOverrides() async throws -> [String: Any] {
+        let overrides = await options.configOverridesProvider()
+        return try Self.computerUseRuntimeConfigOverrides(
+            overrides,
+            computerUseEnabled: computerUseRequiresUserReview,
+            acceptedClientPath: computerUseAcceptedClientPath,
+            effectiveServerNames: effectiveComputerUseServerNames
+        )
+    }
+
+    private var effectiveApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy {
+        computerUseRequiresUserReview ? .onRequest : options.approvalPolicyProvider()
+    }
+
+    private var effectiveApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer {
+        computerUseRequiresUserReview ? .user : options.approvalReviewerProvider()
     }
 
     private static func parseThreadGoalResponse(from result: [String: Any]) throws -> ThreadGoal {
@@ -4473,6 +4547,21 @@ final class CodexNativeSessionController {
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
         }
 
+        func test_handleServerRequest(method: String, params: [String: CodexJSONValue]) async {
+            await handleServerRequest(.init(id: .int(42), method: method, params: params))
+        }
+
+        func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
+            try await updateClientProcessLaunchPolicy()
+            return (effectiveApprovalPolicy, effectiveApprovalReviewer)
+        }
+
+        func test_computerUseStartupConfig() async throws -> [String: Any] {
+            try await updateClientProcessLaunchPolicy()
+            try await inspectComputerUseEffectiveConfiguration()
+            return try await runtimeConfigOverrides()
+        }
+
         func test_handleNotification(
             method: String,
             params: [String: CodexJSONValue]
@@ -4732,7 +4821,10 @@ final class CodexNativeSessionController {
         case .authTokensRefresh:
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
-            if Self.isRepoPromptMCPElicitationRequest(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
+            if autoApproveHost || autoApproveCompanion {
+                logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4741,10 +4833,6 @@ final class CodexNativeSessionController {
                         "_meta": [String: Any]()
                     ]
                 )
-                return
-            }
-            if let autoAcceptResult = await computerUseMCPElicitationAutoAcceptResult(params: params) {
-                await respondToServerRequest(id: request.id, result: autoAcceptResult)
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
@@ -4763,9 +4851,28 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "surface")
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
-            if let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
+            if autoApproveCompanion,
+               let permission = Self.parsePermissionsRequest(
+                   requestID: request.id,
+                   method: method,
+                   params: params,
+                   activeThreadID: threadID,
+                   currentTurnID: routingCurrentTurnID
+               )
+            {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await respondToServerRequest(id: request.id, result: [
+                    "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
+                ])
+                return
+            }
+            if let approvalResult = hostApprovalResult {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4785,6 +4892,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "surface")
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
@@ -4885,50 +4993,28 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
+        guard computerUseRequiresUserReview else { return }
+        CodexComputerUseWorkflow.logApprovalDecision(
+            path: path, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
+            approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider(), outcome: outcome
+        )
+    }
+
+    private func shouldAutoApproveComputerUseCompanion(params: [String: Any]) -> Bool {
+        !withEventsStateLock { computerUseAutoApprovalRevoked }
+            && computerUseScopePrepared && computerUseAcceptedClientPath != nil
+            && CodexComputerUseWorkflow.automaticallyApprovesCompanion(
+                armed: computerUseRequiresUserReview,
+                approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider()
+            ) && MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
+    }
+
     static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
         MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
             requestToolName: nil,
             requestPayload: params
         ) != nil
-    }
-
-    private func computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
-        let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
-        guard computerUseEnabled,
-              options.approvalPolicyProvider() == .never,
-              options.sandboxModeProvider() == .dangerFullAccess,
-              Self.isComputerUseMCPElicitationRequest(params: params)
-        else {
-            return nil
-        }
-        return [
-            "action": "accept",
-            "content": [String: Any](),
-            "_meta": [
-                "repoPromptAutoAccepted": true,
-                "reason": "explicit_computer_use_full_access"
-            ]
-        ]
-    }
-
-    private static func isComputerUseMCPElicitationRequest(params: [String: Any]) -> Bool {
-        let serverCandidates = [
-            "server",
-            "serverName",
-            "server_name",
-            "mcpServer",
-            "mcp_server",
-            "mcpServerName",
-            "mcp_server_name"
-        ]
-        guard let serverName = firstString(in: params, keys: serverCandidates)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !serverName.isEmpty
-        else {
-            return false
-        }
-        return serverName == computerUseMCPServerName
     }
 
     static func parseMCPElicitationRequest(
@@ -5194,7 +5280,9 @@ final class CodexNativeSessionController {
             threadID: threadID,
             turnID: turnID,
             itemID: itemID,
-            questions: parsedQuestions
+            questions: parsedQuestions,
+            repoPromptAutoApprovalVerified: MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: params) != nil,
+            computerUseCompanionVerified: MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
         )
     }
 
@@ -9155,6 +9243,81 @@ final class CodexNativeSessionController {
         )
     }
 
+    /// Inspect the app-server's effective configuration before installing the companion.
+    /// This also catches trusted project/managed layers, not just the owned home's file.
+    static func reservedComputerUseServerNames(_ response: [String: Any]) throws -> [String] {
+        guard let config = response["config"] as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        guard let rawServers = config["mcp_servers"] else { return [] }
+        guard let servers = rawServers as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        return servers.keys.filter { $0.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }.sorted()
+    }
+
+    static func validateComputerUseConfiguration(_ response: [String: Any]) throws {
+        guard try reservedComputerUseServerNames(response).isEmpty else {
+            throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+        }
+    }
+
+    /// Preserve the ordinary static overlay without discovering or rewriting companion entries.
+    /// For armed scopes, the actual thread boundary remains authoritative even when an
+    /// injected/default override provider evaluated readiness differently.
+    static func computerUseRuntimeConfigOverrides(
+        _ proposed: [String: Any],
+        computerUseEnabled: Bool,
+        acceptedClientPath: String?,
+        effectiveServerNames: [String]
+    ) throws -> [String: Any] {
+        guard computerUseEnabled else { return proposed }
+        let prefixes = ["mcp_servers.computer-use", "mcp_servers.\"computer-use\""]
+        var overrides = proposed.filter { key, _ in
+            let lower = key.lowercased()
+            return !prefixes.contains { lower == $0 || lower.hasPrefix("\($0).") }
+        }
+        if var servers = overrides["mcp_servers"] as? [String: Any] {
+            servers = servers.filter { $0.key.caseInsensitiveCompare(computerUseMCPServerName) != .orderedSame }
+            overrides["mcp_servers"] = servers
+        }
+        overrides["features.computer_use"] = computerUseEnabled
+        if computerUseEnabled {
+            guard effectiveServerNames.isEmpty else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+            }
+            guard let acceptedClientPath else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+            }
+            overrides["mcp_servers.computer-use"] = ["command": acceptedClientPath, "args": ["mcp"], "enabled": true] as [String: Any]
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
+        } else {
+            for name in effectiveServerNames {
+                let component = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: name)
+                overrides["mcp_servers.\(component).enabled"] = false
+            }
+        }
+        return overrides
+    }
+
+    static func hasReservedComputerUseEntry(_ entries: [MCPIntegrationHelper.CodexServerEntry]) -> Bool {
+        entries.contains { $0.normalizedName.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }
+    }
+
+    /// Locate only the installed companion executable; never import a personal Codex home.
+    static func computerUseClientPath(fileManager: FileManager = .default) -> String? {
+        let applications = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        let suffix = "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+        for directory in applications {
+            for appName in ["ChatGPT.app", "Codex.app"] {
+                let path = directory.appendingPathComponent(appName, isDirectory: true)
+                    .appendingPathComponent(suffix).path
+                if fileManager.isExecutableFile(atPath: path) { return path }
+            }
+        }
+        return nil
+    }
+
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
@@ -9162,9 +9325,11 @@ final class CodexNativeSessionController {
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        computerUseClientPath: String? = computerUseClientPath(),
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries()
     ) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
+        let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
@@ -9179,18 +9344,23 @@ final class CodexNativeSessionController {
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled,
-                capabilities: capabilities
+                computerUseEnabled: readyComputerUse,
+                capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            computerUseEnabled: readyComputerUse,
+            computerUseClientPath: computerUseClientPath
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
+        }
+        if readyComputerUse {
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
         }
         overrides["features.code_mode.direct_only_tool_namespaces"] = ["mcp__RepoPromptCE"]
         return overrides
@@ -9200,19 +9370,17 @@ final class CodexNativeSessionController {
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         enabledMCPServerNames: Set<String>,
         suppressThirdPartyMCPServers: Bool,
-        computerUseEnabled: Bool
+        computerUseEnabled: Bool,
+        computerUseClientPath: String? = computerUseClientPath()
     ) -> [String: Any] {
         var effectiveEnabledNames = suppressThirdPartyMCPServers
             ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
             : enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: {
-               $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
-           })
-        {
-            effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        // A saved enabled entry never grants computer use to an ordinary turn.
+        effectiveEnabledNames = effectiveEnabledNames.filter {
+            $0.caseInsensitiveCompare(Self.computerUseMCPServerName) != .orderedSame
         }
-        return CodexOverrides.appServerMCPServerMap(
+        var overrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
                 enabledNormalizedNames: effectiveEnabledNames,
@@ -9220,6 +9388,20 @@ final class CodexNativeSessionController {
                 exceptBroken: []
             )
         )
+        let companionKey = "mcp_servers.\(MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: computerUseMCPServerName))"
+        if computerUseEnabled, let computerUseClientPath, !hasReservedComputerUseEntry(serverEntries) {
+            // Codex recursively merges config layers. Only introduce a full definition when
+            // the reserved name is absent; never overlay a saved transport or approval policy.
+            overrides[companionKey] = [
+                "command": computerUseClientPath,
+                "args": ["mcp"],
+                "enabled": true
+            ] as [String: Any]
+            overrides.removeValue(forKey: "\(companionKey).enabled")
+        }
+        // Existing entries were disabled above. Do not synthesize an enabled=false-only
+        // entry: Codex validates transport even for disabled servers.
+        return overrides
     }
 }
 
