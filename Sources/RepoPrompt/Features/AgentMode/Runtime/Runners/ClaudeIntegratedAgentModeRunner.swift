@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 
@@ -311,6 +312,14 @@ final class ClaudeIntegratedAgentModeRunner {
         handedToRunTask = true
     }
 
+    /// The Claude config directory the native `claude` process is launched with: the same
+    /// environment composition as `ClaudeNativeProcessSessionController` (cached shell env
+    /// layered over the app env), so `CLAUDE_CONFIG_DIR` set only in a shell profile counts.
+    private static func claudeRunUsageProfileID() async -> String {
+        let environment = await ProcessEnvironmentBuilder.build(ProcessEnvironmentRequest(purpose: .claudeNative)).environment
+        return ClaudeUsageCredentialProfile.current(environment: environment).id
+    }
+
     private func consumeEvents(
         _ events: AsyncStream<NativeAgentRuntimeEvent>,
         session: AgentTabSession,
@@ -324,9 +333,13 @@ final class ClaudeIntegratedAgentModeRunner {
         if session.selectedAgent == .claudeCode,
            session.runID == runID, session.activeRunAttemptID == runAttemptID
         {
-            await quotaService.setEnabled(GlobalSettingsStore.shared.claudeUsageQuotaEnabled())
+            let recordsTelemetry = GlobalSettingsStore.shared.claudeUsageQuotaEnabled()
+            await quotaService.setEnabled(recordsTelemetry)
+            // Attribute the run to its Claude config directory so the usage pill only adopts
+            // telemetry from the same profile it reads usage for.
+            let profileID = recordsTelemetry ? await Self.claudeRunUsageProfileID() : nil
             if session.runID == runID, session.activeRunAttemptID == runAttemptID {
-                quotaLease = await quotaService.beginObservation()
+                quotaLease = await quotaService.beginObservation(credentialProfileID: profileID)
             }
         }
 

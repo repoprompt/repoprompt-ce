@@ -24,6 +24,7 @@ final class ProviderQuotaRuntime {
     private var foregroundObservation: AnyCancellable?
     private var consentObservation: AnyCancellable?
     private var consentTask: Task<Void, Never>?
+    private var telemetryOverlayObservation: Task<Void, Never>?
     var currentClaudeUsageProfileID: String {
         ClaudeUsageCredentialProfile.current().id
     }
@@ -74,6 +75,21 @@ final class ProviderQuotaRuntime {
                 self?.codexUI.refreshOnForeground()
                 self?.claudeUI.refreshOnForeground()
             }
+        // One app-level subscription. Passive SDK `rate_limit_event` telemetry (recorded only
+        // while the user's "Record rate-limit events" setting is on) refreshes the *displayed*
+        // Claude snapshot during runs without another CLI launch. Display-only: the overlay is
+        // merged in the UI projection, never into `claude`, routing, or balancing, and the
+        // merge refuses a run whose Claude profile differs from the displayed snapshot's.
+        telemetryOverlayObservation = Task { [weak self, claudeTelemetry] in
+            for await status in await claudeTelemetry.subscribe() {
+                guard !Task.isCancelled, let self else { return }
+                switch status {
+                case let .loaded(snapshot): claudeUI.applyDisplayOverlay(snapshot)
+                case .disabled: claudeUI.applyDisplayOverlay(nil)
+                case .idle, .loading, .unavailable, .failed: continue
+                }
+            }
+        }
     }
 
     /// Source authorization has one truth: persisted consent and completed setup. Routing

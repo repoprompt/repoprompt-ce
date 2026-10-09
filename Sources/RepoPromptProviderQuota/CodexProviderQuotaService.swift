@@ -139,6 +139,20 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         await performRead()
     }
 
+    /// Display-driven refresh of a reading the caller judged stale. Same gate as foreground:
+    /// a live observer, at least `foregroundRefreshMinimumGap` since the last read, and never
+    /// a second read while one is in flight.
+    package func refreshAutomatically(didStart: (@Sendable () async -> Void)?) async {
+        guard isEnabled, !continuations.isEmpty, inFlightRead == nil else { return }
+        if let lastReadStartedAt,
+           now().timeIntervalSince(lastReadStartedAt) < Self.foregroundRefreshMinimumGap
+        {
+            return
+        }
+        startIfPossible()
+        await performRead(didStart: didStart)
+    }
+
     /// Activity-triggered advisory demand, not a user click. No timer or automatic retry.
     package func refreshForAdvisory() async {
         guard !Task.isCancelled, isEnabled, !continuations.isEmpty, inFlightRead == nil else { return }
@@ -270,7 +284,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     /// Every caller requires a live observer. An unobserved read would construct a transport
     /// that no `removeSubscriber` teardown will ever reclaim, so the observer check is the
     /// single admission point rather than a per-caller decision.
-    private func performRead(expectedGeneration: UInt64? = nil) async {
+    private func performRead(expectedGeneration: UInt64? = nil, didStart: (@Sendable () async -> Void)? = nil) async {
         guard !Task.isCancelled, isEnabled, !continuations.isEmpty else { return }
         if let expectedGeneration, expectedGeneration != transportGeneration { return }
         if let inFlightRead {
@@ -309,6 +323,8 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         #if DEBUG
             readCount += 1
         #endif
+        // Registered as in flight first, so a reentrant caller during this hop joins it.
+        await didStart?()
         await task.value
 
         // Only clear the registration this call created. After a teardown/restart the field
@@ -355,8 +371,11 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     private func handleTransportFailure(_ error: Error, generation: UInt64) {
         guard isEnabled, transportGeneration == generation else { return }
         // Keep a previously observed snapshot; it becomes stale via its own horizon rather
-        // than being replaced by an error state.
-        if snapshot == nil {
+        // than being replaced by an error state. The failure is still reported alongside it
+        // so surfaces can say the last refresh did not complete.
+        if let snapshot {
+            publish(.failed(reason: Self.userSafeFailureReason(error), previous: snapshot))
+        } else {
             publish(.unavailable(reason: Self.userSafeFailureReason(error)))
         }
     }
