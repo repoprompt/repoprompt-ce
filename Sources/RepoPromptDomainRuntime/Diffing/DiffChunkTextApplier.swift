@@ -20,8 +20,14 @@ package enum DiffChunkTextApplier {
             let difference = chunk.lineCountDifference()
             guard difference != 0 else { continue }
 
+            // On a tie after a pure insertion, a chunk that consumes original lines follows those displaced lines.
             for laterIndex in decodedChunks.index(after: index) ..< decodedChunks.endIndex
                 where adjustedStartLines[laterIndex] > appliedStartLine
+                || (
+                    adjustedStartLines[laterIndex] == appliedStartLine
+                        && chunk.oldLineCount == 0
+                        && decodedChunks[laterIndex].oldLineCount > 0
+                )
             {
                 adjustedStartLines[laterIndex] = clamp(
                     adjustedStartLines[laterIndex] + difference,
