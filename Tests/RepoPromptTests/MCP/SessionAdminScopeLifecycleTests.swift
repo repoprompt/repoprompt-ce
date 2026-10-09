@@ -689,14 +689,16 @@ final class SessionAdminStructureTests: XCTestCase {
             parent: UUID?,
             org: UUID? = nil,
             workspace: UUID? = nil,
+            scope: UUID? = nil,
+            laneCreator: UUID? = nil,
             live: Bool = true,
             state: DomainDelegationScopeTargetState = .idle,
             worktrees: Set<String> = []
         ) {
             sessions[id] = DelegationSessionProvenance(
-                sessionID: id, workspaceID: workspace, parentSessionID: parent, createdByOverseerSessionID: nil,
-                organizationalParentID: org, isLive: live, worktreeCount: worktrees.count, boundWorktreeIDs: worktrees,
-                runState: state
+                sessionID: id, workspaceID: workspace, parentSessionID: parent, createdByOverseerSessionID: laneCreator,
+                organizationalParentID: org, delegationScopeID: scope, isLive: live, worktreeCount: worktrees.count,
+                boundWorktreeIDs: worktrees, runState: state
             )
         }
 
@@ -722,20 +724,28 @@ final class SessionAdminStructureTests: XCTestCase {
         var lastAuthorization: (@MainActor () -> Bool)?
         var forkCalls: [UUID] = []
         var nextFork = UUID()
+        /// Runs inside each placement's durable write, after the in-memory write (a slow disk rewrite).
+        var onPersist: (@MainActor () async -> Void)?
 
         init(provenance: Provenance) {
             self.provenance = provenance
         }
 
-        func setOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) async throws -> Bool {
+        func commitOrganizationalPlacement(
+            sessionID: UUID,
+            parentID: UUID,
+            delegationScopeID: UUID?
+        ) throws -> DelegationPlacementCommit? {
             placements.append((sessionID, parentID, delegationScopeID))
             let old = provenance.sessions[sessionID]
             provenance.sessions[sessionID] = DelegationSessionProvenance(
                 sessionID: sessionID, workspaceID: old?.workspaceID, parentSessionID: old?.parentSessionID,
-                createdByOverseerSessionID: nil, organizationalParentID: parentID, isLive: old?.isLive ?? true,
+                createdByOverseerSessionID: nil, organizationalParentID: parentID,
+                delegationScopeID: delegationScopeID ?? old?.delegationScopeID, isLive: old?.isLive ?? true,
                 boundWorktreeIDs: old?.boundWorktreeIDs ?? [], runState: old?.runState ?? .idle
             )
-            return true
+            let onPersist = onPersist
+            return DelegationPlacementCommit(pendingWrite: Task { @MainActor in await onPersist?() })
         }
 
         func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>? {
@@ -961,8 +971,10 @@ final class SessionAdminStructureTests: XCTestCase {
             ))
         }
 
-        func admit(_ creator: UUID?) -> DelegationSpawnAdmission.Outcome {
-            DelegationSpawnAdmission.admit(creatorSessionID: creator, scopes: runtime, administration: core, projector: projector)
+        func admit(_ creator: UUID?, target: DelegationSpawnTarget = .newSession) -> DelegationSpawnAdmission.Outcome {
+            DelegationSpawnAdmission.admit(
+                creatorSessionID: creator, target: target, scopes: runtime, administration: core, projector: projector
+            )
         }
 
         func value(
@@ -984,6 +996,12 @@ final class SessionAdminStructureTests: XCTestCase {
                 return [:]
             }
         }
+    }
+
+    /// Every refusal code in a reply: the top-level one and each item's.
+    private func codes(_ reply: [String: Value]) -> [String] {
+        [reply["code"]?.stringValue].compactMap(\.self)
+            + (reply["items"]?.arrayValue ?? []).compactMap { $0.objectValue?["code"]?.stringValue }
     }
 
     private func items(_ reply: [String: Value]) -> [String: [String: Value]] {
@@ -1504,11 +1522,254 @@ final class SessionAdminStructureTests: XCTestCase {
     }
 
     /// M1: `agent_run start` with a `tab_id` adds a member unless the tab's session already has a
-    /// spawn parent; an empty or unknown tab always does.
+    /// tree placement; an empty or unknown tab always does.
     func testSpawnIntoAnEmptyTabIsANewMember() {
         let viewModel = WindowState().agentModeViewModel
-        XCTAssertTrue(viewModel.delegationSpawnTargetJoinsAsNewMember(tabID: nil))
-        XCTAssertTrue(viewModel.delegationSpawnTargetJoinsAsNewMember(tabID: UUID()), "a tab with no bound session")
+        XCTAssertEqual(viewModel.delegationSpawnTarget(tabID: nil, creatorSessionID: UUID()), .newSession)
+        XCTAssertEqual(
+            viewModel.delegationSpawnTarget(tabID: UUID(), creatorSessionID: UUID()), .newSession, "a tab with no bound session"
+        )
+    }
+
+    /// Review M2: an `agent_run start` whose `tab_id` holds an adopted session (organizational parent,
+    /// no spawn parent) or a lane is already placed: it is neither admitted, nor stamped, nor moved,
+    /// and a stamp never overwrites another overseer's placement or scope.
+    func testAgentRunIntoAnAlreadyPlacedSessionKeepsItsPlacementAndScope() throws {
+        let session = UUID(), overseerA = UUID(), overseerB = UUID(), scopeA = UUID()
+        func classify(_ placement: DelegationSpawnTargetPlacement?, by creator: UUID? = overseerB) -> DelegationSpawnTarget {
+            DelegationSpawnTarget.classify(sessionID: session, placement: placement, creatorSessionID: creator)
+        }
+        let adopted = DelegationSpawnTargetPlacement(organizationalParentID: overseerA, delegationScopeID: scopeA)
+        XCTAssertEqual(classify(adopted), .placedSession, "the organizational parent wins over any spawn parent agent_run writes")
+        XCTAssertFalse(adopted.admitsStamp(by: overseerB), "another overseer never re-stamps an adopted session")
+        XCTAssertFalse(adopted.admitsStamp(by: overseerA), "an existing placement is never overwritten")
+        XCTAssertNil(
+            try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: overseerB, target: .placedSession),
+            "a placed target is not admitted, so nothing is reserved or stamped"
+        )
+
+        let lane = DelegationSpawnTargetPlacement(createdByOverseerSessionID: overseerA)
+        XCTAssertEqual(classify(lane, by: overseerA), .placedSession, "its own creator's start leaves a lane in place")
+        XCTAssertEqual(classify(lane), .otherCreatorsLane(session), "another creator's spawn parent would move the lane")
+        XCTAssertTrue(lane.admitsStamp(by: overseerA), "a lane's own creator stamps it at creation")
+        XCTAssertFalse(lane.admitsStamp(by: overseerB))
+
+        let spawned = DelegationSpawnTargetPlacement(parentSessionID: overseerA)
+        XCTAssertEqual(classify(spawned), .placedSession, "a spawn parent is write-once")
+        XCTAssertTrue(spawned.admitsStamp(by: overseerA), "a new child is stamped under its own spawn parent")
+        XCTAssertFalse(spawned.admitsStamp(by: overseerB))
+
+        XCTAssertEqual(classify(DelegationSpawnTargetPlacement()), .unplacedSession(session))
+        XCTAssertEqual(classify(nil), .unplacedSession(session))
+        XCTAssertEqual(DelegationSpawnTarget.classify(sessionID: nil, placement: nil, creatorSessionID: overseerB), .newSession)
+    }
+
+    /// Review M2 (follow-up): `agent_run`'s spawn-parent write would move another overseer's lane out
+    /// of that overseer's tree, so the start is refused whenever that changes a live scope's members,
+    /// even for a creator with no scope of its own.
+    func testAnotherOverseersLaneIsNotMovedBetweenScopes() throws {
+        let fixture = Fixture()
+        let overseerA = UUID(), overseerB = UUID(), lane = UUID(), freeLane = UUID(), freeCreator = UUID()
+        fixture.provenance.add(overseerA, parent: nil)
+        fixture.provenance.add(overseerB, parent: nil)
+        fixture.provenance.add(lane, parent: nil, laneCreator: overseerA)
+        fixture.provenance.add(freeCreator, parent: nil)
+        fixture.provenance.add(freeLane, parent: nil, laneCreator: freeCreator)
+        try fixture.grant(overseerA, [.observe])
+        XCTAssertEqual(fixture.admit(overseerB, target: .otherCreatorsLane(lane)), .targetMovesBetweenScopes(count: 1))
+        XCTAssertEqual(
+            fixture.admit(overseerB, target: .otherCreatorsLane(freeLane)), .unscoped,
+            "a lane in no scope moves no scope's membership"
+        )
+        XCTAssertEqual(fixture.admit(overseerB, target: .placedSession), .unscoped)
+    }
+
+    /// Review M1: placement writes for a session with no live tab are queued per session in the order
+    /// they were applied, so the last applied placement is the last written.
+    func testPlacementDiskWritesRunInTheOrderTheyWereApplied() async throws {
+        @MainActor final class Log {
+            var entries: [Int] = []
+        }
+        let log = Log()
+        let session = UUID()
+        let first = DelegationPlacementWriteQueue.schedule(session) {
+            for _ in 0 ..< 5 {
+                await Task.yield()
+            }
+            log.entries.append(1)
+        }
+        let second = DelegationPlacementWriteQueue.schedule(session) { log.entries.append(2) }
+        try await second.value
+        try await first.value
+        XCTAssertEqual(log.entries, [1, 2])
+    }
+
+    /// Review M2: an unplaced `tab_id` target joins with its whole subtree, so a scoped creator may not
+    /// graft a scope anchor (or a tree holding one), and the joining subtree counts against limits.
+    func testScopeAnchorTabIsNotGraftedAndAJoiningSubtreeIsCounted() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), worker = UUID(), stranger = UUID()
+        let anchor = UUID(), holder = UUID(), nestedAnchor = UUID()
+        let loose = UUID(), looseChildA = UUID(), looseChildB = UUID(), single = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(worker, parent: overseer)
+        fixture.provenance.add(stranger, parent: nil)
+        fixture.provenance.add(anchor, parent: nil)
+        fixture.provenance.add(holder, parent: nil)
+        fixture.provenance.add(nestedAnchor, parent: holder)
+        fixture.provenance.add(loose, parent: nil)
+        fixture.provenance.add(looseChildA, parent: loose)
+        fixture.provenance.add(looseChildB, parent: loose)
+        fixture.provenance.add(single, parent: nil)
+        try fixture.grant(overseer, [.spawn, .observe], guardrails: .init(maxLiveSessions: 4))
+        try fixture.grant(anchor, [.observe])
+        try fixture.grant(nestedAnchor, [.observe])
+
+        XCTAssertEqual(fixture.admit(overseer, target: .unplacedSession(anchor)), .targetAnchorsScope, "a scope root is never grafted")
+        XCTAssertEqual(fixture.admit(worker, target: .unplacedSession(anchor)), .targetAnchorsScope, "nor by a worker inside the scope")
+        XCTAssertEqual(fixture.admit(overseer, target: .unplacedSession(holder)), .targetAnchorsScope, "nor a tree that holds a scope")
+        XCTAssertEqual(
+            fixture.admit(stranger, target: .unplacedSession(anchor)), .unscoped,
+            "an unscoped creator moves no scope's membership"
+        )
+
+        // overseer + worker are live; the loose tree (its idle root is about to run) adds three to a
+        // limit of four. `current` is the scope's own count.
+        fixture.provenance.add(loose, parent: nil, live: false)
+        XCTAssertEqual(
+            fixture.admit(overseer, target: .unplacedSession(loose)),
+            .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 4, current: 2))
+        )
+        guard case let .admitted(admission) = fixture.admit(overseer, target: .unplacedSession(single)) else {
+            return XCTFail("a single unplaced session fits")
+        }
+        XCTAssertEqual(admission.reservation.sessions, 1)
+        fixture.runtime.release(admission.reservation)
+
+        // A joining subtree's bound worktrees count against `maxWorktrees` too.
+        let busyRoot = UUID()
+        fixture.provenance.add(busyRoot, parent: nil, worktrees: ["w1", "w2"])
+        try fixture.grant(worker, [.observe], guardrails: .init(maxWorktrees: 1))
+        XCTAssertEqual(
+            fixture.admit(worker, target: .unplacedSession(busyRoot)),
+            .denied(.guardrailExceeded(guardrail: .maxWorktrees, limit: 1, current: 0))
+        )
+    }
+
+    /// Review S3: a `.workspace` scope's guardrails bound only its grantee and the sessions stamped
+    /// with it, never an unrelated session that merely lives in the workspace.
+    func testWorkspaceScopeGuardrailsBoundOnlyItsDelegatedSessions() throws {
+        let fixture = Fixture()
+        let workspace = UUID(), grantee = UUID(), unrelated = UUID(), delegated = UUID()
+        fixture.provenance.add(grantee, parent: nil, workspace: workspace)
+        fixture.provenance.add(unrelated, parent: nil, workspace: workspace)
+        let scope = try fixture.grant(
+            grantee, [.observe], kind: .workspace(workspaceID: workspace), guardrails: .init(maxLiveSessions: 2)
+        )
+        fixture.provenance.add(delegated, parent: grantee, workspace: workspace, scope: scope.id)
+        let child = UUID(), grandchild = UUID(), unrelatedChild = UUID()
+        fixture.provenance.add(child, parent: grantee, workspace: workspace)
+        fixture.provenance.add(grandchild, parent: delegated, workspace: workspace)
+        fixture.provenance.add(unrelatedChild, parent: unrelated, workspace: workspace)
+        let atLimit = DelegationSpawnAdmission.Outcome.denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 6))
+        XCTAssertEqual(fixture.admit(unrelated), .unscoped, "an unrelated session can still agent_run start")
+        XCTAssertEqual(fixture.admit(unrelatedChild), .unscoped, "and so can its own descendants")
+        XCTAssertEqual(fixture.admit(grantee), atLimit)
+        XCTAssertEqual(fixture.admit(delegated), atLimit, "a session stamped with the scope is bounded by it")
+        XCTAssertEqual(fixture.admit(child), atLimit, "the grantee's unstamped descendants cannot escape the limit")
+        XCTAssertEqual(fixture.admit(grandchild), atLimit, "nor can a stamped session's descendants")
+    }
+
+    /// Review S2: `fork` and `worktree_create` count toward every scope the caller's creations join,
+    /// not only the caller's own chain: a worker with its own unlimited scope inside an overseer's
+    /// limited tree is bounded by the overseer's limits.
+    func testForkAndWorktreeCreateHonorEveryScopeTheyCountToward() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), worker = UUID(), member = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(worker, parent: overseer)
+        fixture.provenance.add(member, parent: worker, worktrees: ["w0"])
+        try fixture.grant(overseer, [.observe], guardrails: .init(maxLiveSessions: 3, maxWorktrees: 1))
+        try fixture.grant(worker)
+
+        let fork = try await fixture.value(.adminFork, caller: worker, targets: [member], key: "fork-1")
+        XCTAssertEqual(fork["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertEqual(fork["guardrail"], .string("max_live_sessions"))
+        XCTAssertTrue(fixture.structure.forkCalls.isEmpty)
+
+        let worktree = try await fixture.value(.adminWorktreeCreate, caller: worker, targets: [member])
+        XCTAssertEqual(worktree["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertEqual(worktree["guardrail"], .string("max_worktrees"))
+        XCTAssertTrue(fixture.worktrees.created.isEmpty)
+    }
+
+    /// Review M1: two concurrent cross re-parents (A under B, B under A) both pass preflight, but each
+    /// item's final check and its in-memory write are one synchronous step: one is refused as a cycle
+    /// and no cycle forms.
+    func testConcurrentCrossReparentsCannotFormACycle() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), a = UUID(), b = UUID(), x = UUID(), y = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        for id in [a, b, x, y] {
+            fixture.provenance.add(id, parent: overseer)
+        }
+        try fixture.grant(overseer)
+        // Every durable write suspends, so the two batches interleave item by item.
+        fixture.structure.onPersist = {
+            for _ in 0 ..< 5 {
+                await Task.yield()
+            }
+        }
+        async let first = fixture.value(
+            .adminReparent, caller: overseer, targets: [x, a], args: ["parent_session_id": .string(b.uuidString)]
+        )
+        async let second = fixture.value(
+            .adminReparent, caller: overseer, targets: [y, b], args: ["parent_session_id": .string(a.uuidString)]
+        )
+        let replies = try await [first, second]
+        XCTAssertTrue(replies.flatMap(codes).contains("placement_cycle"), "\(replies)")
+        let movedEndpoints = Set(fixture.structure.placements.map(\.session)).intersection([a, b])
+        XCTAssertEqual(movedEndpoints.count, 1, "exactly one of the cross moves applies")
+        XCTAssertNotNil(fixture.projector.organizationalAncestry(of: a), "no cycle formed")
+        XCTAssertNotNil(fixture.projector.organizationalAncestry(of: b), "no cycle formed")
+    }
+
+    /// Review M1: two approved adopts racing for the last slot under `maxLiveSessions`: the second
+    /// sees the first adoptee as a member (and its reservation) at its final check, so only one applies.
+    func testConcurrentAdoptsAtTheLimitApplyOnlyOne() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID(), p = UUID(), q = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(member, parent: overseer)
+        fixture.provenance.add(p, parent: nil)
+        fixture.provenance.add(q, parent: nil)
+        let scope = try fixture.grant(overseer, guardrails: .init(maxLiveSessions: 3))
+        var cards: [UUID: UUID] = [:]
+        for (adoptee, key) in [(p, "adopt-p"), (q, "adopt-q")] {
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminAdopt, caller: overseer, targets: [adoptee], key: key
+            ) else { return XCTFail("adopt always raises a card, and each fits the limit on its own") }
+            XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+            cards[adoptee] = card.id
+        }
+        fixture.structure.onPersist = {
+            for _ in 0 ..< 5 {
+                await Task.yield()
+            }
+        }
+        let cardP = cards[p], cardQ = cards[q]
+        async let first = fixture.value(.adminAdopt, caller: overseer, targets: [p], key: "adopt-p", confirmation: cardP)
+        async let second = fixture.value(.adminAdopt, caller: overseer, targets: [q], key: "adopt-q", confirmation: cardQ)
+        let replies = try await [first, second]
+        XCTAssertEqual(fixture.structure.placements.count, 1, "only one adoption fits the limit: \(replies)")
+        XCTAssertTrue(replies.flatMap(codes).contains("scope_guardrail_exceeded"), "\(replies)")
+        XCTAssertEqual(fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil).liveSessionCount, 3)
+        XCTAssertEqual(
+            fixture.runtime.usageIncludingReservations(fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil))
+                .liveSessionCount,
+            3,
+            "adopt reservations are released once placement is durable"
+        )
     }
 
     /// M2: a `.workspace` caller cannot re-parent a session whose organizational parent lives in a
@@ -1661,6 +1922,17 @@ final class SessionAdminStructureTests: XCTestCase {
         let first = try await fixture.value(.adminUnlink, caller: overseer, targets: [a])
         XCTAssertEqual(items(first)[a.uuidString]?["result"], .string("unlinked"))
         XCTAssertEqual(fixture.structure.stopped, [Pair(observer: overseer, target: a)])
+
+        // Review S4: the target leaving the scope during the lookup (a membership change, not a
+        // revocation) also stops the unlink.
+        let c = UUID(), outside = UUID()
+        fixture.provenance.add(c, parent: overseer)
+        fixture.provenance.add(outside, parent: nil)
+        fixture.structure.links[Pair(observer: overseer, target: c)] = DomainAgentSessionLinkCapability.managed
+        fixture.structure.onActiveLink = { fixture.provenance.add(c, parent: overseer, org: outside) }
+        let moved = try await fixture.value(.adminUnlink, caller: overseer, targets: [c])
+        XCTAssertEqual(items(moved)[c.uuidString]?["code"], .string("link_failed"))
+        XCTAssertNotNil(fixture.structure.links[Pair(observer: overseer, target: c)], "a non-member's link is not stopped")
 
         fixture.structure.onActiveLink = { fixture.runtime.revoke(scopeID: scope.id) }
         let second = try await fixture.value(.adminUnlink, caller: overseer, targets: [b])

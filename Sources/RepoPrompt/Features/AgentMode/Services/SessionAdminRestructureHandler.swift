@@ -238,8 +238,13 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
                 continue
             }
-            let scopes = context.scopes
-            let outcome = await host.stopLink(observer: observer, target: target) { scopes.isCurrent(lease) }
+            // Re-checked after the link lookup and right before the Stop: the lease is current and both
+            // endpoints are still members of the whole chain (management never chains).
+            let context = context
+            let scope = batch.scope
+            let outcome = await host.stopLink(observer: observer, target: target) {
+                context.isStillAuthorized(lease, scope: scope) && context.isMember(observer, ofChainFrom: scope)
+            }
             items.append(Self.linkItem(target, outcome))
         }
         return SessionAdminReply.batch(
@@ -327,23 +332,14 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         return nil
     }
 
-    /// Grantees and tree roots of every live scope: never adoptable.
-    private func scopeAnchors() -> Set<UUID> {
-        var anchors: Set<UUID> = []
-        for record in context.scopes.allLiveScopes() {
-            anchors.insert(record.grant.granteeSessionID)
-            if case let .tree(root) = record.grant.kind { anchors.insert(root) }
-        }
-        return anchors
-    }
-
     private func adoptRefusal(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         destination: UUID,
         adoptees: [UUID]? = nil
     ) throws -> Value? {
         let roots = context.scopes.liveTreeScopeRoots()
-        let anchors = scopeAnchors()
+        // Grantees and tree roots of every live scope: never adoptable.
+        let anchors = context.scopes.liveScopeAnchors()
         let destinationAncestry = context.projector.organizationalAncestry(of: destination)
         var moved: Set<UUID> = []
         for adoptee in adoptees ?? batch.admittedSessionIDs {
@@ -410,7 +406,10 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
 
     private func adopt(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let destination = try destination(of: batch, required: false)
-        return try await applyPlacement(batch, destination: destination, stampScope: batch.scope.id, op: "adopt") { adoptee in
+        return try await applyPlacement(
+            batch, destination: destination, stampScope: batch.scope.id, op: "adopt",
+            reserve: { adoptee in self.adoptionReservation(batch, adoptee: adoptee) }
+        ) { adoptee in
             // The card was approved against this state; anything that changed since is re-decided,
             // one item at a time (an earlier item of this batch is a member by now), including the
             // guardrails against the membership the earlier items already produced.
@@ -425,11 +424,34 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         }
     }
 
+    /// Counts an adoptee's joining subtree against the caller's chain from its final check until its
+    /// placement is visible to the projector (the in-memory write), like spawn and fork. Held any
+    /// longer it would count the subtree twice (as members and as reserved).
+    private func adoptionReservation(
+        _ batch: AgentSessionAdministrationAuthorizedBatch,
+        adoptee: UUID
+    ) -> DelegationScopeReservation {
+        let moved = context.projector.organizationalSubtree(of: adoptee).map { $0.map(\.sessionID) } ?? [adoptee]
+        let joining = moved.filter { !context.isMember($0, ofChainFrom: batch.scope) }
+        return context.scopes.reserve(
+            scopeIDs: context.scopeChain(of: batch.scope).map(\.id),
+            sessions: joining.count { context.projector.knownProvenance(for: $0)?.isLive ?? true },
+            worktrees: joining.reduce(into: Set<String>()) {
+                $0.formUnion(context.projector.knownProvenance(for: $1)?.boundWorktreeIDs ?? [])
+            }.count
+        )
+    }
+
+    /// Each item's final re-validation, its reservation, and its in-memory placement write run in one
+    /// synchronous region (no suspension), so concurrent placement changes are decided one after the
+    /// other: a cross re-parent is refused as a cycle and a second adopt at a limit is refused. Only
+    /// the durable write is awaited afterwards.
     private func applyPlacement(
         _ batch: AgentSessionAdministrationAuthorizedBatch,
         destination: UUID,
         stampScope: UUID?,
         op: String,
+        reserve: (UUID) -> DelegationScopeReservation? = { _ in nil },
         revalidate: (UUID) throws -> Value?
     ) async throws -> Value {
         var items: [SessionAdminItemResult] = []
@@ -463,14 +485,31 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: code))
                 continue
             }
-            let written = try await host.setOrganizationalPlacement(
-                sessionID: source, parentID: destination, delegationScopeID: stampScope
-            )
-            items.append(SessionAdminItemResult(
-                sessionID: source, result: written ? "moved" : "not_applied",
-                code: written ? nil : "session_not_loaded",
-                fields: ["parent_session_id": .string(destination.uuidString)]
-            ))
+            let reservation = reserve(source)
+            let commit: DelegationPlacementCommit?
+            do {
+                defer { context.scopes.release(reservation) }
+                commit = try host.commitOrganizationalPlacement(
+                    sessionID: source, parentID: destination, delegationScopeID: stampScope
+                )
+            }
+            guard let commit else {
+                items.append(SessionAdminItemResult(
+                    sessionID: source, result: "not_applied", code: "session_not_loaded",
+                    fields: ["parent_session_id": .string(destination.uuidString)]
+                ))
+                continue
+            }
+            var fields: [String: Value] = ["parent_session_id": .string(destination.uuidString)]
+            do {
+                try await commit.persisted()
+            } catch {
+                // Applied in memory (membership already changed); only the session file rewrite
+                // failed. Reported per item so the rest of the batch and its results are kept.
+                fields["persist_failed"] = .bool(true)
+                fields["detail"] = .string(error.localizedDescription)
+            }
+            items.append(SessionAdminItemResult(sessionID: source, result: "moved", fields: fields))
         }
         return SessionAdminReply.batch(op: op, items: items, preview: batch.request.preview)
     }

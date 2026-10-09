@@ -141,10 +141,19 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
             return .object(["result": .string("in_progress"), "detail": .string("This fork is already being created.")])
         }
         defer { forksInFlight.remove(ledgerKey) }
-        // Reserved before the first suspension, right after the core's guardrail check, so concurrent
-        // forks and spawns cannot overshoot `maxLiveSessions`.
+        // The fork is placed under the caller, so it counts toward every scope a session the caller
+        // spawns would join, not only the caller's own chain (which the core already checked).
+        let evaluation = DelegationSpawnAdmission.evaluate(
+            DelegationSpawnAdmission.guardrailScopes(forCreator: caller, scopes: context.scopes, projector: context.projector),
+            creator: caller, operation: .adminFork, scopes: context.scopes, projector: context.projector
+        )
+        if let denial = evaluation.denial {
+            return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
+        }
+        // Reserved before the first suspension, right after the guardrail checks, so concurrent forks
+        // and spawns cannot overshoot `maxLiveSessions`.
         let reservation = context.scopes.reserve(
-            scopeIDs: context.scopeChain(of: batch.scope).map(\.id), sessions: 1
+            scopeIDs: Array(evaluation.scopeIDs.union(context.scopeChain(of: batch.scope).map(\.id))), sessions: 1
         )
         defer { context.scopes.release(reservation) }
         guard context.scopes.isCurrent(lease) else { return SessionAdminReply.batch(op: "fork", items: [.revoked(source)]) }
@@ -155,9 +164,13 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         recordForkReceipt(receipt, key: ledgerKey)
         // The fork exists either way; only joining the scope needs live authority.
         if context.scopes.isCurrent(lease) {
-            let joined = try await host.setOrganizationalPlacement(
+            let commit = try host.commitOrganizationalPlacement(
                 sessionID: forked, parentID: caller, delegationScopeID: batch.scope.id
             )
+            // The fork is a member now; the reservation is not held through the durable write.
+            context.scopes.release(reservation)
+            try await commit?.persisted()
+            let joined = commit != nil
             receipt = ForkReceipt(sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: joined)
             if forkReceipts[ledgerKey] != nil { forkReceipts[ledgerKey] = receipt }
         }

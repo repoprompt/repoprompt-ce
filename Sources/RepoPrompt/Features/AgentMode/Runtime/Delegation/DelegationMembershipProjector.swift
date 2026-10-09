@@ -14,6 +14,9 @@ struct DelegationSessionProvenance: Hashable {
     let createdByOverseerSessionID: UUID?
     /// Mutable organizational parent. When set it wins over spawn provenance.
     let organizationalParentID: UUID?
+    /// The scope this session was stamped into by scoped creation or `adopt`, if any. Decides whether
+    /// a `.workspace` scope's guardrails bound this session's own spawns.
+    let delegationScopeID: UUID?
     /// Counts toward `maxLiveSessions`.
     let isLive: Bool
     /// Counts toward `maxWorktrees` when `boundWorktreeIDs` is empty (sources without identities).
@@ -29,6 +32,7 @@ struct DelegationSessionProvenance: Hashable {
         parentSessionID: UUID?,
         createdByOverseerSessionID: UUID?,
         organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         isLive: Bool,
         worktreeCount: Int = 0,
         boundWorktreeIDs: Set<String> = [],
@@ -39,6 +43,7 @@ struct DelegationSessionProvenance: Hashable {
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
         self.organizationalParentID = organizationalParentID
+        self.delegationScopeID = delegationScopeID
         self.isLive = isLive
         self.worktreeCount = worktreeCount
         self.boundWorktreeIDs = boundWorktreeIDs
@@ -245,6 +250,7 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             parentSessionID: entry.parentSessionID,
             createdByOverseerSessionID: entry.createdByOverseerSessionID,
             organizationalParentID: entry.organizationalParentID,
+            delegationScopeID: entry.delegationScopeID,
             isLive: isLive,
             worktreeCount: entry.worktreeBindingSummaries.count,
             boundWorktreeIDs: Set(entry.worktreeBindingSummaries.map(\.worktreeID)),

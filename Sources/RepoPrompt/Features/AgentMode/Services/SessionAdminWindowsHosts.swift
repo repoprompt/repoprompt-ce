@@ -30,10 +30,14 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         self.bridge = bridge
     }
 
-    func setOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) async throws -> Bool {
-        guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else { return false }
+    func commitOrganizationalPlacement(
+        sessionID: UUID,
+        parentID: UUID,
+        delegationScopeID: UUID?
+    ) throws -> DelegationPlacementCommit? {
+        guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else { return nil }
         let scopeID = delegationScopeID ?? viewModel.ownerValidatedSessionIndex[sessionID]?.delegationScopeID
-        return try await viewModel.setDelegationPlacement(
+        return try viewModel.commitDelegationPlacement(
             sessionID: sessionID, organizationalParentID: parentID, delegationScopeID: scopeID
         )
     }
@@ -328,9 +332,10 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         return removed.map(\.worktreeID)
     }
 
-    /// Authority is evaluated synchronously right before the transition and again at its commit
-    /// fence (`beforeCommit`), after its own suspensions, so a revocation or a membership change that
-    /// lands mid-transition aborts it before anything is published.
+    /// Authority is evaluated synchronously right before the transition and again at its
+    /// `beforeCommit` fence, after its preparation suspensions, so a revocation or a membership change
+    /// that lands before the fence aborts it. As with `manage_worktree`, the transition may still await
+    /// recovery handoff and provider-context invalidation after the fence, before it publishes.
     private func transition(
         _ desired: [AgentSessionWorktreeBinding],
         sessionID: UUID,

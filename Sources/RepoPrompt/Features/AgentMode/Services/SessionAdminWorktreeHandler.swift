@@ -154,9 +154,24 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 "session_id": .string(target.uuidString), "bind": .bool(bindAfter)
             ])
         }
-        // Reserved before the first suspension, right after the core's `maxWorktrees` check, so two
-        // concurrent creations cannot both pass; the ownership record takes over once it exists.
-        let reservation = context.scopes.reserve(scopeIDs: context.scopeChain(of: batch.scope).map(\.id), worktrees: 1)
+        // The worktree is owned by the caller, so it counts toward every scope the caller's creations
+        // count toward (and, once bound, the target's), not only the caller's own chain (which the core
+        // already checked).
+        var records = DelegationSpawnAdmission.guardrailScopes(forCreator: caller, scopes: context.scopes, projector: context.projector)
+        if bindAfter {
+            records += DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
+        }
+        let evaluation = DelegationSpawnAdmission.evaluate(
+            records, creator: caller, operation: .adminWorktreeCreate, scopes: context.scopes, projector: context.projector
+        )
+        if let denial = evaluation.denial {
+            return try SessionAdminMCPToolService.deniedValue(denial, sessionID: nil)
+        }
+        // Reserved before the first suspension, right after the guardrail checks, so two concurrent
+        // creations cannot both pass; the ownership record takes over once it exists.
+        let reservation = context.scopes.reserve(
+            scopeIDs: Array(evaluation.scopeIDs.union(context.scopeChain(of: batch.scope).map(\.id))), worktrees: 1
+        )
         defer { context.scopes.release(reservation) }
         let info = try await host.createWorktree(forSession: target, repoRoot: repoRoot, branch: branch, baseRef: baseRef)
         // Ownership is recorded even if authority lapsed during creation: the worktree exists, and

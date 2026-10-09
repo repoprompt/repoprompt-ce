@@ -229,14 +229,28 @@ final class DelegationScopeRuntime: ObservableObject {
         )
     }
 
-    /// Spawn guardrails for a scope and every ancestor (`maxLiveSessions`, `maxDepth`), for creators
-    /// that are members of a scope rather than its grantee. `usageByScopeID` must cover the chain.
-    func evaluateSpawnGuardrails(
+    /// Creation guardrails for a scope and every ancestor — `maxLiveSessions`/`maxDepth` for a session
+    /// (`adminSpawn`, `adminFork`), `maxWorktrees` for a worktree (`adminWorktreeCreate`) — for scopes
+    /// the new session or worktree counts toward beyond the caller's own. `usageByScopeID` must cover
+    /// the chain.
+    func evaluateCreationGuardrails(
         scopeID: UUID,
+        operation: DomainAgentSessionTargetOperation,
         usageByScopeID: [UUID: DomainDelegationScopeUsage]
     ) -> DomainDelegationScopeDenial? {
         expireDueScopes()
-        return authority.evaluateGuardrails(scopeID: scopeID, operation: .adminSpawn, usageByScopeID: usageByScopeID)
+        return authority.evaluateGuardrails(scopeID: scopeID, operation: operation, usageByScopeID: usageByScopeID)
+    }
+
+    /// Grantees and tree roots of every live scope. Placement never moves one of them into another
+    /// scope (`adopt`, or an `agent_run` start into an unplaced tab).
+    func liveScopeAnchors() -> Set<UUID> {
+        var anchors: Set<UUID> = []
+        for record in allLiveScopes() {
+            anchors.insert(record.grant.granteeSessionID)
+            if case let .tree(root) = record.grant.kind { anchors.insert(root) }
+        }
+        return anchors
     }
 
     /// Roots of every live `.tree` scope, for placement decisions (`reparent`, `adopt`).

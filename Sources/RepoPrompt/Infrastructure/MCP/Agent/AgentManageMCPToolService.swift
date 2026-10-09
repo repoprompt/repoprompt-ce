@@ -822,6 +822,8 @@ struct AgentManageMCPToolService {
         if target.origin == .createdNewTab, let createdSessionID = target.sessionID {
             await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: createdSessionID, viewModel: agentModeVM)
         }
+        // The new member is visible to the projector now; the reservation is not held any longer.
+        DelegationSpawnAdmission.finish(spawnAdmission)
         do {
             #if DEBUG
                 await testAfterTargetResolution?(target)

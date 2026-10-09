@@ -7,7 +7,8 @@ import RepoPromptDomainRuntime
 // only perform the already-authorized effect through the existing owner of that state:
 // - links go through `AgentSessionLinkRuntimeBridge.addMonitorLink` / `stopMonitorLink` (link
 //   authority stays the sole owner);
-// - placement through the owning window's `setDelegationPlacement`;
+// - placement through the owning window's `commitDelegationPlacement` (in memory synchronously,
+//   durable write queued);
 // - model/effort through the target's existing model-commit seam;
 // - worktree bindings through `transitionWorktreeBindings(.externalManagement)`;
 // - merge apply through the existing user merge-review prompt.
@@ -30,9 +31,11 @@ enum SessionAdminLifecycleOutcome: Equatable {
 
 @MainActor
 protocol SessionAdminStructureHost: AnyObject {
-    /// Writes organizational placement; `delegationScopeID == nil` keeps the existing value.
-    /// Spawn provenance is never written. Returns `false` when no loaded window owns the session.
-    func setOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) async throws -> Bool
+    /// Applies organizational placement synchronously, with no suspension, so the handler's final
+    /// re-validation and this write form one critical section; the returned commit carries the queued
+    /// durable write. `delegationScopeID == nil` keeps the existing value. Spawn provenance is never
+    /// written. Returns `nil` when no loaded window owns the session.
+    func commitOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) throws -> DelegationPlacementCommit?
     /// Capabilities of the active link from `observer` to `target`, or `nil` when none.
     func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>?
     /// Capabilities every link minted through the bridge carries.
@@ -93,8 +96,9 @@ protocol SessionAdminWorktreeHost: AnyObject {
     ) async throws -> SessionAdminWorktreeInfo
     /// Binds `worktree` (selector: `@id:`, path, branch, or name) for the target now. Throws when the
     /// target is not idle; the handler decides whether to defer. `isStillAuthorized` is evaluated
-    /// synchronously right before the binding transition and again at its commit fence; `false`
-    /// throws `SessionAdminHostError.authorityEnded` and nothing changes.
+    /// synchronously right before the binding transition and again at its `beforeCommit` fence; `false`
+    /// throws `SessionAdminHostError.authorityEnded` and nothing changes. Work after that fence
+    /// (recovery handoff, publication) is not re-checked, as with `manage_worktree`.
     func bindWorktree(
         sessionID: UUID,
         worktree: String,

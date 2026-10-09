@@ -113,9 +113,16 @@ extension AgentModeViewModel {
         else { return incomplete }
 
         if let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
-           AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease)
+           AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease),
+           DelegationSpawnTargetPlacement(
+               organizationalParentID: session.organizationalParentID,
+               parentSessionID: session.parentSessionID,
+               createdByOverseerSessionID: session.createdByOverseerSessionID,
+               delegationScopeID: session.delegationScopeID
+           ).admitsStamp(by: creatorSessionID)
         {
-            // Auto-join before the first save so the lane's placement is durable with it.
+            // Auto-join before the first save so the lane's placement is durable with it. Like every
+            // stamp, it never overwrites an existing placement or scope.
             session.organizationalParentID = creatorSessionID
             session.delegationScopeID = scopeID
         }
