@@ -38,21 +38,28 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         // Validate before the (possibly slow) snapshot.
         let filter = batch.request.operation == .adminInventory ? try AgentSessionAdminArguments.filter(args["filter"]) : nil
         let limit = try AgentSessionAdminArguments.limit(args)
-        let snapshot = await source.snapshot()
+        let full = await source.snapshot()
         // Re-check authority after the suspension: a revoked or expired scope reveals nothing.
         guard isScopeCurrent(batch.scope), batch.leases.allSatisfy(isLeaseCurrent) else {
             throw SessionAdminMCPToolService.unavailableError
         }
+        // Membership is decided on the full snapshot; everything rendered, counted, filtered, or
+        // classified below comes from the scope-restricted view, so no output can name, count, or
+        // reflect a session outside the scope.
         let visibility = AgentSessionScopeVisibility(chain: scopeChain(batch.scope.id))
+        let snapshot = full.restricted(to: Set(
+            full.records.values
+                .filter { visibility.isVisible($0, in: full) }
+                .map(\.sessionID)
+        ))
         let date = now()
         func visible(_ id: UUID) -> DomainAgentSessionInventoryRecord? {
-            snapshot.records[id].flatMap { visibility.isVisible($0, in: snapshot) ? $0 : nil }
+            snapshot.records[id]
         }
 
         switch batch.request.operation {
         case .adminInventory:
             let matches = snapshot.records.values
-                .filter { visibility.isVisible($0, in: snapshot) }
                 .filter { filter?.matchesStructured($0, in: snapshot, now: date) ?? true }
                 .filter { AgentSessionInventoryRendering.matchesQuery(filter?.query, record: $0) }
                 .sorted { lhs, rhs in
@@ -79,7 +86,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             })
             row["children"] = .array(
                 snapshot.records.values
-                    .filter { $0.effectiveParentID == target && visibility.isVisible($0, in: snapshot) }
+                    .filter { $0.effectiveParentID == target }
                     .sorted { $0.lastActivityAt > $1.lastActivityAt }
                     .map { .string($0.sessionID.uuidString) }
             )
@@ -89,7 +96,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             let rootID = batch.request.targetSessionIDs.first ?? defaultRoot(batch)
             guard let rootID, let root = visible(rootID) else { throw SessionAdminMCPToolService.unavailableError }
             var childrenByParent: [UUID: [DomainAgentSessionInventoryRecord]] = [:]
-            for record in snapshot.records.values where visibility.isVisible(record, in: snapshot) {
+            for record in snapshot.records.values {
                 if let parent = record.effectiveParentID, parent != record.sessionID {
                     childrenByParent[parent, default: []].append(record)
                 }
@@ -107,7 +114,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     "pinned": .bool(record.isPinned),
                     "observes": .array(
                         snapshot.edges(touching: record.sessionID)
-                            .filter { $0.observerSessionID == record.sessionID }
+                            .filter { $0.observerSessionID == record.sessionID && visible($0.targetSessionID) != nil }
                             .map { .string($0.targetSessionID.uuidString) }
                     )
                 ]
@@ -131,9 +138,9 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
 
         case .adminLinks:
             let focus = batch.request.targetSessionIDs.first
+            if let focus, visible(focus) == nil { throw SessionAdminMCPToolService.unavailableError }
             let edges = snapshot.edges.filter { edge in
-                if let focus, !edge.touches(focus) { return false }
-                return visible(edge.observerSessionID) != nil || visible(edge.targetSessionID) != nil
+                focus.map(edge.touches) ?? true
             }
             return .object([
                 "result": .string("ok"),

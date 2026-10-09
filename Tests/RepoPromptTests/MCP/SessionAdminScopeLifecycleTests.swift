@@ -679,6 +679,10 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
     final class FakeOrganizer: AgentSessionOrganizingBackend {
         var states: [UUID: AgentSessionOrganizeState] = [:]
         var stopped: [UUID] = []
+        /// Every session whose stored state any write touched, in order.
+        var written: [UUID] = []
+        /// Archive calls; each re-checks authorization inside the stash's mutation context.
+        var archiveAuthorizationChecks = 0
 
         func add(
             _ id: UUID, workspace: UUID, name: String, pinned: Bool = false, pinnedOrder: Int? = nil,
@@ -728,37 +732,43 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             return changed
         }
 
-        func setPinnedOrder(_ orderedSessionIDs: [UUID], workspaceID _: UUID) -> Bool {
-            for (rank, id) in orderedSessionIDs.enumerated() {
-                states[id]?.pinnedOrder = rank
-            }
-            return true
-        }
-
-        func setGroup(_ group: String?, order: Int?, sessionIDs: [UUID]) -> Set<UUID> {
+        func setPinnedRanks(_ ranks: [UUID: Int?]) -> Set<UUID> {
             var changed: Set<UUID> = []
-            for id in sessionIDs where states[id]?.sidebarGroup != group {
-                states[id]?.sidebarGroup = group
-                states[id]?.sidebarGroupOrder = group == nil ? nil : order
+            for (id, rank) in ranks where states[id]?.isPinned == true && states[id]?.isArchived == false {
+                guard states[id]?.pinnedOrder != rank else { continue }
+                states[id]?.pinnedOrder = rank
+                written.append(id)
                 changed.insert(id)
             }
             return changed
         }
 
-        func setGroupOrders(_ orders: [String: Int], workspaceID: UUID) -> Bool {
-            for (id, state) in states where state.workspaceID == workspaceID {
-                if let group = state.sidebarGroup, let order = orders[group] { states[id]?.sidebarGroupOrder = order }
+        func setGroup(_ group: String?, order: Int?, sessionIDs: [UUID]) -> Set<UUID> {
+            var changed: Set<UUID> = []
+            for id in sessionIDs
+                where states[id]?.sidebarGroup != group || states[id]?.sidebarGroupOrder != (group == nil ? nil : order)
+            {
+                states[id]?.sidebarGroup = group
+                states[id]?.sidebarGroupOrder = group == nil ? nil : order
+                written.append(id)
+                changed.insert(id)
             }
-            return true
+            return changed
         }
 
-        func restore(_ state: AgentSessionOrganizeState) -> Bool {
-            guard states[state.sessionID] != nil else { return false }
-            states[state.sessionID] = state
-            return true
+        func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID> {
+            var changed: Set<UUID> = []
+            for (id, value) in values where states[id]?.sidebarGroup != nil && states[id]?.sidebarGroupOrder != value {
+                states[id]?.sidebarGroupOrder = value
+                written.append(id)
+                changed.insert(id)
+            }
+            return changed
         }
 
-        func archive(_ sessionIDs: [UUID]) async -> Set<UUID> {
+        func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID> {
+            archiveAuthorizationChecks += 1
+            guard isAuthorized() else { return [] }
             var changed: Set<UUID> = []
             for id in sessionIDs where states[id]?.isArchived == false {
                 states[id]?.isArchived = true
@@ -790,6 +800,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         unowned let links: FakeLinks
         var historyOnly: [DomainAgentSessionInventoryRecord] = []
         var idleDays: [UUID: Double] = [:]
+        var creators: [UUID: UUID] = [:]
         let now: Date
 
         init(organizer: FakeOrganizer, provenance: FakeProvenance, links: FakeLinks, now: Date) {
@@ -807,6 +818,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                     sidebarGroup: state.sidebarGroup, sidebarGroupOrder: state.sidebarGroupOrder,
                     runState: state.runState == .idle ? .idle : .running,
                     parentSessionID: provenance.sessions[state.sessionID]?.parentSessionID,
+                    createdByOverseerSessionID: creators[state.sessionID],
                     lastActivityAt: now.addingTimeInterval(-(idleDays[state.sessionID] ?? 0) * 86400)
                 )
             }
@@ -1016,7 +1028,6 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(stale["result"], .string("order_conflict"))
         XCTAssertEqual(stale["current_order"], ids([a, b]))
         XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), [a, x, b])
-
         let applied = try await fixture.call([
             "op": .string("reorder_pins"), "order": ids([b, a]), "expected_order": ids([a, b])
         ])
@@ -1026,11 +1037,13 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             [b, x, a],
             "the outsider keeps its slot"
         )
+        XCTAssertFalse(fixture.organizer.written.contains(x), "the outsider's rank is never written")
 
         let token = try XCTUnwrap(applied["undo_token"]?.stringValue)
         let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
         XCTAssertEqual(undone["result"], .string("undone"))
         XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), [a, x, b])
+        XCTAssertFalse(fixture.organizer.written.contains(x), "undo never writes the outsider either")
     }
 
     func testReorderGroupsCASOverEveryMemberOfTheNamedGroups() async throws {
@@ -1256,5 +1269,198 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "an always-carded op is claimed by the core and ends applied"
         )
         XCTAssertTrue(fixture.organizer.stopped.isEmpty)
+    }
+
+    // MARK: - Review fixes
+
+    /// M1: archive stashes the tab (cancelling a run), so a non-idle target needs `control`, both as
+    /// authorized and as re-read by the handler; undo of unarchive follows the same rule.
+    func testArchiveRequiresControlForNonIdleTargetsIncludingFreshStateAndUndo() async throws {
+        let fixture = Fixture()
+        let running = fixture.member("Running", run: .running)
+        let turnedRunning = fixture.member("Turned running")
+        let idle = fixture.member("Idle")
+        try fixture.grant([.observe, .organize, .restructure])
+        // Authorized as idle (projector) but running when the handler re-reads it.
+        fixture.organizer.states[turnedRunning]?.runState = .running
+
+        let reply = try await fixture.call(["op": .string("archive"), "targets": ids([running, turnedRunning, idle])])
+        XCTAssertEqual(reply["requires_control"], ids([running]))
+        XCTAssertEqual(items(reply)[turnedRunning.uuidString], "skipped")
+        XCTAssertEqual(items(reply)[idle.uuidString], "changed")
+        XCTAssertEqual(fixture.organizer.states[running]?.isArchived, false)
+        XCTAssertEqual(fixture.organizer.states[turnedRunning]?.isArchived, false)
+        XCTAssertEqual(fixture.organizer.states[idle]?.isArchived, true)
+
+        // Undo of unarchive is an archive: re-authorized and re-checked the same way.
+        let unarchived = try await fixture.call(["op": .string("unarchive"), "session_id": .string(idle.uuidString)])
+        let token = try XCTUnwrap(unarchived["undo_token"]?.stringValue)
+        fixture.provenance.add(idle, parent: fixture.overseer, workspace: fixture.workspace, state: .running)
+        fixture.organizer.states[idle]?.runState = .running
+        let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
+        XCTAssertEqual(undone["requires_control"], ids([idle]))
+        XCTAssertEqual(fixture.organizer.states[idle]?.isArchived, false, "a running session is not stashed without control")
+
+        // With control, a running member is archived.
+        let full = Fixture()
+        let busy = full.member("Busy", run: .running)
+        try full.grant()
+        _ = try await full.call(["op": .string("archive"), "session_id": .string(busy.uuidString)])
+        XCTAssertEqual(full.organizer.states[busy]?.isArchived, true)
+    }
+
+    /// M2: a retire target that started running after authorization is neither stopped, unlinked,
+    /// nor archived without `control`.
+    func testRetireReverifiesControlForATargetThatStartedRunning() async throws {
+        let fixture = Fixture()
+        let lane = fixture.member("Lane")
+        let peer = fixture.member("Peer")
+        fixture.links.link(peer, lane)
+        try fixture.grant([.observe, .organize, .restructure])
+        let pending = try await fixture.call([
+            "op": .string("retire"), "session_id": .string(lane.uuidString), "idempotency_key": .string("retire-m2")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        // Starts running after the card; the projector still reports idle, the handler re-reads it.
+        fixture.organizer.states[lane]?.runState = .running
+        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
+        let item = try XCTUnwrap(result["items"]?.arrayValue?.single?.objectValue)
+        XCTAssertEqual(item["reason"], .string("requires_control"))
+        XCTAssertTrue(fixture.organizer.stopped.isEmpty)
+        XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+        XCTAssertTrue(fixture.links.stoppedLinkIDs.isEmpty, "nothing is done to the target")
+    }
+
+    /// M4: no output names, counts, or reflects a session outside the scope.
+    func testInventoryOutputsNeverRevealOutOfScopeSessions() async throws {
+        let fixture = Fixture()
+        let secretName = "SECRET-OUTSIDER"
+        let outsider = fixture.outsider(secretName)
+        let lane = fixture.member("Lane")
+        let spawned = fixture.member("Spawned")
+        fixture.inventory.creators[spawned] = outsider
+        fixture.links.link(outsider, lane)
+        fixture.links.link(lane, outsider)
+        let ghost = UUID()
+        fixture.links.persisted.append(AgentSessionOversightIntent(observerSessionID: ghost, targetSessionID: lane))
+        try fixture.grant()
+
+        var outputs: [[String: Value]] = []
+        try await outputs.append(fixture.call(["op": .string("inventory")]))
+        try await outputs.append(fixture.call(["op": .string("inventory"), "filter": .object(["has_links": .bool(true)])]))
+        try await outputs.append(fixture.call(["op": .string("get"), "session_id": .string(lane.uuidString)]))
+        try await outputs.append(fixture.call(["op": .string("get"), "session_id": .string(spawned.uuidString)]))
+        try await outputs.append(fixture.call(["op": .string("tree")]))
+        try await outputs.append(fixture.call(["op": .string("links")]))
+        try await outputs.append(fixture.call(["op": .string("links"), "session_id": .string(lane.uuidString)]))
+        for output in outputs {
+            let text = String(describing: output)
+            XCTAssertFalse(text.contains(outsider.uuidString), text)
+            XCTAssertFalse(text.contains(secretName), text)
+            XCTAssertFalse(text.contains(ghost.uuidString), "deleted sessions are reported as missing, without IDs")
+        }
+        let laneRow = try XCTUnwrap(outputs[2]["session"]?.objectValue)
+        XCTAssertEqual(laneRow["link_count"], .int(1), "only the deleted-observer intent counts")
+        XCTAssertEqual(
+            laneRow["orphan_reasons"],
+            .array([.string("link_intent_missing_session"), .string("observer_archived_or_deleted")])
+        )
+        let spawnedRow = try XCTUnwrap(outputs[3]["session"]?.objectValue)
+        XCTAssertNil(spawnedRow["created_by_overseer_session_id"])
+        XCTAssertEqual(spawnedRow["orphaned"], .bool(false), "an out-of-scope creator is hidden, not missing")
+        do {
+            _ = try await fixture.call(["op": .string("links"), "session_id": .string(outsider.uuidString)])
+            XCTFail("focusing an outside session is refused uniformly")
+        } catch {}
+    }
+
+    /// S2: explicit targets in an unloaded workspace get a per-item result; unknown ones stay uniform.
+    func testExplicitUnloadedTargetsReportWorkspaceNotLoadedWithAProductionShapedProjector() async throws {
+        let fixture = Fixture()
+        let loaded = fixture.member("Loaded")
+        let unloaded = UUID()
+        // Production projectors only see loaded workspaces: the unloaded member is in history only.
+        fixture.inventory.historyOnly = [DomainAgentSessionInventoryRecord(
+            sessionID: unloaded, name: "Unloaded", workspaceID: UUID(), isLoaded: false,
+            parentSessionID: fixture.overseer, lastActivityAt: fixture.now
+        )]
+        try fixture.grant()
+        let reply = try await fixture.call(["op": .string("set_pin"), "targets": ids([loaded, unloaded]), "pinned": .bool(true)])
+        XCTAssertEqual(items(reply)[loaded.uuidString], "changed")
+        XCTAssertEqual(items(reply)[unloaded.uuidString], "skipped")
+        let only = try await fixture.call(["op": .string("set_pin"), "session_id": .string(unloaded.uuidString), "pinned": .bool(true)])
+        XCTAssertEqual(items(only)[unloaded.uuidString], "skipped")
+        do {
+            _ = try await fixture.call(["op": .string("set_pin"), "session_id": .string(UUID().uuidString), "pinned": .bool(true)])
+            XCTFail("an unknown session keeps the uniform denial")
+        } catch {}
+    }
+
+    /// S3/S4: joining a group takes the group's own order value; a new group goes after the largest.
+    func testSetGroupUsesExistingOrderValuesAndNewGroupsAppend() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A")
+        let b = fixture.member("B")
+        let c = fixture.member("C")
+        let x = fixture.outsider("X")
+        fixture.organizer.states[x]?.sidebarGroup = "Shared"
+        fixture.organizer.states[x]?.sidebarGroupOrder = 7
+        try fixture.grant()
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(a.uuidString), "group": .string("Shared")])
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 7)
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(b.uuidString), "group": .string("New")])
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 8)
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(c.uuidString), "group": .string("Newer")])
+        XCTAssertEqual(fixture.organizer.states[c]?.sidebarGroupOrder, 9)
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+
+        // Reordering two groups swaps only their values and writes only their carriers.
+        _ = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Newer"), .string("New")]),
+            "expected_order": .array([.string("New"), .string("Newer")])
+        ])
+        XCTAssertEqual(fixture.organizer.states[c]?.sidebarGroupOrder, 8)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 9)
+        XCTAssertEqual(fixture.organizer.states[x]?.sidebarGroupOrder, 7)
+        XCTAssertFalse(fixture.organizer.written.contains(x))
+    }
+
+    /// S8: only calls that changed something are replayed; a no-op is re-evaluated on retry.
+    func testIdempotencyLedgerRecordsOnlyChangingResults() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", pinned: true)
+        try fixture.grant()
+        let args: [String: Value] = [
+            "op": .string("set_pin"), "session_id": .string(a.uuidString), "pinned": .bool(true),
+            "idempotency_key": .string("pin-noop")
+        ]
+        let noop = try await fixture.call(args)
+        XCTAssertEqual(items(noop)[a.uuidString], "unchanged")
+        fixture.organizer.states[a]?.isPinned = false
+        let retry = try await fixture.call(args)
+        XCTAssertNil(retry["idempotent_replay"])
+        XCTAssertEqual(items(retry)[a.uuidString], "changed")
+        XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
+        let replay = try await fixture.call(args)
+        XCTAssertEqual(replay["idempotent_replay"], .bool(true))
+    }
+
+    /// S1: an index written under another schema leaves the scan incomplete (orphan detection off).
+    func testSchemaMismatchedHistoryIndexMakesTheScanIncomplete() {
+        let directory = URL(fileURLWithPath: "/tmp/history-fixture")
+        func scan(schema: Int?, readFailed: Bool = false) -> HistoryInventoryScan {
+            HistoryInventoryScan(
+                workspaces: [HistoryWorkspaceScanResult(
+                    workspaceDir: directory, workspaceName: "W", workspaceID: UUID(), records: [],
+                    indexReadFailed: readFailed, indexSchemaVersion: schema
+                )],
+                diagnostics: []
+            )
+        }
+        XCTAssertTrue(LiveAgentSessionInventorySource.isComplete(scan(schema: nil)))
+        XCTAssertFalse(LiveAgentSessionInventorySource.isComplete(scan(schema: 7)))
+        XCTAssertFalse(LiveAgentSessionInventorySource.isComplete(scan(schema: nil, readFailed: true)))
     }
 }

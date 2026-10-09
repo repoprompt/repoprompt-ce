@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
 
@@ -278,8 +279,10 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         lastModified = try c.decodeIfPresent(Date.self, forKey: .lastModified) ?? WorkspaceDecodeSynthesis.mark(Date())
         isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         pinnedOrder = try? c.decode(Int.self, forKey: .pinnedOrder)
-        // Additive and optional like `pinnedOrder`: absent or malformed values decode as ungrouped.
-        sidebarGroup = try? c.decode(String.self, forKey: .sidebarGroup)
+        // Additive and optional like `pinnedOrder`: absent, malformed, or invalid names (empty,
+        // multi-line, over-long) decode as ungrouped; valid names are trimmed like the ops write them.
+        sidebarGroup = (try? c.decode(String.self, forKey: .sidebarGroup))
+            .flatMap(DomainAgentSessionSidebarGroup.normalizedName)
         sidebarGroupOrder = sidebarGroup == nil ? nil : try? c.decode(Int.self, forKey: .sidebarGroupOrder)
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)

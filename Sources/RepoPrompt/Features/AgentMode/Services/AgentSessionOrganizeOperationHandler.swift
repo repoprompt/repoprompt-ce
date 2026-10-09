@@ -2,14 +2,37 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+/// One field a reversible organize call changed: the value before, and the value the call wrote.
+enum AgentSessionOrganizeFieldChange: Equatable {
+    case name(before: String, after: String)
+    case pinned(before: Bool, beforeRank: Int?, after: Bool)
+    /// Pin rank only (reorders and rank materialization).
+    case pinRank(before: Int?, after: Int?)
+    case group(before: String?, beforeOrder: Int?, after: String?, afterOrder: Int?)
+    /// Group order value only (group reorders).
+    case groupOrder(before: Int?, after: Int?)
+}
+
+struct AgentSessionOrganizeFieldRestore: Equatable {
+    let sessionID: UUID
+    let change: AgentSessionOrganizeFieldChange
+}
+
 /// What `undo` restores for one reversible organize call.
 enum AgentSessionOrganizeUndoPayload {
-    /// Exact prior name/pin/order/group state.
-    case restore([AgentSessionOrganizeState])
+    /// Exactly the fields the call changed. Each is restored only while it still holds the value the
+    /// call wrote, and only on a session the undo holds its own lease for.
+    case fields([AgentSessionOrganizeFieldRestore])
     /// Undo of `archive`.
     case unarchive([UUID])
-    /// Undo of `unarchive`.
+    /// Undo of `unarchive`; authorized as `archive` (state-dependent).
     case archive([UUID])
+
+    /// The operation an undo is re-authorized as.
+    func authorizationOperation(original: DomainAgentSessionTargetOperation) -> DomainAgentSessionTargetOperation {
+        if case .archive = self { return .adminArchive }
+        return original
+    }
 }
 
 /// Thrown by target derivation when the call ends with a result rather than a batch.
@@ -30,6 +53,8 @@ protocol AgentSessionAdministrationUndoing: AnyObject {
     typealias UndoEntry = DomainAgentSessionAdministrationUndoLedger<AgentSessionOrganizeUndoPayload>.Entry
     func redeemUndo(token: String, granteeSessionID: UUID) -> DomainAgentSessionAdministrationUndoLedger<AgentSessionOrganizeUndoPayload>.Redeem
     func performUndo(_ entry: UndoEntry, batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value
+    /// Puts back a token whose undo was refused, so a denial never burns it.
+    func restoreUndo(_ entry: UndoEntry)
 }
 
 /// `rename`, `set_pin`, `reorder_pins`, `set_group`, `reorder_groups`, `archive`, `unarchive`.
@@ -47,6 +72,9 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     private let backend: any AgentSessionOrganizingBackend
     private let isLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
+    /// Whether the scope is still live and its whole chain holds `control`, for targets that turned
+    /// out not to be idle when re-read.
+    private let holdsControl: @MainActor (DomainDelegationScopeRecord) -> Bool
     private let now: () -> Date
     private let makeToken: () -> String
     private var undoLedger: DomainAgentSessionAdministrationUndoLedger<AgentSessionOrganizeUndoPayload>
@@ -54,12 +82,14 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
     init(
         backend: any AgentSessionOrganizingBackend,
         isLeaseCurrent: @escaping @MainActor (DomainDelegationScopeLease) -> Bool,
+        holdsControl: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool,
         now: @escaping () -> Date = Date.init,
         makeToken: @escaping () -> String = { UUID().uuidString },
         undoLifetime: TimeInterval = 15 * 60
     ) {
         self.backend = backend
         self.isLeaseCurrent = isLeaseCurrent
+        self.holdsControl = holdsControl
         self.now = now
         self.makeToken = makeToken
         undoLedger = DomainAgentSessionAdministrationUndoLedger(lifetime: undoLifetime)
@@ -241,14 +271,24 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             changed.insert(state.sessionID)
         }
         record(context, attempted: states, changed: changed)
-        return .restore(states.filter { changed.contains($0.sessionID) })
+        return .fields(states.filter { changed.contains($0.sessionID) }.compactMap { state in
+            // Store what was actually written (rename validates the name).
+            backend.state(of: state.sessionID).map {
+                AgentSessionOrganizeFieldRestore(sessionID: state.sessionID, change: .name(before: state.name, after: $0.name))
+            }
+        })
     }
 
     private func setPin(_ context: Context, pinned: Bool) -> AgentSessionOrganizeUndoPayload? {
         let states = currentOnly(context, eligibleStates(context, archived: false) { $0.isPinned == pinned })
         let changed = states.isEmpty ? [] : backend.setPinned(pinned, sessionIDs: states.map(\.sessionID))
         record(context, attempted: states, changed: changed)
-        return .restore(states.filter { changed.contains($0.sessionID) })
+        return .fields(states.filter { changed.contains($0.sessionID) }.map {
+            AgentSessionOrganizeFieldRestore(
+                sessionID: $0.sessionID,
+                change: .pinned(before: $0.isPinned, beforeRank: $0.pinnedOrder, after: pinned)
+            )
+        })
     }
 
     private func reorderPins(_ context: Context, args: [String: Value]) throws -> Value {
@@ -272,32 +312,44 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         guard let workspaceID, let current = backend.pinnedSessionOrder(workspaceID: workspaceID) else {
             return Self.workspaceNotLoaded(workspaceID)
         }
-        let next: [UUID]
-        switch DomainAgentSessionOrdering.permute(current: current, expected: expected, desired: order, describe: \.uuidString) {
-        case let .success(value): next = value
-        case let .failure(error): return Self.orderingFailure(error)
+        // CAS on the named pins' current relative order.
+        if case let .failure(error) = DomainAgentSessionOrdering.permute(
+            current: current, expected: expected, desired: order, describe: \.uuidString
+        ) {
+            return Self.orderingFailure(error)
         }
-        // Undo restores every pin rank this write assigns; positions of pins outside the call are
-        // unchanged (they keep their slots).
-        let before = current.compactMap { backend.state(of: $0) }
+        // The named pins swap their explicit rank values among themselves; no other pin is written,
+        // unless ranks must first be materialized (documented on `DomainAgentSessionPinRanks`).
+        let rankBefore = Dictionary(uniqueKeysWithValues: current.map { ($0, backend.state(of: $0)?.pinnedOrder) })
+        let planned = DomainAgentSessionPinRanks.reordered(
+            current: current.map { ($0, rankBefore[$0] ?? nil) },
+            desired: order
+        )
+        let writes = planned.ranks.filter { rankBefore[$0.key] ?? nil != $0.value }
         guard order.allSatisfy(context.isCurrent) else {
             return Self.scopeNoLongerCurrent(context.batch.request.operation)
         }
-        guard next == current || backend.setPinnedOrder(next, workspaceID: workspaceID) else {
-            throw AgentSessionAdminArguments.invalid("the pinned sessions changed before reordering; list them and retry.")
-        }
-        let moved = Set(zip(current, next).filter { $0 != $1 }.map(\.1))
+        let changed = writes.isEmpty ? [] : backend.setPinnedRanks(writes.mapValues { Optional($0) })
+        let named = Set(order)
         for id in order {
-            context.add(id, moved.contains(id) ? .changed : .unchanged)
+            context.add(id, changed.contains(id) ? .changed : .unchanged)
         }
+        let materialized = changed.subtracting(named).count
+        if materialized > 0 { context.extra["ranks_materialized"] = .int(materialized) }
         context.extra["workspace_id"] = .string(workspaceID.uuidString)
-        context.extra["pinned_order"] = .array(next.map { .string($0.uuidString) })
-        return finish(context, payload: moved.isEmpty ? nil : .restore(before))
+        context.extra["pinned_order"] = .array(
+            (backend.pinnedSessionOrder(workspaceID: workspaceID) ?? [])
+                .filter(named.contains).map { .string($0.uuidString) }
+        )
+        return finish(context, payload: .fields(changed.sorted { $0.uuidString < $1.uuidString }.map { id in
+            AgentSessionOrganizeFieldRestore(sessionID: id, change: .pinRank(before: rankBefore[id] ?? nil, after: writes[id]))
+        }))
     }
 
     private func setGroup(_ context: Context, group: String?) throws -> AgentSessionOrganizeUndoPayload? {
         let states = currentOnly(context, eligibleStates(context, archived: false) { $0.sidebarGroup == group })
         var changed: Set<UUID> = []
+        var writtenOrder: [UUID: Int?] = [:]
         let byWorkspace = Dictionary(grouping: states, by: \.workspaceID)
         for workspaceID in byWorkspace.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
             let ids = byWorkspace[workspaceID]?.map(\.sessionID) ?? []
@@ -307,10 +359,21 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                     existing: (backend.groupEntries(workspaceID: workspaceID) ?? []).map { ($0.group, $0.order) }
                 )
             }
+            for id in ids {
+                writtenOrder[id] = order
+            }
             changed.formUnion(backend.setGroup(group, order: order, sessionIDs: ids))
         }
         record(context, attempted: states, changed: changed)
-        return .restore(states.filter { changed.contains($0.sessionID) })
+        return .fields(states.filter { changed.contains($0.sessionID) }.map {
+            AgentSessionOrganizeFieldRestore(
+                sessionID: $0.sessionID,
+                change: .group(
+                    before: $0.sidebarGroup, beforeOrder: $0.sidebarGroupOrder,
+                    after: group, afterOrder: writtenOrder[$0.sessionID] ?? nil
+                )
+            )
+        })
     }
 
     private func reorderGroups(_ context: Context, args: [String: Value]) throws -> Value {
@@ -332,32 +395,71 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             ])
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
-        let next: [String]
-        switch DomainAgentSessionOrdering.permute(current: current, expected: expected, desired: order, describe: { $0 }) {
-        case let .success(value): next = value
-        case let .failure(error): return Self.orderingFailure(error)
+        if case let .failure(error) = DomainAgentSessionOrdering.permute(
+            current: current, expected: expected, desired: order, describe: { $0 }
+        ) {
+            return Self.orderingFailure(error)
         }
-        let before = affected.compactMap { backend.state(of: $0) }
+        // The named groups' values are redistributed among them; only their carriers are written.
+        let values = DomainAgentSessionSidebarGroup.redistributedOrders(
+            desired: order,
+            entries: entries.map { ($0.group, $0.order) }
+        )
+        var before: [UUID: Int?] = [:]
+        var writes: [UUID: Int?] = [:]
+        for entry in entries {
+            guard let value = values[entry.group] else { continue }
+            before[entry.sessionID] = entry.order
+            if entry.order != value { writes[entry.sessionID] = value }
+        }
         guard affected.allSatisfy(context.isCurrent) else {
             return Self.scopeNoLongerCurrent(context.batch.request.operation)
         }
-        let orders = Dictionary(uniqueKeysWithValues: next.enumerated().map { ($0.element, $0.offset) })
-        guard backend.setGroupOrders(orders, workspaceID: workspaceID) else { return Self.workspaceNotLoaded(workspaceID) }
-        let after = Dictionary(uniqueKeysWithValues: affected.compactMap { id in backend.state(of: id).map { (id, $0) } })
-        for state in before {
-            context.add(state.sessionID, after[state.sessionID]?.sidebarGroupOrder == state.sidebarGroupOrder ? .unchanged : .changed)
+        let changed = writes.isEmpty ? [] : backend.setGroupOrderValues(writes)
+        for id in affected {
+            context.add(id, changed.contains(id) ? .changed : .unchanged)
         }
         context.extra["workspace_id"] = .string(workspaceID.uuidString)
-        context.extra["group_order"] = .array(next.map(Value.string))
-        let changed = before.contains { after[$0.sessionID]?.sidebarGroupOrder != $0.sidebarGroupOrder }
-        return finish(context, payload: changed ? .restore(before) : nil)
+        let after = backend.groupEntries(workspaceID: workspaceID) ?? []
+        context.extra["group_order"] = .array(
+            DomainAgentSessionSidebarGroup.orderedGroups(after.map { ($0.group, $0.order) })
+                .filter(Set(order).contains).map(Value.string)
+        )
+        return finish(context, payload: .fields(changed.sorted { $0.uuidString < $1.uuidString }.map { id in
+            AgentSessionOrganizeFieldRestore(
+                sessionID: id,
+                change: .groupOrder(before: before[id] ?? nil, after: writes[id] ?? nil)
+            )
+        }))
     }
 
     private func archive(_ context: Context) async -> AgentSessionOrganizeUndoPayload? {
-        let states = currentOnly(context, eligibleStates(context, archived: false) { _ in false })
-        let changed = states.isEmpty ? [] : await backend.archive(states.map(\.sessionID))
+        let states = currentOnly(context, controlCheckedForStash(context, eligibleStates(context, archived: false) { _ in false }))
+        let changed = await archiveAuthorized(context, states.map(\.sessionID))
         record(context, attempted: states, changed: changed)
         return .unarchive(states.map(\.sessionID).filter(changed.contains))
+    }
+
+    /// Archiving stashes the tab, which cancels a live run and its pending prompts. The authority
+    /// admitted these targets against the run state it saw; the state is re-read now, and a target
+    /// that is not idle is archived only while the scope chain still holds `control`. Otherwise it is
+    /// reported as `requires_control` and left alone.
+    private func controlCheckedForStash(
+        _ context: Context,
+        _ states: [AgentSessionOrganizeState]
+    ) -> [AgentSessionOrganizeState] {
+        states.filter { state in
+            guard state.runState != .idle else { return true }
+            if holdsControl(context.batch.scope) { return true }
+            context.add(state.sessionID, .skipped, "requires_control")
+            return false
+        }
+    }
+
+    /// Stash with every target's lease folded into the stash's own mutation-context check.
+    private func archiveAuthorized(_ context: Context, _ ids: [UUID]) async -> Set<UUID> {
+        guard !ids.isEmpty else { return [] }
+        return await backend.archive(ids, isAuthorized: { ids.allSatisfy(context.isCurrent) })
     }
 
     private func unarchive(_ context: Context) -> AgentSessionOrganizeUndoPayload? {
@@ -377,6 +479,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 token: makeToken(),
                 granteeSessionID: grantee,
                 scopeID: context.batch.scope.id,
+                scopeGeneration: context.batch.scope.generation,
                 operation: context.batch.request.operation,
                 targetSessionIDs: context.targets,
                 payload: payload,
@@ -405,22 +508,27 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         undoLedger.redeem(token: token, granteeSessionID: granteeSessionID, now: now())
     }
 
+    /// Puts a redeemed token back (its undo was refused, so it must not be burned).
+    func restoreUndo(_ entry: UndoEntry) {
+        undoLedger.restore(entry)
+    }
+
     func performUndo(_ entry: UndoEntry, batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
         let context = Context(batch: batch, leases: leases, isLeaseCurrent: isLeaseCurrent)
         switch entry.payload {
-        case let .restore(states):
-            for state in states {
-                // Rank-only restores of pins outside the call ride on the call's own authorization.
-                let gate = leases[state.sessionID] ?? batch.leases.first
-                guard let gate, isLeaseCurrent(gate) else {
-                    context.add(state.sessionID, .failed, "scope_no_longer_current")
+        case let .fields(restores):
+            for restore in restores {
+                // Every restore needs the session's own lease; a materialized rank on a pin outside
+                // the call is left in place (it never changed that pin's position).
+                guard context.isCurrent(restore.sessionID) else {
+                    if leases[restore.sessionID] != nil {
+                        context.add(restore.sessionID, .failed, "scope_no_longer_current")
+                    }
                     continue
                 }
-                let restored = backend.restore(state)
-                if leases[state.sessionID] != nil {
-                    context.add(state.sessionID, restored ? .changed : .skipped, restored ? nil : "workspace_not_loaded")
-                }
+                let outcome = undoField(restore)
+                context.add(restore.sessionID, outcome.status, outcome.reason)
             }
         case let .unarchive(ids):
             let current = ids.filter(context.isCurrent)
@@ -429,16 +537,22 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 context.add(id, changed.contains(id) ? .changed : .skipped, changed.contains(id) ? nil : "not_restorable")
             }
         case let .archive(ids):
-            let current = ids.filter(context.isCurrent)
-            let changed = await backend.archive(current)
-            for id in ids {
+            // Re-authorized as `archive`, so not-idle targets without `control` were never admitted;
+            // the run state is re-read here as well.
+            let states = controlCheckedForStash(
+                context,
+                ids.filter(context.isCurrent).compactMap { backend.state(of: $0) }
+                    .filter { !$0.isArchived }
+            )
+            let changed = await archiveAuthorized(context, states.map(\.sessionID))
+            for id in ids where !context.items.contains(where: { $0.sessionID == id }) {
                 context.add(id, changed.contains(id) ? .changed : .skipped, changed.contains(id) ? nil : "not_archivable")
             }
         }
         var value = AgentSessionAdminRendering.mutationValue(
             operation: entry.operation,
             items: context.items,
-            itemsRequiringControl: [],
+            itemsRequiringControl: batch.itemsRequiringControl,
             extra: ["undone_op": .string(entry.operation.adminOperationName)]
         )
         if case var .object(object) = value {
@@ -446,6 +560,38 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             value = .object(object)
         }
         return value
+    }
+
+    /// Restores one field, only while it still holds the value the call wrote.
+    private func undoField(
+        _ restore: AgentSessionOrganizeFieldRestore
+    ) -> (status: AgentSessionAdminItemResult.Status, reason: String?) {
+        guard let state = backend.state(of: restore.sessionID), !state.isArchived else {
+            return (.skipped, "workspace_not_loaded")
+        }
+        let id = restore.sessionID
+        let applied: Bool
+        switch restore.change {
+        case let .name(before, after):
+            guard state.name == after else { return (.skipped, "changed_since") }
+            applied = backend.rename(id, to: before)
+        case let .pinned(before, beforeRank, after):
+            guard state.isPinned == after else { return (.skipped, "changed_since") }
+            applied = !backend.setPinned(before, sessionIDs: [id]).isEmpty
+            if applied, before, let beforeRank { _ = backend.setPinnedRanks([id: beforeRank]) }
+        case let .pinRank(before, after):
+            guard state.isPinned, state.pinnedOrder == after else { return (.skipped, "changed_since") }
+            applied = !backend.setPinnedRanks([id: before]).isEmpty
+        case let .group(before, beforeOrder, after, afterOrder):
+            guard state.sidebarGroup == after, state.sidebarGroupOrder == afterOrder else {
+                return (.skipped, "changed_since")
+            }
+            applied = !backend.setGroup(before, order: beforeOrder, sessionIDs: [id]).isEmpty
+        case let .groupOrder(before, after):
+            guard state.sidebarGroup != nil, state.sidebarGroupOrder == after else { return (.skipped, "changed_since") }
+            applied = !backend.setGroupOrderValues([id: before]).isEmpty
+        }
+        return applied ? (.changed, nil) : (.failed, "mutation_rejected")
     }
 
     // MARK: - Helpers
@@ -519,7 +665,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 private extension AgentSessionOrganizeUndoPayload {
     var isEffective: Bool {
         switch self {
-        case let .restore(states): !states.isEmpty
+        case let .fields(restores): !restores.isEmpty
         case let .unarchive(ids), let .archive(ids): !ids.isEmpty
         }
     }

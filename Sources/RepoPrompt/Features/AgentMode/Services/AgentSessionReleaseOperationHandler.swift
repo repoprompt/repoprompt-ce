@@ -49,17 +49,21 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
     private let isLeaseCurrent: @MainActor (DomainDelegationScopeLease) -> Bool
     /// Whether a session is a member of the scope (and every ancestor of an attenuated scope).
     private let isMember: @MainActor (UUID, DomainDelegationScopeRecord) -> Bool
+    /// Whether the scope is still live and its whole chain holds `control`.
+    private let holdsControl: @MainActor (DomainDelegationScopeRecord) -> Bool
 
     init(
         backend: any AgentSessionOrganizingBackend,
         links: any AgentSessionLinkReleasing,
         isLeaseCurrent: @escaping @MainActor (DomainDelegationScopeLease) -> Bool,
-        isMember: @escaping @MainActor (UUID, DomainDelegationScopeRecord) -> Bool
+        isMember: @escaping @MainActor (UUID, DomainDelegationScopeRecord) -> Bool,
+        holdsControl: @escaping @MainActor (DomainDelegationScopeRecord) -> Bool
     ) {
         self.backend = backend
         self.links = links
         self.isLeaseCurrent = isLeaseCurrent
         self.isMember = isMember
+        self.holdsControl = holdsControl
     }
 
     func confirmationItems(
@@ -92,10 +96,14 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     continue
                 }
                 if state.runState != .idle {
-                    // Admitted while not idle means the scope holds `control` (otherwise the authority
-                    // set this item aside as `requires_control`).
                     guard isCurrent(target) else {
                         items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current"))
+                        continue
+                    }
+                    // The target may have been idle when it was authorized and started running since.
+                    // Stopping it needs `control` now; without it nothing is done to this target.
+                    guard holdsControl(batch.scope) else {
+                        items.append(.init(sessionID: target, status: .skipped, reason: "requires_control"))
                         continue
                     }
                     detail["stopped"] = await .bool(backend.stopRun(target))
@@ -145,7 +153,12 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
                     continue
                 }
-                let archived = await backend.archive([target]).contains(target)
+                // Archiving stashes the tab and cancels any run: re-check run state once more.
+                if backend.state(of: target)?.runState ?? .unknown != .idle, !holdsControl(batch.scope) {
+                    items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                    continue
+                }
+                let archived = await backend.archive([target], isAuthorized: { isCurrent(target) }).contains(target)
                 detail["archived"] = .bool(archived)
                 let status: AgentSessionAdminItemResult.Status = archived ? .changed : (unlinked > 0 ? .changed : .failed)
                 items.append(.init(sessionID: target, status: status, reason: archived ? nil : "archive_rejected", detail: detail))

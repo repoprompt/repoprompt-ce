@@ -198,7 +198,61 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         let entries: [(group: String, order: Int?)] = [("B", 1), ("A", 0), ("B", 1), ("C", nil)]
         XCTAssertEqual(DomainAgentSessionSidebarGroup.orderedGroups(entries), ["A", "B", "C"])
         XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "B", existing: entries), 1)
-        XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "New", existing: entries), 3)
+        XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "New", existing: entries), 2, "max + 1, not a position")
+        XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "C", existing: entries), 2, "a group with no value gets max + 1")
+        XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "X", existing: []), 0)
+        XCTAssertEqual(DomainAgentSessionSidebarGroup.order(for: "B", existing: [("B", 9), ("A", 3)]), 9)
+    }
+
+    func testGroupReorderRedistributesOnlyTheNamedGroupsValues() {
+        let entries: [(group: String, order: Int?)] = [("A", 2), ("B", 5), ("C", 7), ("A", 2)]
+        XCTAssertEqual(
+            DomainAgentSessionSidebarGroup.redistributedOrders(desired: ["C", "A"], entries: entries),
+            ["C": 2, "A": 7],
+            "C and A swap their own values; B keeps 5"
+        )
+        // Named groups without distinct values get fresh values after every value in use.
+        let legacy: [(group: String, order: Int?)] = [("A", nil), ("B", 5), ("C", nil)]
+        XCTAssertEqual(
+            DomainAgentSessionSidebarGroup.redistributedOrders(desired: ["C", "A"], entries: legacy),
+            ["C": 6, "A": 7]
+        )
+    }
+
+    func testPinRanksSwapAmongNamedPinsAndMaterializeOnlyWhenNeeded() {
+        let a = UUID()
+        let x = UUID()
+        let b = UUID()
+        let swapped = DomainAgentSessionPinRanks.reordered(current: [(a, 0), (x, 4), (b, 9)], desired: [b, a])
+        XCTAssertFalse(swapped.materialized)
+        XCTAssertEqual(swapped.ranks, [b: 0, x: 4, a: 9], "x keeps its rank; a and b swap theirs")
+
+        let legacy = DomainAgentSessionPinRanks.reordered(current: [(a, nil), (x, nil), (b, 3)], desired: [b, a])
+        XCTAssertTrue(legacy.materialized)
+        XCTAssertEqual(legacy.ranks, [b: 0, x: 1, a: 2], "materialized in displayed order, so x does not move")
+    }
+
+    func testRestrictedSnapshotHidesOutsideSessionsWithoutMarkingThemMissing() {
+        let member = UUID()
+        let outsider = UUID()
+        let ghost = UUID()
+        let child = UUID()
+        let full = DomainAgentSessionInventorySnapshot(
+            records: [record(member), record(outsider), record(child, parent: outsider)],
+            edges: DomainAgentSessionInventoryEdge.merge(
+                live: [(outsider, member, UUID(), 1)],
+                persisted: [(ghost, member)]
+            ),
+            isComplete: true
+        )
+        let view = full.restricted(to: [member, child])
+        XCTAssertNil(view.records[outsider])
+        XCTAssertEqual(view.edges.map(\.observerSessionID), [ghost], "edges to outside sessions are dropped")
+        XCTAssertEqual(view.edges(touching: member).count, 1)
+        XCTAssertFalse(view.isMissing(outsider), "hidden is not missing")
+        XCTAssertTrue(view.isMissing(ghost))
+        XCTAssertEqual(view.orphanReasons(for: child), [], "a hidden parent is not a missing parent")
+        XCTAssertEqual(view.orphanReasons(for: member), [.linkIntentMissingSession, .observerArchivedOrDeleted])
     }
 
     // MARK: - Ledgers
@@ -224,6 +278,7 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
             token: "t",
             granteeSessionID: grantee,
             scopeID: UUID(),
+            scopeGeneration: 1,
             operation: .adminSetPin,
             targetSessionIDs: [UUID()],
             payload: 1,
@@ -243,6 +298,7 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
             token: "late",
             granteeSessionID: grantee,
             scopeID: UUID(),
+            scopeGeneration: 1,
             operation: .adminSetPin,
             targetSessionIDs: [],
             payload: 2,

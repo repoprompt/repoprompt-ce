@@ -7,7 +7,7 @@ import Foundation
 // MARK: - Run state
 
 /// Coarse run state used for inventory filters and rendering.
-package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable {
+package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable, Sendable {
     case idle
     case running
     /// Waiting on the user: an approval, a question, or input.
@@ -40,7 +40,7 @@ package enum DomainAgentSessionInventoryRunState: String, CaseIterable, Hashable
 }
 
 /// A session's oversight role, mirroring the HUD role filter.
-package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable {
+package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable, Sendable {
     /// Observes at least one session (live link or persisted intent).
     case overseer
     /// Is observed by at least one session.
@@ -48,7 +48,7 @@ package enum DomainAgentSessionInventoryRole: String, CaseIterable, Hashable {
 }
 
 /// Why a session counts as orphaned (design §4.2).
-package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable {
+package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable, Sendable {
     /// A persisted oversight intent touching this session names a session that no longer exists.
     case linkIntentMissingSession = "link_intent_missing_session"
     /// An observer of this session is archived or deleted.
@@ -62,7 +62,7 @@ package enum DomainAgentSessionOrphanReason: String, CaseIterable, Hashable {
 // MARK: - Records
 
 /// One session as inventory sees it. Projected by the app; never built from tool arguments.
-package struct DomainAgentSessionInventoryRecord: Hashable {
+package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
     package let sessionID: UUID
     package let name: String
     package let workspaceID: UUID?
@@ -130,7 +130,7 @@ package struct DomainAgentSessionInventoryRecord: Hashable {
 }
 
 /// One directed observer → target relationship: a live link, a persisted intent, or both.
-package struct DomainAgentSessionInventoryEdge: Hashable {
+package struct DomainAgentSessionInventoryEdge: Hashable, Sendable {
     package let observerSessionID: UUID
     package let targetSessionID: UUID
     /// A live link currently exists in the link authority.
@@ -198,12 +198,15 @@ package struct DomainAgentSessionInventoryEdge: Hashable {
 // MARK: - Snapshot
 
 /// Every known session plus the oversight edges among them, at one moment.
-package struct DomainAgentSessionInventorySnapshot {
+package struct DomainAgentSessionInventorySnapshot: Sendable {
     package let records: [UUID: DomainAgentSessionInventoryRecord]
     package let edges: [DomainAgentSessionInventoryEdge]
     /// The history scan covered every workspace. Absence-based orphan reasons ("missing") are only
     /// reported when this is true: an incomplete scan cannot tell "deleted" from "not scanned".
     package let isComplete: Bool
+    /// Every session known to exist, including ones a restricted view hides. Absence from this set
+    /// (on a complete scan) is what "missing" means; a session hidden by scope is never missing.
+    package let knownSessionIDs: Set<UUID>
 
     private let edgesBySession: [UUID: [DomainAgentSessionInventoryEdge]]
 
@@ -218,9 +221,19 @@ package struct DomainAgentSessionInventorySnapshot {
             if let existing = byID[record.sessionID], existing.isLoaded, !record.isLoaded { continue }
             byID[record.sessionID] = record
         }
-        self.records = byID
+        self.init(records: byID, edges: edges, isComplete: isComplete, knownSessionIDs: Set(byID.keys))
+    }
+
+    private init(
+        records: [UUID: DomainAgentSessionInventoryRecord],
+        edges: [DomainAgentSessionInventoryEdge],
+        isComplete: Bool,
+        knownSessionIDs: Set<UUID>
+    ) {
+        self.records = records
         self.edges = edges
         self.isComplete = isComplete
+        self.knownSessionIDs = knownSessionIDs
         var bySession: [UUID: [DomainAgentSessionInventoryEdge]] = [:]
         for edge in edges {
             bySession[edge.observerSessionID, default: []].append(edge)
@@ -229,6 +242,30 @@ package struct DomainAgentSessionInventorySnapshot {
             }
         }
         edgesBySession = bySession
+    }
+
+    /// The view a scope may see: only `visibleSessionIDs`' records, and only edges whose every
+    /// endpoint is visible or truly missing (deleted, on a complete scan). Edges to existing sessions
+    /// outside the scope are dropped entirely, so counts, roles, and orphan reasons derived from the
+    /// view never reflect, count, or name an out-of-scope session.
+    package func restricted(to visibleSessionIDs: Set<UUID>) -> Self {
+        let visibleRecords = records.filter { visibleSessionIDs.contains($0.key) }
+        let visibleEdges = edges.filter { edge in
+            [edge.observerSessionID, edge.targetSessionID].allSatisfy { id in
+                visibleRecords[id] != nil || isMissing(id)
+            }
+        }
+        return Self(
+            records: visibleRecords,
+            edges: visibleEdges,
+            isComplete: isComplete,
+            knownSessionIDs: knownSessionIDs
+        )
+    }
+
+    /// Known not to exist: only on a complete scan, and never for a session merely hidden by scope.
+    package func isMissing(_ sessionID: UUID) -> Bool {
+        isComplete && !knownSessionIDs.contains(sessionID)
     }
 
     package func edges(touching sessionID: UUID) -> [DomainAgentSessionInventoryEdge] {
@@ -252,9 +289,6 @@ package struct DomainAgentSessionInventorySnapshot {
     package func orphanReasons(for sessionID: UUID) -> [DomainAgentSessionOrphanReason] {
         guard let record = records[sessionID] else { return [] }
         var reasons: Set<DomainAgentSessionOrphanReason> = []
-        func isMissing(_ id: UUID) -> Bool {
-            isComplete && records[id] == nil
-        }
         for edge in edges(touching: sessionID) {
             if edge.isPersisted, isMissing(edge.observerSessionID) || isMissing(edge.targetSessionID) {
                 reasons.insert(.linkIntentMissingSession)
@@ -297,8 +331,8 @@ package struct DomainAgentSessionInventorySnapshot {
 
 /// Structured inventory filter (design §3.1). `query` is free text and is evaluated by the app with
 /// the shared session search matcher, so it is carried here but not interpreted.
-package struct DomainAgentSessionInventoryFilter: Hashable {
-    package enum GroupMatch: Hashable {
+package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
+    package enum GroupMatch: Hashable, Sendable {
         case named(String)
         /// Sessions with no sidebar group.
         case none
@@ -398,7 +432,7 @@ package struct DomainAgentSessionInventoryFilter: Hashable {
 
 // MARK: - Ordering (compare-and-swap)
 
-package enum DomainAgentSessionOrderingError: Error, Hashable {
+package enum DomainAgentSessionOrderingError: Error, Hashable, Sendable {
     /// `order` and `expected_order` must name the same items, each once.
     case orderSetMismatch
     /// An item in `order` is not currently in the ordered set.
@@ -466,11 +500,67 @@ package enum DomainAgentSessionSidebarGroup {
         }
     }
 
-    /// The order value for a group: its existing order, else one past the current maximum.
+    /// The order value for a group: the existing group's own order value, else one past the largest
+    /// order value in use (0 when none is). Never a position index, so joining an existing group
+    /// keeps its mirror consistent and a new group never collides with another group's value.
     package static func order(for group: String, existing: [(group: String, order: Int?)]) -> Int {
-        let ordered = orderedGroups(existing)
-        if let index = ordered.firstIndex(of: group) { return index }
-        return ordered.count
+        if let value = existing.filter({ $0.group == group }).compactMap(\.order).min() {
+            return value
+        }
+        return (existing.compactMap(\.order).max() ?? -1) + 1
+    }
+
+    /// New order values for `desired` (a permutation of the named groups): the named groups'
+    /// current values are redistributed among them, so groups outside the call keep their values
+    /// and their carriers are never written. When the named groups lack distinct values (legacy or
+    /// malformed mirrors), fresh values after every value in use are assigned to them instead.
+    package static func redistributedOrders(
+        desired: [String],
+        entries: [(group: String, order: Int?)]
+    ) -> [String: Int] {
+        let named = Set(desired)
+        let currentNamed = orderedGroups(entries).filter(named.contains)
+        let values = currentNamed.map { group in entries.filter { $0.group == group }.compactMap(\.order).min() }
+        let explicit = values.compactMap(\.self)
+        let slots: [Int]
+        if explicit.count == values.count, Set(explicit).count == explicit.count {
+            slots = explicit.sorted()
+        } else {
+            let base = (entries.compactMap(\.order).max() ?? -1) + 1
+            slots = desired.indices.map { base + $0 }
+        }
+        return Dictionary(uniqueKeysWithValues: zip(desired, slots).map { ($0, $1) })
+    }
+}
+
+// MARK: - Pin ranks
+
+package enum DomainAgentSessionPinRanks {
+    /// Explicit ranks after reordering `desired` pins within the slots they occupy in `current`
+    /// (displayed order, with each pin's current explicit rank).
+    ///
+    /// When `current` is already backed by distinct, increasing explicit ranks, the named pins swap
+    /// those rank values among themselves and no other pin changes. Otherwise ranks are first
+    /// *materialized* (`0..<count` in displayed order, so no pin moves) and then permuted; that is
+    /// the only case that writes ranks to pins outside `desired`, and it never changes their position.
+    package static func reordered(
+        current: [(id: UUID, rank: Int?)],
+        desired: [UUID]
+    ) -> (ranks: [UUID: Int], materialized: Bool) {
+        let ranks = current.map(\.rank)
+        let explicit = ranks.compactMap(\.self)
+        let consistent = explicit.count == ranks.count && zip(explicit, explicit.dropFirst()).allSatisfy { $0 < $1 }
+        var base: [UUID: Int] = [:]
+        for (offset, pin) in current.enumerated() {
+            base[pin.id] = consistent ? (pin.rank ?? offset) : offset
+        }
+        let named = Set(desired)
+        let slots = current.map(\.id).filter(named.contains).compactMap { base[$0] }
+        var result = base
+        for (id, slot) in zip(desired, slots) {
+            result[id] = slot
+        }
+        return (result, !consistent)
     }
 }
 
@@ -478,8 +568,8 @@ package enum DomainAgentSessionSidebarGroup {
 
 /// Idempotency for direct (uncarded) administration calls: a key replays its first result for the
 /// identical request and conflicts for any other. Bounded; oldest entries are evicted first.
-package struct DomainAgentSessionAdministrationIdempotencyLedger<Result: Sendable> {
-    package enum Lookup {
+package struct DomainAgentSessionAdministrationIdempotencyLedger<Result: Sendable>: Sendable {
+    package enum Lookup: Sendable {
         case miss
         case replay(Result)
         case conflict
@@ -525,19 +615,22 @@ package struct DomainAgentSessionAdministrationIdempotencyLedger<Result: Sendabl
 }
 
 /// Undo tokens for reversible bulk operations (design §2.5): one token per applied call, bound to
-/// its grantee and scope, valid for a bounded window, consumed at most once.
-package struct DomainAgentSessionAdministrationUndoLedger<Payload: Sendable> {
-    package struct Entry {
+/// its grantee and to the exact scope generation it was issued under, valid for a bounded window,
+/// consumed at most once (a refused undo may be `restore`d rather than burned).
+package struct DomainAgentSessionAdministrationUndoLedger<Payload: Sendable>: Sendable {
+    package struct Entry: Sendable {
         package let token: String
         package let granteeSessionID: UUID
         package let scopeID: UUID
+        /// The scope generation the call ran under; any other generation authorizes nothing.
+        package let scopeGeneration: UInt64
         package let operation: DomainAgentSessionTargetOperation
         package let targetSessionIDs: [UUID]
         package let payload: Payload
         package let expiresAt: Date
     }
 
-    package enum Redeem {
+    package enum Redeem: Sendable {
         case redeemed(Entry)
         /// Unknown token, another grantee's token, or already consumed. Deliberately one case.
         case unavailable
@@ -559,6 +652,7 @@ package struct DomainAgentSessionAdministrationUndoLedger<Payload: Sendable> {
         token: String,
         granteeSessionID: UUID,
         scopeID: UUID,
+        scopeGeneration: UInt64,
         operation: DomainAgentSessionTargetOperation,
         targetSessionIDs: [UUID],
         payload: Payload,
@@ -568,6 +662,7 @@ package struct DomainAgentSessionAdministrationUndoLedger<Payload: Sendable> {
             token: token,
             granteeSessionID: granteeSessionID,
             scopeID: scopeID,
+            scopeGeneration: scopeGeneration,
             operation: operation,
             targetSessionIDs: targetSessionIDs,
             payload: payload,

@@ -39,14 +39,18 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     func rename(_ sessionID: UUID, to name: String) -> Bool
     /// Returns the sessions whose pin state changed.
     func setPinned(_ pinned: Bool, sessionIDs: [UUID]) -> Set<UUID>
-    func setPinnedOrder(_ orderedSessionIDs: [UUID], workspaceID: UUID) -> Bool
+    /// Writes explicit pin ranks, only to sessions that are still pinned and active. Writes nothing
+    /// else. Returns the sessions whose rank changed.
+    func setPinnedRanks(_ ranks: [UUID: Int?]) -> Set<UUID>
     /// Returns the sessions whose group changed.
     func setGroup(_ group: String?, order: Int?, sessionIDs: [UUID]) -> Set<UUID>
-    func setGroupOrders(_ orders: [String: Int], workspaceID: UUID) -> Bool
-    /// Restores pin, pin order, group, group order, and name exactly (undo).
-    func restore(_ state: AgentSessionOrganizeState) -> Bool
-    /// Archives (stashes) active sessions. Returns the sessions that were archived.
-    func archive(_ sessionIDs: [UUID]) async -> Set<UUID>
+    /// Writes group order values, only to sessions that are still grouped and active. Writes nothing
+    /// else. Returns the sessions whose value changed.
+    func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID>
+    /// Archives (stashes) active sessions. `isAuthorized` is folded into the stash's mutation-context
+    /// check, so authority is re-proved after the stash's own suspensions. Returns the sessions that
+    /// were archived.
+    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID>
     /// Restores archived sessions to the sidebar without switching the user's current tab.
     func unarchive(_ sessionIDs: [UUID]) -> Set<UUID>
     /// Cancels the session's live run. Returns false when nothing could be cancelled.
@@ -164,16 +168,12 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         return changed
     }
 
-    func setPinnedOrder(_ orderedSessionIDs: [UUID], workspaceID: UUID) -> Bool {
-        guard let (window, workspace) = loadedWorkspace(workspaceID) else { return false }
-        let rows = window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
-        let tabIDBySessionID = Dictionary(
-            rows.compactMap { row in row.sessionID.map { ($0, row.tabID) } },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let orderedTabIDs = orderedSessionIDs.compactMap { tabIDBySessionID[$0] }
-        guard orderedTabIDs.count == orderedSessionIDs.count else { return false }
-        return window.promptManager.setPinnedComposeTabOrder(orderedTabIDs, workspaceID: workspaceID)
+    func setPinnedRanks(_ ranks: [UUID: Int?]) -> Set<UUID> {
+        writeActiveTabField(Array(ranks.keys)) { tab, sessionID in
+            guard tab.isPinned, let rank = ranks[sessionID], tab.pinnedOrder != rank else { return false }
+            tab.pinnedOrder = rank
+            return true
+        }
     }
 
     func setGroup(_ group: String?, order: Int?, sessionIDs: [UUID]) -> Set<UUID> {
@@ -195,42 +195,17 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         return changed
     }
 
-    func setGroupOrders(_ orders: [String: Int], workspaceID: UUID) -> Bool {
-        guard let (window, _) = loadedWorkspace(workspaceID) else { return false }
-        _ = mutateActiveTabs(window: window, workspaceID: workspaceID) { tab in
-            guard let group = tab.sidebarGroup, let order = orders[group], tab.sidebarGroupOrder != order else {
+    func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID> {
+        writeActiveTabField(Array(values.keys)) { tab, sessionID in
+            guard tab.sidebarGroup != nil, let value = values[sessionID], tab.sidebarGroupOrder != value else {
                 return false
             }
-            tab.sidebarGroupOrder = order
+            tab.sidebarGroupOrder = value
             return true
         }
-        return true
     }
 
-    func restore(_ state: AgentSessionOrganizeState) -> Bool {
-        guard let location = locate(state.sessionID), location.stashedTabID == nil else { return false }
-        if location.tab.name != state.name {
-            location.window.agentModeViewModel.renameSession(tabID: location.tabID, to: state.name)
-        }
-        if location.tab.isPinned != state.isPinned {
-            _ = Self.setTabsPinned(state.isPinned, tabIDs: [location.tabID], promptManager: location.window.promptManager)
-        }
-        _ = mutateActiveTabs(window: location.window, workspaceID: location.workspaceID) { tab in
-            guard tab.id == location.tabID else { return false }
-            let pinnedOrder = state.isPinned ? state.pinnedOrder : nil
-            guard tab.pinnedOrder != pinnedOrder
-                || tab.sidebarGroup != state.sidebarGroup
-                || tab.sidebarGroupOrder != state.sidebarGroupOrder
-            else { return false }
-            tab.pinnedOrder = pinnedOrder
-            tab.sidebarGroup = state.sidebarGroup
-            tab.sidebarGroupOrder = state.sidebarGroupOrder
-            return true
-        }
-        return true
-    }
-
-    func archive(_ sessionIDs: [UUID]) async -> Set<UUID> {
+    func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor () -> Bool) async -> Set<UUID> {
         var archived: Set<UUID> = []
         for (window, entries) in activeLocationsByWindow(sessionIDs) {
             let workspaceID = entries[0].location.workspaceID
@@ -239,7 +214,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
                 Set(entries.map(\.location.tabID)),
                 promptManager: window.promptManager,
                 expandCascade: false,
-                isMutationContextCurrent: { window.workspaceManager.activeWorkspaceID == workspaceID }
+                isMutationContextCurrent: { window.workspaceManager.activeWorkspaceID == workspaceID && isAuthorized() }
             )
             for entry in entries where report.removedComposeTabIDs.contains(entry.location.tabID) {
                 archived.insert(entry.sessionID)
@@ -371,6 +346,28 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             groups[key]?.1.append((sessionID, location))
         }
         return order.compactMap { groups[$0] }
+    }
+
+    /// Writes one field on the active tabs carrying `sessionIDs`, one workspace write per window.
+    private func writeActiveTabField(
+        _ sessionIDs: [UUID],
+        _ write: (inout ComposeTabState, UUID) -> Bool
+    ) -> Set<UUID> {
+        var changed: Set<UUID> = []
+        for (window, entries) in activeLocationsByWindow(sessionIDs) {
+            let sessionByTabID = Dictionary(
+                entries.map { ($0.location.tabID, $0.sessionID) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let updated = mutateActiveTabs(window: window, workspaceID: entries[0].location.workspaceID) { tab in
+                guard let sessionID = sessionByTabID[tab.id] else { return false }
+                return write(&tab, sessionID)
+            }
+            for entry in entries where updated.contains(entry.location.tabID) {
+                changed.insert(entry.sessionID)
+            }
+        }
+        return changed
     }
 
     /// Mutates active compose tabs of one loaded workspace in a single workspace write. Returns the

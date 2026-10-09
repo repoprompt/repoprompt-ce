@@ -254,7 +254,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         var isComplete = false
         var historyByID: [UUID: (AgentSessionMetadataRecord, String)] = [:]
         if let scan = try? await scanner.scanWorkspaces(matching: nil) {
-            isComplete = !scan.isTruncated && !scan.workspaces.contains(where: \.indexReadFailed)
+            isComplete = Self.isComplete(scan)
             for workspace in scan.workspaces {
                 for record in workspace.records {
                     historyByID[record.id] = (record, workspace.workspaceName)
@@ -269,6 +269,13 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             persisted: persisted.map { ($0.observerSessionID, $0.targetSessionID) }
         )
         return DomainAgentSessionInventorySnapshot(records: records, edges: edges, isComplete: isComplete)
+    }
+
+    /// A scan is complete only when it covered every workspace and read every index in full. An
+    /// unreadable index or one written under a different schema (its records are skipped) leaves
+    /// sessions unaccounted for, so absence-based orphan detection must stay off.
+    static func isComplete(_ scan: HistoryInventoryScan) -> Bool {
+        !scan.isTruncated && !scan.workspaces.contains { $0.indexReadFailed || $0.indexSchemaVersion != nil }
     }
 
     private static func historyRecord(
@@ -343,6 +350,9 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
 
 // MARK: - Inventory rendering
 
+/// Renders inventory from a scope-restricted snapshot (`DomainAgentSessionInventorySnapshot.restricted`):
+/// any session ID that is not a record of that view is either outside the scope (never rendered) or
+/// known to be deleted (rendered as `missing`, without its ID).
 enum AgentSessionInventoryRendering {
     static func row(
         _ record: DomainAgentSessionInventoryRecord,
@@ -371,8 +381,11 @@ enum AgentSessionInventoryRendering {
         if let order = record.pinnedOrder { object["pinned_order"] = .int(order) }
         if let group = record.sidebarGroup { object["group"] = .string(group) }
         if let order = record.sidebarGroupOrder { object["group_order"] = .int(order) }
-        if let parent = record.parentSessionID { object["parent_session_id"] = .string(parent.uuidString) }
-        if let creator = record.createdByOverseerSessionID {
+        // Provenance pointing outside the scope is redacted; orphan reasons cover deleted ones.
+        if let parent = record.parentSessionID, snapshot.records[parent] != nil {
+            object["parent_session_id"] = .string(parent.uuidString)
+        }
+        if let creator = record.createdByOverseerSessionID, snapshot.records[creator] != nil {
             object["created_by_overseer_session_id"] = .string(creator.uuidString)
         }
         if let createdAt = record.createdAt { object["created_at"] = .string(AgentSessionAdminRendering.iso(createdAt)) }
@@ -386,17 +399,16 @@ enum AgentSessionInventoryRendering {
 
     static func edge(_ edge: DomainAgentSessionInventoryEdge, snapshot: DomainAgentSessionInventorySnapshot) -> Value {
         var object: [String: Value] = [
-            "observer_session_id": .string(edge.observerSessionID.uuidString),
-            "target_session_id": .string(edge.targetSessionID.uuidString),
             "live": .bool(edge.isLive),
             "persisted": .bool(edge.isPersisted)
         ]
-        if let name = snapshot.records[edge.observerSessionID]?.name { object["observer_name"] = .string(name) }
-        if let name = snapshot.records[edge.targetSessionID]?.name { object["target_name"] = .string(name) }
-        if snapshot.isComplete {
-            let missing = [edge.observerSessionID, edge.targetSessionID].filter { snapshot.records[$0] == nil }
-            if !missing.isEmpty {
-                object["missing_session_ids"] = .array(missing.map { .string($0.uuidString) })
+        for (role, id) in [("observer", edge.observerSessionID), ("target", edge.targetSessionID)] {
+            if let record = snapshot.records[id] {
+                object["\(role)_session_id"] = .string(id.uuidString)
+                object["\(role)_name"] = .string(record.name)
+            } else {
+                // The restricted view keeps only edges whose other endpoints are deleted sessions.
+                object[role] = .string("missing")
             }
         }
         if snapshot.records[edge.observerSessionID]?.isArchived == true { object["observer_archived"] = .bool(true) }
@@ -410,9 +422,10 @@ enum AgentSessionInventoryRendering {
         guard !parsed.isEmpty else { return true }
         let fields = AgentSessionSearchFields(
             title: record.name,
+            status: [record.runState.rawValue, record.isArchived ? "archived" : nil],
             secondary: [record.workspaceName, record.sidebarGroup],
             identifier: [record.sessionID.uuidString]
-        )
+        ).withFacets(isPinned: record.isPinned, group: record.sidebarGroup)
         return AgentSessionSearchMatcher.matches(query: parsed, fields: fields)
     }
 }
