@@ -152,7 +152,7 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
                 ],
                 identifier: [workspaceID.uuidString]
             ).fields
-        )
+        ).withFacets(isPinned: base.isPinned, group: base.normalizedGroup)
     }
 
     var isSubagent: Bool {

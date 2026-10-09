@@ -305,7 +305,7 @@ struct AgentModeSidebarSessionBuilder {
         let canStash = boundLiveSession?.items.isEmpty == false
             || boundLiveSession?.transcript.turns.isEmpty == false
             || entry.map(Self.sessionIndexEntryHasConversationContent) == true
-        let searchFieldSource = Self.searchFieldSource(
+        var searchFieldSource = Self.searchFieldSource(
             title: title,
             entry: entry,
             runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
@@ -315,6 +315,9 @@ struct AgentModeSidebarSessionBuilder {
             sessionID: resolvedSessionID,
             tabID: tab.id
         )
+        searchFieldSource.isPinned = tab.isPinned
+        searchFieldSource.sidebarGroup = tab.sidebarGroup
+        searchFieldSource.sidebarGroupOrder = tab.sidebarGroupOrder
 
         return SidebarSession(
             id: tab.id,
@@ -503,7 +506,7 @@ struct AgentModeSidebarSessionBuilder {
         let mergeSummaries = source.activeWorktreeMergeSummaries
         let worktree = source.worktree
         let mergeAttention = source.mergeAttention
-        return AgentSessionSearchFields(
+        let fields = AgentSessionSearchFields(
             title: source.title,
             status: [
                 source.runState?.searchLabel,
@@ -562,6 +565,7 @@ struct AgentModeSidebarSessionBuilder {
                 source.entryID?.uuidString
             ]
         )
+        return fields.withFacets(isPinned: source.isPinned, group: source.sidebarGroup)
     }
 
     nonisolated static func searchFields(

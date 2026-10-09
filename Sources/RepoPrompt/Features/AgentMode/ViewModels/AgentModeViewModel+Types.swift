@@ -256,6 +256,8 @@ extension AgentModeViewModel {
         let activeAgentSessionID: UUID?
         let isPinned: Bool
         let pinnedOrder: Int?
+        let sidebarGroup: String?
+        let sidebarGroupOrder: Int?
         let lastModified: Date
     }
 

@@ -615,10 +615,12 @@ extension AgentModeViewModel {
             currentTabID: currentTabID,
             visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
+        // Paging takes the *requested* count: the effective count already includes pinned rows,
+        // which are exempt from the page cap, and must not be widened twice.
         let pagedSessions = pagedSidebarSessions(
             filteredSessions: filteredSessions,
             currentTabID: currentTabID,
-            visibleSessionCount: effectiveVisibleSessionCount
+            visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
         let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
             stashedTabs,
@@ -1037,7 +1039,13 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
-        let requestedVisibleCount = max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount)
+        let requestedUnpinnedCount = max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount)
+        // Pinned rows are exempt from the page cap: the cap counts unpinned rows only, so hundreds
+        // of pins never push ordinary sessions off the first page or hide each other.
+        let requestedVisibleCount = Self.sidebarPrefixLength(
+            containingUnpinned: requestedUnpinnedCount,
+            in: filteredSessions
+        )
         let activeIndex: Int?
         let result: Int
         if let currentTabID,
@@ -1064,6 +1072,21 @@ extension AgentModeViewModel {
             )
         #endif
         return result
+    }
+
+    /// Length of the shortest prefix of `rows` holding `unpinnedLimit` unpinned rows plus every
+    /// pinned row before the cut.
+    static func sidebarPrefixLength(containingUnpinned unpinnedLimit: Int, in rows: [SidebarSession]) -> Int {
+        var unpinnedSeen = 0
+        var length = 0
+        for row in rows {
+            if !row.isPinned {
+                guard unpinnedSeen < unpinnedLimit else { break }
+                unpinnedSeen += 1
+            }
+            length += 1
+        }
+        return length
     }
 
     func effectiveSidebarVisibleSessionCount(
