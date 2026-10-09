@@ -20,7 +20,7 @@ package enum DiffChunkTextApplier {
             let difference = chunk.lineCountDifference()
             guard difference != 0 else { continue }
 
-            // On a tie after a pure insertion, a chunk that consumes original lines follows those displaced lines.
+            // A pure insertion pushes the original line at its start down; a later chunk that consumes that line moves with it.
             for laterIndex in decodedChunks.index(after: index) ..< decodedChunks.endIndex
                 where adjustedStartLines[laterIndex] > appliedStartLine
                 || (

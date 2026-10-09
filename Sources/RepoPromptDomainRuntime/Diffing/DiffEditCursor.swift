@@ -13,10 +13,8 @@ package struct DiffEditCursor {
         return map[Self.key(from: raw)] ?? 0
     }
 
-    /// Advances the key's scan position _after_ a successful diff to at least
-    /// `firstChunk.startLine + raw.count`. The batch generator passes the edit's first chunk,
-    /// or its last chunk for a replace-all. The position comes from chunk positions only, so it
-    /// doesn't prove that no occurrence of the key remains: one that emitted no chunk isn't passed.
+    /// Advances the key's scan position after a successful diff, from the supplied chunk (the last one for a replace-all).
+    /// Unchanged matches emit no chunk, so this doesn't prove the key is exhausted.
     mutating func advanceCursor(for raw: [String]?, firstChunk: DiffChunk?) {
         guard
             let raw, !raw.isEmpty,

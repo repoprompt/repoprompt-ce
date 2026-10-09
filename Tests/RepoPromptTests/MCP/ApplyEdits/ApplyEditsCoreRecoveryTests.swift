@@ -154,11 +154,8 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         XCTAssertEqual(outcomes[1], EditOutcome(index: 1, status: "success", error: nil))
     }
 
-    // Batch fallback (no edit applies as a unique literal). After a chunk changes the line count,
-    // DiffChunkTextApplier.swift:24 shifts only later chunks whose adjusted start is strictly greater,
-    // so a later chunk starting on the same line keeps stale coordinates, and DiffApplicator removes
-    // whatever line is there. In the first row the sibling's match also overlaps the replace-all's
-    // second match. Each row asserts the loss-free result.
+    /// Batch fallback with no unique literal match. Same-start chunks and a repeat of a
+    /// replace-all's search must keep unrelated lines and report accurate outcomes.
     func testBatchDiffFallbackKeepsLinesBesideSameLineChunks() async throws {
         struct Row {
             let name: String
