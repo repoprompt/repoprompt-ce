@@ -2710,6 +2710,17 @@ final class ContentReadCancellationTests: XCTestCase {
         )
     }
 
+    /// Temporary reproduction for #1301: work that settles after a short real delay,
+    /// standing in for a runner that is slow to schedule the awaited task.
+    func testTaskResultPollSurvivesDelayedSettlement() async {
+        let delayedTask = Task { () -> Bool in
+            try? await Task.sleep(for: .milliseconds(300))
+            return true
+        }
+        let result = await waitForTaskResult(delayedTask)
+        XCTAssertNotNil(result, "Task result poll gave up before a task delayed 300 ms settled")
+    }
+
     private func waitForLimiterIdle() async -> ContentReadAsyncLimiter.Snapshot {
         for _ in 0 ..< 10000 {
             let snapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
