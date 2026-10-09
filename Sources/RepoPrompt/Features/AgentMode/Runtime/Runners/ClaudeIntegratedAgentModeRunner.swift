@@ -333,7 +333,12 @@ final class ClaudeIntegratedAgentModeRunner {
         if session.selectedAgent == .claudeCode,
            session.runID == runID, session.activeRunAttemptID == runAttemptID
         {
-            let recordsTelemetry = GlobalSettingsStore.shared.claudeUsageQuotaEnabled()
+            // Diagnostics toggle OR connected Claude usage display (see
+            // `GlobalSettingsStore.claudeRunTelemetryRecordingEnabled`): the pill stays current
+            // during runs by default, and this per-run sync never switches that off.
+            let recordsTelemetry = GlobalSettingsStore.shared.claudeRunTelemetryRecordingEnabled(
+                profileID: ClaudeUsageCredentialProfile.current().id
+            )
             await quotaService.setEnabled(recordsTelemetry)
             // Attribute the run to its Claude config directory so the usage pill only adopts
             // telemetry from the same profile it reads usage for.

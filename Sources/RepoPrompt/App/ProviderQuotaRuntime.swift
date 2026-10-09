@@ -24,7 +24,7 @@ final class ProviderQuotaRuntime {
     private var foregroundObservation: AnyCancellable?
     private var consentObservation: AnyCancellable?
     private var consentTask: Task<Void, Never>?
-    private var telemetryOverlayObservation: Task<Void, Never>?
+    private var telemetryDisplayBridge: ClaudeRunTelemetryDisplayBridge?
     var currentClaudeUsageProfileID: String {
         ClaudeUsageCredentialProfile.current().id
     }
@@ -75,33 +75,33 @@ final class ProviderQuotaRuntime {
                 self?.codexUI.refreshOnForeground()
                 self?.claudeUI.refreshOnForeground()
             }
-        // One app-level subscription. Passive SDK `rate_limit_event` telemetry (recorded only
-        // while the user's "Record rate-limit events" setting is on) refreshes the *displayed*
-        // Claude snapshot during runs without another CLI launch. Display-only: the overlay is
-        // merged in the UI projection, never into `claude`, routing, or balancing, and the
-        // merge refuses a run whose Claude profile differs from the displayed snapshot's.
-        telemetryOverlayObservation = Task { [weak self, claudeTelemetry] in
-            for await status in await claudeTelemetry.subscribe() {
-                guard !Task.isCancelled, let self else { return }
-                switch status {
-                case let .loaded(snapshot): claudeUI.applyDisplayOverlay(snapshot)
-                case .disabled: claudeUI.applyDisplayOverlay(nil)
-                case .idle, .loading, .unavailable, .failed: continue
-                }
-            }
-        }
+        // One app-level subscription. Passive SDK `rate_limit_event` telemetry refreshes the
+        // *displayed* Claude snapshot during runs without another CLI launch. It is recorded and
+        // shown by default once Claude usage display is connected (no diagnostics toggle
+        // needed: it is the run's own output, no extra read or credential). Display-only: the
+        // overlay is merged in the UI projection, never into `claude`, routing, or balancing,
+        // and the merge refuses a run whose Claude profile differs from the displayed one.
+        telemetryDisplayBridge = ClaudeRunTelemetryDisplayBridge(
+            telemetry: claudeTelemetry,
+            store: claudeUI,
+            displayConsented: { settingsStore.claudeUsageDisplayConsented(profileID: ClaudeUsageCredentialProfile.current().id) }
+        )
     }
 
     /// Source authorization has one truth: persisted consent and completed setup. Routing
     /// leases only subscribe; they cannot override a UI setup/disconnect transition.
-    private func applyAcquisitionConsent() {
+    /// Run telemetry recording follows the same settings (diagnostics toggle OR connected
+    /// usage display), applied in this one ordered task so toggles cannot reorder.
+    func applyAcquisitionConsent() {
         consentTask?.cancel()
-        consentTask = Task { [weak self, codex, claude] in
+        consentTask = Task { [weak self, codex, claude, claudeTelemetry] in
             guard let self, !Task.isCancelled else { return }
             await codex.setEnabled(settingsStore.codexUsageQuotaEnabled())
             guard !Task.isCancelled else { return }
             let grant = settingsStore.claudeCLIUsageGrant()
             await claude.setEnabled(grant?.isReady == true && grant?.applies(toProfileID: currentClaudeUsageProfileID) == true)
+            guard !Task.isCancelled else { return }
+            await claudeTelemetry.setEnabled(settingsStore.claudeRunTelemetryRecordingEnabled(profileID: currentClaudeUsageProfileID))
         }
     }
 
@@ -111,6 +111,7 @@ final class ProviderQuotaRuntime {
         }
         codexUI.setPresentationEnabled(enabled)
         claudeUI.setPresentationEnabled(enabled)
+        applyAcquisitionConsent()
     }
 
     func applyCodexUsageEnabled(_ enabled: Bool) {
@@ -181,7 +182,10 @@ enum CodexUsageQuotaRuntimeBridge {
 
 @MainActor
 enum ClaudeUsageQuotaRuntimeBridge {
-    static var applyEnabled: (Bool) -> Void = { enabled in
-        Task { await WindowStatesManager.shared.providerQuotaRuntime.claudeTelemetry.setEnabled(enabled) }
+    /// The diagnostics toggle was already persisted; recording is the combined policy
+    /// (diagnostics OR connected usage display), so turning diagnostics off never stops the
+    /// display's own telemetry.
+    static var applyEnabled: (Bool) -> Void = { _ in
+        WindowStatesManager.shared.providerQuotaRuntime.applyAcquisitionConsent()
     }
 }
