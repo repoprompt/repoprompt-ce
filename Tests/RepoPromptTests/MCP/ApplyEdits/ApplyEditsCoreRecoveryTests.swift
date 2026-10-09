@@ -665,6 +665,65 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
         }
     }
 
+    /// Batch fallback (no edit applies as a unique literal): each edit is matched against the original
+    /// text, so two distinct searches can claim the same original line. Their overlapping chunks then
+    /// remove an untouched or inserted line, and every edit reports success. Each row asserts the
+    /// loss-free result: an edit whose match overlaps lines an earlier edit already claimed fails.
+    func testBatchDiffFallbackRefusesEditsThatClaimTheSameOriginalLine() async throws {
+        struct Row {
+            let name: String
+            let original: String
+            let edits: [ApplyEditsOperation]
+            let text: String
+            let applied: Int
+            let outcomeStatuses: [String]
+        }
+
+        let rows = [
+            Row(
+                name: "later edits overlap a removed two-line block",
+                original: "B\nC\ntail\n",
+                edits: [
+                    ApplyEditsOperation(search: "b\nc", replace: "", replaceAll: false),
+                    ApplyEditsOperation(search: "c", replace: "Y\nC", replaceAll: false),
+                    ApplyEditsOperation(search: "c\ntail", replace: "Z\ntail", replaceAll: false)
+                ],
+                text: "tail\n",
+                applied: 1,
+                outcomeStatuses: ["success", "failed", "failed"]
+            ),
+            Row(
+                name: "a two-line edit overlaps a removed line and a sibling's line",
+                original: "A\nB\nC\nD\n",
+                edits: [
+                    ApplyEditsOperation(search: "b", replace: "", replaceAll: false),
+                    ApplyEditsOperation(search: "c", replace: "Y\nC", replaceAll: false),
+                    ApplyEditsOperation(search: "b\nc", replace: "X\nC", replaceAll: false)
+                ],
+                text: "A\nY\nC\nD\n",
+                applied: 2,
+                outcomeStatuses: ["success", "success", "failed"]
+            )
+        ]
+
+        for row in rows {
+            let request = ApplyEditsRequest(path: "file.txt", mode: .batch(row.edits), verbose: false)
+
+            let result = try await engine.apply(request: request, to: row.original)
+
+            XCTAssertEqual(result.updatedText, row.text, row.name)
+            XCTAssertEqual(result.status, .partial, row.name)
+            XCTAssertEqual(result.editsRequested, row.edits.count, row.name)
+            XCTAssertEqual(result.editsApplied, row.applied, row.name)
+            let outcomes = try XCTUnwrap(result.outcomes, row.name)
+            XCTAssertEqual(outcomes.map(\.index), Array(row.edits.indices), row.name)
+            XCTAssertEqual(outcomes.map(\.status), row.outcomeStatuses, row.name)
+            for outcome in outcomes {
+                XCTAssertEqual(outcome.error == nil, outcome.status == "success", "\(row.name), edit \(outcome.index)")
+            }
+        }
+    }
+
     func testRequestBuilderAcceptsBatchPayloadShapes() throws {
         struct Case {
             let name: String
