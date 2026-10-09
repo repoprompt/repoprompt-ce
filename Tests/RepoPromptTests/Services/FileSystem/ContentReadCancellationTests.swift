@@ -332,7 +332,7 @@ final class ContentReadCancellationTests: XCTestCase {
             }
         }
 
-        guard await waitUntil(iterations: 100_000, { physicalReadGate.isBlockedSnapshot() }) else {
+        guard await waitUntil({ physicalReadGate.isBlockedSnapshot() }) else {
             watchdogTask.cancel()
             return XCTFail("Nested provider did not reach the controlled physical gate")
         }
@@ -534,7 +534,7 @@ final class ContentReadCancellationTests: XCTestCase {
             }
         }
 
-        guard await waitUntil(iterations: 100_000, { physicalReadGate.isBlockedSnapshot() }) else {
+        guard await waitUntil({ physicalReadGate.isBlockedSnapshot() }) else {
             watchdogTask.cancel()
             if let earlyResult = await waitForTaskResult(watchdogTask),
                case let .failure(error) = earlyResult.get()
@@ -680,7 +680,7 @@ final class ContentReadCancellationTests: XCTestCase {
             }
             watchdogTasks.append(watchdogTask)
 
-            guard await waitUntil(iterations: 100_000, { attempt.physicalReadGate.isBlockedSnapshot() }) else {
+            guard await waitUntil({ attempt.physicalReadGate.isBlockedSnapshot() }) else {
                 watchdogTask.cancel()
                 return XCTFail("Explicit-materialization attempt \(attemptNumber) did not reach its physical probe")
             }
@@ -1418,7 +1418,7 @@ final class ContentReadCancellationTests: XCTestCase {
 
         let firstSleeps = ControlledWatchdogSleeps(clock: clock)
         guard let firstTask = startWatchdogAttempt(1, sleeps: firstSleeps) else { return }
-        guard await waitUntil(iterations: 100_000, { physicalReadGates.isBlocked(at: 0) }) else {
+        guard await waitUntil({ physicalReadGates.isBlocked(at: 0) }) else {
             firstTask.cancel()
             let earlyResult = await waitForTaskResult(firstTask)
             return XCTFail("First exact-resolution path-state probe did not block; result=\(String(describing: earlyResult))")
@@ -2722,55 +2722,49 @@ final class ContentReadCancellationTests: XCTestCase {
     }
 
     private func waitForLimiterIdle() async -> ContentReadAsyncLimiter.Snapshot {
-        for _ in 0 ..< 10000 {
-            let snapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
-            if snapshot.isIdle {
-                return snapshot
-            }
-            await Task.yield()
+        await waitForSnapshot {
+            await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
+        } matching: {
+            $0.isIdle
         }
-        return await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
     }
 
     private func waitForLimiterSnapshot(
         _ limiter: ContentReadAsyncLimiter,
         matching predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
     ) async -> ContentReadAsyncLimiter.Snapshot {
-        for _ in 0 ..< 10000 {
-            let snapshot = await limiter.snapshotForTesting()
-            if predicate(snapshot) {
-                return snapshot
-            }
-            await Task.yield()
-        }
-        return await limiter.snapshotForTesting()
+        await waitForSnapshot({ await limiter.snapshotForTesting() }, matching: predicate)
     }
 
     private func waitForCacheSnapshot(
         _ cache: WorkspaceInteractiveReadCache,
         matching predicate: (WorkspaceInteractiveReadCache.Snapshot) -> Bool
     ) async -> WorkspaceInteractiveReadCache.Snapshot {
-        for _ in 0 ..< 10000 {
-            let snapshot = await cache.snapshotForTesting()
+        await waitForSnapshot({ await cache.snapshotForTesting() }, matching: predicate)
+    }
+
+    private func waitUntil(_ predicate: () async -> Bool) async -> Bool {
+        await waitForSnapshot(predicate, matching: { $0 })
+    }
+
+    /// Returns the first snapshot that matches, or a final read once the deadline passes.
+    private func waitForSnapshot<Snapshot>(
+        _ read: () async -> Snapshot,
+        matching predicate: (Snapshot) -> Bool
+    ) async -> Snapshot {
+        let deadline = ContinuousClock.now.advanced(by: contentReadCancellationPollTimeout)
+        while ContinuousClock.now < deadline {
+            let snapshot = await read()
             if predicate(snapshot) {
                 return snapshot
             }
-            await Task.yield()
-        }
-        return await cache.snapshotForTesting()
-    }
-
-    private func waitUntil(
-        iterations: Int = 10000,
-        _ predicate: () async -> Bool
-    ) async -> Bool {
-        for _ in 0 ..< iterations {
-            if await predicate() {
-                return true
+            do {
+                try await Task.sleep(for: contentReadCancellationPollInterval)
+            } catch {
+                break
             }
-            await Task.yield()
         }
-        return await predicate()
+        return await read()
     }
 
     private func waitForTaskResult<Success: Sendable, Failure: Error & Sendable>(
@@ -2823,6 +2817,11 @@ final class ContentReadCancellationTests: XCTestCase {
         return url
     }
 }
+
+/// Polls are bounded by wall-clock time, not a `Task.yield()` count, because runner load can
+/// delay the awaited work (#1301). Sleeping between checks frees the executor for that work.
+private let contentReadCancellationPollTimeout: Duration = .seconds(30)
+private let contentReadCancellationPollInterval: Duration = .milliseconds(1)
 
 @MainActor
 private func runMainActorProviderTask(
