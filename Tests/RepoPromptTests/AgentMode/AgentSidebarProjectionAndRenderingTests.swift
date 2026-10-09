@@ -400,6 +400,23 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         )
     }
 
+    func testSelectionOrderFollowsGroupedVisibleRowsAndSkipsCollapsedGroups() {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Ungrouped"),
+            ComposeTabState(id: id(2), name: "In A", sidebarGroup: "A", sidebarGroupOrder: 0),
+            ComposeTabState(id: id(3), name: "Also A", sidebarGroup: "A", sidebarGroupOrder: 0)
+        ]
+        let store = viewModel.ui.sessionSidebar
+        let expanded = projection(viewModel, tabs: tabs, snapshot: store.snapshot).renderedSelectionOrder
+        XCTAssertEqual(Set(expanded.prefix(2)), [.active(tabID: id(2)), .active(tabID: id(3))], "group rows come first")
+        XCTAssertEqual(expanded.last, .active(tabID: id(1)))
+
+        store.toggleGroupCollapsed("A")
+        let collapsed = projection(viewModel, tabs: tabs, snapshot: store.snapshot).renderedSelectionOrder
+        XCTAssertEqual(collapsed, [.active(tabID: id(1))], "rows of a collapsed group are not selectable (Cmd-A)")
+    }
+
     // MARK: - Helpers
 
     private func projection(

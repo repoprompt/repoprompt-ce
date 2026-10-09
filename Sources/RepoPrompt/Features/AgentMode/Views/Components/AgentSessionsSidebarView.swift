@@ -394,9 +394,6 @@ struct AgentModeSessionsListView: View {
     @State private var showingClearArchivedConfirmation = false
     @State private var showingBulkDeleteConfirmation = false
     @State private var sessionLinkProjectionRevision: UInt64 = 0
-    /// Collapsed sidebar group sections (view-local).
-    @State private var collapsedSidebarGroups: Set<String> = []
-
     private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
         guard let name = item.groupName else { return nil }
         return AnyView(AgentSidebarGroupSectionHeader(
@@ -404,9 +401,7 @@ struct AgentModeSessionsListView: View {
             rowCount: item.groupRowCount,
             isCollapsed: item.isGroupCollapsed,
             isFirst: item.isFirstHeader,
-            onToggle: {
-                if collapsedSidebarGroups.remove(name) == nil { collapsedSidebarGroups.insert(name) }
-            }
+            onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
         ))
     }
 
@@ -498,7 +493,7 @@ struct AgentModeSessionsListView: View {
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
         let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
             for: snapshot.pagedSessions,
-            collapsedGroups: collapsedSidebarGroups,
+            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
             perfRecorder: perfRecorder
         )
         let selectionState = sidebarUI.selectionState
