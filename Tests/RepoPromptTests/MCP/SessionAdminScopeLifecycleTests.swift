@@ -646,6 +646,31 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         }
     }
 
+    // MARK: - App adapter schema
+
+    /// The app catalog reprojects every canonical schema through `Tool(canonicalizing:)`, whose
+    /// JSONSchema decoder accepts only a single-string `type`. A union such as `["string","null"]`
+    /// fails the whole `session_admin` registration, so decode it through that production path.
+    func testSessionAdminSchemaDecodesThroughAppAdapterCanonicalization() throws {
+        let definition = MCPDomainSessionAdminToolDefinition.definition
+        let adapted = try RepoPromptApp.Tool(domainBinding: MCPDomainToolBinding(definition: definition) { _ in .null })
+        let canonical = try RepoPromptApp.Tool(canonicalizing: adapted)
+        XCTAssertEqual(canonical.name, MCPWindowToolName.sessionAdmin)
+
+        let schema = try JSONDecoder().decode(Value.self, from: JSONEncoder().encode(canonical.inputSchema))
+        let properties = try XCTUnwrap(schema.objectValue?["properties"]?.objectValue)
+        let expected = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+        XCTAssertEqual(Set(properties.keys), Set(expected.keys), "decoding must keep every property")
+        XCTAssertEqual(properties["group"]?.objectValue?["type"], .string("string"))
+
+        for candidate in MCPDomainCanonicalToolDefinitions.definitions {
+            XCTAssertNoThrow(
+                try RepoPromptApp.Tool(domainBinding: MCPDomainToolBinding(definition: candidate) { _ in .null }),
+                candidate.name
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     private func assertUnavailable(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
@@ -1099,6 +1124,17 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(shared["result"], .string("groups_outside_scope"))
         XCTAssertFalse(String(describing: shared).contains(outsider.uuidString))
         XCTAssertEqual(fixture.organizer.states[outsider]?.sidebarGroupOrder, 1)
+    }
+
+    func testSetGroupWithEmptyStringClearsTheGroup() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A")
+        try fixture.grant()
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(a.uuidString), "group": .string("Alpha")])
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroup, "Alpha")
+
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(a.uuidString), "group": .string("")])
+        XCTAssertNil(fixture.organizer.states[a]?.sidebarGroup, "an empty string ungroups")
     }
 
     // MARK: - Cards, untick, apply-on-approval

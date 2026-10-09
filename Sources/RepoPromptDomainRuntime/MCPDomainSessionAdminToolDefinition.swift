@@ -46,7 +46,7 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `release_scope`: give up one of your scopes; revokes its nested scopes too.
 
         **Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
-        **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group or null), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
+        **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Other ops may return `not_implemented`.
 
@@ -101,7 +101,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "filter": .object([
                     "type": .string("object"),
-                    "description": .string("[inventory, bulk ops] Keys: workspace, root_overseer, state, pinned, group (null=ungrouped), query, idle_days_gt, created_before, created_after, has_links, role (overseer|overseen), orphaned, archived, loaded. Exclusive with targets.")
+                    "description": .string("[inventory, bulk ops] Keys: workspace, root_overseer, state, pinned, group (empty string or null = ungrouped), query, idle_days_gt, created_before, created_after, has_links, role (overseer|overseen), orphaned, archived, loaded. Exclusive with targets.")
                 ]),
                 "limit": .object([
                     "type": .string("integer"),
@@ -114,10 +114,9 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "type": .string("boolean"),
                     "description": .string("[set_pin] true pins, false unpins.")
                 ]),
-                "group": .object([
-                    "type": .array([.string("string"), .string("null")]),
-                    "description": .string("[set_group] Sidebar group name (max 64 chars); null removes the group.")
-                ]),
+                // Single-type schema: the app adapter's JSONSchema decoder rejects union `type` arrays,
+                // so clearing is spelled as an empty string rather than `null`.
+                "group": .stringSchema("[set_group] Sidebar group name (max 64 chars); an empty string removes the group."),
                 "order": .object([
                     "type": .string("array"),
                     "items": .object(["type": .string("string")]),

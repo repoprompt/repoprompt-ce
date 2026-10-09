@@ -172,7 +172,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             return try reorderPins(context, args: args)
         case .adminSetGroup:
             guard args.keys.contains("group") else {
-                throw AgentSessionAdminArguments.invalid("set_group requires group (a name, or null to ungroup).")
+                throw AgentSessionAdminArguments.invalid("set_group requires group (a name, or an empty string to ungroup).")
             }
             return try finish(context, payload: setGroup(context, group: normalizedGroupArgument(args)))
         case .adminReorderGroups:
@@ -624,6 +624,8 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
 
     // MARK: - Helpers
 
+    /// The schema advertises `group` as a plain string; an empty (or whitespace-only) string clears
+    /// the group. A literal `null` is still tolerated for callers written against the earlier schema.
     private func normalizedGroupArgument(_ args: [String: Value]) throws -> String? {
         guard let raw = try AgentSessionAdminArguments.string(args, "group"),
               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
