@@ -445,17 +445,13 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
                 ]
             ),
             BatchCase(
-                name: "a repeated search cannot take a literal hit in a previous repeat's output",
-                original: "anchor\nFOO\n",
-                edits: [Self.edit("anchor", "header"), Self.edit("foo", "foo2"), Self.edit("foo", "bar")],
-                expectedText: "header\nFOO\n",
+                name: "a repeated search with an exact hit applies before repeats are refused",
+                original: "x = foo()\ny = foo()\n",
+                edits: [Self.edit("foo", "bar"), Self.edit("foo", "baz", all: true)],
+                expectedText: "x = baz()\ny = baz()\n",
                 expectedStatus: .partial,
                 expectedApplied: 1,
-                expectedOutcomes: [
-                    Self.outcome(0),
-                    Self.outcome(1, failure: Self.repeatRefused),
-                    Self.outcome(2, failure: Self.repeatRefused)
-                ]
+                expectedOutcomes: [Self.outcome(0, failure: Self.repeatRefused), Self.outcome(1)]
             ),
             BatchCase(
                 name: "repeats with an ambiguous literal hit are refused beside an exact sibling",
