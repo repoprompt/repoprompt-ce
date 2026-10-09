@@ -75,6 +75,51 @@ final class ProviderQuotaDisplayOverlayTests: XCTestCase {
         XCTAssertEqual(base.buckets.first?.window(role: "five_hour")?.percent?.rawValue, 20)
     }
 
+    func testAccumulationKeepsWindowsANewRunDoesNotMention() throws {
+        let t1 = t0.addingTimeInterval(60)
+        let t2 = t0.addingTimeInterval(120)
+        let run1 = try sdk([("five_hour", 0.30, nil), ("seven_day", 0.85, nil)], observedAt: t1)
+        let afterRun1 = ProviderQuotaDisplayOverlay.accumulate(run1, into: nil)
+        let run2 = try sdk([("five_hour", 0.35, nil)], observedAt: t2)
+        let accumulated = try XCTUnwrap(ProviderQuotaDisplayOverlay.accumulate(run2, into: afterRun1))
+        let merged = ProviderQuotaDisplayOverlay.merge(accumulated, onto: cli(fiveHour: 20, weekly: 60, observedAt: t0))
+        XCTAssertEqual(merged.buckets.first?.window(role: "five_hour")?.percent?.rawValue ?? 0, 35, accuracy: 0.001)
+        XCTAssertEqual(merged.buckets.first?.window(role: "seven_day")?.percent?.rawValue ?? 0, 85, accuracy: 0.001, "run 1's weekly reading survives run 2")
+
+        let older = try sdk([("seven_day", 0.10, nil)], observedAt: t0.addingTimeInterval(30))
+        let notRegressed = try XCTUnwrap(ProviderQuotaDisplayOverlay.accumulate(older, into: accumulated))
+        XCTAssertEqual(notRegressed, accumulated, "an older observation never replaces a newer one")
+    }
+
+    func testAccumulationNeverLetsAMissingUtilizationEraseOrFreshenAFigure() throws {
+        let t1 = t0.addingTimeInterval(60)
+        let t2 = t0.addingTimeInterval(120)
+        let seventy = try ProviderQuotaDisplayOverlay.accumulate(sdk([("five_hour", 0.70, nil)], observedAt: t1), into: nil)
+        let missing = try sdk([("five_hour", nil, t0.addingTimeInterval(9000))], observedAt: t2)
+        let kept = try XCTUnwrap(ProviderQuotaDisplayOverlay.accumulate(missing, into: seventy))
+        XCTAssertEqual(kept, seventy, "no percent: nothing changes, including reset time and observation time")
+
+        let rejected = try sdk([("five_hour", nil, nil)], observedAt: t2, status: .rejected)
+        let flagged = try XCTUnwrap(ProviderQuotaDisplayOverlay.accumulate(rejected, into: seventy))
+        let window = try XCTUnwrap(flagged.buckets.first?.windows.first)
+        XCTAssertEqual(window.isReached, true, "an explicit limit-reached flag is still shown")
+        XCTAssertEqual(window.percent?.rawValue ?? 0, 70, accuracy: 0.001)
+        XCTAssertEqual(window.observedAt, t1)
+
+        let merged = ProviderQuotaDisplayOverlay.merge(kept, onto: cli(fiveHour: 40, weekly: 10, observedAt: t0))
+        XCTAssertEqual(merged.buckets.first?.window(role: "five_hour")?.percent?.rawValue ?? 0, 70, accuracy: 0.001, "not the older CLI 40%")
+    }
+
+    func testAccumulationStartsOverForAnotherProfile() throws {
+        let mine = try ProviderQuotaDisplayOverlay.accumulate(sdk([("seven_day", 0.85, nil)], observedAt: t0), into: nil)
+        let other = try sdk([("five_hour", 0.35, nil)], observedAt: t0.addingTimeInterval(60), profile: "/other/.claude")
+        let restarted = try XCTUnwrap(ProviderQuotaDisplayOverlay.accumulate(other, into: mine))
+        XCTAssertEqual(restarted.accountKey.credentialProfileID, "/other/.claude")
+        XCTAssertNil(restarted.buckets.first { $0.windows.contains { $0.nativeRole == "seven_day" } }, "profiles never mix")
+        let unattributed = try sdk([("five_hour", 0.35, nil)], observedAt: t0.addingTimeInterval(60), profile: .some(nil))
+        XCTAssertNil(ProviderQuotaDisplayOverlay.accumulate(unattributed, into: mine), "an unattributed run clears rather than mixes")
+    }
+
     func testTelemetryPublishesTheRunProfileAndStillMergesSparseEvents() async throws {
         let service = ClaudeRunRateLimitTelemetryService()
         await service.setEnabled(true)

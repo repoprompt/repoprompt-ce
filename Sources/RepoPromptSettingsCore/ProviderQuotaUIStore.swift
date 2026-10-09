@@ -187,10 +187,14 @@ package final class ProviderQuotaUIStore: ObservableObject {
         }
     }
 
-    /// Passive telemetry for display only (see file header). `nil` clears it.
+    /// Passive telemetry for display only (see file header). Each publication is folded into
+    /// the accumulated overlay per window (`ProviderQuotaDisplayOverlay.accumulate`), so a new
+    /// run or an event without utilization never regresses a newer displayed value. `nil`
+    /// clears it, as does a cleared provider snapshot (see `apply`).
     package func applyDisplayOverlay(_ overlay: ProviderQuotaSnapshot?) {
-        guard overlay != displayOverlay else { return }
-        displayOverlay = overlay
+        let next = overlay.flatMap { ProviderQuotaDisplayOverlay.accumulate($0, into: displayOverlay) }
+        guard next != displayOverlay else { return }
+        displayOverlay = next
         publish(ProviderQuotaPresenter.viewState(for: displayStatus, now: now()))
         publishIndicator()
     }
@@ -256,6 +260,12 @@ package final class ProviderQuotaUIStore: ObservableObject {
         default:
             return latestStatus
         }
+    }
+
+    /// True from an automatic refresh request until the service call returns (admitted or
+    /// not). Tests settle on this between cycles; a new request is ignored while it is true.
+    var isAutomaticRefreshPending: Bool {
+        automaticRefreshTask != nil
     }
 
     private func requestAutomaticRefreshIfNeeded() {

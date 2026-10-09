@@ -21,10 +21,82 @@ import Foundation
 //    window reached, but never advances its observation time (which would make an old
 //    figure look fresh).
 //  - Model-scoped and overage buckets are ignored; they are not plan-pill evidence.
+//
+// Accumulation across publications (`accumulate`): the telemetry service restarts its
+// snapshot at every run and its mapper treats each event as a whole new observation (a
+// missing utilization becomes `nil` with a newer time). Those are faithful diagnostics, but
+// the display must not regress, so the overlay is folded per window before it is merged:
+//  - Windows a publication does not mention are kept (a new run reporting only `five_hour`
+//    does not drop the previous run's newer `seven_day`).
+//  - Per window, the newest observation *with a percent* wins.
+//  - An observation without a percent never replaces a percent and never advances the
+//    window's observation time. It may only add an explicit limit-reached flag; its reset
+//    time is ignored (a reset time without a figure is not a fresher reading).
+//  - A publication from a different profile starts over instead of mixing profiles.
 
 package enum ProviderQuotaDisplayOverlay {
     /// Account-wide plan windows a passive SDK event may refresh for display.
     package static let planWindowRoles: Set<String> = ["five_hour", "seven_day"]
+
+    /// Folds one telemetry publication into the accumulated display overlay (see header).
+    /// Returns `nil` when nothing displayable remains.
+    package static func accumulate(_ incoming: ProviderQuotaSnapshot, into existing: ProviderQuotaSnapshot?) -> ProviderQuotaSnapshot? {
+        guard incoming.source == .claudeSDKEvent,
+              incoming.accountKey.lineage == .anthropicFirstParty,
+              incoming.accountKey.credentialProfileID != nil
+        else { return nil }
+        let prior = existing?.accountKey == incoming.accountKey ? existing : nil
+        var windows = planWindows(in: prior)
+        for (role, window) in planWindows(in: incoming) {
+            guard let current = windows[role] else {
+                windows[role] = window
+                continue
+            }
+            guard window.observedAt > current.observedAt else { continue }
+            if window.percent != nil {
+                windows[role] = window
+            } else if window.isReached == true, current.isReached != true {
+                var reached = current
+                reached.isReached = true
+                windows[role] = reached
+            }
+        }
+        guard !windows.isEmpty else { return nil }
+        let ordered = windows.sorted { $0.key < $1.key }.map(\.value)
+        return ProviderQuotaSnapshot(
+            accountKey: incoming.accountKey,
+            buckets: ordered.map { window in
+                ProviderQuotaBucket(
+                    bucketID: window.key.bucketID,
+                    displayLabel: nil,
+                    nativeModelAlias: nil,
+                    scope: .accountWide,
+                    reachedType: nil,
+                    isReached: nil,
+                    planType: nil,
+                    credits: nil,
+                    spendControl: nil,
+                    windows: [window]
+                )
+            },
+            facets: .empty,
+            source: .claudeSDKEvent,
+            coverage: .reportedBucketsOnly,
+            observedAt: ordered.map(\.observedAt).max() ?? incoming.observedAt
+        )
+    }
+
+    /// Newest account-wide plan window per role.
+    private static func planWindows(in snapshot: ProviderQuotaSnapshot?) -> [String: ProviderQuotaWindow] {
+        var result: [String: ProviderQuotaWindow] = [:]
+        for bucket in snapshot?.buckets ?? [] where bucket.scope == .accountWide {
+            for window in bucket.windows where planWindowRoles.contains(window.nativeRole) {
+                if let existing = result[window.nativeRole], existing.observedAt >= window.observedAt { continue }
+                result[window.nativeRole] = window
+            }
+        }
+        return result
+    }
 
     package static func merge(_ overlay: ProviderQuotaSnapshot?, onto base: ProviderQuotaSnapshot) -> ProviderQuotaSnapshot {
         guard let overlay,
@@ -36,13 +108,7 @@ package enum ProviderQuotaDisplayOverlay {
               overlay.accountKey.credentialProfileID == profileID
         else { return base }
 
-        var updates: [String: ProviderQuotaWindow] = [:]
-        for bucket in overlay.buckets where bucket.scope == .accountWide {
-            for window in bucket.windows where planWindowRoles.contains(window.nativeRole) {
-                if let existing = updates[window.nativeRole], existing.observedAt >= window.observedAt { continue }
-                updates[window.nativeRole] = window
-            }
-        }
+        let updates = planWindows(in: overlay)
         guard !updates.isEmpty else { return base }
 
         var newest = base.observedAt

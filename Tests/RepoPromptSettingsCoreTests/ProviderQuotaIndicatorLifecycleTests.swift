@@ -41,7 +41,8 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let store = makeStore(source: source, clock: clock)
         store.activate()
         await source.emit(.loaded(fiveHourSnapshot(used: 80, observedAt: start, resetsAt: start.addingTimeInterval(3600))))
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         clock.advance(by: 90 * 60)
         store.revalidateFreshness()
@@ -59,7 +60,8 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.activate()
         let snapshot = fiveHourSnapshot(used: 42, observedAt: start, resetsAt: start.addingTimeInterval(4 * 3600))
         await source.emit(.loaded(snapshot))
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         await source.emit(.failed(reason: "Usage limits are not available right now.", previous: snapshot))
         let failed = await waitUntil { store.indicatorState?.refreshFailed == true }
@@ -75,7 +77,8 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let store = makeStore(source: source, clock: clock)
         store.activate()
         await source.emit(.loaded(fiveHourSnapshot(used: 42, observedAt: start, resetsAt: nil)))
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         // Account switch / sign-out: the service discards the snapshot and republishes idle.
         await source.emit(.idle)
@@ -87,8 +90,9 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
 
         // A failed read without a previous snapshot (sign-in required) is also neutral.
         await source.emit(.failed(reason: "Sign in", previous: nil))
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await settle()
         XCTAssertEqual(store.indicatorState?.freshness, .unavailable)
+        XCTAssertNil(store.indicatorState?.usedPercent)
         store.deactivate()
     }
 
@@ -110,14 +114,16 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let store = makeStore(source: source, clock: clock)
         store.activate()
         await source.emit(.loaded(fiveHourSnapshot(used: 42, observedAt: start, resetsAt: nil)))
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         store.setPresentationEnabled(false)
         XCTAssertNil(store.indicatorState, "display off is a hide reason")
 
         store.setPresentationEnabled(true)
         await source.emit(.loaded(fiveHourSnapshot(used: 43, observedAt: start, resetsAt: nil)))
-        _ = await waitUntil { store.indicatorState != nil }
+        let reshown = await waitUntil { store.indicatorState?.usedPercent == 43 }
+        XCTAssertTrue(reshown, "display back on shows the current value")
         store.setEnabled(false)
         XCTAssertNil(store.indicatorState, "source off is a hide reason")
         store.deactivate()
@@ -132,11 +138,12 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.activate()
         let primed = await waitUntil { await reader.count == 1 }
         XCTAssertTrue(primed, "the startup read happens once")
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         // Stale immediately, but the last attempt was just now.
         store.revalidateFreshness()
-        await settle()
+        await settleAutomaticRefresh(store)
         var count = await reader.count
         XCTAssertEqual(count, 1, "a tick within the automatic gap issues no read")
 
@@ -144,13 +151,16 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.revalidateFreshness()
         let refreshed = await waitUntil { await reader.count == 2 }
         XCTAssertTrue(refreshed, "a stale reading past the gap triggers one automatic read")
+        await settleAutomaticRefresh(store)
 
-        store.revalidateFreshness()
-        store.revalidateFreshness()
-        store.revalidateFreshness()
+        // Each tick runs to completion, so every one is a real admission attempt.
+        for _ in 0 ..< 3 {
+            store.revalidateFreshness()
+            await settleAutomaticRefresh(store)
+        }
         clock.advance(by: 10 * 60)
         store.revalidateFreshness()
-        await settle()
+        await settleAutomaticRefresh(store)
         count = await reader.count
         XCTAssertEqual(count, 2, "repeated ticks inside fifteen minutes issue nothing")
 
@@ -158,6 +168,7 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.revalidateFreshness()
         let again = await waitUntil { await reader.count == 3 }
         XCTAssertTrue(again)
+        await settleAutomaticRefresh(store)
         store.deactivate()
         await service.shutdown()
     }
@@ -167,8 +178,10 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let reader = Reader(clock: clock, age: 3 * 3600)
         let (store, service) = await makeLiveStore(reader: reader, clock: clock, automaticInterval: 30)
         store.activate()
-        _ = await waitUntil { await reader.count == 1 }
-        _ = await waitUntil { store.indicatorState != nil }
+        let primed = await waitUntil { await reader.count == 1 }
+        XCTAssertTrue(primed)
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         await reader.setMode(.fail)
         clock.advance(by: 31)
@@ -178,11 +191,12 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let failedState = await waitUntil { store.indicatorState?.refreshFailed == true }
         XCTAssertTrue(failedState)
         XCTAssertEqual(store.indicatorState?.usedPercent, 42, "a failed refresh keeps the figure")
+        await settleAutomaticRefresh(store)
 
         // First failure backs off 60s; the 30s gap alone would admit a read.
         clock.advance(by: 45)
         store.revalidateFreshness()
-        await settle()
+        await settleAutomaticRefresh(store)
         var count = await reader.count
         XCTAssertEqual(count, 2, "failure backoff suppresses the automatic read")
 
@@ -191,11 +205,16 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.revalidateFreshness()
         let recovered = await waitUntil { await reader.count == 3 }
         XCTAssertTrue(recovered, "after backoff the automatic read resumes")
+        let cleared = await waitUntil { store.indicatorState?.refreshFailed == false }
+        XCTAssertTrue(cleared, "a successful read clears the failed state")
+        // The recovery cycle must finish before the next tick, or that tick is coalesced away.
+        await settleAutomaticRefresh(store)
 
         await reader.setMode(.hold)
         clock.advance(by: 31)
         store.revalidateFreshness()
-        _ = await waitUntil { await reader.count == 4 }
+        let held = await waitUntil { await reader.count == 4 }
+        XCTAssertTrue(held, "the next stale tick admits one read")
         let updating = await waitUntil { store.indicatorState?.isUpdating == true }
         XCTAssertTrue(updating, "an admitted read shows updating in place")
         for _ in 0 ..< 3 {
@@ -209,6 +228,7 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         await reader.release()
         let done = await waitUntil { store.indicatorState?.isUpdating == false }
         XCTAssertTrue(done)
+        await settleAutomaticRefresh(store)
         store.deactivate()
         await service.shutdown()
     }
@@ -218,8 +238,10 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let reader = Reader(clock: clock, age: 0)
         let (store, service) = await makeLiveStore(reader: reader, clock: clock)
         store.activate()
-        _ = await waitUntil { await reader.count == 1 }
-        _ = await waitUntil { store.indicatorState != nil }
+        let primed = await waitUntil { await reader.count == 1 }
+        XCTAssertTrue(primed)
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         clock.advance(by: 20 * 60)
         store.refreshOnForeground()
@@ -231,6 +253,7 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         store.refreshOnForeground()
         let refreshed = await waitUntil { await reader.count == 2 }
         XCTAssertTrue(refreshed, "a stale reading refreshes on foreground instead of being a no-op")
+        await settleAutomaticRefresh(store)
         count = await reader.count
         XCTAssertEqual(count, 2)
         store.deactivate()
@@ -242,7 +265,8 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let reader = Reader(clock: clock, age: 0)
         let (store, service) = await makeLiveStore(reader: reader, clock: clock)
         store.activate()
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         var publications: [ProviderQuotaIndicatorState?] = []
         let recorder = store.$indicatorState.dropFirst().sink { publications.append($0) }
@@ -258,6 +282,7 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         XCTAssertTrue(refreshed, "the stale reading is replaced in place")
         XCTAssertEqual(store.indicatorState?.freshness, .fresh, "a successful refresh clears stale")
         XCTAssertFalse(publications.contains { $0 == nil }, "the pill never disappears during a refresh cycle")
+        await settleAutomaticRefresh(store)
         store.deactivate()
         await service.shutdown()
     }
@@ -269,19 +294,22 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let reader = Reader(clock: clock, age: 3 * 3600)
         let (store, service) = await makeLiveStore(reader: reader, clock: clock)
         store.activate()
-        _ = await waitUntil { await reader.count == 1 }
-        _ = await waitUntil { store.indicatorState != nil }
+        let primed = await waitUntil { await reader.count == 1 }
+        XCTAssertTrue(primed)
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         clock.advance(by: 5 * 60)
         store.revalidateFreshness()
-        await settle()
+        await settleAutomaticRefresh(store)
         var count = await reader.count
         XCTAssertEqual(count, 1, "the automatic gap still holds")
 
         store.refresh()
         let manual = await waitUntil { await reader.count == 2 }
         XCTAssertTrue(manual, "a user refresh is not subject to the automatic gap")
-        _ = await waitUntil { !store.isRefreshing }
+        let manualDone = await waitUntil { !store.isRefreshing }
+        XCTAssertTrue(manualDone)
 
         await reader.setMode(.hold)
         clock.advance(by: 2 * 60)
@@ -296,7 +324,9 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         XCTAssertNotNil(store.indicatorState)
         await reader.release()
         await direct.value
-        _ = await waitUntil { !store.isRefreshing }
+        let released = await waitUntil { !store.isRefreshing }
+        XCTAssertTrue(released)
+        await settleAutomaticRefresh(store)
         count = await reader.count
         XCTAssertEqual(count, 3)
         store.deactivate()
@@ -310,7 +340,8 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         let reader = Reader(clock: clock, age: 0)
         let (store, service) = await makeLiveStore(reader: reader, clock: clock)
         store.activate()
-        _ = await waitUntil { store.indicatorState != nil }
+        let shown = await waitUntil { store.indicatorState != nil }
+        XCTAssertTrue(shown)
 
         clock.advance(by: 2 * 3600)
         try store.applyDisplayOverlay(sdkSnapshot(utilization: 0.61, observedAt: clock.now, profile: "profile"))
@@ -318,6 +349,7 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
         XCTAssertEqual(store.indicatorState?.freshness, .fresh)
 
         store.revalidateFreshness()
+        XCTAssertFalse(store.isAutomaticRefreshPending, "a display kept current by telemetry requests no refresh")
         await settle()
         let count = await reader.count
         XCTAssertEqual(count, 1, "telemetry kept the display current, so no CLI read is spent")
@@ -404,6 +436,13 @@ final class ProviderQuotaIndicatorLifecycleTests: XCTestCase {
 
     private func settle() async {
         try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+
+    /// Waits until the store's automatic refresh request (admitted or rejected) has returned,
+    /// so the next tick is a fresh admission attempt rather than coalesced into this one.
+    private func settleAutomaticRefresh(_ store: ProviderQuotaUIStore, file: StaticString = #filePath, line: UInt = #line) async {
+        let idle = await waitUntil { !store.isAutomaticRefreshPending }
+        XCTAssertTrue(idle, "automatic refresh did not settle", file: file, line: line)
     }
 
     private func waitUntil(timeout: TimeInterval = 3, _ condition: @MainActor () async -> Bool) async -> Bool {
