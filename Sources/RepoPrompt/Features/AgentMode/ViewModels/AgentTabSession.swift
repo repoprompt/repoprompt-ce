@@ -163,6 +163,11 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// Set while Handoff installs inherited worktree bindings on a never-activated destination.
+    /// Debounced autosaves stay disarmed so the first durable record cannot be the provisional,
+    /// unbound state; Handoff performs the destination's first save explicitly afterwards.
+    var isInstallingHandoffWorktreeBindings = false
+
     var worktreeBindingTransitionInProgress: Bool = false
 
     /// Wait/question state

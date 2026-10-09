@@ -15547,6 +15547,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else { return }
         guard let session = sessions[tabID] else { return }
         session.saveRequestGeneration &+= 1
+        guard !session.isInstallingHandoffWorktreeBindings else {
+            // Handoff saves the destination explicitly once its inherited bindings are installed.
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+            return
+        }
         #if DEBUG
             let replacedPendingSave = session.saveDebounceTask != nil
             perfRecorder.increment("save.schedule", tabID: tabID)
@@ -15558,7 +15564,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.saveDebounceTask?.cancel()
         session.saveDebounceTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second debounce
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  self?.sessions[tabID]?.isInstallingHandoffWorktreeBindings != true
+            else { return }
             await self?.saveSession(for: tabID)
         }
     }
@@ -22420,7 +22428,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // stale or unavailable removes the never-activated destination instead of silently
         // falling back to the primary checkout.
         if !sourceWorktreeSnapshot.bindings.isEmpty {
+            // Transcript/payload mutation above already armed the ordinary autosave debounce.
+            // Disarm it before awaiting installation so no save can persist the provisional,
+            // unbound destination; step 6 performs the first save once the mappings are installed.
+            destSession.isInstallingHandoffWorktreeBindings = true
+            destSession.saveDebounceTask?.cancel()
+            destSession.saveDebounceTask = nil
             do {
+                defer { destSession.isInstallingHandoffWorktreeBindings = false }
                 try await installHandoffDestinationWorktreeBindings(
                     sourceWorktreeSnapshot,
                     sourceTabID: sourceTabID,
@@ -22552,6 +22567,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               sourceSession.activeAgentSessionID == sourceSessionID,
               !sourceSession.worktreeBindingTransitionInProgress,
               !sourceSession.isChangingExecutionLocation,
+              !sourceSession.isPreparingInitialWorktree,
               worktreeBindingState(forAgentSessionID: sourceSessionID, tabID: sourceTabID)
               == .hydrated(snapshot.bindings)
         else {

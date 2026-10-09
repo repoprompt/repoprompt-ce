@@ -86,6 +86,81 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         }
     }
 
+    func testProvisionalInstallNeverAutosavesUnboundDestination() async throws {
+        try await withFixture(bindSource: true) { fixture in
+            let sourceBindings = fixture.sourceSession.worktreeBindings
+            let cutoffItemID = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+            var installIsProvisional = false
+            var destinationSaves: [(bindings: [AgentSessionWorktreeBinding], duringInstall: Bool, data: Data)] = []
+
+            fixture.viewModel.test_setAgentSessionSaver { session, _, _ in
+                if session.id != fixture.sourceSessionID {
+                    try destinationSaves.append((
+                        session.worktreeBindings,
+                        installIsProvisional,
+                        JSONEncoder().encode(session)
+                    ))
+                }
+                return fixture.git.sandbox.appendingPathComponent("\(session.id).json")
+            }
+            fixture.viewModel.test_setAgentSessionLinkInheritanceHandler { _, _ in .empty }
+            // Hold installation past the ordinary one-second autosave debounce that the transcript
+            // and payload mutations arm; the real scheduler must not save the unbound destination.
+            fixture.viewModel.test_beforeHandoffDestinationWorktreeInstall = {
+                installIsProvisional = true
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                installIsProvisional = false
+            }
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                upToItemID: cutoffItemID,
+                destinationAgent: fixture.sourceSession.selectedAgent,
+                destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw
+            )
+
+            XCTAssertFalse(
+                destinationSaves.contains(where: \.duringInstall),
+                "no destination save may run while installation is provisional"
+            )
+            let firstSave = try XCTUnwrap(destinationSaves.first)
+            XCTAssertEqual(firstSave.bindings, sourceBindings)
+            let reloaded = try JSONDecoder().decode(AgentSession.self, from: firstSave.data)
+            XCTAssertEqual(reloaded.worktreeBindings, sourceBindings, "the first durable record reloads bound")
+            XCTAssertEqual(fixture.viewModel.sessions[destinationTabID]?.worktreeBindings, sourceBindings)
+            XCTAssertFalse(fixture.viewModel.sessions[destinationTabID]?.isInstallingHandoffWorktreeBindings ?? true)
+        }
+    }
+
+    func testSourceStartingInitialWorktreePreparationDuringHandoffFails() async throws {
+        try await withFixture(bindSource: true) { fixture in
+            let cutoffItemID = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+            let composeTabIDsBefore = composeTabIDs(fixture)
+            fixture.viewModel.test_setAgentSessionSaver { session, _, _ in
+                fixture.git.sandbox.appendingPathComponent("\(session.id).json")
+            }
+            fixture.viewModel.test_setAgentSessionsDeleter { _, _ in }
+            fixture.viewModel.test_beforeHandoffDestinationWorktreeInstall = {
+                fixture.sourceSession.isPreparingInitialWorktree = true
+            }
+
+            do {
+                _ = try await fixture.viewModel.prepareHandoffToNewTab(
+                    upToItemID: cutoffItemID,
+                    destinationAgent: fixture.sourceSession.selectedAgent,
+                    destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw
+                )
+                XCTFail("A source preparing a new execution location must not be snapshotted mid-move")
+            } catch let AgentSessionError.handoffExecutionLocationUnavailable(reason) {
+                XCTAssertTrue(reason.contains("changed during Handoff"), reason)
+            }
+            fixture.sourceSession.isPreparingInitialWorktree = false
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.sourceTabID)
+            XCTAssertEqual(composeTabIDs(fixture), composeTabIDsBefore)
+        }
+    }
+
     func testUnboundSourceHandoffKeepsPrimaryCheckoutBehavior() async throws {
         try await withFixture(bindSource: false) { fixture in
             XCTAssertTrue(fixture.sourceSession.worktreeBindings.isEmpty)
