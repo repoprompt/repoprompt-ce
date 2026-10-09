@@ -215,6 +215,56 @@ final class HistoryAnalyticsTests: XCTestCase {
         XCTAssertEqual(Set(matches.map(\.sessionID)), expectedIDs)
     }
 
+    /// A head-sniffed stale entry caches only directory-derived identity. Direct lookup must
+    /// still resolve `workspace.json`, and upgrading the index must surface its records.
+    func testStaleCacheEntryDoesNotSupplyIdentityAndUpgradesToCurrentIndex() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("rp-history-1091-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let realName = "Real Workspace Name"
+        let workspaceDir = try makeHistoryWorkspace(
+            root: root,
+            name: "Workspace-DirectoryName-\(UUID().uuidString)",
+            indexData: Data("{\"schemaVersion\":5,\"generatedAt\":0,\"entries\":[]}".utf8),
+            workspaceJSON: "{\"name\":\"\(realName)\"}"
+        )
+        let sessionsDir = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
+        let record = makeRecord(id: UUID(), freshness: 800_000_000, itemCount: 3)
+        try Data("{}".utf8).write(to: sessionsDir.appendingPathComponent(record.filename))
+
+        let scanner = HistorySessionScanner(
+            applicationSupportRoot: root,
+            workspaceDirectoryProvider: { _ in [workspaceDir] }
+        )
+
+        let staleScan = try await scanner.scanWorkspaces(matching: nil)
+        let stale = try XCTUnwrap(staleScan.workspaces.first)
+        XCTAssertEqual(stale.indexSchemaVersion, 5)
+        XCTAssertNotEqual(stale.workspaceName, realName, "stale skip must not read workspace.json")
+        let staleCacheEntries = await scanner.indexScanCacheEntryCountForTesting
+        XCTAssertEqual(staleCacheEntries, 1)
+
+        let staleLookup = try await scanner.locateSession(sessionID: record.id)
+        let staleLocation = try XCTUnwrap(staleLookup.location)
+        XCTAssertEqual(staleLocation.workspaceName, realName)
+        XCTAssertNil(staleLocation.record)
+
+        let currentIndex = try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [record]))
+        try currentIndex.write(to: sessionsDir.appendingPathComponent("AgentSessionIndex.json"))
+
+        let refreshed = try await scanner.scanWorkspacesRefreshing(matching: nil)
+        let current = try XCTUnwrap(refreshed.workspaces.first)
+        XCTAssertNil(current.indexSchemaVersion)
+        XCTAssertEqual(current.workspaceName, realName)
+        XCTAssertEqual(current.records.map(\.id), [record.id])
+
+        let currentLookup = try await scanner.locateSession(sessionID: record.id)
+        XCTAssertEqual(currentLookup.location?.record?.id, record.id)
+        XCTAssertEqual(currentLookup.location?.workspaceName, realName)
+    }
+
     private func makeHistoryWorkspace(
         root: URL,
         name: String,

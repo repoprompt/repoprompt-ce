@@ -430,9 +430,82 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             }
         }
 
+        // MARK: - List paging through the provider boundary (#1091)
+
+        func testListPagesNonPrunableWorktreesThroughProvider() async throws {
+            try await withProvider { fixture in
+                let extras = try fixture.addWorktrees(["page-a", "page-b", "page-c"])
+                let gone = try XCTUnwrap(fixture.addWorktrees(["page-gone"]).first)
+                try FileManager.default.removeItem(at: gone)
+                let expected = Set(([fixture.logical, fixture.physical] + extras).map(Self.canonicalPath))
+
+                var seen: [String] = []
+                var offset = 0
+                var pages = 0
+                while pages < 10 {
+                    let reply = try XCTUnwrap(try await fixture.listCall([
+                        "limit": .int(2), "offset": .int(offset)
+                    ]).objectValue)
+                    pages += 1
+                    XCTAssertEqual(reply["total_count"]?.intValue, expected.count)
+                    XCTAssertTrue(reply["warning"]?.stringValue?.contains("Omitted 1 stale (prunable)") == true)
+                    let worktrees = try XCTUnwrap(reply["worktrees"]?.arrayValue)
+                    XCTAssertLessThanOrEqual(worktrees.count, 2)
+                    seen += worktrees.compactMap { $0.objectValue?["path"]?.stringValue }.map {
+                        Self.canonicalPath(URL(fileURLWithPath: $0))
+                    }
+                    guard let next = reply["next_offset"]?.intValue else {
+                        XCTAssertNil(reply["truncated"])
+                        break
+                    }
+                    XCTAssertEqual(reply["truncated"]?.boolValue, true)
+                    XCTAssertEqual(next, offset + worktrees.count)
+                    offset = next
+                }
+
+                XCTAssertEqual(pages, 3)
+                XCTAssertEqual(seen.count, expected.count, "pages must not duplicate worktrees")
+                XCTAssertEqual(Set(seen), expected)
+                XCTAssertFalse(seen.contains(Self.canonicalPath(gone)))
+            }
+        }
+
+        func testPersistVisualsListOnlyPersistsReturnedPage() async throws {
+            try await withProvider { fixture in
+                let extras = try fixture.addWorktrees(["visual-a", "visual-b"])
+                let roots = [fixture.logical, fixture.physical] + extras
+                let identities = try roots.map { try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: $0)) }
+                func persisted(_ identity: GitWorktreeIdentitySnapshot) -> Bool {
+                    GlobalSettingsStore.shared.worktreeVisualIdentity(
+                        repositoryID: identity.repository.repositoryID, worktreeID: identity.worktreeID
+                    ) != nil
+                }
+                XCTAssertFalse(identities.contains(where: persisted))
+
+                let reply = try XCTUnwrap(try await fixture.listCall([
+                    "limit": .int(1), "offset": .int(1), "persist_visuals": .bool(true)
+                ]).objectValue)
+                let page = try XCTUnwrap(reply["worktrees"]?.arrayValue)
+                XCTAssertEqual(page.count, 1)
+                let pageID = try XCTUnwrap(page.first?.objectValue?["worktree_id"]?.stringValue)
+
+                for identity in identities {
+                    XCTAssertEqual(
+                        persisted(identity), identity.worktreeID == pageID,
+                        "only the returned page may persist visuals: \(identity.worktreeID)"
+                    )
+                }
+            }
+        }
+
+        private static func canonicalPath(_ url: URL) -> String {
+            url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+
         @MainActor
         private struct Fixture {
             let driver: ContextBuilderMultiRootDiscoveryDriver
+            let git: ReviewGitRepositoryFixture
             let logical: URL
             let physical: URL
             let identity: GitWorktreeIdentitySnapshot
@@ -462,6 +535,35 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                 )
                 return try await MCPDomainInvocationSecurityContext.$current.withValue(requestSecurity) {
                     try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                }
+            }
+
+            /// `list` rejects the binding-only `session_id`/`worktree` arguments `call` injects.
+            func listCall(_ extra: [String: Value]) async throws -> Value {
+                var args = extra
+                args["op"] = .string("list")
+                args["repo_root"] = .string(logical.path)
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID, tabContextHint: nil
+                )
+                let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_worktree", metadata: metadata)
+                let requestSecurity = DomainToolInvocationSecurityContext(
+                    principal: security.principal,
+                    connectionID: security.connectionID, connectionGeneration: security.connectionGeneration,
+                    invocationID: UUID(), runtimeID: security.runtimeID, runtimeGeneration: security.runtimeGeneration,
+                    authorizedCanonicalRoots: security.authorizedCanonicalRoots,
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
+                )
+                return try await MCPDomainInvocationSecurityContext.$current.withValue(requestSecurity) {
+                    try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                }
+            }
+
+            func addWorktrees(_ names: [String]) throws -> [URL] {
+                try names.map { name in
+                    let url = git.sandbox.appendingPathComponent(name)
+                    _ = try git.runGit(["worktree", "add", "--detach", url.path, "HEAD"], at: logical)
+                    return url
                 }
             }
         }
@@ -505,6 +607,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                 )
                 try await body(Fixture(
                     driver: driver,
+                    git: git,
                     logical: logical,
                     physical: physical,
                     identity: identity,
