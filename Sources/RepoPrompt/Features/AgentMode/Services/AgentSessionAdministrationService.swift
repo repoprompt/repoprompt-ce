@@ -108,9 +108,17 @@ protocol AgentSessionAdministrationOperationHandler: AnyObject {
         scope: DomainDelegationScopeRecord
     ) -> [BatchConfirmationItem]
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value
+    /// Synchronous, operation-specific validation after the authority admitted the batch and
+    /// **before** any batch card is raised or the handler runs. A non-nil value is returned to the
+    /// caller as-is, so a structurally refused request never reaches the user's card.
+    func preflight(_ batch: AgentSessionAdministrationAuthorizedBatch) throws -> Value?
 }
 
 extension AgentSessionAdministrationOperationHandler {
+    func preflight(_: AgentSessionAdministrationAuthorizedBatch) -> Value? {
+        nil
+    }
+
     func confirmationItems(
         for request: AgentSessionAdministrationRequest,
         scope _: DomainDelegationScopeRecord
@@ -194,10 +202,11 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         var usage: [UUID: DomainDelegationScopeUsage] = [:]
         if request.operation.scopeGuardrailUse != nil {
             for record in chain {
-                usage[record.id] = projector.usage(
+                // In-flight creations (spawn, fork, worktree_create) count until they settle.
+                usage[record.id] = scopes.usageIncludingReservations(projector.usage(
                     of: record.grant,
                     spawnParentSessionID: request.targetSessionIDs.first
-                )
+                ))
             }
         }
         let confirmation = request.confirmationID.flatMap {
@@ -244,6 +253,7 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .scopeSelectionRequired(scopeIDs):
             return .scopeSelectionRequired(scopeIDs: scopeIDs)
         case let .confirmationRequired(reason, pending):
+            if let refusal = try handler.preflight(pending) { return .completed(refusal) }
             // Lane B owns preview rendering; until then a preview reports the requirement only.
             guard !request.preview, let idempotencyKey = request.idempotencyKey else {
                 return .denied(.confirmationRequired(reason: reason), sessionID: nil)
@@ -268,6 +278,9 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)
         case let .authorized(batch):
+            // Structural refusals are decided before any card is claimed, exactly as before a card
+            // is raised in the branch above.
+            if let refusal = try handler.preflight(batch) { return .completed(refusal) }
             // Only a card the authority actually required is claimed: an approved card authorizes
             // exactly one application, claimed before the handler suspends (so a concurrent replay
             // cannot double-apply) and marked applied only after the handler succeeds. The handler

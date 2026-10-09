@@ -142,6 +142,14 @@ package struct DomainDelegationScopeAuthority: Sendable {
             .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
     }
 
+    /// Every live scope in the process, oldest grant first. Placement decisions use this to refuse a
+    /// move that would change some other scope's membership; it never authorizes on its own.
+    package func liveRecords(now: Date) -> [DomainDelegationScopeRecord] {
+        records.values
+            .filter { liveRecord(id: $0.id, now: now) != nil }
+            .sorted { ($0.grant.grantedAt, $0.id.uuidString) < ($1.grant.grantedAt, $1.id.uuidString) }
+    }
+
     package func hasLiveScope(grantedTo sessionID: UUID, now: Date) -> Bool {
         records.values.contains {
             $0.grant.granteeSessionID == sessionID && liveRecord(id: $0.id, now: now) != nil

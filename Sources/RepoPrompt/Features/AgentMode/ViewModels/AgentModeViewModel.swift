@@ -5102,6 +5102,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ? indexEntry.agentReasoningEffortRaw : nil
         session.acpModelParameterSelections = indexEntry.acpModelParameterSelections
         session.createdByOverseerSessionID = indexEntry.createdByOverseerSessionID
+        session.organizationalParentID = indexEntry.organizationalParentID
+        session.delegationScopeID = indexEntry.delegationScopeID
         session.autoEditEnabled = indexEntry.autoEditEnabled
         session.oversight.autoWakeOnUpdates = indexEntry.autoWakeOnOversightUpdates
         session.oversight.autoWakeTargetSessionIDs = indexEntry.agentSessionLinkAutoWakeTargetSessionIDs
@@ -5140,6 +5142,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.lastUserMessageAt = nil
         session.parentSessionID = nil
         session.createdByOverseerSessionID = nil
+        session.organizationalParentID = nil
+        session.delegationScopeID = nil
         session.worktreeBindings = []
         session.worktreeMergeOperations = []
         sessionIndexStore.removeSortDate(forTabID: session.tabID)
@@ -6057,6 +6061,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
+        // Placement written while the file was being read lands in the index first; prefer it so a
+        // hydrate can never revert a newer placement to the file's older value.
+        let indexedPlacement = ownerValidatedSessionIndex[agentSession.id]
+        session.organizationalParentID = indexedPlacement?.organizationalParentID ?? agentSession.organizationalParentID
+        session.delegationScopeID = indexedPlacement?.delegationScopeID ?? agentSession.delegationScopeID
         session.isMCPOriginated = agentSession.isMCPOriginated
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
@@ -6422,6 +6431,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.hasLoadedPersistedState = false
         session.parentSessionID = nil
         session.createdByOverseerSessionID = nil
+        session.organizationalParentID = nil
+        session.delegationScopeID = nil
         session.setItemsSilently([], reason: .routeActivation)
         session.clearDerivedTranscriptCaches()
         session.hasSentFirstMessage = false
@@ -8452,7 +8463,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func requireIdleWorktreeBindingTransition(
+    /// Internal (not private) so delegated `worktree_bind apply: next_boundary` can wait for exactly
+    /// the boundary this transition admits; it never relaxes the gate.
+    func requireIdleWorktreeBindingTransition(
         _ session: TabSession,
         ownsExecutionLocationGate: Bool = false
     ) throws {
@@ -8713,6 +8726,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 periodicIdleWakeIntervalSeconds: existingEntry.periodicIdleWakeIntervalSeconds,
                 parentSessionID: parentSessionID,
                 createdByOverseerSessionID: existingEntry.createdByOverseerSessionID,
+                organizationalParentID: existingEntry.organizationalParentID,
+                delegationScopeID: existingEntry.delegationScopeID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
@@ -14402,6 +14417,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
+        organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
@@ -14428,6 +14445,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             periodicIdleWakeIntervalSeconds: AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds),
             parentSessionID: parentSessionID,
             createdByOverseerSessionID: createdByOverseerSessionID,
+            organizationalParentID: organizationalParentID,
+            delegationScopeID: delegationScopeID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -16037,6 +16056,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             automationTurnAudit: session.automationTurnAudit,
             parentSessionID: session.parentSessionID,
             createdByOverseerSessionID: session.createdByOverseerSessionID,
+            organizationalParentID: session.organizationalParentID,
+            delegationScopeID: session.delegationScopeID,
             pendingHandoffPayload: session.pendingHandoff.payload,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
             pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
@@ -16095,6 +16116,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 periodicIdleWakeIntervalSeconds: agentSession.periodicIdleWakeIntervalSeconds,
                 parentSessionID: agentSession.parentSessionID,
                 createdByOverseerSessionID: agentSession.createdByOverseerSessionID,
+                organizationalParentID: agentSession.organizationalParentID,
+                delegationScopeID: agentSession.delegationScopeID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
                 activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
@@ -22517,6 +22540,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Creates a duplicate tab, migrates transcript items up to the cutoff, sets the pending handoff
     /// payload (delivered on the destination tab's first user send), and switches to the new tab.
     ///
+    /// Delegation-scope `fork` passes an explicit `sourceTabID`, `activateDestination: false` (no
+    /// focus change), and `inheritOversightLinks: false` (a scope may not mint links to sessions
+    /// outside it). The defaults are the user Handoff/Fork behavior.
+    ///
     /// - Returns: The destination tab ID on success.
     @MainActor
     @discardableResult
@@ -22524,11 +22551,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         upToItemID: UUID,
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
-        destinationReasoningEffortRaw: String?
+        destinationReasoningEffortRaw: String?,
+        sourceTabID explicitSourceTabID: UUID? = nil,
+        activateDestination: Bool = true,
+        inheritOversightLinks: Bool = true
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager,
-              let sourceTabID = currentTabID,
+              let sourceTabID = explicitSourceTabID ?? currentTabID,
               let sourceSession = sessions[sourceTabID]
         else {
             throw AgentSessionError.noActiveWorkspace
@@ -22638,7 +22668,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // Only the canonical user Handoff/Fork path invokes inheritance. It settles before the tab
         // switch and therefore before a destination composer can claim its first provider turn.
-        if let parentLinkEndpoint,
+        if inheritOversightLinks,
+           let parentLinkEndpoint,
            let childEndpoint,
            parentLinkEndpoint != childEndpoint,
            !Task.isCancelled
@@ -22646,6 +22677,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = await agentSessionLinkInheritanceHandler(parentLinkEndpoint, childEndpoint)
         }
 
+        guard activateDestination else { return destTabID }
         // 7) Switch to the destination tab, focus the cloned active Oracle chat if one
         //    exists, then update active bindings for the handoff session.
         await promptManager.switchComposeTab(destTabID)

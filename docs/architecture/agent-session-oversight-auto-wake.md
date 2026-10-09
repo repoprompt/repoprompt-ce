@@ -43,8 +43,8 @@ Rules that hold the scope design together:
 
 - **Membership is projected, never argued.** `DelegationMembershipProjector` computes membership
   proofs from persisted provenance (`parentSessionID`, `createdByOverseerSessionID`, and the
-  future `organizationalParentID`) and presents them to the authority, the same way link leases are
-  presented. Tool arguments only name targets.
+  mutable `organizationalParentID`, which wins when set) and presents them to the authority, the
+  same way link leases are presented. Tool arguments only name targets.
 - **One authority check.** `DomainDelegationScopeAuthority.authorize` runs, in order: scope live
   (grantee, active, unexpired, generation), capability held (target-independent, so checked first
   and it cannot probe membership), membership proofs valid for the scope *and every ancestor* (an
@@ -111,6 +111,55 @@ Rules that hold the scope design together:
   brought the batch to or below the threshold) by the front door, so a successful application
   always ends `applied` and a failed one returns the card to `approved`. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
+
+Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
+door, so their cards apply on approval too; each handler's `preflight` runs before a card is raised,
+before an approved card is claimed, and in `preview`, so a structurally refused call never reaches
+the user's card.
+
+- **Links under a scope.** `link`/`unlink` go through the bridge's ordinary durable Add/Stop, so
+  link authority stays the sole owner. A scope only mints links its own grantee observes
+  (`observer_must_be_caller`); `unlink` needs both endpoints to be members (management never chains).
+  A new link's capabilities must be within the scope's ceiling (`poll`/`wait`/`read` need
+  `observe`; `send_when_idle`/`manage` need `control`). The bridge mints only the default managed set
+  and durable intent restores it as such, so a scope without `observe` + `control` cannot create a
+  link at all. An existing link is reported as-is and never upgraded.
+- **Placement never moves membership elsewhere.** `reparent` needs the source and destination both
+  in the caller's scope chain; `adopt` needs a user card and a user-granted (not nested) scope. Both
+  are refused (`placement_affects_other_scopes`, with a count, never other scopes' IDs) if the move
+  would make the moved subtree join or leave any live scope outside the caller's own chain. A chain
+  that runs into a session whose provenance is not loaded is `placement_unresolved` unless both
+  chains stop at the same unknown session. `adopt` lists every session that moves (the adoptee's
+  whole subtree) on its card, never adopts a scope's grantee or root, and checks `maxLiveSessions`,
+  `maxWorktrees`, and `maxDepth` against post-adopt membership before the card and again at apply
+  (each adoption is reserved from that final check until its in-memory placement lands);
+  `reparent` enforces `maxDepth` on the moved subtree. Only `organizationalParentID` changes; spawn
+  provenance is immutable. Each item's final re-validation and its in-memory placement write (index
+  entry and live tab) run in one synchronous region, and only the disk rewrite is queued, so
+  concurrent placement changes are decided one after the other (a cross re-parent is refused as a
+  cycle; a second adopt at a limit is refused).
+- **Spawn under scope.** `agent_run start` (including an empty `tab_id`, or one whose session has
+  no tree placement at all), `agent_manage create_session`, and `create_lane` evaluate the
+  guardrails of every live tree scope the creator is a member of, and of a workspace scope only
+  for delegated work (the creator is its grantee or stamped with it, or descends organizationally
+  from one), each with its ancestors, because the new session joins them; an unrelated session that
+  merely lives in a delegated workspace is never limited. `fork` and `worktree_create` evaluate the same scopes for the caller. In-flight spawns,
+  forks, adoptions, and worktree creations are reserved so concurrent calls cannot overshoot; a
+  spawn's reservation ends once the new session is stamped, not when its run settles. An
+  already-placed `tab_id` session (adopted, spawned, or a lane) is never re-stamped, a stamp never
+  overwrites an existing placement or scope, another overseer's lane is refused when the start's
+  spawn-parent write would move it between live scopes (`placement_affects_other_scopes`), and a
+  scoped creator cannot graft a session whose subtree holds or roots a live scope
+  (`spawn_target_anchors_scope`); an unplaced target's whole subtree counts against the limits. Auto-join stamping
+  happens for a creator holding a live `spawn` scope. A session in no scope is unchanged. A scope
+  `fork` never inherits oversight links.
+- **Leases are re-checked after every suspension** before the next mutation; a revocation that
+  lands mid-batch stops the remaining items (`scope_revoked`). An unlink re-checks the lease and
+  both endpoints' membership right before the bridge's Stop. Worktree binds and unbinds re-check the
+  lease and the target's membership right before the binding transition and again at its
+  `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
+  and provider-context invalidation after that fence, before it publishes.
+- **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).

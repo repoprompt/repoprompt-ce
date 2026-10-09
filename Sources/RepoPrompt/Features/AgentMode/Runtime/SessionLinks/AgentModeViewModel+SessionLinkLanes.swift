@@ -70,6 +70,9 @@ extension AgentModeViewModel {
         else {
             throw MCPError.invalidParams("The destination workspace is not active.")
         }
+        // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
+        let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target: MCPSessionTarget
         do {
             target = try await mcpResolveOrCreateSessionTarget(
@@ -109,6 +112,20 @@ extension AgentModeViewModel {
               session.mcpControlContext == nil
         else { return incomplete }
 
+        if let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
+           AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease),
+           DelegationSpawnTargetPlacement(
+               organizationalParentID: session.organizationalParentID,
+               parentSessionID: session.parentSessionID,
+               createdByOverseerSessionID: session.createdByOverseerSessionID,
+               delegationScopeID: session.delegationScopeID
+           ).admitsStamp(by: creatorSessionID)
+        {
+            // Auto-join before the first save so the lane's placement is durable with it. Like every
+            // stamp, it never overwrites an existing placement or scope.
+            session.organizationalParentID = creatorSessionID
+            session.delegationScopeID = scopeID
+        }
         // Provenance was installed by the fresh-session seam before this first dirty marking.
         session.isDirty = true
         #if DEBUG

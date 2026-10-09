@@ -53,6 +53,14 @@ struct DelegationScopeRequest: Identifiable, Equatable {
     }
 }
 
+/// One in-flight creation counted against its scopes' guardrails until released.
+struct DelegationScopeReservation: Hashable {
+    let id: UUID
+    let scopeIDs: [UUID]
+    let sessions: Int
+    let worktrees: Int
+}
+
 enum DelegationScopeRequestError: Error, Equatable {
     case invalid(DomainDelegationScopeDenial)
     case idempotencyConflict
@@ -95,6 +103,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     private var authority = DomainDelegationScopeAuthority()
     private var store: DelegationScopeStore?
+    private var reservations: [UUID: DelegationScopeReservation] = [:]
     private var requestOrder: [UUID] = []
     private var requestIDByKey: [String: UUID] = [:]
     private var persistChain: Task<Void, Never>?
@@ -188,6 +197,69 @@ final class DelegationScopeRuntime: ObservableObject {
         authority.activeGrants
             .compactMap { authority.liveRecord(id: $0.id, now: now()) }
             .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
+    }
+
+    // MARK: - In-flight reservations
+
+    /// Sessions and worktrees being created under a scope but not yet visible to the projector.
+    ///
+    /// Taken synchronously right after a guardrail check (no suspension in between) and released when
+    /// creation finishes or fails, so two concurrent creations can never both pass a limit of one.
+    func reserve(scopeIDs: [UUID], sessions: Int = 0, worktrees: Int = 0) -> DelegationScopeReservation {
+        let reservation = DelegationScopeReservation(
+            id: makeUUID(), scopeIDs: Array(Set(scopeIDs)), sessions: sessions, worktrees: worktrees
+        )
+        reservations[reservation.id] = reservation
+        return reservation
+    }
+
+    func release(_ reservation: DelegationScopeReservation?) {
+        guard let reservation else { return }
+        reservations.removeValue(forKey: reservation.id)
+    }
+
+    /// Projected usage plus in-flight reservations on the same scope.
+    func usageIncludingReservations(_ usage: DomainDelegationScopeUsage) -> DomainDelegationScopeUsage {
+        let held = reservations.values.filter { $0.scopeIDs.contains(usage.scopeID) }
+        return DomainDelegationScopeUsage(
+            scopeID: usage.scopeID,
+            liveSessionCount: usage.liveSessionCount + held.reduce(0) { $0 + $1.sessions },
+            worktreeCount: usage.worktreeCount + held.reduce(0) { $0 + $1.worktrees },
+            spawnParentDepth: usage.spawnParentDepth
+        )
+    }
+
+    /// Creation guardrails for a scope and every ancestor — `maxLiveSessions`/`maxDepth` for a session
+    /// (`adminSpawn`, `adminFork`), `maxWorktrees` for a worktree (`adminWorktreeCreate`) — for scopes
+    /// the new session or worktree counts toward beyond the caller's own. `usageByScopeID` must cover
+    /// the chain.
+    func evaluateCreationGuardrails(
+        scopeID: UUID,
+        operation: DomainAgentSessionTargetOperation,
+        usageByScopeID: [UUID: DomainDelegationScopeUsage]
+    ) -> DomainDelegationScopeDenial? {
+        expireDueScopes()
+        return authority.evaluateGuardrails(scopeID: scopeID, operation: operation, usageByScopeID: usageByScopeID)
+    }
+
+    /// Grantees and tree roots of every live scope. Placement never moves one of them into another
+    /// scope (`adopt`, or an `agent_run` start into an unplaced tab).
+    func liveScopeAnchors() -> Set<UUID> {
+        var anchors: Set<UUID> = []
+        for record in allLiveScopes() {
+            anchors.insert(record.grant.granteeSessionID)
+            if case let .tree(root) = record.grant.kind { anchors.insert(root) }
+        }
+        return anchors
+    }
+
+    /// Roots of every live `.tree` scope, for placement decisions (`reparent`, `adopt`).
+    func liveTreeScopeRoots() -> [DomainDelegationTreeScopeRoot] {
+        expireDueScopes()
+        return authority.liveRecords(now: now()).compactMap { record in
+            guard case let .tree(rootSessionID) = record.grant.kind else { return nil }
+            return DomainDelegationTreeScopeRoot(scopeID: record.id, rootSessionID: rootSessionID)
+        }
     }
 
     /// The request, but only for the session that made it.

@@ -2002,12 +2002,32 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.\n\nA scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.\n\n**Scope ops**\n- `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.\n- `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).\n- `release_scope`: give up one of your scopes; revokes its nested scopes too.\n\n**Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).\n**Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.\n**Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.\nTarget ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Other ops may return `not_implemented`.\n\n**Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.",
+      "description" : "Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.\n\nA scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.\n\n**Scope ops**\n- `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.\n- `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).\n- `release_scope`: give up one of your scopes; revokes its nested scopes too.\n\n**Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).\n**Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.\n**Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.\nTarget ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.\n\n**Structure ops** (members only; membership never grows by moving sessions)\n- `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). New links need observe + control; existing links are never upgraded. `unlink`: from `observer_session_id` (default you), both in scope.\n- `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions and their subtrees under a member (user card; user-granted scopes only; never another scope's overseer). Refused with `placement_affects_other_scopes` if another scope's membership would change, `placement_unresolved` if a chain runs through an unloaded workspace.\n- `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.\n- `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.\n- `worktree_create` (`repo_root`, `branch`, `base_ref`, `bind`), `worktree_bind` (`worktree`, `apply`: now|next_boundary), `worktree_unbind`, `worktree_release` (card; unbind + mark stale), `worktree_inventory` (`idle_days`), `merge_preview` (`merge_target`), `merge_apply` (`operation_id`; the user reviews it).\n\n**Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.",
       "inputSchema" : {
         "additionalProperties" : false,
         "properties" : {
+          "apply" : {
+            "description" : "[worktree_create, worktree_bind] now (default) or at the target's next idle boundary.",
+            "enum" : [
+              "now",
+              "next_boundary"
+            ],
+            "type" : "string"
+          },
+          "base_ref" : {
+            "description" : "[worktree_create] Base ref or commit.",
+            "type" : "string"
+          },
+          "bind" : {
+            "description" : "[worktree_create] Also bind it to the target.",
+            "type" : "boolean"
+          },
+          "branch" : {
+            "description" : "[worktree_create] Branch to create or check out.",
+            "type" : "string"
+          },
           "capabilities" : {
-            "description" : "[request_scope] Requested capabilities; the user may narrow them.",
+            "description" : "[request_scope, attenuate] Requested capabilities; the user may narrow them.",
             "items" : {
               "enum" : [
                 "observe",
@@ -2024,6 +2044,10 @@
           },
           "confirmation_id" : {
             "description" : "[confirmation_status, applying call] Confirmation UUID from pending_confirmation; its applied_result appears once the user approves. Pass it on an unchanged repeat of the carded call.",
+            "type" : "string"
+          },
+          "effort" : {
+            "description" : "[set_effort] Effort supported by the target's model.",
             "type" : "string"
           },
           "expected_order" : {
@@ -2043,7 +2067,7 @@
           },
           "guardrails" : {
             "additionalProperties" : false,
-            "description" : "[request_scope] Proposed guardrails; the user may tighten them.",
+            "description" : "[request_scope, attenuate] Proposed guardrails; the user may tighten them.",
             "properties" : {
               "bulk_confirmation_threshold" : {
                 "minimum" : 1,
@@ -2072,6 +2096,11 @@
             "description" : "[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes.",
             "type" : "string"
           },
+          "idle_days" : {
+            "description" : "[worktree_inventory] Flag worktrees idle longer than this.",
+            "minimum" : 0,
+            "type" : "integer"
+          },
           "kind" : {
             "description" : "[request_scope] Scope kind; default tree rooted at this session.",
             "enum" : [
@@ -2087,8 +2116,20 @@
             "minimum" : 1,
             "type" : "integer"
           },
+          "merge_target" : {
+            "description" : "[merge_preview] Merge target selector; default @main.",
+            "type" : "string"
+          },
+          "model_id" : {
+            "description" : "[set_model] Same-agent model_id from agent_manage.list_agents.",
+            "type" : "string"
+          },
           "name" : {
             "description" : "[rename] New session name.",
+            "type" : "string"
+          },
+          "observer_session_id" : {
+            "description" : "[unlink] Observer session UUID; default you. [link] Only you.",
             "type" : "string"
           },
           "op" : {
@@ -2130,12 +2171,20 @@
             ],
             "type" : "string"
           },
+          "operation_id" : {
+            "description" : "[merge_apply] Operation ID from merge_preview.",
+            "type" : "string"
+          },
           "order" : {
             "description" : "[reorder_pins] Desired order of pinned session UUIDs. [reorder_groups] Desired order of group names.",
             "items" : {
               "type" : "string"
             },
             "type" : "array"
+          },
+          "parent_session_id" : {
+            "description" : "[reparent, adopt] Destination member session UUID; adopt defaults to you.",
+            "type" : "string"
           },
           "pinned" : {
             "description" : "[set_pin] true pins, false unpins.",
@@ -2147,6 +2196,10 @@
           },
           "reason" : {
             "description" : "[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes.",
+            "type" : "string"
+          },
+          "repo_root" : {
+            "description" : "[worktree_create, worktree_bind, merge_preview] Repository root in the target's workspace.",
             "type" : "string"
           },
           "request_id" : {
@@ -2172,8 +2225,20 @@
             "description" : "[undo] Token returned by a reversible call.",
             "type" : "string"
           },
+          "up_to_item_id" : {
+            "description" : "[fork] Transcript row cutoff; default the latest row.",
+            "type" : "string"
+          },
           "workspace" : {
             "description" : "[request_scope] Workspace UUID for kind=workspace; default this session's workspace. [reorder_groups] Workspace UUID.",
+            "type" : "string"
+          },
+          "worktree" : {
+            "description" : "[worktree_bind] Worktree selector: @id:<worktree_id>, path, branch, or name.",
+            "type" : "string"
+          },
+          "worktree_id" : {
+            "description" : "[worktree_unbind, worktree_release] Only this worktree; default all.",
             "type" : "string"
           }
         },

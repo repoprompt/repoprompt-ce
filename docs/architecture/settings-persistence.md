@@ -415,6 +415,37 @@ and follows the same preserve-first rules:
   `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
   and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
 
+### Organizational placement and delegated worktree ownership
+
+- **Session placement.** `AgentSession` carries `organizationalParentID` and `delegationScopeID`,
+  additive and decoded with `decodeIfPresent`, **without** a serialization-version bump (still 9): a
+  bump would make this build rewrite every older session file on load and would not stop an older
+  build from dropping the fields on its own re-save. An older file decodes with no explicit
+  placement and falls back to spawn provenance (`parentSessionID`, then
+  `createdByOverseerSessionID`), which stays write-once. Only delegation-scope administration
+  (`reparent`, `adopt`, scoped creation, `fork`) writes placement. The index entry and live tab are
+  updated synchronously; only the placement-only file rewrite of a session with no live tab is
+  queued, serialized per session in the order placements were applied. A hydrate prefers the
+  index's placement over the file's so it cannot revert.
+- **Index mirror.** `AgentSessionMetadataRecord` / `AgentSessionIndexEntry` carry the same two
+  fields additively **without** bumping `AgentSessionMetadataIndex.currentSchemaVersion` (still 8):
+  a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
+  `history` scan until rebuilt, changing external `history` output. A record missing the fields
+  falls back to spawn provenance, and placement only exists after this build writes it.
+- **Worktree ownership.**
+
+  ```text
+  ~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json
+  ```
+
+  Owner: `WorktreeOwnershipStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the oversight persistence mode (suppressed launches stay in memory).
+  A versioned document (`version`, `worktrees`) recording, per worktree created under a scope,
+  `created_by_session_id`, `delegation_scope_id`, `created_at`, and, after `worktree_release`,
+  `released_at` / `released_by_session_id` (the stale mark). It never authorizes and never removes a
+  worktree; removing or pruning worktrees stays human-only. A future `version` is preserved and
+  blocks writes; malformed bytes move to `Backups/delegationWorktreeOwnership.corrupt.<uuid>.json`.
+
 ## Sidebar groups on compose tabs
 
 `ComposeTabState` (workspace files, not global settings) carries two optional, additive fields
