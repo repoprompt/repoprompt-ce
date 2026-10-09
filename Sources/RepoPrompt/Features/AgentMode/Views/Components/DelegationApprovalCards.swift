@@ -64,8 +64,16 @@ struct DelegationApprovalSlot: View {
                         onToggle: { sessionID, ticked in
                             confirmations.setItem(sessionID, ticked: ticked, confirmationID: card.id)
                         },
-                        onApprove: { _ = confirmations.approve(confirmationID: card.id) },
-                        onDeny: { confirmations.deny(confirmationID: card.id, reason: "Denied by user") }
+                        // Approval applies the stored request to the ticked items right away; the
+                        // agent reads the outcome through `confirmation_status`.
+                        onApprove: {
+                            let frontDoor = AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
+                            Task { await frontDoor.approveAndApply(confirmationID: card.id) }
+                        },
+                        onDeny: {
+                            AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
+                                .denyConfirmation(confirmationID: card.id)
+                        }
                     )
                 }
             }

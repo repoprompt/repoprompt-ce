@@ -87,6 +87,31 @@ Rules that hold the scope design together:
   Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or
   admitted for administrative principals, and fails closed in direct-headless.
 
+- **Archive is state-dependent, like retire.** Archiving stashes the session's tab, which cancels a
+  live run and its pending prompts, so an idle target needs `organize` while a non-idle (running,
+  waiting, or unknown-state) target needs `organize` + `control`; without `control` it is reported
+  as `requires_control` and left alone. Undo of `unarchive` is authorized as `archive`. Run state is
+  aggregated across every window and re-checked at commit time: each target is stashed separately
+  with `lease current && (idle || scope chain holds control)` folded into that stash's
+  mutation-context check, which the stash evaluates after its own preflight suspension and
+  immediately before it commits. `retire` re-checks the same condition after its inventory read,
+  before each unlink, and at stash commit; a target that fails it is neither unlinked further nor
+  archived.
+- **Release goes through the link owner.** `session_admin release`/`retire` unlink only links whose
+  other endpoint is also a scope member, and only through the bridge's `stopMonitorLink`, so the link
+  authority keeps sole ownership: durable-intent removal and Auto-wake target cleanup happen inside
+  that path. Durable intents with no live link are reported (`dormant_intents`), never removed by a
+  scope. Inventory reads links through `oversightInventory()` (live links plus durable intents) and
+  grants nothing.
+- **Batch cards apply on approval.** `AgentSessionAdministrationFrontDoor` keeps the exact request
+  behind each card and, when the user approves, applies it with identical arguments narrowed to the
+  ticked items (so the arguments digest the card is bound to matches); the outcome is reported by
+  `confirmation_status` (`applied_result`). The card is claimed with `beginApplying` and settled with
+  `finishApplying`: by the core when the authority still requires the card, otherwise (unticking
+  brought the batch to or below the threshold) by the front door, so a successful application
+  always ends `applied` and a failed one returns the card to `approved`. Undo tokens are
+  re-authorized as the original operation over the original targets at redemption.
+
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
 

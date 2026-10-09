@@ -22,8 +22,14 @@ package enum MCPDomainSessionAdminToolDefinition {
         "confirmation_status", "undo"
     ]
 
-    /// Operations Lane A implements end to end.
-    package static let implementedOperations: Set<String> = ["request_scope", "scope_status", "release_scope"]
+    /// Operations implemented end to end: the scope lifecycle (Lane A) and the organizing ops
+    /// (Lane B: inventory, organize, release, batch confirmation, undo).
+    package static let implementedOperations: Set<String> = [
+        "request_scope", "scope_status", "release_scope",
+        "inventory", "get", "tree", "links",
+        "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
+        "release", "retire", "confirmation_status", "undo"
+    ]
 
     package static let capabilityValues: [String] = DomainDelegationScopeCapability.allCases.map(\.rawValue)
 
@@ -39,9 +45,12 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
         - `release_scope`: give up one of your scopes; revokes its nested scopes too.
 
-        Other ops are reserved and may return `not_implemented`.
+        **Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
+        **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
+        **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
+        Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Other ops may return `not_implemented`.
 
-        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. After the user approves, repeat the same call unchanged (same op, arguments, and `idempotency_key`) with `confirmation_id`; changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
+        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -59,7 +68,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "workspace": .object([
                     "type": .string("string"),
-                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default this session's workspace.")
+                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default this session's workspace. [reorder_groups] Workspace UUID.")
                 ]),
                 "capabilities": .object([
                     "type": .string("array"),
@@ -92,14 +101,39 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "filter": .object([
                     "type": .string("object"),
-                    "description": .string("[bulk ops] Inventory filter; exclusive with targets.")
+                    "description": .string("[inventory, bulk ops] Keys: workspace, root_overseer, state, pinned, group (empty string or null = ungrouped), query, idle_days_gt, created_before, created_after, has_links, role (overseer|overseen), orphaned, archived, loaded. Exclusive with targets.")
                 ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "minimum": .int(1),
+                    "maximum": .int(500),
+                    "description": .string("[inventory, tree, links] Max rows; default 100.")
+                ]),
+                "name": .stringSchema("[rename] New session name."),
+                "pinned": .object([
+                    "type": .string("boolean"),
+                    "description": .string("[set_pin] true pins, false unpins.")
+                ]),
+                // Single-type schema: the app adapter's JSONSchema decoder rejects union `type` arrays,
+                // so clearing is spelled as an empty string rather than `null`.
+                "group": .stringSchema("[set_group] Sidebar group name (max 64 chars); an empty string removes the group."),
+                "order": .object([
+                    "type": .string("array"),
+                    "items": .object(["type": .string("string")]),
+                    "description": .string("[reorder_pins] Desired order of pinned session UUIDs. [reorder_groups] Desired order of group names.")
+                ]),
+                "expected_order": .object([
+                    "type": .string("array"),
+                    "items": .object(["type": .string("string")]),
+                    "description": .string("[reorder_pins, reorder_groups] Current order of the same items (compare-and-swap).")
+                ]),
+                "undo_token": .stringSchema("[undo] Token returned by a reversible call."),
                 "preview": .object([
                     "type": .string("boolean"),
                     "description": .string("[mutating ops] Dry run listing exact items and effects.")
                 ]),
                 "idempotency_key": .stringSchema("[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes."),
-                "confirmation_id": .stringSchema("[confirmation_status, applying call] Confirmation UUID from pending_confirmation; pass it on the unchanged repeat of the carded call.")
+                "confirmation_id": .stringSchema("[confirmation_status, applying call] Confirmation UUID from pending_confirmation; its applied_result appears once the user approves. Pass it on an unchanged repeat of the carded call.")
             ]),
             "required": .array([.string("op")])
         ]),

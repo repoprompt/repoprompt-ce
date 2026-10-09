@@ -75,11 +75,15 @@ package extension DomainAgentSessionTargetOperation {
     /// `restructure` for an idle or finished target, so an `.allSessions` scope can retire idle
     /// members; stopping a running (or unknown-state) target additionally needs `control`, and the
     /// authority reports such items as `requires_control` instead of granting it implicitly.
+    /// `archive` stashes the session's tab, which cancels a live run and its pending prompts, so a
+    /// non-idle target likewise needs `organize` + `control`.
     func requiredScopeCapabilities(for state: DomainDelegationScopeTargetState) -> Set<DomainDelegationScopeCapability> {
         guard let primary = requiredScopeCapability else { return [] }
         switch self {
         case .adminRetire:
             return state == .idle ? [.organize, .restructure] : [.organize, .restructure, .control]
+        case .adminArchive:
+            return state == .idle ? [.organize] : [.organize, .control]
         default:
             return [primary]
         }

@@ -394,6 +394,17 @@ struct AgentModeSessionsListView: View {
     @State private var showingClearArchivedConfirmation = false
     @State private var showingBulkDeleteConfirmation = false
     @State private var sessionLinkProjectionRevision: UInt64 = 0
+    private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
+        guard let name = item.groupName else { return nil }
+        return AnyView(AgentSidebarGroupSectionHeader(
+            title: name,
+            rowCount: item.groupRowCount,
+            isCollapsed: item.isGroupCollapsed,
+            isFirst: item.isFirstHeader,
+            onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
+        ))
+    }
+
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
     private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -480,7 +491,11 @@ struct AgentModeSessionsListView: View {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions, perfRecorder: perfRecorder)
+        let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+            for: snapshot.pagedSessions,
+            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+            perfRecorder: perfRecorder
+        )
         let selectionState = sidebarUI.selectionState
         let showsSelectionPresentation = selectionState.showsSelectionPresentation
         let isInteractionEnabled = !selectionState.isMutationInFlight
@@ -523,10 +538,12 @@ struct AgentModeSessionsListView: View {
             ScrollView {
                 VStack(spacing: listRowSpacing) {
                     AgentSidebarKeyedRowList(
-                        items: AgentSidebarDateSectionBuilder.renderedActiveRows(for: activeSections),
+                        items: renderedActiveRows,
                         showsHeader: \.showsHeader,
                         headerTitle: \.headerTitle,
-                        isFirstHeader: \.isFirstHeader
+                        isFirstHeader: \.isFirstHeader,
+                        customHeader: groupSectionHeader,
+                        showsRow: { !$0.hidesRow }
                     ) { item in
                         let session = item.session
                         let identity = AgentSidebarSelectionIdentity.active(tabID: session.tabID)
@@ -1314,6 +1331,12 @@ struct AgentSidebarRenderedActiveRow: Identifiable {
     let showsHeader: Bool
     let isFirstHeader: Bool
     let headerTitle: String
+    /// Set on the first row of a sidebar group section; its header is collapsible.
+    var groupName: String?
+    var isGroupCollapsed = false
+    var groupRowCount = 0
+    /// A collapsed group's first row carries only the header.
+    var hidesRow = false
 
     var id: UUID {
         session.id
@@ -1344,17 +1367,24 @@ struct AgentSidebarKeyedRowList<Item: Identifiable, Row: View>: View {
     let showsHeader: (Item) -> Bool
     let headerTitle: (Item) -> String
     let isFirstHeader: (Item) -> Bool
+    /// Replaces the date header for an item (sidebar group sections).
+    var customHeader: ((Item) -> AnyView?)?
+    var showsRow: (Item) -> Bool = { _ in true }
     @ViewBuilder let row: (Item) -> Row
 
     var body: some View {
         ForEach(items) { item in
-            if showsHeader(item) {
+            if let header = customHeader?(item) {
+                header
+            } else if showsHeader(item) {
                 AgentSidebarDateSectionHeader(
                     title: headerTitle(item),
                     isFirst: isFirstHeader(item)
                 )
             }
-            row(item)
+            if showsRow(item) {
+                row(item)
+            }
         }
     }
 }

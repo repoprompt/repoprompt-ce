@@ -328,6 +328,95 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         )
     }
 
+    // MARK: - Pins, groups, and facets
+
+    func testPinnedAndGroupSearchFacetsFilterRows() {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Alpha", isPinned: true, sidebarGroup: "My lanes"),
+            ComposeTabState(id: id(2), name: "Beta", sidebarGroup: "Lanes"),
+            ComposeTabState(id: id(3), name: "Gamma", isPinned: true)
+        ]
+        let store = viewModel.ui.sessionSidebar
+        func filtered(_ text: String) -> Set<UUID> {
+            store.update(
+                searchText: text,
+                visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize,
+                archivedVisibleSessionCount: AgentModeViewModel.sessionSidebarArchivedPageSize
+            )
+            return Set(projection(viewModel, tabs: tabs, snapshot: store.snapshot).filteredSessions.map(\.tabID))
+        }
+        XCTAssertEqual(filtered("is:pinned"), [id(1), id(3)])
+        XCTAssertEqual(filtered("group:lanes"), [id(2)])
+        XCTAssertEqual(filtered("group:\"My lanes\""), [id(1)])
+        XCTAssertEqual(filtered("is:pinned gamma"), [id(3)], "facets combine with free text")
+        XCTAssertEqual(filtered("is:pinned group:lanes"), [])
+
+        let query = AgentSessionSearchQuery.parse("IS:PINNED group:Lanes beta")
+        XCTAssertTrue(query.requiresPinned)
+        XCTAssertEqual(query.groupFacets, ["lanes"])
+        XCTAssertEqual(query.tokens, ["beta"])
+    }
+
+    func testPinnedRowsAreExemptFromThePageCap() {
+        let viewModel = makeViewModel()
+        let pinned = (1 ... 20).map { ComposeTabState(id: id($0), name: "Pinned \($0)", isPinned: true, pinnedOrder: $0) }
+        let unpinned = (21 ... 40).map { ComposeTabState(id: id($0), name: "Session \($0)") }
+        let result = projection(viewModel, tabs: pinned + unpinned, snapshot: viewModel.ui.sessionSidebar.snapshot)
+
+        let paged = result.pagedSessions
+        XCTAssertEqual(paged.filter(\.isPinned).count, 20, "every pin is visible")
+        XCTAssertEqual(paged.count(where: { !$0.isPinned }), AgentModeViewModel.sessionSidebarPageSize)
+        XCTAssertEqual(result.effectiveVisibleSessionCount, paged.count)
+    }
+
+    func testGroupSectionsRenderFirstInGroupOrderAndCollapse() {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Ungrouped"),
+            ComposeTabState(id: id(2), name: "In B", sidebarGroup: "B", sidebarGroupOrder: 1),
+            ComposeTabState(id: id(3), name: "In A", sidebarGroup: "A", sidebarGroupOrder: 0),
+            ComposeTabState(id: id(4), name: "Also A", sidebarGroup: "A", sidebarGroupOrder: 0)
+        ]
+        let rows = projection(viewModel, tabs: tabs, snapshot: viewModel.ui.sessionSidebar.snapshot).pagedSessions
+        let rendered = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(for: rows, collapsedGroups: [])
+        XCTAssertEqual(rendered.compactMap(\.groupName), ["A", "B"])
+        XCTAssertEqual(Set(rendered.prefix(2).map(\.session.tabID)), [id(3), id(4)])
+        XCTAssertEqual(rendered.last?.session.tabID, id(1), "ungrouped rows keep their date sections after groups")
+        XCTAssertEqual(rendered.first?.groupRowCount, 2)
+
+        let collapsed = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(for: rows, collapsedGroups: ["A"])
+        let groupA = collapsed.filter { $0.headerTitle == "A" }
+        XCTAssertEqual(groupA.count, 1, "a collapsed group keeps one header carrier")
+        XCTAssertEqual(groupA.first?.hidesRow, true)
+
+        let ungroupedOnly = [rows.first { $0.tabID == id(1) }].compactMap(\.self)
+        XCTAssertEqual(
+            AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(for: ungroupedOnly, collapsedGroups: []).map(\.id),
+            AgentSidebarDateSectionBuilder.renderedActiveRows(
+                for: AgentSidebarDateSectionBuilder.activeSections(for: ungroupedOnly)
+            ).map(\.id),
+            "without groups the list is unchanged"
+        )
+    }
+
+    func testSelectionOrderFollowsGroupedVisibleRowsAndSkipsCollapsedGroups() {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Ungrouped"),
+            ComposeTabState(id: id(2), name: "In A", sidebarGroup: "A", sidebarGroupOrder: 0),
+            ComposeTabState(id: id(3), name: "Also A", sidebarGroup: "A", sidebarGroupOrder: 0)
+        ]
+        let store = viewModel.ui.sessionSidebar
+        let expanded = projection(viewModel, tabs: tabs, snapshot: store.snapshot).renderedSelectionOrder
+        XCTAssertEqual(Set(expanded.prefix(2)), [.active(tabID: id(2)), .active(tabID: id(3))], "group rows come first")
+        XCTAssertEqual(expanded.last, .active(tabID: id(1)))
+
+        store.toggleGroupCollapsed("A")
+        let collapsed = projection(viewModel, tabs: tabs, snapshot: store.snapshot).renderedSelectionOrder
+        XCTAssertEqual(collapsed, [.active(tabID: id(1))], "rows of a collapsed group are not selectable (Cmd-A)")
+    }
+
     // MARK: - Helpers
 
     private func projection(

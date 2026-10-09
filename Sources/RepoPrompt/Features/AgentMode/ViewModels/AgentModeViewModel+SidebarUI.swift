@@ -196,17 +196,21 @@ extension AgentModeViewModel {
                 onProjectionRemovalCommitted: onProjectionRemovalCommitted
             )
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
+        // Pin/unpin/stash share one mutation path with `session_admin` (design §3.4); delete stays
+        // human-only and keeps its own path above.
         case .stash:
-            let report = await promptManager.stashComposeTabs(
-                withIDs: targets.stashTabIDs,
+            let report = await OpenWindowsAgentSessionOrganizer.stashTabs(
+                targets.stashTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent,
                 onProjectionRemovalCommitted: onProjectionRemovalCommitted
             )
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .pin:
-            let report = promptManager.setComposeTabsPinned(
+            let report = OpenWindowsAgentSessionOrganizer.setTabsPinned(
                 true,
-                for: targets.pinTabIDs,
+                tabIDs: targets.pinTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent
             )
             if report.contextRejected {
@@ -219,9 +223,10 @@ extension AgentModeViewModel {
                 )
             }
         case .unpin:
-            let report = promptManager.setComposeTabsPinned(
+            let report = OpenWindowsAgentSessionOrganizer.setTabsPinned(
                 false,
-                for: targets.unpinTabIDs,
+                tabIDs: targets.unpinTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent
             )
             if report.contextRejected {
@@ -492,6 +497,8 @@ extension AgentModeViewModel {
             activeAgentSessionID: tab.activeAgentSessionID,
             isPinned: tab.isPinned,
             pinnedOrder: tab.pinnedOrder,
+            sidebarGroup: tab.sidebarGroup,
+            sidebarGroupOrder: tab.sidebarGroupOrder,
             lastModified: tab.lastModified
         )
     }
@@ -666,6 +673,12 @@ extension AgentModeViewModel {
                     changed = true
                 }
                 if previousTab.pinnedOrder != currentTab.pinnedOrder { categories.insert("tabMetadata.pinnedOrder")
+                    changed = true
+                }
+                if previousTab.sidebarGroup != currentTab.sidebarGroup
+                    || previousTab.sidebarGroupOrder != currentTab.sidebarGroupOrder
+                {
+                    categories.insert("tabMetadata.sidebarGroup")
                     changed = true
                 }
                 if previousTab.lastModified != currentTab.lastModified {

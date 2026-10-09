@@ -6,6 +6,9 @@ struct AgentSessionSidebarSnapshot: Equatable {
     var visibleSessionCount: Int
     var archivedVisibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
+    /// Collapsed sidebar group sections, by group name. Presentation-only, like thread collapse; the
+    /// list projection reads it so selection order matches what is shown.
+    var collapsedSidebarGroups: Set<String> = []
     /// Thread keys that have already received one-shot default collapse handling
     /// during this view-model lifetime. Explicit user expand/collapse actions
     /// and Expand All mark keys handled so later renders do not immediately
@@ -209,6 +212,19 @@ final class AgentSessionSidebarUIStore: ObservableObject {
 
     func toggleThreadCollapse(_ key: AgentSidebarThreadKey) {
         setThreadCollapsed(!isThreadCollapsed(key), for: key)
+    }
+
+    func toggleGroupCollapsed(_ group: String) {
+        var next = snapshot
+        if next.collapsedSidebarGroups.remove(group) == nil {
+            next.collapsedSidebarGroups.insert(group)
+        }
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.groupCollapse",
+            force: false,
+            affectsRowContent: false
+        )
     }
 
     func clearCollapsedThreads() {
