@@ -272,6 +272,8 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
     // MARK: - Issue #1262: a mixed batch matches each edit against the text its predecessors left
 
     private static let notFound = "search block not found in file (matches are exact, including whitespace/indentation)"
+    private static let repeatRefused =
+        "search repeats in this batch and has no unique exact match; use a distinct search for each edit"
 
     private struct BatchCase {
         let name: String
@@ -343,13 +345,105 @@ final class ApplyEditsCoreRecoveryTests: XCTestCase {
                 expectedOutcomes: [Self.outcome(0), Self.outcome(1)]
             ),
             BatchCase(
-                name: "repeated identical searches take successive occurrences",
+                name: "a repeated search without a unique exact match is refused",
                 original: "a\na\nb\n",
                 edits: [Self.edit("a", "x"), Self.edit("a", "y"), Self.edit("b", "c")],
-                expectedText: "x\ny\nc\n",
-                expectedStatus: .success,
-                expectedApplied: 3,
-                expectedOutcomes: [Self.outcome(0), Self.outcome(1), Self.outcome(2)]
+                expectedText: "a\na\nc\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated search without an exact hit is refused, not matched by line",
+                original: "anchor\nFOO\n",
+                edits: [Self.edit("anchor", "header"), Self.edit("foo", "FoO"), Self.edit("foo", "bar")],
+                expectedText: "header\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated search cannot take a literal hit in a previous repeat's output",
+                original: "anchor\nFOO\n",
+                edits: [Self.edit("anchor", "header"), Self.edit("foo", "foo2"), Self.edit("foo", "bar")],
+                expectedText: "header\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "repeats with an ambiguous literal hit are refused beside an exact sibling",
+                original: "x = foo()\nfoo\nFOO\n",
+                edits: [
+                    Self.edit("foo", "Foo"),
+                    Self.edit("foo", "baz"),
+                    Self.edit("foo", "qux"),
+                    Self.edit("x =", "y =")
+                ],
+                expectedText: "y = foo()\nfoo\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused),
+                    Self.outcome(3)
+                ]
+            ),
+            BatchCase(
+                name: "a repeated replace-all without an exact hit is refused",
+                original: "anchor\nFOO\nFOO\n",
+                edits: [Self.edit("anchor", "header"), Self.edit("foo", "foo2"), Self.edit("foo", "bar", all: true)],
+                expectedText: "header\nFOO\nFOO\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "identical searches separated by another edit are refused",
+                original: "a\nb\na\n",
+                edits: [Self.edit("a", "x"), Self.edit("b", "c"), Self.edit("a", "y")],
+                expectedText: "a\nc\na\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0, failure: Self.repeatRefused),
+                    Self.outcome(1),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
+            ),
+            BatchCase(
+                name: "repeated multi-line searches are refused without losing an inserted line",
+                original: "anchor\nA\nb\nc\nd\nA\nb\nc\nd\n",
+                edits: [
+                    Self.edit("anchor", "header"),
+                    Self.edit("A\nb\nc\nd", "A2\nb\nc\nd\nY"),
+                    Self.edit("A\nb\nc\nd", "A3\nb\nc\nd")
+                ],
+                expectedText: "header\nA\nb\nc\nd\nA\nb\nc\nd\n",
+                expectedStatus: .partial,
+                expectedApplied: 1,
+                expectedOutcomes: [
+                    Self.outcome(0),
+                    Self.outcome(1, failure: Self.repeatRefused),
+                    Self.outcome(2, failure: Self.repeatRefused)
+                ]
             )
         ])
     }
