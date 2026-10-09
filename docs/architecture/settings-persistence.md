@@ -384,6 +384,30 @@ The MCP `app_settings` surface remains global for model-related keys such as:
 
 Those keys write the global backing fields. Workspace-specific Agent Models overrides are not exposed through `app_settings`; they are selected by the active RepoPrompt workspace/window and resolved by runtime services.
 
+## Delegation scope intent
+
+Delegation scopes are not settings, but their durable intent lives beside the oversight-link file
+and follows the same preserve-first rules:
+
+```text
+~/Library/Application Support/RepoPrompt CE/delegationScopes.json
+```
+
+- Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
+  `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
+  `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
+- Payload: a versioned document (`version`, `scopes`) holding only the **active** grants: scope ID,
+  grantee session, kind, capabilities, guardrails (including the per-scope bulk confirmation
+  threshold), origin (user or attenuated parent), and grant time. Revoked and expired scopes are
+  removed. Generations, leases, pending `request_scope` cards, and batch confirmations are
+  process-local and never written.
+- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
+  Grants past their expiry, and attenuated grants whose parent is missing or inactive, are not
+  reactivated, so a reload can never undo a cascade.
+- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
+  `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
+  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+
 ## Non-goals and migration notes
 
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.
