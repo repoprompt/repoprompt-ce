@@ -389,12 +389,38 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
     }
 
+    func testHeadlessGitRejectsNestedRepositorySelectorsForEveryRead() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture(loadNestedDirectory: true)
+        for op in ["status", "diff", "log", "show", "blame"] {
+            let outcome = try await Self.callTool(fixture.client, name: "git", arguments: [
+                "op": .string(op), "repo_root": .string(fixture.loadedRoot.path), "path": .string("README.md")
+            ])
+            XCTAssertTrue(outcome.isError, "\(op): \(outcome.text)")
+            XCTAssertTrue(outcome.text.contains("No authorized Git repository"), outcome.text)
+        }
+    }
+
+    func testHeadlessGitStillReadsRegisteredLinkedWorktree() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture(loadLinkedWorktree: true)
+        let outcome = try await Self.callTool(fixture.client, name: "git", arguments: ["op": .string("status")])
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
+    }
+
+    func testHeadlessGitReadDoesNotFollowConfiguredExternalWorktree() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture(redirectWorktree: true)
+        let outcome = try await Self.callTool(fixture.client, name: "git", arguments: ["op": .string("status")])
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertFalse(outcome.text.contains("outside-only.txt"), outcome.text)
+    }
+
     private struct HeadlessWorktreeFixture {
         let client: Client
         let linkedWorktree: URL
+        let loadedRoot: URL
     }
 
-    private func makeHeadlessWorktreeFixture() async throws -> HeadlessWorktreeFixture {
+    private func makeHeadlessWorktreeFixture(loadNestedDirectory: Bool = false, loadLinkedWorktree: Bool = false, redirectWorktree: Bool = false) async throws -> HeadlessWorktreeFixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-worktree-list-\(UUID().uuidString)", isDirectory: true)
         let repo = directory.appendingPathComponent("repo", isDirectory: true)
@@ -410,10 +436,18 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         )
         try Self.runGit(["worktree", "add", "--quiet", "--detach", linked.path, "HEAD"], at: repo)
 
+        if redirectWorktree {
+            let outside = directory.appendingPathComponent("outside")
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try Data("outside".utf8).write(to: outside.appendingPathComponent("outside-only.txt"))
+            try Self.runGit(["config", "core.worktree", outside.path], at: repo)
+        }
+        let loadedRoot = loadNestedDirectory ? repo.appendingPathComponent("nested") : (loadLinkedWorktree ? linked : repo)
+        try FileManager.default.createDirectory(at: loadedRoot, withIntermediateDirectories: true)
         let service = DirectHeadlessMCPService(environment: [
             "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-list-contract",
             "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": directory.appendingPathComponent("profile").path,
-            "REPOPROMPT_MCP_WORKING_DIRS": repo.path,
+            "REPOPROMPT_MCP_WORKING_DIRS": loadedRoot.path,
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
         ], currentDirectory: repo)
         let prepared = try await service.prepareRuntime()
@@ -430,7 +464,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let client = Client(name: "Headless worktree client", version: "1")
         _ = try await client.connect(transport: transports.client)
         addTeardownBlock { await client.disconnect() }
-        return HeadlessWorktreeFixture(client: client, linkedWorktree: linked)
+        return HeadlessWorktreeFixture(client: client, linkedWorktree: linked, loadedRoot: loadedRoot)
     }
 
     /// Normalizes both wire shapes: an `isError` tool result and a thrown JSON-RPC error.
@@ -438,8 +472,16 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         _ client: Client,
         arguments: [String: Value]
     ) async throws -> (isError: Bool, text: String) {
+        try await callTool(client, name: "manage_worktree", arguments: arguments)
+    }
+
+    private static func callTool(
+        _ client: Client,
+        name: String,
+        arguments: [String: Value]
+    ) async throws -> (isError: Bool, text: String) {
         do {
-            let result = try await client.callTool(name: "manage_worktree", arguments: arguments)
+            let result = try await client.callTool(name: name, arguments: arguments)
             let text = result.content.compactMap { content -> String? in
                 guard case let .text(value, _, _) = content else { return nil }
                 return value

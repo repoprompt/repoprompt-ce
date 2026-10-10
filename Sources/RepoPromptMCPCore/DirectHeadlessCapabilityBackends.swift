@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared
+import RepoPromptVCS
 
 actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
     private let context: DirectHeadlessDomainContext
@@ -267,7 +268,12 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 command = ["diff", "--no-ext-diff", "--no-textconv", "--color=never"]
             default: throw MCPError.invalidParams("unknown git op: \(op)")
             }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + command, isProvider: false)
+            guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: snapshot.roots) else {
+                throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
+            }
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: [
+                "-C", root.path, "--git-dir", layout.gitDir.path, "--work-tree", root.path
+            ] + command, isProvider: false)
             outputs.append(.object(["repo_root": .string(root.path), "output": .string(output)]))
         }
         return try .object(["op": .string(op), "repositories": .array(outputs)])
@@ -282,7 +288,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             throw MCPError.invalidParams(MCPWorktreeListPagination.headlessUnsupportedMessage)
         }
         let snapshot = try await context.snapshot(for: request)
-        guard let repo = snapshot.roots.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent(".git").path) }) else {
+        guard let repo = snapshot.roots.first(where: { GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: $0, authorizedRoots: snapshot.roots) != nil }) else {
             throw MCPError.invalidParams("no Git repository is bound")
         }
         let op = args["op"]?.stringValue ?? "list"
@@ -684,13 +690,23 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         snapshot: DirectHeadlessDomainContext.Snapshot
     ) throws -> [URL] {
         if let root = args["repo_root"]?.stringValue {
-            return try [context.resolvePath(root, roots: snapshot.roots)]
+            let resolved = try context.resolvePath(root, roots: snapshot.roots)
+            guard GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: resolved, authorizedRoots: snapshot.roots) != nil else {
+                throw MCPError.invalidParams("No authorized Git repository at the requested root.")
+            }
+            return [resolved]
         }
         if let roots = args["repo_roots"]?.arrayValue?.compactMap(\.stringValue) {
-            return try roots.map { try context.resolvePath($0, roots: snapshot.roots) }
+            return try roots.map {
+                let resolved = try context.resolvePath($0, roots: snapshot.roots)
+                guard GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: resolved, authorizedRoots: snapshot.roots) != nil else {
+                    throw MCPError.invalidParams("No authorized Git repository at the requested root.")
+                }
+                return resolved
+            }
         }
         return snapshot.roots.filter {
-            FileManager.default.fileExists(atPath: $0.appendingPathComponent(".git").path)
+            GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: $0, authorizedRoots: snapshot.roots) != nil
         }
     }
 }

@@ -295,7 +295,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptMCPCore",
-            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptVCS", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCPCore",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),

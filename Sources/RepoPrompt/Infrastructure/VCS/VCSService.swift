@@ -159,6 +159,42 @@ public actor VCSService {
         return nil
     }
 
+    /// Resolve a repository for an MCP read at an explicitly authorized workspace root.
+    /// Do not reuse unrestricted discovery caches or run parent-searching command fallbacks.
+    func resolveRepoForRead(at root: URL, authorizedRoots: [URL]) async -> VCSResolvedRepo? {
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(root.path, roots: authorizedRoots.map(\.path)) else { return nil }
+        let jjDirectory = root.appendingPathComponent(".jj")
+        var jjIsDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: jjDirectory.path, isDirectory: &jjIsDirectory) {
+            guard jjIsDirectory.boolValue else { return nil }
+            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(jjDirectory.path, roots: authorizedRoots.map(\.path)) else { return nil }
+            let jjRepository = jjDirectory.appendingPathComponent("repo")
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: jjRepository.path, isDirectory: &isDirectory) {
+                guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(jjRepository.path, roots: authorizedRoots.map(\.path)) else { return nil }
+                if !isDirectory.boolValue {
+                    guard let handle = try? FileHandle(forReadingFrom: jjRepository) else { return nil }
+                    defer { try? handle.close() }
+                    guard let data = try? handle.read(upToCount: 4097), data.count <= 4096,
+                          let content = String(data: data, encoding: .utf8)
+                    else { return nil }
+                    let path = content.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
+                    guard !path.isEmpty, !path.contains("\0"), !path.contains("\n"), !path.contains("\r") else { return nil }
+                    let target = path.hasPrefix("/") ? URL(fileURLWithPath: path) : jjRepository.deletingLastPathComponent().appendingPathComponent(path)
+                    guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(target.path, roots: authorizedRoots.map(\.path)) else { return nil }
+                }
+            }
+            if await isJJAvailable() {
+                backendKindCache[root.standardizedFileURL.path] = .jujutsu
+                return VCSResolvedRepo(rootURL: root, backendKind: .jujutsu)
+            }
+        }
+        guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: authorizedRoots) else { return nil }
+        gitLayoutCache[root.standardizedFileURL.path] = layout
+        backendKindCache[root.standardizedFileURL.path] = .git
+        return VCSResolvedRepo(rootURL: root, backendKind: .git)
+    }
+
     /// Get the backend for a known repository root.
     /// Use this when you already know the repo root from a previous resolve call.
     ///
