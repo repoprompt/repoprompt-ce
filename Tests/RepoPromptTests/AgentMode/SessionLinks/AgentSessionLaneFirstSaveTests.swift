@@ -62,6 +62,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         await cleanup()
     }
 
+    /// Model denied-role ownership at the property boundary: public MCP activation correctly
+    /// refuses to capture an app-owned linked overseer. These races test proof revocation and
+    /// rollback, not capture admission; the production didSet and release path still run.
+    private func installDeniedRoleControlFixture(on session: AgentTabSession, sessionID: UUID) async {
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+        session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: sessionID, activationID: UUID(), registration: registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+        )
+    }
+
     private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -181,10 +196,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 }
             }
             let consumeActivation: @MainActor () async throws -> Void = {
-                _ = try await viewModel.mcpActivateControlContext(
-                    forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                    taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                )
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                 XCTAssertNil(creator.oversight.overseerActivation)
                 await bridge.test_auditObserverEligibility()
                 await bridge.test_settleLaunchReconciliation()
@@ -426,10 +438,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     let a1 = start("Lifecycle-A1")
                     tasks.append(a1)
                     await fulfillment(of: [otherParked], timeout: 10)
-                    _ = try await viewModel.mcpActivateControlContext(
-                        forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                        taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                    )
+                    await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                     XCTAssertNil(creator.oversight.overseerActivation)
                     await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
                     XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
@@ -586,10 +595,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 let beforeControl = await authority.links(forObserver: creatorID)
                 XCTAssertEqual(beforeControl.items.map(\.targetSessionID), [pairA.targetSessionID])
                 XCTAssertNotNil(creator.oversight.overseerActivation)
-                _ = try await viewModel.mcpActivateControlContext(
-                    forTabID: creatorTabID, sessionID: creatorID, originatingConnectionID: nil,
-                    taskLabelKind: .explore, markSessionAsMCPOriginated: false
-                )
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
                 XCTAssertNil(creator.oversight.overseerActivation)
                 XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint))
                 await bridge.test_auditObserverEligibility()
