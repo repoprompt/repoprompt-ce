@@ -7,8 +7,24 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptPersistence
 import RepoPromptProcess
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
+
+extension GitDiffCompareSpec {
+    /// Validate even programmatically constructed or decoded specs before Git runs.
+    func validateRevisionArgument() throws {
+        switch self {
+        case let .uncommitted(base), let .uncommittedMergeBase(base),
+             let .staged(base), let .stagedMergeBase(base):
+            try GitRevisionArgument.validate(base)
+        case let .revspec(spec):
+            try GitRevisionArgument.validate(spec)
+        case .unstaged:
+            break
+        }
+    }
+}
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -2174,6 +2190,8 @@ actor GitService {
     // MARK: - Worktree Merge Primitives
 
     func getMergeBase(sourceHead: String, targetHead: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(sourceHead)
+        try GitRevisionArgument.validate(targetHead)
         let (stdout, stderr, exitCode) = try await runGit(
             ["merge-base", targetHead, sourceHead],
             at: repoURL
@@ -2185,6 +2203,8 @@ actor GitService {
     }
 
     func isAncestor(_ ancestor: String, of descendant: String, at repoURL: URL) async throws -> Bool {
+        try GitRevisionArgument.validate(ancestor)
+        try GitRevisionArgument.validate(descendant)
         let (_, stderr, exitCode) = try await runGit(
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
@@ -2670,8 +2690,9 @@ actor GitService {
 
     /// Resolve any ref (branch, tag, commit-ish) to a SHA.
     func getRefSHA(at repoURL: URL, ref: String) async throws -> String {
+        try GitRevisionArgument.validate(ref)
         let (stdout, stderr, exitCode) = try await runGit(
-            ["rev-parse", ref],
+            ["rev-parse", "--verify", "--end-of-options", ref],
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -2779,6 +2800,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree
     func getDiff(from branch: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Compare branch to working tree to include all uncommitted changes
         let (stdout, stderr, exitCode) = try await runGit(
             ["diff", branch],
@@ -2794,6 +2816,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree for specific files
     func getDiff(from branch: String, for files: [String], at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Prefer normal argv for smaller file sets (compatibility),
         // use pathspec-from-file when args are large, and chunk as a fallback.
         let maxChunk = 3000
@@ -3186,6 +3209,7 @@ actor GitService {
         paths: [String]?,
         at repoURL: URL
     ) async throws -> String {
+        if let refArg { try GitRevisionArgument.validate(refArg) }
         let maxChunk = 3000
         let pathspecByteLimit = 128 * 1024
         let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
@@ -3209,7 +3233,7 @@ actor GitService {
             do {
                 var args = baseArgs()
                 args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
-                if let refArg, !refArg.isEmpty {
+                if let refArg {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
@@ -3227,9 +3251,10 @@ actor GitService {
 
         guard !cleanedPaths.isEmpty else {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
+            args.append("--")
             let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
@@ -3239,7 +3264,7 @@ actor GitService {
 
         if cleanedPaths.count <= maxChunk {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3254,7 +3279,7 @@ actor GitService {
         var combined = ""
         for chunk in cleanedPaths.chunked(into: maxChunk) {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3749,6 +3774,9 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
         let numstatArgs = ["diff"] + reference + ["--numstat"]
         let nameStatusArgs = ["diff"] + reference + ["--name-status"]
 
@@ -3916,6 +3944,7 @@ actor GitService {
         paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        try compare.validateRevisionArgument()
         if let paths, paths.isEmpty { return [] }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
@@ -7256,6 +7285,7 @@ actor GitService {
 
     /// Get commit info (metadata only, no diff).
     func commitInfo(ref: String, at repoURL: URL) async throws -> CommitInfo {
+        try GitRevisionArgument.validate(ref)
         let args = [
             "show",
             "-s",
@@ -7264,7 +7294,8 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref
+            ref,
+            "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
