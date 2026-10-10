@@ -86,6 +86,10 @@ package struct LineFramer {
 
     package let limits: Limits
 
+    /// Lines larger than this hand their carry storage to the emitted line instead of
+    /// leaving the carry buffer holding that capacity for the rest of the stream.
+    static let maxRetainedCarryCapacityBytes = 1024 * 1024
+
     package init(limits: Limits = .default) {
         self.limits = limits
     }
@@ -236,6 +240,13 @@ package struct LineFramer {
     /// Extracts the completed line from carry (stripping the trailing newline and optional CR), appends to pending, and resets line state.
     private mutating func emitLine(_ pending: inout [Data], fatalLimit: Int?) -> Overflow? {
         var line = carry
+        // A large frame (e.g. a full-history resume) must not pin its buffer for the life
+        // of the stream. Releasing carry also makes `line` unique, so trimming below does
+        // not copy the whole frame.
+        let releasesCarryStorage = carry.count > Self.maxRetainedCarryCapacityBytes
+        if releasesCarryStorage {
+            carry = Data()
+        }
         line.removeLast() // remove the \n
         if line.last == 0x0D {
             line.removeLast() // remove optional \r
@@ -244,7 +255,9 @@ package struct LineFramer {
             return Overflow(limitBytes: fatalLimit)
         }
         pending.append(line)
-        carry.removeAll(keepingCapacity: true)
+        if !releasesCarryStorage {
+            carry.removeAll(keepingCapacity: true)
+        }
         inJSONString = false
         isEscapingJSONStringCharacter = false
         hasSeenLineStart = false

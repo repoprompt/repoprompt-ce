@@ -39,4 +39,23 @@ final class LineFramerTests: XCTestCase {
         XCTAssertTrue(diagnosed)
         legacy.flush { XCTAssertEqual($0, Data("xxxx".utf8)) }
     }
+
+    func testLargeLineReleasesCarryStorageWithoutChangingFraming() {
+        let budget = 4 * LineFramer.maxRetainedCarryCapacityBytes
+        var framer = LineFramer(limits: .init(maxLineBytes: budget, maxCarryBytes: budget, tailRetainBytes: 0))
+        let largeBody = String(repeating: "x", count: LineFramer.maxRetainedCarryCapacityBytes + 1)
+        let largeLine = "{\"result\":\"\(largeBody)\"}"
+        var lines: [String] = []
+        let record: (Data) -> Void = { lines.append(String(decoding: $0, as: UTF8.self)) }
+
+        let bytes = Data((largeLine + "\r\n{\"next\":1}\n{\"split").utf8)
+        let midpoint = bytes.count / 2
+        XCTAssertNil(framer.feed(bytes.prefix(midpoint), onLine: record))
+        XCTAssertNil(framer.feed(bytes.suffix(from: midpoint), onLine: record))
+        XCTAssertNil(framer.feed(Data("\":2}\n".utf8), onLine: record))
+        XCTAssertNil(framer.feed(Data((largeLine + "\n").utf8), onLine: record))
+
+        XCTAssertEqual(lines, [largeLine, "{\"next\":1}", "{\"split\":2}", largeLine])
+        framer.flush { _ in XCTFail("No partial line should remain after complete frames") }
+    }
 }

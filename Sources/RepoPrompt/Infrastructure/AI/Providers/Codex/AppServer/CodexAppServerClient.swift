@@ -356,6 +356,18 @@ actor CodexAppServerClient {
         error is AmbiguousMutationError
     }
 
+    /// True when the transport was closed because a single stdout frame exceeded the
+    /// frame budget. Matching is typed: the overflowing response is never decoded, so
+    /// there is no server message to inspect.
+    static func isStdoutFrameBudgetExceededError(_ error: Error) -> Bool {
+        guard let clientError = error as? ClientError,
+              case .stdoutFrameBudgetExceeded = clientError
+        else {
+            return false
+        }
+        return true
+    }
+
     private static func isTimeoutErrorMessage(_ message: String) -> Bool {
         let normalized = message
             .trimmingCharacters(in: .whitespacesAndNewlines)

@@ -327,6 +327,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private enum CodexNativeSessionFallbackReason {
         case missingRollout
         case repeatedResumeTimeout
+        case resumeFrameTooLarge
     }
 
     private enum LiveBashRunningApplyResult {
@@ -4682,16 +4683,25 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return recordCodexResumeTimeout(for: session, existingRef: existingRef)
     }
 
-    private func shouldRetryFreshStartAfterResumeTimeout(
+    /// Chooses the fresh-thread fallback for a failed resume attempt, if any.
+    ///
+    /// A resume response over the stdout frame budget is deterministic: retrying the same
+    /// target overflows again, so it falls back on the first occurrence. Timeouts may be
+    /// transient and only fall back once the repeated-timeout threshold is reached.
+    private func resumeFreshStartFallbackReason(
+        attemptedResume: Bool,
         timeoutCount: Int?,
+        error: Error,
         allowResumeTimeoutFallback: Bool
-    ) -> Bool {
-        guard allowResumeTimeoutFallback,
-              let timeoutCount
-        else {
-            return false
+    ) -> CodexNativeSessionFallbackReason? {
+        guard allowResumeTimeoutFallback, attemptedResume else { return nil }
+        if CodexAppServerClient.isStdoutFrameBudgetExceededError(error) {
+            return .resumeFrameTooLarge
         }
-        return timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold
+        if let timeoutCount, timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold {
+            return .repeatedResumeTimeout
+        }
+        return nil
     }
 
     private func makeCodexRunLease(
@@ -4735,7 +4745,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resumeRecoveryMessage()
         case .repeatedResumeTimeout:
             repeatedResumeTimeoutRecoveryMessage()
+        case .resumeFrameTooLarge:
+            resumeFrameTooLargeRecoveryMessage()
         }
+    }
+
+    private static func resumeFrameTooLargeRecoveryMessage() -> String {
+        "Codex couldn't resume the previous thread because its history was too large to load. Started a fresh thread."
     }
 
     private static func missedCodexCompletionRecoveryMessage() -> String {
@@ -7477,16 +7493,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     error: effectiveError
                 )
             }()
-            if shouldRetryFreshStartAfterResumeTimeout(
+            if let freshStartFallbackReason = resumeFreshStartFallbackReason(
+                attemptedResume: attemptedResume,
                 timeoutCount: resumeTimeoutCount,
+                error: effectiveError,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback
             ) {
-                logCodex("[AgentModeVM][CodexReconnect] repeated resume timeout for tab \(session.tabID); retrying with a fresh thread start")
+                let isFrameTooLarge = freshStartFallbackReason == .resumeFrameTooLarge
+                let failureDescription = isFrameTooLarge ? "oversized resume response" : "repeated resume timeout"
+                logCodex("[AgentModeVM][CodexReconnect] \(failureDescription) for tab \(session.tabID); retrying with a fresh thread start")
                 let expectedController = session.codexController
                 _ = invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: expectedController,
-                    source: "resume-timeout-fallback",
+                    source: isFrameTooLarge ? "resume-frame-too-large-fallback" : "resume-timeout-fallback",
                     preserveRunID: true
                 )
                 guard let freshController = await prepareCodexController() else { return }
@@ -7519,7 +7539,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if retryResult.fallbackReason == nil {
                         retryResult = CodexNativeSessionStartResult(
                             sessionRef: retryResult.sessionRef,
-                            fallbackReason: .repeatedResumeTimeout,
+                            fallbackReason: freshStartFallbackReason,
                             disposition: .resumeFellBackToFresh
                         )
                     }

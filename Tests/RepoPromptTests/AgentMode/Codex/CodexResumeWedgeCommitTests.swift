@@ -1153,6 +1153,38 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await MCPRoutingWaiter.shared.cleanup(runID: runID)
     }
 
+    func testOversizedResumeResponseFallsBackToFreshThreadOnFirstFailure() async throws {
+        let fixture = makeFixture([
+            [.oversizedResume],
+            [.success("fresh-after-oversized-resume")]
+        ])
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+
+        XCTAssertEqual(fixture.factory.controllers.count, 2, "an oversized resume must retire the poisoned controller")
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.factory.controllers[0].shutdownCount, 1)
+        XCTAssertEqual(fixture.factory.controllers[1].receivedExistingIDs, [nil])
+        XCTAssertEqual(fixture.session.codexResumeTimeoutState.consecutiveTimeouts, 0, "a frame overflow is not a timeout")
+        assertOldTuple(fixture.session)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        await startup.value
+
+        XCTAssertEqual(fixture.session.codexConversationID, "fresh-after-oversized-resume")
+        XCTAssertEqual(fixture.session.providerCleanupHandle?.conversationID, "fresh-after-oversized-resume")
+        XCTAssertEqual(fixture.session.codexNativeStartupDisposition, .resumeFellBackToFresh)
+        XCTAssertFalse(fixture.session.codexNeedsReconnect)
+        XCTAssertEqual(
+            fixture.session.items.count(where: { $0.text.contains("history was too large to load. Started a fresh thread") }),
+            1
+        )
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("after repeated timeout") })
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("frame budget") }, "the overflow must not surface as a send failure")
+    }
+
     func testSettledOldLeaseCannotRevokeSameRunSuccessor() async {
         let runID = UUID()
         let tabID = UUID()
@@ -1519,6 +1551,7 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         case timeout
         case routedTimeout
         case missingRollout
+        case oversizedResume
         case suspendedSuccess(String, TestReleaseFence)
         case suspendedMissingRollout(TestReleaseFence)
         case success(String)
@@ -1641,6 +1674,8 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
                 message: "Request timed out after 120.0s",
                 data: nil
             ))
+        case .oversizedResume:
+            throw CodexAppServerClient.ClientError.stdoutFrameBudgetExceeded(limitBytes: 64 * 1024 * 1024)
         case let .suspendedMissingRollout(gate):
             await gate.enterAndWait()
             throw CodexAppServerClient.ClientError.requestFailed(.init(
