@@ -193,20 +193,34 @@ struct ContextBuilderResultCard: View {
         contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: dto)
     }
 
-    private var summary: String {
-        if isActiveResultCard {
-            return contextBuilderCardSubtitle(
+    var summary: String {
+        let label = isActiveResultCard
+            ? contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 fallbackStatus: dto?.status,
                 phase: phase
             )
-        }
-        return contextBuilderFinalStatusLabel(dto?.status)
+            : contextBuilderFinalStatusLabel(dto?.status)
+        guard phase == .completed else { return label }
+        let outcome = contextBuilderCompletedOutcomeLabel(
+            label, coverage: laneCoverage, toolIsError: item.toolIsError,
+            fallbackStatus: AgentTranscriptToolNormalizer.status(for: item)
+        )
+        guard let laneCoverage else { return outcome }
+        return outcome.isEmpty ? laneCoverage.summaryText : "\(outcome) · \(laneCoverage.summaryText)"
     }
 
-    private var status: ToolCardStatus {
+    private var laneCoverage: OracleLaneCoverage? {
+        contextBuilderOracleLaneCoverage(for: dto)
+    }
+
+    var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
-        if item.toolIsError == true { return .failure }
+        if item.toolIsError == true || dto?.status?.lowercased() == "error" { return .failure }
+        let outcome = AgentTranscriptToolNormalizer.status(for: item)
+        if outcome == .failed || outcome == .cancelled { return .failure }
+        if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
+        if outcome == .warning { return .warning }
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure
@@ -652,6 +666,19 @@ func contextBuilderOracleLaneSummaries(
     }
 }
 
+func contextBuilderOracleLaneCoverage(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> OracleLaneCoverage? {
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return nil }
+    let reply = switch branch {
+    case .review: dto.review
+    case .plan: dto.plan
+    }
+    return OracleLaneCoverage(lanes: reply?.oracleResults, oracleCount: reply?.oracleCount)
+}
+
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
     guard let dto,
           let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
@@ -771,6 +798,29 @@ private func contextBuilderFollowUpLabel(contextBuilderAgentVM: ContextBuilderAg
     default:
         return responseType
     }
+}
+
+/// Context building and its Oracle follow-up have distinct outcomes. Do not
+/// present incomplete lane coverage as an unqualified operation success.
+func contextBuilderCompletedOutcomeLabel(
+    _ label: String,
+    coverage: OracleLaneCoverage?,
+    toolIsError: Bool?,
+    fallbackStatus: AgentTranscriptToolStatus = .unknown
+) -> String {
+    let persistedOracleOutcome = coverage != nil
+        && (
+            (label == "warning" && fallbackStatus == .warning)
+                || (label == "failed" && fallbackStatus == .failed)
+        )
+    guard label == "success" || label == "completed" || persistedOracleOutcome else { return label }
+    if toolIsError == true { return "error" }
+    if fallbackStatus == .failed || fallbackStatus == .cancelled { return "Oracle incomplete" }
+    if let coverage {
+        guard !coverage.isComplete else { return label }
+        return coverage.completedCount > 0 ? "partial success" : "Oracle incomplete"
+    }
+    return fallbackStatus == .warning ? "partial success" : label
 }
 
 private func contextBuilderFinalStatusLabel(_ raw: String?) -> String {

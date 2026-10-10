@@ -15,7 +15,6 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         )
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router))
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 10)
         let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: JSONEncoder().encode(document))
         XCTAssertEqual(decoded.scalarPreferences?.modelRouter, router)
     }

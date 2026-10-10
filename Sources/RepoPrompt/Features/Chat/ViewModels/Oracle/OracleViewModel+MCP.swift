@@ -122,6 +122,7 @@ extension OracleViewModel {
         let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
         let transientImages: [AITransientImage]
+        var toolSettlement: OracleToolSettlementCallbacks?
 
         init(
             tabID: UUID,

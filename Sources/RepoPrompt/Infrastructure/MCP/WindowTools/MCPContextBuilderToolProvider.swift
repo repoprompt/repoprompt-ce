@@ -978,9 +978,12 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         markdown,
                         capturedOracleExportDestination
                     )
+                    let exportedLaneCount = [planReply, reviewReply]
+                        .compactMap { $0?.oracleGroup?.result.oracleResults.count }
+                        .max()
                     oracleExportFile = OracleExportFile(
                         path: resolvedPath,
-                        instruction: AgentOracleExport.instruction(path: resolvedPath)
+                        instruction: AgentOracleExport.instruction(path: resolvedPath, oracleLaneCount: exportedLaneCount)
                     )
                 }
 
@@ -999,10 +1002,10 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         oracleCount: Int?
     ) -> String {
         let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false)"
-        guard let oracleCount, oracleCount > 1 else { return continuation }
-
-        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
-        return groupGuidance + "\n\nOptional later follow-up: " + continuation
+        guard let reminder = OracleGroupDeliveryContract.followUpReminder(laneCount: oracleCount ?? 0) else {
+            return continuation
+        }
+        return reminder + "\n\nOptional later follow-up: " + continuation
     }
 
     nonisolated static func responseDisposition(
@@ -1081,32 +1084,24 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             return try await operation()
         }
 
-        let heartbeatTask = Task {
-            do {
-                while !Task.isCancelled {
-                    try await Task.sleep(for: interval)
-                    try Task.checkCancellation()
-                    let heartbeat: (stage: String, message: String) = if let timeline {
-                        await timeline.heartbeat(
-                            fallbackStage: stage,
-                            fallbackMessage: message
-                        )
-                    } else {
-                        (stage, message)
-                    }
-                    await execution.sendHeartbeatProgress(
-                        connectionID,
-                        tool,
-                        heartbeat.stage,
-                        heartbeat.message
-                    )
-                }
-            } catch {
-                // Cancellation is the expected completion path.
+        return try await MCPToolHeartbeat.run(interval: interval) {
+            let heartbeat: (stage: String, message: String) = if let timeline {
+                await timeline.heartbeat(
+                    fallbackStage: stage,
+                    fallbackMessage: message
+                )
+            } else {
+                (stage, message)
             }
+            await execution.sendHeartbeatProgress(
+                connectionID,
+                tool,
+                heartbeat.stage,
+                heartbeat.message
+            )
+        } operation: {
+            try await operation()
         }
-        defer { heartbeatTask.cancel() }
-        return try await operation()
     }
 
     private static func withTimelinePhaseCompletion<T: Sendable>(

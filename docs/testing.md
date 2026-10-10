@@ -86,6 +86,28 @@ or `ACPAgentSessionController`, or scope a launch/probe with
 to the configured instance or task, not a process-global environment switch. Mark a process
 `.tool` only for genuinely non-provider tooling, such as Git worktree operations.
 
+## Oracle settled-response recovery
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed `ask_oracle` / `oracle_send` with `export_response:true`; `make dev-test FILTER=OracleGroupBoundaryTests` | Optional export failure retains the settled answer and chat IDs with a safe `oracle_export_error`; no automatic paid replay | Pre-settlement validation/send failures still throw. Recover through returned chat IDs. The deterministic fixture is not live filesystem proof. |
+
+## Oracle reconciliation and progress lifetime
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Reopen an Agent Mode transcript and open a saved `ask_oracle` / `oracle_send` card; `make dev-test FILTER=OracleLaneCoverageTests` | Fresh disk restoration routes to the exact primary chat for both fitting lane digests and summary-budget fallback, while preserving lane coverage | Conflicting or malformed lane identities must not route to another chat or fall back to the latest chat |
+| Complete or fail an Oracle request during progress delivery; `make dev-test FILTER=MCPToolHeartbeatTests` | A gated in-flight heartbeat drains before the tool call returns or rethrows; cancellation preserves the operation's settled result | Cancellation alone does not complete an already-running async progress callback; the deterministic gate is not live transport proof |
+
+The inventory-first reconciliation guidance in `OracleGroupDeliveryContract` showed a paired GPT score gain in the local r02 experiment, but failed its final holdout factual/format gates (more false acceptances) and produced longer answers. Delivery-string tests verify the guidance contract, not reconciliation accuracy.
+
+## Oracle reconciliation settings editor
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Settings → Agent Models → beneath Oracle roster; background Cua controls labeled `Oracle reconciliation guidance`, `Save Oracle reconciliation guidance`, `Restore default Oracle reconciliation guidance`, `Reload Oracle reconciliation guidance`; `make dev-test FILTER=AgentModelsSettingsViewModelStaleEditTests` | Typing does not write; Save persists only guidance in the selected whole profile; blank/Restore Default removes the override. Dirty drafts survive unrelated refreshed profile edits (including same-page Add Oracle), and Save preserves those edits. Conflict is derived from guidance baseline or actual write-destination mismatch; Reload Current Text discards a conflicting draft. Switching between workspaces using the same global profile does not invalidate a global draft. The whole-profile cache/live guard refuses an uncached edit without retrying that click; after refresh, a new explicit Save succeeds if guidance and destination still match, preserving unrelated edits. Clean drafts follow settings notifications. | Global/workspace routing is authoritative; nil workspace guidance uses the built-in default, not global fieldwise inheritance. The existing Settings persistence banner owns pending-save/recovery warnings. GUI driving requires an authorized matching artifact; VM tests are not GUI proof. |
+| Save guidance, start grouped `ask_oracle` / `oracle_send` or Context Builder plan/question/review, then change settings while discovery/lanes are pending; inspect returned text and optional export; `make dev-test FILTER='OraclePresetExecutionTests\|ContextBuilderOraclePresetTests\|ContextBuilderOracleGroupStateTests\|OracleGuidanceContractTests\|OracleGroupDeliveryContractTests\|OracleGroupBoundaryTests'` | The pending request retains its captured guidance in inline and exported results; a later continuation uses new scoped text without changing the conversation roster/prompt. Absent/blank overrides use unchanged default delivery; an explicit override equal to the default remains metadata. N=1 delivery is unchanged. | Caller-facing policy only: lane prompts and canonical history contain no guidance. Direct headless delivery retains the built-in default. Live provider uploads/paid requests and app lifecycle need separate authorization; deterministic transport hooks prove capture/serialization, not live model behavior. |
+
 ## Oracle image delivery
 
 Feature map (app-backed only):
