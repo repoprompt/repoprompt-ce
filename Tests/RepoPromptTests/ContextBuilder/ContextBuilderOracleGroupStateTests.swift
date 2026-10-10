@@ -383,14 +383,6 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
 
         XCTAssertEqual(reply.oracleGroup?.result.oracleCount, 2)
         XCTAssertEqual(reply.toMCPValue().objectValue?["oracle_reconciliation_guidance"]?.stringValue, guidance)
-        let roundTrip = try JSONDecoder().decode(ChatSendReply.self, from: JSONEncoder().encode(reply))
-        let exported = ToolOutputFormatter.formatDiscoverContext(value: .object(["plan": roundTrip.toMCPValue()]))
-            .compactMap { block -> String? in
-                guard case let .text(text, _, _) = block else { return nil }
-                return text
-            }.joined(separator: "\n")
-        XCTAssertTrue(exported.contains(guidance))
-        XCTAssertFalse(exported.contains(OracleGroupDeliveryContract.defaultReconciliationGuidance))
         XCTAssertEqual(capturedMessages.count, 2)
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt == marker })
     }

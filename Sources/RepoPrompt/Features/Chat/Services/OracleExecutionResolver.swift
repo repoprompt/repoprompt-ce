@@ -95,7 +95,7 @@ struct ResolvedOracleExecution {
     let promptConfiguration: OraclePromptConfiguration
     let selection: OracleExecutionSelection
     /// Caller-facing delivery policy, never provider prompt configuration or canonical history.
-    let reconciliationGuidance: String
+    let reconciliationGuidance: String?
 
     fileprivate init(
         mode: OracleMode,
@@ -103,7 +103,7 @@ struct ResolvedOracleExecution {
         models: [AIModel],
         promptConfiguration: OraclePromptConfiguration,
         selection: OracleExecutionSelection,
-        reconciliationGuidance: String
+        reconciliationGuidance: String?
     ) {
         self.mode = mode
         self.roster = roster
@@ -449,9 +449,7 @@ struct OracleExecutionResolver {
             models: models,
             promptConfiguration: capturePromptConfiguration(chatPreset, mode),
             selection: selection,
-            reconciliationGuidance: OracleGroupDeliveryContract.effectiveReconciliationGuidance(
-                profile.oracleReconciliationGuidance
-            )
+            reconciliationGuidance: profile.oracleReconciliationGuidance
         )
     }
 

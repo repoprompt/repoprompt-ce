@@ -5,7 +5,7 @@ import RepoPromptSettingsCore
 
 struct OracleToolSettlementCallbacks {
     let prepared: @MainActor @Sendable (_ groupID: OracleGroupID, _ turnID: OracleTurnID) async -> Void
-    let settled: @MainActor @Sendable (_ result: OracleGroupResult, _ turnID: OracleTurnID, _ reconciliationGuidance: String) -> Void
+    let settled: @MainActor @Sendable (_ result: OracleGroupResult, _ turnID: OracleTurnID, _ reconciliationGuidance: String?) -> Void
 }
 
 struct AppOracleGroupExecutionCallbacks {
@@ -31,7 +31,7 @@ private struct AppOracleConfiguredRosterSelection {
 
 private enum AppOracleConfiguredRosterDispatch {
     case singleMCPValue([String: Value])
-    case groupedCompletion(OracleGroupRuntime.Completion, reconciliationGuidance: String)
+    case groupedCompletion(OracleGroupRuntime.Completion, reconciliationGuidance: String?)
 }
 
 private enum AppOracleConfiguredRosterSingleFallback {
@@ -167,11 +167,6 @@ extension OracleViewModel {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         let profile = capturedProfile
             ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
-        // Freeze delivery policy before canonical lookup or session restoration can suspend.
-        // A CB start already carries its pre-discovery authority. Later continuations use
-        // the newly captured scoped profile, independently of frozen roster/prompt history.
-        let reconciliationGuidance = resolvedStartExecution?.reconciliationGuidance
-            ?? OracleGroupDeliveryContract.effectiveReconciliationGuidance(profile.oracleReconciliationGuidance)
         let route = try OracleConversationRoute.resolve(
             chatID: args["chat_id"]?.stringValue,
             newChat: args["new_chat"]?.boolValue == true,
@@ -201,6 +196,13 @@ extension OracleViewModel {
                 snapshotOverride: selectionSnapshotOverride
             )
             : nil
+        // An execution with no override owns the built-in policy; it must not fall
+        // through to a different profile's custom guidance. Continuations use this request's profile.
+        let reconciliationGuidance = if let startExecution {
+            startExecution.reconciliationGuidance
+        } else {
+            profile.oracleReconciliationGuidance
+        }
         let singleExecution: ResolvedOracleExecution? = if let startExecution {
             startExecution
         } else if let sessionID = selection.singleSessionID,
@@ -249,14 +251,14 @@ extension OracleViewModel {
             tabContext: tabContext,
             workspaceID: workspaceID,
             startExecution: startExecution,
-            reconciliationGuidance: startExecution?.reconciliationGuidance ?? reconciliationGuidance,
+            reconciliationGuidance: reconciliationGuidance,
             selectionSnapshotOverride: selectionSnapshotOverride,
             existingGroup: selection.group,
             frozenInput: frozenInput,
             callbacks: callbacks,
             contextBuilderSupervision: contextBuilderSupervision
         )
-        return .groupedCompletion(completion, reconciliationGuidance: startExecution?.reconciliationGuidance ?? reconciliationGuidance)
+        return .groupedCompletion(completion, reconciliationGuidance: reconciliationGuidance)
     }
 
     @MainActor
@@ -339,7 +341,7 @@ extension OracleViewModel {
         tabContext: OracleSendTabContext?,
         workspaceID: UUID?,
         startExecution: ResolvedOracleExecution?,
-        reconciliationGuidance: String,
+        reconciliationGuidance: String?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,

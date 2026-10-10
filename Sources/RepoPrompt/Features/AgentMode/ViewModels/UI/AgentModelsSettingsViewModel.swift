@@ -41,7 +41,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
     @Published var oracleReconciliationGuidanceDraft: String
-    @Published private(set) var oracleGuidanceHasConflict = false
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
     @Published var syncChatWithOracle: Bool {
@@ -85,7 +84,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var isReloadingScopedState = false
     // The draft depends only on guidance and scope; unrelated refreshed profile edits are safe.
-    private var oracleGuidanceDraftWorkspaceID: UUID?
     private var oracleGuidanceDraftScope: AgentModelsEditingScope
     private var oracleGuidanceDraftBaseline: String?
 
@@ -114,7 +112,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
         oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(initialProfile.oracleReconciliationGuidance)
-        oracleGuidanceDraftWorkspaceID = workspaceID
         oracleGuidanceDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
         oracleGuidanceDraftBaseline = initialProfile.oracleReconciliationGuidance
         self.settingsManager = settingsManager
@@ -330,36 +327,26 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         loadOracleGuidanceDraft()
     }
 
-    private var oracleGuidanceDraftMatchesCurrentProfile: Bool {
-        oracleGuidanceDraftWorkspaceID == workspaceID
-            && oracleGuidanceDraftScope == editingScope
-            && oracleGuidanceDraftBaseline == profileSnapshot.oracleReconciliationGuidance
+    var oracleGuidanceHasConflict: Bool {
+        oracleGuidanceDraftScope != editingScope
+            || oracleGuidanceDraftBaseline != profileSnapshot.oracleReconciliationGuidance
     }
 
     private func loadOracleGuidanceDraft() {
-        oracleGuidanceDraftWorkspaceID = workspaceID
         oracleGuidanceDraftScope = editingScope
         oracleGuidanceDraftBaseline = profileSnapshot.oracleReconciliationGuidance
         oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(profileSnapshot.oracleReconciliationGuidance)
-        oracleGuidanceHasConflict = false
     }
 
     private func persistOracleGuidanceDraft(_ text: String?) -> Bool {
-        guard !oracleGuidanceHasConflict, oracleGuidanceDraftMatchesCurrentProfile else {
-            oracleGuidanceHasConflict = true
-            return false
-        }
-        let draft = oracleReconciliationGuidanceDraft
+        guard !oracleGuidanceHasConflict else { return false }
         let accepted = updateSelectedProfile(reason: "agent_models.oracle_guidance") { profile in
             profile.oracleReconciliationGuidance = text
         }
         if accepted {
             loadOracleGuidanceDraft()
-        } else {
-            // The live/cache guard refreshes on rejection. Never retry that click against its new base.
-            oracleReconciliationGuidanceDraft = draft
-            oracleGuidanceHasConflict = true
         }
+        // A rejected click is never retried against the refreshed cache.
         return accepted
     }
 
@@ -943,10 +930,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         syncChatWithOracle = nextProfile.syncChatModelWithOracle
         restrictMCPAgentDiscoveryToRoleLabels = nextProfile.restrictMCPAgentDiscoveryToRoleLabels
         isReloadingScopedState = false
-        if !isOracleGuidanceDraftDirty, !oracleGuidanceHasConflict {
+        if !isOracleGuidanceDraftDirty {
             loadOracleGuidanceDraft()
-        } else if !oracleGuidanceDraftMatchesCurrentProfile {
-            oracleGuidanceHasConflict = true
         }
     }
 

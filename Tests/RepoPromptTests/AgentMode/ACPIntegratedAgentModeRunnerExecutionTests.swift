@@ -33,7 +33,7 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
         ])
         let turn = OracleTurnID(rawValue: UUID())
         await callbacks.prepared(result.groupID, turn)
-        callbacks.settled(result, turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        callbacks.settled(result, turn, nil)
         var fields = OracleGroupMCPCodec.groupFields(result)
         fields["chat_id"] = .string(result.primary.chatID)
         fields["mode"] = .string("review")
@@ -46,7 +46,7 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
         XCTAssertTrue(accountedOutputs.compactMap(\.self).first?.contains("87") == true)
         let absent = try XCTUnwrap(runner.oracleToolSettlementCallbacks(session: session, invocationID: UUID(), toolName: "ask_oracle", isOwnerCurrent: { true }))
         await absent.prepared(result.groupID, turn)
-        absent.settled(result, turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        absent.settled(result, turn, nil)
         XCTAssertEqual(session.items.map(\.id), [rowID], "Missing prepared row must not synthesize a transcript invocation")
         XCTAssertEqual(accountedOutputs.count, 1)
     }
@@ -86,12 +86,12 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
             OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .cancelled, error: .init(code: "cancelled", message: "Owner cancelled"))
         ])
         let failedPayload = session.items.first?.toolResultJSON
-        try callbacks.settled(OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: result.status, oracleResults: result.oracleResults), turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        try callbacks.settled(OracleGroupResult(groupID: OracleGroupID(rawValue: UUID()), status: result.status, oracleResults: result.oracleResults), turn, nil)
         XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Wrong group has no row authority")
-        callbacks.settled(result, OracleTurnID(rawValue: UUID()), OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        callbacks.settled(result, OracleTurnID(rawValue: UUID()), nil)
         XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Wrong turn has no row authority")
         currentOwner = nil
-        callbacks.settled(result, turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        callbacks.settled(result, turn, nil)
         XCTAssertEqual(session.items.first?.toolResultJSON, failedPayload, "Replaced tab owner fences the old settlement")
         currentOwner = session
         let capturedGuidance = "  Retain disagreements after cancellation.\nRead every lane.  "
@@ -113,10 +113,10 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
             OracleLaneResult(laneIndex: 0, chatID: "primary", providerID: nil, modelID: "primary-model", status: .completed, response: "changed"),
             OracleLaneResult(laneIndex: 1, chatID: "sibling", providerID: nil, modelID: "sibling-model", status: .completed, response: "changed")
         ])
-        callbacks.settled(changed, turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        callbacks.settled(changed, turn, nil)
         XCTAssertEqual(session.items.first?.toolResultJSON, settledPayload, "Installing a successor run ID already fences the old settlement")
         session.beginRunAttempt(source: "successor")
-        callbacks.settled(changed, turn, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        callbacks.settled(changed, turn, nil)
         XCTAssertEqual(session.items.first?.toolResultJSON, settledPayload, "A successor attempt fences the old settlement")
     }
 

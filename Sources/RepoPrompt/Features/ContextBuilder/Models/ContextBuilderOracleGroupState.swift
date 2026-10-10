@@ -273,8 +273,7 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
 
     init(result: OracleGroupResult, reconciliationGuidance: String? = nil) {
         self.result = result
-        let custom = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(reconciliationGuidance)
-        self.reconciliationGuidance = custom == OracleGroupDeliveryContract.defaultReconciliationGuidance ? nil : custom
+        self.reconciliationGuidance = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(reconciliationGuidance)
     }
 
     var orderedResults: [OracleLaneResult] {
@@ -301,7 +300,7 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
 
     func toMCPFields() -> [String: Value] {
         var fields = OracleGroupMCPCodec.groupFields(result)
-        // Default/legacy metadata stays absent; single-lane replies never own a group.
+        // Absent or blank overrides omit metadata; explicit nonblank text is preserved.
         if let reconciliationGuidance {
             fields["oracle_reconciliation_guidance"] = .string(reconciliationGuidance)
         }

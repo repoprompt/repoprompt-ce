@@ -1961,9 +1961,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         // Freeze only caller-facing policy here. Keep discovery model/effort and
         // Oracle roster resolution at their existing post-validation boundary.
-        let reconciliationGuidance = OracleGroupDeliveryContract.effectiveReconciliationGuidance(
-            settingsManager.effectiveAgentModelsProfile(workspaceID: identity.workspaceID).oracleReconciliationGuidance
-        )
+        let reconciliationGuidance = settingsManager.effectiveAgentModelsProfile(workspaceID: identity.workspaceID).oracleReconciliationGuidance
         #if DEBUG
             if let validationOverride = runTestHooks?.validateContextBuilderProviders {
                 await validationOverride()
@@ -5626,6 +5624,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         case .review: "Review"
         case .chat: "Answer"
         }
+        let reviewGitContext = mode == .review
+            ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
+            : .automaticOnly()
         let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: originWorkspaceID)
         guard let primaryModelRaw = profile.planningModelRaw else {
             throw ContextBuilderGenerationError.oracleModelUnavailable(
@@ -5661,10 +5662,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mode: mode.mcpModeName,
             snapshot: snapshot
         )
-        let reviewGitContext = mode == .review
-            ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
-            : .automaticOnly()
-
         return try await runFollowUpOracleStream(
             for: tabID,
             originWorkspaceID: originWorkspaceID,

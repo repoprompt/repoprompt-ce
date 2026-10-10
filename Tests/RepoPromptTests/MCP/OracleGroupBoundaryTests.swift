@@ -1193,10 +1193,15 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
 
         let legacyFields = OracleGroupMCPCodec.groupFields(group)
         let defaultText = joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(legacyFields), emitResources: false))
-        for override in [nil, " \n\t", OracleGroupDeliveryContract.defaultReconciliationGuidance] as [String?] {
+        for override in [nil, " \n\t"] as [String?] {
             let fields = ContextBuilderOracleGroupReply(result: group, reconciliationGuidance: override).toMCPFields()
             XCTAssertEqual(fields, legacyFields)
         }
+        let explicitDefault = OracleGroupDeliveryContract.defaultReconciliationGuidance
+        let explicitReply = ContextBuilderOracleGroupReply(result: group, reconciliationGuidance: explicitDefault)
+        let explicitRoundTrip = try JSONDecoder().decode(ContextBuilderOracleGroupReply.self, from: JSONEncoder().encode(explicitReply))
+        XCTAssertEqual(explicitRoundTrip.toMCPFields()["oracle_reconciliation_guidance"]?.stringValue, explicitDefault)
+        XCTAssertEqual(joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(explicitRoundTrip.toMCPFields()), emitResources: false)), defaultText)
         for raw in [Value.null, .string(" \n")] {
             var fields = legacyFields
             fields["oracle_reconciliation_guidance"] = raw

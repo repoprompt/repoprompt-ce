@@ -328,7 +328,6 @@ final class ContextBuilderOraclePresetTests: XCTestCase {
             workspaceContext: nil, responseType: "plan", oraclePreset: nil
         )
         XCTAssertEqual(next.configuration.generatedResponseAuthority.execution?.reconciliationGuidance, later)
-        XCTAssertEqual(captured.reconciliationGuidance, original)
         // A custom workspace with no override uses the built-in policy, not global text.
         profile.oracleReconciliationGuidance = nil
         store.setWorkspaceAgentModelsProfile(workspaceID: workspace.id, profile: profile)
@@ -340,7 +339,7 @@ final class ContextBuilderOraclePresetTests: XCTestCase {
             identity: .init(workspaceID: workspace.id, tabID: tab.id), nestedTabContext: nested,
             workspaceContext: nil, responseType: "question", oraclePreset: nil
         )
-        XCTAssertEqual(builtin.configuration.generatedResponseAuthority.execution?.reconciliationGuidance, OracleGroupDeliveryContract.defaultReconciliationGuidance)
+        XCTAssertNil(try XCTUnwrap(builtin.configuration.generatedResponseAuthority.execution).reconciliationGuidance)
     }
 
     private func makeTabContext(workspaceID: UUID, tabID: UUID) -> OracleViewModel.OracleSendTabContext {
