@@ -3774,7 +3774,9 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
-        for ref in reference { try GitRevisionArgument.validate(ref) }
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
         let numstatArgs = ["diff"] + reference + ["--numstat"]
         let nameStatusArgs = ["diff"] + reference + ["--name-status"]
 
