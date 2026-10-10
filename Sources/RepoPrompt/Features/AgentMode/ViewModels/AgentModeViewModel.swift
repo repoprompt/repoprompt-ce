@@ -734,6 +734,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
+    /// Overrides `<workspace>/AgentSessions/attachments` (tests); `nil` uses the active workspace.
+    var sessionAttachmentsRootOverride: (() -> URL?)?
+    var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard
+    /// Latest blocked-attach notice surfaced in the composer instead of a mid-run transcript row.
+    var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
+    /// Off-main moves of finished turns' images into session storage, keyed by a per-move token.
+    var attachmentRetentionTasks: [UUID: Task<Void, Never>] = [:]
+    /// Attachment roots already swept this process (`AgentModeViewModel+DraftsAttachments`).
+    static var sweptSessionAttachmentRoots: Set<String> = []
     let workspacePathProvider: () -> String?
     /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
     /// to the shared polling service; the DEBUG test init can inject a scripted provider so
@@ -14687,6 +14696,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
         let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
         await handleWorkspaceSwitch(workspace, owner: owner)
+        scheduleSessionAttachmentSweepIfNeeded()
     }
 
     private func handleWorkspaceSwitch(

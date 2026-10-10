@@ -295,6 +295,54 @@ extension AgentModeViewModel {
         scheduleSave(for: tabID)
     }
 
+    // MARK: - Attach Guard
+
+    /// Grok Build advertises no ACP image capability; its provider rejects attachments.
+    static func providerSupportsImageAttachments(_ agent: AgentProviderKind) -> Bool {
+        agent != .grokBuild
+    }
+
+    /// The rule shared by the attach button, paste, and drop for `tabID`'s session.
+    func imageAttachmentBlockReason(tabID: UUID?) -> AgentImageAttachmentBlockReason? {
+        let session = tabID.flatMap { session(for: $0, createIfNeeded: false) }
+        let agent = session?.selectedAgent ?? selectedAgent
+        let isBusy = session.map { $0.runState == .running } ?? (tabID == currentTabID && isAgentBusy)
+        return AgentImageAttachmentGuard.blockReason(
+            hasTab: tabID != nil,
+            isAgentBusy: isBusy,
+            providerSupportsImages: Self.providerSupportsImageAttachments(agent),
+            providerName: agent.displayName
+        )
+    }
+
+    /// Paste and drop entry point: attaches when the guard allows it, otherwise explains why not.
+    @discardableResult
+    func attachImagesIfAllowed(tabID: UUID, urls: [URL]) -> Bool {
+        guard !urls.isEmpty else { return false }
+        if let reason = imageAttachmentBlockReason(tabID: tabID) {
+            reportImageAttachmentBlocked(reason, tabID: tabID)
+            return false
+        }
+        attachImages(tabID: tabID, urls: urls)
+        return true
+    }
+
+    /// A running turn streams into the last transcript row, so a busy block is reported as a
+    /// composer notice; other block reasons append a short error row.
+    func reportImageAttachmentBlocked(_ reason: AgentImageAttachmentBlockReason, tabID: UUID) {
+        if reason == .agentBusy {
+            imageAttachmentNotice = AgentImageAttachmentNoticeProps(id: UUID(), tabID: tabID, message: reason.message)
+            if tabID == currentTabID {
+                syncComposerUIState(tabID: tabID)
+            }
+            return
+        }
+        let session = session(for: tabID)
+        session.appendItem(AgentChatItem.error(reason.message, sequenceIndex: session.nextSequenceIndex))
+        updateBindingsFromSession(session)
+        scheduleSave(for: tabID)
+    }
+
     func removePendingImage(tabID: UUID, attachmentID: UUID) {
         let session = session(for: tabID)
         let beforeCount = session.pendingImageAttachments.count
@@ -394,11 +442,127 @@ extension AgentModeViewModel {
         attachmentWorkspaceDirectoryProvider()?.standardizedFileURL
     }
 
-    private func clearConsumedAttachmentFilesIfNeeded(_ attachments: [AgentImageAttachment]) {
+    // MARK: - Session Attachment Retention
+
+    /// `<workspace>/AgentSessions/attachments`, or `nil` when sessions are not persisted.
+    func sessionAttachmentsRootURL() -> URL? {
+        if let sessionAttachmentsRootOverride {
+            return sessionAttachmentsRootOverride()?.standardizedFileURL
+        }
+        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence,
+              let workspace = workspaceManager?.activeWorkspace
+        else { return nil }
+        let agentSessionsFolder = WorkspaceSessionSidecarMigration
+            .workspaceDirectory(for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL())
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+        return AgentSessionAttachmentStore.rootURL(forAgentSessionsFolder: agentSessionsFolder)
+    }
+
+    /// Finished turns keep their images for the life of the session: the temporary copies are
+    /// moved into `AgentSessions/attachments/<sessionID>/` off the main thread, then the user row is
+    /// rewritten to the kept copy. Providers already consumed the temporary path, so their
+    /// behaviour is unchanged. Without a persisted session the copies are deleted as before.
+    private func retainConsumedAttachmentFiles(_ attachments: [AgentImageAttachment], session: TabSession) {
         guard clearConsumedAttachmentsAfterProviderConsumption else { return }
         guard !attachments.isEmpty else { return }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else { return }
-        attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+        guard let sessionID = session.activeAgentSessionID,
+              let root = sessionAttachmentsRootURL()
+        else {
+            attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+            return
+        }
+        let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
+        let temporaryRoot = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
+        let move = Task.detached(priority: .utility) {
+            store.retain(attachments, sessionID: sessionID, temporaryRoot: temporaryRoot)
+        }
+        let token = UUID()
+        attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
+            let result = await move.value
+            guard let self else { return }
+            attachmentRetentionTasks[token] = nil
+            guard let session else { return }
+            applyRetainedAttachments(result.retained, to: session, sessionID: sessionID)
+        }
+    }
+
+    /// Points every user row that carried a retained attachment at its kept copy and saves.
+    func applyRetainedAttachments(_ retained: [UUID: AgentImageAttachment], to session: TabSession, sessionID: UUID) {
+        guard !retained.isEmpty, session.activeAgentSessionID == sessionID else { return }
+        let indices = session.items.indices.filter { index in
+            session.items[index].kind == .user
+                && session.items[index].attachments.contains { retained[$0.id] != nil }
+        }
+        guard !indices.isEmpty else { return }
+        for index in indices {
+            session.mutateItem(at: index) { item in
+                item.attachments = item.attachments.map { retained[$0.id] ?? $0 }
+            }
+        }
+        session.isDirty = true
+        scheduleSave(for: session)
+    }
+
+    /// Awaits in-flight turn-end moves (tests and orderly teardown).
+    func waitForAttachmentRetention() async {
+        while let task = attachmentRetentionTasks.values.first {
+            await task.value
+        }
+    }
+
+    /// Low-priority, once-per-process sweep of a workspace's attachment storage: session folders
+    /// whose transcript is gone, and temporary copies older than seven days not pending anywhere.
+    func scheduleSessionAttachmentSweepIfNeeded(delayNanoseconds: UInt64 = 20_000_000_000) {
+        guard clearConsumedAttachmentsAfterProviderConsumption,
+              let root = sessionAttachmentsRootURL(),
+              Self.sweptSessionAttachmentRoots.insert(root.path).inserted
+        else { return }
+        let agentSessionsFolder = root.deletingLastPathComponent()
+        let temporaryRoot = attachmentWorkspaceDirectoryURL().map { AgentAttachmentStore.managedStorageRootURL(for: $0) }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard let self else { return }
+            let protection = liveAttachmentSweepProtection()
+            _ = await Task.detached(priority: .background) {
+                AgentSessionAttachmentStore.sweep(
+                    agentSessionsFolder: agentSessionsFolder,
+                    temporaryRoot: temporaryRoot,
+                    protectedSessionIDs: protection.sessionIDs,
+                    protectedTemporaryPaths: protection.temporaryPaths
+                )
+            }.value
+        }
+    }
+
+    /// Live sessions and every attachment still pending, reserved, or in flight across windows.
+    func liveAttachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
+        var viewModels = WindowStatesManager.shared.allWindows.map(\.agentModeViewModel)
+        if !viewModels.contains(where: { $0 === self }) {
+            viewModels.append(self)
+        }
+        var sessionIDs: Set<UUID> = []
+        var paths: Set<String> = []
+        for viewModel in viewModels {
+            for session in viewModel.sessions.values {
+                if let sessionID = session.activeAgentSessionID {
+                    sessionIDs.insert(sessionID)
+                }
+                var attachments = session.pendingImageAttachments + session.attachmentsPendingProviderConsumptionCleanup
+                switch session.attachmentTurnState {
+                case .idle:
+                    break
+                case let .reserved(_, turnAttachments), let .consumed(_, turnAttachments):
+                    attachments.append(contentsOf: turnAttachments)
+                }
+                for attachment in attachments {
+                    if let path = AgentImageAttachmentAvailabilityResolver.path(for: attachment) {
+                        paths.insert(path)
+                    }
+                }
+            }
+        }
+        return (sessionIDs, paths)
     }
 
     /// Local image files this tab's Agent session attached itself — the in-flight turn plus any
@@ -412,6 +576,8 @@ extension AgentModeViewModel {
               let workspaceDirectory = attachmentWorkspaceDirectoryURL()
         else { return [] }
         let storagePrefix = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory).path + "/"
+        // Earlier turns' images now live in this session's own retained folder.
+        let retainedStore = sessionAttachmentsRootURL().map { AgentSessionAttachmentStore(rootURL: $0) }
 
         var candidates: [AgentImageAttachment] = []
         switch session.attachmentTurnState {
@@ -430,8 +596,10 @@ extension AgentModeViewModel {
         for attachment in candidates {
             guard case let .localFile(path) = attachment.source else { continue }
             let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
-            guard standardized.hasPrefix(storagePrefix),
-                  !standardized.dropFirst(storagePrefix.count).contains("/"),
+            let isManagedTemporaryFile = standardized.hasPrefix(storagePrefix)
+                && !standardized.dropFirst(storagePrefix.count).contains("/")
+            let isRetainedSessionFile = retainedStore?.isRetainedPath(standardized, sessionID: agentSessionID) == true
+            guard isManagedTemporaryFile || isRetainedSessionFile,
                   seen.insert(standardized).inserted
             else { continue }
             paths.append(standardized)
@@ -479,7 +647,7 @@ extension AgentModeViewModel {
         let attachments = session.attachmentsPendingProviderConsumptionCleanup
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         guard shouldDeleteFiles else { return }
-        clearConsumedAttachmentFilesIfNeeded(attachments)
+        retainConsumedAttachmentFiles(attachments, session: session)
     }
 
     func finalizeAttachmentsForTurn(
@@ -515,7 +683,7 @@ extension AgentModeViewModel {
             let hadDeferred = !session.attachmentsPendingProviderConsumptionCleanup.isEmpty
             consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: true)
             if !hadDeferred {
-                clearConsumedAttachmentFilesIfNeeded(attachments)
+                retainConsumedAttachmentFiles(attachments, session: session)
             }
         case .keepFiles:
             consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: false)
