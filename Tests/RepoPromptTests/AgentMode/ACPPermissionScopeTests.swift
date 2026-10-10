@@ -408,6 +408,237 @@ private extension XCTestCase {
     }
 }
 
+@MainActor
+final class ACPPermissionIdentityTests: XCTestCase {
+    func testTypedWireIDsHaveIndependentApprovalIncarnations() async throws {
+        let fixture = try await makeFixture(scenario: "typed")
+        let watchdog = watchdog(for: fixture)
+        defer { watchdog.cancel() }
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        do {
+            let first = try await nextApproval(&events)
+            let second = try await nextApproval(&events)
+            XCTAssertNotEqual(first.id, second.id)
+            await fixture.controller.respondToPermissionRequest(id: first.requestID.displayValue, decision: .accept)
+            await fixture.controller.respondToPermissionRequest(id: second.requestID.displayValue, decision: .decline)
+            try await prompt.value
+            let responses = try fixture.responses()
+            XCTAssertEqual(responses.count, 2)
+            XCTAssertTrue(responses[0]["id"] is String)
+            XCTAssertEqual(responses[1]["id"] as? Int, 7)
+            XCTAssertEqual(outcome(responses[0]), "selected")
+            await fixture.controller.shutdown()
+        } catch {
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    func testDuplicateDuringAuthorizationInvalidatesPendingApproval() async throws {
+        let fixture = try await makeFixture(scenario: "duplicate")
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        let gate = AuthorizationGate()
+        let watchdog = watchdog(for: fixture, gate: gate)
+        defer { watchdog.cancel() }
+        do {
+            let first = try await nextApproval(&events)
+            let response = Task {
+                await fixture.controller.respondToPermissionRequestForOverseer(id: first.requestID.displayValue, decision: .accept) {
+                    await gate.hold()
+                }
+            }
+            await gate.waitForEntry()
+            try Data().write(to: fixture.trigger)
+            guard case let .stream(error) = await events.next() else {
+                gate.release()
+                XCTFail("Duplicate active wire IDs must fail the protocol, not publish another approval")
+                await fixture.controller.shutdown()
+                _ = await response.value
+                _ = try? await prompt.value
+                return
+            }
+            XCTAssertEqual(error.type, "error")
+            gate.release()
+            let result = await response.value
+            XCTAssertEqual(result, .notSubmitted)
+            do {
+                try await prompt.value
+                XCTFail("Duplicate active wire IDs must fail the active prompt")
+            } catch {}
+            await fixture.controller.shutdown()
+            XCTAssertTrue(try fixture.responses().isEmpty)
+        } catch {
+            gate.release()
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    func testCancellationAndWireIDReuseCannotConsumeAnEarlierApproval() async throws {
+        let fixture = try await makeFixture(scenario: "reuse")
+        var events = await fixture.controller.events.makeAsyncIterator()
+        let prompt = Task { try await fixture.controller.prompt(AgentMessage(userMessage: "Run"), request: fixture.request) }
+        let gate = AuthorizationGate()
+        let watchdog = watchdog(for: fixture, gate: gate)
+        defer { watchdog.cancel() }
+        do {
+            let first = try await nextApproval(&events)
+            let staleResponse = Task {
+                await fixture.controller.respondToPermissionRequestForOverseer(id: first.requestID.displayValue, decision: .accept) {
+                    await gate.hold()
+                }
+            }
+            await gate.waitForEntry()
+            await fixture.controller.cancelPrompt()
+            let replacement = try await nextApproval(&events)
+            XCTAssertNotEqual(first.id, replacement.id)
+            gate.release()
+            let staleResult = await staleResponse.value
+            XCTAssertEqual(staleResult, .notSubmitted)
+            let freshResult = await fixture.controller.respondToPermissionRequestForOverseer(
+                id: replacement.requestID.displayValue, decision: .accept, authorize: { true }
+            )
+            XCTAssertEqual(freshResult, .submitted)
+            try await prompt.value
+            let responses = try fixture.responses()
+            XCTAssertEqual(responses.map { outcome($0) }, ["cancelled", "selected"])
+            await fixture.controller.shutdown()
+        } catch {
+            gate.release()
+            await fixture.controller.shutdown()
+            throw error
+        }
+    }
+
+    private func watchdog(for fixture: Fixture, gate: AuthorizationGate? = nil) -> Task<Void, Never> {
+        Task {
+            do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            XCTFail("Permission identity fixture exceeded its bounded deadline")
+            gate?.release()
+            await fixture.controller.shutdown()
+        }
+    }
+
+    private func nextApproval(_ events: inout AsyncStream<NormalizedAgentRuntimeEvent>.Iterator) async throws -> AgentApprovalRequest {
+        while let event = await events.next() {
+            if case let .approvalRequested(approval) = event { return approval }
+        }
+        throw NSError(domain: "ACPPermissionIdentityTests", code: 1)
+    }
+
+    private func outcome(_ response: [String: Any]) -> String? {
+        ((response["result"] as? [String: Any])?["outcome"] as? [String: Any])?["outcome"] as? String
+    }
+
+    private struct Fixture {
+        let controller: ACPAgentSessionController
+        let request: ACPRunRequest
+        let trigger: URL
+        let record: URL
+
+        func responses() throws -> [[String: Any]] {
+            let text = try String(contentsOf: record, encoding: .utf8)
+            return try text.split(separator: "\n").map {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+            }
+        }
+    }
+
+    private func makeFixture(scenario: String) async throws -> Fixture {
+        let directory = try makeTestDirectory(name: "ACPPermissionIdentity")
+        let executable = directory.appendingPathComponent("scripted-acp")
+        let trigger = directory.appendingPathComponent("continue")
+        let record = directory.appendingPathComponent("responses.jsonl")
+        try Data().write(to: record)
+        let script = #"""
+        #!/usr/bin/env python3
+        import json, sys, os, time
+        scenario = "\#(scenario)"
+        def send(message):
+            print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+        def permission(wire_id, item):
+            send({"id": wire_id, "method": "session/request_permission", "params": {
+                "sessionId": "test-session", "toolCall": {"toolCallId": item, "title": item, "kind": "execute"},
+                "options": [{"optionId": "once", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]}})
+        prompt_id = None
+        response_count = 0
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "initialize":
+                send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+            elif method == "session/new":
+                send({"id": request["id"], "result": {"sessionId": "test-session"}})
+            elif method == "session/prompt":
+                prompt_id = request["id"]
+                permission("7", "first")
+                if scenario == "typed":
+                    permission(7, "second")
+                elif scenario == "duplicate":
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(r"\#(trigger.path)") and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    permission("7", "second")
+            elif "result" in request:
+                with open(r"\#(record.path)", "a", encoding="utf-8") as output:
+                    output.write(json.dumps(request) + "\n")
+                response_count += 1
+                if scenario == "reuse" and response_count == 1:
+                    permission("7", "second")
+                elif response_count == 2:
+                    send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let request = ACPRunRequest(
+            agentKind: .openCode, modelString: nil, workspacePath: directory.path,
+            resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(
+            provider: ScriptedScopeProvider(providerID: .openCode, executable: executable.path), runRequest: request,
+            allowsProviderProcessLaunchForTesting: true
+        )
+        do { _ = try await controller.bootstrap() } catch {
+            await controller.shutdown()
+            throw error
+        }
+        return Fixture(controller: controller, request: request, trigger: trigger, record: record)
+    }
+
+    @MainActor
+    private final class AuthorizationGate {
+        private var entered = false
+        private var released = false
+        private var entryWaiter: CheckedContinuation<Void, Never>?
+        private var continuation: CheckedContinuation<Bool, Never>?
+
+        func hold() async -> Bool {
+            if released { return true }
+            return await withCheckedContinuation {
+                continuation = $0
+                entered = true
+                entryWaiter?.resume()
+                entryWaiter = nil
+            }
+        }
+
+        func waitForEntry() async {
+            if entered || released { return }
+            await withCheckedContinuation { entryWaiter = $0 }
+        }
+
+        func release() {
+            released = true
+            entryWaiter?.resume()
+            entryWaiter = nil
+            continuation?.resume(returning: true)
+            continuation = nil
+        }
+    }
+}
+
 /// A local scripted transport; never resolves or launches a real provider.
 private struct ScriptedScopeProvider: ACPAgentProvider {
     let providerID: ACPProviderID
