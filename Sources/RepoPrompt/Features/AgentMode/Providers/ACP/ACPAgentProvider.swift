@@ -352,11 +352,6 @@ protocol ACPDirectSessionModelProvider: Sendable {
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
-    /// Returns an invocation identity only when the provider protocol attests it and the
-    /// server is the RepoPrompt instance provisioned by this adapter. Presentation fields
-    /// and model-controlled arguments must never implement this authority.
-    func attestedRepoPromptToolName(in toolCall: [String: Any]) -> String?
-
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration
     func makeSessionConfiguration(
@@ -393,10 +388,6 @@ protocol ACPAgentProvider: Sendable {
 }
 
 extension ACPAgentProvider {
-    func attestedRepoPromptToolName(in _: [String: Any]) -> String? {
-        nil
-    }
-
     func recognizesUnmatchedResponseID(_: String) -> Bool {
         false
     }

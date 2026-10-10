@@ -115,19 +115,6 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func attestedRepoPromptToolName(in toolCall: [String: Any]) -> String? {
-        guard config.includeRepoPromptMCPServer,
-              let name = (toolCall["_meta"] as? [String: Any])?["cognition.ai/toolName"] as? String,
-              name.hasPrefix("mcp__\(repoPromptMCPConfiguration.name)__")
-        else { return nil }
-        let toolName = String(name.dropFirst("mcp__\(repoPromptMCPConfiguration.name)__".count))
-        guard MCPIntegrationHelper.repoPromptToolNames.contains(toolName) else { return nil }
-        // Exact catalog membership also rejects ambiguous server/tool separators and empty names.
-        // Devin's structured invocation name identifies the server configured by this
-        // adapter, unlike titles, catalog labels, or arbitrary tool-call server fields.
-        return name
-    }
-
     func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID _: String

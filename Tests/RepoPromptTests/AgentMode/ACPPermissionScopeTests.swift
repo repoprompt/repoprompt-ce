@@ -127,6 +127,7 @@ final class ACPPermissionScopeTests: XCTestCase {
             #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","kind":"edit"}"#,
             #"{"toolCallId":"tool-1","title":"Shell","kind":"execute","rawInput":{"server":"RepoPromptCE","name":"git"}}"#,
             #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","_meta":{"cognition.ai/toolName":"mcp__OtherServer__git"}}"#,
+            #"{"toolCallId":"tool-1","title":"Calling git","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#,
             #"{"toolCallId":"tool-1","name":"mcp__RepoPromptCE__git","server":"RepoPromptCE","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__unknown_tool"}}"#,
             #"{"toolCallId":"tool-1","title":"git (RepoPromptCE MCP Server)","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__foreign__git"}}"#
         ]
@@ -136,38 +137,6 @@ final class ACPPermissionScopeTests: XCTestCase {
                 XCTAssertTrue(result.approvalRequested, "\(providerID): \(toolCall)")
                 XCTAssertEqual(result.outcome["optionId"], "reject_once")
             }
-        }
-    }
-
-    func testOnlyDevinAdapterAttestsStructuredInvocationIdentity() async throws {
-        let toolCall = #"{"toolCallId":"tool-1","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
-        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild] {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID)
-            XCTAssertTrue(result.approvalRequested, "\(providerID)")
-            XCTAssertEqual(result.outcome["optionId"], "reject_once")
-        }
-    }
-
-    func testDevinAttestationFollowsExactConfiguredServerName() {
-        let provider = DevinACPAgentProvider(
-            config: DevinAgentConfig(includeRepoPromptMCPServer: true),
-            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(name: "ConfiguredServer", command: "/usr/bin/true")
-        )
-        for name in ["mcp__RepoPromptCE__git", "mcp__ConfiguredServer__foreign__git", "mcp__ConfiguredServer__"] {
-            XCTAssertNil(provider.attestedRepoPromptToolName(in: ["_meta": ["cognition.ai/toolName": name]]))
-        }
-        let name = "mcp__ConfiguredServer__git"
-        XCTAssertEqual(provider.attestedRepoPromptToolName(in: ["_meta": ["cognition.ai/toolName": name]]), name)
-    }
-
-    func testStructuredDevinIdentityRequiresConfiguredRepoPromptServer() async throws {
-        let toolCall = #"{"toolCallId":"tool-1","title":"Calling git","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
-        for injected in [false, true] {
-            let result = try await autoApprovalOutcome(
-                toolCallJSON: toolCall, providerID: .devin, repoPromptInjected: injected
-            )
-            XCTAssertEqual(result.approvalRequested, !injected)
-            XCTAssertEqual(result.outcome["optionId"], injected ? "allow_once" : "reject_once")
         }
     }
 
@@ -181,23 +150,21 @@ final class ACPPermissionScopeTests: XCTestCase {
             ["optionId": "allow_persistent", "kind": "allow_once"],
             ["optionId": "enable-always-approve", "kind": "allow_once"]
         ]
-        // Exercise both identity-based approval and Cursor's explicit full-access path.
-        for providerID: ACPProviderID in [.devin, .cursor] {
-            for option in invalidOptions {
-                // Mixed fixtures use distinct wire IDs; the exact allow_once mislabel is
-                // covered alone rather than treating duplicate option IDs as valid consent.
-                let availabilityCases = option["optionId"] == "allow_once" ? [false] : [false, true]
-                for genuineOptionAvailable in availabilityCases {
-                    var options = [option]
-                    if genuineOptionAvailable { options.append(["optionId": "allow_once", "kind": "allow_once"]) }
-                    options.append(["optionId": "reject_once", "kind": "reject_once"])
-                    let result = try await autoApprovalOutcome(
-                        toolCallJSON: toolCall, providerID: providerID, options: options,
-                        repoPromptInjected: true, fullAccess: providerID == .cursor
-                    )
-                    XCTAssertEqual(result.approvalRequested, !genuineOptionAvailable, "\(providerID): \(option)")
-                    XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "allow_once" : "reject_once")
-                }
+        // Cursor's explicit user full-access setting is the remaining automatic path.
+        for option in invalidOptions {
+            // Mixed fixtures use distinct wire IDs; the exact allow_once mislabel is
+            // covered alone rather than treating duplicate option IDs as valid consent.
+            let availabilityCases = option["optionId"] == "allow_once" ? [false] : [false, true]
+            for genuineOptionAvailable in availabilityCases {
+                var options = [option]
+                if genuineOptionAvailable { options.append(["optionId": "allow_once", "kind": "allow_once"]) }
+                options.append(["optionId": "reject_once", "kind": "reject_once"])
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: toolCall, providerID: .cursor, options: options,
+                    fullAccess: true
+                )
+                XCTAssertEqual(result.approvalRequested, !genuineOptionAvailable, "\(option)")
+                XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "allow_once" : "reject_once")
             }
         }
     }
@@ -210,7 +177,6 @@ final class ACPPermissionScopeTests: XCTestCase {
             ["optionId": "allow_once", "kind": "allow_once", "name": "Allow"],
             ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
         ],
-        repoPromptInjected: Bool = true,
         fullAccess: Bool = false
     ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
@@ -257,7 +223,7 @@ final class ACPPermissionScopeTests: XCTestCase {
         )
         let controller = try ACPAgentSessionController(
             provider: ScriptedScopeProvider(
-                providerID: providerID, executable: executable.path, repoPromptInjected: repoPromptInjected
+                providerID: providerID, executable: executable.path
             ), runRequest: request,
             allowsProviderProcessLaunchForTesting: true
         )
@@ -408,15 +374,6 @@ private extension XCTestCase {
 private struct ScriptedScopeProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let executable: String
-    var repoPromptInjected = false
-
-    func attestedRepoPromptToolName(in toolCall: [String: Any]) -> String? {
-        guard providerID == .devin else { return nil }
-        return DevinACPAgentProvider(
-            config: DevinAgentConfig(includeRepoPromptMCPServer: repoPromptInjected)
-        ).attestedRepoPromptToolName(in: toolCall)
-    }
-
     func support(for _: ACPRunRequest) async -> ACPSupportResult {
         .supported
     }
