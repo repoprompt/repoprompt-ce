@@ -877,8 +877,9 @@
         }
 
         private func waitForPersistedCodexReplayRestore(tabID: UUID) async -> Bool {
-            // Large synthetic sessions (RP_AGENT_STRESS_RESTORED_TURNS) need longer to project and settle.
-            let timeout = min(300, 30 + Double(configuration.restoredTurnCount) * 0.1)
+            // Default restores keep the original 30 s budget; only explicitly large synthetic sessions
+            // (RP_AGENT_STRESS_RESTORED_TURNS) get longer to project and settle.
+            let timeout: TimeInterval = configuration.restoredTurnCountOverride.map { min(300, 30 + Double($0) * 0.1) } ?? 30
             let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
                 guard !Task.isCancelled else { return false }

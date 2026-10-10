@@ -209,11 +209,14 @@
         private(set) var isCollecting = false
         private var cachedSummary: AgentChatStressFrameIntervalRecorder.Summary?
         private var cachedSummaryAt: Date?
+        /// Lets the display-link probe pause while nothing is being collected.
+        var onCollectingChange: ((Bool) -> Void)?
 
         func setCollecting(_ collecting: Bool) {
             guard collecting != isCollecting else { return }
             isCollecting = collecting
             recorder.breakSequence()
+            onCollectingChange?(collecting)
         }
 
         func recordDisplayFrame(timestamp: CFTimeInterval) {
@@ -233,9 +236,9 @@
 
         func reset() {
             recorder.reset()
-            isCollecting = false
             cachedSummary = nil
             cachedSummaryAt = nil
+            setCollecting(false)
         }
     }
 
@@ -253,13 +256,23 @@
         }
     }
 
+    /// Display link stays paused unless the sampler is collecting, so the probe does not wake the
+    /// main thread every frame (or hold a ProMotion display at its maximum rate) while idle.
     final class AgentChatStressFrameProbeNSView: NSView {
-        var sampler: AgentChatStressFrameIntervalSampler
+        var sampler: AgentChatStressFrameIntervalSampler {
+            didSet {
+                guard sampler !== oldValue else { return }
+                oldValue.onCollectingChange = nil
+                observeSampler()
+            }
+        }
+
         private var displayLink: CADisplayLink?
 
         init(sampler: AgentChatStressFrameIntervalSampler) {
             self.sampler = sampler
             super.init(frame: .zero)
+            observeSampler()
         }
 
         @available(*, unavailable)
@@ -277,8 +290,16 @@
             displayLink = nil
             guard window != nil else { return }
             let link = displayLink(target: self, selector: #selector(handleDisplayLink(_:)))
+            link.isPaused = !sampler.isCollecting
             link.add(to: .main, forMode: .common)
             displayLink = link
+        }
+
+        private func observeSampler() {
+            sampler.onCollectingChange = { [weak self] collecting in
+                self?.displayLink?.isPaused = !collecting
+            }
+            displayLink?.isPaused = !sampler.isCollecting
         }
 
         @objc private func handleDisplayLink(_ link: CADisplayLink) {

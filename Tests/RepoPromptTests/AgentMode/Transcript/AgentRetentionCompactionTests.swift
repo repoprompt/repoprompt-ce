@@ -3,9 +3,6 @@
     @_spi(TestSupport) @testable import RepoPromptApp
     import XCTest
 
-    @_spi(TestSupport) @testable import RepoPromptApp
-    import XCTest
-
     @MainActor
     final class AgentRetentionCompactionTests: XCTestCase {
         func testFullReconciliationPreservesPayloadsAndMeasuresRetentionScan() {
@@ -211,10 +208,8 @@
     /// Opt-in through the existing scale-test flag; see
     /// docs/testing.md#agent-transcript-pipeline-timing-diagnostics for the exact command.
     /// When enabled it measures 50, 150, 300 and 1000 turns. There is deliberately no wall-clock
-    /// threshold yet: import
-    /// and compaction are currently super-linear in turn count, so any bound would only restate
-    /// today's numbers. Transcript PR 3 (removing display compaction) is expected to make the
-    /// pipeline near-linear and will add a real acceptance threshold.
+    /// assertion until an acceptance threshold is added: import and compaction are currently
+    /// super-linear in turn count, so any bound today would only restate the current numbers.
     ///
     /// Self-contained: depends only on pre-existing transcript APIs, so it can be copied onto
     /// another revision for a controlled before/after comparison.

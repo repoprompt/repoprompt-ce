@@ -87,8 +87,8 @@ enum TranscriptScrollAnchorJump: Equatable {
 /// returned `TranscriptScrollAnchorAdjustment`.
 ///
 /// Not wired into the UI yet: the SwiftUI transcript container cannot report per-row frames
-/// cheaply. The NSTableView-backed transcript container (follow-up PR) drives it through
-/// `TranscriptScrollDriver`. `Codable` so the reading position can later be persisted per session.
+/// cheaply. It is intended to be driven by a container that can (for example an
+/// `NSTableView`-backed transcript) through `TranscriptScrollDriver`. `Codable` so the reading position can later be persisted per session.
 struct TranscriptScrollAnchorModel: Codable, Equatable {
     enum Mode: Codable, Equatable {
         case following
@@ -231,7 +231,9 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
     }
 
     /// The anchor row vanished. Re-anchor to the nearest surviving row of the same turn, keeping
-    /// that row where it was on screen; if the turn has no surviving rows, go to the bottom.
+    /// that row where it was on screen. Without such a row (unknown turn, or the whole turn is
+    /// gone) the reader is never thrown to the bottom: the clip origin stays put (clamped to the
+    /// new content) and the model keeps reading from the row now at the viewport top.
     private mutating func fallbackAdjustment(
         lostAnchorBlockID: String,
         oldLayout: TranscriptScrollAnchorLayout,
@@ -241,8 +243,7 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
         guard let lostRow = oldLayout.row(for: lostAnchorBlockID),
               let turnID = lostRow.turnID
         else {
-            mode = .following
-            return adjustment(to: newLayout.maxClipOriginY, from: clipOriginY)
+            return reanchorInPlace(newLayout: newLayout, clipOriginY: clipOriginY)
         }
         let survivingTurnRows = oldLayout.rows.filter { row in
             row.turnID == turnID && row.blockID != lostAnchorBlockID && newLayout.row(for: row.blockID) != nil
@@ -252,12 +253,26 @@ struct TranscriptScrollAnchorModel: Codable, Equatable {
         }),
             let nearestNewRow = newLayout.row(for: nearestOldRow.blockID)
         else {
-            mode = .following
-            return adjustment(to: newLayout.maxClipOriginY, from: clipOriginY)
+            return reanchorInPlace(newLayout: newLayout, clipOriginY: clipOriginY)
         }
         let offset = nearestOldRow.minY - clipOriginY
         mode = .reading(anchorBlockID: nearestNewRow.blockID, offsetFromViewportTop: offset)
         return adjustment(to: newLayout.clampedClipOriginY(nearestNewRow.minY - offset), from: clipOriginY)
+    }
+
+    /// Keeps the viewport where it is (clamped to the new content) and reads from the row now at
+    /// the viewport top. Follows only when the new layout has no rows to anchor to.
+    private mutating func reanchorInPlace(
+        newLayout: TranscriptScrollAnchorLayout,
+        clipOriginY: CGFloat
+    ) -> TranscriptScrollAnchorAdjustment {
+        let target = newLayout.clampedClipOriginY(clipOriginY)
+        if let topRow = newLayout.topVisibleRow(clipOriginY: target) {
+            mode = .reading(anchorBlockID: topRow.blockID, offsetFromViewportTop: topRow.minY - target)
+        } else {
+            mode = .following
+        }
+        return adjustment(to: target, from: clipOriginY)
     }
 
     private func adjustment(to target: CGFloat, from clipOriginY: CGFloat) -> TranscriptScrollAnchorAdjustment {

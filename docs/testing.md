@@ -259,10 +259,10 @@ the typed matrix records. Ordinary test runs skip the diagnostic unless opted in
 
 ## Agent transcript pipeline timing diagnostics
 
-This is an opt-in diagnostic, not a CI timing gate. It has no acceptance threshold
-yet: import and compaction are currently super-linear in turn count, so any bound
-would only restate today's numbers. Transcript PR 3 (display-compaction removal)
-adds a real acceptance threshold.
+This is an opt-in diagnostic, not a CI timing gate. Treat its output as evidence
+only, not a pass/fail result, until an acceptance threshold is added: import and
+compaction are currently super-linear in turn count, so any bound today would only
+restate the current numbers.
 
 `AgentTranscriptProjectionTimingDiagnostics` builds a synthetic Agent Mode session
 of 50, 150, 300 and 1000 turns (per turn: user request, assistant opener, four tool

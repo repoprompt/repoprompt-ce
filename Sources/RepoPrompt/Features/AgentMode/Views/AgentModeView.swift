@@ -1404,6 +1404,8 @@ struct AgentModeChatDetailView: View {
             else {
                 return
             }
+            // Legitimate bottom scrolls (bottom button, send while detached) call pinToLiveBottom()
+            // before scrolling, so any bottom scroll that runs while still detached is a snap-back.
             stressTelemetryState.snapBackWhileReadingCount += 1
             noteStressHarness(
                 "Snap-back while reading: reason=\(reason) distance=\(Int(scrollMetrics.distanceToBottom)) count=\(stressTelemetryState.snapBackWhileReadingCount)"

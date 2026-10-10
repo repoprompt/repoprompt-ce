@@ -534,7 +534,6 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
             following.didAppend(from: old, to: appended, clipOriginY: old.maxClipOriginY),
             .setClipOrigin(appended.maxClipOriginY)
         )
-        XCTAssertEqual(appended.maxClipOriginY, 1900)
     }
 
     func testStreamingGrowthDoesNotMoveReaderButPinsFollower() {
@@ -556,7 +555,7 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         var follower = TranscriptScrollAnchorModel()
         XCTAssertEqual(
             follower.streamingDidGrow(from: old, to: grown, clipOriginY: old.maxClipOriginY),
-            .setClipOrigin(2040)
+            .setClipOrigin(grown.maxClipOriginY)
         )
     }
 
@@ -572,6 +571,34 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         // b4 now spans 1200..<1500; a quarter into it (75pt) keeps the same reading position.
         XCTAssertEqual(adjustment, .setClipOrigin(1275))
         XCTAssertEqual(model.mode, .reading(anchorBlockID: "b4", offsetFromViewportTop: -75))
+    }
+
+    func testWidthChangeKeepsNonNegativeOffsetsUnscaled() {
+        let old = layout(baseSpecs)
+        let narrow = layout(baseSpecs.map { ($0.0, $0.1, $0.2 * 1.5) }) // b4 moves to 1200..<1500
+
+        // Anchor row top exactly at the viewport top: stays exactly at the top.
+        var atTop = TranscriptScrollAnchorModel(mode: .reading(anchorBlockID: "b4", offsetFromViewportTop: 0))
+        XCTAssertEqual(atTop.widthDidChange(from: old, to: narrow, clipOriginY: 800), .setClipOrigin(1200))
+        XCTAssertEqual(atTop.mode, .reading(anchorBlockID: "b4", offsetFromViewportTop: 0))
+
+        // Anchor row top below the viewport top: the gap above it is kept in points, not scaled.
+        var belowTop = TranscriptScrollAnchorModel(mode: .reading(anchorBlockID: "b4", offsetFromViewportTop: 30))
+        XCTAssertEqual(belowTop.widthDidChange(from: old, to: narrow, clipOriginY: 770), .setClipOrigin(1170))
+        XCTAssertEqual(belowTop.mode, .reading(anchorBlockID: "b4", offsetFromViewportTop: 30))
+    }
+
+    func testAnchorTargetBeyondShrunkContentIsClampedAndKeepsReading() {
+        let old = layout(baseSpecs)
+        var model = TranscriptScrollAnchorModel()
+        model.userDidScroll(clipOriginY: 1500, layout: old) // inside b7, offset -100
+
+        // Rows below the anchor disappear, so the anchor's preferred position is past the new end.
+        let shrunk = layout(Array(baseSpecs.prefix(8)))
+        let adjustment = model.layoutDidChange(from: old, to: shrunk, clipOriginY: 1500)
+
+        XCTAssertEqual(adjustment, .setClipOrigin(shrunk.maxClipOriginY))
+        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b7", offsetFromViewportTop: -100))
     }
 
     func testFoldAndUnfoldAboveAnchorRoundTripsToTheOriginalClipOrigin() {
@@ -607,16 +634,37 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         XCTAssertEqual(adjustment, .none)
     }
 
-    func testRemovedAnchorWithNoSurvivingTurnRowsFallsBackToBottom() {
+    func testRemovedTurnKeepsViewportAndReadsFromNewTopVisibleRow() {
         let old = layout(baseSpecs)
+        let withoutTurnA = layout(baseSpecs.filter { $0.1 != turnA }) // b5...b9 now at 0..<1000
+
+        // Clip origin still valid in the new content: nothing moves, reading continues from b6.
+        var inRange = TranscriptScrollAnchorModel()
+        inRange.userDidScroll(clipOriginY: 250, layout: old) // inside b1 (turn A)
+        XCTAssertEqual(inRange.layoutDidChange(from: old, to: withoutTurnA, clipOriginY: 250), .none)
+        XCTAssertEqual(inRange.mode, .reading(anchorBlockID: "b6", offsetFromViewportTop: -50))
+
+        // Clip origin past the new end: clamped, never thrown to following.
+        let withoutTurnB = layout(baseSpecs.filter { $0.1 != turnB }) // b0...b4 at 0..<1000
+        var pastEnd = TranscriptScrollAnchorModel()
+        pastEnd.userDidScroll(clipOriginY: 1500, layout: old) // inside b7 (turn B)
+        XCTAssertEqual(
+            pastEnd.layoutDidChange(from: old, to: withoutTurnB, clipOriginY: 1500),
+            .setClipOrigin(withoutTurnB.maxClipOriginY)
+        )
+        XCTAssertEqual(pastEnd.mode, .reading(anchorBlockID: "b3", offsetFromViewportTop: 0))
+    }
+
+    func testRemovedAnchorWithoutTurnKeepsViewportInsteadOfUsingSiblings() {
+        var specs = baseSpecs
+        specs[3].1 = nil // b3 (600..<800) has no turn
+        let old = layout(specs)
         var model = TranscriptScrollAnchorModel()
-        model.userDidScroll(clipOriginY: 250, layout: old) // inside b1 (turn A)
+        model.userDidScroll(clipOriginY: 650, layout: old)
 
-        let new = layout(baseSpecs.filter { $0.1 != turnA })
-        let adjustment = model.layoutDidChange(from: old, to: new, clipOriginY: 250)
-
-        XCTAssertTrue(model.isFollowing)
-        XCTAssertEqual(adjustment, .setClipOrigin(new.maxClipOriginY))
+        let new = layout(specs.filter { $0.0 != "b3" }) // b4 slides up to 600..<800
+        XCTAssertEqual(model.layoutDidChange(from: old, to: new, clipOriginY: 650), .none)
+        XCTAssertEqual(model.mode, .reading(anchorBlockID: "b4", offsetFromViewportTop: -50))
     }
 
     // MARK: - Explicit jumps
@@ -632,29 +680,34 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         XCTAssertEqual(model.mode, .reading(anchorBlockID: "b5", offsetFromViewportTop: 0))
 
         // A block whose top cannot reach the viewport top lands at the bottom and follows.
-        XCTAssertEqual(model.jump(to: .block("b9"), layout: base, clipOriginY: 1000), .setClipOrigin(1600))
+        XCTAssertEqual(model.jump(to: .block("b9"), layout: base, clipOriginY: 1000), .setClipOrigin(base.maxClipOriginY))
         XCTAssertTrue(model.isFollowing)
 
-        XCTAssertEqual(model.jump(to: .block("missing"), layout: base, clipOriginY: 1600), .none)
+        XCTAssertEqual(model.jump(to: .block("missing"), layout: base, clipOriginY: base.maxClipOriginY), .none)
 
         model.userDidScroll(clipOriginY: 200, layout: base)
-        XCTAssertEqual(model.jump(to: .bottom, layout: base, clipOriginY: 200), .setClipOrigin(1600))
+        XCTAssertEqual(model.jump(to: .bottom, layout: base, clipOriginY: 200), .setClipOrigin(base.maxClipOriginY))
         XCTAssertTrue(model.isFollowing)
     }
 
     // MARK: - Persistence
 
-    func testCodableRoundTripPreservesModeAndThreshold() throws {
-        let reading = TranscriptScrollAnchorModel(
-            mode: .reading(anchorBlockID: "turn-3:conclusion", offsetFromViewportTop: -42.5),
-            followThreshold: 32
-        )
-        let following = TranscriptScrollAnchorModel()
+    /// Persisted reading positions must keep decoding after refactors: renaming a mode case, an
+    /// associated-value label or a stored property would silently drop saved positions.
+    func testPersistedJSONShapeIsStable() throws {
+        let readingJSON = #"{"followThreshold":32,"mode":{"reading":{"anchorBlockID":"turn-3:conclusion","offsetFromViewportTop":-42.5}}}"#
+        let followingJSON = #"{"followThreshold":24,"mode":{"following":{}}}"#
 
-        for model in [reading, following] {
-            let data = try JSONEncoder().encode(model)
-            XCTAssertEqual(try JSONDecoder().decode(TranscriptScrollAnchorModel.self, from: data), model)
-        }
+        let reading = try JSONDecoder().decode(TranscriptScrollAnchorModel.self, from: Data(readingJSON.utf8))
+        XCTAssertEqual(reading.mode, .reading(anchorBlockID: "turn-3:conclusion", offsetFromViewportTop: -42.5))
+        XCTAssertEqual(reading.followThreshold, 32)
+        let following = try JSONDecoder().decode(TranscriptScrollAnchorModel.self, from: Data(followingJSON.utf8))
+        XCTAssertTrue(following.isFollowing)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        XCTAssertEqual(try String(decoding: encoder.encode(reading), as: UTF8.self), readingJSON)
+        XCTAssertEqual(try String(decoding: encoder.encode(following), as: UTF8.self), followingJSON)
     }
 }
 
