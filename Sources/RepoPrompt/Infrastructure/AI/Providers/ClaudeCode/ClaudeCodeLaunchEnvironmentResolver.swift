@@ -35,8 +35,8 @@ enum ClaudeCodeGLMIntegration {
         ClaudeCodeCompatibleBackendIntegration.setConfigured(isConfigured, for: .glmZAI, defaults: defaults)
     }
 
-    static func environment(apiKey: String) -> [String: String] {
-        ClaudeCodeCompatibleBackendIntegration.environment(
+    static func environment(apiKey: String) throws -> [String: String] {
+        try ClaudeCodeCompatibleBackendIntegration.environment(
             config: ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI),
             apiKey: apiKey
         )
