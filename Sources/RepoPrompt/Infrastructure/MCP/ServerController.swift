@@ -38,24 +38,10 @@ final actor ServerController: ObservableObject {
     private var pendingConnectionID: String?
     weak var mcpService: MCPService?
 
-    /// ──────────  NEW: persistent allow-list of client IDs  ──────────
+    /// Legacy display-name records are retained for inspection/removal only.
+    /// Initialize metadata is not a verified principal and never grants admission.
     private static let alwaysAllowedKey = "mcp.alwaysAllowedClients"
-    /// Built-in always-allowed clients (do not require manual approval).
-    ///
-    /// RepoPrompt CLI client names are intentionally excluded: those names are
-    /// spoofable via MCP initialize metadata and must be verified by bundled
-    /// executable path before auto-approval.
-    private static let defaultAlwaysAllowedClients: Set<String> = [
-        "claude-code",
-        "codex-mcp-client",
-        "gemini-cli-mcp-client",
-        "opencode",
-        "cursor",
-        "cursor-mcp-client",
-        "claude-ai"
-    ]
-    /// In-memory copy (always mutate on MainActor)
-    private var alwaysAllowedClients: Set<String> = ServerController.loadSanitizedAlwaysAllowedClients()
+    private var alwaysAllowedClients: Set<String> = ServerController.loadLegacyClientNames()
 
     /// –––––  Private implementation helpers  –––––
     private enum DesiredTransportState: Equatable {
@@ -84,7 +70,7 @@ final actor ServerController: ObservableObject {
     private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
 
     // –––––  Injected callbacks for approval flow  –––––
-    nonisolated(unsafe) var onApprovalRequest: ((String) async -> Void)?
+    nonisolated(unsafe) var onApprovalRequest: ((String, UInt64) async -> Void)?
     nonisolated(unsafe) var onApprovalResolved: ((Bool) -> Void)?
 
     /// Activity token used to disable App Nap while the server runs.
@@ -92,7 +78,7 @@ final actor ServerController: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
 
     /// Set the approval callback
-    func setApprovalCallback(_ callback: @escaping (String) async -> Void) {
+    func setApprovalCallback(_ callback: @escaping (String, UInt64) async -> Void) {
         onApprovalRequest = callback
     }
 
@@ -169,7 +155,9 @@ final actor ServerController: ObservableObject {
                 // executable verification. Do not consult the generic allow-list for these
                 // spoofable client names.
                 let isRepoCLI = Self.isRepoPromptCLIClientName(client.name)
-                if isRepoCLI, await isBundledRepoPromptCLIConnection(connectionID: connectionID) {
+                let verifiedBundledCLI = isRepoCLI
+                    ? await isBundledRepoPromptCLIConnection(connectionID: connectionID) : false
+                if Self.canAutomaticallyApprove(clientName: client.name, bundledCLI: verifiedBundledCLI) {
                     serverControllerDebugLog("Auto-approving '\(client.name)' (RepoPrompt bundled CLI verified)")
                     if let service = await mcpService {
                         await service.clientConnectedSuccessfully(name: client.name)
@@ -179,15 +167,8 @@ final actor ServerController: ObservableObject {
                     log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
                 }
 
-                // Per-client auto-approve when whitelisted. RepoPrompt CLI names are handled
-                // above and intentionally never bypass executable verification through this list.
-                if !isRepoCLI, await isClientAlwaysAllowed(clientID: client.name) {
-                    serverControllerDebugLog("Auto-approving '\(client.name)' (in allow-list)")
-                    if let service = await mcpService {
-                        await service.clientConnectedSuccessfully(name: client.name)
-                    }
-                    return true
-                }
+                // All other peers require a connection-specific decision. Built-in and
+                // legacy saved names are display metadata, not executable principals.
 
                 // Otherwise request approval through the callback
                 let approved = await withCheckedContinuation { c in
@@ -239,44 +220,19 @@ final actor ServerController: ObservableObject {
 
     // MARK: – Allow-list helpers –
 
-    /// Checks if a client is in the always-allowed list.
-    ///
-    /// Supports both exact matches and prefix matches. Prefix matching allows entries
-    /// like "gemini-cli" to match "gemini-cli-mcp-client" or versioned variants.
-    ///
-    /// NOTE: Prefix matching broadens what gets auto-approved. Consider making this
-    /// opt-in per entry if stricter control is needed in the future.
-    private func isClientAlwaysAllowed(clientID: String) -> Bool {
-        if isDefaultAlwaysAllowed(clientID) {
-            return true
-        }
-        if alwaysAllowedClients.contains(where: { MCPClientIdentity.matches($0, clientID) }) {
-            return true
-        }
-        return false
+    /// Compatibility surface for the dashboard: no display name is inherently trusted.
+    static func isBuiltInAlwaysAllowedClient(_: String) -> Bool {
+        false
     }
 
-    private func isDefaultAlwaysAllowed(_ clientID: String) -> Bool {
-        Self.isBuiltInAlwaysAllowedClient(clientID)
+    static func loadLegacyClientNames(defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: alwaysAllowedKey) ?? [])
     }
 
-    /// Whether the client name (or a same-family variant) is one of the built-in
-    /// always-trusted defaults, which cannot be removed from the allow-list.
-    static func isBuiltInAlwaysAllowedClient(_ clientID: String) -> Bool {
-        defaultAlwaysAllowedClients.contains(where: { MCPClientIdentity.matches($0, clientID) })
-    }
-
-    private static func loadSanitizedAlwaysAllowedClients() -> Set<String> {
-        let saved = UserDefaults.standard.stringArray(forKey: alwaysAllowedKey) ?? []
-        let sanitizedSaved = sanitizedAlwaysAllowedClients(Set(saved))
-        if Set(saved) != sanitizedSaved {
-            UserDefaults.standard.set(Array(sanitizedSaved), forKey: alwaysAllowedKey)
-        }
-        return sanitizedSaved.union(defaultAlwaysAllowedClients)
-    }
-
-    private static func sanitizedAlwaysAllowedClients(_ clients: Set<String>) -> Set<String> {
-        clients.filter { !isRepoPromptCLIClientName($0) }
+    /// Only the existing kernel-observed bundled-executable check may authorize a
+    /// named client automatically. Saved names deliberately do not enter this policy.
+    static func canAutomaticallyApprove(clientName: String, bundledCLI verified: Bool) -> Bool {
+        isRepoPromptCLIClientName(clientName) && verified
     }
 
     private static func isRepoPromptCLIClientName(_ value: String) -> Bool {
@@ -284,16 +240,12 @@ final actor ServerController: ObservableObject {
     }
 
     #if DEBUG
-        static var test_defaultAlwaysAllowedClients: Set<String> {
-            defaultAlwaysAllowedClients
-        }
-
-        static func test_isRepoPromptCLIClientName(_ value: String) -> Bool {
-            isRepoPromptCLIClientName(value)
-        }
-
-        static func test_sanitizedAlwaysAllowedClients(_ clients: Set<String>) -> Set<String> {
-            sanitizedAlwaysAllowedClients(clients)
+        func test_requestApproval(
+            clientID: String,
+            approve: @escaping () -> Void,
+            deny: @escaping () -> Void
+        ) async {
+            await requestApproval(clientID: clientID, approve: approve, deny: deny)
         }
     #endif
 
@@ -320,16 +272,6 @@ final actor ServerController: ObservableObject {
         return String(cString: buffer)
     }
 
-    private func addAlwaysAllowed(clientID: String) {
-        guard !Self.isRepoPromptCLIClientName(clientID) else { return }
-        guard !alwaysAllowedClients.contains(where: { MCPClientIdentity.matches($0, clientID) }) else { return }
-        alwaysAllowedClients.insert(clientID)
-        UserDefaults.standard.set(
-            Array(alwaysAllowedClients),
-            forKey: Self.alwaysAllowedKey
-        )
-    }
-
     // MARK: - Dashboard & Auto-Approve Management
 
     /// Returns the list of always-allowed client IDs
@@ -346,15 +288,10 @@ final actor ServerController: ObservableObject {
 
     /// Add or remove a client from the persistent allow-list
     func setAlwaysAllowed(clientID: String, allowed: Bool) async {
-        if !allowed, isDefaultAlwaysAllowed(clientID) {
-            return
-        }
-        if allowed {
-            addAlwaysAllowed(clientID: clientID)
-        } else {
-            alwaysAllowedClients = alwaysAllowedClients.filter {
-                !MCPClientIdentity.matches($0, clientID) || isDefaultAlwaysAllowed($0)
-            }
+        // Name-only standing approvals are no longer supported. Keep old records
+        // unchanged unless the user explicitly removes a displayed record.
+        if !allowed {
+            alwaysAllowedClients.remove(clientID)
             UserDefaults.standard.set(
                 Array(alwaysAllowedClients),
                 forKey: Self.alwaysAllowedKey
@@ -622,7 +559,7 @@ final actor ServerController: ObservableObject {
             )
         }
 
-        await onApprovalRequest?(clientID)
+        await onApprovalRequest?(clientID, expectedGeneration)
     }
 
     /// Starts the next queued approval request, if any.
@@ -671,8 +608,9 @@ final actor ServerController: ObservableObject {
     private var currentApprovalCallbacks: (() -> Void, () -> Void)?
 
     /// Called by MCPService when the UI has made a decision.
-    func resolvePendingApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        guard let (approve, deny) = currentApprovalCallbacks else { return }
+    func resolvePendingApproval(allow: Bool, generation: UInt64) async {
+        guard generation == approvalGeneration,
+              let (approve, deny) = currentApprovalCallbacks else { return }
         let resolvedClientID = pendingConnectionID
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
@@ -687,22 +625,14 @@ final actor ServerController: ObservableObject {
         }
 
         if allow {
-            // If user selected "always allow", add to the persistent list
-            if alwaysAllow, let clientID = resolvedClientID {
-                addAlwaysAllowed(clientID: clientID)
-            }
+            // Approval applies only to this connection, never to its display name.
             approve()
         } else {
             deny()
         }
 
-        // Process any queued approvals for the same client.
-        // Coalescing same-client decisions prevents continuation leaks on reconnect storms.
+        // A queued peer with the same display name must receive its own prompt.
         if let clientID = resolvedClientID {
-            while let idx = pendingApprovals.firstIndex(where: { $0.0 == clientID }) {
-                let (_, a, d) = pendingApprovals.remove(at: idx)
-                allow ? a() : d()
-            }
             activeApprovalDialogs.remove(clientID)
         }
 
