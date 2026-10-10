@@ -1304,6 +1304,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var authorityIncompleteRestoreClassificationTask: Task<AuthorityRestoreClassificationResult, Never>?
     /// Sequence equality is valid, but a superseded local classification may not publish.
     private var authorityRestoreClassificationAttemptID: UUID?
+    private var authorityRestoreClassificationCoverage: (protectedIDs: Set<UUID>, pendingScopedAttemptID: UUID?) = ([], nil)
     private var lastAuthorityRecoveryClassificationSequence: UInt64 = 0
 
     @Published private(set) var activeWorkspaceID: UUID? = nil {
@@ -4929,17 +4930,25 @@ class WorkspaceManagerViewModel: ObservableObject {
                         return nil
                     }
                 }
-                await refreshAuthorityIncompleteRestoreClassification(
-                    workspaces: loaded,
-                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.document.fileURL)
-                    }),
-                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.revisions)
-                    }),
-                    publicationSequence: snapshot.publicationSequence,
-                    unavailableWorkspaceIDs: unavailableWorkspaceIDs
+                let fileURLs = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0.document.fileURL)
+                })
+                let revisions = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0.revisions)
+                })
+                let classification = await refreshAuthorityIncompleteRestoreClassification(
+                    workspaces: loaded, fileURLsByWorkspaceID: fileURLs, revisionsByWorkspaceID: revisions,
+                    publicationSequence: snapshot.publicationSequence, unavailableWorkspaceIDs: unavailableWorkspaceIDs
                 )
+                if case .superseded = classification {
+                    // One bounded attempt reuses this inventory. Refusal or another supersession
+                    // intentionally returns the existing inventory for liveness, without waiting or spinning.
+                    await refreshAuthorityIncompleteRestoreClassification(
+                        workspaces: loaded, fileURLsByWorkspaceID: fileURLs, revisionsByWorkspaceID: revisions,
+                        publicationSequence: snapshot.publicationSequence, unavailableWorkspaceIDs: unavailableWorkspaceIDs,
+                        preservingCurrentCoverage: true
+                    )
+                }
                 return loaded
             }
         }
@@ -7942,6 +7951,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         authorityIncompleteRestoreClassificationTask?.cancel()
         authorityIncompleteRestoreClassificationTask = nil
         authorityRestoreClassificationAttemptID = nil
+        authorityRestoreClassificationCoverage.pendingScopedAttemptID = nil
     }
 
     private func beginAuthorityRestoreClassification(publicationSequence: UInt64) -> UUID? {
@@ -7974,19 +7984,26 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURLsByWorkspaceID: [UUID: URL],
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
         publicationSequence: UInt64,
-        unavailableWorkspaceIDs: Set<UUID> = []
+        unavailableWorkspaceIDs: Set<UUID> = [],
+        preservingCurrentCoverage: Bool = false
     ) -> Task<AuthorityRestoreClassificationResult, Never> {
+        // Retry must not revoke unfinished scoped work or overwrite newer member evidence.
+        guard !preservingCurrentCoverage || authorityRestoreClassificationCoverage.pendingScopedAttemptID == nil else {
+            return Task { .superseded }
+        }
+        let protectedIDs = unavailableWorkspaceIDs.union(preservingCurrentCoverage ? authorityRestoreClassificationCoverage.protectedIDs : [])
         guard let attemptID = beginAuthorityRestoreClassification(publicationSequence: publicationSequence) else {
             return Task { .superseded }
         }
+        authorityRestoreClassificationCoverage.protectedIDs = protectedIDs
         let candidates = authorityIncompleteRestoreCandidates(
-            workspaces: workspaces.filter { !unavailableWorkspaceIDs.contains($0.id) },
+            workspaces: workspaces.filter { !protectedIDs.contains($0.id) },
             fileURLsByWorkspaceID: fileURLsByWorkspaceID,
             revisionsByWorkspaceID: revisionsByWorkspaceID
         )
         let candidateIDs = Set(candidates.map(\.workspaceID))
         // Unknown is not saved-phase evidence. Genuine absence/non-candidacy still clears guards.
-        authorityIncompleteConsolidatedRestoreIDs.formIntersection(candidateIDs.union(unavailableWorkspaceIDs))
+        authorityIncompleteConsolidatedRestoreIDs.formIntersection(candidateIDs.union(protectedIDs))
         publishPendingConsolidatedRestoreIDs()
         guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else {
             return Task { .superseded }
@@ -8007,7 +8024,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
             // Consult live guards, never a pre-await capture. The attempt owns both membership and results.
             authorityIncompleteConsolidatedRestoreIDs = incompleteIDs.union(
-                authorityIncompleteConsolidatedRestoreIDs.intersection(unavailableWorkspaceIDs)
+                authorityIncompleteConsolidatedRestoreIDs.intersection(protectedIDs)
             )
             publishPendingConsolidatedRestoreIDs()
             guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
@@ -8024,7 +8041,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURLsByWorkspaceID: [UUID: URL],
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
         publicationSequence: UInt64,
-        unavailableWorkspaceIDs: Set<UUID>
+        unavailableWorkspaceIDs: Set<UUID>,
+        preservingCurrentCoverage: Bool = false
     ) async -> AuthorityRestoreClassificationResult {
         // Cleanup/inventory supersede, then join, the same owner used by accepted projections.
         // A scoped attempt can revoke coverage of unrelated candidates: task termination alone
@@ -8032,7 +8050,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let task = scheduleAuthorityIncompleteRestoreClassification(
             workspaces: workspaces, fileURLsByWorkspaceID: fileURLsByWorkspaceID,
             revisionsByWorkspaceID: revisionsByWorkspaceID, publicationSequence: publicationSequence,
-            unavailableWorkspaceIDs: unavailableWorkspaceIDs
+            unavailableWorkspaceIDs: unavailableWorkspaceIDs, preservingCurrentCoverage: preservingCurrentCoverage
         )
         let result = await withTaskCancellationHandler {
             await task.value
@@ -8058,6 +8076,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Even unknown scoped evidence supersedes an older bulk classifier. It cannot authorize
         // a saved-phase read, but must revoke that older attempt before preserving the live guard.
         guard let attemptID = beginAuthorityRestoreClassification(publicationSequence: snapshot.publicationSequence) else { return .stale }
+        authorityRestoreClassificationCoverage.protectedIDs.insert(workspaceID)
+        authorityRestoreClassificationCoverage.pendingScopedAttemptID = attemptID
+        defer {
+            if authorityRestoreClassificationCoverage.pendingScopedAttemptID == attemptID {
+                authorityRestoreClassificationCoverage.pendingScopedAttemptID = nil
+            }
+        }
         guard let authoritative = snapshot.workspace else { return .unowned }
         guard let working = try? decodeDomainWorkspaceCatalogRecord(authoritative) else { return .unavailable }
 
