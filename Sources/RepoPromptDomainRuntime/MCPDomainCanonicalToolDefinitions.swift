@@ -1114,6 +1114,9 @@ package enum MCPDomainCanonicalToolDefinitions {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         definitions.insert(agentSelfDefinition, at: insertion)
+        if let linkIndex = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSessionLink }) {
+            definitions.insert(MCPDomainSessionAdminToolDefinition.definition, at: linkIndex + 1)
+        }
         guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }

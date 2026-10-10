@@ -2857,9 +2857,14 @@ actor ServerNetworkManager {
         let hasAnyActiveLink: Bool
         /// Kept separate for observer prompt/catalog readiness and outbound operations.
         let hasActiveOutboundLink: Bool
+        /// `session_admin` reachability: a live delegation scope, or (for `request_scope` only) an
+        /// orchestrator/overseer run. Confers no scope authority; the service re-authorizes per call.
+        var isSessionAdminEligible = false
 
         var additionalGrants: Set<String> {
-            hasAnyActiveLink ? [MCPWindowToolName.agentSessionLink] : []
+            var grants: Set<String> = hasAnyActiveLink ? [MCPWindowToolName.agentSessionLink] : []
+            if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
+            return grants
         }
     }
 
@@ -2909,11 +2914,22 @@ actor ServerNetworkManager {
         ), revalidatedRouteToken == routeToken else {
             return nil
         }
-        return LiveSessionLinkGrantSnapshot(
+        // Unlike link grants, a delegation scope is granted to a *session* (it is durable and outlives
+        // any one window incarnation), so session identity is the correct key here. The route itself
+        // is still the exact, revalidated run-scoped endpoint, never a caller-supplied value.
+        let callerSessionID = routeToken.observerEndpoint.sessionID
+        let holdsLiveScope = await MainActor.run {
+            AgentSessionLinkRuntimeBridge.shared.delegationScopes.hasLiveScope(grantedTo: callerSessionID)
+        }
+        var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink
         )
+        snapshot.isSessionAdminEligible = holdsLiveScope
+            || runState.allowsAgentExternalControlTools
+            || hasActiveOutboundLink
+        return snapshot
     }
 
     private func completeRunCatalogObservation(
@@ -3215,7 +3231,10 @@ actor ServerNetworkManager {
     /// at session UUID scope because one UUID can own several live runs, but every candidate connection
     /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
     /// incarnation therefore receives no catalog grant from the incarnation the user linked.
-    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+    ///
+    /// - Parameter forceRelist: relist even when every link fact is unchanged. Delegation-scope
+    ///   changes alter `session_admin` eligibility without touching any link fact.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID, forceRelist: Bool = false) async {
         let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
             guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
             return (runID, state.windowID, tabID)
@@ -3240,7 +3259,8 @@ actor ServerNetworkManager {
             let routeToken = snapshot?.routeToken
             let hasAnyActiveLink = snapshot?.hasAnyActiveLink
             let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
-            if observation?.routeToken == routeToken,
+            if !forceRelist,
+               observation?.routeToken == routeToken,
                observation?.hasAgentSessionLink == hasAnyActiveLink,
                observation?.hasAnyActiveLink == hasAnyActiveLink,
                observation?.hasActiveOutboundLink == hasActiveOutboundLink
@@ -12960,9 +12980,9 @@ actor ServerNetworkManager {
                 let effectivePolicy = await effectivePolicyState(for: connectionID)
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                // must never decide execution. Scoped to the only tool whose grant is live link
-                // state, so no other tool call pays for the lookup or its actor hop.
-                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                // must never decide execution. Scoped to the tools whose grant is live authority
+                // state (`isLiveGrantTool`), so no other tool call pays for the lookup or its hop.
+                let liveSessionLinkGrant = Self.isLiveGrantTool(toolName)
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 let liveAdditional = effectivePolicy.additional.union(
@@ -12981,7 +13001,7 @@ actor ServerNetworkManager {
                         policy: domainPolicy
                     )
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
-                    where toolName == MCPWindowToolName.agentSessionLink
+                    where Self.isLiveGrantTool(toolName)
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -13057,7 +13077,7 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                let liveSessionLinkGrant = Self.isLiveGrantTool(toolName)
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
@@ -13076,6 +13096,9 @@ actor ServerNetworkManager {
             } catch MCPDomainCallPolicyDenial.restricted {
                 log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
                 return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+            } catch MCPDomainCallPolicyDenial.roleUnavailable where toolName == MCPWindowToolName.sessionAdmin {
+                // Same uniform text as an ungranted call, so the role gate reveals nothing more.
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is not available for this session.")
             } catch MCPDomainCallPolicyDenial.roleUnavailable {
                 return Self.toolErrorResult(
                     rawJSON: capturedRawJSON,

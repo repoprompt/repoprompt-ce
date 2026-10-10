@@ -24,6 +24,72 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Delegation scopes (amendment)
+
+A **delegation scope** is durable, user-granted authority for one overseer session to act on many
+sessions without per-item prompts (the agent-only `session_admin` tool). It sits **beside** links,
+not in place of them: links remain the per-pair transport for cursors, passive notices, and
+Auto-wake; a scope is the authority to act across its members.
+
+| Invariant | With scopes |
+| --- | --- |
+| Grants are created only by explicit user action | Still true for scopes: a scope is created only by the user's approval card (`request_scope`) or by attenuation of a scope the user granted. Links may additionally be created **inside** a user-granted scope by its grantee. |
+| Management never chains (A→B→C gives A nothing over C) | Still true for links. Authority over C comes only from C being a member of A's scope, never from chaining links. |
+| Restricted grants are never upgraded | Still true. A scope neither mutates nor upgrades a link's capabilities; a link created under a scope carries capabilities within the scope. |
+| Four disjoint owners | Unchanged. The **scope authority** (`DomainDelegationScopeAuthority`, held by `DelegationScopeRuntime`) is an authority *input*, not a fifth owner of link state, notices, claims, or wake policy. Any future descendant-prompt notice enters only through the passive reducer; any wake-policy change lives only in the wake coordinator. No transport-level dampers. |
+| Snooze suppresses admission, never delivery | Unchanged. Scope approval cards and batch confirmation cards never pass through the oversight transport. |
+
+Rules that hold the scope design together:
+
+- **Membership is projected, never argued.** `DelegationMembershipProjector` computes membership
+  proofs from persisted provenance (`parentSessionID`, `createdByOverseerSessionID`, and the
+  future `organizationalParentID`) and presents them to the authority, the same way link leases are
+  presented. Tool arguments only name targets.
+- **One authority check.** `DomainDelegationScopeAuthority.authorize` runs, in order: scope live
+  (grantee, active, unexpired, generation), capability held (target-independent, so checked first
+  and it cannot probe membership), membership proofs valid for the scope *and every ancestor* (an
+  attenuated scope never reaches beyond its parents), guardrails (whole-subtree counts across the
+  scope chain), batch confirmation (an approved card authorizes one application). Each target lease is then
+  re-bound by `DomainAgentSessionOperationAuthorizer` to the exact operation, caller, and target
+  under the `.delegationScope(scopeID, generation, capability)` basis.
+- **Uniform denials.** Only `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`,
+  `scope_revoked`, `confirmation_required`, `confirmation_mismatch` (with the approved item IDs),
+  and the per-item `requires_control` are caller-visible, and each only after the caller is known
+  to be the scope's grantee. Unknown scopes, non-grantees, non-members, and unresolved callers all
+  receive the existing uniform "not available / not found" text.
+- **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
+  idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
+  the same key conflict instead of riding the approval, and an approval applies once.
+- **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
+  granted to a session UUID, so every live incarnation of that session (for example the same session
+  open in two windows) holds it. The caller is still resolved only from exact server-owned run
+  routing, and the grant card is bound to the requesting tab *and* session (a session change
+  cancels it).
+- **The user can always revoke.** The oversight popover lists every active delegation with a Revoke
+  control; revocation is immediate (generation bump), cascades, and is durable through a tombstone.
+  Deleting a session revokes every scope granted to or rooted at it.
+- **`.allSessions` scopes** hold only `observe`, `organize`, and `restructure`. They can `retire`
+  (stop + release + archive) idle or finished members, which needs `organize` + `restructure`;
+  stopping a running (or unknown-state) member additionally needs `control`, so such members are
+  reported per item as `requires_control` and never stopped. The requirement depends on the target's
+  app-presented run state and is never granted implicitly.
+- **`destructive` is a reserved flag.** No operation requires it. `retire` and `worktree_release`
+  (unbind + mark stale, needs `worktree`) always raise a batch card regardless of the threshold.
+- **Human-only stays human-only.** Deleting sessions, removing or pruning worktrees, keys and
+  providers, permission modes, MCP approvals and server control, settings writes, app quit/update,
+  and handoff instructions are not capabilities. `agent_manage.cleanup_sessions` refuses the scope
+  basis outright.
+- **Revocation is a generation bump.** Revoking, releasing, or expiring a scope cascades to every
+  attenuated descendant and stops authority immediately. Sessions keep running and links stay until
+  released.
+- **External MCP is untouched.** `session_admin` is policy-gated (`agent_session_admin`), granted by
+  no static profile, recomputed live per `tools/list` and `tools/call` only for an exactly routed
+  Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or
+  admitted for administrative principals, and fails closed in direct-headless.
+
+Scope intent persistence is described in
+[`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
+
 ## Same-process window reopen
 
 Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime

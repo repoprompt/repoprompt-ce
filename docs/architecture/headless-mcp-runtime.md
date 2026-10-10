@@ -12,7 +12,7 @@ repoprompt-mcp --backend auto
 
 ## Ownership
 
-`RepoPromptDomainRuntime` owns the protocol-neutral MCP host and canonical 28-tool catalog. It owns connection generations, invocation admission, policy/resource lanes, progress, watchdogs, settlement, terminal fencing, response-delivery accounting, and bounded drain. The app's `ServerNetworkManager`, `ServerController`, and `MCPService` are transport, presentation, proxy, reconnect, replay, listener, and approval adapters.
+`RepoPromptDomainRuntime` owns the protocol-neutral MCP host and canonical 30-tool catalog. It owns connection generations, invocation admission, policy/resource lanes, progress, watchdogs, settlement, terminal fencing, response-delivery accounting, and bounded drain. The app's `ServerNetworkManager`, `ServerController`, and `MCPService` are transport, presentation, proxy, reconnect, replay, listener, and approval adapters.
 
 App transport lifetime is process-owned from launch through termination. Opening or closing the last window does not start or stop MCP. Window identity is accepted only as an admission selector: public `window_id` binding captures that window's current logical tab as an explicit authoritative context, while hidden `_windowID` captures the same context for one call. Later active-tab changes do not redirect either admitted call or persistent binding. There is no active-tab execution fallback.
 

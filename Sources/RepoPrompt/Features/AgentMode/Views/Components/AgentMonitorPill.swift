@@ -191,6 +191,7 @@ struct AgentMonitorPopoverView: View {
                         Divider()
                     }
                     addSection
+                    DelegationActiveScopesSection(runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes)
                     if props.isOverseer {
                         Divider()
                         // Scoped to the controls so the Add field is not re-rendered every minute.

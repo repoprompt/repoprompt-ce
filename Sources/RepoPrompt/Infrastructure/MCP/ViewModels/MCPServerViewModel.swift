@@ -1395,6 +1395,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             return try await agentSelfToolService.execute(args: args)
         },
+        executeSessionAdmin: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
+            return try await sessionAdminToolService(requireTargetWindow: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                return try requireTargetWindow()
+            })
+            .execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -2153,6 +2161,7 @@ final class MCPServerViewModel: ObservableObject {
             ),
             MCPAskUserToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
+            MCPSessionAdminToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
             MCPAgentSessionControlToolProvider(
                 runtime: windowToolRuntime,
                 execution: windowToolExecutionCapabilities

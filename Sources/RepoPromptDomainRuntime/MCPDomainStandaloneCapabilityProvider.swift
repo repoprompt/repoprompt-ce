@@ -320,6 +320,11 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.agentRun, backends.agent.run),
             binding(MCPWindowToolName.agentManage, backends.agent.manage),
             binding(MCPWindowToolName.agentSessionLink, backends.agent.monitorSessionLink),
+            // Delegation scopes are app-owned Agent-session authority. Direct-headless has no Agent
+            // Mode run, no scope store, and no user to approve a card, so it fails closed.
+            binding(MCPWindowToolName.sessionAdmin) { _ in
+                throw MCPError.invalidParams("session_admin is not available for this session.")
+            },
             // Direct-headless has no app-owned Agent Mode run or registration-time self origin.
             // Keep the canonical catalog complete while failing closed even if a caller names it.
             binding(MCPWindowToolName.agentSelf) { _ in
