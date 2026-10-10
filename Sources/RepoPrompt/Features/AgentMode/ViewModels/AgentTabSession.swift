@@ -900,6 +900,9 @@ final class AgentTabSession: ObservableObject {
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
+    /// `AgentSessions/attachments` of the workspace this turn was sent from, captured when its
+    /// images are reserved so a mid-turn workspace switch cannot retain them elsewhere.
+    var attachmentRetentionRoot: URL?
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?

@@ -123,6 +123,11 @@ final class ImageAwareTextView: NSTextView {
         return true
     }
 
+    /// Ends any reported image-drag hover (the view is being torn down mid-drag).
+    func endImageDragHover() {
+        setImageDragHover(false)
+    }
+
     private func setImageDragHover(_ isActive: Bool) {
         guard isReportingImageDragHover != isActive else { return }
         isReportingImageDragHover = isActive
@@ -458,6 +463,7 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.delegate = nil
         textView.imagePasteHandler = nil
+        textView.endImageDragHover()
         textView.imageDragHoverHandler = nil
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()

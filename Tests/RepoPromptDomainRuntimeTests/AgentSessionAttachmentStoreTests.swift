@@ -196,6 +196,53 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
     }
 
+    func testRepairMissingPathsLocatesKeptCopyByAttachmentID() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let sessionID = UUID()
+        let folder = store.sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let lost = AgentImageAttachment(
+            source: .localFile(path: temporaryRoot.appendingPathComponent("gone.png").path),
+            title: "lost.png"
+        )
+        let kept = folder.appendingPathComponent("\(lost.id.uuidString).jpg")
+        try Data("kept".utf8).write(to: kept)
+        let present = temporaryRoot.appendingPathComponent("present.png")
+        try Data("present".utf8).write(to: present)
+        let stillThere = AgentImageAttachment(source: .localFile(path: present.path))
+        let noCopy = AgentImageAttachment(source: .localFile(path: temporaryRoot.appendingPathComponent("never.png").path))
+
+        let repaired = store.repairMissingPaths([lost, stillThere, noCopy], sessionID: sessionID)
+
+        XCTAssertEqual(Set(repaired.keys), [lost.id])
+        XCTAssertEqual(repaired[lost.id]?.source, .localFile(path: kept.path))
+        XCTAssertEqual(repaired[lost.id]?.title, "lost.png")
+        XCTAssertEqual(repaired[lost.id]?.createdAt, lost.createdAt)
+        XCTAssertTrue(store.repairMissingPaths([lost], sessionID: UUID()).isEmpty, "Another session's folder is never searched")
+    }
+
+    func testRetainedPathRejectsSymlinksInAndOutOfTheSessionFolder() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let sessionID = UUID()
+        let folder = store.sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let real = folder.appendingPathComponent("real.png")
+        try Data("real".utf8).write(to: real)
+        let outside = baseURL.appendingPathComponent("secret.png")
+        try Data("secret".utf8).write(to: outside)
+        let linkInFolder = folder.appendingPathComponent("link.png")
+        try FileManager.default.createSymbolicLink(at: linkInFolder, withDestinationURL: outside)
+        let otherFolder = store.sessionFolderURL(sessionID: UUID())
+        try FileManager.default.createDirectory(at: otherFolder, withIntermediateDirectories: true)
+        let linkToRetained = otherFolder.appendingPathComponent("alias.png")
+        try FileManager.default.createSymbolicLink(at: linkToRetained, withDestinationURL: real)
+
+        XCTAssertTrue(store.isRetainedPath(real.path, sessionID: sessionID))
+        XCTAssertFalse(store.isRetainedPath(linkInFolder.path, sessionID: sessionID))
+        XCTAssertFalse(store.isRetainedPath(linkToRetained.path, sessionID: sessionID))
+        XCTAssertFalse(store.isRetainedPath(folder.appendingPathComponent("../\(sessionID.uuidString)x/a.png").path, sessionID: sessionID))
+    }
+
     // MARK: - Helpers
 
     private func setModificationDate(_ date: Date, of url: URL) throws {

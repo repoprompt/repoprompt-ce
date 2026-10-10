@@ -444,13 +444,14 @@ extension AgentModeViewModel {
 
     // MARK: - Session Attachment Retention
 
-    /// `<workspace>/AgentSessions/attachments`, or `nil` when sessions are not persisted.
-    func sessionAttachmentsRootURL() -> URL? {
+    /// `<workspace>/AgentSessions/attachments` for `workspace` (the active workspace when `nil`), or
+    /// `nil` when sessions are not persisted.
+    func sessionAttachmentsRootURL(for workspace: WorkspaceModel? = nil) -> URL? {
         if let sessionAttachmentsRootOverride {
             return sessionAttachmentsRootOverride()?.standardizedFileURL
         }
         guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence,
-              let workspace = workspaceManager?.activeWorkspace
+              let workspace = workspace ?? workspaceManager?.activeWorkspace
         else { return nil }
         let agentSessionsFolder = WorkspaceSessionSidecarMigration
             .workspaceDirectory(for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL())
@@ -461,15 +462,23 @@ extension AgentModeViewModel {
     /// Finished turns keep their images for the life of the session: the temporary copies are
     /// moved into `AgentSessions/attachments/<sessionID>/` off the main thread, then the user row is
     /// rewritten to the kept copy. Providers already consumed the temporary path, so their
-    /// behaviour is unchanged. Without a persisted session the copies are deleted as before.
+    /// behaviour is unchanged.
+    ///
+    /// The destination is the root captured when the turn reserved its images, never the window's
+    /// current workspace. A session that is not persisted, has no captured root, or is no longer the
+    /// live owner of its tab (for example torn down by a workspace switch) deletes the copies as
+    /// before. A session that stops being live mid-move keeps its files; the user row's dead
+    /// temporary path is repaired from the kept copy the next time the session hydrates.
     private func retainConsumedAttachmentFiles(_ attachments: [AgentImageAttachment], session: TabSession) {
         guard clearConsumedAttachmentsAfterProviderConsumption else { return }
         guard !attachments.isEmpty else { return }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else { return }
         guard let sessionID = session.activeAgentSessionID,
-              let root = sessionAttachmentsRootURL()
+              let root = session.attachmentRetentionRoot,
+              sessions[session.tabID] === session
         else {
             attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+            invalidateAttachmentPreviews(paths: attachments.compactMap(AgentImageAttachmentAvailabilityResolver.path(for:)))
             return
         }
         let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
@@ -482,8 +491,40 @@ extension AgentModeViewModel {
             let result = await move.value
             guard let self else { return }
             attachmentRetentionTasks[token] = nil
+            let movedPaths = attachments
+                .filter { result.retained[$0.id] != nil }
+                .compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))
+            invalidateAttachmentPreviews(paths: movedPaths + result.evictedPaths)
             guard let session else { return }
             applyRetainedAttachments(result.retained, to: session, sessionID: sessionID)
+        }
+    }
+
+    /// Paths whose file just moved or was evicted render as missing instead of a stale cached image.
+    private func invalidateAttachmentPreviews(paths: [String]) {
+        guard !paths.isEmpty else { return }
+        AgentAttachmentThumbnailCache.shared.invalidate(paths: paths)
+    }
+
+    /// Repairs user rows whose image path no longer exists by locating the session's kept copy
+    /// (`attachments/<sessionID>/<attachmentID>.*`) in the current workspace's storage. Covers a
+    /// rewrite lost because the session stopped being live mid-move, and storage that moved.
+    func repairRetainedAttachmentPathsAfterHydration(_ session: TabSession, sessionID: UUID) {
+        guard clearConsumedAttachmentsAfterProviderConsumption,
+              let root = sessionAttachmentsRootURL()
+        else { return }
+        let attachments = session.items.filter { $0.kind == .user }.flatMap(\.attachments)
+        guard attachments.contains(where: { if case .localFile = $0.source { true } else { false } }) else { return }
+        let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
+        let token = UUID()
+        attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
+            let repaired = await Task.detached(priority: .utility) {
+                store.repairMissingPaths(attachments, sessionID: sessionID)
+            }.value
+            guard let self else { return }
+            attachmentRetentionTasks[token] = nil
+            guard let session, !repaired.isEmpty else { return }
+            applyRetainedAttachments(repaired, to: session, sessionID: sessionID)
         }
     }
 
@@ -513,18 +554,22 @@ extension AgentModeViewModel {
 
     /// Low-priority, once-per-process sweep of a workspace's attachment storage: session folders
     /// whose transcript is gone, and temporary copies older than seven days not pending anywhere.
-    func scheduleSessionAttachmentSweepIfNeeded(delayNanoseconds: UInt64 = 20_000_000_000) {
+    /// Called from the live workspace-switch path once the activation owns the session index.
+    func scheduleSessionAttachmentSweepIfNeeded(for workspace: WorkspaceModel?) {
         guard clearConsumedAttachmentsAfterProviderConsumption,
-              let root = sessionAttachmentsRootURL(),
+              let root = sessionAttachmentsRootURL(for: workspace),
               Self.sweptSessionAttachmentRoots.insert(root.path).inserted
         else { return }
         let agentSessionsFolder = root.deletingLastPathComponent()
         let temporaryRoot = attachmentWorkspaceDirectoryURL().map { AgentAttachmentStore.managedStorageRootURL(for: $0) }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: delayNanoseconds)
-            guard let self else { return }
+        let delayNanoseconds = sessionAttachmentSweepDelayNanoseconds
+        sessionAttachmentSweepTask = Task { @MainActor [weak self] in
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            guard let self else { return nil }
             let protection = liveAttachmentSweepProtection()
-            _ = await Task.detached(priority: .background) {
+            return await Task.detached(priority: .background) {
                 AgentSessionAttachmentStore.sweep(
                     agentSessionsFolder: agentSessionsFolder,
                     temporaryRoot: temporaryRoot,
@@ -615,6 +660,7 @@ extension AgentModeViewModel {
         }
         let reservationID = UUID()
         session.attachmentTurnState = .reserved(reservationID: reservationID, attachments: attachments)
+        session.attachmentRetentionRoot = sessionAttachmentsRootURL()
         return reservationID
     }
 
@@ -663,6 +709,7 @@ extension AgentModeViewModel {
             } else {
                 consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: false)
             }
+            session.attachmentRetentionRoot = nil
             return
         case let .reserved(storedID, storedAttachments),
              let .consumed(storedID, storedAttachments):
@@ -690,6 +737,7 @@ extension AgentModeViewModel {
         }
 
         session.attachmentTurnState = .idle
+        session.attachmentRetentionRoot = nil
         session.isDirty = true
         scheduleSave(for: session.tabID)
     }

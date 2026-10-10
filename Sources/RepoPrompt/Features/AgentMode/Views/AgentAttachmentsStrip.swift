@@ -509,6 +509,9 @@ final class AgentAttachmentThumbnailCache {
 
     private let thumbnails = NSCache<NSString, AgentAttachmentDecodedImage>()
     private let previews = NSCache<NSString, AgentAttachmentDecodedImage>()
+    /// Cache keys stored per path, so a moved or evicted file can drop every rendition.
+    private let keysLock = NSLock()
+    private var keysByPath: [String: Set<NSString>] = [:]
     private let loadQueue = DispatchQueue(label: "com.repoprompt.agent-attachment-thumbnails", qos: .userInitiated)
 
     private init() {
@@ -522,6 +525,28 @@ final class AgentAttachmentThumbnailCache {
 
     func cachedImage(for key: AgentAttachmentImageKey) -> AgentAttachmentDecodedImage? {
         store(for: key).object(forKey: key.cacheKey)
+    }
+
+    /// Marks `paths` missing and drops their cached renditions (a file was moved out of the
+    /// temporary store or evicted by the session cap).
+    func invalidate(paths: [String]) {
+        for path in paths {
+            let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+            availability.record(.missing, forPath: standardized)
+            keysLock.lock()
+            let keys = keysByPath.removeValue(forKey: standardized) ?? []
+            keysLock.unlock()
+            for key in keys {
+                thumbnails.removeObject(forKey: key)
+                previews.removeObject(forKey: key)
+            }
+        }
+    }
+
+    private func noteCachedKey(_ key: AgentAttachmentImageKey) {
+        keysLock.lock()
+        keysByPath[key.path, default: []].insert(key.cacheKey)
+        keysLock.unlock()
     }
 
     func loadImage(
@@ -539,13 +564,14 @@ final class AgentAttachmentThumbnailCache {
 
         let availability = availability
         let cache = store(for: key)
-        loadQueue.async { [weak token] in
+        loadQueue.async { [weak self, weak token] in
             guard let token, !token.isCancelled else { return }
             let result = Self.decode(key)
             switch result {
             case let .image(decoded):
                 availability.record(.available, forPath: key.path)
                 cache.setObject(decoded, forKey: key.cacheKey)
+                self?.noteCachedKey(key)
             case .missing:
                 availability.record(.missing, forPath: key.path)
             case .undecodable:

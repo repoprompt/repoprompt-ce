@@ -71,11 +71,48 @@ package struct AgentSessionAttachmentStore: Sendable {
         rootURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
     }
 
-    /// Whether `path` names a file directly inside this session's folder.
+    /// Whether `path` names a regular file directly inside this session's folder. Symlinks are
+    /// rejected and both sides are compared after resolving symlinks, so a link planted in (or
+    /// pointing out of) the folder never widens what the path authorizes.
     package func isRetainedPath(_ path: String, sessionID: UUID) -> Bool {
-        let prefix = sessionFolderURL(sessionID: sessionID).path + "/"
-        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
-        return standardized.hasPrefix(prefix) && !standardized.dropFirst(prefix.count).contains("/")
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        if (try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+            return false
+        }
+        let prefix = sessionFolderURL(sessionID: sessionID).resolvingSymlinksInPath().path + "/"
+        let resolved = candidate.resolvingSymlinksInPath().path
+        return resolved.hasPrefix(prefix) && !resolved.dropFirst(prefix.count).contains("/")
+    }
+
+    /// The kept copy of `attachmentID` in this session's folder, whatever its extension.
+    package func locateRetainedFile(attachmentID: UUID, sessionID: UUID) -> URL? {
+        let folder = sessionFolderURL(sessionID: sessionID)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return nil }
+        let stem = attachmentID.uuidString
+        guard let name = names.sorted().first(where: { ($0 as NSString).deletingPathExtension == stem }) else {
+            return nil
+        }
+        return folder.appendingPathComponent(name)
+    }
+
+    /// Rewrites local attachments whose file no longer exists to their kept copy in this session's
+    /// folder, when one exists. Attachments that still resolve, or have no kept copy, are omitted.
+    package func repairMissingPaths(_ attachments: [AgentImageAttachment], sessionID: UUID) -> [UUID: AgentImageAttachment] {
+        var repaired: [UUID: AgentImageAttachment] = [:]
+        for attachment in attachments where repaired[attachment.id] == nil {
+            guard case let .localFile(path) = attachment.source,
+                  !FileManager.default.fileExists(atPath: path),
+                  let kept = locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID),
+                  kept.path != URL(fileURLWithPath: path).standardizedFileURL.path
+            else { continue }
+            repaired[attachment.id] = AgentImageAttachment(
+                id: attachment.id,
+                source: .localFile(path: kept.path),
+                title: attachment.title,
+                createdAt: attachment.createdAt
+            )
+        }
+        return repaired
     }
 
     /// Moves (falling back to copy) each temporary attachment into the session folder.
@@ -153,7 +190,13 @@ package struct AgentSessionAttachmentStore: Sendable {
         }
         var evicted: [String] = []
         for file in files where total > limits.maxSessionFolderBytes {
-            guard (try? FileManager.default.removeItem(at: file.url)) != nil else { continue }
+            do {
+                try FileManager.default.removeItem(at: file.url)
+            } catch {
+                // A concurrent move for this session may already have evicted it; it no longer
+                // counts toward the cap, so treat it as removed rather than evicting a newer file.
+                guard !FileManager.default.fileExists(atPath: file.url.path) else { continue }
+            }
             total -= file.size
             evicted.append(file.url.path)
         }

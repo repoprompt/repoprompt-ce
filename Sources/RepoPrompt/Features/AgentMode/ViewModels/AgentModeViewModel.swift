@@ -743,6 +743,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var attachmentRetentionTasks: [UUID: Task<Void, Never>] = [:]
     /// Attachment roots already swept this process (`AgentModeViewModel+DraftsAttachments`).
     static var sweptSessionAttachmentRoots: Set<String> = []
+    /// Delay before the startup sweep runs, so it never competes with workspace restore.
+    var sessionAttachmentSweepDelayNanoseconds: UInt64 = 20_000_000_000
+    /// The most recently scheduled sweep; its value is `nil` when the view model went away first.
+    var sessionAttachmentSweepTask: Task<AgentSessionAttachmentStore.SweepResult?, Never>?
     let workspacePathProvider: () -> String?
     /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
     /// to the shared polling service; the DEBUG test init can inject a scripted provider so
@@ -6064,6 +6068,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isColdLoad: true,
             builtPresentation: payload.builtPresentation
         )
+        repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
@@ -14696,7 +14701,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
         let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
         await handleWorkspaceSwitch(workspace, owner: owner)
-        scheduleSessionAttachmentSweepIfNeeded()
     }
 
     private func handleWorkspaceSwitch(
@@ -14716,6 +14720,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // activation is still the owner) or leaves it to the successor that superseded it; a stale
         // owner can never settle a level it does not own.
         let discoveryEpoch = beginAgentSessionLinkDiscoveryEpoch(workspaceID: workspace?.id)
+        // Synchronous: only schedules the delayed, low-priority sweep for this workspace's storage.
+        scheduleSessionAttachmentSweepIfNeeded(for: workspace)
         #if DEBUG
             let workspaceSwitchStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count

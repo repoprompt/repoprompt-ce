@@ -28,6 +28,9 @@ final class AgentImageDropController: ObservableObject {
     func paneDragEntered(typeIdentifiers: [String], fileURLProviders: [NSItemProvider], currentTabID: UUID?) {
         let classification = AgentImageDropClassifier.classify(typeIdentifiers: typeIdentifiers, fileURLs: nil)
         let generation = tracker.begin(tabID: currentTabID, classification: classification)
+        // AppKit exits the text view before the pane is entered; clear a hover a torn-down or
+        // missed text-view exit left behind.
+        setTextViewImageDragActive(false)
         publishHighlight()
         guard classification == .undetermined, !fileURLProviders.isEmpty else { return }
         probeFileURLs(fileURLProviders, generation: generation)
@@ -38,6 +41,9 @@ final class AgentImageDropController: ObservableObject {
         publishHighlight()
     }
 
+    /// Leaves the text-view hover alone: SwiftUI may deliver this exit after AppKit has already
+    /// entered the text view, and clearing it here would unlight a live hover. Stuck hovers are
+    /// cleared on the next pane entry, on drop, and when the text view is dismantled.
     func paneDragExited() {
         tracker.exit()
         publishHighlight()
