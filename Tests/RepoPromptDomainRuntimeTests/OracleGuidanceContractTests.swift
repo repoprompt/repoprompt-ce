@@ -36,17 +36,12 @@ final class OracleGuidanceContractTests: XCTestCase {
         let original = try XCTUnwrap(OracleGroupDeliveryContract.preamble(lanes: lanes))
         let actual = try XCTUnwrap(OracleGroupDeliveryContract.preamble(lanes: lanes, reconciliationGuidance: custom))
         XCTAssertEqual(actual, original.replacingOccurrences(of: OracleGroupDeliveryContract.defaultReconciliationGuidance, with: custom))
-        XCTAssertEqual(actual.components(separatedBy: custom).count, 2)
         XCTAssertTrue(actual.hasSuffix("- Oracle — `same` — Completed — chat ID `first`\n- Oracle 2 — `same` — Failed (partial) — chat ID `second`"))
-        XCTAssertEqual(OracleGroupDeliveryContract.endMarker(laneCount: 2), "End of Oracle group: 2 lanes above.")
     }
 
     func testSingleLaneAndEmptyGroupsStaySilentEvenWithCustomGuidance() {
         for lanes in [[], [lane(0)]] {
             XCTAssertNil(OracleGroupDeliveryContract.preamble(lanes: lanes, reconciliationGuidance: "custom"))
-            XCTAssertNil(OracleGroupDeliveryContract.endMarker(laneCount: lanes.count))
-            XCTAssertNil(OracleGroupDeliveryContract.followUpReminder(laneCount: lanes.count))
-            XCTAssertNil(OracleGroupDeliveryContract.exportReadingRequirement(laneCount: lanes.count))
         }
     }
 

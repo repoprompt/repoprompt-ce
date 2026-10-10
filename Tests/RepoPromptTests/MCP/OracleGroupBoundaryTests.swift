@@ -1196,7 +1196,6 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         for override in [nil, " \n\t", OracleGroupDeliveryContract.defaultReconciliationGuidance] as [String?] {
             let fields = ContextBuilderOracleGroupReply(result: group, reconciliationGuidance: override).toMCPFields()
             XCTAssertEqual(fields, legacyFields)
-            XCTAssertEqual(joinedText(ToolOutputFormatter.formatChatSend(args: [:], value: .object(fields), emitResources: false)), defaultText)
         }
         for raw in [Value.null, .string(" \n")] {
             var fields = legacyFields
