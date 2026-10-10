@@ -727,8 +727,8 @@ final class DevinPermissionLevelTests: XCTestCase {
                 providerFactory: { _ in
                     DevinACPAgentProvider(config: DevinAgentConfig(
                         commandName: executable.path,
-                        includeRepoPromptMCPServer: false
-                    ))
+                        includeRepoPromptMCPServer: true
+                    ), repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"))
                 }
             )
             let shouldApprove = ["git", "git-input-update", "manage_selection", "corroborated"].contains(scenario)
@@ -799,7 +799,8 @@ final class DevinPermissionLevelTests: XCTestCase {
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let provider = DevinACPAgentProvider(
-            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: true),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
         let controller = try ACPAgentSessionController(

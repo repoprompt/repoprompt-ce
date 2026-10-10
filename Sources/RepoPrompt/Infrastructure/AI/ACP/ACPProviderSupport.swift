@@ -656,7 +656,7 @@ enum ACPPermissionOptionPolicy {
                   normalizedOptionValue(option.kind) == "allow_once",
                   isAutoSelectable(optionID: id, for: providerID)
             else { return false }
-            return !id.contains("always") && !id.contains("session") && !id.contains("persist")
+            return !id.contains("always") && !id.contains("session") && !id.contains("persist") && !id.contains("global")
         }?.optionID
     }
 

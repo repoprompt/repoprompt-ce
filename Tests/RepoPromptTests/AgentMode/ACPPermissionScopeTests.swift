@@ -117,97 +117,88 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
-    /// Issue #1243: model-controlled `rawInput` arguments and host-rendered titles must not
-    /// grant RepoPrompt provenance at the ACP permission boundary.
-    func testRepoPromptAutoApprovalIgnoresArgumentAndTitleProvenance() async throws {
-        let manualCases: [(String, String)] = [
-            ("rawInput server/name", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "./untrusted-script", "server": "RepoPromptCE", "name": "git"}}"#),
-            ("rawInput server only", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "./untrusted-script", "server_name": "RepoPromptCE"}}"#),
-            ("rawInput qualified name", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "x", "tool_name": "mcp__RepoPromptCE__git"}}"#),
-            ("file-path title", #"{"toolCallId": "tool-1", "title": "git (RepoPromptCE MCP Server)", "kind": "edit", "rawInput": {"filePath": "git (RepoPromptCE MCP Server)"}}"#),
-            ("server label title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE: git", "kind": "execute"}"#),
-            ("foreign server", #"{"toolCallId": "tool-1", "title": "git", "kind": "other", "server": "OtherServer"}"#),
-            ("filename-derived prefixed title", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__git", "kind": "edit", "rawInput": {"filePath": "mcp__RepoPromptCE__git"}}"#),
-            ("command-derived prefixed title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE_read_file", "kind": "execute", "rawInput": {"command": "RepoPromptCE_read_file"}}"#),
-            ("prefixed nested name on read", #"{"toolCallId": "tool-1", "title": "notes.txt", "name": "mcp__RepoPromptCE__read_file", "kind": "read"}"#)
+    func testUnattestedRepoPromptLabelsAlwaysRequireManualApproval() async throws {
+        let toolCalls = [
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"RepoPromptCE_read_file"}"#,
+            #"{"toolCallId":"tool-1","name":"mcp__RepoPromptCE__git","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"git","server":"RepoPromptCE","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","server":"OtherServer","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","kind":"edit"}"#,
+            #"{"toolCallId":"tool-1","title":"Shell","kind":"execute","rawInput":{"server":"RepoPromptCE","name":"git"}}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","_meta":{"cognition.ai/toolName":"mcp__OtherServer__git"}}"#,
+            #"{"toolCallId":"tool-1","name":"mcp__RepoPromptCE__git","server":"RepoPromptCE","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__unknown_tool"}}"#,
+            #"{"toolCallId":"tool-1","title":"git (RepoPromptCE MCP Server)","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__foreign__git"}}"#
         ]
-        for (label, toolCall) in manualCases {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall)
-            XCTAssertTrue(result.approvalRequested, label)
-            XCTAssertEqual(result.outcome["optionId"], "reject_once", label)
-        }
-
-        for (label, toolCall) in [
-            ("prefixed title", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#),
-            ("OpenCode MCP title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE_read_file", "kind": "other"}"#),
-            ("prefixed title without kind", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file"}"#),
-            ("server field", #"{"toolCallId": "tool-1", "title": "read_file", "kind": "other", "server": "RepoPromptCE"}"#)
-        ] {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall)
-            XCTAssertFalse(result.approvalRequested, label)
-            XCTAssertEqual(result.outcome["optionId"], "allow_once", label)
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            for toolCall in toolCalls {
+                let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID)
+                XCTAssertTrue(result.approvalRequested, "\(providerID): \(toolCall)")
+                XCTAssertEqual(result.outcome["optionId"], "reject_once")
+            }
         }
     }
 
-    func testGrokRepoPromptAutoApprovalRequiresGenuineOneTimeOption() async throws {
-        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
-        let cases: [(name: String, options: [[String: String]], expectedOptionID: String?)] = [
-            ("genuine one-time option", [
-                ["optionId": "allow-once", "kind": "allow_once"]
-            ], "allow-once"),
-            ("one-time ID with persistent kind alongside genuine option", [
-                ["optionId": "allow-once", "kind": "allow_always"],
-                ["optionId": "opaque-once", "kind": "allow_once"]
-            ], "opaque-once"),
-            ("persistent ID with one-time kind alongside genuine option", [
-                ["optionId": "always-allow", "kind": "allow_once"],
-                ["optionId": "opaque-once", "kind": "allow_once"]
-            ], "opaque-once"),
-            ("one-time ID with persistent kind only", [
-                ["optionId": "allow-once", "kind": "allow_always"]
-            ], nil),
-            ("persistent ID with one-time kind only", [
-                ["optionId": "always-allow", "kind": "allow_once"]
-            ], nil),
-            ("session grant and denylisted option only", [
-                ["optionId": "allow-edits-session", "kind": "allow_always"],
-                ["optionId": "enable-always-approve", "kind": "allow_once"]
-            ], nil)
-        ]
-        // Exercise every row before asserting so a red run reports both unsafe selection paths.
-        var mismatches: [String] = []
-        for testCase in cases {
+    func testOnlyDevinAdapterAttestsStructuredInvocationIdentity() async throws {
+        let toolCall = #"{"toolCallId":"tool-1","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild] {
+            let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID)
+            XCTAssertTrue(result.approvalRequested, "\(providerID)")
+            XCTAssertEqual(result.outcome["optionId"], "reject_once")
+        }
+    }
+
+    func testDevinAttestationFollowsExactConfiguredServerName() {
+        let provider = DevinACPAgentProvider(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: true),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(name: "ConfiguredServer", command: "/usr/bin/true")
+        )
+        for name in ["mcp__RepoPromptCE__git", "mcp__ConfiguredServer__foreign__git", "mcp__ConfiguredServer__"] {
+            XCTAssertNil(provider.attestedRepoPromptToolName(in: ["_meta": ["cognition.ai/toolName": name]]))
+        }
+        let name = "mcp__ConfiguredServer__git"
+        XCTAssertEqual(provider.attestedRepoPromptToolName(in: ["_meta": ["cognition.ai/toolName": name]]), name)
+    }
+
+    func testStructuredDevinIdentityRequiresConfiguredRepoPromptServer() async throws {
+        let toolCall = #"{"toolCallId":"tool-1","title":"Calling git","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
+        for injected in [false, true] {
             let result = try await autoApprovalOutcome(
-                toolCallJSON: toolCall, providerID: .grokBuild,
-                options: testCase.options + [["optionId": "reject_once", "kind": "reject_once"]]
+                toolCallJSON: toolCall, providerID: .devin, repoPromptInjected: injected
             )
-            let expectedApprovalRequested = testCase.expectedOptionID == nil
-            let expectedOptionID = testCase.expectedOptionID ?? "reject_once"
-            if result.approvalRequested != expectedApprovalRequested {
-                mismatches.append("\(testCase.name): approvalRequested=\(result.approvalRequested), expected=\(expectedApprovalRequested)")
-            }
-            if result.outcome["outcome"] != "selected" {
-                mismatches.append("\(testCase.name): outcome=\(result.outcome["outcome"] ?? "missing"), expected=selected")
-            }
-            if result.outcome["optionId"] != expectedOptionID {
-                mismatches.append("\(testCase.name): optionId=\(result.outcome["optionId"] ?? "missing"), expected=\(expectedOptionID)")
-            }
+            XCTAssertEqual(result.approvalRequested, !injected)
+            XCTAssertEqual(result.outcome["optionId"], injected ? "allow_once" : "reject_once")
         }
-        XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "\n"))
     }
 
-    func testOtherProvidersRepoPromptAutoApprovalIsUnchanged() async throws {
-        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
-        let options = [
-            ["optionId": "always", "kind": "allow_always"],
-            ["optionId": "allow_once", "kind": "allow_once"],
-            ["optionId": "reject_once", "kind": "reject_once"]
+    func testAutomaticSelectionsRequireGenuineOneTimeOptions() async throws {
+        let toolCall = #"{"toolCallId":"tool-1","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
+        let invalidOptions = [
+            ["optionId": "allow_once", "kind": "allow_always"],
+            ["optionId": "always", "kind": "allow_once"],
+            ["optionId": "allow_session", "kind": "allow_once"],
+            ["optionId": "allow_global", "kind": "allow_once"],
+            ["optionId": "allow_persistent", "kind": "allow_once"],
+            ["optionId": "enable-always-approve", "kind": "allow_once"]
         ]
-        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .devin] {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID, options: options)
-            XCTAssertFalse(result.approvalRequested, "\(providerID)")
-            XCTAssertEqual(result.outcome["outcome"], "selected", "\(providerID)")
-            XCTAssertEqual(result.outcome["optionId"], providerID == .devin ? "allow_once" : "always", "\(providerID)")
+        // Exercise both identity-based approval and Cursor's explicit full-access path.
+        for providerID: ACPProviderID in [.devin, .cursor] {
+            for option in invalidOptions {
+                // Mixed fixtures use distinct wire IDs; the exact allow_once mislabel is
+                // covered alone rather than treating duplicate option IDs as valid consent.
+                let availabilityCases = option["optionId"] == "allow_once" ? [false] : [false, true]
+                for genuineOptionAvailable in availabilityCases {
+                    var options = [option]
+                    if genuineOptionAvailable { options.append(["optionId": "allow_once", "kind": "allow_once"]) }
+                    options.append(["optionId": "reject_once", "kind": "reject_once"])
+                    let result = try await autoApprovalOutcome(
+                        toolCallJSON: toolCall, providerID: providerID, options: options,
+                        repoPromptInjected: true, fullAccess: providerID == .cursor
+                    )
+                    XCTAssertEqual(result.approvalRequested, !genuineOptionAvailable, "\(providerID): \(option)")
+                    XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "allow_once" : "reject_once")
+                }
+            }
         }
     }
 
@@ -218,7 +209,9 @@ final class ACPPermissionScopeTests: XCTestCase {
         options: [[String: String]] = [
             ["optionId": "allow_once", "kind": "allow_once", "name": "Allow"],
             ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
-        ]
+        ],
+        repoPromptInjected: Bool = true,
+        fullAccess: Bool = false
     ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPAutoApprovalProvenance")
@@ -263,11 +256,14 @@ final class ACPPermissionScopeTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
         let controller = try ACPAgentSessionController(
-            provider: ScriptedScopeProvider(providerID: providerID, executable: executable.path), runRequest: request,
+            provider: ScriptedScopeProvider(
+                providerID: providerID, executable: executable.path, repoPromptInjected: repoPromptInjected
+            ), runRequest: request,
             allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
+            await controller.setAutoApproveAllToolPermissions(fullAccess)
             let events = await controller.events
             let consumer = Task { () -> Bool in
                 for await event in events {
@@ -412,6 +408,14 @@ private extension XCTestCase {
 private struct ScriptedScopeProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let executable: String
+    var repoPromptInjected = false
+
+    func attestedRepoPromptToolName(in toolCall: [String: Any]) -> String? {
+        guard providerID == .devin else { return nil }
+        return DevinACPAgentProvider(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: repoPromptInjected)
+        ).attestedRepoPromptToolName(in: toolCall)
+    }
 
     func support(for _: ACPRunRequest) async -> ACPSupportResult {
         .supported

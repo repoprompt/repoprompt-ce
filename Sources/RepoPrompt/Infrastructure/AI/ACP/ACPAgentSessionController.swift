@@ -2247,12 +2247,8 @@ actor ACPAgentSessionController {
             )
         )
 
-        let devinAttestedToolName = provider.providerID == .devin
-            ? (resolvedToolCall["_meta"] as? [String: Any])?["cognition.ai/toolName"] as? String
-            : nil
         if let autoApproval = autoApprovalSelection(
-            requestToolName: devinAttestedToolName ?? toolTitle,
-            requestToolNameIsProviderAttested: devinAttestedToolName != nil,
+            attestedToolName: provider.attestedRepoPromptToolName(in: resolvedToolCall),
             requestPayload: autoApprovalPayload,
             options: options
         ) {
@@ -4011,7 +4007,10 @@ actor ACPAgentSessionController {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
         case .cursor:
-            return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
+            // Full access auto-approves each request once; it must not persist a grant.
+            return ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
+            )
         case .openCode, .grokBuild, .antigravity, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`) and
             // Devin's is a launch-time `--permission-mode`; the controller never
@@ -4039,45 +4038,22 @@ actor ACPAgentSessionController {
     }
 
     private func autoApprovalSelection(
-        requestToolName: String?,
-        requestToolNameIsProviderAttested: Bool,
+        attestedToolName: String?,
         requestPayload: [String: Any],
         options: [PermissionOption]
     ) -> AutoApprovalSelection? {
-        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ), isStrictACPRepoPromptPermissionMatch(
-            match,
-            requestToolName: requestToolName,
-            requestToolNameIsProviderAttested: requestToolNameIsProviderAttested,
-            requestPayload: requestPayload
-        )
-        else {
-            return nil
-        }
-
-        let selectedOptionID: String? = switch provider.providerID {
-        case .grokBuild:
-            // Strict RepoPrompt MCP auto-approval must remain genuinely one-time,
-            // even when Grok mislabels a broader option's ID or kind.
-            preferredAllowOptionID(for: options, sessionScoped: false)
-        case .devin:
-            safePermissionOptionsForAutoSelection(options).first(where: { $0.optionID == "allow_once" })?.optionID
-        case .openCode, .cursor, .antigravity:
-            optionID(
-                for: safePermissionOptionsForAutoSelection(options),
-                preferences: [
-                    .optionID("always"),
-                    .optionID("allow_always"),
-                    .kind("allow_always"),
-                    .optionID("once"),
-                    .optionID("allow_once"),
-                    .kind("allow_once")
-                ]
-            )
-        }
-        guard let selectedOptionID else { return nil }
+        // Most ACP hosts supply no attested invocation identity. Do not promote their
+        // titles, nested names, or server strings into authority; surface manual approval.
+        guard let attestedToolName,
+              let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                  requestToolName: attestedToolName,
+                  requestPayload: requestPayload
+              ), match.source == .topLevelToolName,
+              let selectedOptionID = ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                  options: options.filter { provider.providerID != .devin || $0.optionID == "allow_once" }
+                      .map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
+              )
+        else { return nil }
         return AutoApprovalSelection(optionID: selectedOptionID, match: match)
     }
 
@@ -4088,54 +4064,6 @@ actor ACPAgentSessionController {
         options.filter { option in
             ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
         }
-    }
-
-    /// ACP permission requests carry no provider-attested MCP server identity for most hosts, so
-    /// RepoPrompt provenance is accepted only from (in order of trust):
-    /// - a host-supplied RepoPrompt server field;
-    /// - a provider-attested invocation name (Devin `cognition.ai/toolName`);
-    /// - a RepoPrompt-prefixed title/name, but only when the host classifies the call as an MCP-style
-    ///   `other` operation (or gives no kind). Hosts derive titles for built-in kinds such as `edit`,
-    ///   `read`, or `execute` from file paths and commands, so a title like `mcp__RepoPromptCE__git`
-    ///   on an `edit` request is argument-controlled text, not identity (#1243).
-    ///
-    /// Known residual: an `other`/unclassified request from a foreign MCP tool whose host title
-    /// spells a RepoPrompt-prefixed name still matches, because most ACP hosts provide no attested
-    /// server identity. Failing closed there would force manual approval of every RepoPrompt call
-    /// on OpenCode, Cursor, and Antigravity, so title fallback is kept intentionally.
-    private func isStrictACPRepoPromptPermissionMatch(
-        _ match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch,
-        requestToolName: String?,
-        requestToolNameIsProviderAttested: Bool,
-        requestPayload: [String: Any]
-    ) -> Bool {
-        if MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil {
-            return true
-        }
-        switch match.source {
-        case .serverIdentifier:
-            // A display label alone (e.g. `git (RepoPromptCE MCP Server)`) never suffices.
-            return false
-        case .topLevelToolName:
-            guard let requestToolName, MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(requestToolName) else {
-                return false
-            }
-            return requestToolNameIsProviderAttested || Self.acpKindAllowsTitleDerivedIdentity(requestPayload)
-        case .nestedToolName:
-            return MCPIntegrationHelper.repoPromptPermissionContainsServerPrefixedToolName(in: requestPayload)
-                && Self.acpKindAllowsTitleDerivedIdentity(requestPayload)
-        }
-    }
-
-    private static func acpKindAllowsTitleDerivedIdentity(_ requestPayload: [String: Any]) -> Bool {
-        guard let kind = (requestPayload["kind"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !kind.isEmpty
-        else {
-            return true
-        }
-        return kind == "other"
     }
 
     private func repoPromptPermissionAutoApprovalPayload(
