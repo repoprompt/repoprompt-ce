@@ -52,6 +52,10 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         defer { lock.unlock() }
         var configs = loadConfigsLocked()
         var normalized = config.normalized
+        let previous = configs[config.id.rawValue] ?? config.id.defaultPreset
+        if ProviderEndpointConsent.endpointIdentity(previous.baseURL) != ProviderEndpointConsent.endpointIdentity(normalized.baseURL) {
+            normalized.httpCredentialConsentEndpoint = nil
+        }
         normalized.updatedAt = Date()
         configs[normalized.id.rawValue] = normalized
         saveConfigsLocked(configs)
@@ -219,7 +223,7 @@ enum ClaudeCodeCompatibleBackendIntegration {
     static func environment(
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String
-    ) -> [String: String] {
-        ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
+    ) throws -> [String: String] {
+        try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
     }
 }

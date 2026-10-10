@@ -10,10 +10,11 @@ struct CustomProviderConfiguration: Codable {
     var maxTokens: Int? // Add the new optional maxTokens property
     var userPreferredModel: String?
     var includeContentTypeHeader: Bool = false // Add flag for Content-Type header
+    var httpCredentialConsentEndpoint: String? = nil
     var apiVersion: String? = nil // NEW: optional API version (e.g., "v1", "v4")
 
     enum CodingKeys: String, CodingKey {
-        case url, defaultModel, headers, name, enabledModels, maxTokens, userPreferredModel, includeContentTypeHeader, apiVersion
+        case url, defaultModel, headers, name, enabledModels, maxTokens, userPreferredModel, includeContentTypeHeader, apiVersion, httpCredentialConsentEndpoint
     }
 
     /// Custom decoder to handle backwards compatibility
@@ -28,11 +29,12 @@ struct CustomProviderConfiguration: Codable {
         userPreferredModel = try container.decodeIfPresent(String.self, forKey: .userPreferredModel)
         // Default to false for backwards compatibility
         includeContentTypeHeader = try container.decodeIfPresent(Bool.self, forKey: .includeContentTypeHeader) ?? false
+        httpCredentialConsentEndpoint = try container.decodeIfPresent(String.self, forKey: .httpCredentialConsentEndpoint)
         apiVersion = try container.decodeIfPresent(String.self, forKey: .apiVersion) // may be nil for legacy
     }
 
     /// Manual initializer
-    init(url: String, defaultModel: String, headers: [String: String], name: String, enabledModels: Set<String> = [], maxTokens: Int? = nil, userPreferredModel: String? = nil, includeContentTypeHeader: Bool = false, apiVersion: String? = nil) throws { // Add maxTokens, includeContentTypeHeader, apiVersion
+    init(url: String, defaultModel: String, headers: [String: String], name: String, enabledModels: Set<String> = [], maxTokens: Int? = nil, userPreferredModel: String? = nil, includeContentTypeHeader: Bool = false, apiVersion: String? = nil, httpCredentialConsentEndpoint: String? = nil) throws { // Add maxTokens, includeContentTypeHeader, apiVersion
         guard !url.isEmpty else {
             throw AIProviderError.missingURL
         }
@@ -52,6 +54,7 @@ struct CustomProviderConfiguration: Codable {
         self.userPreferredModel = userPreferredModel
         self.includeContentTypeHeader = includeContentTypeHeader // Initialize the new flag
         self.apiVersion = apiVersion
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 
     var effectiveDefaultModel: String {
@@ -71,8 +74,16 @@ struct CustomProviderConfiguration: Codable {
     }
 
     static func save(_ config: CustomProviderConfiguration, apiKey: String, keyManager: KeyManager) async throws {
+        try ProviderEndpointConsent.validate(config.url, credentialBearing: ProviderEndpointConsent.hasCredentials(apiKey: apiKey, customHeaders: config.headers), consentEndpoint: config.httpCredentialConsentEndpoint)
         try save(config)
         try await keyManager.saveAPIKey(apiKey, for: .customProvider)
+    }
+
+    static func revokeHTTPConsent(defaults: UserDefaults = .standard) throws {
+        guard let data = defaults.data(forKey: "CustomProviderConfig") else { return }
+        var config = try JSONDecoder().decode(CustomProviderConfiguration.self, from: data)
+        config.httpCredentialConsentEndpoint = nil
+        try defaults.set(JSONEncoder().encode(config), forKey: "CustomProviderConfig")
     }
 
     static func delete() {
@@ -98,7 +109,8 @@ struct CustomProviderConfiguration: Codable {
             customHeaders: headers,
             configuredMaxTokens: maxTokens,
             includeContentTypeHeader: includeContentTypeHeader,
-            apiVersion: apiVersion
+            apiVersion: apiVersion,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 }

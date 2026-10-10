@@ -207,7 +207,15 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    @Published var azureBaseURL: String = ""
+    @Published var azureHTTPConsentEndpoint: String?
+    @Published var azureBaseURL: String = "" {
+        didSet {
+            if azureHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(azureConsentURL) {
+                azureHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var azureApiKey: String = ""
     @Published var azureApiVersion: String = "2025-04-01-preview"
     @Published private(set) var availableAzureModels: [AzureOpenAIConfiguration.ModelDescriptor] = AzureOpenAIProvider.defaultModelDescriptors
@@ -215,12 +223,29 @@ public class APISettingsViewModel: ObservableObject {
     @Published var azureCustomModel: String = UserDefaults.standard.string(forKey: "customModelAzure") ?? ""
     @Published var anthropicApiKey: String = ""
     @Published var openAIApiKey: String = ""
-    @Published var openAIBaseURL: String = UserDefaults.standard.string(forKey: "customBaseURLOpenAI") ?? ""
+    @Published var openAIHTTPConsentEndpoint: String? = UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint")
+
+    @Published var openAIBaseURL: String = UserDefaults.standard.string(forKey: "customBaseURLOpenAI") ?? "" {
+        didSet {
+            if openAIHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(openAIConsentURL) {
+                openAIHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var isOpenAIBaseURLValid: Bool = false
     @Published var openAIServiceTier: String = UserDefaults.standard.string(forKey: "openAIServiceTier") ?? "auto"
     @Published var openAIShowServiceTierVariants: Bool = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
     @Published var ollamaURL: String = "http://localhost:11434"
-    @Published var customProviderURL: String = ""
+    @Published var customProviderHTTPConsentEndpoint: String?
+    @Published var customProviderURL: String = "" {
+        didSet {
+            if customProviderHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(customProviderConsentURL) {
+                customProviderHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var customProviderApiKey: String = ""
     @Published var isCustomProviderValid: Bool = false
     @Published private(set) var keychainAccessDiagnostics: [APIKeychainAccessDiagnostic] = []
@@ -1166,6 +1191,7 @@ public class APISettingsViewModel: ObservableObject {
             } else {
                 customProviderURL = customConfig.url
             }
+            customProviderHTTPConsentEndpoint = customConfig.httpCredentialConsentEndpoint
             availableCustomModels = Array(customConfig.enabledModels).sorted()
             customEnabledModelSet = customConfig.enabledModels
             customProviderMaxTokensString = String(customConfig.maxTokens ?? 8192)
@@ -1540,6 +1566,7 @@ public class APISettingsViewModel: ObservableObject {
            let config = try? JSONDecoder().decode(AzureOpenAIConfiguration.self, from: data)
         {
             azureBaseURL = config.baseURL.absoluteString
+            azureHTTPConsentEndpoint = config.httpCredentialConsentEndpoint
             azureApiKey = config.apiKey
             azureApiVersion = config.apiVersion
             availableAzureModels = AzureOpenAIProvider.mergedWithDefaultDescriptors(config.models)
@@ -2250,11 +2277,17 @@ public class APISettingsViewModel: ObservableObject {
 
     func validateOpenAIKey() async throws -> Bool {
         let trimmed = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Use override if present
+        // Use override if present; malformed overrides must not fall back to another endpoint.
+        if !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           OpenAIURLHelper.normalizeBaseURL(openAIBaseURL) == nil
+        {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         let base = normalizedOpenAIBaseURL(openAIBaseURL)
         let ok = try await aiQueriesService.testOpenAIAPI(
             with: trimmed,
-            baseURL: base.isEmpty ? nil : base
+            baseURL: base.isEmpty ? nil : base,
+            httpCredentialConsentEndpoint: openAIHTTPConsentEndpoint
         )
         if ok {
             try await keyManager.saveAPIKey(trimmed, for: .openAI)
@@ -2269,6 +2302,11 @@ public class APISettingsViewModel: ObservableObject {
     @MainActor
     func validateAndSaveOpenAIBaseURL() async throws -> Bool {
         // Parse base and optional version from the user input
+        if !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           OpenAIURLHelper.normalizeBaseURL(openAIBaseURL) == nil
+        {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         let (baseURLString, version) = normalizedOpenAIBaseURLAndVersion(openAIBaseURL)
 
         // If no key is present, persist base/version but mark as not validated (old behavior preserved)
@@ -2280,13 +2318,15 @@ public class APISettingsViewModel: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
             }
             openAIBaseURL = baseURLString
+            UserDefaults.standard.set(openAIHTTPConsentEndpoint, forKey: "openAIHTTPConsentEndpoint")
             isOpenAIBaseURLValid = false
             return true
         }
 
         // Validate using a temporary override that *includes* the version to ensure the probe hits the correct endpoint
         let baseForTest = version.map { "\(baseURLString)/\($0)" } ?? baseURLString
-        let ok = try await aiQueriesService.testOpenAIAPI(with: openAIApiKey, baseURL: baseForTest)
+        let consentEndpoint = openAIHTTPConsentEndpoint
+        let ok = try await aiQueriesService.testOpenAIAPI(with: openAIApiKey, baseURL: baseForTest, httpCredentialConsentEndpoint: consentEndpoint)
         if ok {
             UserDefaults.standard.set(baseURLString, forKey: "customBaseURLOpenAI")
             if let v = version, !v.isEmpty {
@@ -2295,6 +2335,8 @@ public class APISettingsViewModel: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
             }
             openAIBaseURL = baseURLString
+            openAIHTTPConsentEndpoint = consentEndpoint
+            UserDefaults.standard.set(consentEndpoint, forKey: "openAIHTTPConsentEndpoint")
             isOpenAIBaseURLValid = true
             await updateOpenAIModels()
         } else {
@@ -2308,6 +2350,8 @@ public class APISettingsViewModel: ObservableObject {
     func resetOpenAIBaseURL() async {
         UserDefaults.standard.removeObject(forKey: "customBaseURLOpenAI")
         UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
+        UserDefaults.standard.removeObject(forKey: "openAIHTTPConsentEndpoint")
+        openAIHTTPConsentEndpoint = nil
         openAIBaseURL = ""
         isOpenAIBaseURLValid = false
         await updateOpenAIModels()
@@ -2582,6 +2626,39 @@ public class APISettingsViewModel: ObservableObject {
         await updateAvailableModels()
     }
 
+    func setOpenAIHTTPConsent(_ endpoint: String?) {
+        UserDefaults.standard.set(endpoint, forKey: "openAIHTTPConsentEndpoint")
+        openAIHTTPConsentEndpoint = endpoint
+    }
+
+    func setCustomProviderHTTPConsent(_ endpoint: String?) throws {
+        if endpoint == nil { try CustomProviderConfiguration.revokeHTTPConsent() }
+        customProviderHTTPConsentEndpoint = endpoint
+    }
+
+    func setAzureHTTPConsent(_ endpoint: String?) async throws {
+        if endpoint == nil, let stored = try await keyManager.getAPIKey(for: .azure), !stored.isEmpty {
+            guard let data = stored.data(using: .utf8) else { throw AIProviderError.providerNotConfigured }
+            let config = try JSONDecoder().decode(AzureOpenAIConfiguration.self, from: data).revokingHTTPConsent()
+            let encoded = try JSONEncoder().encode(config)
+            guard let json = String(data: encoded, encoding: .utf8) else { throw AIProviderError.providerNotConfigured }
+            try await keyManager.saveAPIKey(json, for: .azure)
+        }
+        azureHTTPConsentEndpoint = endpoint
+    }
+
+    var customProviderConsentURL: String {
+        OpenAIURLHelper.normalizeBaseURLString(customProviderURL) ?? customProviderURL
+    }
+
+    var openAIConsentURL: String {
+        OpenAIURLHelper.normalizeBaseURLString(openAIBaseURL) ?? openAIBaseURL
+    }
+
+    var azureConsentURL: String {
+        normalizeAzureBaseURL(from: azureBaseURL)?.absoluteString ?? azureBaseURL
+    }
+
     // MARK: - Custom Provider (OpenAI-compatible)
 
     func validateCustomProvider() async throws -> Bool {
@@ -2611,6 +2688,8 @@ public class APISettingsViewModel: ObservableObject {
         let previouslyEnabled = existingConfig?.enabledModels ?? []
 
         let apiKey = customProviderApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let consentEndpoint = customProviderHTTPConsentEndpoint
+        try ProviderEndpointConsent.validate(baseURL, credentialBearing: !apiKey.isEmpty, consentEndpoint: consentEndpoint)
         let userModel = customProviderUserModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxTokensValue = Int(customProviderMaxTokensString)
 
@@ -2624,7 +2703,8 @@ public class APISettingsViewModel: ObservableObject {
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,
                 overrideVersion: detectedVersion,
-                includeUsageInStream: false
+                includeUsageInStream: false,
+                httpCredentialConsentEndpoint: consentEndpoint
             )
 
             let testMessage = AIMessage(
@@ -2653,7 +2733,8 @@ public class APISettingsViewModel: ObservableObject {
                 apiKey: apiKey,
                 defaultModel: "gpt-4o",
                 defaultTemperature: 0.7,
-                apiVersion: detectedVersion
+                apiVersion: detectedVersion,
+                httpCredentialConsentEndpoint: consentEndpoint
             )
 
             do {
@@ -2703,7 +2784,8 @@ public class APISettingsViewModel: ObservableObject {
             maxTokens: maxTokensValue,
             userPreferredModel: userModel.isEmpty ? nil : userModel,
             includeContentTypeHeader: customProviderIncludeContentType,
-            apiVersion: detectedVersion
+            apiVersion: detectedVersion,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
         try CustomProviderConfiguration.save(config)
 
@@ -2760,11 +2842,14 @@ public class APISettingsViewModel: ObservableObject {
 
         AzureOpenAIProvider.debug("Starting validation for base URL \(normalizedURL.absoluteString) using API version \(trimmedVersion)")
 
+        let consentEndpoint = azureHTTPConsentEndpoint
+        try ProviderEndpointConsent.validate(normalizedURL, apiKey: trimmedKey, consentEndpoint: consentEndpoint)
         let discoveryVersions = AzureOpenAIProvider.discoveryAPIVersions
         let models = try await AzureOpenAIProvider.discoverDeployments(
             baseURL: normalizedURL,
             apiKey: trimmedKey,
-            apiVersions: discoveryVersions
+            apiVersions: discoveryVersions,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
         let resolvedAPIVersion = trimmedVersion
         AzureOpenAIProvider.debug("Retrieved \(models.count) Azure deployments")
@@ -2798,7 +2883,8 @@ public class APISettingsViewModel: ObservableObject {
             apiVersion: resolvedAPIVersion,
             extraHeaders: nil,
             models: models,
-            defaultModelID: selectedDescriptor.id
+            defaultModelID: selectedDescriptor.id,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
 
         AzureOpenAIProvider.debug("Testing Azure credentials against deployment \(selectedDescriptor.id) (base model: \(selectedDescriptor.baseModelID ?? "unknown"))")
@@ -2858,7 +2944,8 @@ public class APISettingsViewModel: ObservableObject {
         components.scheme = components.scheme ?? "https"
         components.host = host
         components.path = ""
-        return components.url
+        guard let url = components.url, ProviderEndpointConsent.endpointIdentity(url.absoluteString) != nil else { return nil }
+        return url
     }
 
     @MainActor
@@ -2875,7 +2962,8 @@ public class APISettingsViewModel: ObservableObject {
             let descriptors = try await AzureOpenAIProvider.discoverDeployments(
                 baseURL: normalizedURL,
                 apiKey: trimmedKey,
-                apiVersions: discoveryVersions
+                apiVersions: discoveryVersions,
+                httpCredentialConsentEndpoint: azureHTTPConsentEndpoint
             )
             availableAzureModels = AzureOpenAIProvider.mergedWithDefaultDescriptors(descriptors)
         } catch {
@@ -2908,10 +2996,12 @@ public class APISettingsViewModel: ObservableObject {
 
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: customProviderURL,
+                baseURL: customProviderConsentURL,
                 apiKey: customProviderApiKey,
                 defaultModel: "",
-                defaultTemperature: 0.7
+                defaultTemperature: 0.7,
+                apiVersion: OpenAIURLHelper.splitBaseURLAndVersion(customProviderURL).version,
+                httpCredentialConsentEndpoint: customProviderHTTPConsentEndpoint
             )
 
             let models = try await provider.getAvailableModels()
@@ -4087,7 +4177,8 @@ public class APISettingsViewModel: ObservableObject {
                 apiKey: openAIApiKey,
                 defaultModel: "gpt-3.5-turbo",
                 defaultTemperature: 0.7,
-                apiVersion: version
+                apiVersion: version,
+                httpCredentialConsentEndpoint: openAIHTTPConsentEndpoint
             )
             let models = try await provider.getAvailableModels()
             await MainActor.run { availableOpenAIModels = models }

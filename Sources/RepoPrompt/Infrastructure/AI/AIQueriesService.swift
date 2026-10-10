@@ -573,7 +573,7 @@ public class AIQueriesService {
         }
     }
 
-    func testOpenAIAPI(with apiKey: String? = nil, baseURL: String? = nil) async throws -> Bool {
+    func testOpenAIAPI(with apiKey: String? = nil, baseURL: String? = nil, httpCredentialConsentEndpoint: String? = nil) async throws -> Bool {
         let key: String? = if let apiKey {
             apiKey
         } else {
@@ -586,6 +586,9 @@ public class AIQueriesService {
         let overrideRaw = baseURL ?? UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
         let split = OpenAIURLHelper.splitBaseURLAndVersion(overrideRaw)
         let base = split.base
+        if let overrideRaw, !overrideRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, base == nil {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         // If a version is present in the override string, prefer it; otherwise look for stored override
         let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
         let version = split.version ?? storedVersion
@@ -595,7 +598,8 @@ public class AIQueriesService {
             apiKey: key,
             baseURL: base,
             configuredMaxTokens: nil,
-            overrideVersion: version
+            overrideVersion: version,
+            httpCredentialConsentEndpoint: baseURL == nil ? UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint") : httpCredentialConsentEndpoint
         )
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
@@ -737,12 +741,13 @@ public class AIQueriesService {
 
     struct TimeoutError: Error {}
 
-    func testCustomProviderAPI(url: String, apiKey: String, model: String) async throws -> Bool {
+    func testCustomProviderAPI(url: String, apiKey: String, model: String, httpCredentialConsentEndpoint: String? = nil) async throws -> Bool {
         try await OpenAIProvider.testCustomProviderAPI(
             url: url,
             apiKey: apiKey,
             model: model,
-            timeout: 30.0
+            timeout: 30.0,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 }
@@ -761,7 +766,8 @@ extension OpenAIProvider {
         url: String,
         apiKey: String,
         model: String,
-        timeout: TimeInterval = 8.0
+        timeout: TimeInterval = 8.0,
+        httpCredentialConsentEndpoint: String? = nil
     ) async throws -> Bool {
         // ── 1. Normalize and split base + version ────────────────────────────────
         let split = OpenAIURLHelper.splitBaseURLAndVersion(url)
@@ -774,7 +780,8 @@ extension OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16, // keep the test cheap
-            overrideVersion: split.version
+            overrideVersion: split.version,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
 
         // ── 3. Perform a tiny completion call ───────────────────────────────
