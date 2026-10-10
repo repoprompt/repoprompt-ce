@@ -21,11 +21,11 @@ func agentSessionRowOversightMarkIsInteractive(role _: AgentSessionOversightRole
 struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
-    /// Fb mark model: the row's own group slot when it oversees, plus its overseers in
-    /// link-creation order. Drives the inline eye mark; `.none` renders nothing.
+    /// Role model: the row's own group slot when it oversees, plus its overseers in
+    /// link-creation order. Drives the inline role mark; `.none` renders nothing.
     var oversightRole = AgentSessionOversightRole.none
     /// Overseer-creator provenance for the tooltip's `Created by:` segment. Live links still own
-    /// the mark's colour; this never paints a separate origin mark.
+    /// the mark's role; this never paints a separate origin mark.
     var creatorSessionID: UUID?
     var creatorDisplayName: String?
     /// Revalidates and navigates to the lane's creator for the `Open creator "{name}"` item.
@@ -262,8 +262,8 @@ struct AgentSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
-    private var oversightMarkFontSize: CGFloat {
-        fontPreset.scaledClamped(10, min: 9, max: 12)
+    private var oversightMarkSize: CGFloat {
+        fontPreset.scaledClamped(16, min: 14, max: 18)
     }
 
     private var chipHorizontalPadding: CGFloat {
@@ -856,7 +856,7 @@ struct AgentSessionRow: View {
         _ = onSelectionGesture(.toggle)
     }
 
-    // MARK: - Oversight role mark (Fb iconography)
+    // MARK: - Oversight role mark
 
     /// The mark's combined tooltip/VoiceOver line — `Overseeing: … · Overseen by: … · Created
     /// by: …`, segments omitted when empty. Only called for rows carrying a role, so at least one
@@ -872,10 +872,9 @@ struct AgentSessionRow: View {
         )
     }
 
-    /// The always-visible role mark, drawn inline just before the title. One mark per row:
-    /// `eye.fill` in the row's own group colour when it oversees, `eye` in its first overseer's
-    /// group colour when it is overseen, and a two-tone `eye.circle.fill` when both apply. Several
-    /// overseers keep the first overseer's colour (link-creation order) plus a count superscript.
+    /// The always-visible role mark, drawn inline just before the title: an amber hub for an
+    /// overseer, a grey worker for an overseen session, and both glyphs when both roles apply.
+    /// Several overseers retain a count superscript.
     /// When mutations are allowed, clicking opens the Oversee-by lane menu — the same menu model
     /// as the hover affordance and the context submenu. Otherwise it stays a passive state marker
     /// so it can never offer a mutation the row forbids.
@@ -886,8 +885,8 @@ struct AgentSessionRow: View {
         interactive: Bool
     ) -> some View {
         if interactive, let summary {
-            // A menu label image template-renders, which would flatten the palette
-            // colours (and the two-tone/count colours) to the control tint — and to white on
+            // A menu label image template-renders, which would flatten the role
+            // colours to the control tint — and to white on
             // selected rows. The coloured glyph therefore stays ordinary content underneath a
             // clear-label StableMenuButton that owns the same hit target; the glyph itself
             // never hit-tests. The AppKit menu also survives the SwiftUI invalidations that
@@ -913,39 +912,28 @@ struct AgentSessionRow: View {
             // click menu's sections carry the same information for sighted users.
             oversightMarkGlyph
                 .fixedSize()
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel(tooltip)
         }
     }
 
-    @ViewBuilder
     private var oversightMarkGlyph: some View {
-        let ownColor = oversightRole.ownOverseerSlot.map { AgentOversightPalette.color(for: $0) }
-        let overseerColor = oversightRole.overseers.first
-            .map { AgentOversightPalette.color(for: $0.slot) }
         HStack(spacing: 1) {
-            switch (ownColor, overseerColor) {
-            case let (.some(own), .some(overseer)):
-                // Both roles: the eye keeps this row's own group colour, the ring its overseer's.
-                Image(systemName: AgentOversightUICopy.dualRoleMarkIcon)
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(own, overseer)
-            case let (.some(own), .none):
-                Image(systemName: AgentOversightUICopy.overseerMarkIcon)
-                    .foregroundStyle(own)
-            case let (.none, .some(overseer)):
-                Image(systemName: AgentOversightUICopy.overseenMarkIcon)
-                    .foregroundStyle(overseer)
-            case (.none, .none):
-                EmptyView()
+            if oversightRole.isOverseer {
+                AgentOversightRoleIcon(role: .overseer, size: oversightMarkSize)
+                    .foregroundStyle(AgentOversightRoleStyle.overseer)
+            }
+            if oversightRole.isOverseen {
+                AgentOversightRoleIcon(role: .worker, size: oversightMarkSize)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
             if oversightRole.overseers.count > 1 {
                 Text("\(oversightRole.overseers.count)")
                     .font(.system(size: 7, weight: .bold))
                     .baselineOffset(4)
-                    .foregroundStyle(overseerColor ?? .secondary)
+                    .foregroundStyle(AgentOversightRoleStyle.worker)
             }
         }
-        .font(.system(size: oversightMarkFontSize, weight: .semibold))
     }
 
     @ViewBuilder

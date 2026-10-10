@@ -35,8 +35,17 @@ struct AgentMonitorPill: View {
         } label: {
             HStack(spacing: 4) {
                 // Status is carried by the glyph and the count text, never by colour alone.
-                Image(systemName: props.isOverseer ? "eye.fill" : "eye")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                ForEach(
+                    AgentOversightRoleIcon.Role.toolbarRoles(isOverseer: props.isOverseer, hasInbound: props.hasInbound),
+                    id: \.self
+                ) { role in
+                    AgentOversightRoleIcon(role: role, size: fontPreset.scaledClamped(16, min: 14, max: 18))
+                        .foregroundStyle(
+                            role == .overseer && props.isOverseer
+                                ? AgentOversightRoleStyle.overseer : AgentOversightRoleStyle.worker
+                        )
+                        .accessibilityHidden(true)
+                }
                 if let outboundCount = props.dashboardOutboundCount {
                     Text("\(outboundCount)")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
