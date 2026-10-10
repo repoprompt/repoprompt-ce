@@ -126,6 +126,11 @@ struct APISettingsView: View {
                     )
 
                     if showOpenAIAdvanced {
+                        ProviderHTTPConsentView(endpoint: viewModel.openAIConsentURL, consentEndpoint: Binding(
+                            get: { viewModel.openAIHTTPConsentEndpoint },
+                            set: { viewModel.setOpenAIHTTPConsent($0) }
+                        ))
+                        .disabled(isLoadingOpenAIBaseURL || isLoadingOpenAI)
                         apiKeySection(
                             title: "OpenAI Base URL",
                             key: $viewModel.openAIBaseURL,
@@ -636,6 +641,21 @@ struct APISettingsView: View {
                     TextField("https://example.openai.azure.com", text: $viewModel.azureBaseURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
+                ProviderHTTPConsentView(endpoint: viewModel.azureConsentURL, consentEndpoint: Binding(
+                    get: { viewModel.azureHTTPConsentEndpoint },
+                    set: { endpoint in
+                        Task {
+                            isLoadingAzure = true
+                            defer { isLoadingAzure = false }
+                            do { try await viewModel.setAzureHTTPConsent(endpoint) }
+                            catch {
+                                alertMessage = "Could not update HTTP consent: \(error.localizedDescription)"
+                                showAlert = true
+                            }
+                        }
+                    }
+                ))
+                .disabled(isLoadingAzure)
 
                 HStack {
                     Text("API Version")

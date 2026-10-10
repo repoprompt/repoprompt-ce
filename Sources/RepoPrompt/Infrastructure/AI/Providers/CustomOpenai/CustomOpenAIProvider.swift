@@ -49,6 +49,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // Configuration
     private let baseURL: String
     private let apiKey: String
+    private let httpCredentialConsentEndpoint: String?
     private let defaultModel: String
     private let defaultTemperature: Double
     private let customHeaders: [String: String]
@@ -162,11 +163,13 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         configuredMaxTokens: Int? = nil,
         includeContentTypeHeader: Bool = false,
         apiVersion: String? = nil,
+        httpCredentialConsentEndpoint: String? = nil,
         httpClient: HTTPClient = DefaultHTTPClient.aiClient,
         streamingHttpClient: HTTPClient = DefaultHTTPClient.aiStreamingClient
     ) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
         self.defaultModel = defaultModel
         self.defaultTemperature = defaultTemperature
         self.customHeaders = customHeaders
@@ -177,11 +180,12 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         self.streamingHttpClient = streamingHttpClient
     }
 
-    private func urlFor(path: String) -> URL? {
+    private func urlFor(path: String) throws -> URL? {
+        try ProviderEndpointConsent.validate(baseURL, credentialBearing: ProviderEndpointConsent.hasCredentials(apiKey: apiKey, customHeaders: customHeaders), consentEndpoint: httpCredentialConsentEndpoint)
         if let v = apiVersion, !v.isEmpty {
-            URL(string: "\(baseURL)/\(v)/\(path)")
+            return URL(string: "\(baseURL)/\(v)/\(path)")
         } else {
-            URL(string: "\(baseURL)/\(path)")
+            return URL(string: "\(baseURL)/\(path)")
         }
     }
 
@@ -202,7 +206,9 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
             }
         }
 
-        headers["Authorization"] = "Bearer \(apiKey)"
+        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            headers["Authorization"] = "Bearer \(apiKey)"
+        }
         headers.merge(customHeaders) { _, new in new }
         return headers
     }
@@ -339,7 +345,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     }
 
     func getAvailableModels() async throws -> [String] {
-        guard let url = urlFor(path: "models") else {
+        guard let url = try urlFor(path: "models") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
 
@@ -592,7 +598,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         maxTokens: Int? = nil,
         temperature: Double? = nil
     ) throws -> URLRequest {
-        guard let url = urlFor(path: "chat/completions") else {
+        guard let url = try urlFor(path: "chat/completions") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
 

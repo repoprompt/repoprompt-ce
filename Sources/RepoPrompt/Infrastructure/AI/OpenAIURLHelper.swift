@@ -5,10 +5,11 @@ enum OpenAIURLHelper {
     /// Splits a raw base URL into a normalized base (without trailing version) and an optional version string (e.g., "v1", "v4").
     /// - Important: Adds https:// if missing, removes trailing slashes, and detects only the **last** path segment if it matches ^v\\d+([A-Za-z0-9._-]+)?$.
     static func splitBaseURLAndVersion(_ raw: String?) -> (base: URL?, version: String?) {
-        guard var s = raw, !s.isEmpty else { return (nil, nil) }
+        guard var s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return (nil, nil) }
 
         // Add protocol if missing
         if !s.lowercased().hasPrefix("http://"), !s.lowercased().hasPrefix("https://") {
+            guard !s.contains("://") else { return (nil, nil) }
             s = "https://" + s
         }
         // Trim trailing slashes for stable parsing
@@ -19,7 +20,7 @@ enum OpenAIURLHelper {
         guard let url = URL(string: s),
               var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         else {
-            return (URL(string: s), nil)
+            return (nil, nil)
         }
 
         var path = comps.path
@@ -42,8 +43,11 @@ enum OpenAIURLHelper {
         if path.hasSuffix("/"), path != "/" { path.removeLast() }
         comps.path = path
         // Rebuild a string without the trailing /vN if any
-        let baseStr = comps.string ?? s
-        return (URL(string: baseStr), detectedVersion)
+        guard let baseStr = comps.string,
+              let identity = ProviderEndpointConsent.endpointIdentity(baseStr),
+              let base = URL(string: identity)
+        else { return (nil, nil) }
+        return (base, detectedVersion)
     }
 
     /// Normalizes a custom OpenAI base URL by:

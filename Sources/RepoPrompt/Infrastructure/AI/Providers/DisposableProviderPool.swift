@@ -119,7 +119,9 @@ actor DisposableProviderPool {
                 for: providerType,
                 key: "",
                 ollamaURL: ollamaURL,
-                azureConfiguration: cachedConfig
+                // Cached configuration must not resurrect a revoked cleartext approval
+                // when secure storage is temporarily unavailable.
+                azureConfiguration: cachedConfig.revokingHTTPConsent()
             )
         } else {
             // If everything fails, create a blank provider
