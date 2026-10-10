@@ -730,7 +730,7 @@ struct AgentRunMCPToolService {
             }
             #if DEBUG
                 if let worktreeStartupBenchmarkToken {
-                    try await WorktreeStartupBenchmarkDiagnostics.$currentPendingStart.withValue(
+                    try await WorktreeStartupBenchmarkDiagnostics.currentPendingStartTaskLocal.withValue(
                         DebugWorktreeStartupBenchmarkPendingStart(
                             token: worktreeStartupBenchmarkToken,
                             startAttemptID: UUID()

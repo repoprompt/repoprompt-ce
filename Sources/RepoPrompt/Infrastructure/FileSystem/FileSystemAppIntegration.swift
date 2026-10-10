@@ -10,7 +10,7 @@ import RepoPromptVCS
         func withAttribution<Value: Sendable>(
             _ operation: @Sendable () async throws -> Value
         ) async throws -> Value {
-            try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(
+            try await WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal.withValue(
                 benchmarkMetricTag,
                 operation: operation
             )

@@ -7,6 +7,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 #if DEBUG
@@ -491,7 +492,11 @@ actor WorkspaceFileContextStore {
         let flightID: UUID
     }
 
-    @TaskLocal private static var activeCodemapRecoveryApplication: CodemapRecoveryApplication?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    private nonisolated static let activeCodemapRecoveryApplicationTaskLocal = BoxedTaskLocal<CodemapRecoveryApplication?>(nil)
+    private nonisolated static var activeCodemapRecoveryApplication: CodemapRecoveryApplication? {
+        activeCodemapRecoveryApplicationTaskLocal.get()
+    }
 
     /// Physical-catalog recovery owned by one root epoch after its root authority was revoked.
     ///
@@ -13983,7 +13988,7 @@ actor WorkspaceFileContextStore {
         rootEpoch: WorkspaceCodemapRootEpoch,
         flightID: UUID
     ) async -> Bool {
-        await Self.$activeCodemapRecoveryApplication.withValue(
+        await Self.activeCodemapRecoveryApplicationTaskLocal.withValue(
             CodemapRecoveryApplication(rootEpoch: rootEpoch, flightID: flightID)
         ) {
             await performLoadedRootCatalogReconciliation(rootID: rootEpoch.rootID).succeeded

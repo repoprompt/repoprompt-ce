@@ -61,7 +61,7 @@ enum AgentTranscriptPanePresentation: Equatable {
         if let scope {
             guard case let .owner(owner) = input.target.owner, scope.owner == owner else { return nil }
         }
-        if let content = input.content, content.scope == scope, content.hasUsableContent || content.hasArchivedHistory {
+        if let content = input.content, content.canPresentExistingTranscript(for: input.target) {
             return .transcript
         }
         if let runScope = input.liveRunScope, runScope == scope {
@@ -154,6 +154,21 @@ struct AgentTranscriptPaneContentFacts: Equatable {
     let hasUsableContent: Bool
     /// Archived history blocks reachable from this scope's projection.
     let hasArchivedHistory: Bool
+
+    /// A rejected operation may advance currency without replacing committed content. Only
+    /// materialized content ignores that transition counter; every identity still has to match.
+    func canPresentExistingTranscript(for target: AgentTranscriptPaneTarget) -> Bool {
+        guard hasUsableContent || hasArchivedHistory,
+              let current = target.scope,
+              current.tabID == target.tabID,
+              case let .owner(owner) = target.owner,
+              current.owner == owner
+        else { return false }
+        return scope.owner == current.owner
+            && scope.tabID == current.tabID
+            && scope.sessionIdentity == current.sessionIdentity
+            && scope.binding == current.binding
+    }
 
     init(scope: AgentSessionPresentationScope, hasUsableContent: Bool, hasArchivedHistory: Bool = false) {
         self.scope = scope

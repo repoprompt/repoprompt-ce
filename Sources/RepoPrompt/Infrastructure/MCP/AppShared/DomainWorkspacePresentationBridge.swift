@@ -1,4 +1,6 @@
-import Combine
+#if DEBUG
+    import Combine
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 

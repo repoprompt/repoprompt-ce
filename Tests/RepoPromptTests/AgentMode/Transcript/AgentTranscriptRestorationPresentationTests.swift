@@ -548,8 +548,8 @@ final class AgentTranscriptPanePresentationTests: XCTestCase {
         XCTAssertEqual(presentation, .restoring)
     }
 
-    /// §4.4 row 1: rows from an earlier binding transition of the same binding are not shown.
-    func testContentFromEarlierBindingTransitionIsNotPresented() {
+    /// Rejected transition currency does not replace the committed content identity.
+    func testContentFromEarlierBindingTransitionRemainsVisible() {
         let scope = savedScope
         let earlierTransition = AgentSessionPresentationScope(
             owner: owner,
@@ -564,7 +564,18 @@ final class AgentTranscriptPanePresentationTests: XCTestCase {
             record: savedLoadingRecord(scope)
         )
 
-        XCTAssertEqual(presentation, .restoring)
+        XCTAssertEqual(presentation, .transcript)
+        XCTAssertEqual(resolve(
+            target: target(scope: scope),
+            content: AgentTranscriptPaneContentFacts(scope: earlierTransition, hasUsableContent: false, hasArchivedHistory: true),
+            record: savedLoadingRecord(scope)
+        ), .transcript)
+        // Empty projections still need exact operation currency to authorize welcome.
+        XCTAssertEqual(resolve(
+            target: target(scope: scope),
+            content: AgentTranscriptPaneContentFacts(scope: earlierTransition, hasUsableContent: false),
+            record: savedSettledRecord(scope, .payloadApplied)
+        ), .restoring)
     }
 
     /// §4.4 row 3: a run belonging to the previous incarnation is not the current run.
@@ -842,6 +853,7 @@ private extension XCTestCase {
     func withSavedSelectedTab(
         bound: Bool = true,
         suppressPersistence: Bool = false,
+        additionalTabs: [ComposeTabState] = [],
         beforeSwitch: ((AgentModeViewModel) -> Void)? = nil,
         _ body: (Fixture) async throws -> Void
     ) async throws {
@@ -875,7 +887,7 @@ private extension XCTestCase {
             name: "Restoration"
         )
         var workspace = manager.workspaces[0]
-        workspace.composeTabs = [ComposeTabState(id: tabID, name: "Saved", activeAgentSessionID: bound ? sessionID : nil)]
+        workspace.composeTabs = [ComposeTabState(id: tabID, name: "Saved", activeAgentSessionID: bound ? sessionID : nil)] + additionalTabs
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
         let completions = ActivationCompletions()
@@ -2629,6 +2641,9 @@ extension AgentTranscriptPaneSnapshotPublicationTests {
             await switchGate.waitUntilEntered()
 
             let snapshot = fixture.viewModel.ui.transcript.snapshot
+            XCTAssertFalse(fixture.viewModel.activeTranscriptPresentation.workingRows.isEmpty, "outgoing backing projection is still populated")
+            XCTAssertFalse(fixture.viewModel.activeTranscriptPresentation.visibleRows.isEmpty, "ownership filtering must not discard backing content")
+            XCTAssertTrue(snapshot.archivedBlocks.isEmpty, "outgoing history is not authorized either")
             XCTAssertEqual(snapshot.paneTarget.owner, .awaitingOwner(workspaceID: incoming.id), "precondition: target replaced")
             XCTAssertTrue(snapshot.presentation.workingRows.isEmpty, "outgoing working rows dropped")
             XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty, "outgoing visible rows dropped")
@@ -3025,186 +3040,6 @@ extension AgentTranscriptRestorationLifecycleTests {
             )
 
             XCTAssertEqual(fixture.viewModel.selectedRestorationSettlement(), .settled(.workspaceUnavailable))
-        }
-    }
-}
-
-/// §4.2/§4.3: `renameSession` on an initially unbound live tab attaches the sidebar index's preferred
-/// saved session (`boundSessionID` falls back to the index). The attached saved conversation must restore
-/// through the existing qualified loader, never strand the pane or save the empty placeholder over it.
-@MainActor
-extension AgentTranscriptRestorationLifecycleTests {
-    private func indexEntry(sessionID: UUID, tabID: UUID) -> AgentSessionIndexEntry {
-        AgentSessionIndexEntry(
-            id: sessionID, tabID: tabID, name: "Saved", lastUserMessageAt: Date(), savedAt: Date(),
-            lastRunStateRaw: nil, itemCount: 1, agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil,
-            autoEditEnabled: false, parentSessionID: nil, hasUnknownConversationContent: false,
-            isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
-        )
-    }
-
-    /// Seeds the index with the tab's preferred saved entry through the real refresh consumer.
-    private func seedPreferredIndexEntry(_ fixture: Fixture) async throws -> WorkspaceModel {
-        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
-        let entry = indexEntry(sessionID: fixture.sessionID, tabID: fixture.tabID)
-        let open = PrepareGate()
-        await open.open()
-        let builders = gatedSidebarIndexBuilders(open, entries: { [entry.id: entry] })
-        fixture.viewModel.test_setSidebarIndexBuilders(prioritized: builders.0, stream: builders.1)
-        fixture.viewModel.test_refreshSessionListCache(for: workspace)
-        await fixture.viewModel.test_waitForSessionListCacheRefresh()
-        XCTAssertEqual(fixture.viewModel.boundSessionID(for: fixture.tabID), fixture.sessionID, "precondition: index-preferred")
-        return workspace
-    }
-
-    private func savePersistedHistory(_ fixture: Fixture, workspace: WorkspaceModel) async throws {
-        var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
-        saved.composeTabID = fixture.tabID
-        saved.items = [AgentChatItemPersist(
-            from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Persisted history")
-        )]
-        _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: workspace)
-    }
-
-    private func persistedItemCount(_ fixture: Fixture, workspace: WorkspaceModel) async throws -> Int? {
-        try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: workspace)?.items.count
-    }
-
-    func testRenameAttachingIndexDerivedSavedSessionRestoresWithoutOverwritingHistory() async throws {
-        try await withSavedSelectedTab(bound: false) { fixture in
-            let viewModel = fixture.viewModel
-            let workspace = try await seedPreferredIndexEntry(fixture)
-            try await savePersistedHistory(fixture, workspace: workspace)
-            viewModel.setAgentModeActive(true)
-            let session = try XCTUnwrap(viewModel.sessions[fixture.tabID])
-            XCTAssertNil(session.activeAgentSessionID, "precondition: unbound live target")
-
-            viewModel.renameSession(tabID: fixture.tabID, to: "Renamed")
-            let activationGeneration = viewModel.test_sessionActivationGeneration
-            XCTAssertEqual(session.activeAgentSessionID, fixture.sessionID, "attached the index-derived saved session")
-            XCTAssertEqual(viewModel.test_ownerValidatedSessionIndex[fixture.sessionID]?.name, "Renamed", "rename applied")
-            // No placeholder save may replace the saved history, before or after restoration.
-            await viewModel.flushSave(for: fixture.tabID)
-            let countAfterRename = try await persistedItemCount(fixture, workspace: workspace)
-            XCTAssertEqual(countAfterRename, 1, "history not overwritten")
-
-            let loadTask = try XCTUnwrap(session.persistedLoadTask, "the existing qualified loader restores it")
-            await fixture.gate.waitUntilEntered()
-            XCTAssertEqual(viewModel.ui.transcript.snapshot.panePresentation, .restoring)
-            await fixture.gate.open()
-            await loadTask.value
-            await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
-            XCTAssertEqual(viewModel.ui.transcript.snapshot.panePresentation, .transcript)
-            XCTAssertEqual(session.items.map(\.text), ["Persisted history"])
-            await viewModel.flushSave(for: fixture.tabID)
-            let countAfterRestore = try await persistedItemCount(fixture, workspace: workspace)
-            XCTAssertEqual(countAfterRestore, 1)
-        }
-    }
-
-    /// Observable rename contract with the real prompt manager: the compose-tab name (display and save
-    /// authority) survives hydration and a later real save, and the saved history is retained.
-    func testRenameSurvivesHydrationAndLaterRealSaveWithPromptManager() async throws {
-        try await withRealObserverSavedTab(bound: false) { fixture in
-            let viewModel = fixture.viewModel
-            let entry = indexEntry(sessionID: fixture.sessionID, tabID: fixture.tabID)
-            let open = PrepareGate()
-            await open.open()
-            let builders = gatedSidebarIndexBuilders(open, entries: { [entry.id: entry] })
-            viewModel.test_setSidebarIndexBuilders(prioritized: builders.0, stream: builders.1)
-            var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
-            saved.composeTabID = fixture.tabID
-            saved.items = [AgentChatItemPersist(
-                from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Persisted history")
-            )]
-            _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
-            viewModel.setAgentModeActive(true)
-            await viewModel.handleWorkspaceSwitch(fixture.workspace)
-            await viewModel.test_waitForSessionListCacheRefresh()
-            XCTAssertEqual(viewModel.boundSessionID(for: fixture.tabID), fixture.sessionID, "precondition: index-preferred")
-            await fixture.prompt.switchComposeTab(fixture.tabID)
-            let session = viewModel.session(for: fixture.tabID)
-            XCTAssertNil(session.activeAgentSessionID, "precondition: unbound live target")
-            XCTAssertEqual(viewModel.currentTabID, fixture.tabID, "precondition: current target")
-
-            viewModel.renameSession(tabID: fixture.tabID, to: "Renamed")
-            let activationGeneration = viewModel.test_sessionActivationGeneration
-            await fixture.gate.waitUntilEntered()
-            let loadTask = try XCTUnwrap(session.persistedLoadTask)
-            await fixture.gate.open()
-            await loadTask.value
-            await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
-            XCTAssertEqual(session.items.map(\.text), ["Persisted history"])
-
-            // Display authority after hydration: the renamed compose tab, not the hydrated index name.
-            let tabs = fixture.prompt.currentComposeTabs
-            XCTAssertEqual(tabs.first { $0.id == fixture.tabID }?.name, "Renamed")
-            XCTAssertEqual(viewModel.agentChatsSidebarSessions(for: tabs).first { $0.tabID == fixture.tabID }?.title, "Renamed")
-
-            // A later real save persists the renamed authority with the history retained.
-            session.appendItem(AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "After rename"))
-            await viewModel.flushSave(for: fixture.tabID)
-            let persisted = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: fixture.workspace)
-            XCTAssertEqual(persisted?.name, "Renamed")
-            XCTAssertEqual(persisted?.items.count, 2, "history retained plus the new turn")
-        }
-    }
-
-    func testRenameOfNonCurrentEmptyTabNeverSavesPlaceholderOverHistory() async throws {
-        try await withSavedSelectedTab(bound: false) { fixture in
-            let viewModel = fixture.viewModel
-            let workspace = try await seedPreferredIndexEntry(fixture)
-            try await savePersistedHistory(fixture, workspace: workspace)
-            viewModel.setAgentModeActive(true)
-            let session = try XCTUnwrap(viewModel.sessions[fixture.tabID])
-            viewModel.test_setCurrentTabIDOverride(UUID())
-
-            viewModel.renameSession(tabID: fixture.tabID, to: "Renamed")
-            XCTAssertEqual(session.activeAgentSessionID, fixture.sessionID)
-            XCTAssertNil(session.persistedLoadTask, "not current: restores on selection, no load now")
-            XCTAssertFalse(session.hasLoadedPersistedState, "next activation loads the saved history")
-            await viewModel.flushSave(for: fixture.tabID)
-            let count = try await persistedItemCount(fixture, workspace: workspace)
-            XCTAssertEqual(count, 1, "history not overwritten")
-            viewModel.test_setCurrentTabIDOverride(fixture.tabID)
-        }
-    }
-
-    func testRenameWithLocalContentAttachesWithoutLoadingOverLocalItems() async throws {
-        try await withSavedSelectedTab(bound: false) { fixture in
-            let viewModel = fixture.viewModel
-            _ = try await seedPreferredIndexEntry(fixture)
-            viewModel.setAgentModeActive(true)
-            let session = try XCTUnwrap(viewModel.sessions[fixture.tabID])
-            let local = AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Local draft turn")
-            session.appendItem(local)
-
-            viewModel.renameSession(tabID: fixture.tabID, to: "Renamed")
-            XCTAssertNil(session.persistedLoadTask, "local content owns the scope; no disk load over it")
-            XCTAssertEqual(session.items.map(\.id), [local.id])
-            let entries = await fixture.gate.entries
-            XCTAssertEqual(entries, 0)
-        }
-    }
-
-    func testRejectedAttachmentStartsNoLoadForAnUnrelatedSession() async throws {
-        try await withSavedSelectedTab(bound: false) { fixture in
-            let viewModel = fixture.viewModel
-            var workspace = try await seedPreferredIndexEntry(fixture)
-            viewModel.setAgentModeActive(true)
-            let session = try XCTUnwrap(viewModel.sessions[fixture.tabID])
-            // Durable authority moved to an unrelated session after the live target materialized unbound:
-            // compare-and-set from the live (nil) binding is rejected.
-            let unrelatedSessionID = UUID()
-            workspace.composeTabs[0].activeAgentSessionID = unrelatedSessionID
-            fixture.manager.workspaces = [workspace]
-            fixture.manager.activeWorkspace = workspace
-
-            viewModel.renameSession(tabID: fixture.tabID, to: "Renamed")
-            XCTAssertNil(session.activeAgentSessionID, "attachment rejected")
-            XCTAssertNil(session.persistedLoadTask, "no load of an unrelated session")
-            let entries = await fixture.gate.entries
-            XCTAssertEqual(entries, 0)
         }
     }
 }
@@ -3609,6 +3444,266 @@ final class AgentSidebarRestoreStabilityTests: XCTestCase {
             XCTAssertFalse(viewModel.isSidebarOwnerPending)
             XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreBaseline?.owner.workspaceID, incoming.id)
             XCTAssertNotNil(viewModel.test_ownerValidatedSidebarRestoreBaseline?.entries[incomingTabID])
+        }
+    }
+}
+
+@MainActor
+extension AgentTranscriptRestorationLifecycleTests {
+    func testRejectedMCPRebindPreservesTranscriptAndPendingApproval() async throws {
+        try await withSavedSelectedTab { fixture in
+            let vm = fixture.viewModel
+            let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+            var saved = AgentSession(id: fixture.sessionID, name: "Existing", savedAt: Date())
+            saved.composeTabID = fixture.tabID
+            saved.items = [AgentChatItemPersist(from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Keep this transcript"))]
+            _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: workspace)
+            vm.setAgentModeActive(true)
+            let activation = vm.test_sessionActivationGeneration
+            await fixture.gate.waitUntilEntered()
+            let session = try XCTUnwrap(vm.sessions[fixture.tabID])
+            let load = try XCTUnwrap(session.persistedLoadTask)
+            await fixture.gate.open()
+            await load.value
+            await fixture.completions.wait(tabID: fixture.tabID, generation: activation)
+            let before = vm.makeTranscriptUISnapshot()
+            XCTAssertEqual(before.panePresentation, .transcript)
+            XCTAssertFalse(before.presentation.workingRows.isEmpty)
+            let binding = session.persistentSessionBindingIdentity
+            let transition = session.bindingTransitionGeneration
+            let approval = AgentApprovalRequest(
+                requestID: .codex(.int(7)), method: "item/commandExecution/requestApproval",
+                kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "pending"
+            )
+            session.pendingApproval = approval
+            vm.syncTranscriptUIState()
+            let incomingID = UUID()
+            var incoming = AgentSession(id: incomingID, name: "Incoming", savedAt: Date())
+            incoming.composeTabID = fixture.tabID
+            _ = try await AgentSessionDataService.shared.saveAgentSession(incoming, for: workspace)
+            let rebindGate = PrepareGate()
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                if id == incomingID { try await rebindGate.hold() }
+            }
+            // Real MCP routed activation suspends at payload preparation. The run starts waiting
+            // while suspended, so the post-prepare rebind rejects ownership after advancing currency.
+            let routed = Task { await vm.activateRoutedAgentSession(tabID: fixture.tabID, sessionID: incomingID, workspace: workspace) }
+            await rebindGate.waitUntilEntered()
+            session.runState = .waitingForApproval
+            await rebindGate.open()
+            let result = await routed.value
+            XCTAssertEqual(result, .blockedByActiveDifferentSession)
+            XCTAssertGreaterThan(session.bindingTransitionGeneration, transition)
+            XCTAssertEqual(session.persistentSessionBindingIdentity, binding)
+            XCTAssertFalse(session.bindingTransitionInProgress)
+            XCTAssertEqual(session.pendingApproval?.id, approval.id)
+            let after = vm.makeTranscriptUISnapshot()
+            XCTAssertEqual(after.panePresentation, .transcript)
+            XCTAssertEqual(after.presentation.workingRows.map(\.id), before.presentation.workingRows.map(\.id))
+            XCTAssertEqual(session.items.map(\.text), ["Keep this transcript"])
+            session.pendingApproval = nil
+            session.runState = .idle
+        }
+    }
+}
+
+@MainActor
+extension AgentSidebarRestoreStabilityTests {
+    func testDeadlineUnfreezesNestedSortedRowsWhileSelectedRestoreNeverSettles() async throws {
+        let deadline = PrepareGate()
+        let parentTabID = UUID()
+        let parentSessionID = UUID()
+        try await withSavedSelectedTab(additionalTabs: [ComposeTabState(id: parentTabID, name: "Parent", activeAgentSessionID: parentSessionID)], beforeSwitch: { vm in
+            let store = AgentWorkspaceSessionIndexStore(perfRecorder: vm.perfRecorder, restorationDeadlineWait: { try await deadline.hold() })
+            store.delegate = vm
+            vm.sessionIndexStore = store
+            guard let manager = vm.workspaceManager, let workspace = manager.activeWorkspace,
+                  let childTabID = workspace.activeComposeTabID,
+                  let childSessionID = workspace.composeTabs.first?.activeAgentSessionID else { return XCTFail("fixture owner") }
+            func entry(_ session: UUID, _ tab: UUID, parent: UUID?, date: Double) -> AgentSessionIndexEntry {
+                AgentSessionIndexEntry(id: session, tabID: tab, name: "Thread", lastUserMessageAt: Date(timeIntervalSince1970: date), savedAt: Date(timeIntervalSince1970: date), lastRunStateRaw: nil, itemCount: 1, agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil, autoEditEnabled: false, parentSessionID: parent, hasUnknownConversationContent: false, isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: [])
+            }
+            let entries = [childSessionID: entry(childSessionID, childTabID, parent: parentSessionID, date: 200), parentSessionID: entry(parentSessionID, parentTabID, parent: nil, date: 100)]
+            vm.test_setSidebarIndexBuilders(
+                prioritized: { _ in AgentSessionSidebarBuildResult(entriesBySessionID: entries, preferredSessionIDByTabID: [:]) },
+                stream: { _, _ in AsyncThrowingStream { continuation in
+                    continuation.yield(AgentSessionSidebarBuildBatch(entriesBySessionID: entries, preferredSessionIDByTabID: [:]))
+                    continuation.finish()
+                } }
+            )
+        }) { fixture in
+            let vm = fixture.viewModel
+            vm.setAgentModeActive(true)
+            await fixture.gate.waitUntilEntered()
+            await vm.test_waitForSessionListCacheRefresh()
+            XCTAssertNotNil(vm.test_ownerValidatedSidebarRestoreBaseline)
+            XCTAssertEqual(vm.test_ownerValidatedSidebarRestoreJoin?.selected.isSettled, false)
+            let newTabID = UUID()
+            var workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+            workspace.composeTabs.append(ComposeTabState(id: newTabID, name: "Newest"))
+            fixture.manager.workspaces = [workspace]
+            fixture.manager.activeWorkspace = workspace
+            vm.syncSidebarUIState(refresh: true, sidebarTabs: workspace.composeTabs)
+            @MainActor func displayedChatRows() -> [AgentModeViewModel.SidebarSession] {
+                vm.sidebarListProjection(
+                    workspaceID: workspace.id, composeTabs: workspace.composeTabs, stashedTabs: [],
+                    currentTabID: fixture.tabID, sidebarSnapshot: vm.ui.sessionSidebar.snapshot,
+                    archivedSessionsExpanded: false, showComposeTabsWithoutAgentSessions: true
+                ).filteredSessions
+            }
+            let frozen = displayedChatRows()
+            XCTAssertEqual(frozen.last?.tabID, newTabID, "baseline appends new chat")
+            XCTAssertTrue(frozen.allSatisfy { $0.depth == 0 })
+            let released = expectation(description: "deadline publishes unfrozen projection")
+            released.assertForOverFulfill = false
+            let subscription = vm.ui.sessionSidebar.$snapshot.dropFirst().sink { _ in
+                if vm.test_ownerValidatedSidebarRestoreBaseline == nil { released.fulfill() }
+            }
+            await deadline.open()
+            await fulfillment(of: [released], timeout: 1)
+            subscription.cancel()
+            XCTAssertNil(vm.test_ownerValidatedSidebarRestoreBaseline)
+            XCTAssertNil(vm.test_ownerValidatedSidebarRestoreJoin)
+            let rows = displayedChatRows()
+            XCTAssertEqual(rows.first?.tabID, newTabID, "new chat sorts rather than appends")
+            XCTAssertEqual(rows.first { $0.tabID == fixture.tabID }?.depth, 1, "saved child nests under parent")
+            XCTAssertEqual(rows.first { $0.tabID == parentTabID }?.hasThreadChildren, true)
+            XCTAssertEqual(vm.makeTranscriptUISnapshot().panePresentation, .restoring, "deadline does not fake transcript settlement")
+            let load = try XCTUnwrap(vm.sessions[fixture.tabID]?.persistedLoadTask)
+            await fixture.gate.open()
+            await load.value
+            XCTAssertNil(vm.test_ownerValidatedSidebarRestoreBaseline, "late completion never refreezes")
+        }
+        await deadline.open()
+    }
+}
+
+@MainActor
+extension AgentSidebarRestoreStabilityTests {
+    /// The actual refresh stream never finishes before expiry. Selected projection may be settled
+    /// or remain held too; neither can make the positional baseline permanent.
+    func testDeadlineUnfreezesRealPendingIndexWithSettledOrPendingSelectedRestore() async throws {
+        for selectedSettled in [true, false] {
+            let deadline = PrepareGate()
+            let indexGate = PrepareGate()
+            let parentTabID = UUID()
+            let parentSessionID = UUID()
+            let oldProducerFinished = expectation(description: "held index producer drained")
+            oldProducerFinished.assertForOverFulfill = false
+            try await withSavedSelectedTab(
+                additionalTabs: [ComposeTabState(id: parentTabID, name: "Parent", activeAgentSessionID: parentSessionID)],
+                beforeSwitch: { vm in
+                    let store = AgentWorkspaceSessionIndexStore(perfRecorder: vm.perfRecorder, restorationDeadlineWait: { try await deadline.hold() })
+                    store.delegate = vm
+                    vm.sessionIndexStore = store
+                    guard let workspace = vm.workspaceManager?.activeWorkspace,
+                          let childTabID = workspace.activeComposeTabID,
+                          let childSessionID = workspace.composeTabs.first?.activeAgentSessionID else { return XCTFail("fixture owner") }
+                    func entry(_ id: UUID, _ tab: UUID, parent: UUID?) -> AgentSessionIndexEntry {
+                        AgentSessionIndexEntry(id: id, tabID: tab, name: "Provisional", lastUserMessageAt: Date(timeIntervalSince1970: 100), savedAt: Date(timeIntervalSince1970: 100), lastRunStateRaw: nil, itemCount: 1, agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil, autoEditEnabled: false, parentSessionID: parent, hasUnknownConversationContent: false, isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: [])
+                    }
+                    let entries = [childSessionID: entry(childSessionID, childTabID, parent: parentSessionID), parentSessionID: entry(parentSessionID, parentTabID, parent: nil)]
+                    vm.test_setSidebarIndexBuilders(
+                        prioritized: { _ in AgentSessionSidebarBuildResult(entriesBySessionID: entries, preferredSessionIDByTabID: [:]) },
+                        stream: { _, _ in AsyncThrowingStream { continuation in
+                            let task = Task {
+                                do {
+                                    try await indexGate.hold()
+                                    continuation.yield(AgentSessionSidebarBuildBatch(entriesBySessionID: entries, preferredSessionIDByTabID: [:]))
+                                    continuation.finish()
+                                } catch { continuation.finish(throwing: error) }
+                                oldProducerFinished.fulfill()
+                            }
+                            continuation.onTermination = { _ in task.cancel() }
+                        } }
+                    )
+                }
+            ) { fixture in
+                let vm = fixture.viewModel
+                let workspaceBefore = try XCTUnwrap(fixture.manager.activeWorkspace)
+                var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
+                saved.composeTabID = fixture.tabID
+                saved.parentSessionID = parentSessionID
+                saved.items = [AgentChatItemPersist(from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Saved rows"))]
+                _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: workspaceBefore)
+                vm.setAgentModeActive(true)
+                let activation = vm.test_sessionActivationGeneration
+                await fixture.gate.waitUntilEntered()
+                await indexGate.waitUntilEntered()
+                let load = try XCTUnwrap(vm.sessions[fixture.tabID]?.persistedLoadTask)
+                if selectedSettled {
+                    await fixture.gate.open()
+                    await load.value
+                    await fixture.completions.wait(tabID: fixture.tabID, generation: activation)
+                }
+                XCTAssertEqual(vm.test_ownerValidatedSidebarRestoreJoin?.selected.isSettled, selectedSettled)
+                XCTAssertEqual(vm.test_ownerValidatedSidebarRestoreJoin?.index.isTerminal, false)
+                XCTAssertFalse(vm.test_ownerValidatedSessionListCacheReady)
+                let newTabID = UUID()
+                var workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+                workspace.composeTabs.append(ComposeTabState(id: newTabID, name: "Newest"))
+                fixture.manager.workspaces = [workspace]
+                fixture.manager.activeWorkspace = workspace
+                vm.syncSidebarUIState(refresh: true, sidebarTabs: workspace.composeTabs)
+                @MainActor func displayedRows() -> [AgentModeViewModel.SidebarSession] {
+                    vm.sidebarListProjection(
+                        workspaceID: workspace.id, composeTabs: workspace.composeTabs, stashedTabs: [],
+                        currentTabID: fixture.tabID, sidebarSnapshot: vm.ui.sessionSidebar.snapshot,
+                        archivedSessionsExpanded: false, showComposeTabsWithoutAgentSessions: true
+                    ).filteredSessions
+                }
+                XCTAssertEqual(displayedRows().last?.tabID, newTabID)
+                XCTAssertTrue(displayedRows().allSatisfy { $0.depth == 0 })
+                let released = expectation(description: "pending-index deadline release")
+                let subscription = vm.ui.sessionSidebar.$snapshot.dropFirst().sink { _ in
+                    if vm.test_ownerValidatedSidebarRestoreBaseline == nil { released.fulfill() }
+                }
+                await deadline.open()
+                await fulfillment(of: [released], timeout: 1)
+                subscription.cancel()
+                XCTAssertNil(vm.test_ownerValidatedSidebarRestoreBaseline)
+                XCTAssertNil(vm.test_ownerValidatedSidebarRestoreJoin)
+                XCTAssertFalse(vm.test_ownerValidatedSessionListCacheReady, "expiry cannot claim index success")
+                XCTAssertEqual(displayedRows().first?.tabID, newTabID)
+                XCTAssertEqual(displayedRows().first { $0.tabID == fixture.tabID }?.depth, 1)
+                XCTAssertEqual(displayedRows().first { $0.tabID == parentTabID }?.hasThreadChildren, true)
+                if !selectedSettled {
+                    XCTAssertEqual(vm.makeTranscriptUISnapshot().panePresentation, .restoring, "neither producer was settled by expiry")
+                }
+                if selectedSettled {
+                    // Valid late completion goes through the real VM token/owner path.
+                    await indexGate.open()
+                    await fulfillment(of: [oldProducerFinished], timeout: 1)
+                    await vm.test_waitForSessionListCacheRefresh()
+                    XCTAssertTrue(vm.test_ownerValidatedSessionListCacheReady)
+                    XCTAssertEqual(vm.sessionIndexStore.ownerValidatedSessionIndex[fixture.sessionID]?.parentSessionID, parentSessionID)
+                } else {
+                    // Replace the still-held refresh; a canceled old stream may not undo the new
+                    // projection or readiness after the deadline has removed its join.
+                    vm.setAgentModeActive(false)
+                    let replacement = AgentSessionIndexEntry(id: fixture.sessionID, tabID: fixture.tabID, name: "Replacement", lastUserMessageAt: Date(), savedAt: Date(), lastRunStateRaw: nil, itemCount: 1, agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil, autoEditEnabled: false, parentSessionID: parentSessionID, hasUnknownConversationContent: false, isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: [])
+                    vm.test_setSidebarIndexBuilders(
+                        prioritized: { _ in AgentSessionSidebarBuildResult(entriesBySessionID: [replacement.id: replacement], preferredSessionIDByTabID: [:]) },
+                        stream: { _, _ in AsyncThrowingStream { continuation in
+                            continuation.yield(AgentSessionSidebarBuildBatch(entriesBySessionID: [replacement.id: replacement], preferredSessionIDByTabID: [:]))
+                            continuation.finish()
+                        } }
+                    )
+                    vm.setAgentModeActive(true)
+                    await vm.test_waitForSessionListCacheRefresh()
+                    XCTAssertTrue(vm.test_ownerValidatedSessionListCacheReady)
+                    await indexGate.open()
+                    await fulfillment(of: [oldProducerFinished], timeout: 1)
+                    await vm.test_waitForSessionListCacheRefresh()
+                    XCTAssertTrue(vm.test_ownerValidatedSessionListCacheReady)
+                    XCTAssertEqual(vm.sessionIndexStore.ownerValidatedSessionIndex[fixture.sessionID]?.name, "Replacement", "old full batch cannot overwrite successor metadata")
+                }
+                await fixture.gate.open()
+                await load.value
+                XCTAssertNil(vm.test_ownerValidatedSidebarRestoreBaseline, "late producers never rearm positional restoration")
+            }
+            await deadline.open()
+            await indexGate.open()
         }
     }
 }

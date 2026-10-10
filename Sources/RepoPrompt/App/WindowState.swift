@@ -318,6 +318,10 @@ class WindowState: ObservableObject {
     /// Installed only by `setWorkspaceInstanceAssignment(_:)`; never allocated here.
     @Published private(set) var workspaceInstanceAssignment: WorkspaceInstanceAssignment?
 
+    /// Durable restorable identity is separate from the fail-closed live routing pair. Never mix
+    /// an incoming workspace's metadata with an outgoing assignment during publication/listener gaps.
+    private var lastCoherentSessionEntry: WindowSessionEntry?
+
     /// The instance number for the current workspace; nil while the assignment belongs to another.
     var workspaceInstanceNumber: Int? {
         workspaceManager.activeWorkspaceID.flatMap { workspaceInstanceNumber(for: $0) }
@@ -340,6 +344,7 @@ class WindowState: ObservableObject {
             else { return }
         }
         workspaceInstanceAssignment = assignment
+        refreshCoherentSessionEntry()
         requestWindowTitleUpdate(reason: .workspaceChanged)
     }
 
@@ -821,6 +826,7 @@ class WindowState: ObservableObject {
         // recovered, or cancelled) requests reevaluation after the switching flag clears.
         workspaceManager.$activeWorkspaceID
             .sink { [weak self] workspaceID in
+                self?.noteActiveWorkspacePublishedForCapture(workspaceID)
                 self?.noteActiveWorkspacePublishedForTitle(workspaceID)
             }
             .store(in: &cancellables)
@@ -1795,6 +1801,46 @@ class WindowState: ObservableObject {
         // Default fallback, which would discard the user's real window layout.
     }
 
+    /// Clear on an actual published departure, not a later capture/switch-flag observation. A
+    /// System/ephemeral/unloaded stop must not resurrect an older persistent identity on return.
+    private func noteActiveWorkspacePublishedForCapture(_ workspaceID: UUID?) {
+        guard let workspaceID else {
+            lastCoherentSessionEntry = nil
+            return
+        }
+        if let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+           workspace.isSystemWorkspace || workspace.isEphemeral
+        {
+            lastCoherentSessionEntry = nil
+        }
+    }
+
+    private func makeLiveSessionEntry(for workspace: WorkspaceModel) -> WindowSessionEntry {
+        WindowSessionEntry(
+            windowKind: kind,
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            isSystemWorkspace: workspace.isSystemWorkspace,
+            isEphemeral: workspace.isEphemeral,
+            primaryRepoPath: workspace.repoPaths.first.map { ($0 as NSString).expandingTildeInPath },
+            lastFocused: isCurrentlyFocused,
+            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
+        )
+    }
+
+    /// Assignment installation captures immediately, even if no ordinary persist happened before
+    /// the next switch. Nil during termination leaves the last complete persistent entry intact.
+    private func refreshCoherentSessionEntry() {
+        guard let workspace = workspaceManager.activeWorkspace,
+              !workspace.isSystemWorkspace, !workspace.isEphemeral
+        else {
+            lastCoherentSessionEntry = nil
+            return
+        }
+        guard workspaceInstanceNumber(for: workspace.id) != nil else { return }
+        lastCoherentSessionEntry = makeLiveSessionEntry(for: workspace)
+    }
+
     /// This window's session-capture decision, computed from the authoritative live selection.
     /// Explicit-close exclusion and persistence gating stay in `WindowStatesManager`, so a
     /// closing window still reports its candidate here.
@@ -1816,19 +1862,17 @@ class WindowState: ObservableObject {
             guard let workspace else {
                 return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
             }
-            let primaryPath = workspace.repoPaths.first.map { repoPath in
-                (repoPath as NSString).expandingTildeInPath
+            if !workspace.isSystemWorkspace, !workspace.isEphemeral,
+               workspaceInstanceNumber(for: workspace.id) == nil
+            {
+                // No coherent identity yet: retain all outgoing durable metadata (or omit), while
+                // live MCP diagnostics continue reporting the incoming workspace with null number.
+                var retained = lastCoherentSessionEntry
+                retained?.lastFocused = isCurrentlyFocused
+                return WindowSessionCaptureCandidate(windowID: windowID, entry: retained)
             }
-            let entry = WindowSessionEntry(
-                windowKind: kind,
-                workspaceID: workspace.id,
-                workspaceName: workspace.name,
-                isSystemWorkspace: workspace.isSystemWorkspace,
-                isEphemeral: workspace.isEphemeral,
-                primaryRepoPath: primaryPath,
-                lastFocused: isCurrentlyFocused,
-                workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
-            )
+            let entry = makeLiveSessionEntry(for: workspace)
+            lastCoherentSessionEntry = workspace.isSystemWorkspace || workspace.isEphemeral ? nil : entry
             return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
         }
     }

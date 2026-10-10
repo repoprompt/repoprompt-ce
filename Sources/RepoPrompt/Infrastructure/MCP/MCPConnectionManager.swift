@@ -2303,17 +2303,32 @@ actor ServerNetworkManager {
         return (UserDefaults.standard.object(forKey: "mcp.preserveOnePerClient") as? Bool) ?? true
     }
 
-    /// 🆕 Task-local keys to expose current routing hints inside tool calls
-    @TaskLocal
-    static var currentConnectionID: UUID?
-    @TaskLocal
-    static var currentProgressState: MCPRequestProgressContext?
-    @TaskLocal
-    static var currentTabContextHint: MCPServerViewModel.TabContextHint?
-    @TaskLocal
-    static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
-    @TaskLocal
-    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+    /// 🆕 Task-local keys to expose current routing hints inside tool calls.
+    /// Boxed so macOS 14 never runs the miscompiled back-deployed `withValue` fallback (#1039).
+    static let currentConnectionIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
+    static var currentConnectionID: UUID? {
+        currentConnectionIDTaskLocal.get()
+    }
+
+    static let currentProgressStateTaskLocal = BoxedTaskLocal<MCPRequestProgressContext?>(nil)
+    static var currentProgressState: MCPRequestProgressContext? {
+        currentProgressStateTaskLocal.get()
+    }
+
+    static let currentTabContextHintTaskLocal = BoxedTaskLocal<MCPServerViewModel.TabContextHint?>(nil)
+    static var currentTabContextHint: MCPServerViewModel.TabContextHint? {
+        currentTabContextHintTaskLocal.get()
+    }
+
+    static let currentToolDispatchAuthorizationTaskLocal = BoxedTaskLocal<ToolDispatchAuthorization?>(nil)
+    static var currentToolDispatchAuthorization: ToolDispatchAuthorization? {
+        currentToolDispatchAuthorizationTaskLocal.get()
+    }
+
+    static let currentExplicitWindowRoutingHintTaskLocal = BoxedTaskLocal<MCPExplicitWindowRoutingHint?>(nil)
+    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint? {
+        currentExplicitWindowRoutingHintTaskLocal.get()
+    }
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -3524,17 +3539,17 @@ actor ServerNetworkManager {
         // supplies a new one for a new top-level request.
         let effectiveProgressState = progressContext
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
-        return try await $currentProgressState.withValue(effectiveProgressState) {
+        return try await currentProgressStateTaskLocal.withValue(effectiveProgressState) {
             #if DEBUG || EDIT_FLOW_PERF
                 let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
                 guard let effectiveLifecycleCorrelation else {
-                    return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                    return try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
                 }
-                return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
-                    try await $currentConnectionID.withValue(connectionID, operation: operation)
+                return try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(effectiveLifecycleCorrelation) {
+                    try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
                 }
             #else
-                return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                return try await currentConnectionIDTaskLocal.withValue(connectionID, operation: operation)
             #endif
         }
     }
@@ -13319,7 +13334,7 @@ actor ServerNetworkManager {
                             lifecycleCorrelation: lifecycleCorrelation,
                             progressHandle: capturedProgressState
                         ) {
-                            await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
+                            await Self.currentTabContextHintTaskLocal.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
                                     EditFlowPerf.Dimensions(toolName: toolName)
@@ -14865,8 +14880,8 @@ actor ServerNetworkManager {
                                                 windowIdentity: windowDispatchIdentity,
                                                 recordScope: shouldTrackToolOwnership
                                             ) {
-                                                try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
-                                                    let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                try await Self.currentToolDispatchAuthorizationTaskLocal.withValue(dispatchAuthorization) {
+                                                    let value = try await Self.currentExplicitWindowRoutingHintTaskLocal.withValue(explicitWindowRoutingHint) {
                                                         try await EditFlowPerf.measure(
                                                             EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                             EditFlowPerf.Dimensions(toolName: toolName)

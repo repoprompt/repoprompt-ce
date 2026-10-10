@@ -345,6 +345,9 @@ enum HistoryMCPToolService {
                         : "This session file exceeds the safe history read limit."
                 ))
             }
+            if case .sessionAuthorityViolation = error {
+                return .error(HistoryErrorReply(error: error.localizedDescription, retryable: false))
+            }
             throw error
         }
         let transcript = loaded.transcript
@@ -965,7 +968,7 @@ enum HistoryMCPToolService {
         switch error {
         case .sessionFileNotFound:
             return sessionReadFailureDiagnostic(phase: phase)
-        case .transcriptDecodingFailed:
+        case .transcriptDecodingFailed, .sessionAuthorityViolation:
             return sessionReadFailureDiagnostic(phase: phase, retryable: false)
         case let .workBudgetExceeded(diagnostic):
             return diagnostic

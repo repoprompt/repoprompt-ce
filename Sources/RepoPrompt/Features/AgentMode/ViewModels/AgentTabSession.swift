@@ -308,6 +308,17 @@ final class AgentTabSession: ObservableObject {
     var mcpStateObservationCancellable: AnyCancellable?
     var mcpControlCleanupTask: Task<Void, Never>?
     var mcpControlActivationGeneration: UInt64 = 0
+    private(set) var codexComputerUseOwnershipTransitionHolds: Set<UUID> = []
+    var codexComputerUseRevocationDepth = 0
+
+    /// A scoped eligibility fence, not link authority. Independent ownership transitions cannot
+    /// release each other's hold, and a rebound endpoint still releases its captured session.
+    func holdCodexComputerUseAdmission() -> @MainActor () -> Void {
+        let token = UUID()
+        codexComputerUseOwnershipTransitionHolds.insert(token)
+        return { [weak self] in self?.codexComputerUseOwnershipTransitionHolds.remove(token) }
+    }
+
     var mcpFollowUpRunPendingUpdatedAt: Date?
     var mcpFollowUpRunPending: Bool = false {
         didSet {
@@ -622,6 +633,8 @@ final class AgentTabSession: ObservableObject {
         let origin: CodexFallbackOrigin
         let dispatchTicket: UInt64?
         var stopFence: AgentRunStartStopFence?
+        /// Explicit composer provenance; absent/internal contexts never inherit companion access.
+        var isLocalUserInput: Bool = false
     }
 
     struct CodexFallbackBlockingTurn: Equatable {
@@ -1206,9 +1219,12 @@ final class AgentTabSession: ObservableObject {
         var capabilities: CodexCapabilitySettings = .disabled
     }
 
+    // In-memory authority for this chat, never written to AgentSession persistence. Runtime
+    // reconnects and ownership transitions may reuse it; session shutdown and explicit off revoke it.
+    var codexComputerUseArmingRequestID: UUID?
     var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?
     var codexControllerFeatureState: CodexControllerFeatureState?
-    var wantsCodexComputerUseForNextTurn: Bool {
+    var isCodexComputerUseArmed: Bool {
         pendingCodexComputerUseActivation != nil
     }
 

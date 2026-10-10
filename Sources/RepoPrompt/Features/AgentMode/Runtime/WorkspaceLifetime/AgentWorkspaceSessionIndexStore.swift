@@ -136,8 +136,8 @@ struct AgentSidebarRestoreBaseline: Equatable {
     }
 }
 
-/// Two-sided restore join (§5.2/§5.5): the baseline is released only once the owner's index
-/// transaction and the initially selected restoration are both terminal.
+/// Two-sided restore join (§5.2/§5.5): normal release waits for index and selection.
+/// A bounded positional deadline may release the baseline without settling either producer.
 struct AgentSidebarRestoreJoin: Equatable {
     enum IndexOutcome: Equatable {
         case success
@@ -261,8 +261,16 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
 final class AgentWorkspaceSessionIndexStore: ObservableObject {
     private let perfRecorder: any AgentModePerfRecording
 
-    init(perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
+    private let restorationDeadlineWait: @Sendable () async throws -> Void
+
+    init(
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
+        restorationDeadlineWait: @escaping @Sendable () async throws -> Void = {
+            try await Task.sleep(for: .seconds(10))
+        }
+    ) {
         self.perfRecorder = perfRecorder
+        self.restorationDeadlineWait = restorationDeadlineWait
     }
 
     /// Owner epoch tracking which workspace activation produced the current
@@ -322,6 +330,30 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// Index/selected join gating the baseline's single release.
     private(set) var sidebarRestoreJoin: AgentSidebarRestoreJoin?
     private var sidebarRestoreBaselineRevision: UInt64 = 0
+    /// Armed once at owner installation; same-owner refreshes never extend the ten-second bound.
+    private var sidebarRestoreDeadlineTask: Task<Void, Never>?
+
+    deinit {
+        sidebarRestoreDeadlineTask?.cancel()
+    }
+
+    private func armSidebarRestoreDeadline(for owner: SessionIndexOwner) {
+        let wait = restorationDeadlineWait
+        sidebarRestoreDeadlineTask = Task { [weak self] in
+            do {
+                try await wait()
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.releaseSidebarRestore(owner: owner, allowIncomplete: true)
+        }
+    }
+
+    private func cancelSidebarRestoreDeadline() {
+        sidebarRestoreDeadlineTask?.cancel()
+        sidebarRestoreDeadlineTask = nil
+    }
 
     // MARK: - Workspace switch / owner creation
 
@@ -439,6 +471,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
         now: Date = Date(),
         calendar: Calendar = .current
     ) {
+        cancelSidebarRestoreDeadline()
         suppressDelegateNotifications = true
         defer {
             suppressDelegateNotifications = false
@@ -471,6 +504,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
                 // No selection has nothing to restore: settle immediately (§5.5).
                 selected: selectedTabID == nil ? .settled(.restoration(.noSelection)) : .discovering
             )
+            armSidebarRestoreDeadline(for: owner)
         } else {
             sidebarRestoreBaseline = nil
             sidebarRestoreJoin = nil
@@ -559,22 +593,35 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
         guard sidebarRestoreBaseline != nil || sidebarRestoreJoin != nil else { return }
         if let owner, sidebarRestoreBaseline?.owner != owner { return }
         let hadBaseline = sidebarRestoreBaseline != nil
+        cancelSidebarRestoreDeadline()
         sidebarRestoreBaseline = nil
         sidebarRestoreJoin = nil
         guard hadBaseline, !suppressDelegateNotifications else { return }
         delegate?.sessionIndexStore(self, didChangeStateWithReason: .restoreProjection)
     }
 
-    /// One non-suspending release once both sides are terminal (§5.6): revalidate the owner, apply the
-    /// latest local overlay to the staged entries, install index, dates, readiness and baseline
-    /// removal under suppression, then notify exactly once.
     private func releaseSidebarRestoreIfSettled() {
-        guard let join = sidebarRestoreJoin,
-              join.isReleasable,
-              let owner = sidebarRestoreBaseline?.owner,
-              isOwnerCurrent(owner),
-              case let .terminal(_, _, entries, ready) = join.index
+        guard let owner = sidebarRestoreBaseline?.owner else { return }
+        releaseSidebarRestore(owner: owner, allowIncomplete: false)
+    }
+
+    /// One non-suspending transaction for normal settlement or positional expiry. Expiry preserves
+    /// provisional metadata and honest readiness; it does not settle/cancel index or transcript work.
+    private func releaseSidebarRestore(owner: SessionIndexOwner, allowIncomplete: Bool) {
+        guard let join = currentJoin(for: owner),
+              allowIncomplete || join.isReleasable
         else { return }
+        let entries: [UUID: AgentSessionIndexEntry]
+        let ready: Bool
+        switch join.index {
+        case let .terminal(_, _, staged, stagedReady):
+            entries = staged
+            ready = stagedReady
+        case .pending, .deferred:
+            entries = sessionIndex
+            ready = false
+        }
+        cancelSidebarRestoreDeadline()
         do {
             let wasSuppressed = suppressDelegateNotifications
             suppressDelegateNotifications = true

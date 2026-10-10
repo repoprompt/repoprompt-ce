@@ -7,8 +7,10 @@ extension AgentModeViewModel {
         let session = activeSession
         let paneInput = transcriptPaneInput(tabID: tabID, session: session)
         let scopedPresentation = scopedActiveTranscriptPresentation(for: tabID)
-        // Committed content of another scope never survives a target replacement (§4.5).
-        let presentation = activeTranscriptContentScopeMismatches(paneInput.target)
+        // Existing rows/history survive a rejected operation, not a content-identity replacement.
+        let canPresentExistingTranscript = paneInput.content?.canPresentExistingTranscript(for: paneInput.target) == true
+        let contentScopeMismatches = activeTranscriptContentScopeMismatches(paneInput.target)
+        let presentation = contentScopeMismatches && !canPresentExistingTranscript
             ? AgentTranscriptPresentationSnapshot(revision: scopedPresentation.revision)
             : scopedPresentation
         return AgentTranscriptUISnapshot(
@@ -21,7 +23,7 @@ extension AgentModeViewModel {
             activeBashLiveExecutionByItemID: activeBashLiveExecutionByItemID,
             runtimeFooterByItemID: agentMessageRuntimeFooters(for: tabID),
             fallbackFollowArmingState: session?.transcriptAutoFollowArmingState ?? .armed,
-            archivedBlocks: session?.archivedTranscriptSnapshot.blocks ?? [],
+            archivedBlocks: canPresentExistingTranscript ? session?.archivedTranscriptSnapshot.blocks ?? [] : [],
             panePresentation: AgentTranscriptPanePresentation.resolve(paneInput)
                 // Nil rejects stale candidate evidence; it never authorizes welcome (§4.5).
                 ?? .restoring,

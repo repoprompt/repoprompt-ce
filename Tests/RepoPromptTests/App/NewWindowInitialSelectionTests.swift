@@ -641,6 +641,10 @@ import XCTest
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                     XCTAssertEqual(route.rootRoute, .main)
                     XCTAssertNil(window.protectedRestoreEntryForTesting)
+                    // This composition fixture deliberately never registers a window manager.
+                    // Durable capture needs a qualified assignment; selection alone cannot invent it.
+                    XCTAssertNil(window.sessionCaptureCandidate().entry)
+                    window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                     XCTAssertEqual(
                         window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
@@ -667,6 +671,8 @@ import XCTest
                 // observer's RunLoop delivery lands after the acceptance. The setter publishes
                 // synchronously; a requested switch suspends and could let the observer drain first.
                 manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                // Unregistered fixture: install the otherwise manager-owned coherent assignment.
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.aardvarkID, number: 1))
                 let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                 let restored = Signal("restore completion")
                 window.applyWindowRestoreEntry(entry) { restored.fire() }
@@ -691,6 +697,9 @@ import XCTest
                 XCTAssertEqual(restored.count, 1)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                 XCTAssertNil(window.protectedRestoreEntryForTesting, "Post-acceptance selection releases protection")
+                XCTAssertNil(window.workspaceInstanceNumber(for: Fixture.requestedID))
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.aardvarkID, "durable identity waits for assignment")
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                 XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
             }
         }
@@ -790,26 +799,57 @@ import XCTest
 
         // MARK: 8. Non-System namesake is never automatically activated
 
-        func testInitialDefaultRejectsNonSystemNamesake() async throws {
-            try await Fixture.run(seeds: Fixture.namesakeSeeds) { f in
-                let window = f.makeWindow()
-                let manager = window.workspaceManager
-                await manager.awaitInitialWorkspaceActivationCompletion()
-                await manager.awaitInitialized()
-                try await f.awaitCatalogProjection(window)
-                XCTAssertNil(manager.activeWorkspaceID)
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "initial_default_selection")
-                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.workspaceID, Fixture.namesakeID)
-                let namesake = try XCTUnwrap(manager.workspace(withID: Fixture.namesakeID))
-                XCTAssertFalse(namesake.isSystemWorkspace, "Namesake is not reclassified")
-                XCTAssertEqual(namesake.name, "Default")
-                let canonical = await f.runtime.workspaceStore.snapshot()
-                XCTAssertEqual(
-                    canonical.workspaces.first { $0.document.workspaceID == Fixture.namesakeID }?.document.metadata.isSystemWorkspace,
-                    false
-                )
-                let result = await manager.requestWorkspaceSwitch(to: namesake)
-                XCTAssertTrue(result.didSwitch, "Explicit activation of the user namesake stays allowed: \(result)")
+        func testInitialDefaultUsesSystemIdentityInsteadOfNamesake() async throws {
+            // Cover both creation beside a user namesake and reuse of a differently named System.
+            for seeds in [
+                Fixture.namesakeSeeds,
+                Fixture.namesakeSeeds + [Fixture.model(id: Fixture.defaultID, name: "System", isSystem: true)]
+            ] {
+                try await Fixture.run(seeds: seeds) { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    try await f.awaitCatalogProjection(window)
+                    let system = try XCTUnwrap(manager.activeWorkspace)
+                    XCTAssertTrue(system.isSystemWorkspace)
+                    XCTAssertNotEqual(system.id, Fixture.namesakeID)
+                    XCTAssertNil(manager.domainWorkspaceAuthorityIssue, "A user namesake is not an authority failure")
+                    if seeds.contains(where: \.isSystemWorkspace) {
+                        XCTAssertEqual(system.id, Fixture.defaultID, "Reuse System regardless of its display name")
+                        XCTAssertEqual(manager.workspaces.count, seeds.count, "Do not create a duplicate System")
+                    } else {
+                        XCTAssertEqual(manager.workspaces.count, seeds.count + 1, "Create System without replacing the user namesake")
+                    }
+                    let namesake = try XCTUnwrap(manager.workspace(withID: Fixture.namesakeID))
+                    XCTAssertFalse(namesake.isSystemWorkspace, "Namesake is not reclassified")
+                    XCTAssertEqual(namesake.name, "Default")
+                    let canonical = await f.runtime.workspaceStore.snapshot()
+                    XCTAssertEqual(
+                        canonical.workspaces.first { $0.document.workspaceID == Fixture.namesakeID }?.document.metadata.isSystemWorkspace,
+                        false
+                    )
+                    let result = await manager.requestWorkspaceSwitch(to: namesake)
+                    XCTAssertTrue(result.didSwitch, "Explicit activation of the user namesake stays allowed: \(result)")
+                }
+            }
+
+            // The bridge's initial catalog candidate uses the same identity rule and supplied order.
+            try await Fixture.run(seeds: []) { f in
+                let namesake = Fixture.model(id: Fixture.namesakeID, name: "Default")
+                let system = Fixture.model(id: Fixture.defaultID, name: "System", isSystem: true)
+                for hasSystem in [false, true] {
+                    let manager = f.makeManager()
+                    manager.workspaces = hasSystem ? [namesake, system] : [namesake]
+                    let candidate = try XCTUnwrap(manager.runtimeOwnedDefaultWorkspaceCandidate())
+                    XCTAssertTrue(candidate.isSystemWorkspace)
+                    XCTAssertNotEqual(candidate.id, namesake.id)
+                    XCTAssertEqual(manager.workspaces.count, 2)
+                    XCTAssertEqual(manager.workspace(withID: namesake.id), namesake, "User namesake stays unchanged")
+                    if hasSystem {
+                        XCTAssertEqual(candidate.id, system.id)
+                    }
+                }
             }
 
             // A gate-time classification change is caught by the publication recheck.
@@ -894,6 +934,7 @@ import XCTest
             try await Fixture.run(seeds: Fixture.twoSystemSeeds) { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
+                let resolution = f.holdInitialResolution(manager)
                 let hydration = f.holdHydrationSpawn(manager, of: Fixture.defaultID)
                 let recoveryGate = f.makeGate()
                 let recoveryEntered = Signal("startup recovery began")
@@ -902,9 +943,20 @@ import XCTest
                     await recoveryGate.wait()
                 }
                 let recorder = f.makeRecorder(manager: manager)
+                try await f.wait(resolution.entered)
+                try await f.awaitCatalogProjection(window)
+                // Startup now uses the first System, not the name "Default". Supply Default first
+                // for startup, then move the other System first to keep recovery discriminating.
+                let defaultIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.defaultID })
+                let startupSystem = manager.workspaces.remove(at: defaultIndex)
+                manager.workspaces.insert(startupSystem, at: 0)
+                resolution.gate.release()
                 try await f.wait(hydration.entered)
                 try await f.awaitCatalogProjection(window)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID, "startup published before recovery")
+                let otherIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.earlierSystemID })
+                let recoverySystem = manager.workspaces.remove(at: otherIndex)
+                manager.workspaces.insert(recoverySystem, at: 0)
 
                 let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                 let closeCompleted = Signal("pending restore completed by close during recovery")

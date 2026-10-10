@@ -97,6 +97,7 @@ final class ClaudeCodeProvider: AIProvider {
     private let defaultRequestTimeout: TimeInterval
     private let testRequestTimeout: TimeInterval
     private let maxRetries: Int
+    private let livenessHeartbeatInterval: TimeInterval
     private let initialBackoff: TimeInterval = 1.0
     private let maxBackoff: TimeInterval = 8.0
 
@@ -108,7 +109,8 @@ final class ClaudeCodeProvider: AIProvider {
         testRequestTimeout: TimeInterval? = nil,
         maxRetries: Int? = nil,
         logCollector: CLIProcessLogCollector? = nil,
-        runner: CLIProcessRunner? = nil
+        runner: CLIProcessRunner? = nil,
+        livenessHeartbeatInterval: TimeInterval = ProviderTransportActivity.pendingCompletionHeartbeatInterval
     ) {
         var config = CLIProcessConfiguration(
             workingDirectory: workingDirectory,
@@ -129,23 +131,14 @@ final class ClaudeCodeProvider: AIProvider {
         self.defaultRequestTimeout = resolvedDefaultTimeout
         self.testRequestTimeout = resolvedTestTimeout
         self.maxRetries = resolvedRetries
+        self.livenessHeartbeatInterval = livenessHeartbeatInterval
     }
 
+    /// The CLI returns its JSON only after the child exits, so the stream reports
+    /// transport liveness while that request is still in flight (#803).
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let completion = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
-        return AsyncThrowingStream { continuation in
-            continuation.yield(AIStreamResult(type: "content", text: completion.text))
-            continuation.yield(
-                AIStreamResult(
-                    type: "message_stop",
-                    text: nil,
-                    reasoning: nil,
-                    promptTokens: completion.promptTokens,
-                    completionTokens: completion.completionTokens,
-                    cost: completion.cost
-                )
-            )
-            continuation.finish()
+        ProviderPendingCompletionStream.make(heartbeatInterval: livenessHeartbeatInterval) { [self] in
+            try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
         }
     }
 

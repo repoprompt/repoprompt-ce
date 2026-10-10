@@ -229,6 +229,155 @@ final class AgentWorkspaceSessionIndexStoreNotificationCoalescingTests: XCTestCa
         XCTAssertEqual(fixture.delegate.notifications.map(\.reason), [.restoreProjection])
     }
 
+    /// Expiry is positional only: an incomplete index keeps its provisional metadata and latest
+    /// local overlay, never claims readiness, and publishes exactly one coherent transaction.
+    func testDeadlineReleasesWithPendingIndexForSettledAndPendingSelection() async {
+        for selectedSettled in [true, false] {
+            let deadline = DeadlineGate()
+            let armed = expectation(description: "owner deadline armed")
+            let fixture = makeInstalledStore(deadlineWait: {
+                armed.fulfill()
+                try await deadline.wait()
+            })
+            await fulfillment(of: [armed], timeout: 1)
+            let store = fixture.store
+            let owner = fixture.owner
+            store.beginSidebarRestoreIndex(generation: 1, owner: owner)
+            let provisional = entry(id(111), tabID: id(11))
+            store.setSessionIndexAndRebuildSortDates([provisional.id: provisional])
+            store.applyLocalRemoval(sessionID: provisional.id)
+            let local = entry(id(113), tabID: id(13))
+            store.applyLocalUpsert(local)
+            if selectedSettled {
+                store.recordSidebarRestoreSelected(.settled(.restoration(.payloadApplied)), owner: owner)
+            }
+            // Replacement, coverage and deferral must not rearm/extend the original deadline.
+            store.beginSidebarRestoreIndex(generation: 2, owner: owner)
+            store.deferSidebarRestoreIndex(.agentModeInactive, owner: owner)
+            store.admitSidebarRestoreCoverage(fixture.workspace.composeTabs + [ComposeTabState(id: id(14), name: "New")])
+            fixture.delegate.notifications.removeAll()
+            let released = expectation(description: "incomplete expiry released")
+            fixture.delegate.onRestoreProjection = { released.fulfill() }
+            await deadline.open()
+            await fulfillment(of: [released], timeout: 1)
+            fixture.delegate.onRestoreProjection = nil
+            XCTAssertEqual(fixture.delegate.notifications.map(\.reason), [.restoreProjection])
+            XCTAssertEqual(fixture.delegate.notifications.first?.indexCount, 1)
+            XCTAssertEqual(fixture.delegate.notifications.first?.sortDateCount, 1)
+            XCTAssertEqual(fixture.delegate.notifications.first?.ready, false)
+            XCTAssertEqual(fixture.delegate.notifications.first?.baselineReleased, true)
+            XCTAssertEqual(store.ownerValidatedSessionIndex, [local.id: local])
+            XCTAssertNil(store.sidebarRestoreJoin)
+            // A valid late producer is now ordinary metadata publication, never a refreeze.
+            XCTAssertFalse(store.recordSidebarRestoreIndexTerminal(generation: 2, owner: owner, outcome: .success, entries: [:], ready: true))
+            store.setSessionIndexAndRebuildSortDates([local.id: local])
+            store.setSessionListCacheReady(true, for: owner)
+            XCTAssertTrue(store.ownerValidatedSessionListCacheReady)
+            XCTAssertNil(store.sidebarRestoreBaseline)
+        }
+    }
+
+    func testNormalSettlementCancelsDeadlineAndExpiredOldOwnerCannotReleaseSuccessor() async {
+        let oldDeadline = DeadlineGate()
+        let nextDeadline = DeadlineGate()
+        let oldArmed = expectation(description: "old owner armed")
+        let nextArmed = expectation(description: "successor armed independently")
+        let cancelled = expectation(description: "old deadline observes cancellation")
+        let waits = DeadlineWaitSequence([
+            {
+                oldArmed.fulfill()
+                do { try await oldDeadline.wait() } catch {
+                    cancelled.fulfill()
+                    throw error
+                }
+            },
+            {
+                nextArmed.fulfill()
+                try await nextDeadline.wait()
+            }
+        ])
+        let fixture = makeInstalledStore(deadlineWait: { try await waits.wait() })
+        await fulfillment(of: [oldArmed], timeout: 1)
+        let store = fixture.store
+        store.recordSidebarRestoreIndexTerminal(generation: nil, owner: fixture.owner, outcome: .success, entries: [:], ready: true)
+        store.recordSidebarRestoreSelected(.settled(.restoration(.fresh)), owner: fixture.owner)
+        XCTAssertNil(store.sidebarRestoreBaseline)
+        let nextOwner = store.receiveWorkspaceSwitchNotification(fixture.workspace)
+        store.installOwner(nextOwner, workspace: fixture.workspace, now: day, calendar: calendar)
+        await fulfillment(of: [nextArmed], timeout: 1)
+        fixture.delegate.notifications.removeAll()
+        // Drain only the old timer. The successor is still held at its own independent deadline.
+        await oldDeadline.open()
+        await fulfillment(of: [cancelled], timeout: 1)
+        XCTAssertTrue(fixture.delegate.notifications.isEmpty)
+        XCTAssertEqual(store.sidebarRestoreBaseline?.owner, nextOwner)
+        XCTAssertEqual(store.sidebarRestoreJoin?.index, .pending(generation: nil))
+        let released = expectation(description: "successor owns its release")
+        fixture.delegate.onRestoreProjection = { released.fulfill() }
+        await nextDeadline.open()
+        await fulfillment(of: [released], timeout: 1)
+        fixture.delegate.onRestoreProjection = nil
+        XCTAssertEqual(fixture.delegate.notifications.map(\.reason), [.restoreProjection])
+        XCTAssertEqual(fixture.delegate.notifications.first?.ready, false)
+        XCTAssertEqual(store.sessionIndexOwner, nextOwner)
+        XCTAssertNil(store.sidebarRestoreBaseline)
+        let waitCount = await waits.waitCount
+        XCTAssertEqual(waitCount, 2, "one independent deadline per installation")
+    }
+
+    func testDeadlineDoesNotRetainStoreWhileWaitingAndTeardownCancelsIt() async {
+        let deadline = DeadlineGate()
+        let armed = expectation(description: "deadline armed")
+        let cancelled = expectation(description: "teardown cancellation")
+        var fixture: InstalledStore? = makeInstalledStore(deadlineWait: {
+            armed.fulfill()
+            do { try await deadline.wait() } catch {
+                cancelled.fulfill()
+                throw error
+            }
+        })
+        await fulfillment(of: [armed], timeout: 1)
+        weak var store = fixture?.store
+        fixture = nil
+        XCTAssertNil(store, "suspended deadline must hold the store weakly")
+        await deadline.open()
+        await fulfillment(of: [cancelled], timeout: 1)
+    }
+
+    private actor DeadlineWaitSequence {
+        typealias Wait = @Sendable () async throws -> Void
+        private let waits: [Wait]
+        private(set) var waitCount = 0
+
+        init(_ waits: [Wait]) {
+            self.waits = waits
+        }
+
+        func wait() async throws {
+            let index = waitCount
+            waitCount += 1
+            guard index < waits.count else { throw CancellationError() }
+            try await waits[index]()
+        }
+    }
+
+    private actor DeadlineGate {
+        private var isOpen = false
+        private var held: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async throws {
+            if !isOpen { await withCheckedContinuation { held.append($0) } }
+            try Task.checkCancellation()
+        }
+
+        func open() {
+            isOpen = true
+            let waiting = held
+            held.removeAll()
+            waiting.forEach { $0.resume() }
+        }
+    }
+
     private struct InstalledStore {
         let store: AgentWorkspaceSessionIndexStore
         let delegate: Delegate
@@ -244,7 +393,10 @@ final class AgentWorkspaceSessionIndexStoreNotificationCoalescingTests: XCTestCa
         return value
     }
 
-    private func makeInstalledStore(hasSelection: Bool = true) -> InstalledStore {
+    private func makeInstalledStore(
+        hasSelection: Bool = true,
+        deadlineWait: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .seconds(10)) }
+    ) -> InstalledStore {
         var workspace = WorkspaceModel(
             id: id(1),
             dateModified: day,
@@ -259,7 +411,7 @@ final class AgentWorkspaceSessionIndexStoreNotificationCoalescingTests: XCTestCa
         )
         workspace.activeComposeTabID = hasSelection ? id(12) : nil
         let delegate = Delegate(workspaceID: workspace.id)
-        let store = AgentWorkspaceSessionIndexStore()
+        let store = AgentWorkspaceSessionIndexStore(restorationDeadlineWait: deadlineWait)
         store.delegate = delegate
         let owner = store.receiveWorkspaceSwitchNotification(workspace)
         store.installOwner(owner, workspace: workspace, now: day, calendar: calendar)
@@ -303,6 +455,7 @@ final class AgentWorkspaceSessionIndexStoreNotificationCoalescingTests: XCTestCa
 
         let workspaceID: UUID
         var notifications: [Notification] = []
+        var onRestoreProjection: (() -> Void)?
 
         init(workspaceID: UUID) {
             self.workspaceID = workspaceID
@@ -345,6 +498,7 @@ final class AgentWorkspaceSessionIndexStoreNotificationCoalescingTests: XCTestCa
                 ready: store.ownerValidatedSessionListCacheReady,
                 baselineReleased: store.sidebarRestoreBaseline == nil
             ))
+            if case .restoreProjection = reason { onRestoreProjection?() }
         }
     }
 }
