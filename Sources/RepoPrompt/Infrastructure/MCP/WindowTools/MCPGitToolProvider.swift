@@ -1018,7 +1018,7 @@ final class MCPGitToolProvider {
             let commitInfo = try await showBackend.commitInfo(ref: ref, at: repoURL)
 
             // Get diff for this commit
-            let revspec = "\(commitInfo.sha)^!"
+            let revspec = "\(commitInfo.id)^!"
             let contextLines = args["context_lines"]?.intValue ?? 3
             let detectRenames = args["detect_renames"]?.boolValue ?? false
             let changedFiles = try await showBackend.getChangedFilesStats(
