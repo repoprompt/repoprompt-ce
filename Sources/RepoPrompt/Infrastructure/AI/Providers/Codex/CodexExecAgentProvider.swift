@@ -103,6 +103,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         CLIProcessConfiguration(
             command: resolution.resolvedCommand,
             environment: resolution.environmentOverrides,
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .codexExec, explicitOverrides: resolution.environmentOverrides),
             enableDebugLogging: enableDebugLogging,
             captureStdoutTailBytes: 128 * 1024,
             captureStderrTailBytes: 256 * 1024,

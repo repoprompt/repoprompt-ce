@@ -130,6 +130,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 command: launch.command,
                 workingDirectory: promptDirectory.path,
                 environment: environment,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .grokBuild),
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 resolveCandidates: [(launch.command as NSString).lastPathComponent],

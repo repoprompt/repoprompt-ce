@@ -1201,6 +1201,54 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func providerEnvironmentWithheldNames() -> [String] {
+        scalarPreferences.agentMode?.providerEnvironmentWithheldNames ?? []
+    }
+
+    package func providerEnvironmentPassthroughNames(for provider: String) -> [String] {
+        scalarPreferences.agentMode?.providerEnvironmentPassthroughNames?[provider] ?? []
+    }
+
+    @discardableResult
+    package func setProviderEnvironmentWithheldNames(_ names: [String], commit: Bool = true) -> Bool {
+        guard let normalized = ProviderEnvironmentNames.normalized(names) else { return false }
+        updateAgentModeScalar(commit: commit) {
+            $0.providerEnvironmentWithheldNames = normalized.isEmpty ? nil : normalized
+        }
+        return true
+    }
+
+    @discardableResult
+    package func setProviderEnvironmentPassthroughNames(_ names: [String], for provider: String, commit: Bool = true) -> Bool {
+        guard !provider.isEmpty, let normalized = ProviderEnvironmentNames.normalized(names) else { return false }
+        updateAgentModeScalar(commit: commit) {
+            var providers = $0.providerEnvironmentPassthroughNames ?? [:]
+            providers[provider] = normalized.isEmpty ? nil : normalized
+            $0.providerEnvironmentPassthroughNames = providers.isEmpty ? nil : providers
+        }
+        return true
+    }
+
+    /// One in-memory mutation and one raw-preserving write for the UI's paired controls.
+    @discardableResult
+    package func setProviderEnvironmentFiltering(withheldNames: [String], passthroughNames: [String], for provider: String) -> Bool {
+        guard !provider.isEmpty,
+              let withheld = ProviderEnvironmentNames.normalized(withheldNames),
+              let passthrough = ProviderEnvironmentNames.normalized(passthroughNames)
+        else { return false }
+        updateAgentModeScalar(commit: false) {
+            $0.providerEnvironmentWithheldNames = withheld.isEmpty ? nil : withheld
+            var providers = $0.providerEnvironmentPassthroughNames ?? [:]
+            providers[provider] = passthrough.isEmpty ? nil : passthrough
+            $0.providerEnvironmentPassthroughNames = providers.isEmpty ? nil : providers
+        }
+        return save()
+    }
+
+    package func providerEnvironmentRemovedNames(for provider: String) -> Set<String> {
+        Set(providerEnvironmentWithheldNames()).subtracting(providerEnvironmentPassthroughNames(for: provider))
+    }
+
     package func subagentDefaultWaitSeconds() -> Int {
         MCPTimeoutPolicy.resolvedSubagentDefaultWaitSeconds(
             scalarPreferences.agentMode?.subagentDefaultWaitSeconds

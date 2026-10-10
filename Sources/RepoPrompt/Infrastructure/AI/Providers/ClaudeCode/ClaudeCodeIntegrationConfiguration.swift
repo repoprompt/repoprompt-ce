@@ -211,6 +211,7 @@ enum ClaudeCodeIntegrationConfiguration {
         let config = CLIProcessConfiguration(
             command: "claude",
             workingDirectory: workspacePath,
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .claudeCode),
             enableDebugLogging: false
         )
         let runner = CLIProcessRunner(config: config)

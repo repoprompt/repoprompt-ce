@@ -2939,9 +2939,12 @@ actor ACPAgentSessionController {
                 enableDebugLogging: launchConfiguration.enableDebugLogging
             )
         )
-        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(
-            into: result.environment
+        let filtered = await ProviderEnvironmentFiltering.filterACP(
+            result.environment,
+            launchConfiguration: launchConfiguration,
+            for: runRequest.agentKind
         )
+        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: filtered)
     }
 
     private func beginOpeningSessionConfiguration() {
