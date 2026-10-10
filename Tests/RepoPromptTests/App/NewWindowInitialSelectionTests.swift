@@ -644,6 +644,10 @@ import XCTest
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                     XCTAssertEqual(route.rootRoute, .main)
                     XCTAssertNil(window.protectedRestoreEntryForTesting)
+                    // This composition fixture deliberately never registers a window manager.
+                    // Durable capture needs a qualified assignment; selection alone cannot invent it.
+                    XCTAssertNil(window.sessionCaptureCandidate().entry)
+                    window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                     XCTAssertEqual(
                         window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
@@ -670,6 +674,8 @@ import XCTest
                 // observer's RunLoop delivery lands after the acceptance. The setter publishes
                 // synchronously; a requested switch suspends and could let the observer drain first.
                 manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                // Unregistered fixture: install the otherwise manager-owned coherent assignment.
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.aardvarkID, number: 1))
                 let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                 let restored = Signal("restore completion")
                 window.applyWindowRestoreEntry(entry) { restored.fire() }
@@ -694,6 +700,9 @@ import XCTest
                 XCTAssertEqual(restored.count, 1)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                 XCTAssertNil(window.protectedRestoreEntryForTesting, "Post-acceptance selection releases protection")
+                XCTAssertNil(window.workspaceInstanceNumber(for: Fixture.requestedID))
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "a settled unregistered restore cannot retain outgoing identity")
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: Fixture.requestedID, number: 1))
                 XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
             }
         }

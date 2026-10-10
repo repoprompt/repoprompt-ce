@@ -151,7 +151,9 @@ import RepoPromptSettingsCore
                     to: workspaceB
                 )
             )
-            liveB.workspaceInstanceNumber = liveBInstanceNumber
+            liveB.setWorkspaceInstanceAssignment(
+                WorkspaceInstanceAssignment(workspaceID: workspaceB.id, number: liveBInstanceNumber)
+            )
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
                     workspaceID: workspaceB.id,
@@ -204,7 +206,9 @@ import RepoPromptSettingsCore
                     to: workspaceA
                 )
             )
-            restoredA.workspaceInstanceNumber = restoredAInstanceNumber
+            restoredA.setWorkspaceInstanceAssignment(
+                WorkspaceInstanceAssignment(workspaceID: workspaceA.id, number: restoredAInstanceNumber)
+            )
             XCTAssertEqual(restoredAInstanceNumber, persistedWorkspaceInstanceNumber)
             let restoredAToolsEnabled = await restoredA.mcpServer.setWindowToolsEnabled(true)
             XCTAssertTrue(restoredAToolsEnabled)
@@ -235,6 +239,624 @@ import RepoPromptSettingsCore
                 retainedAfterRestore.lastWorkspaceInstanceNumber,
                 restoredAInstanceNumber
             )
+        }
+
+        /// #1112: a registered window's real switch is held after the target ID is published and
+        /// before its listener assigns the number. Live capture and MCP route recording made there
+        /// keep durable outgoing metadata while live MCP pairs the target with nil, never the
+        /// outgoing number; both advance once the target assignment is installed.
+        @MainActor
+        func testLiveCaptureAndRouteRecordQualifyInstanceNumberAcrossAssignmentGap() async throws {
+            // Already normalized: route records are stored under `MCPClientIdentity.storageKey`.
+            let clientName = "issue1112-routing-gap-tests"
+            // Real manager persistence writes windowSessions.json; refuse to run outside the sandbox.
+            _ = try WorkspaceTestProcessSandbox.validate()
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            let previousSession = try? Data(contentsOf: sessionURL)
+            addTeardownBlock {
+                if let previousSession {
+                    try? previousSession.write(to: sessionURL, options: .atomic)
+                } else {
+                    try? FileManager.default.removeItem(at: sessionURL)
+                }
+            }
+            let sessionKey = "issue-1112-gap-\(UUID().uuidString)"
+            let rootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("issue-1112-gap-\(UUID().uuidString)", isDirectory: true)
+            for name in ["outgoing", "target"] {
+                try FileManager.default.createDirectory(
+                    at: rootURL.appendingPathComponent(name), withIntermediateDirectories: true
+                )
+            }
+            let outgoing = workspace(name: "Outgoing", root: rootURL.appendingPathComponent("outgoing").path)
+            let target = workspace(name: "Target", root: rootURL.appendingPathComponent("target").path)
+            let manager = ServerNetworkManager.shared
+            let previousWindows = WindowStatesManager.shared.allWindows
+            addTeardownBlock { @MainActor in
+                await manager.debugRestorePersistedRoutingFixtureForTesting()
+                WindowStatesManager.shared.allWindows = previousWindows
+                try? FileManager.default.removeItem(at: rootURL)
+            }
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            WindowStatesManager.shared.allWindows = []
+            // Exact numbering: Outgoing=3 (two earlier instances), Target=1; restored afterwards.
+            let previousAllocator = WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting()
+            addTeardownBlock { @MainActor in
+                WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting(previousAllocator)
+            }
+            for _ in 1 ... 2 {
+                WindowStatesManager.shared.recordWorkspaceSwitch(
+                    forWindowID: WindowState.reserveWindowIDForTesting(),
+                    to: outgoing
+                )
+            }
+            let window = try await makeWindow(activeWorkspace: outgoing)
+            addTeardownBlock { @MainActor in
+                window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            WindowStatesManager.shared.registerWindowState(window)
+            let outgoingNumber = try XCTUnwrap(window.workspaceInstanceNumber(for: outgoing.id))
+            XCTAssertEqual(outgoingNumber, 3)
+            let connection = try await makeProductionMCPConnection(
+                networkManager: manager,
+                clientName: clientName,
+                sessionToken: sessionKey
+            )
+            addTeardownBlock { await connection.cleanup() }
+            let outgoingIdentity = await recordedIdentity(window, connection, clientName: clientName)
+            XCTAssertEqual(outgoingIdentity.entry?.workspaceInstanceNumber, outgoingNumber)
+            XCTAssertEqual(outgoingIdentity.record?.lastWorkspaceInstanceNumber, outgoingNumber)
+
+            // Stable target affinities: one paired with the number this window carries into the gap,
+            // one with the target's own settled number.
+            let staleClient = "issue1112-stale-pair"
+            let staleKey = "issue-1112-stale-\(UUID().uuidString)"
+            let settledClient = "issue1112-settled-pair"
+            let settledKey = "issue-1112-settled-\(UUID().uuidString)"
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [
+                routingRecord(
+                    clientName: staleClient,
+                    sessionKey: staleKey,
+                    windowID: window.windowID + 10000,
+                    workspaceID: target.id,
+                    instanceNumber: outgoingNumber
+                ),
+                routingRecord(
+                    clientName: settledClient,
+                    sessionKey: settledKey,
+                    windowID: window.windowID + 10001,
+                    workspaceID: target.id,
+                    instanceNumber: 1
+                )
+            ])
+
+            window.workspaceManager.workspaces.append(target)
+            var gapIdentity: (entry: WindowSessionEntry?, record: MCPRoutingState.ClientRecord?)?
+            var gapWindowObject: [String: Any]?
+            var gapStaleRoute: Int?
+            var gapSettledRoute: Int?
+            window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { [self] id in
+                guard id == target.id else { return }
+                XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+                gapIdentity = await recordedIdentity(window, connection, clientName: clientName)
+                gapWindowObject = await debugWindowObject(window, connection, clientName: clientName)
+                gapStaleRoute = await manager.debugPreferredWindowIDForTesting(clientName: staleClient, sessionKey: staleKey)
+                gapSettledRoute = await manager.debugPreferredWindowIDForTesting(
+                    clientName: settledClient,
+                    sessionKey: settledKey
+                )
+            }
+            _ = await window.workspaceManager.switchWorkspace(
+                to: target,
+                saveState: false,
+                reason: "persistedMCPRoutingIdentityGapTest"
+            )
+            let gap = try XCTUnwrap(gapIdentity)
+            XCTAssertEqual(gap.entry?.workspaceID, outgoing.id, "durable entry retains the last complete identity")
+            XCTAssertEqual(gap.entry?.workspaceInstanceNumber, outgoingNumber)
+            XCTAssertEqual(gap.entry?.workspaceName, outgoing.name)
+            XCTAssertEqual(gap.entry?.primaryRepoPath, outgoing.repoPaths.first)
+            XCTAssertEqual(gap.record?.lastWorkspaceID, target.id)
+            XCTAssertNotNil(gap.record)
+            XCTAssertNil(gap.record?.lastWorkspaceInstanceNumber, "routing record")
+            XCTAssertEqual(gapWindowObject?["workspace_id"] as? String, target.id.uuidString)
+            XCTAssertTrue(gapWindowObject?["workspace_instance_number"] is NSNull, "\(String(describing: gapWindowObject))")
+            XCTAssertNil(gapStaleRoute, "the gap window must not satisfy a target pair carrying the outgoing number")
+            XCTAssertNil(gapSettledRoute, "the gap window has no target number yet")
+
+            let targetNumber = try XCTUnwrap(window.workspaceInstanceNumber(for: target.id))
+            XCTAssertEqual(targetNumber, 1)
+            let settled = await recordedIdentity(window, connection, clientName: clientName)
+            XCTAssertEqual(settled.entry?.workspaceID, target.id)
+            XCTAssertEqual(settled.entry?.workspaceInstanceNumber, targetNumber)
+            XCTAssertEqual(settled.record?.lastWorkspaceID, target.id)
+            XCTAssertEqual(settled.record?.lastWorkspaceInstanceNumber, targetNumber)
+            let settledWindowObject = await debugWindowObject(window, connection, clientName: clientName)
+            XCTAssertEqual(settledWindowObject?["workspace_instance_number"] as? Int, targetNumber)
+            let settledRoute = await manager.debugPreferredWindowIDForTesting(
+                clientName: settledClient,
+                sessionKey: settledKey
+            )
+            XCTAssertEqual(settledRoute, window.windowID)
+            let settledStaleRoute = await manager.debugPreferredWindowIDForTesting(
+                clientName: staleClient,
+                sessionKey: staleKey
+            )
+            XCTAssertNil(settledStaleRoute)
+
+            // Durable gap capture remains outgoing, so it seeds nothing for the target. The live
+            // incoming/null pair is diagnostics only and is never persisted as a restore identity.
+            let restored = try WindowSessionSnapshot(
+                version: 4,
+                windows: [XCTUnwrap(outgoingIdentity.entry), XCTUnwrap(gap.entry)]
+            )
+            let liveAllocator = WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting()
+            WindowStatesManager.shared.preseedInstanceNumberStateForTesting(from: restored)
+            let restoredTarget = WindowStatesManager.shared.recordWorkspaceSwitch(
+                forWindowID: WindowState.reserveWindowIDForTesting(),
+                to: target
+            )
+            let restoredOutgoing = WindowStatesManager.shared.recordWorkspaceSwitch(
+                forWindowID: WindowState.reserveWindowIDForTesting(),
+                to: outgoing
+            )
+            WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting(liveAllocator)
+            XCTAssertEqual(restoredTarget, 1)
+            XCTAssertEqual(restoredOutgoing, 3)
+        }
+
+        @MainActor
+        func testSettledAuthorityAdoptionCapturesAndRestoresFallbackIdentity() async throws {
+            try await assertSettledAuthorityAdoption(clearsSelection: false, incumbentToken: false)
+        }
+
+        @MainActor
+        func testSettledAuthorityAdoptionAfterNilPublicationCapturesFallback() async throws {
+            try await assertSettledAuthorityAdoption(clearsSelection: true, incumbentToken: false)
+        }
+
+        @MainActor
+        func testSettledAuthorityAdoptionKeepsIncumbentTokenAcrossOrderedRestore() async throws {
+            try await assertSettledAuthorityAdoption(clearsSelection: false, incumbentToken: true)
+        }
+
+        /// Authority reconciliation adopts without didSwitch. Capture and ordered restoration
+        /// must preserve the adopted identity and any incumbent window's persisted MCP token.
+        @MainActor
+        private func assertSettledAuthorityAdoption(clearsSelection: Bool, incumbentToken: Bool) async throws {
+            _ = try WorkspaceTestProcessSandbox.validate()
+            let windows = WindowStatesManager.shared
+            let network = ServerNetworkManager.shared
+            let previousWindows = windows.allWindows
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            let previousSession = try? Data(contentsOf: sessionURL)
+            let previousAllocator = windows.replaceInstanceAllocatorStateForTesting()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("adoption-\(UUID())", isDirectory: true)
+            for name in ["outgoing", "fallback"] {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            let outgoing = workspace(name: "Outgoing adoption", root: root.appendingPathComponent("outgoing").path)
+            let fallback = workspace(name: "Fallback adoption", root: root.appendingPathComponent("fallback").path)
+            let clientName = "adoption-routing-tests"
+            let token = "adoption-\(UUID())"
+            let lifetime = QuitGapLifetime()
+            await network.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            windows.allWindows = []
+            addTeardownBlock { @MainActor in
+                for connection in lifetime.connections {
+                    await connection.cleanup()
+                }
+                for window in lifetime.ownedWindows {
+                    _ = await window.mcpServer.setWindowToolsEnabled(false)
+                    window.beginClose()
+                    await window.tearDown()
+                    windows.unregisterWindowState(window)
+                    windows.clearInstanceAssignment(forWindowID: window.windowID)
+                }
+                await windows.persistWindowSessionImmediately(reason: "adoptionFixtureCleanup")
+                await network.debugRestorePersistedRoutingFixtureForTesting()
+                windows.replaceInstanceAllocatorStateForTesting(previousAllocator)
+                windows.allWindows = previousWindows
+                if let previousSession {
+                    try previousSession.write(to: sessionURL, options: .atomic)
+                } else if FileManager.default.fileExists(atPath: sessionURL.path) {
+                    try FileManager.default.removeItem(at: sessionURL)
+                }
+                try FileManager.default.removeItem(at: root)
+            }
+            let window = try await makeWindow(activeWorkspace: outgoing)
+            lifetime.ownedWindows.append(window)
+            windows.registerWindowState(window)
+            XCTAssertNotNil(window.workspaceInstanceNumber(for: outgoing.id))
+            var incumbentRecord: MCPRoutingState.ClientRecord?
+            var incumbent: WindowState?
+            if incumbentToken {
+                let second = try await makeWindow(activeWorkspace: fallback)
+                incumbent = second
+                lifetime.ownedWindows.append(second)
+                windows.registerWindowState(second)
+                XCTAssertEqual(second.workspaceInstanceNumber(for: fallback.id), 1)
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                let enabled = await second.mcpServer.setWindowToolsEnabled(true)
+                XCTAssertTrue(enabled)
+                let connection = try await makeProductionMCPConnection(networkManager: network, clientName: clientName, sessionToken: token)
+                lifetime.connections.append(connection)
+                let seeded = await network.debugSeedRoutingAffinityPayload(connectionID: connection.connectionID, windowID: second.windowID)
+                XCTAssertEqual(seeded["persisted"] as? Bool, true)
+                let records = await network.debugRoutingRecordsForTesting(clientName: clientName)
+                incumbentRecord = try XCTUnwrap(records.first)
+                XCTAssertEqual(incumbentRecord?.lastWorkspaceInstanceNumber, 1)
+            }
+            var switchNotifications = 0
+            window.workspaceManager.addWorkspaceDidSwitchListener(label: "adoptionRegression") { _ in
+                switchNotifications += 1
+            }
+            if clearsSelection {
+                window.workspaceManager.applyDomainWorkspaceProjection(
+                    [], fileURLsByWorkspaceID: [:], revisionsByWorkspaceID: [:],
+                    digestsByWorkspaceID: [:], healthByWorkspaceID: [:], catalogRevision: 1,
+                    preferredActiveWorkspaceID: nil, publicationSequence: UInt64.max - 1
+                )
+                XCTAssertNil(window.workspaceManager.activeWorkspaceID)
+                XCTAssertNil(window.workspaceInstanceAssignment)
+                XCTAssertNil(windows.currentInstanceNumber(forWindowID: window.windowID))
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "nil publication must discard outgoing identity")
+            }
+            window.workspaceManager.applyDomainWorkspaceProjection(
+                [fallback], fileURLsByWorkspaceID: [:], revisionsByWorkspaceID: [:],
+                digestsByWorkspaceID: [:], healthByWorkspaceID: [:], catalogRevision: 2,
+                preferredActiveWorkspaceID: nil, publicationSequence: UInt64.max
+            )
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, fallback.id)
+            XCTAssertFalse(window.workspaceManager.isSwitchingWorkspace)
+            XCTAssertNil(window.workspaceManager.activeWorkspaceSwitch)
+            XCTAssertEqual(switchNotifications, 0)
+            let expectedNumber = incumbentToken ? 2 : 1
+            let entry = try XCTUnwrap(window.sessionCaptureCandidate().entry)
+            print("AUTHORITY_ADOPTION live=\(window.workspaceManager.activeWorkspace?.name ?? "nil") durable=\(entry.workspaceName ?? "nil") number=\(entry.workspaceInstanceNumber.map(String.init) ?? "nil")")
+            XCTAssertEqual(entry.workspaceID, fallback.id)
+            XCTAssertEqual(entry.workspaceName, fallback.name)
+            XCTAssertEqual(entry.primaryRepoPath, fallback.repoPaths.first)
+            XCTAssertEqual(entry.workspaceInstanceNumber, expectedNumber)
+            XCTAssertEqual(window.workspaceInstanceNumber(for: fallback.id), expectedNumber)
+            if let incumbent {
+                XCTAssertEqual(incumbent.workspaceInstanceNumber(for: fallback.id), 1)
+                let preferred = await network.debugPreferredWindowIDForTesting(clientName: clientName, sessionKey: token)
+                XCTAssertEqual(preferred, incumbent.windowID)
+                XCTAssertNotEqual(preferred, window.windowID)
+            }
+            // Save adopter first, incumbent second: numbers [2, 1], not numeric sort order.
+            let snapshot = WindowSessionSnapshot(version: 1, windows: windows.allWindows.compactMap { $0.sessionCaptureCandidate().entry })
+            let saved = try JSONDecoder().decode(WindowSessionSnapshot.self, from: JSONEncoder().encode(snapshot))
+            XCTAssertEqual(saved.windows.map(\.workspaceInstanceNumber), incumbentToken ? [2, 1] : [1])
+            for connection in lifetime.connections {
+                await connection.cleanup()
+            }
+            lifetime.connections.removeAll()
+            for old in windows.allWindows {
+                _ = await old.mcpServer.setWindowToolsEnabled(false)
+                old.beginClose()
+                await old.tearDown()
+                windows.unregisterWindowState(old)
+            }
+            windows.allWindows = []
+            windows.replaceInstanceAllocatorStateForTesting()
+            windows.preseedInstanceNumberStateForTesting(from: saved)
+            var restored: [WindowState] = []
+            for savedEntry in saved.windows {
+                let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+                GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+                let newWindow = WindowState()
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+                lifetime.ownedWindows.append(newWindow)
+                await newWindow.workspaceManager.awaitInitialized()
+                newWindow.workspaceManager.workspaces = [fallback]
+                windows.registerWindowState(newWindow)
+                let completed = expectation(description: "adopted fallback restored")
+                newWindow.applyWindowRestoreEntry(savedEntry) { completed.fulfill() }
+                await fulfillment(of: [completed], timeout: 5)
+                XCTAssertEqual(newWindow.workspaceManager.activeWorkspaceID, fallback.id)
+                XCTAssertEqual(newWindow.sessionCaptureCandidate().entry?.workspaceID, fallback.id)
+                XCTAssertEqual(newWindow.workspaceInstanceNumber(for: fallback.id), savedEntry.workspaceInstanceNumber)
+                if incumbentToken {
+                    let enabled = await newWindow.mcpServer.setWindowToolsEnabled(true)
+                    XCTAssertTrue(enabled)
+                }
+                restored.append(newWindow)
+            }
+            if let incumbentRecord {
+                await network.debugInstallPersistedRoutingFixtureForTesting(records: [incumbentRecord])
+                let reconnect = try await makeProductionMCPConnection(networkManager: network, clientName: clientName, sessionToken: token)
+                lifetime.connections.append(reconnect)
+                _ = try await reconnect.client.listTools()
+                let preferred = await network.debugPreferredWindowIDForTesting(clientName: clientName, sessionKey: token)
+                let selected = await network.selectedWindow(for: reconnect.connectionID)
+                XCTAssertNotEqual(preferred, restored[0].windowID, "the adopter must never take the incumbent's token")
+                XCTAssertEqual(preferred, restored[1].windowID)
+                XCTAssertEqual(selected, restored[1].windowID, "real pre-call binding must reconnect to the incumbent")
+            }
+        }
+
+        @MainActor
+        func testSettledAdoptionSkipsRememberedAndQueuedRestoreReservation() {
+            let windows = WindowStatesManager.shared
+            let previous = windows.replaceInstanceAllocatorStateForTesting()
+            defer { windows.replaceInstanceAllocatorStateForTesting(previous) }
+            let fallback = workspace(name: "Reserved fallback", root: "/tmp/reserved-fallback")
+            let outgoing = workspace(name: "Reserved outgoing", root: "/tmp/reserved-outgoing")
+            let incumbent = WindowState.reserveWindowIDForTesting()
+            let adopter = WindowState.reserveWindowIDForTesting()
+            XCTAssertEqual(windows.recordWorkspaceSwitch(forWindowID: incumbent, to: fallback), 1)
+            XCTAssertEqual(windows.recordWorkspaceSwitch(forWindowID: adopter, to: fallback), 2)
+            _ = windows.recordWorkspaceSwitch(forWindowID: adopter, to: outgoing)
+            let reservation = WindowSessionEntry(
+                windowKind: .standard, workspaceID: fallback.id, workspaceName: fallback.name,
+                isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: fallback.repoPaths.first,
+                lastFocused: false, workspaceInstanceNumber: 2
+            )
+            windows.preseedInstanceNumberStateForTesting(from: WindowSessionSnapshot(version: 1, windows: [reservation]))
+            XCTAssertEqual(windows.recordWorkspaceSwitch(forWindowID: adopter, to: fallback, consumeRestoredNumbers: false), 3)
+            XCTAssertEqual(windows.currentInstanceNumber(forWindowID: incumbent), 1)
+            XCTAssertEqual(windows.recordWorkspaceSwitch(forWindowID: WindowState.reserveWindowIDForTesting(), to: fallback), 2)
+        }
+
+        /// Real quit/relaunch sequence: W1 previously owned S2, is now T2, and returns to S
+        /// while W2 still owns S3. A durable gap entry must never transfer W2's token to W1.
+        @MainActor
+        func testQuitInWorkspaceAssignmentGapRetainsStableClientWindowAcrossOrderedRestore() async throws {
+            _ = try WorkspaceTestProcessSandbox.validate()
+            let windows = WindowStatesManager.shared
+            let network = ServerNetworkManager.shared
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            let previousSession = try? Data(contentsOf: sessionURL)
+            let previousWindows = windows.allWindows
+            let previousTerminating = windows.isTerminating
+            let previousAllocator = windows.replaceInstanceAllocatorStateForTesting()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("quit-gap-\(UUID())", isDirectory: true)
+            for name in ["S", "T"] {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            let sharedWorkspace = workspace(name: "S", root: root.appendingPathComponent("S").path)
+            let outgoingWorkspace = workspace(name: "T", root: root.appendingPathComponent("T").path)
+            let clientName = "quit-gap-routing-tests"
+            let token = "quit-gap-\(UUID())"
+            let gap = QuitGapGate()
+            let lifetime = QuitGapLifetime()
+            await network.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            windows.allWindows = []
+            windows.setTerminatingForTesting(false)
+            addTeardownBlock { @MainActor in
+                await gap.open()
+                if let task = lifetime.switchTask { _ = await task.value }
+                for connection in lifetime.connections {
+                    await connection.cleanup()
+                }
+                windows.setTerminatingForTesting(true)
+                for window in lifetime.ownedWindows {
+                    window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+                    _ = await window.mcpServer.setWindowToolsEnabled(false)
+                    window.beginClose()
+                    await window.tearDown()
+                    windows.unregisterWindowState(window)
+                    windows.clearInstanceAssignment(forWindowID: window.windowID)
+                }
+                // Drain/cancel the writer's pending debounce before restoring shared file state.
+                await windows.persistWindowSessionImmediately(reason: "quitGapFixtureCleanup")
+                await network.debugRestorePersistedRoutingFixtureForTesting()
+                windows.replaceInstanceAllocatorStateForTesting(previousAllocator)
+                windows.setTerminatingForTesting(previousTerminating)
+                windows.allWindows = previousWindows
+                if let previousSession {
+                    try previousSession.write(to: sessionURL, options: .atomic)
+                } else if FileManager.default.fileExists(atPath: sessionURL.path) {
+                    try FileManager.default.removeItem(at: sessionURL)
+                }
+                try FileManager.default.removeItem(at: root)
+            }
+            // Reserve S1, then W1 owns S2 and remembers it after switching to T2.
+            _ = windows.recordWorkspaceSwitch(forWindowID: WindowState.reserveWindowIDForTesting(), to: sharedWorkspace)
+            let w1 = try await makeWindow(activeWorkspace: sharedWorkspace)
+            lifetime.ownedWindows.append(w1)
+            windows.registerWindowState(w1)
+            XCTAssertEqual(w1.workspaceInstanceNumber(for: sharedWorkspace.id), 2)
+            _ = windows.recordWorkspaceSwitch(forWindowID: WindowState.reserveWindowIDForTesting(), to: outgoingWorkspace)
+            w1.workspaceManager.workspaces.append(outgoingWorkspace)
+            _ = await w1.workspaceManager.switchWorkspace(to: outgoingWorkspace, saveState: false, reason: "quitGapOutgoing")
+            XCTAssertEqual(w1.workspaceInstanceNumber(for: outgoingWorkspace.id), 2)
+            let w2 = try await makeWindow(activeWorkspace: sharedWorkspace)
+            lifetime.ownedWindows.append(w2)
+            windows.registerWindowState(w2)
+            XCTAssertEqual(w2.workspaceInstanceNumber(for: sharedWorkspace.id), 3)
+            XCTAssertEqual(windows.allWindows.map(\.windowID), [w1.windowID, w2.windowID])
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let w2ToolsEnabled = await w2.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(w2ToolsEnabled)
+            let original = try await makeProductionMCPConnection(networkManager: network, clientName: clientName, sessionToken: token)
+            lifetime.connections.append(original)
+            let seeded = await network.debugSeedRoutingAffinityPayload(connectionID: original.connectionID, windowID: w2.windowID)
+            XCTAssertEqual(seeded["persisted"] as? Bool, true)
+            let records = await network.debugRoutingRecordsForTesting(clientName: clientName)
+            let record = try XCTUnwrap(records.first)
+            XCTAssertEqual(record.lastWorkspaceID, sharedWorkspace.id)
+            XCTAssertEqual(record.lastWorkspaceInstanceNumber, 3)
+            XCTAssertEqual(record.lastWindowID, w2.windowID)
+            let reachedGap = expectation(description: "target published before assignment listener")
+            w1.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { id in
+                guard id == sharedWorkspace.id else { return }
+                reachedGap.fulfill()
+                await gap.hold()
+            }
+            lifetime.switchTask = Task { await w1.workspaceManager.switchWorkspace(to: sharedWorkspace, saveState: false, reason: "quitGapReturn") }
+            await fulfillment(of: [reachedGap], timeout: 5)
+            XCTAssertEqual(w1.workspaceManager.activeWorkspaceID, sharedWorkspace.id)
+            XCTAssertNil(w1.workspaceInstanceNumber(for: sharedWorkspace.id), "live identity remains fail-closed")
+            let livePreferred = await network.debugPreferredWindowIDForTesting(clientName: clientName, sessionKey: token)
+            XCTAssertEqual(livePreferred, w2.windowID)
+            // Same order as applicationShouldTerminate: fence first, then the final immediate write.
+            windows.signalTermination()
+            await windows.persistWindowSessionImmediately(reason: "appShouldTerminate")
+            let encoded = try Data(contentsOf: sessionURL)
+            let final = try JSONDecoder().decode(WindowSessionSnapshot.self, from: encoded)
+            XCTAssertEqual(final.windows.count, 2)
+            guard final.windows.count == 2 else { return }
+            XCTAssertEqual(final.windows[0].workspaceID, outgoingWorkspace.id)
+            XCTAssertEqual(final.windows[0].workspaceInstanceNumber, 2)
+            XCTAssertEqual(final.windows[1].workspaceID, sharedWorkspace.id)
+            XCTAssertEqual(final.windows[1].workspaceInstanceNumber, 3)
+            print("QUIT_GAP durable W1=\(final.windows[0].workspaceName ?? "nil"):\(final.windows[0].workspaceInstanceNumber.map(String.init) ?? "nil") W2=\(final.windows[1].workspaceName ?? "nil"):\(final.windows[1].workspaceInstanceNumber.map(String.init) ?? "nil")")
+            // Let the old listener run while still terminating: it cannot allocate a repair number.
+            await gap.open()
+            _ = await lifetime.switchTask?.value
+            lifetime.switchTask = nil
+            XCTAssertNil(w1.workspaceInstanceNumber(for: sharedWorkspace.id))
+            await original.cleanup()
+            lifetime.connections.removeAll()
+            for window in [w1, w2] {
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+                window.beginClose()
+                await window.tearDown()
+                windows.unregisterWindowState(window)
+            }
+            windows.allWindows = []
+            windows.setTerminatingForTesting(false)
+            windows.replaceInstanceAllocatorStateForTesting()
+            windows.preseedInstanceNumberStateForTesting(from: final)
+            // Real WindowState restore dispatch, in saved W1/W2 order, against a fresh allocator.
+            var restored: [WindowState] = []
+            for entry in final.windows {
+                let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+                GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+                let window = WindowState()
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+                lifetime.ownedWindows.append(window)
+                await window.workspaceManager.awaitInitialized()
+                window.workspaceManager.workspaces = [sharedWorkspace, outgoingWorkspace]
+                windows.registerWindowState(window)
+                let applied = expectation(description: "saved entry restore completed")
+                window.applyWindowRestoreEntry(entry) { applied.fulfill() }
+                await fulfillment(of: [applied], timeout: 5)
+                XCTAssertEqual(window.workspaceManager.activeWorkspaceID, entry.workspaceID)
+                let restoredToolsEnabled = await window.mcpServer.setWindowToolsEnabled(true)
+                XCTAssertTrue(restoredToolsEnabled)
+                restored.append(window)
+            }
+            // Reload exactly the persisted token record, not a fresh route or numeric-window cache.
+            await network.debugInstallPersistedRoutingFixtureForTesting(records: [record])
+            let reconnect = try await makeProductionMCPConnection(networkManager: network, clientName: clientName, sessionToken: token)
+            lifetime.connections.append(reconnect)
+            _ = try await reconnect.client.listTools()
+            let preferred = await network.debugPreferredWindowIDForTesting(clientName: clientName, sessionKey: token)
+            let selected = await network.selectedWindow(for: reconnect.connectionID)
+            print("QUIT_GAP reconnect preferred=\(preferred.map(String.init) ?? "nil") restoredW1=\(restored[0].windowID) restoredW2=\(restored[1].windowID)")
+            XCTAssertNotEqual(preferred, restored[0].windowID, "S3 must never be transferred to W1")
+            XCTAssertEqual(preferred, restored[1].windowID, "completed restore retains original W2")
+            XCTAssertEqual(selected, restored[1].windowID, "real reconnect/pre-call binding reaches W2")
+        }
+
+        @MainActor
+        private final class QuitGapLifetime {
+            var ownedWindows: [WindowState] = []
+            var switchTask: Task<WorkspaceSwitchResult, Never>?
+            var connections: [Issue862ProductionMCPConnection] = []
+        }
+
+        private actor QuitGapGate {
+            private var isOpen = false
+            private var held: [CheckedContinuation<Void, Never>] = []
+            func hold() async {
+                if !isOpen { await withCheckedContinuation { held.append($0) } }
+            }
+
+            func open() {
+                isOpen = true
+                let waiting = held
+                held.removeAll()
+                waiting.forEach { $0.resume() }
+            }
+        }
+
+        @MainActor
+        func testDurableCaptureOmitsUnassignedAndDoesNotResurrectAfterPublishedDeparture() async throws {
+            _ = try WorkspaceTestProcessSandbox.validate()
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("coherent-capture-\(UUID())", isDirectory: true)
+            for name in ["outgoing", "incoming"] {
+                try FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            addTeardownBlock { try FileManager.default.removeItem(at: root) }
+            let outgoing = workspace(name: "Outgoing coherent", root: root.appendingPathComponent("outgoing").path)
+            let incoming = workspace(name: "Incoming unassigned", root: root.appendingPathComponent("incoming").path)
+            let system = WorkspaceModel(name: "System", repoPaths: [], isSystemWorkspace: true)
+            let ephemeral = WorkspaceModel(name: "Transient", repoPaths: [], ephemeralFlag: true)
+            for departure in [nil, system, ephemeral] as [WorkspaceModel?] {
+                let window = try await makeWindow(activeWorkspace: outgoing)
+                addTeardownBlock { @MainActor in
+                    window.beginClose()
+                    await window.tearDown()
+                }
+                let manager = window.workspaceManager
+                manager.workspaces.append(incoming)
+                if let departure { manager.workspaces.append(departure) }
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "no coherent number exists yet")
+                // Installation must capture without relying on an intervening persist.
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: outgoing.id, number: 7))
+                manager.activeWorkspace = incoming
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "a settled selection is not an outgoing switch gap")
+                XCTAssertNil(window.workspaceInstanceNumber(for: incoming.id))
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: incoming.id, number: 9))
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, incoming.id)
+                // No capture between departure and return: invalidation belongs to publication,
+                // not just a persist path or the asynchronous switch flag.
+                manager.activeWorkspace = departure
+                manager.activeWorkspace = outgoing
+                XCTAssertNil(window.sessionCaptureCandidate().entry, "a settled departure cannot resurrect incoming S9")
+                window.setWorkspaceInstanceAssignment(.init(workspaceID: outgoing.id, number: 11))
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceInstanceNumber, 11)
+                window.beginClose()
+                await window.tearDown()
+            }
+        }
+
+        /// The diagnostics routing snapshot's object for `window`.
+        @MainActor
+        private func debugWindowObject(
+            _ window: WindowState,
+            _ connection: Issue862ProductionMCPConnection,
+            clientName: String
+        ) async -> [String: Any]? {
+            let payload = await ServerNetworkManager.shared.debugRoutingSnapshotPayload(
+                currentConnectionID: connection.connectionID,
+                requestedConnectionID: nil,
+                clientNameFilter: clientName,
+                includeRecords: false,
+                includeWindows: true
+            )
+            return (payload["windows"] as? [[String: Any]])?.first { $0["window_id"] as? Int == window.windowID }
+        }
+
+        /// The entry the manager persists for `window` (decoded from windowSessions.json after a real
+        /// `persistWindowSessionImmediately`) and the MCP route record written for it right now.
+        @MainActor
+        private func recordedIdentity(
+            _ window: WindowState,
+            _ connection: Issue862ProductionMCPConnection,
+            clientName: String
+        ) async -> (entry: WindowSessionEntry?, record: MCPRoutingState.ClientRecord?) {
+            let sessionURL = WindowSessionStore.sessionFileURL()
+            try? FileManager.default.removeItem(at: sessionURL)
+            await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "issue1112RoutingGapTest")
+            let entry = (try? Data(contentsOf: sessionURL))
+                .flatMap { try? JSONDecoder().decode(WindowSessionSnapshot.self, from: $0) }?
+                .windows.first
+            let payload = await ServerNetworkManager.shared.debugSeedRoutingAffinityPayload(
+                connectionID: connection.connectionID,
+                windowID: window.windowID
+            )
+            XCTAssertEqual(payload["persisted"] as? Bool, true, "\(payload)")
+            let records = await ServerNetworkManager.shared.debugRoutingRecordsForTesting(clientName: clientName)
+            return (entry, records.first)
         }
 
         func testReusedNumericWindowIDDoesNotRouteWorkspaceAToLiveWorkspaceB() async {

@@ -522,6 +522,20 @@ struct AgentModeSessionsListView: View {
             }
             ScrollView {
                 VStack(spacing: listRowSpacing) {
+                    if snapshot.isOwnerPending {
+                        // Owner adoption unresolved: no outgoing rows or target headings (§5.3).
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Restoring conversations\u{2026}")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, listHorizontalPadding)
+                        .padding(.vertical, 6)
+                        .accessibilityElement(children: .combine)
+                    }
                     AgentSidebarKeyedRowList(
                         items: AgentSidebarDateSectionBuilder.renderedActiveRows(for: activeSections),
                         showsHeader: \.showsHeader,
@@ -1219,69 +1233,6 @@ private struct AgentSidebarDateSectionHeader: View {
     }
 }
 
-enum AgentSidebarDateSectionBucket: CaseIterable, Hashable, Identifiable {
-    case today
-    case yesterday
-    case previous
-
-    var id: Self {
-        self
-    }
-
-    var title: String {
-        switch self {
-        case .today:
-            "Today"
-        case .yesterday:
-            "Yesterday"
-        case .previous:
-            "Previous"
-        }
-    }
-
-    static func bucket(
-        for date: Date,
-        relativeTo now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> AgentSidebarDateSectionBucket {
-        let clampedDate = min(date, now)
-        let todayStart = calendar.startOfDay(for: now)
-        let dateStart = calendar.startOfDay(for: clampedDate)
-        if dateStart == todayStart {
-            return .today
-        }
-        if let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart),
-           calendar.isDate(dateStart, inSameDayAs: yesterdayStart)
-        {
-            return .yesterday
-        }
-        return .previous
-    }
-
-    /// Model identity for one contiguous run of this bucket.
-    ///
-    /// The sidebar list does not use this as a `ForEach` key. Each row is keyed
-    /// by its own id. `ordinal` keeps a second run of the same day (a pinned
-    /// group separated from later unpinned rows) distinct from the first.
-    func sectionID(ordinal: Int) -> UUID {
-        let bucketByte: UInt8 = switch self {
-        case .today:
-            1
-        case .yesterday:
-            2
-        case .previous:
-            3
-        }
-        return UUID(uuid: (
-            0xB7, 0xA1, 0xD0, bucketByte,
-            0x00, 0x00,
-            0x40, 0x00,
-            0x80, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, UInt8(clamping: ordinal)
-        ))
-    }
-}
-
 struct AgentSidebarActiveDateGroup: Identifiable {
     let id: UUID
     let bucket: AgentSidebarDateSectionBucket
@@ -1419,11 +1370,18 @@ enum AgentSidebarDateSectionBuilder {
 
         func flushCurrentRows() {
             guard let firstRow = currentRows.first else { return }
-            let date = currentRows
-                .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
-                .max() ?? firstRow.activityDate
-            let bucket = AgentSidebarDateSectionBucket.bucket(
-                for: date,
+            // Restoration rows carry captured buckets (freshest wins) so incremental live/index dates,
+            // or a midnight/calendar change, cannot relabel headings before release (§5.4).
+            let capturedBucket = currentRows
+                .compactMap(\.restorationDateBucket)
+                .min { lhs, rhs in
+                    let order = AgentSidebarDateSectionBucket.allCases
+                    return (order.firstIndex(of: lhs) ?? .max) < (order.firstIndex(of: rhs) ?? .max)
+                }
+            let bucket = capturedBucket ?? AgentSidebarDateSectionBucket.bucket(
+                for: currentRows
+                    .map { $0.threadActivityDate ?? $0.lastUserMessageAt ?? $0.activityDate }
+                    .max() ?? firstRow.activityDate,
                 relativeTo: now,
                 calendar: calendar
             )

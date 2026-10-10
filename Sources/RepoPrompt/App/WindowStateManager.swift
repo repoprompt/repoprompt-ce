@@ -816,10 +816,11 @@ class WindowStatesManager: ObservableObject {
             maxByWorkspace[workspaceID] = max(maxByWorkspace[workspaceID] ?? number, number)
         }
 
-        // Normalize lists (unique, sorted) for deterministic consumption order
+        // Restore consumes entries in saved window order. Sorting numbers would transfer a
+        // later window's persisted MCP identity to an earlier window on the same workspace.
         for (wsID, numbers) in restoredInstanceNumbersByWorkspace {
-            let uniqueSorted = Array(Set(numbers)).sorted()
-            restoredInstanceNumbersByWorkspace[wsID] = uniqueSorted
+            var seen: Set<Int> = []
+            restoredInstanceNumbersByWorkspace[wsID] = numbers.filter { seen.insert($0).inserted }
         }
 
         // Set "next" counters just past the highest restored instance
@@ -1052,10 +1053,35 @@ class WindowStatesManager: ObservableObject {
         state.workspaceManager.addWorkspaceDidSwitchListener(label: "windowStateManager") { [weak self, weak state] newWorkspace in
             guard let self, let state else { return }
             let number = recordWorkspaceSwitch(forWindowID: state.windowID, to: newWorkspace)
-            // Publish to the window so UI can react (e.g., in the title)
-            state.workspaceInstanceNumber = number
-            state.requestWindowTitleUpdate(reason: .workspaceChanged)
+            // Publish the workspace-qualified pair; the window refreshes its coherent title.
+            state.setWorkspaceInstanceAssignment(newWorkspace.flatMap { workspace in
+                number.map { WorkspaceInstanceAssignment(workspaceID: workspace.id, number: $0) }
+            })
             persistWindowSession(reason: "workspaceSwitch")
+        }
+
+        state.workspaceManager.onSettledProjectedWorkspaceSelection = { [weak self, weak state] workspace in
+            guard let self, let state else { return }
+            @MainActor func canInstall() -> Bool {
+                !isTerminating && !state.isClosing
+                    && allWindows.contains(where: { $0 === state })
+                    && !state.workspaceManager.isSwitchingWorkspace
+                    && state.workspaceManager.activeWorkspaceSwitch == nil
+                    && state.workspaceManager.activeWorkspaceID == workspace?.id
+            }
+            guard canInstall() else { return }
+            let number = recordWorkspaceSwitch(
+                forWindowID: state.windowID, to: workspace, consumeRestoredNumbers: false
+            )
+            // Allocation posts synchronously: a notification may close or change this window.
+            guard canInstall(),
+                  assignedInstanceByWindowID[state.windowID]?.workspaceID == workspace?.id,
+                  assignedInstanceByWindowID[state.windowID]?.number == number
+            else { return }
+            state.setWorkspaceInstanceAssignment(workspace.flatMap { workspace in
+                number.map { WorkspaceInstanceAssignment(workspaceID: workspace.id, number: $0) }
+            })
+            persistWindowSession(reason: "settledProjectedWorkspaceSelection")
         }
 
         applyNextRestoreEntryIfAvailable(to: state)
@@ -1063,8 +1089,7 @@ class WindowStatesManager: ObservableObject {
         // Assign an initial instance number if the workspace is already set
         if let ws = state.workspaceManager.activeWorkspace {
             let n = recordWorkspaceSwitch(forWindowID: state.windowID, to: ws)
-            state.workspaceInstanceNumber = n
-            state.requestWindowTitleUpdate(reason: .workspaceChanged)
+            state.setWorkspaceInstanceAssignment(n.map { WorkspaceInstanceAssignment(workspaceID: ws.id, number: $0) })
         }
 
         // If we have pending URLs that arrived *before* any windows,
@@ -1100,6 +1125,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func unregisterWindowState(_ state: WindowState) {
+        state.workspaceManager.onSettledProjectedWorkspaceSelection = nil
         state.beginClose()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
@@ -1308,6 +1334,39 @@ class WindowStatesManager: ObservableObject {
                 terminationWindowSnapshot.removeAll()
             }
         }
+
+        /// Opaque instance-allocator state, so a test can seed exact numbering from an empty
+        /// allocator and then restore the process-wide history. Allocation policy is unchanged.
+        struct InstanceAllocatorStateForTesting {
+            fileprivate var next: [UUID: Int] = [:]
+            fileprivate var assigned: [Int: (workspaceID: UUID, number: Int)] = [:]
+            fileprivate var history: [Int: [UUID: Int]] = [:]
+            fileprivate var restored: [UUID: [Int]] = [:]
+
+            init() {}
+        }
+
+        /// Seeds instance numbers from `snapshot` exactly as session restore does.
+        func preseedInstanceNumberStateForTesting(from snapshot: WindowSessionSnapshot?) {
+            preseedInstanceNumberState(from: snapshot)
+        }
+
+        /// Installs `state` (empty by default) and returns the state it replaced.
+        @discardableResult
+        func replaceInstanceAllocatorStateForTesting(
+            _ state: InstanceAllocatorStateForTesting = InstanceAllocatorStateForTesting()
+        ) -> InstanceAllocatorStateForTesting {
+            var previous = InstanceAllocatorStateForTesting()
+            previous.next = nextInstanceNumberByWorkspace
+            previous.assigned = assignedInstanceByWindowID
+            previous.history = windowWorkspaceNumberHistory
+            previous.restored = restoredInstanceNumbersByWorkspace
+            nextInstanceNumberByWorkspace = state.next
+            assignedInstanceByWindowID = state.assigned
+            windowWorkspaceNumberHistory = state.history
+            restoredInstanceNumbersByWorkspace = state.restored
+            return previous
+        }
     #endif
 
     /// Cancels Combine subscriptions and clears state that could trigger updates during shutdown.
@@ -1397,7 +1456,11 @@ class WindowStatesManager: ObservableObject {
     /// Records that a window switched to a given workspace and assigns a new sticky instance number.
     /// Returns the assigned number, or nil if workspace is nil.
     @discardableResult
-    func recordWorkspaceSwitch(forWindowID windowID: Int, to workspace: WorkspaceModel?) -> Int? {
+    func recordWorkspaceSwitch(
+        forWindowID windowID: Int,
+        to workspace: WorkspaceModel?,
+        consumeRestoredNumbers: Bool = true
+    ) -> Int? {
         // Skip during termination to prevent observation crashes
         guard !isTerminating else { return nil }
 
@@ -1430,7 +1493,10 @@ class WindowStatesManager: ObservableObject {
             let isOccupied = assignedInstanceByWindowID.contains { otherWindowID, current in
                 otherWindowID != windowID && current.workspaceID == wsID && current.number == remembered
             }
-            if !isOccupied {
+            // Settled adoption must not claim a pending saved window's routing identity.
+            let isReserved = !consumeRestoredNumbers
+                && (restoredInstanceNumbersByWorkspace[wsID]?.contains(remembered) ?? false)
+            if !isOccupied, !isReserved {
                 let assignedNumber = remembered
                 assignedInstanceByWindowID[windowID] = (workspaceID: wsID, number: assignedNumber)
                 // Ensure 'next' is beyond assigned
@@ -1449,7 +1515,9 @@ class WindowStatesManager: ObservableObject {
 
         // 2) Try to consume a restored instance number for this workspace
         var assignedNumber: Int
-        if var restored = restoredInstanceNumbersByWorkspace[wsID], !restored.isEmpty {
+        if consumeRestoredNumbers,
+           var restored = restoredInstanceNumbersByWorkspace[wsID], !restored.isEmpty
+        {
             assignedNumber = restored.removeFirst()
             restoredInstanceNumbersByWorkspace[wsID] = restored
         } else if let next = nextInstanceNumberByWorkspace[wsID] {

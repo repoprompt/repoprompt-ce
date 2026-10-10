@@ -9858,7 +9858,9 @@ actor ServerNetworkManager {
                         } else {
                             workspace?.name ?? NSNull()
                         }
-                        let workspaceInstanceNumber: Any = window.workspaceInstanceNumber ?? NSNull()
+                        let workspaceInstanceNumber: Any = workspace.flatMap {
+                            window.workspaceInstanceNumber(for: $0.id)
+                        } ?? NSNull()
                         let activeContextID: Any = activeTabID?.uuidString ?? NSNull()
                         let activeContextName: Any = activeTabID.flatMap { window.workspaceManager.composeTabName(with: $0) } ?? NSNull()
                         let repoPaths: [String] = workspace.map { WorkspaceManagerViewModel.loadableRepoPaths(for: $0) } ?? []
@@ -16403,11 +16405,12 @@ actor ServerNetworkManager {
             }
         #endif
         return await MainActor.run {
-            WindowStatesManager.shared.allWindows.map {
-                MCPRoutingWindowSnapshot(
-                    workspaceID: $0.workspaceManager.activeWorkspace?.id,
-                    instanceNumber: $0.workspaceInstanceNumber,
-                    windowID: $0.windowID
+            WindowStatesManager.shared.allWindows.map { window in
+                let workspaceID = window.workspaceManager.activeWorkspace?.id
+                return MCPRoutingWindowSnapshot(
+                    workspaceID: workspaceID,
+                    instanceNumber: workspaceID.flatMap { window.workspaceInstanceNumber(for: $0) },
+                    windowID: window.windowID
                 )
             }
         }
@@ -16612,7 +16615,9 @@ actor ServerNetworkManager {
                 let windowID,
                 let win = WindowStatesManager.shared.window(withID: windowID)
             else { return (nil, nil) }
-            return (win.workspaceManager.activeWorkspace?.id, win.workspaceInstanceNumber)
+            // Pair the number with the same workspace ID; a pending assignment records nil.
+            let workspaceID = win.workspaceManager.activeWorkspace?.id
+            return (workspaceID, workspaceID.flatMap { win.workspaceInstanceNumber(for: $0) })
         }
 
         await pruneRoutingRecords()

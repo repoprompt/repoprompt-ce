@@ -3366,6 +3366,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var workspaceDidSwitchListeners: [WorkspaceDidSwitchListener] = []
 
+    /// A settled authority selection needs numbering, but is not a completed workspace switch.
+    /// Delivered synchronously after installation to the registered window's numbering owner.
+    var onSettledProjectedWorkspaceSelection: ((WorkspaceModel?) -> Void)?
+
     /// Multiple callbacks that will be triggered before saving the active workspace.
     private var beforeSaveListeners: [BeforeSaveListener] = []
     private var composeTabApplyTask: Task<Void, Never>?
@@ -8780,6 +8784,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             reconcileFirstProjectedWorkspaceSelection(
                 canonicalSystemWorkspaceIDs: canonicalSystemWorkspaceIDs
             )
+        }
+        if previousActiveWorkspaceID != activeWorkspaceID,
+           !isPreparingForWindowClose, !isSwitchingWorkspace, activeWorkspaceSwitch == nil
+        {
+            onSettledProjectedWorkspaceSelection?(activeWorkspace)
         }
         if previousActiveWorkspaceID != activeWorkspaceID, let activeWorkspaceID {
             requestRootReconciliation(workspaceID: activeWorkspaceID)

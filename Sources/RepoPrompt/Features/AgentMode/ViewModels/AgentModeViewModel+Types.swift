@@ -2,6 +2,69 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
+/// Qualifies transcript presentation facts by owner, tab, session object, binding
+/// incarnation and transition. Presentation-only; never an authorization token.
+struct AgentSessionPresentationScope: Equatable {
+    let owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
+    let tabID: UUID
+    let sessionIdentity: ObjectIdentifier?
+    let binding: AgentPersistentSessionBindingIdentity?
+    let bindingTransitionGeneration: UInt64
+}
+
+struct AgentPersistedLoadAttempt: Equatable {
+    let scope: AgentSessionPresentationScope
+    let attemptID: UUID
+    let sourceItemsRevision: Int
+    /// The loader's existing commit fence for this bound attempt (never a new authority).
+    let commitToken: AgentModeViewModel.PersistedHydrationCommitToken?
+    /// The settled attempt an explicit Retry admitted this replacement for.
+    let retriedAttemptID: UUID?
+
+    init(
+        scope: AgentSessionPresentationScope,
+        attemptID: UUID,
+        sourceItemsRevision: Int,
+        commitToken: AgentModeViewModel.PersistedHydrationCommitToken? = nil,
+        retriedAttemptID: UUID? = nil
+    ) {
+        self.scope = scope
+        self.attemptID = attemptID
+        self.sourceItemsRevision = sourceItemsRevision
+        self.commitToken = commitToken
+        self.retriedAttemptID = retriedAttemptID
+    }
+}
+
+enum AgentPersistedLoadExit: Equatable {
+    case payloadApplied
+    case missingPayload
+    case loadFailed
+    case cancelled
+    case sourceRevisionSuperseded
+    case persistenceSuppressed
+}
+
+struct AgentSessionPresentationRecord: Equatable {
+    enum Origin: Equatable {
+        case fresh
+        case saved
+    }
+
+    enum Phase: Equatable {
+        /// Saved load is scheduled/deferred for this scope but has not installed an attempt.
+        case notStarted
+        case loading(AgentPersistedLoadAttempt)
+        case settled(AgentPersistedLoadAttempt, AgentPersistedLoadExit)
+        /// Local state owns the scope (fresh creation, already-loaded or competing local transaction).
+        case settledLocal
+    }
+
+    let scope: AgentSessionPresentationScope
+    let origin: Origin
+    let phase: Phase
+}
+
 enum AgentSidebarThreadKey: Hashable, Equatable {
     case session(UUID)
     case tab(UUID)
@@ -170,12 +233,14 @@ extension AgentModeViewModel {
         case search
         case visibleCount
         case explicit
+        case restoreProjection
     }
 
     struct SidebarSessionRowsCacheKey: Equatable {
         let workspaceID: UUID?
         let rowContentRevision: Int
         let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
+        let restorePresentation: SidebarRestorePresentationKey
     }
 
     struct SidebarListProjectionCacheKey: Equatable {
@@ -186,10 +251,13 @@ extension AgentModeViewModel {
         let stashedTabSignatures: [AgentSessionSidebarStashedTabSignature]
         let archivedSessionsExpanded: Bool
         let showComposeTabsWithoutAgentSessions: Bool
+        let restorePresentation: SidebarRestorePresentationKey
     }
 
     struct SidebarListProjection {
         let workspaceID: UUID?
+        /// An actual switch/queued adoption is unresolved: no outgoing rows and no target headings (§5.3).
+        let isOwnerPending: Bool
         let filteredSessions: [SidebarSession]
         let pagedSessions: [SidebarSession]
         let effectiveVisibleSessionCount: Int
@@ -297,7 +365,18 @@ extension AgentModeViewModel {
         let sessionSignatures: [AgentSessionSidebarTabSignature]
         let sessionIndex: [UUID: AgentSessionIndexEntry]
         let sessionListSortDates: [UUID: Date]
-        let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
+        /// Baseline revision (nil once released) and owner-pending state; a baseline-only change must
+        /// invalidate consumers even when index and transcript inputs are unchanged.
+        let sidebarRestorePresentation: SidebarRestorePresentationKey
+    }
+
+    /// Positional restoration state that row caches, the list projection and fingerprints key on.
+    struct SidebarRestorePresentationKey: Equatable {
+        let baselineOwner: AgentWorkspaceSessionIndexStore.SessionIndexOwner?
+        let baselineRevision: UInt64?
+        let isOwnerPending: Bool
+
+        static let settled = SidebarRestorePresentationKey(baselineOwner: nil, baselineRevision: nil, isOwnerPending: false)
     }
 
     struct ActiveUIInvalidation: OptionSet {
@@ -869,6 +948,9 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
+        /// Captured restoration date bucket while the sidebar baseline positions this row (§5.4);
+        /// nil for settled rows, which keep the ordinary maximum-date heading.
+        let restorationDateBucket: AgentSidebarDateSectionBucket?
         /// Deferred search-field inputs. Rows intentionally store the raw source
         /// rather than normalized `AgentSessionSearchFields` so ordinary sidebar
         /// rebuilds never pay ICU folding cost for a search box that is empty.
@@ -897,6 +979,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
             threadActivityDate: Date? = nil,
+            restorationDateBucket: AgentSidebarDateSectionBucket? = nil,
             searchFieldSource: AgentSessionSearchFieldSource = .empty
         ) {
             self.id = id
@@ -919,6 +1002,7 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
+            self.restorationDateBucket = restorationDateBucket
             self.searchFieldSource = searchFieldSource
         }
 
