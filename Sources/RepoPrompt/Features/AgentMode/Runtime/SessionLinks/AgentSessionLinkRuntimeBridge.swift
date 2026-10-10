@@ -1315,6 +1315,8 @@ final class AgentSessionLinkRuntimeBridge {
         var test_beforeLaneCreationIndependentGrantSample: (@MainActor (Set<DomainAgentSessionLinkEndpointIdentity>) async -> Void)?
         var test_afterLaneCreationIndependentGrantSample: (@MainActor (DomainAgentSessionLinkGrant?) async -> Void)?
         var test_afterLaneCapInventoryBeforeRevision: (@MainActor () async -> Void)?
+        /// Emulates scheduling delay at the final cap-admission caller authorization hop.
+        var test_beforeLaneCapCallerValidation: (@MainActor () async -> Void)?
         var test_afterAddInsertionBeforeEstablishment: (@MainActor (AgentSessionOversightIntent) async -> Void)?
         /// Parks the exact entry owner after its mutation, before outer compensation/cap release.
         var test_afterActivationBackedEstablishmentMutation: (@MainActor (AgentSessionOversightIntent, Bool) async -> Void)?
@@ -7565,11 +7567,20 @@ final class AgentSessionLinkRuntimeBridge {
         _ endpoint: DomainAgentSessionLinkEndpointIdentity,
         basis: LaneCreationCallerBasis
     ) async -> Bool {
-        guard !isFrozenForTermination, !Task.isCancelled, let host else { return false }
-        switch basis {
-        case .linked:
+        guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
+        if case .linked = basis {
             guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
-        case let .activated(activation):
+        }
+        return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)
+    }
+
+    /// Synchronous incarnation/eligibility fence after the last authority suspension.
+    private func laneCreationCallerEndpointIsCurrent(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        basis: LaneCreationCallerBasis
+    ) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, let host else { return false }
+        if case let .activated(activation) = basis {
             guard host.agentSessionLinkBootstrapState(for: endpoint)?.activation == activation else { return false }
         }
         guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return false }
@@ -7786,8 +7797,9 @@ final class AgentSessionLinkRuntimeBridge {
             }
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
         guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
-        // No suspension between this count and the reservation: admission is creator-scoped and
-        // counts both active lanes and the pending allocations that have not linked yet.
+        // Admission is creator-scoped and counts active lanes plus pending allocations. The final
+        // authorization must be inside the stability fence: it can suspend while a competing
+        // reservation becomes a linked lane and is released.
         let creatorID = observerEndpoint.sessionID
         var linkedIDs: Set<UUID>
         var stabilityAttempts = 0
@@ -7800,9 +7812,14 @@ final class AgentSessionLinkRuntimeBridge {
             #if DEBUG
                 await test_afterLaneCapInventoryBeforeRevision?()
             #endif
-            let currentRevision = await authority.snapshot().authorityRevision
+            #if DEBUG
+                await test_beforeLaneCapCallerValidation?()
+            #endif
             guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
             guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
+            let currentRevision = await authority.snapshot().authorityRevision
+            guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard laneCreationCallerEndpointIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
             if generation == laneCreationCapGeneration[creatorID, default: 0],
                snapshot.revision == currentRevision
             {
@@ -7810,10 +7827,8 @@ final class AgentSessionLinkRuntimeBridge {
                 break
             }
         }
+        // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
-        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis)
-        else { return .refused(.denied) }
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
         guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
