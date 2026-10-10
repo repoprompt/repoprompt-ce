@@ -7544,10 +7544,12 @@ actor GitService {
 
         switch repositoryBinding {
         case .inferred:
-            // For gitfile worktrees, inject GIT_DIR and GIT_WORK_TREE to ensure
-            // git commands operate in the correct context.
-            // Skip for commands that don't need repo context (e.g., --no-index diffs).
-            if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+            // Bind read operations to the requested working tree even for normal
+            // checkouts: core.worktree must not silently redirect a scoped read.
+            // Retain the existing explicit binding for gitfile worktree mutations.
+            if requiresRepoContext, let layout = getLayout(for: repoURL),
+               layout.isWorktree || Self.isVerifiedReadOnlyGitOperation(args)
+            {
                 environment["GIT_DIR"] = layout.gitDir.path
                 environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
             }

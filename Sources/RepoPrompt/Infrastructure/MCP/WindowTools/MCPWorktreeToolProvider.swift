@@ -784,6 +784,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             repo = defaultRepo
         }
 
+        guard await vcsService.resolveRepoForRead(at: repo.rootURL, authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]) != nil else {
+            throw MCPError.invalidParams("Repository metadata is not authorized for this worktree request.")
+        }
         return RepositoryContext(repo: repo, allRepos: allRepos, visibleRoots: visibleRoots, lookupContext: lookupContext, explicitLogicalRoot: explicitLogicalRoot)
     }
 
@@ -815,7 +818,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         var repos: [GitRepoDescriptor] = []
         var seen = Set<String>()
         for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
+            if let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: root.standardizedFullPath), authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }) {
                 let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
                 let key = descriptor.rootPath.lowercased()
                 if seen.insert(key).inserted {
@@ -829,7 +832,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     private func resolveDefaultGitRepo(rootScope: WorkspaceLookupRootScope) async throws -> GitRepoDescriptor {
         let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
         for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
+            if let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: root.standardizedFullPath), authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }) {
                 return GitRepoDescriptor(rootURL: resolved.rootURL)
             }
         }
@@ -876,7 +879,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         visibleRoots: [WorkspaceRootRef]
     ) async throws -> WorkspaceRootRef {
         for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)),
+            if let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: root.standardizedFullPath), authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }),
                GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
             {
                 return root

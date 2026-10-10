@@ -831,3 +831,73 @@ private actor ListingSpy {
         await gate?.wait()
     }
 }
+
+final class VCSReadRootAuthorizationTests: XCTestCase {
+    func testNormalCheckoutReadDoesNotFollowConfiguredExternalWorktree() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-read-binding-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let external = base.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Data("inside".utf8).write(to: root.appendingPathComponent("inside-only.txt"))
+        try Data("outside".utf8).write(to: external.appendingPathComponent("outside-only.txt"))
+        for args in [["init", "--quiet"], ["config", "core.worktree", external.path]] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", root.path] + args
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+        }
+        let status = try await GitService().getStatusPorcelainZ(at: root)
+        let text = String(decoding: status, as: UTF8.self)
+        XCTAssertTrue(text.contains("inside-only.txt"), text)
+        XCTAssertFalse(text.contains("outside-only.txt"), text)
+    }
+
+    func testJujutsuMetadataDoesNotExpandReadRoots() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("jj-read-root-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let external = base.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let service = VCSService(jjRunner: JJCommandRunner { _, _, _ in ("", "", 0) })
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        let initial = await service.resolveRepo(from: root)
+        XCTAssertEqual(initial?.backendKind, .git)
+        let jjDirectory = root.appendingPathComponent(".jj")
+        try FileManager.default.createSymbolicLink(at: jjDirectory, withDestinationURL: external)
+        let symlinkResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(symlinkResult)
+        try FileManager.default.removeItem(at: jjDirectory)
+        try FileManager.default.createDirectory(at: jjDirectory, withIntermediateDirectories: true)
+        try Data((external.path + "\n").utf8).write(to: jjDirectory.appendingPathComponent("repo"))
+        let pointerResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNil(pointerResult)
+        let approvedResult = await service.resolveRepoForRead(at: root, authorizedRoots: [root, external])
+        XCTAssertEqual(approvedResult?.backendKind, .jujutsu)
+        let backend = await service.backend(forRepoRoot: root)
+        XCTAssertEqual(backend.kind, .jujutsu)
+    }
+
+    func testScopedDiscoveryDoesNotReuseParentRepositoryCache() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("vcs-read-root-\(UUID().uuidString)")
+        let nested = root.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = VCSService()
+        let unrestricted = await service.resolveRepo(from: nested)
+        XCTAssertEqual(unrestricted?.rootURL.standardizedFileURL.path, root.standardizedFileURL.path)
+        let scoped = await service.resolveRepoForRead(at: nested, authorizedRoots: [nested])
+        XCTAssertNil(scoped)
+        let unauthorizedParent = await service.resolveRepoForRead(at: root, authorizedRoots: [nested])
+        XCTAssertNil(unauthorizedParent)
+        let authorizedParent = await service.resolveRepoForRead(at: root, authorizedRoots: [root])
+        XCTAssertNotNil(authorizedParent)
+    }
+}

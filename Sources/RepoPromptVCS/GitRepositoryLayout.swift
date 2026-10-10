@@ -126,41 +126,93 @@ public enum GitRepositoryLayoutResolver {
         )
     }
 
+    /// Resolve metadata for a workspace-scoped read without treating discovery as authority.
+    /// External metadata is permitted only for a reciprocally registered linked worktree;
+    /// granting that metadata does not grant reads of the main or sibling working trees.
+    package static func resolveForRead(atWorkTreeRoot root: URL, authorizedRoots: [URL]) -> GitRepositoryLayout? {
+        let rootPaths = authorizedRoots.map(\.path)
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(root.path, roots: rootPaths) else { return nil }
+        let dotGit = root.appendingPathComponent(".git")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) else { return nil }
+        if isDirectory.boolValue {
+            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(dotGit.path, roots: rootPaths) else { return nil }
+            let commonFile = dotGit.appendingPathComponent("commondir")
+            if FileManager.default.fileExists(atPath: commonFile.path) {
+                guard let commonDir = readMetadataPath(at: commonFile, relativeTo: dotGit),
+                      GitRepoRootAuthorization.isPathWithinAuthorizedRoots(commonDir.path, roots: rootPaths)
+                else { return nil }
+            }
+            return resolve(atWorkTreeRoot: root)
+        }
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(dotGit.path, roots: rootPaths),
+              let gitDir = parseGitFile(at: dotGit, relativeTo: root)
+        else { return nil }
+        var gitDirIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &gitDirIsDirectory), gitDirIsDirectory.boolValue else { return nil }
+
+        if GitRepoRootAuthorization.isPathWithinAuthorizedRoots(gitDir.path, roots: rootPaths) {
+            let commonFile = gitDir.appendingPathComponent("commondir")
+            if FileManager.default.fileExists(atPath: commonFile.path) {
+                guard let commonDir = readMetadataPath(at: commonFile, relativeTo: gitDir),
+                      GitRepoRootAuthorization.isPathWithinAuthorizedRoots(commonDir.path, roots: rootPaths)
+                else { return nil }
+            }
+            guard let layout = resolve(atWorkTreeRoot: root),
+                  GitRepoRootAuthorization.isPathWithinAuthorizedRoots(layout.commonDir.path, roots: rootPaths)
+            else { return nil }
+            return layout
+        }
+
+        // A linked worktree's metadata lives at <common>/worktrees/<id>. Check the
+        // backpointer before following commondir, rather than accepting any gitfile.
+        let canonicalGitDir = gitDir.resolvingSymlinksInPath().standardizedFileURL
+        let registrations = canonicalGitDir.deletingLastPathComponent()
+        guard registrations.lastPathComponent == "worktrees",
+              let backlink = readMetadataPath(at: canonicalGitDir.appendingPathComponent("gitdir"), relativeTo: canonicalGitDir),
+              GitRepoRootAuthorization.canonicalPath(backlink.path) == GitRepoRootAuthorization.canonicalPath(dotGit.path),
+              let commonDir = readMetadataPath(at: canonicalGitDir.appendingPathComponent("commondir"), relativeTo: canonicalGitDir),
+              GitRepoRootAuthorization.canonicalPath(commonDir.path) == GitRepoRootAuthorization.canonicalPath(registrations.deletingLastPathComponent().path)
+        else { return nil }
+        return GitRepositoryLayout(
+            workTreeRoot: root,
+            dotGitPath: dotGit,
+            gitDir: gitDir,
+            commonDir: commonDir,
+            isWorktree: true
+        )
+    }
+
+    private static func readMetadataText(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4097), data.count <= 4096,
+              let content = String(data: data, encoding: .utf8)
+        else { return nil }
+        var text = content
+        while text.last == "\r" || text.last == "\n" {
+            text.removeLast()
+        }
+        guard !text.isEmpty, !text.contains("\n"), !text.contains("\r"), !text.contains("\0") else { return nil }
+        return text
+    }
+
+    private static func readMetadataPath(at url: URL, relativeTo base: URL) -> URL? {
+        guard let path = readMetadataText(at: url) else { return nil }
+        return (path.hasPrefix("/") ? URL(fileURLWithPath: path) : base.appendingPathComponent(path)).standardizedFileURL
+    }
+
     // MARK: - Private Helpers
 
     /// Parse a gitfile to extract the git directory path.
     /// Gitfiles contain: "gitdir: <path>\n"
     private static func parseGitFile(at url: URL, relativeTo base: URL) -> URL? {
-        // Read only the first line (gitfiles are tiny, typically < 100 bytes)
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        defer { try? handle.close() }
-
-        // Read a small chunk - gitdir lines are short
-        guard let data = try? handle.read(upToCount: 512),
-              let content = String(data: data, encoding: .utf8)
-        else {
-            return nil
-        }
-
-        // Parse "gitdir: <path>"
-        let prefix = "gitdir:"
-        guard content.hasPrefix(prefix) else {
-            return nil
-        }
-
-        var pathStr = String(content.dropFirst(prefix.count))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Handle newlines in case there's more content
-        if let newlineIndex = pathStr.firstIndex(of: "\n") {
-            pathStr = String(pathStr[..<newlineIndex])
-        }
-
-        guard !pathStr.isEmpty else {
-            return nil
-        }
+        // Refuse truncated or ambiguous metadata rather than authorizing a prefix
+        // that Git would interpret as a different path. Preserve path whitespace.
+        let prefix = "gitdir: "
+        guard let content = readMetadataText(at: url), content.hasPrefix(prefix) else { return nil }
+        let pathStr = String(content.dropFirst(prefix.count))
+        guard !pathStr.isEmpty else { return nil }
 
         // Resolve relative paths against the worktree root
         let gitDirURL: URL = if pathStr.hasPrefix("/") {
@@ -177,22 +229,8 @@ public enum GitRepositoryLayoutResolver {
     private static func resolveCommonDir(gitDir: URL) -> URL {
         // Try reading the `commondir` file first (most reliable)
         let commondirFile = gitDir.appendingPathComponent("commondir")
-        if let handle = try? FileHandle(forReadingFrom: commondirFile) {
-            defer { try? handle.close() }
-
-            if let data = try? handle.read(upToCount: 512),
-               let content = String(data: data, encoding: .utf8)
-            {
-                let pathStr = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !pathStr.isEmpty {
-                    // commondir is relative to gitDir
-                    if pathStr.hasPrefix("/") {
-                        return URL(fileURLWithPath: pathStr).standardizedFileURL
-                    } else {
-                        return gitDir.appendingPathComponent(pathStr).standardizedFileURL
-                    }
-                }
-            }
+        if let commonDir = readMetadataPath(at: commondirFile, relativeTo: gitDir) {
+            return commonDir
         }
 
         // Fallback heuristic: if gitDir looks like `.git/worktrees/<name>`,
