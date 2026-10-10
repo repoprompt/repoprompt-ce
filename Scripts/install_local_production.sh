@@ -357,5 +357,6 @@ APP_INSTALLED=0
 
 printf 'Installed local self-signed production app: %s\n' "$LOCAL_PRODUCTION_APP"
 printf 'Registered local signing fingerprint: %s\n' "$SELECTED_CERTIFICATE_SHA256"
-printf 'Local secure-storage service generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Local signing compatibility generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Local self-signed builds use in-memory secure storage; re-enter provider keys and secure permission changes after each launch. Existing Keychain items are left untouched.\n'
 printf 'This app is local-only, not notarized, and must not be distributed or uploaded to GitHub Releases.\n'

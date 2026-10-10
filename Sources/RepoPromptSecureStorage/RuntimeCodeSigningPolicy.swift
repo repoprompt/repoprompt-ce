@@ -73,6 +73,7 @@ enum RuntimeSecureStorageRejectionReason: Equatable {
     case localIdentityMetadataUnavailable
     case localIdentityRegistryUnavailable
     case localIdentityContinuityMismatch
+    case localIdentityNotTrustedForPersistence
 }
 
 enum RuntimeLocalSigningContext: Equatable {
@@ -225,7 +226,7 @@ package enum RuntimeCodeSigningPolicy {
                 }
                 return ephemeral(.localIdentityRegistryUnavailable)
             }
-            guard let validatedIdentity = expectation.validatedIdentity else {
+            guard expectation.validatedIdentity != nil else {
                 return ephemeral(.localIdentityContinuityMismatch)
             }
             guard matches(
@@ -236,12 +237,9 @@ package enum RuntimeCodeSigningPolicy {
             ) else {
                 return ephemeral(.markerSignatureMismatch)
             }
-            return RuntimeSecureStorageDecision(
-                domain: .localSelfSigned,
-                rejectionReason: nil,
-                localCertificateFingerprint: validatedIdentity.fingerprint,
-                localServiceGeneration: validatedIdentity.serviceGeneration
-            )
+            // Certificate and registry continuity establish build identity, not
+            // authority to persist secrets. Local self-signed builds stay process-local.
+            return ephemeral(.localIdentityNotTrustedForPersistence)
         case "release-candidate-adhoc":
             return ephemeral(.releaseCandidate)
         case "debug-adhoc":
