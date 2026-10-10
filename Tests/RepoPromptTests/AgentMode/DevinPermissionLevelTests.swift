@@ -727,31 +727,24 @@ final class DevinPermissionLevelTests: XCTestCase {
                 providerFactory: { _ in
                     DevinACPAgentProvider(config: DevinAgentConfig(
                         commandName: executable.path,
-                        includeRepoPromptMCPServer: false
-                    ))
+                        includeRepoPromptMCPServer: true
+                    ), repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"))
                 }
             )
-            let shouldApprove = ["git", "git-input-update", "manage_selection", "corroborated"].contains(scenario)
             do {
                 try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
                     let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
                     for try await _ in stream {}
                 }
-                XCTAssertTrue(shouldApprove, scenario)
+                XCTFail("Unattested provider metadata must require approval: \(scenario)")
             } catch {
-                XCTAssertFalse(shouldApprove, "\(scenario): \(error)")
                 XCTAssertTrue(error.localizedDescription.contains("approval"), "\(scenario): \(error)")
             }
             await provider.dispose()
-            if shouldApprove {
-                let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
-                XCTAssertEqual(response["outcome"], "selected", scenario)
-                XCTAssertEqual(response["optionId"], "allow_once", scenario)
-            }
         }
     }
 
-    func testSparseDevinRepoPromptPermissionUsesExactAllowOnce() async throws {
+    func testSparseDevinRepoPromptPermissionRequiresExplicitAllowOnce() async throws {
         let directory = try makeTestDirectory(name: "DevinSparsePermission")
         let executable = directory.appendingPathComponent("devin")
         let record = directory.appendingPathComponent("permission.json")
@@ -799,7 +792,8 @@ final class DevinPermissionLevelTests: XCTestCase {
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let provider = DevinACPAgentProvider(
-            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: true),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
         let controller = try ACPAgentSessionController(
@@ -807,8 +801,20 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         do {
             _ = try await controller.bootstrap()
+            let events = await controller.events
+            let consumer = Task { () -> Bool in
+                for await event in events {
+                    if case let .approvalRequested(approval) = event {
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: .accept)
+                        return true
+                    }
+                }
+                return false
+            }
             try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
             await controller.shutdown()
+            let approvalRequested = await consumer.value
+            XCTAssertTrue(approvalRequested, "Injected server configuration and cached metadata do not authenticate invocation identity")
         } catch {
             await controller.shutdown()
             throw error
