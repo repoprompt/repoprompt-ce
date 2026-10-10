@@ -41,7 +41,9 @@ enum MCPAppSocketAvailabilityProbe {
 
     static func isAvailable(at socketURL: URL) -> Bool {
         let path = socketURL.path
-        guard isUnixDomainSocket(at: path) else { return false }
+        guard let directory = try? MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent()),
+              (try? directory.validateSocket(at: socketURL)) != nil
+        else { return false }
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
@@ -78,7 +80,7 @@ enum MCPAppSocketAvailabilityProbe {
             }
         }
         if result == 0 {
-            return true
+            return (try? directory.validateSocket(at: socketURL)) != nil
         }
         guard errno == EINPROGRESS || errno == EAGAIN else {
             return false
@@ -104,12 +106,6 @@ enum MCPAppSocketAvailabilityProbe {
         ) == 0 else {
             return false
         }
-        return socketError == 0
-    }
-
-    private static func isUnixDomainSocket(at path: String) -> Bool {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return false }
-        return info.st_mode & S_IFMT == S_IFSOCK
+        return socketError == 0 && (try? directory.validateSocket(at: socketURL)) != nil
     }
 }

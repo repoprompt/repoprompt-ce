@@ -294,12 +294,6 @@ actor BootstrapSocketServer {
 
         self.onNewConnection = onNewConnection
 
-        // Ensure socket directory exists with secure permissions
-        MCPFilesystemConstants.ensureSocketDirectoryExists()
-        #if DEBUG
-            print("[MCPStartup] ensured socket dir=\(socketURL.deletingLastPathComponent().path) exists=\(FileManager.default.fileExists(atPath: socketURL.deletingLastPathComponent().path))")
-        #endif
-
         let ownership = try BootstrapSocketOwnership.acquire(socketURL: socketURL)
         socketOwnership = ownership
         do {
@@ -353,6 +347,14 @@ actor BootstrapSocketServer {
             }
         }
 
+        do {
+            try ownership.validateDirectoryForBinding()
+        } catch {
+            Darwin.close(fd)
+            socketOwnership = nil
+            ownership.release()
+            throw error
+        }
         let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
                 bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))

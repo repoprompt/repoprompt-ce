@@ -2238,6 +2238,13 @@ actor InteractiveMCPClientSession {
     /// Performs the bootstrap socket handshake and returns the connected FD.
     private func performBootstrapHandshake() async throws -> Int32 {
         let socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+        let directory: MCPBootstrapDirectory
+        do {
+            directory = try MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent())
+            try directory.validateSocket(at: socketURL)
+        } catch let error as MCPBootstrapDirectory.DirectoryError where error.isMissing {
+            throw InteractiveSessionError.appNotRunning
+        }
 
         // Create socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -2293,6 +2300,7 @@ actor InteractiveMCPClientSession {
             throw InteractiveSessionError.connectFailed(errno: err)
         }
 
+        try directory.validateSocket(at: socketURL)
         logger.debug("Connected to bootstrap socket")
 
         // Send handshake request

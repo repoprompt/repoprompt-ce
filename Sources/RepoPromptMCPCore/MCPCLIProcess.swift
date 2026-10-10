@@ -945,6 +945,13 @@ actor BootstrapSocketProxy {
     // MARK: - Socket Connection
 
     private func connectToSocket() throws {
+        let directory: MCPBootstrapDirectory
+        do {
+            directory = try MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent())
+            try directory.validateSocket(at: socketURL)
+        } catch let error as MCPBootstrapDirectory.DirectoryError where error.isMissing {
+            throw SocketProxyError.connectFailed(errno: ENOENT)
+        }
         // Create socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -1005,6 +1012,12 @@ actor BootstrapSocketProxy {
             _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         }
 
+        do {
+            try directory.validateSocket(at: socketURL)
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
         socketFD = fd
         log.debug("BootstrapSocketProxy: Connected to \(socketURL.path)")
     }
