@@ -577,9 +577,8 @@ package actor GitDiffEngine {
         case let .uncommitted(base):
             let backend = await vcsService.backend(forRepoRoot: repoURL)
             let normalizedBase = backend.normalizeBaseRef(base)
-            if await isRemoteBranch(normalizedBase, repoURL: repoURL) {
-                try? await backend.fetch(at: repoURL)
-            }
+            // Diff generation reads existing tracking refs; fetching is an
+            // explicitly requested network operation, never a read side effect.
             let fingerprint = try await backend.getStatusFingerprint(at: repoURL, baseRef: normalizedBase)
             let cacheKey = CacheKey(
                 repoPath: repoURL.path,
@@ -653,9 +652,8 @@ package actor GitDiffEngine {
         case let .uncommittedMergeBase(base):
             let backend = await vcsService.backend(forRepoRoot: repoURL)
             let normalizedBase = backend.normalizeBaseRef(base)
-            if await isRemoteBranch(normalizedBase, repoURL: repoURL) {
-                try? await backend.fetch(at: repoURL)
-            }
+            // Diff generation reads existing tracking refs; fetching is an
+            // explicitly requested network operation, never a read side effect.
             let fingerprint = try await backend.getStatusFingerprint(at: repoURL, baseRef: normalizedBase)
             let cacheKey = CacheKey(
                 repoPath: repoURL.path,
@@ -843,11 +841,5 @@ package actor GitDiffEngine {
 
     private func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
         GitDiffPathNormalization.gitRelativePaths(from: absolutePaths, repoRootPath: repoRootPath)
-    }
-
-    private func isRemoteBranch(_ branchName: String, repoURL: URL) async -> Bool {
-        guard branchName != "HEAD", !branchName.isEmpty else { return false }
-        let backend = await vcsService.backend(forRepoRoot: repoURL)
-        return await backend.hasRemoteTrackingRef(named: branchName, at: repoURL)
     }
 }
