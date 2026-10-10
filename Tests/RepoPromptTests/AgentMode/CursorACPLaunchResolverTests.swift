@@ -844,3 +844,112 @@ private final class CursorDiscoveryClock: @unchecked Sendable {
         return elapsedProbeTime + (FileManager.default.fileExists(atPath: lookupMarker.path) ? 20 : 0)
     }
 }
+
+/// Cross-provider final launch-boundary witnesses share the existing launch test import seam.
+final class ProviderEnvironmentFilteringTests: XCTestCase {
+    func testDefaultPolicyPreservesAuthenticationAndToolchainValues() {
+        let environment = ["OPENAI_API_KEY": "fixture", "CUSTOM_BACKEND_AUTH": "fixture", "SSH_AUTH_SOCK": "/fixture/socket", "NODE_PATH": "/fixture/runtime"]
+        XCTAssertEqual(ProviderEnvironmentFiltering.applying(removedNames: [], to: environment), environment)
+    }
+
+    func testEachProviderUsesItsDeclaredPassThroughWithoutBackendGuessing() async {
+        for provider in AgentProviderKind.allCases {
+            let ambient = ["RPCE_TEST_TOKEN": "fixture", "RPCE_TEST_SOCKET": "/fixture/socket", "PATH": "/usr/bin"]
+            let filtered = await ProviderEnvironmentFiltering.filter(
+                ambient,
+                for: provider,
+                removedNamesProvider: { requestedProvider in
+                    XCTAssertEqual(requestedProvider, provider.rawValue)
+                    // Synthetic per-provider exception: no model/backend introspection.
+                    return Set(["RPCE_TEST_TOKEN", "RPCE_TEST_SOCKET"]).subtracting(["RPCE_TEST_TOKEN"])
+                }
+            )
+            XCTAssertEqual(filtered["RPCE_TEST_TOKEN"], "fixture")
+            XCTAssertNil(filtered["RPCE_TEST_SOCKET"])
+            XCTAssertEqual(filtered["PATH"], "/usr/bin")
+        }
+    }
+
+    func testACPProvenanceDoesNotExemptCopiedAmbientSnapshot() async {
+        let providers: [(ACPProviderID, AgentProviderKind)] = [(.openCode, .openCode), (.cursor, .cursor), (.grokBuild, .grokBuild), (.antigravity, .antigravity), (.devin, .devin)]
+        for (id, provider) in providers {
+            let configuration = ACPLaunchConfiguration(
+                providerID: id, command: "/fixture/provider", arguments: [],
+                environment: ["COPIED_TOKEN": "ambient", "APP_TOKEN": "explicit"],
+                workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false,
+                explicitEnvironmentKeys: ["APP_TOKEN"]
+            )
+            let filtered = await ProviderEnvironmentFiltering.filterACP(
+                ["COPIED_TOKEN": "ambient", "APP_TOKEN": "ambient"],
+                launchConfiguration: configuration, for: provider,
+                removedNamesProvider: { _ in ["COPIED_TOKEN", "APP_TOKEN"] }
+            )
+            XCTAssertNil(filtered["COPIED_TOKEN"])
+            XCTAssertEqual(filtered["APP_TOKEN"], "explicit")
+        }
+        let undeclared = ACPLaunchConfiguration(
+            providerID: .devin, command: "/fixture/provider", arguments: [], environment: ["COPIED_TOKEN": "ambient"],
+            workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false
+        )
+        XCTAssertTrue(undeclared.explicitEnvironmentKeys.isEmpty)
+        let filtered = await ProviderEnvironmentFiltering.filterACP(
+            undeclared.environment, launchConfiguration: undeclared, for: .devin,
+            removedNamesProvider: { _ in ["COPIED_TOKEN"] }
+        )
+        XCTAssertNil(filtered["COPIED_TOKEN"])
+    }
+
+    func testExplicitOverridesSurviveButDynamicLoaderSanitizationStillWins() {
+        let filtered = ProviderEnvironmentFiltering.applying(
+            removedNames: ["TOKEN", "SSH_AUTH_SOCK"],
+            to: ["TOKEN": "ambient", "SSH_AUTH_SOCK": "/fixture/socket", "token": "case-sensitive"],
+            explicitOverrides: ["TOKEN": "explicit", "DYLD_INSERT_LIBRARIES": "/fixture/library"]
+        )
+        XCTAssertEqual(filtered["TOKEN"], "explicit")
+        XCTAssertEqual(filtered["token"], "case-sensitive")
+        XCTAssertNil(filtered["SSH_AUTH_SOCK"])
+        XCTAssertNil(filtered["DYLD_INSERT_LIBRARIES"])
+    }
+
+    func testFinalRunnerFilterCannotBeUndoneByAmbientReconstructionOrCopiedSnapshot() async throws {
+        let filter = ProviderEnvironmentFiltering.cliFilter(
+            for: .openCode,
+            explicitOverrides: ["RPCE_TEST_EXPLICIT": "configured"],
+            removedNamesProvider: { _ in ["RPCE_TEST_AMBIENT", "RPCE_TEST_EXPLICIT", "RPCE_TEST_REMOVED"] }
+        )
+        let config = CLIProcessConfiguration(
+            command: "/bin/sh",
+            processPurpose: .tool,
+            environment: ["RPCE_TEST_AMBIENT": "copied-snapshot", "RPCE_TEST_EXPLICIT": "copied-snapshot"],
+            environmentFilter: filter,
+            additionalPaths: [],
+            shellLookupMode: .disabled
+        )
+        let result = try await CLIProcessRunner(config: config).run(
+            args: ["-c", "printf '%s|%s|%s' \"${RPCE_TEST_AMBIENT-unset}\" \"${RPCE_TEST_EXPLICIT-unset}\" \"${RPCE_TEST_REMOVED-unset}\""],
+            stdin: nil,
+            outputMode: .none,
+            timeout: 10,
+            additionalEnvironment: ["RPCE_TEST_EXPLICIT": "runtime", "RPCE_TEST_REMOVED": "runtime"],
+            additionalRemovedKeys: ["RPCE_TEST_REMOVED"]
+        )
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "unset|runtime|unset")
+    }
+
+    func testUnconfiguredToolRunnerRemainsUnfiltered() async throws {
+        let config = CLIProcessConfiguration(
+            command: "/bin/sh",
+            processPurpose: .tool,
+            environment: ["RPCE_TEST_AMBIENT": "unchanged"],
+            additionalPaths: [],
+            shellLookupMode: .disabled
+        )
+        XCTAssertNil(config.environmentFilter)
+        let result = try await CLIProcessRunner(config: config).run(
+            args: ["-c", "printf '%s' \"$RPCE_TEST_AMBIENT\""], stdin: nil, outputMode: .none, timeout: 10
+        )
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "unchanged")
+    }
+}

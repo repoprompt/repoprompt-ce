@@ -240,6 +240,7 @@ final class DevinCLIProvider: AIProvider {
             command: launch.command,
             workingDirectory: directory.path,
             environment: launch.environment.merging(integration.environment) { _, overlay in overlay },
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .devin, explicitOverrides: integration.environment),
             additionalPaths: [],
             enableDebugLogging: config.enableDebugLogging,
             resolveCandidates: [(launch.command as NSString).lastPathComponent],

@@ -139,6 +139,7 @@ actor ClaudeCLIUsageSource {
             shellLookupMode: .disabled
         )
         guard FileManager.default.isExecutableFile(atPath: command), let helper = Bundle.main.executableURL else { throw ProviderQuotaReadError.cliUnavailable }
+        environment = await ProviderEnvironmentFiltering.filter(environment, for: .claudeCode)
         // This source is for the subscription CLI, never compatible backends or API billing.
         for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"] {
             environment[key] = nil

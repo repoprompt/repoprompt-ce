@@ -237,6 +237,7 @@ package final class CLIProcessRunner {
         timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy? = nil,
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
+        environmentFilter: CLIProcessConfiguration.EnvironmentFilter? = nil,
         cancelChildOnTaskCancellation: Bool = false
     ) async throws -> Result {
         if config.processPurpose == .provider {
@@ -245,7 +246,8 @@ package final class CLIProcessRunner {
         return try await gate.withPermit { [self] in
             let environment = await resolvedEnvironment(
                 additionalEnvironment: additionalEnvironment,
-                additionalRemovedKeys: additionalRemovedKeys
+                additionalRemovedKeys: additionalRemovedKeys,
+                environmentFilter: environmentFilter
             )
             // Prefer a previously successful absolute path for this command.
             let resolvedCommand: String = await {
@@ -842,7 +844,8 @@ package final class CLIProcessRunner {
 
     private func resolvedEnvironment(
         additionalEnvironment: [String: String] = [:],
-        additionalRemovedKeys: Set<String> = []
+        additionalRemovedKeys: Set<String> = [],
+        environmentFilter: CLIProcessConfiguration.EnvironmentFilter? = nil
     ) async -> [String: String] {
         var overrides = config.environment
         // Runtime environment variables take highest priority.
@@ -857,7 +860,12 @@ package final class CLIProcessRunner {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
-        return result.environment
+        guard let filter = environmentFilter ?? config.environmentFilter else { return result.environment }
+        let filtered = await filter(result.environment, additionalEnvironment)
+        return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
+            filtered,
+            additionalRemovedKeys: additionalRemovedKeys
+        )
     }
 
     private func log(_ message: String) {

@@ -1,6 +1,10 @@
 import Foundation
 
 package struct CLIProcessConfiguration {
+    /// Applied after all ambient reconstruction and before the final launch sanitizer.
+    /// The second argument contains explicit per-invocation overrides, not ambient values.
+    package typealias EnvironmentFilter = @Sendable ([String: String], [String: String]) async -> [String: String]
+
     package static func resolvedWorkingDirectory(_ workingDirectory: String?) -> String {
         workingDirectory ?? FileManager.default.temporaryDirectory.path
     }
@@ -13,6 +17,7 @@ package struct CLIProcessConfiguration {
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
     package var workingDirectory: String
     package var environment: [String: String]
+    package var environmentFilter: EnvironmentFilter?
     package var additionalPaths: [String]
     package var commandSuffix: [String]
     package var enableDebugLogging: Bool
@@ -34,6 +39,7 @@ package struct CLIProcessConfiguration {
         allowsProviderProcessLaunchForTesting: Bool = false,
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
         environment: [String: String] = [:],
+        environmentFilter: EnvironmentFilter? = nil,
         additionalPaths: [String] = CLINativePathDefaults.defaultAdditionalPaths,
         commandSuffix: [String] = [],
         enableDebugLogging: Bool = false,
@@ -49,6 +55,7 @@ package struct CLIProcessConfiguration {
         self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         self.workingDirectory = Self.resolvedWorkingDirectory(workingDirectory)
         self.environment = environment
+        self.environmentFilter = environmentFilter
         self.additionalPaths = additionalPaths
         self.commandSuffix = commandSuffix
         self.enableDebugLogging = enableDebugLogging

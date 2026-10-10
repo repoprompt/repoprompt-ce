@@ -112,6 +112,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             let launch = try await resolveLaunchForProbe(for: config)
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
+                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .devin),
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 shellLookupMode: .fallbackOnly

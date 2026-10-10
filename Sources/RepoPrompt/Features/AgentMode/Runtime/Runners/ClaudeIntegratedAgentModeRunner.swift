@@ -317,7 +317,8 @@ final class ClaudeIntegratedAgentModeRunner {
     /// layered over the app env), so `CLAUDE_CONFIG_DIR` set only in a shell profile counts.
     private static func claudeRunUsageProfileID() async -> String {
         let environment = await ProcessEnvironmentBuilder.build(ProcessEnvironmentRequest(purpose: .claudeNative)).environment
-        return ClaudeUsageCredentialProfile.current(environment: environment).id
+        let filtered = await ProviderEnvironmentFiltering.filter(environment, for: .claudeCode)
+        return ClaudeUsageCredentialProfile.current(environment: filtered).id
     }
 
     private func consumeEvents(

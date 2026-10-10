@@ -216,7 +216,7 @@ enum CodexProviderHelpers {
         } else {
             await ProcessEnvironmentBuilder.build(request)
         }
-        return environmentResult.environment
+        return await ProviderEnvironmentFiltering.filter(environmentResult.environment, for: .codexExec)
     }
 
     private static func logPreflightResolution(
