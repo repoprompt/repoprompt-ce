@@ -125,7 +125,7 @@ enum GitReadSafety {
             let key = String(entry[0]).lowercased()
             let relevant = (checksFilters && key.hasPrefix("filter."))
                 || (checksMergeDrivers && key.hasPrefix("merge."))
-            if relevant && (scope == "local" || scope == "worktree") {
+            if relevant, scope == "local" || scope == "worktree" {
                 guard entry.count == 2, entry[1].isEmpty else {
                     throw GitError(message: "Passive Git inspection is unavailable for repository-configured executable filters or merge drivers. Use an explicitly trusted Git workflow for this repository.")
                 }
