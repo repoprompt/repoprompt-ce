@@ -24,6 +24,7 @@ final class ProviderQuotaRuntime {
     private var foregroundObservation: AnyCancellable?
     private var consentObservation: AnyCancellable?
     private var consentTask: Task<Void, Never>?
+    private var managedAuthTransitionTask: Task<Void, Never>?
     private var telemetryDisplayBridge: ClaudeRunTelemetryDisplayBridge?
     var currentClaudeUsageProfileID: String {
         ClaudeUsageCredentialProfile.current().id
@@ -35,6 +36,9 @@ final class ProviderQuotaRuntime {
         },
         accountIDProvider: @escaping @Sendable () async -> String? = {
             await CodexManagedAuthRecoveryService.shared.managedAccountSnapshot()?.accountID
+        },
+        managedAuthTransitions: @escaping @Sendable () async -> AsyncStream<CodexManagedAuthTransition> = {
+            await CodexManagedAuthRecoveryService.shared.authTransitions()
         },
         settingsStore: GlobalSettingsStore = .shared
     ) {
@@ -67,6 +71,20 @@ final class ProviderQuotaRuntime {
         consentObservation = settingsStore.objectWillChange.receive(on: RunLoop.main).sink { [weak self] _ in self?.applyAcquisitionConsent() }
         applyAcquisitionConsent()
         routingObservation = ProviderUsageRoutingObservation(settings: settingsStore, codex: codex, claude: claude, advisor: usageAdvisor, accountID: accountIDProvider)
+        // The managed-auth authority, not each sign-in surface, reports credential transitions
+        // in one ordered stream. The Codex usage process caches credentials at start, so an
+        // established transition replaces it; a sign-out fences out earlier generations. The
+        // service itself gates restarts on enabled + observed.
+        managedAuthTransitionTask = Task { [codex] in
+            for await transition in await managedAuthTransitions() {
+                switch transition {
+                case let .established(accountID, generation):
+                    await codex.handleManagedAuthenticationEstablished(accountID: accountID, authGeneration: generation)
+                case let .signOutStarted(generation):
+                    await codex.handleSignOutOrAccountChange(authGeneration: generation)
+                }
+            }
+        }
         // One app-level foreground hook, not one listener per pill/window. Hidden stores
         // immediately return without creating acquisition work.
         foregroundObservation = NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
