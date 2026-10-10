@@ -1634,6 +1634,14 @@ actor ServerNetworkManager {
     private var runCatalogProjectionRevision: UInt64 = 0
     private var runCatalogWaitersByRunID: [UUID: [UUID: RunCatalogWaiter]] = [:]
 
+    /// Per-run "route may have changed" pulses for `awaitAuthoritativeRunCatalogRouteToken`.
+    ///
+    /// A pulse is only a hint to re-run the strict token query; it never carries or implies
+    /// authority. The generation closes the gap between a waiter's last query and its parking: a
+    /// pulse fired while the query was suspended advances it, so the waiter re-queries at once.
+    private var runRouteChangeGenerationByRunID: [UUID: UInt64] = [:]
+    private var runRouteChangeWaitersByRunID: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+
     // 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:]
     private var windowBindingTransactions: [UUID: (mutex: AsyncMutex, users: Int)] = [:]
@@ -3801,6 +3809,99 @@ actor ServerNetworkManager {
         )
     }
 
+    /// Bounded wait for the exact server-owned route of one run.
+    ///
+    /// Re-runs the strict `authoritativeRunCatalogRouteToken` query until it yields a token, the
+    /// timeout elapses, or the calling task is cancelled; it never builds a token any other way.
+    /// Used only for a provider process the caller has just launched, whose RepoPrompt MCP child may
+    /// not yet have connected, passed the PID gate and admission, and committed its run mapping.
+    ///
+    /// This deliberately waits on route authority, never on tool-catalog freshness or the weaker
+    /// `MCPRoutingWaiter` routed flag: a stale catalog is a discovery fact and must not delay or
+    /// refuse a send (see `docs/architecture/agent-session-oversight-auto-wake.md`).
+    ///
+    /// Wakes on the per-run route-change pulse (route commit, run mapping, cleanup/revoke) and polls
+    /// every `runRouteChangePollInterval` as a backstop for mapping changes that do not pulse.
+    func awaitAuthoritativeRunCatalogRouteToken(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID,
+        timeout: TimeInterval
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(max(0, timeout) * 1000)))
+        while !Task.isCancelled {
+            // Sampled before the query so a pulse fired while it is suspended is never lost.
+            let generation = runRouteChangeGenerationByRunID[runID, default: 0]
+            if let token = await authoritativeRunCatalogRouteToken(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID
+            ) {
+                return token
+            }
+            let now = ContinuousClock.now
+            guard now < deadline, !Task.isCancelled else { return nil }
+            await awaitRunRouteChange(
+                runID: runID,
+                after: generation,
+                until: min(deadline, now.advanced(by: Self.runRouteChangePollInterval))
+            )
+        }
+        return nil
+    }
+
+    private static let runRouteChangePollInterval: Duration = .milliseconds(50)
+
+    /// Parks until this run's route-change pulse, `wakeAt`, or cancellation, whichever comes first.
+    private func awaitRunRouteChange(
+        runID: UUID,
+        after generation: UInt64,
+        until wakeAt: ContinuousClock.Instant
+    ) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                guard !Task.isCancelled,
+                      runRouteChangeGenerationByRunID[runID, default: 0] == generation
+                else {
+                    continuation.resume()
+                    return
+                }
+                runRouteChangeWaitersByRunID[runID, default: [:]][waiterID] = continuation
+                Task { [weak self] in
+                    try? await Task.sleep(until: wakeAt, clock: .continuous)
+                    await self?.resumeRunRouteChangeWaiter(runID: runID, waiterID: waiterID)
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.resumeRunRouteChangeWaiter(runID: runID, waiterID: waiterID)
+            }
+        }
+    }
+
+    private func resumeRunRouteChangeWaiter(runID: UUID, waiterID: UUID) {
+        guard let continuation = runRouteChangeWaitersByRunID[runID]?.removeValue(forKey: waiterID) else { return }
+        if runRouteChangeWaitersByRunID[runID]?.isEmpty == true {
+            runRouteChangeWaitersByRunID.removeValue(forKey: runID)
+        }
+        continuation.resume()
+    }
+
+    /// Wakes every route waiter for one run so it re-runs the strict token query. A hint only.
+    func signalRunRouteChanged(runID: UUID) {
+        runRouteChangeGenerationByRunID[runID, default: 0] &+= 1
+        guard let waiters = runRouteChangeWaitersByRunID.removeValue(forKey: runID) else { return }
+        for continuation in waiters.values {
+            continuation.resume()
+        }
+    }
+
+    /// Pulse entry point for MainActor run-mapping writers (`MCPServerViewModel`).
+    nonisolated static func noteRunRouteChanged(runID: UUID) {
+        Task { await ServerNetworkManager.shared.signalRunRouteChanged(runID: runID) }
+    }
+
     /// Rechecks committed route authority and, if it is absent, fences this run against
     /// any in-flight policy application before returning. The final actor-side route
     /// sample and fence installation share one actor turn; MainActor mapping checks are
@@ -4168,6 +4269,7 @@ actor ServerNetworkManager {
                 runIDByConnectionID[connectionID] = runID
             }
             presentationWindowByRun[runID] = windowID
+            signalRunRouteChanged(runID: runID)
             return true
         }
 
@@ -4220,6 +4322,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             persistWindowBinding: persistWindowBinding
         )
+        signalRunRouteChanged(runID: runID)
         return true
     }
 
@@ -4669,6 +4772,11 @@ actor ServerNetworkManager {
                 }
             }
         }
+        // Wake route waiters so they observe the revocation now rather than at their next poll, then
+        // drop the run's pulse generation so the map stays bounded; a waiter parked after this
+        // falls back to its poll interval, which only delays a query that now finds no route.
+        signalRunRouteChanged(runID: runID)
+        runRouteChangeGenerationByRunID.removeValue(forKey: runID)
     }
 
     /// Explicitly clears cached run routing/policy state for any runs associated with a closed tab.
@@ -12010,6 +12118,10 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             runID: policy.runID
         )
+        if let runID = policy.runID {
+            // The run's route is committed here; wake any bounded route waiter for it.
+            signalRunRouteChanged(runID: runID)
+        }
         if let pendingPolicyRunIDMappingToken {
             schedulePendingPolicyConnectionReplacement(
                 pendingPolicyRunIDMappingToken,
@@ -12080,6 +12192,9 @@ actor ServerNetworkManager {
 
         await updateRoutingRecordForConnection(connectionID, clientID: clientName)
         await notifyToolListChanged(connectionID: connectionID)
+        if let runID = policy.runID {
+            signalRunRouteChanged(runID: runID)
+        }
         return .applied(runID: policy.runID)
     }
 

@@ -371,6 +371,35 @@ actor MCPBootstrapLease {
         }
     }
 
+    /// Re-arms this run's pending connection policy for a replacement provider process.
+    ///
+    /// `acquire()` installs exactly one one-shot policy, which the first provider process's MCP
+    /// child consumes (or would consume) at admission. When a caller retires that process before
+    /// dispatch and launches a replacement for the *same* run, the replacement's child needs its own
+    /// pending policy or it is refused admission. Installation keeps the one-shot shape: the
+    /// installer collapses any unreserved pending policy for this run, so at most one stays queued.
+    ///
+    /// Valid only between a successful `acquire()` and any release or cleanup; returns `false`
+    /// otherwise, or when an expected-PID policy could not be re-armed. A policy installed while a
+    /// concurrent cleanup was in flight is left to be collapsed by the run's next install or pruned
+    /// by its TTL, exactly as after `cancelAndCleanup(preservingCommittedRoute: true)`.
+    func reinstallPolicyForReplacementProcess() async -> Bool {
+        guard hasAcquired, !shouldAbortAcquire else { return false }
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) reinstalling connection policy for a replacement provider process")
+        await policyInstaller(spec)
+        policyInstalled = true
+        guard !shouldAbortAcquire else { return false }
+        if spec.requiresExpectedAgentPID {
+            let policyArmed = await expectedPIDPolicyArmer(spec)
+            await recordDiagnosticEvent(
+                "lease_expected_pid_policy_rearmed",
+                fields: ["armed": String(policyArmed)]
+            )
+            guard policyArmed, !shouldAbortAcquire else { return false }
+        }
+        return true
+    }
+
     // MARK: - Release Strategies
 
     private enum RoutingWaitSelection {

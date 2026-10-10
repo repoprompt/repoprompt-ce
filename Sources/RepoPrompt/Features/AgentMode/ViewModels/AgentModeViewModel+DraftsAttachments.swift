@@ -127,6 +127,42 @@ extension AgentModeViewModel {
         )
     }
 
+    /// Withdraws a run's initial user turn that a route-verification refusal kept from ever reaching
+    /// the provider, and puts its text back into an empty composer, so a resend leaves no duplicate
+    /// user row. The Claude-native counterpart of Codex's pre-dispatch rejection rollback.
+    ///
+    /// Narrowed to what it can restore losslessly: a plain-text row (no images, tagged files,
+    /// workflow, or cross-session attribution) followed only by error rows, and an empty composer.
+    /// Anything else keeps the row in the transcript for retry, as before.
+    @discardableResult
+    func restoreRouteRefusedUnsentTurn(
+        session: TabSession,
+        userItemID: UUID,
+        message: String
+    ) -> Bool {
+        let tabID = session.tabID
+        guard sessions[tabID] === session,
+              let index = session.items.firstIndex(where: { $0.id == userItemID })
+        else { return false }
+        let item = session.items[index]
+        guard item.kind == .user,
+              session.items[(index + 1)...].allSatisfy({ $0.kind == .error }),
+              !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              item.attachments.isEmpty,
+              item.taggedFileAttachments.isEmpty,
+              item.workflow == nil,
+              item.crossSessionAttribution == nil,
+              retrieveDraftText(for: tabID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        guard session.removeItem(at: index) != nil else { return false }
+        session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == userItemID }
+        session.isDirty = true
+        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .replaceIfEmpty)
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+        return true
+    }
+
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
     /// still-pending fragments are composed into storage so a tab switch cannot
     /// overwrite a recovery that has not reached the editor yet.

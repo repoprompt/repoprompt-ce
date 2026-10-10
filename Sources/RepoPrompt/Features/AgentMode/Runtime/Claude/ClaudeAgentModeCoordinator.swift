@@ -74,8 +74,11 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
+        /// `routeWait` is non-nil only for a controller this send launched; see
+        /// `AgentModeViewModel.qualifyProviderInputRoute(for:routeWait:)`.
         let qualifyAgentSessionLinkProviderInputRoute: @MainActor (
-            _ session: AgentTabSession
+            _ session: AgentTabSession,
+            _ routeWait: AgentModeViewModel.ProviderInputRouteWait?
         ) async -> AgentModeViewModel.ProviderInputRouteReadiness
         let hasCurrentAgentSessionLinkProviderInputRoute: @MainActor (
             _ session: AgentTabSession,
@@ -107,8 +110,9 @@ final class ClaudeAgentModeCoordinator {
             stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Void,
             prependPendingHandoff: @escaping @MainActor (_ text: String, _ session: AgentTabSession) -> String,
             qualifyAgentSessionLinkProviderInputRoute: @escaping @MainActor (
-                _ session: AgentTabSession
-            ) async -> AgentModeViewModel.ProviderInputRouteReadiness = { _ in .notRequired },
+                _ session: AgentTabSession,
+                _ routeWait: AgentModeViewModel.ProviderInputRouteWait?
+            ) async -> AgentModeViewModel.ProviderInputRouteReadiness = { _, _ in .notRequired },
             hasCurrentAgentSessionLinkProviderInputRoute: @escaping @MainActor (
                 _ session: AgentTabSession,
                 _ qualification: AgentModeViewModel.ProviderInputRouteReadiness
@@ -153,7 +157,7 @@ final class ClaudeAgentModeCoordinator {
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
                 prependPendingHandoff: { text, _ in text },
-                qualifyAgentSessionLinkProviderInputRoute: { _ in .notRequired },
+                qualifyAgentSessionLinkProviderInputRoute: { _, _ in .notRequired },
                 hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in true },
                 decorateAgentSessionLinkPrompt: { text, _, _ in
                     .init(text: text, claim: nil, mustAbortDispatch: false)
@@ -207,6 +211,10 @@ final class ClaudeAgentModeCoordinator {
     private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
     private let autoEffortEnabledProvider: @MainActor () -> Bool
+    /// Longest single wait for the exact oversight route of a controller this send launched.
+    private var providerInputRouteWaitTimeoutSeconds: TimeInterval
+    /// Cap on the total route waiting one send may do across its controller attempts.
+    private var providerInputRouteTotalWaitBudgetSeconds: TimeInterval
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
@@ -236,7 +244,9 @@ final class ClaudeAgentModeCoordinator {
         hasActiveMCPTools: @escaping MCPActiveToolQuery = { _ in false },
         hasActiveChildAgentRunWaits: @escaping ActiveAgentRunWaitQuery = { _ in false },
         steeringInterruptSafePointTimeoutSeconds: TimeInterval = 2.0,
-        autoEffortEnabledProvider: @escaping @MainActor () -> Bool = { GlobalSettingsStore.shared.autoEffortEnabled() }
+        autoEffortEnabledProvider: @escaping @MainActor () -> Bool = { GlobalSettingsStore.shared.autoEffortEnabled() },
+        providerInputRouteWaitTimeoutSeconds: TimeInterval = 10,
+        providerInputRouteTotalWaitBudgetSeconds: TimeInterval = 15
     ) {
         self.windowID = windowID
         self.workspacePathProvider = workspacePathProvider
@@ -247,6 +257,8 @@ final class ClaudeAgentModeCoordinator {
         self.hasActiveChildAgentRunWaits = hasActiveChildAgentRunWaits
         self.steeringInterruptSafePointTimeoutSeconds = steeringInterruptSafePointTimeoutSeconds
         self.autoEffortEnabledProvider = autoEffortEnabledProvider
+        self.providerInputRouteWaitTimeoutSeconds = providerInputRouteWaitTimeoutSeconds
+        self.providerInputRouteTotalWaitBudgetSeconds = providerInputRouteTotalWaitBudgetSeconds
     }
 
     private static func makeDefaultController(
@@ -727,6 +739,11 @@ final class ClaudeAgentModeCoordinator {
             hasPendingResumeTransfer(for: session)
                 || pendingResumeTransferGenerationByTabID[session.tabID] != nil
         }
+
+        func test_setProviderInputRouteWaitBudget(perWaitSeconds: TimeInterval, totalSeconds: TimeInterval) {
+            providerInputRouteWaitTimeoutSeconds = perWaitSeconds
+            providerInputRouteTotalWaitBudgetSeconds = totalSeconds
+        }
     #endif
 
     private func sessionOwnsClaudeController(
@@ -1014,7 +1031,8 @@ final class ClaudeAgentModeCoordinator {
         allowsCatalogRouteControllerRecovery: Bool,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let isSelfNote = selfCompactDispatchID?.stage == .note
@@ -1073,10 +1091,19 @@ final class ClaudeAgentModeCoordinator {
         /// are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
         /// names the branch; it carries no identifiers or user content.
         func routeVerificationFailure(_ code: String) -> String {
-            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. [route:\(code)]"
+            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. \(Self.routeVerificationFailureMarkerPrefix)\(code)]"
         }
 
+        // A controller this send launched (fresh start, or a replacement after a recycle) has a
+        // RepoPrompt MCP child that may not have connected and committed its route yet, so its route
+        // qualification may wait, boundedly, for the server-owned route token. A reused controller
+        // never waits: a missing route there is a lost route and recycles at once, as before.
+        var controllersLaunchedBySend: Set<ObjectIdentifier> = []
+        var routeWaitSecondsSpent: TimeInterval = 0
+        var hasRecycledAfterRouteWait = false
+
         for attempt in 0 ..< 3 {
+            let controllerBeforeEnsure = session.claudeController.map { ObjectIdentifier($0 as AnyObject) }
             if isSelfNote {
                 guard let selfCompactDispatchID,
                       session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID),
@@ -1098,6 +1125,10 @@ final class ClaudeAgentModeCoordinator {
                   let controller = session.claudeController
             else {
                 return .superseded
+            }
+            let ensuredControllerID = ObjectIdentifier(controller as AnyObject)
+            if ensuredControllerID != controllerBeforeEnsure {
+                controllersLaunchedBySend.insert(ensuredControllerID)
             }
 
             // A provider control command was admitted against an idle target for one conversation. A
@@ -1215,9 +1246,29 @@ final class ClaudeAgentModeCoordinator {
 
             // A control command carries no oversight supplement, so its ordinary native route
             // and conversation fences suffice without the additional oversight route proof.
+            // Steering (recovery disallowed) never waits: it must keep failing closed at once.
+            let mayWaitForRoute = !isMaintenance
+                && allowsCatalogRouteControllerRecovery
+                && controllersLaunchedBySend.contains(ensuredControllerID)
+            var routeWait: AgentModeViewModel.ProviderInputRouteWait?
+            let routeWaitBudget = min(
+                providerInputRouteWaitTimeoutSeconds,
+                providerInputRouteTotalWaitBudgetSeconds - routeWaitSecondsSpent
+            )
+            if mayWaitForRoute, routeWaitBudget > 0 {
+                routeWait = .init(timeout: routeWaitBudget) { [weak self] in
+                    guard let self else { return false }
+                    return intentIsCurrent(intent, for: session)
+                        && sessionOwnsClaudeController(controller, for: session)
+                }
+            }
+            let routeWaitStartedAt = Date()
             var routeReadiness = !isMaintenance
-                ? await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session)
+                ? await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session, routeWait)
                 : .notRequired
+            if routeWait != nil {
+                routeWaitSecondsSpent += Date().timeIntervalSince(routeWaitStartedAt)
+            }
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(controller, for: session)
             else {
@@ -1232,14 +1283,26 @@ final class ClaudeAgentModeCoordinator {
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return .superseded
             case .unavailable:
+                // A freshly launched controller whose route wait ran out (or whose send already
+                // spent the total budget) recycles at most once per send; a reused controller's
+                // missing route keeps the immediate recycle. Both stay inside the attempt bound.
+                let routeWaitTimedOut = mayWaitForRoute
                 if allowsCatalogRouteControllerRecovery,
                    attempt < 2,
+                   !(routeWaitTimedOut && hasRecycledAfterRouteWait),
                    await recycleClaudeControllerForCatalogRouteRecovery(
                        session: session,
-                       existingController: controller
+                       existingController: controller,
+                       reinstallRunRoutingPolicy: reinstallRunRoutingPolicy
                    )
                 {
-                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    if routeWaitTimedOut {
+                        hasRecycledAfterRouteWait = true
+                    }
+                    guard intentIsCurrent(intent, for: session) else {
+                        hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                        return .superseded
+                    }
                     await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
                     handler = toolHandler(for: session)
                     continue
@@ -1273,10 +1336,14 @@ final class ClaudeAgentModeCoordinator {
                    attempt < 2,
                    await recycleClaudeControllerForCatalogRouteRecovery(
                        session: session,
-                       existingController: controller
+                       existingController: controller,
+                       reinstallRunRoutingPolicy: reinstallRunRoutingPolicy
                    )
                 {
-                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    guard intentIsCurrent(intent, for: session) else {
+                        hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                        return .superseded
+                    }
                     await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
                     handler = toolHandler(for: session)
                     continue
@@ -1417,7 +1484,7 @@ final class ClaudeAgentModeCoordinator {
                 if routeReadiness == .notRequired,
                    !hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
                 {
-                    routeReadiness = await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session)
+                    routeReadiness = await hostCapabilities.qualifyAgentSessionLinkProviderInputRoute(session, nil)
                     guard configurationIsCurrent() else { return .superseded }
                 }
                 if requiresFinalRouteFence,
@@ -1695,9 +1762,15 @@ final class ClaudeAgentModeCoordinator {
     /// The provider message has not been attempted when this runs. Retiring the controller keeps the
     /// process run and captured provider session ID, so the next iteration resumes the same Claude
     /// conversation while establishing a fresh RepoPrompt MCP connection and exact catalog route.
+    ///
+    /// The retired process's MCP child consumed (or still holds) the run's one-shot admission
+    /// policy, so the replacement's child would be refused without a fresh one.
+    /// `reinstallRunRoutingPolicy` re-arms it after retirement and before the replacement launches;
+    /// a refusal ends the recovery, since the replacement could not be admitted.
     private func recycleClaudeControllerForCatalogRouteRecovery(
         session: AgentTabSession,
-        existingController: any NativeAgentRuntimeControlling
+        existingController: any NativeAgentRuntimeControlling,
+        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)?
     ) async -> Bool {
         guard let detached = detachClaudeController(
             existingController,
@@ -1711,7 +1784,18 @@ final class ClaudeAgentModeCoordinator {
             for: session,
             captureProviderSessionID: true
         )
+        if let reinstallRunRoutingPolicy {
+            return await reinstallRunRoutingPolicy()
+        }
         return true
+    }
+
+    /// Prefix of the bracketed code every route-verification refusal ends with. Each such refusal
+    /// happens before `sendUserMessage`, so nothing reached the provider.
+    nonisolated static let routeVerificationFailureMarkerPrefix = "[route:"
+
+    nonisolated static func isRouteVerificationFailure(_ message: String) -> Bool {
+        message.contains(routeVerificationFailureMarkerPrefix)
     }
 
     private func recordSendFailure(
