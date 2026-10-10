@@ -15799,6 +15799,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             return .notRequired
         }
+        guard !session.isInstallingHandoffWorktreeBindings else {
+            // Any save path (debounce, flush, required flush) would persist the provisional,
+            // unbound Handoff destination; Handoff saves it explicitly once installation settles.
+            return .deferred("Handoff is still preparing this chat's worktree execution location.")
+        }
         guard session.isDirty || session.activeAgentSessionID == nil else {
             #if DEBUG
                 perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "clean"])
@@ -22619,11 +22624,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Transcript/payload mutation above already armed the ordinary autosave debounce.
             // Disarm it before awaiting installation so no save can persist the provisional,
             // unbound destination; step 6 performs the first save once the mappings are installed.
+            // The background tab is visible, so also hold the existing initial-worktree send gate:
+            // the destination must not start a provider turn on the primary checkout mid-install.
             destSession.isInstallingHandoffWorktreeBindings = true
+            destSession.isPreparingInitialWorktree = true
             destSession.saveDebounceTask?.cancel()
             destSession.saveDebounceTask = nil
             do {
-                defer { destSession.isInstallingHandoffWorktreeBindings = false }
+                defer {
+                    destSession.isInstallingHandoffWorktreeBindings = false
+                    destSession.isPreparingInitialWorktree = false
+                }
                 try await installHandoffDestinationWorktreeBindings(
                     sourceWorktreeSnapshot,
                     sourceTabID: sourceTabID,
@@ -22745,31 +22756,40 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return HandoffSourceWorktreeSnapshot(sourceSessionID: sourceSessionID, bindings: bindings)
     }
 
+    /// Returns the source's current bindings when they still name the captured execution location.
+    /// Comparison uses execution identity (logical root -> repository, worktree, path) rather than
+    /// whole structs, so branch/head metadata refreshed while the source works in the same worktree
+    /// does not abort Handoff.
     private func revalidateHandoffSourceWorktreeSnapshot(
         _ snapshot: HandoffSourceWorktreeSnapshot,
         sourceTabID: UUID,
         sourceSession: TabSession
-    ) throws {
+    ) throws -> [AgentSessionWorktreeBinding] {
         guard let sourceSessionID = snapshot.sourceSessionID,
               sessions[sourceTabID] === sourceSession,
               sourceSession.activeAgentSessionID == sourceSessionID,
               !sourceSession.worktreeBindingTransitionInProgress,
               !sourceSession.isChangingExecutionLocation,
               !sourceSession.isPreparingInitialWorktree,
-              worktreeBindingState(forAgentSessionID: sourceSessionID, tabID: sourceTabID)
-              == .hydrated(snapshot.bindings)
+              case let .hydrated(currentBindings) = worktreeBindingState(
+                  forAgentSessionID: sourceSessionID,
+                  tabID: sourceTabID
+              ),
+              currentBindings.count == snapshot.bindings.count,
+              Self.executionRootMappings(currentBindings) == Self.executionRootMappings(snapshot.bindings)
         else {
             throw AgentSessionError.handoffExecutionLocationUnavailable(
                 "The source conversation's execution location changed during Handoff. Try again."
             )
         }
         do {
-            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(snapshot.bindings)
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(currentBindings)
         } catch {
             throw AgentSessionError.handoffExecutionLocationUnavailable(
                 "The source worktree is no longer available: \(error.localizedDescription)"
             )
         }
+        return currentBindings
     }
 
     /// Installs the captured source mappings on a fresh, never-activated Handoff destination through
@@ -22788,7 +22808,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         #endif
         try Task.checkCancellation()
-        try revalidateHandoffSourceWorktreeSnapshot(
+        let installBindings = try revalidateHandoffSourceWorktreeSnapshot(
             snapshot,
             sourceTabID: sourceTabID,
             sourceSession: sourceSession
@@ -22802,7 +22822,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let stagedHandoff = destinationSession.pendingHandoff
         _ = try await transitionWorktreeBindings(
-            snapshot.bindings,
+            installBindings,
             forSessionID: destinationSessionID,
             intent: .initialSend
         )
@@ -22814,12 +22834,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard sessions[destinationTabID] === destinationSession,
               destinationSession.activeAgentSessionID == destinationSessionID,
-              destinationSession.worktreeBindings == snapshot.bindings
+              destinationSession.worktreeBindings == installBindings
         else {
             throw ExecutionLocationTransitionError.stale
         }
         // The transition awaited; the payload and mappings must still describe the same source.
-        try revalidateHandoffSourceWorktreeSnapshot(
+        _ = try revalidateHandoffSourceWorktreeSnapshot(
             snapshot,
             sourceTabID: sourceTabID,
             sourceSession: sourceSession
@@ -22832,9 +22852,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessions[tabID]?.saveDebounceTask?.cancel()
         sessions[tabID]?.saveDebounceTask = nil
         let report = await promptManager.closeComposeTab(tabID)
-        let removed = report.rejections.isEmpty && report.removedComposeTabIDs.contains(tabID)
+        // Post-removal issues (for example, durable cleanup that did not complete) mean the
+        // destination may survive a relaunch, so they are reported like a rejected close.
+        let removed = report.rejections.isEmpty
+            && report.cleanupIssues.isEmpty
+            && report.removedComposeTabIDs.contains(tabID)
         if !removed {
-            print("[AgentVM] Warning: failed to remove unactivated handoff destination \(tabID): \(report.rejections.map(\.message))")
+            let messages = report.rejections.map(\.message) + report.cleanupIssues.map(\.message)
+            print("[AgentVM] Warning: failed to remove unactivated handoff destination \(tabID): \(messages)")
         }
         return removed
     }
