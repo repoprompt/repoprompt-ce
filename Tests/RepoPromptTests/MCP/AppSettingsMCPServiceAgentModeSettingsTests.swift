@@ -707,6 +707,37 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         }
     }
 
+    /// Explicitly choosing the agent that reads report as the fallback for an unknown stored ID
+    /// must replace that ID, and the replacement must survive a reload.
+    func testContextBuilderAgentSetOfDisplayedFallbackReplacesUnknownStoredAgent() async throws {
+        try await withContextBuilderSettings { store, service, defaults, fileURL in
+            let claudeRaw = AgentProviderKind.claudeCode.rawValue
+            let unknownRaw = "unknown-context-builder-agent"
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: unknownRaw,
+                    contextBuilderModelsByAgent: [unknownRaw: "unknown-remembered-model", claudeRaw: "haiku"]
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+            let get = try await service.handleForTesting([
+                "op": .string("get"),
+                "keys": .array([.string("context_builder.agent")])
+            ])
+            let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+            XCTAssertEqual(values["context_builder.agent"]?.stringValue, claudeRaw, "Precondition: Claude is the displayed fallback")
+
+            _ = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.agent"),
+                "value": .string(claudeRaw)
+            ])
+
+            let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+            XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw)
+        }
+    }
+
     func testContextBuilderModelReadsWritesAndClearsStoredAgentSlot() async throws {
         try await withContextBuilderSettings { store, service, _, _ in
             for (agent, originalModel, updatedModel): (AgentProviderKind, String, String) in [

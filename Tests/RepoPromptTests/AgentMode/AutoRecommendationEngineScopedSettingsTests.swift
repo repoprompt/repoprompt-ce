@@ -1,4 +1,5 @@
 import Combine
+import enum MCP.Value
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -425,6 +426,54 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             fixture.store.hasUserSetGlobalContextBuilderAgentDefaults,
             "Automatic seeding must not demote an established user-owned selection."
         )
+    }
+
+    /// After MCP clears the model of a valid, available saved Context Builder agent, Full Settings
+    /// and runtime resolution must pick the same provider, whichever clear policy is chosen.
+    func testContextBuilderModelClearKeepsSettingsAndRuntimeProviderInAgreement() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.apiSettings.prepareForWindowClose() }
+        fixture.apiSettings.isClaudeCodeConnected = true
+        fixture.apiSettings.isCodexConnected = true
+        fixture.apiSettings.isCursorConnected = false
+        fixture.apiSettings.isGrokBuildConnected = false
+        fixture.apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: [.claudeCode, .codexExec])
+        let claudeRaw = AgentProviderKind.claudeCode.rawValue
+        fixture.store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                contextBuilderAgentRaw: claudeRaw,
+                contextBuilderModelsByAgent: [claudeRaw: AgentModel.claudeSonnet.rawValue]
+            ),
+            contextBuilderWriteIntent: .userInitiated
+        )
+        /// Same inputs as the Context Builder runtime projection.
+        func runtimeAgent() -> AgentProviderKind? {
+            let profile = fixture.store.effectiveAgentModelsProfile(workspaceID: nil)
+            let agentRaw = profile.contextBuilderAgentRaw
+            return AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: agentRaw,
+                persistedModelRaw: agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] },
+                availability: fixture.apiSettings.contextBuilderRestorationAvailabilityContext,
+                enabledRecommendationProviders: fixture.store.globalRecommendationProviderFilter()
+            )?.agent
+        }
+        XCTAssertEqual(runtimeAgent(), .claudeCode, "Precondition: runtime accepts the saved, available agent")
+
+        _ = try await AppSettingsMCPService(store: fixture.store).handleForTesting([
+            "op": .string("set"),
+            "key": .string("context_builder.model"),
+            "value": .null
+        ])
+        XCTAssertEqual(fixture.store.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw, "Precondition: the clear keeps the agent")
+
+        let settings = AgentModelsSettingsViewModel(
+            apiSettingsVM: fixture.apiSettings,
+            workspaceID: nil,
+            settingsManager: fixture.store,
+            settingsStore: fixture.store,
+            notificationCenter: NotificationCenter()
+        )
+        XCTAssertEqual(settings.selectedContextBuilderAgent, runtimeAgent())
     }
 
     private func recommendedOpenAIModelRaw(from engine: AutoRecommendationEngine) throws -> String {
