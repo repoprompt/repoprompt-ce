@@ -1114,6 +1114,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         definitions.insert(agentSelfDefinition, at: insertion)
+        guard let bootstrapInsertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSelf }) else {
+            preconditionFailure("Missing oversight bootstrap insertion point")
+        }
+        definitions.insert(becomeOverseerDefinition, at: bootstrapInsertion)
         guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
@@ -1122,6 +1126,13 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseOracleImageAttachments)
             .map(advertiseWorktreeListPagination)
     }
+
+    private static let becomeOverseerDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.becomeOverseer,
+        description: "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
+        annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+    )
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.agentSelf,
@@ -1290,6 +1301,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing."
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
+            }
+            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture."
+            if !description.contains(residentDescription) {
+                description += residentDescription
             }
             description = description.replacingOccurrences(
                 of: "Waits up to `timeout` seconds (default 120).",

@@ -938,12 +938,12 @@ struct AgentMonitorPopoverView: View {
         }
     }
 
-    /// Clears this endpoint's authority notices **and** the app warnings currently on screen.
+    /// Clears the rendered endpoint notices **and** the app warnings currently on screen.
     ///
     /// It deliberately does not discard pending cleanup: the disk work is still owed, and **Retry
     /// saving** is how the user asks for it. Clearing the message must not clear the obligation.
     private func dismissButton(label: String) -> some View {
-        let endpoint = props.endpoint
+        let endpoint = props.recentNotices.isEmpty ? nil : props.endpoint
         let warningIDs = Set(props.persistence.warnings.map(\.id))
         return Button("Dismiss") {
             AgentSessionLinkRuntimeBridge.shared.dismissPersistenceWarnings(ids: warningIDs)

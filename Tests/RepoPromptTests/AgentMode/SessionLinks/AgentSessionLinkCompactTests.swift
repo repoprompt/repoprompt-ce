@@ -23,6 +23,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let claude: CompactRecordingNativeController
         let codexRecorder: LifecycleRecorder
         let driftHook: AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook
+        let managesCodexTooling: Bool
     }
 
     @MainActor
@@ -118,7 +119,16 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 events.record(.providerControllerCreated)
                 return claude
             },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, purpose, taskLabelKind, allowsExternalControl, requiresExpectedPID in
+                guard shouldManageCodexTooling else { return }
+                await ServerNetworkManager.shared.installClientConnectionPolicy(
+                    for: clientName, windowID: windowID, restrictedTools: restrictedTools,
+                    oneShot: oneShot, reason: reason, ttl: ttl, tabID: tabID, runID: runID,
+                    additionalTools: additionalTools, purpose: purpose, taskLabelKind: taskLabelKind,
+                    allowsAgentExternalControlTools: allowsExternalControl,
+                    requiresExpectedAgentPID: requiresExpectedPID
+                )
+            },
             mcpServerEnabler: { true },
             testCodexStallWatchdogPollIntervalNanos: codexStallWatchdogPollIntervalNanos,
             testCodexStallWatchdogProbeThreshold: codexStallWatchdogProbeThreshold,
@@ -160,6 +170,19 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             tabName: "Build API",
             isWindowClosing: false
         ))
+        if shouldManageCodexTooling {
+            addTeardownBlock { @MainActor in
+                let runID = session.runID
+                await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+                if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                    await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                        for: clientName, windowID: 1, runID: runID
+                    )
+                    await MCPRoutingWaiter.shared.cleanup(runID: runID)
+                }
+                _ = manager
+            }
+        }
         return Fixture(
             viewModel: viewModel,
             manager: manager,
@@ -169,7 +192,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             events: events,
             claude: claude,
             codexRecorder: codexRecorder,
-            driftHook: driftHook
+            driftHook: driftHook,
+            managesCodexTooling: shouldManageCodexTooling
         )
     }
 
@@ -200,12 +224,27 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         liveness: @escaping AgentSessionLinkSendLivenessProbe = { liveLiveness },
         commit: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkSendTransactionOutcome {
-        await fixture.viewModel.agentSessionLinkPerformCompact(
+        let routing = fixture.managesCodexTooling ? Task {
+            do {
+                try await AsyncTestWait.waitUntil("managed compact resume staged", timeout: 4) {
+                    fixture.viewModel.test_codexCoordinator.test_hasPendingCodexStart(for: fixture.session)
+                }
+                if !Task.isCancelled, let runID = fixture.session.runID {
+                    await MCPRoutingWaiter.shared.notifyRouted(runID: runID)
+                }
+            } catch {
+                if !Task.isCancelled { XCTFail("Managed compact routing fixture failed: \(error)") }
+            }
+        } : nil
+        let outcome = await fixture.viewModel.agentSessionLinkPerformCompact(
             to: fixture.candidate,
             request: request,
             liveness: liveness,
             commitAuthorization: commit
         )
+        routing?.cancel()
+        await routing?.value
+        return outcome
     }
 
     // MARK: - Support
@@ -756,7 +795,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
     }
 
-    func testIdleManagedCodexCompactionResumesExactThreadWithoutTurnBootstrap() async throws {
+    func testIdleManagedCodexCompactionResumesExactThreadWithRoutingWithoutUserTurn() async throws {
         let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true)
         fixture.session.codexConversationID = "lifecycle"
         XCTAssertNil(fixture.session.codexController, "Exercise idle controller restoration")
@@ -784,15 +823,22 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         guard await gate.waitUntilEntered() else { return }
         XCTAssertEqual(fixture.session.items.last?.text, AgentChatItem.overseerCompactionRequestText)
 
+        let runID = try XCTUnwrap(fixture.session.runID)
         operation.cancel()
         gate.release()
         let outcome = await operation.value
+        let policies = try await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+            for: XCTUnwrap(AgentProviderKind.codexExec.mcpClientNameHint)
+        )
+        XCTAssertFalse(policies.contains { $0.runID == runID })
+        let routingOutcome = await MCPRoutingWaiter.currentTerminalOutcome(runID: runID)
+        XCTAssertNil(routingOutcome)
 
         guard case let .delivered(delivery) = outcome else {
             return XCTFail("The durable request survives cancellation: \(outcome)")
         }
         XCTAssertEqual(fixture.session.codexConversationID, "lifecycle")
-        XCTAssertEqual(fixture.session.codexController?.hasActiveThread, true, "Resume still completed")
+        XCTAssertNil(fixture.session.codexController, "Cancelled uncommitted resume is retired")
         XCTAssertEqual(delivery.deliveryState, .persisted, "The cancelled caller must not dispatch")
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:compact"))
         XCTAssertFalse(fixture.codexRecorder.events.contains("codex:send"))

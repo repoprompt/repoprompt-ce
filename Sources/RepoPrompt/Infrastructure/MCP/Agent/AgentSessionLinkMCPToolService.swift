@@ -581,7 +581,10 @@ struct AgentSessionLinkMCPToolService {
     /// The bridge owns authority and sequencing; this surface owns only parsing and receipts.
     private func executeCreateLane(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
-        if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
+        if let refusal = await bridge.laneCreationCallerPreflight(
+            observerEndpoint,
+            idempotencyKey: args["idempotency_key"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ) {
             if refusal == .denied { throw Self.unavailableError }
             return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
         }

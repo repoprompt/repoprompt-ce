@@ -33,8 +33,8 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 29)
-        XCTAssertEqual(Set(canonicalNames).count, 29)
+        XCTAssertEqual(canonicalNames.count, 30)
+        XCTAssertEqual(Set(canonicalNames).count, 30)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
@@ -46,7 +46,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         }
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 29)
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 30)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
 
         let protectedCandidate = await runtime.toolRegistry.resolve(
@@ -59,6 +59,22 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             XCTFail("Standalone protected mutation must deny without an invocation principal")
         } catch let error as DomainMutationPolicyError {
             XCTAssertEqual(error, .principalMissing)
+        }
+
+        let bootstrapCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.becomeOverseer,
+            scope: .standalone(id: scopeID)
+        )
+        let bootstrap = try XCTUnwrap(bootstrapCandidate).binding
+        do {
+            _ = try await bootstrap([:])
+            XCTFail("Standalone bootstrap must fail closed without an app-owned Agent session")
+        } catch let error as MCPError {
+            XCTAssertEqual(error.code, -32602)
+            guard case let .invalidParams(message) = error else {
+                return XCTFail("Expected unavailable-session denial, got \(error)")
+            }
+            XCTAssertEqual(message, "become_overseer is not available for this session.")
         }
 
         await MCPDomainStandaloneToolInstaller.uninstall(installation, runtime: runtime)

@@ -36,6 +36,7 @@ final class AgentRunMCPControlledSessionContext {
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         do {
+            await window.workspaceManager.awaitInitialized()
             let workspace = window.workspaceManager.createWorkspace(
                 name: "\(workspaceNamePrefix) \(UUID().uuidString.prefix(8))",
                 repoPaths: [FileManager.default.currentDirectoryPath],
@@ -52,8 +53,13 @@ final class AgentRunMCPControlledSessionContext {
             window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
 
             let sessionID = UUID()
-            let session = await window.agentModeViewModel.ensureSessionReady(tabID: UUID())
-            _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            guard let tabID = activeWorkspace.activeComposeTabID else {
+                throw MCPError.internalError("Expected active compose tab")
+            }
+            let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+            _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session, compareAndSetInWorkspaceID: activeWorkspace.id
+            )
             try await window.agentModeViewModel.mcpActivateControlContext(
                 forTabID: session.tabID,
                 sessionID: sessionID,

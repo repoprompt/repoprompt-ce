@@ -735,6 +735,27 @@ package actor DomainAgentSessionLinkAuthority {
         return record.grant.observer == observerEndpoint
     }
 
+    /// Exact indexed relationship sample for a caller that must exclude its own unsettled
+    /// activation-backed creations. Ordinary inbound grants cannot be those creations: the private
+    /// bootstrap proof is restricted to a freshly allocated lane target, never the ordinary caller.
+    package func activeDirectGrant(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        excludingOutboundTargets: Set<DomainAgentSessionLinkEndpointIdentity>
+    ) -> DomainAgentSessionLinkGrant? {
+        for id in outboundLinksByEndpoint[endpoint] ?? [] {
+            if let grant = links[id]?.grant, grant.observer == endpoint,
+               !excludingOutboundTargets.contains(grant.target)
+            {
+                return grant
+            }
+        }
+        guard let target = targets[endpoint.sessionID], target.endpoint == endpoint else { return nil }
+        for id in target.inboundLinkIDs {
+            if let grant = links[id]?.grant, grant.target == endpoint { return grant }
+        }
+        return nil
+    }
+
     package func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         if hasActiveOutboundLink(observerEndpoint: endpoint) { return true }
         guard let target = targets[endpoint.sessionID], target.endpoint == endpoint,

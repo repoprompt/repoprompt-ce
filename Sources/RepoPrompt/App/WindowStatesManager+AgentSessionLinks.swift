@@ -1,14 +1,42 @@
 import AppKit
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
-/// Cross-window endpoint source for oversight links.
-///
-/// This is the only place that walks `allWindows` on oversight's behalf. It never switches, focuses,
-/// or activates a window: resolution, snapshotting, and observation are strictly read-only with
-/// respect to window state.
+// Cross-window endpoint source for oversight links.
+//
+// This is the only place that walks `allWindows` on oversight's behalf. It never switches, focuses,
+// or activates a window: resolution, snapshotting, and observation are strictly read-only with
+// respect to window state.
+#if DEBUG
+    enum AgentSessionLinkCatalogReadScope {
+        static let isRoleLookupTaskLocal = BoxedTaskLocal<Bool>(false)
+        static var isRoleLookup: Bool {
+            isRoleLookupTaskLocal.get()
+        }
+    }
+
+    /// Opt-in counters for the bounded actual-route catalog regression fixture.
+    @MainActor
+    enum AgentSessionLinkCatalogReadProbe {
+        static var enabled = false
+        static var snapshot = [0, 0, 0, 0]
+        static var roleSnapshot = [0, 0, 0, 0]
+        static func record(_ index: Int) {
+            snapshot[index] += 1
+            if AgentSessionLinkCatalogReadScope.isRoleLookup { roleSnapshot[index] += 1 }
+        }
+    }
+#endif
+
 extension WindowStatesManager: AgentSessionLinkEndpointHost {
     func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate] {
+        #if DEBUG
+            if AgentSessionLinkCatalogReadProbe.enabled {
+                AgentSessionLinkCatalogReadProbe.record(0)
+                if includeLocation { AgentSessionLinkCatalogReadProbe.record(1) }
+            }
+        #endif
         guard !isTerminating else { return [] }
         var candidates: [AgentSessionLinkEndpointCandidate] = []
         for window in allWindows where !window.isClosing {
@@ -34,12 +62,21 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
+        #if DEBUG
+            if AgentSessionLinkCatalogReadProbe.enabled, includeLocation { AgentSessionLinkCatalogReadProbe.record(1) }
+        #endif
         return window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: includeLocation)
     }
 
     func agentSessionLinkCandidates(
         forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
     ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        #if DEBUG
+            if AgentSessionLinkCatalogReadProbe.enabled {
+                AgentSessionLinkCatalogReadProbe.record(0)
+                if includeLocation { AgentSessionLinkCatalogReadProbe.record(1) }
+            }
+        #endif
         var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
         guard !isTerminating else { return result }
         for window in allWindows where !window.isClosing {
@@ -83,6 +120,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     func agentSessionLinkRefreshSubagentCensus(
         for candidates: [AgentSessionLinkEndpointCandidate]
     ) async {
+        #if DEBUG
+            if AgentSessionLinkCatalogReadProbe.enabled { AgentSessionLinkCatalogReadProbe.record(3) }
+        #endif
         guard !isTerminating else { return }
         // One metadata load per workspace/window in a multi-target poll or wait. Never activate a
         // workspace or switch focus just to observe it.
@@ -417,6 +457,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     // MARK: - Management delegation
 
     func agentSessionLinkModelAvailability(windowID: Int) -> AgentModelCatalog.AvailabilityContext {
+        #if DEBUG
+            if AgentSessionLinkCatalogReadProbe.enabled { AgentSessionLinkCatalogReadProbe.record(2) }
+        #endif
         guard let window = modelRoutingWindow(withID: windowID) else { return .none }
         return window.apiSettingsViewModel.agentAvailability
     }
@@ -426,6 +469,20 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
         return window.agentModeViewModel.agentSessionLinkModelCandidate(for: endpoint)
+    }
+
+    func agentSessionLinkBootstrapState(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionOverseerBootstrapState? {
+        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
+        return window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    func agentSessionLinkActivateOverseer(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
+    ) -> Bool {
+        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return false }
+        return window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
     }
 
     func agentSessionLinkPerformSetModel(

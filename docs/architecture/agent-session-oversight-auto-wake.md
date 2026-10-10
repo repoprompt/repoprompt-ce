@@ -53,8 +53,8 @@ Prompt carry and wake admission read exact published membership and the claim ep
 freshness. Required rendered content, current authority, budget and provider acceptance still own
 claims/receipts; catalog refresh cannot acknowledge them. ACP's existing route/startup and dispatch
 fences remain in place without importing a native pre-discovery requirement into deferred clients.
-Catalog observations and `tools/list_changed` remain discovery/usability signals. This changes no
-MCP tool name, schema, operation, caller identity or per-call authorization contract.
+Catalog observations and `tools/list_changed` remain discovery/usability signals, not authority.
+Role-sized advertisement and explicit session-local activation change discovery, not target grants.
 
 ## Configuration-only model selection
 
@@ -798,17 +798,27 @@ single slot as the live attempt.** A future general remedy is one immutable in-f
 on `AgentTabSession`, separate from the mutable reservation. The bounded attention fixes must be
 absorbed into that record rather than duplicated.
 
-### A returned catalog can get stuck saying the tool is gone
+### A returned catalog can get stuck on an old oversight surface
 
-One projection state cannot heal itself: the *returned* catalog says `agent_session_link` is absent
-while the link authority says that exact endpoint holds a live grant in either direction. It is produced by
-ordinary code. `notifyToolListChangedForAgentSession` republishes the observation with the returned
-presence **preserved** and any-link presence recomputed, so a grant restored against a live run whose
-client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == false` plus
-`hasAnyActiveLink == true`. A client may therefore lack usable observer tools or inverse `request_attention` even though the
-server still authorizes current calls. This no longer withholds `agentSessionLinkPromptContext` or
-blocks a send: discovery repair is separate from route proof and current operation authority.
-The repair uses any-link membership; observer operations remain strictly outbound-only.
+`tools/list` observations carry internal expected and returned fingerprints of the exact client-shaped
+oversight-family definitions (including schema, description and annotations). They distinguish absent,
+parameterless bootstrap, inbound-only reduced, and full surfaces; no MCP wire fields are added.
+`notifyToolListChangedForAgentSession` preserves returned evidence while recomputing expected
+advertisement. Thus explicit activation without grants and an inbound-to-outbound same-name schema
+upgrade are detectable, as are downgrade and withdrawal. Exact equality converges, including stable
+activated full/no-link catalogs; unknown evidence neither opens nor closes a repair cycle.
+
+The role comes from indexed exact endpoint memberships. Inbound-only advertises `set_waiting_on`,
+`request_attention`, and `create_lane` with the existing creation fields. Outbound or explicitly
+activated sessions receive the unchanged full definition. Eligible ordinary no-link sessions receive
+`become_overseer`; disabling `agent_session_link` hides both tools. Activation is session-incarnation
+memory, not a link, badge, prompt supplement, or persisted authority. It survives final unlink and
+controller repair but not rebind/restart. Prompt readiness and inventory remain outbound-only.
+
+Discovery repair is separate from route proof and current operation authority. Claude/OpenCode/Devin
+receive the existing notification route only. No live model pickup is established by protocol tests;
+Devin explicitly reports that discovery may require a new provider session. Codex repair is quiescent
+**next-turn** discovery, never an interruption or synthetic continuation for an empty passive queue.
 
 The repair is Codex-only, bounded to **one controller replacement per repair cycle**, and made of
 parts that already existed:
@@ -855,12 +865,11 @@ is therefore that a projection may already be one connection generation stale by
 runs, costing one controller replacement on a session that was going to reconnect anyway — bounded by
 the cycle record, and no more accurate than an authority round trip that can go stale the same way.
 
-A cycle is closed by exactly five paths, all of which mean it is *over* rather than spent:
+A cycle is closed by these paths, all of which mean it is *over* rather than spent:
 
 | Close path | Where |
 | --- | --- |
-| Exact current positive catalog (`hasAgentSessionLink == true`) | projection reconciler |
-| Exact any-link loss (`hasAnyActiveLink == false`) | projection reconciler |
+| Exact expected/returned surface equality (including withdrawal) | projection reconciler |
 | Provider switch away from `.codexExec` | `handleProviderSwitch` |
 | `agent_session_link` disabled when the cycle is spent | repair entrypoint |
 | Stranded consumed run (`codexController == nil`, `runID != nil`) after its retirement | repair entrypoint |

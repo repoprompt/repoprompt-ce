@@ -32,6 +32,7 @@ package enum MCPWindowToolName {
     package static let agentRun = "agent_run"
     package static let agentManage = "agent_manage"
     package static let agentSessionLink = "agent_session_link"
+    package static let becomeOverseer = "become_overseer"
     package static let agentSelf = "self_compact"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
@@ -312,6 +313,7 @@ package enum MCPDomainToolCatalog {
             ],
             normalization: .trimmedLowercased
         )),
+        .init(name: MCPWindowToolName.becomeOverseer, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control),
         .init(name: MCPWindowToolName.agentSelf, scope: .window, capability: .agentSelfControl, admissionClass: .control, operationPolicy: .init(
             operations: ["context", "compact"],
             normalization: .trimmedLowercased

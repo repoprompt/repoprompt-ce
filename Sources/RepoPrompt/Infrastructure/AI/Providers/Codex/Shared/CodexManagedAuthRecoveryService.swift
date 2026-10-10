@@ -165,6 +165,19 @@ enum CodexManagedAuthLogoutResult: Equatable {
     }
 }
 
+/// Managed-credential transitions, published by the authority in one ordered stream.
+///
+/// `established`: credentials were established in some app-server process (an interactive
+/// sign-in, or a recovery/account change the authority observed). Consumers that own
+/// long-lived app-server processes, which read credentials once at start, replace them.
+/// `signOutStarted`: a sign-out began and moved the auth-mutation generation. Because both
+/// kinds share one stream, an `established` from an earlier generation is always delivered
+/// before the sign-out that supersedes it.
+enum CodexManagedAuthTransition: Equatable {
+    case established(accountID: String?, generation: UInt64)
+    case signOutStarted(generation: UInt64)
+}
+
 struct CodexManagedChatgptDeviceCode: Equatable {
     let loginID: String
     let userCode: String
@@ -255,6 +268,17 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     private var authMutationGeneration: UInt64 = 0
     private var deviceCodePresenters: [UUID: @MainActor @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void] = [:]
     private var currentDeviceCode: CodexManagedChatgptDeviceCode?
+
+    /// What this authority last concluded about managed credentials. `unknown` until the first
+    /// conclusion, so the launch-time account check is not reported as a transition.
+    private enum ObservedAuthState: Equatable {
+        case unknown
+        case unauthenticated
+        case authenticated(accountID: String?)
+    }
+
+    private var observedAuthState: ObservedAuthState = .unknown
+    private var authTransitionContinuations: [UUID: AsyncStream<CodexManagedAuthTransition>.Continuation] = [:]
 
     init(
         clientFactory: @escaping @Sendable () -> any CodexManagedAuthRPCClient,
@@ -364,12 +388,60 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         latestManagedAccount
     }
 
+    /// Credential transitions in observation order. Only the newest pending transition is
+    /// buffered: each one supersedes the previous for transport replacement.
+    func authTransitions() -> AsyncStream<CodexManagedAuthTransition> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<CodexManagedAuthTransition>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        authTransitionContinuations[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeAuthTransitionObserver(id) }
+        }
+        return stream
+    }
+
+    private func removeAuthTransitionObserver(_ id: UUID) {
+        authTransitionContinuations[id] = nil
+    }
+
+    /// Interactive sign-ins always report; otherwise only a change from an observed
+    /// unauthenticated state or to a different account does, so routine recovery reads of an
+    /// unchanged account never replace consumers' processes.
+    private func observeAuthenticated(accountID: String?, interactive: Bool) {
+        let previous = observedAuthState
+        observedAuthState = .authenticated(accountID: accountID)
+        let changed = switch previous {
+        case .unknown:
+            false
+        case .unauthenticated:
+            true
+        case let .authenticated(previousAccountID):
+            previousAccountID != accountID
+        }
+        guard interactive || changed else { return }
+        publishAuthTransition(.established(accountID: accountID, generation: authMutationGeneration))
+    }
+
+    private func publishAuthTransition(_ transition: CodexManagedAuthTransition) {
+        for continuation in authTransitionContinuations.values {
+            continuation.yield(transition)
+        }
+    }
+
+    private func observeUnauthenticated() {
+        observedAuthState = .unauthenticated
+    }
+
     private func applyRefreshResult(_ result: CodexManagedAuthRefreshResult) {
         switch result {
         case let .recovered(account):
             latestManagedAccount = account
+            observeAuthenticated(accountID: account?.accountID, interactive: false)
         case .requiresUserLogin, .executableUnavailable:
             latestManagedAccount = nil
+            observeUnauthenticated()
         }
     }
 
@@ -472,17 +544,22 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 guard operationGeneration == authMutationGeneration else {
                     return .failed(message: "Codex sign-in was canceled because sign out started.")
                 }
+                // Joined an in-flight refresh rather than signing in: report only a real
+                // transition, so the refresh owner and this waiter cannot both report it.
                 switch refreshResult {
                 case let .recovered(account?):
                     latestManagedAccount = account
+                    observeAuthenticated(accountID: account.accountID, interactive: false)
                     return .authenticated(account: account)
                 case .recovered(account: nil):
                     latestManagedAccount = nil
+                    observeAuthenticated(accountID: nil, interactive: false)
                     return .authenticatedWithoutManagedAccount
                 case .requiresUserLogin:
                     continue
                 case let .executableUnavailable(message):
                     latestManagedAccount = nil
+                    observeUnauthenticated()
                     return .executableUnavailable(message: message)
                 }
             }
@@ -503,8 +580,13 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
             switch result {
             case let .authenticated(account):
                 latestManagedAccount = account
-            case .authenticatedWithoutManagedAccount, .executableUnavailable:
+                observeAuthenticated(accountID: account.accountID, interactive: true)
+            case .authenticatedWithoutManagedAccount:
                 latestManagedAccount = nil
+                observeAuthenticated(accountID: nil, interactive: true)
+            case .executableUnavailable:
+                latestManagedAccount = nil
+                observeUnauthenticated()
             case .failed:
                 break
             }
@@ -518,6 +600,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         }
 
         authMutationGeneration &+= 1
+        publishAuthTransition(.signOutStarted(generation: authMutationGeneration))
         let loginTask = inFlightLogin?.task
         loginTask?.cancel()
         if inFlightLogin != nil {
@@ -584,6 +667,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         switch result {
         case .signedOut, .executableUnavailable:
             latestManagedAccount = nil
+            observeUnauthenticated()
         case .failed:
             break
         }

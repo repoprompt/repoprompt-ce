@@ -138,6 +138,42 @@ final class CodexCLIProviderPerfRecorderTests: XCTestCase {
     }
 }
 
+final class CodexMCPDiscoveryPolicyTests: XCTestCase {
+    /// Pure configuration tests: no controller/provider factory or process is reachable.
+    func testOnlyRepoPromptIsRequiredWithoutChangingThirdPartyEnablement() {
+        let entries = ["RepoPromptCE", "Selected", "Disabled"].map {
+            MCPIntegrationHelper.CodexServerEntry(rawName: $0, normalizedName: $0, cliPathComponent: $0)
+        }
+        for suppressThirdParty in [false, true] {
+            let overrides = CodexNativeSessionController.appServerMCPServerOverrides(
+                serverEntries: entries,
+                enabledMCPServerNames: ["Selected"],
+                suppressThirdPartyMCPServers: suppressThirdParty,
+                computerUseEnabled: false
+            )
+            XCTAssertEqual(overrides.count, 4)
+            XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+            XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.required"] as? Bool, true)
+            XCTAssertEqual(overrides["mcp_servers.Selected.enabled"] as? Bool, !suppressThirdParty)
+            XCTAssertEqual(overrides["mcp_servers.Disabled.enabled"] as? Bool, false)
+            XCTAssertNil(overrides["mcp_servers.Selected.required"])
+            XCTAssertNil(overrides["mcp_servers.Disabled.required"])
+        }
+    }
+
+    func testRepoPromptDiscoveryIsRequiredWithoutPersistedServerEntries() {
+        let overrides = CodexNativeSessionController.appServerMCPServerOverrides(
+            serverEntries: [],
+            enabledMCPServerNames: [],
+            suppressThirdPartyMCPServers: false,
+            computerUseEnabled: false
+        )
+        XCTAssertEqual(overrides.count, 2)
+        XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.required"] as? Bool, true)
+    }
+}
+
 final class CodexAppServerFramingTests: XCTestCase {
     private let budget = 64 * 1024 * 1024
 
