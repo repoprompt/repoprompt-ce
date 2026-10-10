@@ -391,3 +391,96 @@ private final class ExecutionCounter: @unchecked Sendable {
         count += 1
     }
 }
+
+#if DEBUG
+    final class MCPConnectionAdmissionTests: XCTestCase {
+        func testUnverifiedNamesNeverAuthorizeAdmission() {
+            let names = [
+                "claude-code", "codex-mcp-client", "gemini-cli-mcp-client",
+                "opencode", "cursor", "cursor-mcp-client", "claude-ai",
+                "Claude Code 2", "cursor-custom", "previously-approved-client",
+                "RepoPrompt CLI", "RepoPrompt CLI Debug"
+            ]
+            for name in names {
+                XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: name, bundledCLI: false), name)
+                XCTAssertFalse(ServerController.isBuiltInAlwaysAllowedClient(name), name)
+            }
+            XCTAssertTrue(ServerController.canAutomaticallyApprove(clientName: "RepoPrompt CLI", bundledCLI: true))
+            XCTAssertTrue(ServerController.canAutomaticallyApprove(clientName: "RepoPrompt CLI Debug", bundledCLI: true))
+            XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: "cursor", bundledCLI: true))
+        }
+
+        func testLegacyNamesArePreservedWithoutBecomingGrants() throws {
+            let suite = "MCPConnectionAdmissionTests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let names = ["previously-approved-client", "RepoPrompt CLI", "cursor-custom"]
+            defaults.set(names, forKey: "mcp.alwaysAllowedClients")
+            XCTAssertEqual(ServerController.loadLegacyClientNames(defaults: defaults), Set(names))
+            XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients"), names)
+            for name in names {
+                XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: name, bundledCLI: false))
+            }
+        }
+
+        func testOneTimeApprovalDoesNotTransferToSameNamePeerOrStaleResponse() async {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation in events.prompt(generation) }
+            await controller.test_requestApproval(
+                clientID: "same-name", approve: { events.decide("first-allowed") }, deny: { events.decide("first-denied") }
+            )
+            await controller.test_requestApproval(
+                clientID: "same-name", approve: { events.decide("second-allowed") }, deny: { events.decide("second-denied") }
+            )
+            XCTAssertEqual(events.generations.count, 1)
+            let first = events.generations[0]
+            await controller.resolvePendingApproval(allow: true, generation: first)
+            XCTAssertEqual(events.decisions, ["first-allowed"])
+            XCTAssertEqual(events.generations.count, 2)
+            let second = events.generations[1]
+            XCTAssertNotEqual(first, second)
+            await controller.resolvePendingApproval(allow: true, generation: first)
+            XCTAssertEqual(events.decisions, ["first-allowed"])
+            await controller.resolvePendingApproval(allow: true, generation: second)
+            XCTAssertEqual(events.decisions, ["first-allowed", "second-allowed"])
+        }
+
+        func testExplicitDenialRemainsConnectionSpecific() async {
+            let controller = ServerController(installNetworkCallbacks: false)
+            let events = AdmissionEvents()
+            await controller.setApprovalCallback { _, generation in events.prompt(generation) }
+            for peer in ["first", "second"] {
+                await controller.test_requestApproval(
+                    clientID: "same-name", approve: { events.decide("\(peer)-allowed") }, deny: { events.decide("\(peer)-denied") }
+                )
+            }
+            await controller.resolvePendingApproval(allow: false, generation: events.generations[0])
+            XCTAssertEqual(events.decisions, ["first-denied"])
+            await controller.resolvePendingApproval(allow: true, generation: events.generations[1])
+            XCTAssertEqual(events.decisions, ["first-denied", "second-allowed"])
+        }
+    }
+
+    private final class AdmissionEvents: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedGenerations: [UInt64] = []
+        private var storedDecisions: [String] = []
+
+        var generations: [UInt64] {
+            lock.withLock { storedGenerations }
+        }
+
+        var decisions: [String] {
+            lock.withLock { storedDecisions }
+        }
+
+        func prompt(_ generation: UInt64) {
+            lock.withLock { storedGenerations.append(generation) }
+        }
+
+        func decide(_ decision: String) {
+            lock.withLock { storedDecisions.append(decision) }
+        }
+    }
+#endif

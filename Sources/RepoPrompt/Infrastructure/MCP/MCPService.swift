@@ -30,6 +30,7 @@ actor MCPService: Sendable {
     struct Snapshot: Equatable {
         var isRunning: Bool
         var pendingClientID: String?
+        var pendingApprovalGeneration: UInt64?
         var diagnostics: MCPDiagnostics
     }
 
@@ -150,8 +151,8 @@ actor MCPService: Sendable {
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
-            await controller.setApprovalCallback { [weak self] clientID in
-                await self?.setPendingApproval(clientID)
+            await controller.setApprovalCallback { [weak self] clientID, generation in
+                await self?.setPendingApproval(clientID, generation: generation)
             }
             await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
@@ -349,20 +350,21 @@ actor MCPService: Sendable {
     /// ──────────────────────────────────────────────
     /// Called by the MainActor after the alert sheet closes
     /// Runs on the actor executor – no extra Task hop required.
-    func continuePendingApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        await controller.resolvePendingApproval(
-            allow: allow,
-            alwaysAllow: alwaysAllow
-        )
-        // Clear the pending client ID and notify observers.
+    func continuePendingApproval(allow: Bool, generation: UInt64) async {
+        guard state.pendingApprovalGeneration == generation else { return }
+        // Clear before the controller activates the next queued request; clearing
+        // afterward would erase that next prompt, including a same-name peer.
         state.pendingClientID = nil
+        state.pendingApprovalGeneration = nil
         yieldState()
+        await controller.resolvePendingApproval(allow: allow, generation: generation)
     }
 
     /// Controller → Service callback - called when a new client requests approval
-    private func setPendingApproval(_ clientID: String?) {
+    private func setPendingApproval(_ clientID: String?, generation: UInt64) {
         mcpServiceLog("Setting pending approval for client: \(clientID ?? "nil")")
         state.pendingClientID = clientID
+        state.pendingApprovalGeneration = generation
         yieldState()
     }
 

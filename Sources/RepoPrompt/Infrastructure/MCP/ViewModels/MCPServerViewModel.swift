@@ -1155,6 +1155,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
+    @Published private(set) var pendingApprovalGeneration: UInt64?
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
         issue: .none,
         lastEventAt: nil,
@@ -3182,6 +3183,7 @@ final class MCPServerViewModel: ObservableObject {
 
         isRunning = snap.isRunning
         pendingClientID = snap.pendingClientID
+        pendingApprovalGeneration = snap.pendingApprovalGeneration
         diagnostics = snap.diagnostics
         lastErrorMessage = humanReadableError(from: snap.diagnostics.issue)
 
@@ -3466,11 +3468,8 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Called by UI after the alert sheet closes
-    func resolveApproval(allow: Bool, alwaysAllow: Bool = false) async {
-        await service.continuePendingApproval(
-            allow: allow,
-            alwaysAllow: alwaysAllow
-        )
+    func resolveApproval(allow: Bool, generation: UInt64) async {
+        await service.continuePendingApproval(allow: allow, generation: generation)
     }
 
     // MARK: - Dashboard Methods
