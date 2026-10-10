@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
+import RepoPromptShared
 import RepoPromptVCS
 import XCTest
 
@@ -336,4 +337,107 @@ final class GitUntrackedLineStatsTests: XCTestCase {
             XCTAssertEqual(file.deletions, value.lines == nil ? nil : 0, value.name)
         }
     }
+}
+
+// MARK: - Revision operand validation
+
+final class GitRevisionArgumentTests: XCTestCase {
+    func testRejectsOptionsAndControlsWithoutEchoingInput() throws {
+        for ref in ["-p", "--stat", "--", " --stat", "", " \n", "HEAD\0tail", "HEAD\n"] {
+            XCTAssertThrowsError(try GitRevisionArgument.validate(ref)) { error in
+                XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+                XCTAssertEqual(error.localizedDescription, "Invalid Git revision operand: expected a nonempty revision, not an option or control characters.")
+            }
+        }
+        for ref in ["HEAD", "HEAD~1", "HEAD^!", "main..HEAD", "main...HEAD", "@{upstream}", "HEAD@{yesterday}", "HEAD:README.md", "refs/tags/v1"] {
+            XCTAssertNoThrow(try GitRevisionArgument.validate(ref))
+        }
+    }
+
+    func testAllCompareVariantsRejectBeforeAnyProcessSpawn() async throws {
+        let service = GitService(processSpawner: { _, _, _, _ in
+            XCTFail("Invalid revisions must be rejected before any Git process launches")
+            throw UnexpectedSpawn()
+        })
+        let root = FileManager.default.temporaryDirectory
+        var specs = ["--stat", "uncommitted:--stat", "mergebase:--stat", "uncommitted-mergebase:--stat", "staged:--stat", "staged-mergebase:--stat"].map { GitDiffCompareSpec.parse($0) }
+        for json in [#"{"kind":"revspec","spec":"--stat"}"#, #"{"kind":"staged","base":"--stat"}"#] {
+            try specs.append(JSONDecoder().decode(GitDiffCompareSpec.self, from: Data(json.utf8)))
+        }
+        specs.append(.uncommitted(base: "--stat"))
+        for spec in specs {
+            do {
+                _ = try await service.getChangedFilesStats(compare: spec, includeUntrackedWhenApplicable: true, at: root)
+                XCTFail("Unsafe compare accepted")
+            } catch {
+                XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+            }
+        }
+        for paths: [String]? in [nil, ["README.md"], [String(repeating: "a", count: 140_000)]] {
+            do {
+                _ = try await service.getDiffRevspec("--stat", paths: paths, contextLines: 3, detectRenames: false, at: root)
+                XCTFail("Unsafe diff operand accepted")
+            } catch {
+                XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+            }
+        }
+        let operations: [() async throws -> Void] = [
+            { _ = try await service.getDiff(from: "--stat", at: root) },
+            { _ = try await service.getDiff(from: "--stat", for: ["README.md"], at: root) },
+            { _ = try await service.getMergeBase(sourceHead: "HEAD", targetHead: "--stat", at: root) },
+            { _ = try await service.isAncestor("--stat", of: "HEAD", at: root) }
+        ]
+        for operation in operations {
+            do {
+                try await operation()
+                XCTFail("Unsafe revision accepted")
+            } catch {
+                XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+            }
+        }
+        do {
+            _ = try await service.commitInfo(ref: "--stat", at: root)
+            XCTFail("Unsafe show operand accepted")
+        } catch {
+            XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+        }
+        do {
+            _ = try await service.getRefSHA(at: root, ref: "--stat")
+            XCTFail("Unsafe resolution operand accepted")
+        } catch {
+            XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+        }
+        do {
+            _ = try await service.getChangedFilesStats(relativeTo: .branch("--stat"), at: root)
+            XCTFail("Unsafe legacy compare accepted")
+        } catch {
+            XCTAssertTrue(error is GitRevisionArgument.InvalidRevision)
+        }
+    }
+
+    func testValidRefsRangesAndCompareAliasesStillReadRevisions() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "GitRevisionArgument")
+        defer { fixture.cleanup() }
+        let root = try fixture.makeRepository(named: "repo", files: ["README.md": "one\n"])
+        try fixture.write("one\ntwo\n", to: "README.md", at: root)
+        try fixture.stage("README.md", at: root)
+        try fixture.commit("Second", at: root)
+        // A revision/path name collision must remain a revision, not a path filter.
+        try fixture.write("collision\n", to: "HEAD", at: root)
+        let service = GitService()
+        let info = try await service.commitInfo(ref: "HEAD", at: root)
+        XCTAssertEqual(info.message, "Second")
+        let unchanged = try await service.getChangedFilesStats(compare: .parse("uncommitted"), includeUntrackedWhenApplicable: false, at: root)
+        XCTAssertTrue(unchanged.isEmpty)
+        let patch = try await service.getDiffRevspec("HEAD~1..HEAD", paths: ["README.md"], contextLines: 3, detectRenames: false, at: root)
+        XCTAssertTrue(patch.contains("+two"))
+        let resolved = try await service.getRefSHA(at: root, ref: "HEAD~1")
+        XCTAssertEqual(resolved.count, 40)
+        for raw in ["HEAD~1..HEAD", "HEAD~1...HEAD", "HEAD^!", "back:1", "uncommitted:HEAD~1", "staged:HEAD~1", "mergebase:HEAD~1", "staged-mergebase:HEAD~1"] {
+            let files = try await service.getChangedFilesStats(compare: .parse(raw), includeUntrackedWhenApplicable: false, at: root)
+            XCTAssertEqual(files.map(\.path), ["README.md"], raw)
+        }
+    }
+
+    private struct UnexpectedSpawn: Error {}
 }

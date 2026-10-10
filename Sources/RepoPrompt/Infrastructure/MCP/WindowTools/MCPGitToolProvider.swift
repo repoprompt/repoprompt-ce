@@ -5,6 +5,7 @@ import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
@@ -913,6 +914,7 @@ final class MCPGitToolProvider {
             }
 
             let spec = GitDiffCompareSpec.parse(rawInput)
+            try spec.validateRevisionArgument()
             let resolved = spec.displayString
             let input = (resolved == rawInput) ? nil : rawInput
             return (spec, resolved, input)
@@ -1008,6 +1010,7 @@ final class MCPGitToolProvider {
             guard let ref = args["ref"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !ref.isEmpty else {
                 throw MCPError.invalidParams("ref is required for op: show")
             }
+            try GitRevisionArgument.validate(ref)
             let rawShowDetail = args["detail"]?.stringValue?.lowercased() ?? "summary"
             // For show, "patches" behaves the same as "full" (single commit, no truncation needed)
             let detail = rawShowDetail == "patches" ? "full" : rawShowDetail
@@ -1015,7 +1018,7 @@ final class MCPGitToolProvider {
             let commitInfo = try await showBackend.commitInfo(ref: ref, at: repoURL)
 
             // Get diff for this commit
-            let revspec = "\(ref)^!"
+            let revspec = "\(commitInfo.sha)^!"
             let contextLines = args["context_lines"]?.intValue ?? 3
             let detectRenames = args["detect_renames"]?.boolValue ?? false
             let changedFiles = try await showBackend.getChangedFilesStats(

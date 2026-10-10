@@ -389,6 +389,35 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
     }
 
+    func testHeadlessGitShowRejectsOptionsAndPreservesValidRevision() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        let marker = fixture.linkedWorktree.deletingLastPathComponent().appendingPathComponent("show-output")
+        let original = Data("preserved\n".utf8)
+        try original.write(to: marker)
+        for ref in ["--output=\(marker.path)", "-p", "--", "HEAD\0tail"] {
+            do {
+                let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string(ref)])
+                XCTAssertEqual(result.isError, true)
+                let text = result.content.compactMap { content -> String? in
+                    guard case let .text(value, _, _) = content else { return nil }
+                    return value
+                }.joined()
+                XCTAssertTrue(text.contains("Invalid Git revision operand"), text)
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("Invalid Git revision operand"), String(describing: error))
+            }
+            XCTAssertEqual(try Data(contentsOf: marker), original)
+        }
+        let result = try await fixture.client.callTool(name: "git", arguments: ["op": .string("show"), "ref": .string("HEAD")])
+        XCTAssertFalse(result.isError == true)
+        let text = result.content.compactMap { content -> String? in
+            guard case let .text(value, _, _) = content else { return nil }
+            return value
+        }.joined()
+        XCTAssertTrue(text.contains("Fixture"), text)
+        XCTAssertEqual(try Data(contentsOf: marker), original)
+    }
+
     private struct HeadlessWorktreeFixture {
         let client: Client
         let linkedWorktree: URL
