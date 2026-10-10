@@ -26,13 +26,24 @@ phase="$1"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-tip-source.XXXXXX")"
 cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Keep the bearer header out of process arguments. Tokens cannot inject config lines.
+[[ "$TIP_SOURCE_GH_TOKEN" != *$'\n'* && "$TIP_SOURCE_GH_TOKEN" != *$'\r'* ]] || fail "Invalid source token"
+curl_token="${TIP_SOURCE_GH_TOKEN//\\/\\\\}"
+curl_token="${curl_token//\"/\\\"}"
+SOURCE_CURL_CONFIG="$tmp_dir/github-curl.conf"
+(umask 077; printf 'header = "Authorization: Bearer %s"\n' "$curl_token" > "$SOURCE_CURL_CONFIG")
+unset curl_token
 
 response="$tmp_dir/live-main.json"
 status="$(curl --location --silent --show-error \
     --connect-timeout 10 --max-time 30 \
     --header 'Accept: application/vnd.github+json' \
     --header 'X-GitHub-Api-Version: 2022-11-28' \
-    --header "Authorization: Bearer $TIP_SOURCE_GH_TOKEN" \
+    --config "$SOURCE_CURL_CONFIG" \
     --output "$response" --write-out '%{http_code}' \
     "https://api.github.com/repos/$TIP_SOURCE_REPOSITORY/commits/$TIP_SOURCE_BRANCH")" ||
     fail "Protected-main GitHub API request failed"
@@ -82,7 +93,7 @@ compare_status="$(curl --location --silent --show-error \
     --connect-timeout 10 --max-time 30 \
     --header 'Accept: application/vnd.github+json' \
     --header 'X-GitHub-Api-Version: 2022-11-28' \
-    --header "Authorization: Bearer $TIP_SOURCE_GH_TOKEN" \
+    --config "$SOURCE_CURL_CONFIG" \
     --output "$compare_response" --write-out '%{http_code}' \
     "https://api.github.com/repos/$TIP_SOURCE_REPOSITORY/compare/$TIP_COMMIT...$TIP_SOURCE_BRANCH")" ||
     fail "Protected-main lineage GitHub API request failed"

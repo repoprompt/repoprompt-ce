@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import stat
 import subprocess
@@ -19,6 +20,66 @@ ROOT_DIR = SCRIPT_DIR.parent
 ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
 POLICY = SCRIPT_DIR / "apple_identity_policy.json"
 PROFILE_TOOL = SCRIPT_DIR / "embedded_provisioning_profile.py"
+
+
+class PromotionCurlConfigTests(unittest.TestCase):
+    def test_config_line_breaks_are_rejected_before_curl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stub = root / "curl"
+            receipt = root / "receipt"
+            stub.write_text('#!/bin/bash\ntouch "$CONFIG_RECEIPT"\nexit 99\n')
+            stub.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(PATH=f"{root}:{environment['PATH']}",
+                               PUBLIC_UPDATE_GH_TOKEN="fixture\ninvalid",
+                               CONFIG_RECEIPT=str(receipt))
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                 "test", str(SCRIPT_DIR / "promote_release.sh")],
+                env=environment, text=True, capture_output=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid updater token", result.stderr)
+            self.assertFalse(receipt.exists())
+
+    def test_private_config_and_cleanup_on_success_and_transport_failure(self) -> None:
+        for fail_transport in (False, True):
+            with self.subTest(fail_transport=fail_transport), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stub = root / "curl"
+                stub.write_text('''#!/usr/bin/env python3
+import json, os, shlex, sys
+from pathlib import Path
+args = sys.argv[1:]
+token = os.environ["PUBLIC_UPDATE_GH_TOKEN"]
+assert not any(token in arg for arg in args), "token in curl argv"
+config = Path(args[args.index("--config") + 1])
+assert config.stat().st_mode & 0o777 == 0o600
+assert config.parent.stat().st_mode & 0o777 == 0o700
+assert shlex.split(config.read_text()) == ["header", "=", "Authorization: Bearer " + token]
+Path(os.environ["CONFIG_RECEIPT"]).write_text(str(config))
+if os.environ["FAIL_TRANSPORT"] == "1":
+    sys.exit(7)
+Path(args[args.index("--output") + 1]).write_text("{}")
+print("404", end="")
+''')
+                stub.chmod(0o755)
+                environment = os.environ.copy()
+                environment.update(PATH=f"{root}:{environment['PATH']}",
+                                   PUBLIC_UPDATE_GH_TOKEN='fixture-quote"-backslash\\-token',
+                                   CONFIG_RECEIPT=str(root / "receipt"),
+                                   FAIL_TRANSPORT="1" if fail_transport else "0")
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                     "test", str(SCRIPT_DIR / "promote_release.sh")],
+                    env=environment, text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, not fail_transport, result.stderr)
+                config = Path((root / "receipt").read_text())
+                self.assertFalse(config.exists())
+                self.assertFalse(config.parent.exists())
+                self.assertNotIn(environment["PUBLIC_UPDATE_GH_TOKEN"], result.stdout + result.stderr)
 
 
 class DebugPackagingIdentityTests(unittest.TestCase):

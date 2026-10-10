@@ -188,6 +188,9 @@ cleanup() {
     [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 prepare_sentry_api_access() {
     validate_sentry_network_bounds
@@ -689,13 +692,21 @@ verify_strictly_newer_build() {
     local latest_json_file="$TMP_DIR/latest-release.json"
     local latest_status latest_json latest_tag latest_appcast latest_build
     validate_release_download_bounds
+    [[ -n "$TMP_DIR" ]] || fail "Updater API access requires verified promotion state"
+    # Keep the bearer header out of process arguments. Tokens cannot inject config lines.
+    [[ "$PUBLIC_UPDATE_GH_TOKEN" != *$'\n'* && "$PUBLIC_UPDATE_GH_TOKEN" != *$'\r'* ]] || fail "Invalid updater token"
+    local curl_token="${PUBLIC_UPDATE_GH_TOKEN//\\/\\\\}"
+    curl_token="${curl_token//\"/\\\"}"
+    local update_curl_config="$TMP_DIR/github-curl.conf"
+    (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$curl_token" > "$update_curl_config")
+    unset curl_token
     if ! latest_status="$(env -u GH_TOKEN -u GITHUB_TOKEN curl \
         --location \
         --silent \
         --show-error \
         --connect-timeout "$RELEASE_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
         --max-time "$RELEASE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS" \
-        --header "Authorization: Bearer $PUBLIC_UPDATE_GH_TOKEN" \
+        --config "$update_curl_config" \
         --header "Accept: application/vnd.github+json" \
         --output "$latest_json_file" \
         --write-out '%{http_code}' \
