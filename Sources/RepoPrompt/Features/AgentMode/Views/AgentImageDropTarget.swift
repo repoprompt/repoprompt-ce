@@ -102,7 +102,7 @@ final class AgentImageDropController: ObservableObject {
             // Unreadable during the drag: stay undetermined and let the drop decide.
             guard !loaded.isEmpty else { return }
             let classification = AgentImageDropClassifier.classify(typeIdentifiers: [], fileURLs: loaded)
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 self?.resolvePaneClassification(classification, generation: generation)
             }
         }

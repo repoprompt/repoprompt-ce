@@ -304,9 +304,14 @@ extension AgentModeViewModel {
 
     /// The rule shared by the attach button, paste, and drop for `tabID`'s session.
     func imageAttachmentBlockReason(tabID: UUID?) -> AgentImageAttachmentBlockReason? {
-        let session = tabID.flatMap { session(for: $0, createIfNeeded: false) }
-        let agent = session?.selectedAgent ?? selectedAgent
-        let isBusy = session.map { $0.runState == .running } ?? (tabID == currentTabID && isAgentBusy)
+        var agent: AgentProviderKind = selectedAgent
+        var isBusy = false
+        if let tabID, let tabSession = session(for: tabID, createIfNeeded: false) {
+            agent = tabSession.selectedAgent
+            isBusy = tabSession.runState == AgentSessionRunState.running
+        } else if let tabID, tabID == currentTabID {
+            isBusy = isAgentBusy
+        }
         return AgentImageAttachmentGuard.blockReason(
             hasTab: tabID != nil,
             isAgentBusy: isBusy,
