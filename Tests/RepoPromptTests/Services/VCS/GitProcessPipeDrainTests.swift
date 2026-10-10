@@ -116,7 +116,7 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
             let (script, marker) = try makeMarkerScript(fixture)
-            try fixture.runGit(["config", "core.fsmonitor", script.path], at: repo)
+            try fixture.runGit(["config", "core.fsmonitor", shellCommand(script.path)], at: repo)
             _ = try fixture.runGit(["status", "--porcelain"], at: repo)
             XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control")
             try FileManager.default.removeItem(at: marker)
@@ -133,7 +133,7 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
             let (script, marker) = try makeMarkerScript(fixture)
             try fixture.write("*.txt diff=inspection\n", to: ".git/info/attributes", at: repo)
-            try fixture.runGit(["config", "diff.inspection.textconv", script.path], at: repo)
+            try fixture.runGit(["config", "diff.inspection.textconv", shellCommand(script.path)], at: repo)
             try fixture.write("after\n", to: "file.txt", at: repo)
             let service = GitService()
             for arguments in [["diff", "HEAD"], ["log", "-p", "-1"], ["show", "HEAD"], ["blame", "file.txt"]] {
@@ -150,7 +150,7 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
             let (script, marker) = try makeMarkerScript(fixture)
-            try fixture.runGit(["config", "diff.external", script.path], at: repo)
+            try fixture.runGit(["config", "diff.external", shellCommand(script.path)], at: repo)
             try fixture.write("after\n", to: "file.txt", at: repo)
             _ = try fixture.runGit(["diff", "HEAD"], at: repo)
             XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control")
@@ -166,7 +166,9 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let (script, marker) = try makeMarkerScript(fixture)
             try fixture.write("*.txt filter=inspection\n", to: ".git/info/attributes", at: repo)
             let includedConfig = fixture.sandbox.appendingPathComponent("driver-config")
-            try "[filter \"inspection\"]\n clean = \(script.path)\n required = true\n".write(to: includedConfig, atomically: true, encoding: .utf8)
+            let command = shellCommand(script.path)
+            try fixture.runGit(["config", "--file", includedConfig.path, "filter.inspection.clean", command], at: repo)
+            try fixture.runGit(["config", "--file", includedConfig.path, "filter.inspection.required", "true"], at: repo)
             try fixture.runGit(["config", "include.path", includedConfig.path], at: repo)
             try fixture.write("after!\n", to: "file.txt", at: repo)
             _ = try fixture.runGit(["diff", "HEAD"], at: repo)
@@ -185,7 +187,7 @@ final class GitProcessPipeDrainTests: XCTestCase {
             // A config read reports the real value; it must not execute it.
             let (value, _, code) = try await service.runGitDataForTesting(["config", "--get", "filter.inspection.clean"], at: repo)
             XCTAssertEqual(code, 0)
-            XCTAssertEqual(String(decoding: value, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), script.path)
+            XCTAssertEqual(String(decoding: value, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), command)
         }
 
         func testPassivePopoverAndRemoteComparisonDoNotFetchButExplicitFetchIsUnchanged() async throws {
@@ -218,11 +220,16 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
             let (script, marker) = try makeMarkerScript(fixture)
             try fixture.write("*.txt filter=inspection\n", to: ".git/info/attributes", at: repo)
-            try fixture.runGit(["config", "filter.inspection.process", script.path], at: repo)
+            try fixture.runGit(["config", "filter.inspection.process", shellCommand(script.path)], at: repo)
             try fixture.write("after!\n", to: "file.txt", at: repo)
             // The marker helper deliberately does not implement the filter protocol.
-            _ = try? fixture.runGit(["diff", "HEAD"], at: repo)
-            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control")
+            var controlDiagnostic = ""
+            do {
+                _ = try fixture.runGit(["diff", "HEAD"], at: repo)
+            } catch {
+                controlDiagnostic = error.localizedDescription
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "positive control: \(controlDiagnostic)")
             try FileManager.default.removeItem(at: marker)
             do {
                 _ = try await GitService().runGitDataForTesting(["diff", "HEAD"], at: repo)
@@ -270,6 +277,10 @@ final class GitProcessPipeDrainTests: XCTestCase {
             let (_, _, code) = try await GitService().runGitDataForTesting(["show", "HEAD:file.txt"], at: repo)
             XCTAssertNotEqual(code, 0)
             XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        }
+
+        private func shellCommand(_ path: String) -> String {
+            "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }
 
         private func makeMarkerScript(_ fixture: ReviewGitRepositoryFixture) throws -> (URL, URL) {
