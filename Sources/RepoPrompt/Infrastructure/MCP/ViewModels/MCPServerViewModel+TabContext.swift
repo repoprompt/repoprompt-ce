@@ -4096,6 +4096,7 @@ extension MCPServerViewModel {
             if signalRouting {
                 MCPRoutingWaiter.signalRouted(runID)
             }
+            ServerNetworkManager.noteRunRouteChanged(runID: runID)
             return true
         }
 
@@ -4142,6 +4143,7 @@ extension MCPServerViewModel {
         if signalRouting {
             MCPRoutingWaiter.signalRouted(runID)
         }
+        ServerNetworkManager.noteRunRouteChanged(runID: runID)
 
         return true
     }

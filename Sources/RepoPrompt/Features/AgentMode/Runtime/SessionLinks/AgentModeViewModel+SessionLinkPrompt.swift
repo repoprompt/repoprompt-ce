@@ -81,6 +81,18 @@ extension AgentModeViewModel {
         }
     }
 
+    /// A bounded wait for the exact route of a provider process the caller has just launched.
+    ///
+    /// Only the route token is awaited, never catalog freshness. `isCurrent` lets the caller abandon
+    /// the wait as soon as its own intent or controller ownership is lost; it is rechecked between
+    /// short wait slices alongside the qualifier's own supersession checks.
+    struct ProviderInputRouteWait {
+        let timeout: TimeInterval
+        let isCurrent: @MainActor () -> Bool
+    }
+
+    private static let providerInputRouteWaitSlice: TimeInterval = 0.25
+
     private func requiresExactSessionLinkProviderInputRoute(_ agent: AgentProviderKind) -> Bool {
         agent == .codexExec || agent.usesClaudeNativeRuntime
     }
@@ -88,7 +100,14 @@ extension AgentModeViewModel {
     /// Qualify the exact server-owned route, independently of whether a client has refreshed tools.
     /// Carry this immutable token to the final mapping fence; catalog observations are discovery
     /// facts, never authority to dispatch (or reasons to wait or recycle a healthy controller).
-    func qualifyProviderInputRoute(for session: TabSession) async -> ProviderInputRouteReadiness {
+    ///
+    /// `routeWait` is honored only after the active-outbound-link check has required a route: a
+    /// freshly launched provider's MCP child may still be connecting, so the server-owned route token
+    /// (and nothing weaker) is awaited for at most `routeWait.timeout`.
+    func qualifyProviderInputRoute(
+        for session: TabSession,
+        routeWait: ProviderInputRouteWait? = nil
+    ) async -> ProviderInputRouteReadiness {
         guard requiresExactSessionLinkProviderInputRoute(session.selectedAgent) else { return .notRequired }
         guard sessions[session.tabID] === session,
               let runID = session.runID
@@ -104,11 +123,32 @@ extension AgentModeViewModel {
         else { return .superseded }
         guard isRequired else { return .notRequired }
 
-        let token = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
+        var token = await agentSessionLinkAuthoritativeRunCatalogRouteToken(
             runID: runID,
             windowID: endpoint.windowID,
             tabID: session.tabID
         )
+        if token == nil, let routeWait, routeWait.timeout > 0 {
+            let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(routeWait.timeout * 1000)))
+            while token == nil {
+                if Task.isCancelled { return .cancelled }
+                guard sessions[session.tabID] === session else { return .unavailable }
+                guard session.runID == runID,
+                      agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint,
+                      routeWait.isCurrent()
+                else { return .superseded }
+                let remaining = deadline - ContinuousClock.now
+                guard remaining > .zero else { break }
+                let remainingSeconds = Double(remaining.components.seconds)
+                    + Double(remaining.components.attoseconds) / 1e18
+                token = await agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: endpoint.windowID,
+                    tabID: session.tabID,
+                    timeout: min(remainingSeconds, Self.providerInputRouteWaitSlice)
+                )
+            }
+        }
         if Task.isCancelled { return .cancelled }
         guard sessions[session.tabID] === session else { return .unavailable }
         guard session.runID == runID,
@@ -145,6 +185,43 @@ extension AgentModeViewModel {
             runID: runID,
             windowID: windowID,
             tabID: tabID
+        )
+    }
+
+    /// One wait slice over the same strict route query. Returns nil on timeout or cancellation.
+    private func agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID,
+        timeout: TimeInterval
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        #if DEBUG
+            if let test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken {
+                return await test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken(
+                    runID,
+                    windowID,
+                    tabID,
+                    timeout
+                )
+            }
+            if let test_agentSessionLinkAuthoritativeRunCatalogRouteToken {
+                // Mirror the production wait over the synthetic token: re-check until it is ready.
+                let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(max(0, timeout) * 1000)))
+                while !Task.isCancelled {
+                    if let token = await test_agentSessionLinkAuthoritativeRunCatalogRouteToken(runID, windowID, tabID) {
+                        return token
+                    }
+                    guard ContinuousClock.now < deadline else { return nil }
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+                return nil
+            }
+        #endif
+        return await ServerNetworkManager.shared.awaitAuthoritativeRunCatalogRouteToken(
+            runID: runID,
+            windowID: windowID,
+            tabID: tabID,
+            timeout: timeout
         )
     }
 

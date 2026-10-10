@@ -292,6 +292,130 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
         #endif
     }
 
+    // MARK: - Bounded route-token wait
+
+    /// The first send after a restart waits on exactly this primitive: it re-runs the strict token
+    /// query, wakes when the run's route commits, and yields nothing once its bound elapses.
+    func testAwaitAuthoritativeRouteTokenWakesOnCommittedRouteAndTimesOutWithoutOne() async throws {
+        #if DEBUG
+            let observer = try await makeRoutedObserver()
+            let manager = observer.manager
+            let windowID = observer.window.windowID
+            let runID = observer.runID
+            let tabID = observer.tabID
+
+            let started = ContinuousClock.now
+            let missing = await manager.awaitAuthoritativeRunCatalogRouteToken(
+                runID: UUID(),
+                windowID: windowID,
+                tabID: tabID,
+                timeout: 0.2
+            )
+            XCTAssertNil(missing, "a run with no committed route yields no token")
+            XCTAssertLessThan(ContinuousClock.now - started, .seconds(3), "the wait honors its bound")
+
+            // Revoke the committed route, arm a successor run policy, and park a waiter before the
+            // successor connection commits its route.
+            let revoking = makeAttemptLease(observer)
+            let revokingAcquired = await revoking.acquire()
+            XCTAssertTrue(revokingAcquired)
+            await revoking.cancelAndCleanup()
+            let revoked = await manager.authoritativeRunCatalogRouteToken(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID
+            )
+            XCTAssertNil(revoked, "precondition: no route until the successor commits")
+            let successor = makeAttemptLease(observer)
+            let successorAcquired = await successor.acquire()
+            XCTAssertTrue(successorAcquired)
+            let successorConnectionID = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: successorConnectionID,
+                connection: CancelledAttemptRouteTestConnection(),
+                pendingClientID: clientName
+            )
+            let waiter = Task {
+                await manager.awaitAuthoritativeRunCatalogRouteToken(
+                    runID: runID,
+                    windowID: windowID,
+                    tabID: tabID,
+                    timeout: 10
+                )
+            }
+            let applied = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: successorConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: "route-wait-\(runID.uuidString)",
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+            XCTAssertEqual(applied.outcome, "applied")
+            let token = await waiter.value
+            XCTAssertEqual(token?.runID, runID)
+            XCTAssertEqual(token?.connectionID, successorConnectionID)
+            let current = await manager.authoritativeRunCatalogRouteToken(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID
+            )
+            XCTAssertEqual(token, current, "the wait returns exactly the strict query's token")
+            await successor.cancelAndCleanup()
+            await manager.removeConnection(successorConnectionID)
+        #else
+            throw XCTSkip("Requires DEBUG MCP routing fixtures.")
+        #endif
+    }
+
+    /// A route-recovery recycle re-arms the run's one-shot policy for the replacement process, but
+    /// only while the lease that installed it is still acquired and unreleased.
+    func testLeaseReinstallsRunPolicyForReplacementProcessOnlyWhileAcquired() async {
+        let hooks = ReplacementPolicyHookCounter()
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: UUID(),
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "RepoPromptCE",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "replacement-process-policy",
+                ttl: 60,
+                purpose: .agentModeRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: true
+            ),
+            policyInstaller: { _ in await hooks.recordInstall() },
+            expectedPIDPolicyArmer: { _ in
+                await hooks.recordArm()
+                return true
+            },
+            policyClearer: { _ in },
+            routeAuthorityResolver: { _ in .committed }
+        )
+
+        let beforeAcquire = await lease.reinstallPolicyForReplacementProcess()
+        XCTAssertFalse(beforeAcquire, "nothing to re-arm before the lease owns a policy")
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
+        let reinstalled = await lease.reinstallPolicyForReplacementProcess()
+        XCTAssertTrue(reinstalled)
+        var counts = await hooks.counts
+        XCTAssertEqual(counts.installs, 2, "acquire plus one re-arm")
+        XCTAssertEqual(counts.arms, 2, "the expected-PID policy is re-armed too")
+
+        await lease.cancelAndCleanup()
+        let afterCleanup = await lease.reinstallPolicyForReplacementProcess()
+        XCTAssertFalse(afterCleanup, "a released lease must not leave a fresh admission policy behind")
+        counts = await hooks.counts
+        XCTAssertEqual(counts.installs, 2)
+    }
+
     func testCancellationThatDoesNotOptInStillRevokesACommittedRoute() async throws {
         #if DEBUG
             // User Stop, provider identity resets, and every non-Claude caller keep the default.
@@ -1165,6 +1289,23 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
         ) async {}
     }
 #endif
+
+private actor ReplacementPolicyHookCounter {
+    private var installs = 0
+    private var arms = 0
+
+    var counts: (installs: Int, arms: Int) {
+        (installs, arms)
+    }
+
+    func recordInstall() {
+        installs += 1
+    }
+
+    func recordArm() {
+        arms += 1
+    }
+}
 
 private actor LeaseHookSpy {
     private(set) var resolverCalls = 0
