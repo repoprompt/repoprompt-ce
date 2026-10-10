@@ -13,8 +13,8 @@
         var canScrollTowardLiveBottom: Bool
         var isNearBottom: Bool
         var distanceToBottom: CGFloat
-        var topVisibleBlockID: String?
-        var topVisibleAnchorDescription: String?
+        /// Block the reading-position probe is tracking while detached (nil while following).
+        var readingAnchorBlockID: String?
         var lastScrollIntentReason: String?
         var lastSettledBottomReason: String?
         var pendingPinnedBottomSourceDescription: String?
@@ -43,13 +43,19 @@
         var lastLargeStreamingHistoricalExposureKind: String?
         var detachedJumpCount: Int
         var maxDetachedJumpMagnitude: CGFloat
-        var detachedAnchorChangeCount: Int
-        var detachedSnapToTopCount: Int
+        /// Times the reading anchor moved more than 1pt with no user scroll input while detached.
+        var positionShiftWhileReadingCount: Int
+        var maxPositionShiftWhileReading: CGFloat
+        /// Programmatic bottom scrolls that executed while the user was detached/reading.
+        var snapBackWhileReadingCount: Int
+        /// Display-link frame intervals sampled while an assistant row streams.
+        var streamingFrameIntervalSampleCount: Int
+        var streamingFrameIntervalP50MS: Double?
+        var streamingFrameIntervalP95MS: Double?
+        var streamingFrameIntervalP99MS: Double?
         var storedDetachedTargetDescription: String?
         var storedDetachedAnchorDescription: String?
         var storedDetachedViewportMinY: CGFloat?
-        var liveDetachedTargetDescription: String?
-        var liveDetachedViewportMinY: CGFloat?
         var detachedAcceptedDriftCount: Int
         var detachedRestoreIntentCount: Int
         var lastDetachedRebaseAction: String?
@@ -61,9 +67,6 @@
         var smoothSendCorrectiveScrollCount: Int
         var lastSmoothSendSettleDurationMS: Double?
         var maxSmoothSendSettleDurationMS: Double?
-        var detachedAuthorityAnchorDescription: String?
-        var viewportFrameUpdateCount: Int
-        var viewportCandidateUpdateCount: Int
         var projectionBuildCount: Int
         var projectionPublishCount: Int
         var lastProjectionBuildDurationMS: Double?
@@ -144,8 +147,7 @@
             canScrollTowardLiveBottom: false,
             isNearBottom: true,
             distanceToBottom: 0,
-            topVisibleBlockID: nil,
-            topVisibleAnchorDescription: nil,
+            readingAnchorBlockID: nil,
             lastScrollIntentReason: nil,
             lastSettledBottomReason: nil,
             pendingPinnedBottomSourceDescription: nil,
@@ -174,13 +176,16 @@
             lastLargeStreamingHistoricalExposureKind: nil,
             detachedJumpCount: 0,
             maxDetachedJumpMagnitude: 0,
-            detachedAnchorChangeCount: 0,
-            detachedSnapToTopCount: 0,
+            positionShiftWhileReadingCount: 0,
+            maxPositionShiftWhileReading: 0,
+            snapBackWhileReadingCount: 0,
+            streamingFrameIntervalSampleCount: 0,
+            streamingFrameIntervalP50MS: nil,
+            streamingFrameIntervalP95MS: nil,
+            streamingFrameIntervalP99MS: nil,
             storedDetachedTargetDescription: nil,
             storedDetachedAnchorDescription: nil,
             storedDetachedViewportMinY: nil,
-            liveDetachedTargetDescription: nil,
-            liveDetachedViewportMinY: nil,
             detachedAcceptedDriftCount: 0,
             detachedRestoreIntentCount: 0,
             lastDetachedRebaseAction: nil,
@@ -192,9 +197,6 @@
             smoothSendCorrectiveScrollCount: 0,
             lastSmoothSendSettleDurationMS: nil,
             maxSmoothSendSettleDurationMS: nil,
-            detachedAuthorityAnchorDescription: nil,
-            viewportFrameUpdateCount: 0,
-            viewportCandidateUpdateCount: 0,
             projectionBuildCount: 0,
             projectionPublishCount: 0,
             lastProjectionBuildDurationMS: nil,
@@ -291,6 +293,12 @@
         )
     }
 
+    /// DEBUG-only Agent chat stress harness. Off unless the app is launched with
+    /// `-RP_AGENT_CHAT_STRESS`; see `AgentChatStressLaunchConfiguration` for the environment
+    /// variables, including `RP_AGENT_STRESS_RESTORED_TURNS` for large (e.g. 1000-turn) synthetic
+    /// persisted sessions. Telemetry includes reading-position stability
+    /// (`positionShiftWhileReadingCount`, `snapBackWhileReadingCount`) and streaming frame-interval
+    /// percentiles sampled from a display link.
     @MainActor
     final class AgentChatStressHarness: ObservableObject {
         static let forceDetachRequestedNotification = Notification.Name("AgentChatStressHarness.forceDetachRequested")
@@ -406,6 +414,9 @@
         unowned let promptManager: PromptViewModel
         unowned let workspaceManager: WorkspaceManagerViewModel
         let windowID: Int
+        /// Reading-position probe; nil when `RP_AGENT_STRESS_TRACK_READING_POSITION` is off.
+        let readingProbe: AgentChatStressReadingProbe?
+        let frameIntervalSampler = AgentChatStressFrameIntervalSampler()
 
         @Published private(set) var status: Status = .idle
         @Published private(set) var telemetry: AgentChatStressTelemetrySnapshot = .empty
@@ -436,6 +447,7 @@
             self.promptManager = promptManager
             self.workspaceManager = workspaceManager
             self.windowID = windowID
+            readingProbe = configuration.tracksReadingPosition ? AgentChatStressReadingProbe() : nil
         }
 
         var statusText: String {
@@ -548,6 +560,8 @@
             telemetry = .empty
             grouping = .empty
             recentEvents = []
+            readingProbe?.reset()
+            frameIntervalSampler.reset()
             status = .idle
             note("Reset stress harness")
             Task { [weak self] in
@@ -863,7 +877,9 @@
         }
 
         private func waitForPersistedCodexReplayRestore(tabID: UUID) async -> Bool {
-            let deadline = Date().addingTimeInterval(30)
+            // Large synthetic sessions (RP_AGENT_STRESS_RESTORED_TURNS) need longer to project and settle.
+            let timeout = min(300, 30 + Double(configuration.restoredTurnCount) * 0.1)
+            let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
                 guard !Task.isCancelled else { return false }
                 let isActivePlaybackTab = promptManager.activeComposeTabID == tabID && agentModeViewModel.currentTabID == tabID
@@ -977,7 +993,7 @@
             let reasoningEffort = "medium"
             var items: [AgentChatItem] = []
             var nextSequenceIndex = 0
-            let restoredTurnCount = max(8, configuration.warmupTurnCount * 3)
+            let restoredTurnCount = configuration.restoredTurnCount
             for turnIndex in 0 ..< restoredTurnCount {
                 appendPersistedReplayHistoricalTurn(
                     turnIndex: turnIndex,

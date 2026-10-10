@@ -48,13 +48,10 @@ final class AgentTranscriptScrollEngine: ObservableObject {
     var pinnedMaintenance = PinnedMaintenanceState()
     var smoothSend = SmoothSendEnvelopeState()
     var rehydrate = RehydrateRestoreState()
-    var detachedSnapshot = DetachedViewportSnapshotState()
     var detachedRebase = DetachedRebaseCaptureState()
     var userScroll = UserScrollInteractionState()
     var bottomScrollOutcome = BottomScrollOutcomeState()
     var programmaticScrollGate = ProgrammaticScrollGate()
-    var pendingProgrammaticRestoreTargetID: AgentTranscriptViewportTargetID?
-    var pendingProgrammaticRestoreAnchor: AgentTranscriptAnchor?
     #if DEBUG
         var stressTelemetryState = AgentChatStressTelemetryState()
         var lastTelemetryDistanceToBottom: CGFloat?
@@ -67,8 +64,6 @@ final class AgentTranscriptScrollEngine: ObservableObject {
         pinnedMaintenance.deferredRequestAfterSmoothSend = nil
         smoothSend.launchGate.cancel()
         bottomScrollOutcome.reset()
-        pendingProgrammaticRestoreTargetID = nil
-        pendingProgrammaticRestoreAnchor = nil
     }
 
     nonisolated deinit {
@@ -164,23 +159,6 @@ struct RehydrateRestoreState {
     }
 }
 
-// MARK: - 2f. DetachedViewportSnapshotState
-
-struct DetachedViewportSnapshotState {
-    var topVisibleBlockID: String?
-    var topVisibleBlockAnchor: AgentTranscriptAnchor?
-    var topVisibleBlockMinY: CGFloat?
-    var topVisibleViewportTargetID: AgentTranscriptViewportTargetID?
-    var topVisibleViewportAnchor: AgentTranscriptAnchor?
-    var topVisibleViewportSequenceIndex: Int?
-    var topVisibleViewportFallbackBlockID: String?
-    var topVisibleViewportMinY: CGFloat?
-
-    mutating func clear() {
-        self = DetachedViewportSnapshotState()
-    }
-}
-
 // MARK: - 2g. DetachedRebaseCaptureState
 
 struct DetachedRebaseCaptureState {
@@ -191,8 +169,6 @@ struct DetachedRebaseCaptureState {
     var pendingSettleStablePassCount = 0
     var candidateKey: AgentDetachedRebaseKey?
     var candidateFirstSeenAt: CFAbsoluteTime?
-    var pendingAnchorChangeAnchor: AgentTranscriptAnchor?
-    var pendingAnchorChangeBlockID: String?
     var lastRestoreKey: AgentDetachedRebaseKey?
     var missingLiveAuthorityCount = 0
     var presentationRevisionCheckToken: UInt64 = 0

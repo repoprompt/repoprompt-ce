@@ -3,6 +3,9 @@
     @_spi(TestSupport) @testable import RepoPromptApp
     import XCTest
 
+    @_spi(TestSupport) @testable import RepoPromptApp
+    import XCTest
+
     @MainActor
     final class AgentRetentionCompactionTests: XCTestCase {
         func testFullReconciliationPreservesPayloadsAndMeasuresRetentionScan() {
@@ -188,6 +191,203 @@
 
         private func id(_ value: Int) -> UUID {
             UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+        }
+    }
+
+    // MARK: - Transcript pipeline timing (diagnostic)
+
+    /// Transcript pipeline timing diagnostic — not an acceptance gate.
+    ///
+    /// Measures, per synthetic session size: legacy-item import (`AgentTranscriptIO.buildTranscript`
+    /// with `compact: false`), compaction/retention (`AgentTranscriptCompactor.compact`), full
+    /// projection (`AgentTranscriptProjectionBuilder.build`), the default tail window
+    /// (`tailWindowedProjection`), and the persistence pipeline
+    /// (`AgentTranscriptPolicyPipeline.persistedTranscript`). Each stage is one wall-clock sample
+    /// (monotonic `DispatchTime`), no warmup, in whatever build configuration the test bundle uses
+    /// (debug/unoptimized for `make dev-test`), so numbers are only comparable on the same machine,
+    /// configuration and fixture parameters. Results are printed as machine-readable
+    /// `TRANSCRIPT_TIMING` and `TRANSCRIPT_BYTES` lines that carry the fixture parameters.
+    ///
+    /// Opt-in through the existing scale-test flag; see
+    /// docs/testing.md#agent-transcript-pipeline-timing-diagnostics for the exact command.
+    /// When enabled it measures 50, 150, 300 and 1000 turns. There is deliberately no wall-clock
+    /// threshold yet: import
+    /// and compaction are currently super-linear in turn count, so any bound would only restate
+    /// today's numbers. Transcript PR 3 (removing display compaction) is expected to make the
+    /// pipeline near-linear and will add a real acceptance threshold.
+    ///
+    /// Self-contained: depends only on pre-existing transcript APIs, so it can be copied onto
+    /// another revision for a controlled before/after comparison.
+    final class AgentTranscriptProjectionTimingDiagnostics: XCTestCase {
+        private static let turnCounts = [50, 150, 300, 1000]
+        private static let toolCallsPerTurn = 4
+        /// User request + assistant opener + call/result per tool + assistant conclusion.
+        private static let itemsPerTurn = 3 + toolCallsPerTurn * 2
+        private static let toolResultLineCount = 24
+
+        func testTranscriptPipelineTimingAcrossSessionSizes() throws {
+            try XCTSkipUnless(
+                ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1",
+                "Opt-in diagnostic: see docs/testing.md#agent-transcript-pipeline-timing-diagnostics"
+            )
+            for turnCount in Self.turnCounts {
+                try measurePipeline(turnCount: turnCount)
+            }
+        }
+
+        private func measurePipeline(turnCount: Int) throws {
+            let fixture = Self.makeFixture(turnCount: turnCount)
+
+            var raw: AgentTranscript!
+            let importSeconds = Self.measure {
+                raw = AgentTranscriptIO.buildTranscript(
+                    from: fixture.items,
+                    terminalState: .completed,
+                    nextSequenceIndex: fixture.nextSequenceIndex,
+                    compact: false
+                )
+            }
+            var compacted: AgentTranscript!
+            let compactSeconds = Self.measure {
+                compacted = AgentTranscriptCompactor.compact(raw)
+            }
+            var projection: AgentTranscriptProjection!
+            let projectionSeconds = Self.measure {
+                projection = AgentTranscriptProjectionBuilder.build(from: compacted)
+            }
+            var window: AgentTranscriptProjection!
+            let windowSeconds = Self.measure {
+                window = AgentTranscriptProjectionBuilder.tailWindowedProjection(
+                    from: projection,
+                    transcript: compacted,
+                    isExpanded: false
+                )
+            }
+            var persisted: AgentTranscriptPolicyPipeline.Result!
+            let persistSeconds = Self.measure {
+                persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: compacted)
+            }
+
+            let encodedRawBytes = try JSONEncoder().encode(raw).count
+            let encodedCompactedBytes = try JSONEncoder().encode(compacted).count
+            let encodedPersistedBytes = try JSONEncoder().encode(persisted.transcript).count
+            let tierCounts = Dictionary(grouping: compacted.turns, by: { "\($0.retentionTier)" }).mapValues(\.count)
+            let tierSummary = tierCounts.keys.sorted().map { "\($0):\(tierCounts[$0] ?? 0)" }.joined(separator: ",")
+            let fixtureFields = "turns=\(turnCount) itemsPerTurn=\(Self.itemsPerTurn)"
+                + " toolCallsPerTurn=\(Self.toolCallsPerTurn) toolResultPayloadBytes=\(fixture.averageToolResultBytes)"
+                + " items=\(fixture.items.count)"
+            print(
+                "TRANSCRIPT_TIMING \(fixtureFields)"
+                    + " importMS=\(Self.ms(importSeconds)) compactMS=\(Self.ms(compactSeconds))"
+                    + " projectionMS=\(Self.ms(projectionSeconds)) windowMS=\(Self.ms(windowSeconds))"
+                    + " persistMS=\(Self.ms(persistSeconds))"
+                    + " workingUnits=\(projection.workingUnitCount) visibleBlocks=\(window.workingBlocks.count)"
+                    + " fullBlocks=\(projection.workingBlocks.count) archivedBlocks=\(projection.archivedBlocks.count)"
+                    + " tiers=\(tierSummary)"
+            )
+            print(
+                "TRANSCRIPT_BYTES \(fixtureFields)"
+                    + " rawFullDetailBytes=\(AgentTranscriptCompactor.retainedFullDetailBytes(for: raw))"
+                    + " retainedFullDetailBytes=\(AgentTranscriptCompactor.retainedFullDetailBytes(for: compacted))"
+                    + " encodedRawBytes=\(encodedRawBytes) encodedCompactedBytes=\(encodedCompactedBytes)"
+                    + " encodedPersistedBytes=\(encodedPersistedBytes)"
+            )
+
+            // Fixture contracts: every synthetic user request becomes a turn, compaction keeps every
+            // turn addressable, and both projections render something.
+            XCTAssertEqual(raw.turns.count, turnCount)
+            XCTAssertEqual(compacted.turns.count, turnCount)
+            XCTAssertFalse(projection.workingBlocks.isEmpty)
+            XCTAssertFalse(window.workingBlocks.isEmpty)
+        }
+
+        // MARK: Synthetic fixture
+
+        private struct Fixture {
+            let items: [AgentChatItem]
+            let nextSequenceIndex: Int
+            let averageToolResultBytes: Int
+        }
+
+        /// Each turn: user request, assistant opener, `toolCallsPerTurn` tool call/result pairs with
+        /// ~1.5 KB JSON results, and a markdown assistant conclusion.
+        private static func makeFixture(turnCount: Int) -> Fixture {
+            var items: [AgentChatItem] = []
+            items.reserveCapacity(turnCount * itemsPerTurn)
+            var sequenceIndex = 0
+            var toolResultBytes = 0
+            func append(_ item: AgentChatItem) {
+                items.append(item)
+                sequenceIndex += 1
+            }
+            let toolNames = ["read_file", "file_search", "apply_edits", "bash"]
+            for turn in 0 ..< turnCount {
+                append(.user(
+                    "Turn \(turn): investigate the transcript scroll regression in module \(turn % 17) and propose a fix.",
+                    sequenceIndex: sequenceIndex
+                ))
+                append(.assistant(
+                    "I'll start by reading the relevant files for turn \(turn) and searching for the scroll anchor code paths.",
+                    sequenceIndex: sequenceIndex
+                ))
+                for call in 0 ..< toolCallsPerTurn {
+                    let toolName = toolNames[call % toolNames.count]
+                    let invocationID = UUID()
+                    let resultJSON = toolResultJSON(turn: turn, call: call)
+                    toolResultBytes += resultJSON.utf8.count
+                    append(.toolCall(
+                        name: toolName,
+                        invocationID: invocationID,
+                        argsJSON: "{\"path\":\"Sources/Module\(turn % 17)/File\(call).swift\",\"start_line\":\(call * 40 + 1),\"limit\":40}",
+                        sequenceIndex: sequenceIndex
+                    ))
+                    append(.toolResult(
+                        name: toolName,
+                        invocationID: invocationID,
+                        resultJSON: resultJSON,
+                        isError: false,
+                        sequenceIndex: sequenceIndex
+                    ))
+                }
+                append(.assistant(
+                    """
+                    ## Turn \(turn) conclusion
+
+                    The anchor drift comes from height changes above the viewport in module \(turn % 17).
+                    - Preserve the anchor row offset across relayout.
+                    - Keep following only within the bottom threshold.
+
+                    ```swift
+                    let adjustment = model.layoutDidChange(from: old, to: new, clipOriginY: origin)
+                    ```
+                    """,
+                    sequenceIndex: sequenceIndex
+                ))
+            }
+            let toolResultCount = max(1, turnCount * toolCallsPerTurn)
+            return Fixture(
+                items: items,
+                nextSequenceIndex: sequenceIndex,
+                averageToolResultBytes: toolResultBytes / toolResultCount
+            )
+        }
+
+        private static func toolResultJSON(turn: Int, call: Int) -> String {
+            let lines = (0 ..< toolResultLineCount).map { line in
+                "\(call * 40 + line + 1): let value\(line) = compute(turn: \(turn), call: \(call), line: \(line))"
+            }
+            let content = lines.joined(separator: "\\n")
+            return "{\"path\":\"Sources/Module\(turn % 17)/File\(call).swift\",\"content\":\"\(content)\",\"total_lines\":400}"
+        }
+
+        private static func measure(_ work: () -> Void) -> TimeInterval {
+            let start = DispatchTime.now().uptimeNanoseconds
+            work()
+            return TimeInterval(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
+        }
+
+        private static func ms(_ seconds: TimeInterval) -> String {
+            String(format: "%.1f", seconds * 1000)
         }
     }
 #endif
