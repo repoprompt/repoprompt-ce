@@ -4647,7 +4647,7 @@ extension ToolOutputFormatter {
 
         switch dto.op.lowercased() {
         case "list":
-            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [])
+            appendManageWorktreeList(&out, worktrees: dto.worktrees ?? [], totalCount: dto.totalCount)
         case "show":
             if let worktree = dto.worktree ?? dto.worktrees?.first {
                 appendManageWorktreeDetails(&out, worktree: worktree)
@@ -4712,10 +4712,15 @@ extension ToolOutputFormatter {
 
     private static func appendManageWorktreeList(
         _ out: inout [String],
-        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO]
+        worktrees: [ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO],
+        totalCount: Int?
     ) {
         out.append("")
-        out.append("### Worktrees (\(worktrees.count))")
+        if let totalCount, totalCount != worktrees.count {
+            out.append("### Worktrees (\(worktrees.count) of \(totalCount))")
+        } else {
+            out.append("### Worktrees (\(worktrees.count))")
+        }
         guard !worktrees.isEmpty else {
             out.append("_No worktrees found._")
             return

@@ -10,6 +10,7 @@ enum AgentSessionError: Error, LocalizedError {
     case loadFailed(Error)
     case noActiveWorkspace
     case invalidHandoffCutoff
+    case handoffExecutionLocationUnavailable(String)
 
     var localizedDescription: String {
         switch self {
@@ -25,6 +26,8 @@ enum AgentSessionError: Error, LocalizedError {
             "No active workspace for agent session"
         case .invalidHandoffCutoff:
             "The selected handoff point is no longer available in this session transcript."
+        case let .handoffExecutionLocationUnavailable(reason):
+            "Handoff did not open a new chat because it could not keep this conversation's worktree execution location. \(reason)"
         }
     }
 

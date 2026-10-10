@@ -327,6 +327,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private enum CodexNativeSessionFallbackReason {
         case missingRollout
         case repeatedResumeTimeout
+        case resumeFrameTooLarge
     }
 
     private enum LiveBashRunningApplyResult {
@@ -4682,23 +4683,33 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return recordCodexResumeTimeout(for: session, existingRef: existingRef)
     }
 
-    private func shouldRetryFreshStartAfterResumeTimeout(
+    /// Chooses the fresh-thread fallback for a failed resume attempt, if any.
+    ///
+    /// A resume response over the stdout frame budget is deterministic: retrying the same
+    /// target overflows again, so it falls back on the first occurrence. Timeouts may be
+    /// transient and only fall back once the repeated-timeout threshold is reached.
+    private func resumeFreshStartFallbackReason(
+        attemptedResume: Bool,
         timeoutCount: Int?,
+        error: Error,
         allowResumeTimeoutFallback: Bool
-    ) -> Bool {
-        guard allowResumeTimeoutFallback,
-              let timeoutCount
-        else {
-            return false
+    ) -> CodexNativeSessionFallbackReason? {
+        guard allowResumeTimeoutFallback, attemptedResume else { return nil }
+        if CodexAppServerClient.isStdoutFrameBudgetExceededError(error) {
+            return .resumeFrameTooLarge
         }
-        return timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold
+        if let timeoutCount, timeoutCount >= Self.repeatedResumeTimeoutFallbackThreshold {
+            return .repeatedResumeTimeout
+        }
+        return nil
     }
 
     private func makeCodexRunLease(
         tabID: UUID,
         runID: UUID,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        allowsAgentExternalControlTools: Bool = false
+        allowsAgentExternalControlTools: Bool = false,
+        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
@@ -4717,7 +4728,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             mcpServerEnabler: { [weak viewModel] in
                 await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
             },
-            policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
+            policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
+            routingStateOwner: routingStateOwner
         )
     }
 
@@ -4735,7 +4747,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resumeRecoveryMessage()
         case .repeatedResumeTimeout:
             repeatedResumeTimeoutRecoveryMessage()
+        case .resumeFrameTooLarge:
+            resumeFrameTooLargeRecoveryMessage()
         }
+    }
+
+    private static func resumeFrameTooLargeRecoveryMessage() -> String {
+        "Codex couldn't resume the previous thread because its history was too large to load. Started a fresh thread."
     }
 
     private static func missedCodexCompletionRecoveryMessage() -> String {
@@ -7042,25 +7060,70 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return
         }
-        // Exact idle compact resumes only for a control-plane request, not an active model turn.
-        // The next ordinary turn establishes its own routed tool policy.
+        // Cold native compact needs the same PID-owned policy before required MCP discovery.
+        // Its control-plane resume may become ready while idle; compaction claims an active
+        // attempt only after routing and the final compaction admission check succeed.
         let shouldInstallPolicy = shouldManageCodexTooling
-            && !forIdleNativeCompact
             && shouldBootstrapSessionInitialization
             && (!policyAlreadyInstalled || !deferPublicationUntilRouting)
             && requiresTransportStart
         let shouldWaitForRouting = requiresTransportStart
         if shouldInstallPolicy {
+            if forIdleNativeCompact {
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptIDAtEntry
+                else { return }
+            }
+            let startupController = session.codexController
+            let startupControllerID = startupController.map(ObjectIdentifier.init)
+            let startupControllerGeneration = session.codexControllerGeneration
+            let routingStateOwner: (@MainActor @Sendable () -> Bool)? = if forIdleNativeCompact {
+                { [weak session] in
+                    guard let session, session.runID == runID, session.codexController != nil else { return true }
+                    return session.codexControllerGeneration == startupControllerGeneration
+                        && session.codexController.map(ObjectIdentifier.init) == startupControllerID
+                }
+            } else {
+                nil
+            }
             let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
             guard let initialLease = makeCodexRunLease(
                 tabID: session.tabID,
                 runID: runID,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
-                allowsAgentExternalControlTools: allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+                routingStateOwner: routingStateOwner
             ) else { return }
             var lease = initialLease
+            func cleanupIdleCompactStartup() async {
+                let originalControllerInstalled = session.codexControllerGeneration == startupControllerGeneration
+                    && session.codexController.map(ObjectIdentifier.init) == startupController.map(ObjectIdentifier.init)
+                let hasSameRunSuccessor = session.runID == runID
+                    && session.codexController != nil && !originalControllerInstalled
+                if originalControllerInstalled, let startupController {
+                    _ = invalidateCodexControllerForReconnect(
+                        session: session, expectedController: startupController,
+                        source: "idle-compact-resume-failed", preserveRunID: true
+                    )
+                } else if let startupController,
+                          session.codexController.map(ObjectIdentifier.init) != ObjectIdentifier(startupController)
+                {
+                    retireCodexController(startupController, tabID: session.tabID, source: "superseded-idle-compact-resume")
+                }
+                if hasSameRunSuccessor {
+                    await lease.releaseGateForDeferredRouting()
+                } else {
+                    // The startup claim remains held through revocation; normal send/compact
+                    // cannot install a successor policy until this cleanup has settled.
+                    await lease.failAndCleanup()
+                    await awaitCodexControllerRetirement(for: session.tabID)
+                }
+            }
             let acquired = await lease.acquire()
-            guard acquired else { return }
+            guard acquired else {
+                if forIdleNativeCompact { await cleanupIdleCompactStartup() }
+                return
+            }
 
             guard await computerUseStartupIsCurrent(preparedController) else {
                 await lease.failAndCleanup()
@@ -7077,6 +7140,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     existingRef: routingReadinessResumeCandidate,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback
                 )
+            if forIdleNativeCompact {
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptIDAtEntry,
+                      session.codexControllerGeneration == startupControllerGeneration,
+                      session.codexController.map(ObjectIdentifier.init) == startupController.map(ObjectIdentifier.init)
+                else {
+                    await cleanupIdleCompactStartup()
+                    return
+                }
+            }
             session.codexNativeStartupDisposition = nil
             await ensureCodexNativeSession(
                 session: session,
@@ -7128,7 +7201,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let pendingStart = pendingCodexStartsByTabID[session.tabID]
             let routingReadinessStartupDisposition = pendingStart?.result.disposition
                 ?? (routingReadinessAttemptedResume ? .resumed : .fresh)
-            let providerReady = effectiveRunState.isActive
+            let providerReady = (effectiveRunState.isActive || forIdleNativeCompact)
                 && pendingStart?.sessionID == ObjectIdentifier(session)
                 && pendingStart?.runID == runID
                 && pendingStart?.runAttemptID == runAttemptIDAtEntry
@@ -7145,6 +7218,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.activeRunAttemptID == runAttemptIDAtEntry,
                   session.codexControllerGeneration == pendingStart.controllerGeneration
             else {
+                if forIdleNativeCompact {
+                    discardPendingCodexStart(for: session, controllerID: startupControllerID)
+                    await cleanupIdleCompactStartup()
+                    return
+                }
                 // A provider response with no owning startup is not a routable session.
                 discardPendingCodexStart(for: session)
                 if let pendingStart,
@@ -7253,9 +7331,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             controller: expectedController,
                             source: "uncommitted-routing-or-attempt"
                         )
+                        if forIdleNativeCompact { await cleanupIdleCompactStartup() }
                         return
                     }
                     await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
+                    return
                 } catch is CancellationError {
                     // Cancellation cannot publish a staged reference even if the provider
                     // already reported an active thread.
@@ -7270,7 +7350,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } catch {
                     // Fail closed: RepoPrompt MCP routing was never confirmed for this run, so the
                     // child cannot be trusted to hold RepoPrompt tools and must not reach its first
-                    // turn. requireRouting has already released the gate, one-shot policy, and routing
+                    // turn. requireRouting has released the gate and any still-owned policy and routing
                     // waiter; tear down the started thread and publish the readiness failure as the
                     // run's terminal outcome so the parent sees a failed start instead of a tool-less
                     // child.
@@ -7301,6 +7381,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 await lease.releaseWithoutRoutingWait()
             }
+            if forIdleNativeCompact { await cleanupIdleCompactStartup() }
             return
         }
         guard requiresTransportStart else {
@@ -7331,6 +7412,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         let existingRef = shouldSkipTimedOutResumeTarget ? nil : resumeCandidate
         guard let startController = session.codexController else { return }
+        let controllerGenerationAtStart = session.codexControllerGeneration
         guard await computerUseStartupIsCurrent(startController) else { return }
         do {
             var startResult = try await startCodexNativeSession(
@@ -7381,6 +7463,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
             }
         } catch {
+            if forIdleNativeCompact {
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptIDAtEntry,
+                      session.codexControllerGeneration == controllerGenerationAtStart,
+                      session.codexController.map({ Self.sameCodexControllerInstance($0, startController) }) == true
+                else { return }
+            }
             if computerUseActivationID != nil {
                 guard session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                       session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
@@ -7477,16 +7566,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     error: effectiveError
                 )
             }()
-            if shouldRetryFreshStartAfterResumeTimeout(
+            if let freshStartFallbackReason = resumeFreshStartFallbackReason(
+                attemptedResume: attemptedResume,
                 timeoutCount: resumeTimeoutCount,
+                error: effectiveError,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback
             ) {
-                logCodex("[AgentModeVM][CodexReconnect] repeated resume timeout for tab \(session.tabID); retrying with a fresh thread start")
+                let isFrameTooLarge = freshStartFallbackReason == .resumeFrameTooLarge
+                let failureDescription = isFrameTooLarge ? "oversized resume response" : "repeated resume timeout"
+                logCodex("[AgentModeVM][CodexReconnect] \(failureDescription) for tab \(session.tabID); retrying with a fresh thread start")
                 let expectedController = session.codexController
                 _ = invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: expectedController,
-                    source: "resume-timeout-fallback",
+                    source: isFrameTooLarge ? "resume-frame-too-large-fallback" : "resume-timeout-fallback",
                     preserveRunID: true
                 )
                 guard let freshController = await prepareCodexController() else { return }
@@ -7519,7 +7612,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if retryResult.fallbackReason == nil {
                         retryResult = CodexNativeSessionStartResult(
                             sessionRef: retryResult.sessionRef,
-                            fallbackReason: .repeatedResumeTimeout,
+                            fallbackReason: freshStartFallbackReason,
                             disposition: .resumeFellBackToFresh
                         )
                     }
@@ -10057,7 +10150,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if let active = state.active,
                        active.compactRunID == session.runID,
                        active.compactRunAttemptID == session.activeRunAttemptID,
-                       active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+                       active.canAcceptCompactConfirmation
                     {
                         state.active?.compactTurnSucceeded = true
                         session.selfCompactState = state

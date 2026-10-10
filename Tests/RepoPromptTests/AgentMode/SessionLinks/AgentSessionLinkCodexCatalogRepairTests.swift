@@ -67,6 +67,25 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
 
     // MARK: - Repair
 
+    func testSurfaceEvidenceHandlesSameNameDowngradeWithdrawalAndUnknownWithoutPhantomReadiness() throws {
+        let fixture = try makeFixture()
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        let route = AgentSessionLinkRunCatalogRouteToken(runID: runID, observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1)
+        let full = Data("full definition".utf8)
+        let reduced = Data("reduced definition".utf8)
+        let absent = Data("[]".utf8)
+        for (expected, returned) in [(reduced, full), (absent, full), (full, absent)] {
+            let mismatch = AgentSessionLinkRunCatalogProjection(runID: runID, routeToken: route, projectionRevision: 2, hasAgentSessionLink: true, hasAnyActiveLink: false, hasActiveOutboundLink: false, expectedSurface: expected, returnedSurface: returned)
+            XCTAssertTrue(AgentSessionLinkCodexCatalogRepair.isStuckProjection(mismatch))
+            XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(mismatch))
+            XCTAssertFalse(mismatch.isReady)
+        }
+        let unknown = AgentSessionLinkRunCatalogProjection(runID: runID, routeToken: route, projectionRevision: 3, hasAgentSessionLink: true, hasAnyActiveLink: false, hasActiveOutboundLink: false, expectedSurface: full, returnedSurface: nil)
+        XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.isStuckProjection(unknown))
+        XCTAssertFalse(AgentSessionLinkCodexCatalogRepair.projectionResolvesCycle(unknown))
+    }
+
     /// The whole contract in one pass: an idle Codex observer behind a false/live-outbound catalog
     /// admits its wake independently of discovery; one exact projection still retires the idle
     /// stale client while preserving the unchanged passive snapshot for a cold restart.

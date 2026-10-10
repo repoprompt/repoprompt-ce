@@ -8,6 +8,10 @@ final class AgentACPModelRegistry {
     private var liveSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
     private var liveSignaturesByProvider: [ACPProviderID: ACPDynamicProviderRecord] = [:]
     private var persistedSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
+    // Derived from the complete effective snapshot, including labels and parameter choices.
+    // Both values are replaced under `lock`; readers never perform derivation or store I/O.
+    private var devinCatalogSnapshot: ACPDiscoveredSessionModels?
+    private var devinCatalog = DevinModelCatalog(snapshot: nil)
     private var standardStoreWarmTask: Task<[ACPProviderID: ACPDiscoveredSessionModels], Never>?
     private var didWarmStandardStore = false
     private var standardStoreWarmGeneration: UInt64 = 0
@@ -35,6 +39,7 @@ final class AgentACPModelRegistry {
             liveSignaturesByProvider[providerID] = providerRecord
         }
         persistedSnapshotsByProvider[providerID] = normalizedSnapshot
+        if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
         lock.unlock()
 
         guard didChange else { return false }
@@ -57,6 +62,18 @@ final class AgentACPModelRegistry {
 
     func resolvedSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
         snapshotFromMemory(for: providerID)
+    }
+
+    func currentDevinCatalog() -> DevinModelCatalog {
+        lock.withLock { devinCatalog }
+    }
+
+    /// Caller holds `lock`. Build and publication are atomic with snapshot mutation.
+    private func refreshDevinCatalogIfNeededLocked() {
+        let snapshot = liveSnapshotsByProvider[.devin] ?? persistedSnapshotsByProvider[.devin]
+        guard snapshot != devinCatalogSnapshot else { return }
+        devinCatalog = DevinModelCatalog(snapshot: snapshot)
+        devinCatalogSnapshot = snapshot
     }
 
     func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
@@ -90,6 +107,7 @@ final class AgentACPModelRegistry {
                 invalidateAdvertisedModels(for: providerID)
             }
             persistedSnapshotsByProvider = loadedSnapshots
+            refreshDevinCatalogIfNeededLocked()
             didWarmStandardStore = true
             standardStoreWarmTask = nil
         }
@@ -125,6 +143,7 @@ final class AgentACPModelRegistry {
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil
             didWarmStandardStore = false
@@ -143,6 +162,7 @@ final class AgentACPModelRegistry {
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil
             didWarmStandardStore = false

@@ -234,20 +234,30 @@ import XCTest
                 try await fixture.manager.addFolder(URL(fileURLWithPath: fixture.rootPaths[1]), to: fixture.workspace)
                 let current = await client.snapshot()
                 XCTAssertGreaterThan(current.catalogRevision, delayed.catalogRevision)
-                let decoded = try delayed.workspaces.map {
-                    try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL)
+                @MainActor func apply(_ snapshot: DomainWorkspaceCatalogSnapshot) throws -> Bool {
+                    let decoded = try snapshot.workspaces.map {
+                        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL)
+                    }
+                    return fixture.manager.applyDomainWorkspaceProjection(
+                        decoded,
+                        canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.metadata.repoPaths) }),
+                        fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) }),
+                        revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.revisions) }),
+                        digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
+                        healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.health) }),
+                        catalogRevision: snapshot.catalogRevision,
+                        preferredActiveWorkspaceID: fixture.workspace.id,
+                        publicationSequence: snapshot.publicationSequence
+                    )
                 }
-                fixture.manager.applyDomainWorkspaceProjection(
-                    decoded,
-                    canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.metadata.repoPaths) }),
-                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) }),
-                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.revisions) }),
-                    digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
-                    healthByWorkspaceID: Dictionary(uniqueKeysWithValues: delayed.workspaces.map { ($0.document.workspaceID, $0.health) }),
-                    catalogRevision: delayed.catalogRevision,
-                    preferredActiveWorkspaceID: fixture.workspace.id,
-                    publicationSequence: delayed.publicationSequence
-                )
+                // #1142: a catalog older than the floor learned from the command outcome is rejected whole.
+                let beforeDelayed = fixture.manager.workspaces
+                XCTAssertFalse(try apply(delayed), "An older catalog revision must not be reconciled")
+                XCTAssertEqual(fixture.manager.workspaces, beforeDelayed, "A rejected delayed catalog mutates no models")
+                // The freshly read current catalog converges the unrelated update; newer local roots survive.
+                let fresh = await client.snapshot()
+                XCTAssertGreaterThanOrEqual(fresh.catalogRevision, current.catalogRevision)
+                XCTAssertTrue(try apply(fresh))
                 XCTAssertEqual(fixture.manager.workspace(withID: other.id)?.currentPromptText, changedOther.currentPromptText)
                 XCTAssertEqual(fixture.manager.activeWorkspace?.repoPaths, fixture.rootPaths)
             }

@@ -48,6 +48,10 @@ package struct DomainWorkspaceStore {
     }
 
     #if DEBUG
+        package func testSetBeforeBootstrapPersistence(_ hook: (@Sendable () async -> Void)?) async {
+            await authority.testSetBeforeBootstrapPersistence(hook)
+        }
+
         package func testSetAfterExactRootSavedMarkerRead(
             _ hook: (@Sendable (UUID) async -> Void)?
         ) async {
@@ -180,6 +184,12 @@ actor DomainWorkspaceContextAuthority {
     private static let maximumCASRecoveryAttempts = 2
 
     #if DEBUG
+        private var testBeforeBootstrapPersistence: (@Sendable () async -> Void)?
+
+        func testSetBeforeBootstrapPersistence(_ hook: (@Sendable () async -> Void)?) {
+            testBeforeBootstrapPersistence = hook
+        }
+
         private var testAfterExactRootSavedMarkerRead: (@Sendable (UUID) async -> Void)?
 
         func testSetAfterExactRootSavedMarkerRead(_ hook: (@Sendable (UUID) async -> Void)?) {
@@ -263,7 +273,15 @@ actor DomainWorkspaceContextAuthority {
             task = bootstrapTask
         } else {
             let persistence = persistence
-            let created = Task { await persistence.bootstrap() }
+            #if DEBUG
+                let beforePersistence = testBeforeBootstrapPersistence
+                let created = Task {
+                    await beforePersistence?()
+                    return await persistence.bootstrap()
+                }
+            #else
+                let created = Task { await persistence.bootstrap() }
+            #endif
             bootstrapTask = created
             task = created
         }
@@ -322,7 +340,11 @@ actor DomainWorkspaceContextAuthority {
                 let lhs = $0.document.metadata.name.localizedCaseInsensitiveCompare($1.document.metadata.name)
                 if lhs != .orderedSame { return lhs == .orderedAscending }
                 return $0.document.workspaceID.uuidString < $1.document.workspaceID.uuidString
-            }
+            },
+            // A stale unavailable entry must not declare a recovered or deleted member missing.
+            unavailableWorkspaceIDs: Set(unavailableWorkspaces.keys)
+                .subtracting(records.keys)
+                .subtracting(deletedWorkspaceIDs)
         )
     }
 

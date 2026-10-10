@@ -175,6 +175,13 @@ enum WindowStateCompositionFactory {
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
             DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
         }
+        if let bridge = domainWorkspacePresentationBridge {
+            // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.
+            workspaceManager.installDomainCatalogRefresh(
+                request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() }
+            )
+        }
         domainWorkspacePresentationBridge?.start()
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,

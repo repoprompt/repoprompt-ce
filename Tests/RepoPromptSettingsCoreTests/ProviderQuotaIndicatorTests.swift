@@ -21,7 +21,11 @@ final class ProviderQuotaIndicatorTests: XCTestCase {
             try ProviderQuotaIndicatorState.project(snapshot(41.7), now: date)
         )
         XCTAssertNotNil(try ProviderQuotaIndicatorState.project(snapshot(42), now: date.addingTimeInterval(901)), "normal refresh latency must not hide available usage")
-        XCTAssertNil(try ProviderQuotaIndicatorState.project(snapshot(42), now: date.addingTimeInterval(4501)))
+        XCTAssertEqual(try ProviderQuotaIndicatorState.project(snapshot(42), now: date.addingTimeInterval(901))?.freshness, .fresh)
+        let aged = try ProviderQuotaIndicatorState.project(snapshot(42), now: date.addingTimeInterval(4501))
+        XCTAssertEqual(aged?.usedPercent, 42, "an aged reading keeps its figure instead of disappearing")
+        XCTAssertEqual(aged?.freshness, .stale)
+        XCTAssertEqual(aged?.observedAt?.timeIntervalSince1970 ?? 0, date.timeIntervalSince1970, accuracy: 60, "observation time is minute-rounded")
     }
 
     func testCodexReportedPercentageAppearsInTheSameIndicator() throws {

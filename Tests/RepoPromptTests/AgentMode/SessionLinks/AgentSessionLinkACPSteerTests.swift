@@ -932,6 +932,53 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(restored.dispatchedProviderText, exact)
     }
 
+    func testInterruptedManagedSteerRedispatchReplaysFullProviderEnvelope() async throws {
+        let fixture = try await makeFixture()
+        let first = request("First overseer direction & keep <>\"' literal")
+        let firstOutcome = await steer(fixture, request: first)
+        guard case let .delivered(firstDelivery) = firstOutcome else {
+            return XCTFail("Expected first managed steer delivery: \(firstOutcome)")
+        }
+        XCTAssertEqual(firstDelivery.deliveryState, .steered)
+        let firstEnvelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: first.observerSessionID, sourceName: first.observerDisplayName,
+            linkID: first.linkID, linkGeneration: first.linkGeneration,
+            message: first.message, framing: .management
+        )
+        let firstRow = try XCTUnwrap(
+            fixture.session.items.first(where: { $0.id == firstDelivery.targetItemID })
+        )
+        XCTAssertEqual(firstRow.text, first.message)
+        XCTAssertEqual(firstRow.dispatchedProviderText, firstEnvelope)
+
+        // The second managed steer interrupts the still-running turn. The serialized ACP
+        // flush re-dispatches the interrupted prompt inside <interrupted_user_messages>;
+        // the replayed bytes must be the exact provider envelope, framing included.
+        let second = request("Second overseer direction")
+        let secondOutcome = await steer(fixture, request: second)
+        guard case let .delivered(secondDelivery) = secondOutcome else {
+            return XCTFail("Expected second managed steer delivery: \(secondOutcome)")
+        }
+        XCTAssertEqual(secondDelivery.deliveryState, .steered)
+        let secondEnvelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: second.observerSessionID, sourceName: second.observerDisplayName,
+            linkID: second.linkID, linkGeneration: second.linkGeneration,
+            message: second.message, framing: .management
+        )
+        let sent = try XCTUnwrap(fixture.provider.promptedMessages.last?.userMessage)
+        XCTAssertTrue(sent.contains("<interrupted_user_messages>"))
+        XCTAssertTrue(sent.contains(firstEnvelope))
+        XCTAssertTrue(sent.contains("delegation=\"user_delegated_management\""))
+        XCTAssertTrue(sent.contains("source_session_id=\"\(first.observerSessionID.uuidString)\""))
+        XCTAssertTrue(sent.contains("<steering_messages>"))
+        XCTAssertTrue(sent.contains(secondEnvelope))
+        let secondRow = try XCTUnwrap(
+            fixture.session.items.first(where: { $0.id == secondDelivery.targetItemID })
+        )
+        XCTAssertEqual(secondRow.dispatchedProviderText, secondEnvelope)
+        XCTAssertEqual(secondRow.crossSessionAttribution, second.attribution)
+    }
+
     func testLegacyAttributedReplayDropsAndLocalReplayRemains() async throws {
         let fixture = try await makeFixture()
         let attribution = request("x").attribution

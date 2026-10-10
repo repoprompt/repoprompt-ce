@@ -177,6 +177,7 @@ actor CodexAppServerClient {
         case processExited(ProcessExitEvidence)
         case invalidResponse
         case jsonDecodeFailed
+        case stdoutFrameBudgetExceeded(limitBytes: Int)
         case requestFailed(RequestFailure)
         case executableUnavailable(String)
         case transportWriteFailed(message: String, errno: Int32?)
@@ -192,6 +193,8 @@ actor CodexAppServerClient {
                 "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
                 "Failed to decode Codex app-server JSON response."
+            case let .stdoutFrameBudgetExceeded(limitBytes):
+                "Codex app-server response exceeded the \(limitBytes / (1024 * 1024)) MiB frame budget; the transport was closed without decoding a truncated response."
             case let .requestFailed(failure):
                 failure.userFacingMessage
             case let .executableUnavailable(message):
@@ -234,6 +237,7 @@ actor CodexAppServerClient {
         case explicitStop
         case livenessCheckFailed(method: String?)
         case decodeRecoveryBudgetExceeded(generation: UInt64)
+        case stdoutFrameBudgetExceeded(limitBytes: Int)
         case readSourceSetupFailed(stream: String, errno: Int32?)
         case observedProcessExit(status: ProcessExitStatus)
     }
@@ -352,6 +356,18 @@ actor CodexAppServerClient {
         error is AmbiguousMutationError
     }
 
+    /// True when the transport was closed because a single stdout frame exceeded the
+    /// frame budget. Matching is typed: the overflowing response is never decoded, so
+    /// there is no server message to inspect.
+    static func isStdoutFrameBudgetExceededError(_ error: Error) -> Bool {
+        guard let clientError = error as? ClientError,
+              case .stdoutFrameBudgetExceeded = clientError
+        else {
+            return false
+        }
+        return true
+    }
+
     private static func isTimeoutErrorMessage(_ message: String) -> Bool {
         let normalized = message
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -403,7 +419,7 @@ actor CodexAppServerClient {
     private var notificationContinuations: [UUID: AsyncStream<Notification>.Continuation] = [:]
     private var serverRequestContinuations: [UUID: AsyncStream<ServerRequest>.Continuation] = [:]
     private var isInitialized = false
-    private var stdoutFramer = LineFramer()
+    private var stdoutFramer = LineFramer(limits: CodexAppServerClient.stdoutFrameLimits)
     private var stdoutTail = Data()
     private var didTerminateTransport = false
     private var lastTransportTerminationReason: TransportTerminationReason?
@@ -424,6 +440,13 @@ actor CodexAppServerClient {
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
     private var preparedRuntimeLaunchContext: PreparedRuntimeLaunchContext?
     private static let maxDecodeRecoveryAttemptsPerGeneration = 128
+    /// Full-history thread/resume results can exceed the shared framer's 8 MiB
+    /// default. This finite Codex-only envelope never permits suffix recovery.
+    private static let stdoutFrameLimits = LineFramer.Limits(
+        maxLineBytes: 64 * 1024 * 1024,
+        maxCarryBytes: 64 * 1024 * 1024,
+        tailRetainBytes: 0
+    )
     private static let stderrTailLimit = 8 * 1024
     private static let exitDiagnosticSettlementWindow: TimeInterval = 0.25
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
@@ -954,7 +977,7 @@ actor CodexAppServerClient {
         )
         activeTransport = nil
 
-        stdoutFramer = LineFramer()
+        stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
         stdoutTail.removeAll(keepingCapacity: false)
         decodeRecoveryAttemptsByGeneration.removeValue(forKey: transportGeneration)
         return terminatingTransport
@@ -1644,7 +1667,7 @@ actor CodexAppServerClient {
         let exitObserver = processExitObserverFactory(spawned.pid)
         let capture = CodexProcessStderrCapture(byteLimit: Self.stderrTailLimit)
 
-        stdoutFramer = LineFramer()
+        stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
         stdoutTail.removeAll(keepingCapacity: false)
         didTerminateTransport = false
         lastTransportTerminationReason = nil
@@ -1767,11 +1790,19 @@ actor CodexAppServerClient {
     private func handleStdoutChunk(_ data: Data, generation: UInt64) async {
         guard activeTransport?.generation == generation, !didTerminateTransport else { return }
         appendTail(&stdoutTail, chunk: data, limit: 128 * 1024)
-        stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
+        let overflow = stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             handleStdoutFramerDiagnostic(diagnostic)
         }, onLine: { [self] lineData in
             handleJSONLine(lineData)
         })
+        if let overflow {
+            await terminateTransport(
+                flushStdout: false,
+                expectedGeneration: generation,
+                requestFailure: .stdoutFrameBudgetExceeded(limitBytes: overflow.limitBytes),
+                reason: .stdoutFrameBudgetExceeded(limitBytes: overflow.limitBytes)
+            )
+        }
     }
 
     /// Called when the stdout consumer task's channel stream ends (EOF or explicit finish).
@@ -2349,6 +2380,10 @@ actor CodexAppServerClient {
             return decodeRecoveryAttemptsByGeneration[key, default: 0]
         }
 
+        func debugIngestStdoutChunk(_ chunk: Data, generation: UInt64) async {
+            await handleStdoutChunk(chunk, generation: generation)
+        }
+
         func debugIngestRawStdoutLine(_ line: Data) {
             handleJSONLine(line)
         }
@@ -2400,6 +2435,7 @@ actor CodexAppServerClient {
                 ),
                 exitObservation: nil
             )
+            stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
             isInitialized = true
             didTerminateTransport = false
             lastTransportTerminationReason = nil

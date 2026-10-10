@@ -1323,8 +1323,8 @@ struct AgentMonitorPillProps: Equatable {
     /// The observing session this projection belongs to, or `nil` while the tab has no durable
     /// top-level binding.
     let sessionID: UUID?
-    /// The exact incarnation this projection was published to, or `nil` for a locally synthesized
-    /// placeholder that carries no authority state.
+    /// The exact current incarnation, including eligibility-only props for a session with no links.
+    /// `nil` means no current incarnation could be resolved. An endpoint is an address, not authority.
     ///
     /// Notices are recorded per incarnation, so dismissing them needs the identity rather than the
     /// session UUID: a duplicate live incarnation of the same UUID must not clear another's notices.

@@ -1865,10 +1865,22 @@ class WindowState: ObservableObject {
             if !workspace.isSystemWorkspace, !workspace.isEphemeral,
                workspaceInstanceNumber(for: workspace.id) == nil
             {
-                // No coherent identity yet: retain all outgoing durable metadata (or omit), while
-                // live MCP diagnostics continue reporting the incoming workspace with null number.
-                var retained = lastCoherentSessionEntry
-                retained?.lastFocused = isCurrentlyFocused
+                guard var retained = lastCoherentSessionEntry else {
+                    return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+                }
+                let isOutgoingSwitchGap = workspaceManager.isSwitchingWorkspace
+                    && workspaceManager.activeWorkspaceSwitch.map { activity in
+                        activity.targetWorkspaceID == workspace.id
+                            && activity.previousWorkspaceID == retained.workspaceID
+                            && activity.previousWorkspaceID != workspace.id
+                    } == true
+                let isTerminatingCurrentIdentity = (windowStatesManager ?? WindowStatesManager.shared).isTerminating
+                    && retained.workspaceID == workspace.id
+                guard isOutgoingSwitchGap || isTerminatingCurrentIdentity else {
+                    return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+                }
+                // Only a proven switch gap retains outgoing metadata. Live MCP stays unassigned.
+                retained.lastFocused = isCurrentlyFocused
                 return WindowSessionCaptureCandidate(windowID: windowID, entry: retained)
             }
             let entry = makeLiveSessionEntry(for: workspace)

@@ -9419,6 +9419,10 @@ final class CodexNativeSessionController {
                 exceptBroken: []
             )
         )
+        // Optional servers can be omitted from the first turn while discovery is pending.
+        // Require only RepoPrompt for these app-owned threads; leave global/third-party policy alone.
+        let repoPromptKey = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: MCPIntegrationHelper.repoPromptMCPServerName)
+        overrides["mcp_servers.\(repoPromptKey).required"] = true
         let companionKey = "mcp_servers.\(MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: computerUseMCPServerName))"
         if computerUseEnabled, let computerUseClientPath, !hasReservedComputerUseEntry(serverEntries) {
             // Codex recursively merges config layers. Only introduce a full definition when

@@ -22,6 +22,9 @@ import RepoPromptDomainRuntime
 /// slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it except a path that can
 /// prove no transport call happened.
 struct AgentSessionOversightState {
+    /// Session-incarnation opt-in only. Never saved, restored, or cleared by ordinary unlink.
+    var overseerActivation: AgentSessionOverseerActivation?
+
     // MARK: Durable Auto-wake selection
 
     /// Master Auto-wake preference, persisted with the session. New sessions default on and remain

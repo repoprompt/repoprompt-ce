@@ -1114,13 +1114,25 @@ package enum MCPDomainCanonicalToolDefinitions {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         definitions.insert(agentSelfDefinition, at: insertion)
+        guard let bootstrapInsertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSelf }) else {
+            preconditionFailure("Missing oversight bootstrap insertion point")
+        }
+        definitions.insert(becomeOverseerDefinition, at: bootstrapInsertion)
         guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
             .map(advertiseOracleImageAttachments)
+            .map(advertiseWorktreeListPagination)
     }
+
+    private static let becomeOverseerDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.becomeOverseer,
+        description: "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
+        annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+    )
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.agentSelf,
@@ -1237,6 +1249,44 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
+    /// The vendored `manage_worktree` definition predates bounded `list` pages, so
+    /// canonicalization advertises `limit`/`offset` from ``MCPWorktreeListPagination``.
+    private static func advertiseWorktreeListPagination(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.manageWorktree,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+
+        properties["limit"] = .object([
+            "type": .string("integer"),
+            "description": .string(MCPWorktreeListPagination.limitPropertyDescription)
+        ])
+        properties["offset"] = .object([
+            "type": .string("integer"),
+            "description": .string(MCPWorktreeListPagination.offsetPropertyDescription)
+        ])
+        schema["properties"] = .object(properties)
+
+        var description = definition.description
+        let outputLine = MCPWorktreeListPagination.outputDescriptionLine
+        let anchor = "- Merge op JSON keeps merge details under the nested `merge` block."
+        if !description.contains(outputLine) {
+            description = description.contains(anchor)
+                ? description.replacingOccurrences(of: anchor, with: "\(outputLine)\n\(anchor)")
+                : description + "\n\(outputLine)"
+        }
+
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
     /// The vendored definitions still carry the retired fixed-wait wording, so canonicalization
     /// restates omitted-timeout semantics from `MCPTimeoutPolicy`, the single owner of that copy.
     /// `DirectHeadlessCompositionTests` fails if the vendored phrasing drifts out of these rules.
@@ -1251,6 +1301,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing."
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
+            }
+            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture."
+            if !description.contains(residentDescription) {
+                description += residentDescription
             }
             description = description.replacingOccurrences(
                 of: "Waits up to `timeout` seconds (default 120).",

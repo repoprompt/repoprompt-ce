@@ -465,11 +465,12 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
 
     /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
     /// context drop, or a native command that outlived its deadline.
-    /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
+    /// The session resumes when completion is confirmed or on the next ordinary send;
+    /// the continuation note is not interpolated here.
     public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
         AgentChatItem(
             kind: .system,
-            text: "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
+            text: "Compaction is not confirmed yet. The session resumes when it is, or with your next message.",
             sequenceIndex: sequenceIndex
         )
     }

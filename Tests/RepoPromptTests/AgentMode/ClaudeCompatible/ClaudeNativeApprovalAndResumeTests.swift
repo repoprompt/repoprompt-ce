@@ -116,6 +116,10 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(hourOld.usedPercent, 6)
         let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
         XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
+        XCTAssertEqual(pastFiveHourHorizon.freshness, .fresh)
+        let everythingAged = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(43 * 3600)), "aged readings stay visible")
+        XCTAssertEqual(everythingAged.usedPercent, 6)
+        XCTAssertEqual(everythingAged.freshness, .resetPassed, "the 5-hour reset has passed with nothing newer")
     }
 
     func testCLIUsageWeeklyReadingInformsBalancingWithinOneHour() throws {

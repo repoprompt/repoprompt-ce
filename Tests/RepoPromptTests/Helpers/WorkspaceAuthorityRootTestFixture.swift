@@ -536,14 +536,17 @@ import XCTest
             self.bridge = bridge
         }
 
+        /// `requireCatalogApplication` skips self-echo baseline checkpoints, which never certify a catalog.
         func waitForProjection(
             afterGeneration: UInt64,
             through publicationSequence: UInt64 = 0,
+            requireCatalogApplication: Bool = false,
             timeout: Duration = .seconds(5)
         ) async -> DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
             let ticket = WaitTicket(
                 afterGeneration: afterGeneration,
-                publicationSequence: publicationSequence
+                publicationSequence: publicationSequence,
+                requireCatalogApplication: requireCatalogApplication
             )
             return await withTaskCancellationHandler {
                 if Task.isCancelled {
@@ -577,7 +580,9 @@ import XCTest
                 return
             }
             ticket.runID = runID
-            if let checkpoint = state.checkpoint, ticket.isSatisfied(by: checkpoint) {
+            if let checkpoint = [state.checkpoint, state.catalogCheckpoint].compactMap(\.self)
+                .first(where: ticket.isSatisfied(by:))
+            {
                 ticket.finish(with: checkpoint)
                 return
             }
@@ -594,7 +599,7 @@ import XCTest
                     ticket.finish(with: checkpoint)
                 case let .stopped(stoppedRunID) where stoppedRunID == ticket.runID:
                     ticket.finish(with: nil)
-                case .applied, .stopped:
+                case .applied, .rejected, .stopped:
                     break
                 }
             }
@@ -611,21 +616,24 @@ import XCTest
             let expectation = XCTestExpectation(description: "domain workspace projection observed")
             let afterGeneration: UInt64
             let publicationSequence: UInt64
+            let requireCatalogApplication: Bool
             var runID: UUID?
             var token: AnyCancellable?
             var result: DomainWorkspacePresentationBridge.ProjectionCheckpoint?
             var isTerminal = false
             var didFinish: (() -> Void)?
 
-            init(afterGeneration: UInt64, publicationSequence: UInt64) {
+            init(afterGeneration: UInt64, publicationSequence: UInt64, requireCatalogApplication: Bool) {
                 self.afterGeneration = afterGeneration
                 self.publicationSequence = publicationSequence
+                self.requireCatalogApplication = requireCatalogApplication
             }
 
             func isSatisfied(by checkpoint: DomainWorkspacePresentationBridge.ProjectionCheckpoint) -> Bool {
                 checkpoint.runID == runID
                     && checkpoint.generation > afterGeneration
                     && checkpoint.publicationSequence >= publicationSequence
+                    && (!requireCatalogApplication || checkpoint.catalogReceipt != nil)
             }
 
             func finish(with checkpoint: DomainWorkspacePresentationBridge.ProjectionCheckpoint?) {

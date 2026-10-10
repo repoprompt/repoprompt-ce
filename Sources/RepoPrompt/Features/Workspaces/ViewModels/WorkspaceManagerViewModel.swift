@@ -1004,6 +1004,120 @@ private func workspaceSavePreparationDecision(
     return .retry(nextRemainingCount: remainingRetryCount - 1)
 }
 
+struct WorkspaceChooserFailure: Equatable {
+    enum Kind: Equatable {
+        case notBootstrapped
+        case authorityUnavailable(DomainAuthorityHealth)
+        case unavailableMembers(Set<UUID>)
+        /// Diagnostic for logs/tests only; never rendered.
+        case modelProjection(String)
+        case catalogChangedDuringRefresh
+    }
+
+    /// Stable across equivalent reports so identity churn does not republish equal content.
+    let id: UUID
+    let kind: Kind
+    let publicationSequence: UInt64
+    let catalogRevision: UInt64
+    /// Report version of the latest equivalent report; clearance must match the version.
+    var reportVersion: UInt64 = 0
+    /// Actual (possibly deduplicated) legacy projection issue published for this report.
+    var legacyIssue: DomainProjectionIssueWitness?
+    var recovery: WorkspaceChooserRecovery = .idle
+}
+
+/// A `.projectionFailure` issue as it stood: ID plus the report generation, which advances on every
+/// report even when the issue publisher deduplicates content and keeps the existing ID.
+struct DomainProjectionIssueWitness: Equatable {
+    let issueID: UUID
+    let reportGeneration: UInt64
+}
+
+/// Captured before an attempt's first await. Orders its success/failure (sequence, then generation)
+/// and scopes what it may clear to the failure and projection issue that existed when it began.
+struct DomainCatalogAttempt: Equatable {
+    struct FailureWitness: Equatable {
+        let id: UUID
+        let reportVersion: UInt64
+    }
+
+    let generation: UInt64
+    let failureWitness: FailureWitness?
+    let projectionIssueWitness: DomainProjectionIssueWitness?
+}
+
+enum WorkspaceChooserRecovery: Equatable {
+    case idle
+    case retrying(UUID)
+
+    var isRetrying: Bool {
+        if case .retrying = self { return true }
+        return false
+    }
+}
+
+/// Chooser completeness of an accepted reconciliation. Only `.complete` certifies ordinary readiness.
+enum DomainCatalogCompleteness: Equatable {
+    case complete
+    case incomplete(WorkspaceChooserFailure)
+
+    var failure: WorkspaceChooserFailure? {
+        if case let .incomplete(failure) = self { failure } else { nil }
+    }
+}
+
+enum DomainCatalogProjection {
+    case full([WorkspaceModel])
+    /// Valid only against the manager's current accepted reconciliation generation.
+    case metadata(baselineGeneration: UInt64)
+}
+
+/// Bridge callers take canonical roots from snapshot metadata; manager reload/cleanup callers keep
+/// their freshly decoded models' roots, matching their pre-#1142 behavior.
+enum DomainCatalogRootMapPolicy {
+    case snapshotMetadata
+    case decodedModels
+}
+
+/// Proof that the manager accepted a reconciliation; completeness is a separate fact.
+struct DomainCatalogApplicationReceipt: Equatable {
+    enum Kind: Equatable {
+        case full
+        case metadata
+    }
+
+    let kind: Kind
+    let publicationSequence: UInt64
+    let catalogRevision: UInt64
+    let reconciliationGeneration: UInt64
+    let completeness: DomainCatalogCompleteness
+}
+
+enum DomainCatalogRejection: Equatable {
+    case closing
+    case cancelled
+    case stalePublication
+    case staleCatalogRevision
+    case reentrant
+    /// An older attempt resolving after a newer one at the same (or a later) sequence.
+    case superseded
+    case fullProjectionRequired
+    case invalidCatalog(String)
+}
+
+enum DomainCatalogApplicationResult: Equatable {
+    case accepted(DomainCatalogApplicationReceipt)
+    case rejected(DomainCatalogRejection)
+
+    var receipt: DomainCatalogApplicationReceipt? {
+        if case let .accepted(receipt) = self { receipt } else { nil }
+    }
+
+    var rejection: DomainCatalogRejection? {
+        if case let .rejected(reason) = self { reason } else { nil }
+    }
+}
+
 /// The main WorkspaceManager, refactored to store each WorkspaceModel
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
@@ -1053,9 +1167,45 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
             refreshSelectionMirrorContextRevision()
+            refreshChooserRowsAfterLocalMutation(from: oldValue)
             refreshAgentCreatorNameSource()
         }
     }
+
+    /// The chooser's coherent rows (#1142). Authority-backed managers start loading; constructor
+    /// rows are internal only until an accepted catalog reconciliation publishes.
+    @WorkspaceChooserPublication private(set) var workspaceChooserPresentation: WorkspaceChooserPresentation = .loading
+
+    /// Installed by composition with weak Bridge captures; the manager owns no refresh task.
+    private var domainCatalogRefreshRequest: ((_ isRetry: Bool) -> Void)?
+    private var domainCatalogRefreshCancellation: (() -> Void)?
+
+    func installDomainCatalogRefresh(request: @escaping (_ isRetry: Bool) -> Void, cancel: @escaping () -> Void) {
+        domainCatalogRefreshRequest = request
+        domainCatalogRefreshCancellation = cancel
+    }
+
+    /// The chooser's Retry: delegates to the Bridge's sole refresh task (`reloadExternalChanges`).
+    func retryWorkspaceChooser() {
+        guard !isPreparingForWindowClose, workspaceChooserPresentation.failure != nil else { return }
+        domainCatalogRefreshRequest?(true)
+    }
+
+    #if DEBUG
+        private var workspaceChooserConsumptionHandlerForTesting: ((WorkspaceChooserConsumption) -> Void)?
+
+        func setWorkspaceChooserConsumptionHandlerForTesting(_ handler: ((WorkspaceChooserConsumption) -> Void)?) {
+            precondition(
+                workspaceChooserConsumptionHandlerForTesting == nil || handler == nil,
+                "Workspace chooser consumption supports only one test recorder"
+            )
+            workspaceChooserConsumptionHandlerForTesting = handler
+        }
+
+        func didConsumeWorkspaceChooserForTesting(_ value: WorkspaceChooserConsumption) {
+            workspaceChooserConsumptionHandlerForTesting?(value)
+        }
+    #endif
 
     private var agentCreatorNameSource: [UUID: AgentSessionCreatorNames.Source] = [:]
 
@@ -1146,7 +1296,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     @Published private(set) var pendingConsolidatedRestoreIDs: Set<UUID> = []
     private var activeConsolidatedRestoreIDs: Set<UUID> = []
     private var authorityIncompleteConsolidatedRestoreIDs: Set<UUID> = []
-    private var authorityIncompleteRestoreClassificationTask: Task<Void, Never>?
+    private enum AuthorityRestoreClassificationResult {
+        case completed(attemptID: UUID, publicationSequence: UInt64)
+        case superseded
+    }
+
+    private var authorityIncompleteRestoreClassificationTask: Task<AuthorityRestoreClassificationResult, Never>?
+    /// Sequence equality is valid, but a superseded local classification may not publish.
+    private var authorityRestoreClassificationAttemptID: UUID?
     private var lastAuthorityRecoveryClassificationSequence: UInt64 = 0
 
     @Published private(set) var activeWorkspaceID: UUID? = nil {
@@ -1455,9 +1612,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         confirmedDomainReadRegistrationsByWorkspaceID[token.workspaceID] = token
     }
 
-    /// Drops confirmed and pending read registrations whose workspace was removed from the
-    /// projected catalog or whose projected canonical digest moved. A registration only remains
-    /// valid while the canonical state it was registered against is unchanged.
+    /// Drops confirmed and pending read registrations whose workspace was removed, became
+    /// unavailable, or whose projected digest moved. Retained presentation metadata is not proof
+    /// that the authority still holds a read overlay for the window's last-known model.
     func invalidateConfirmedDomainReadRegistrations(
         previousDigestsByWorkspaceID: [UUID: String],
         projectedDigestsByWorkspaceID: [UUID: String]
@@ -2726,7 +2883,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var initialDefaultActivationAttempt: InitialDefaultActivationAttempt?
     private var initialDefaultActivationTask: Task<Void, Never>?
     /// Set as the first statement of `prepareForWindowClose`; never reset.
-    private var isPreparingForWindowClose = false
+    private(set) var isPreparingForWindowClose = false
     /// Synchronous Window hook fired when a non-startup activation is requested, before any
     /// await, so a not-yet-dispatched restore can be retired in favor of explicit intent.
     var onNonStartupWorkspaceActivationRequested: (@MainActor () -> Void)?
@@ -3208,6 +3365,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     #endif
 
     private var workspaceDidSwitchListeners: [WorkspaceDidSwitchListener] = []
+
+    /// A settled authority selection needs numbering, but is not a completed workspace switch.
+    /// Delivered synchronously after installation to the registered window's numbering owner.
+    var onSettledProjectedWorkspaceSelection: ((WorkspaceModel?) -> Void)?
 
     /// Multiple callbacks that will be triggered before saving the active workspace.
     private var beforeSaveListeners: [BeforeSaveListener] = []
@@ -4246,6 +4407,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         #endif
         workspaces = loaded
+        if domainWorkspaceAuthorityClient == nil {
+            workspaceChooserPresentation = .ready(.init(workspaces: loaded, source: .local), refresh: .current)
+        }
         corpusLoadSpan.end(extraFields: ["entries": indexEntries.count, "loaded": loaded.count])
         recordRepoPathBaselines(for: loaded)
 
@@ -4344,6 +4508,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func prepareForWindowClose() {
         isPreparingForWindowClose = true
+        domainCatalogRefreshCancellation?()
         // Revoke and cancel startup; its handle stays retained so teardown can join it.
         markInitialDefaultActivationSuperseded()
         initialDefaultActivationTask?.cancel()
@@ -4354,8 +4519,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         reloadWorkspacesTask = nil
         reloadPresetsTask?.cancel()
         reloadPresetsTask = nil
-        authorityIncompleteRestoreClassificationTask?.cancel()
-        authorityIncompleteRestoreClassificationTask = nil
+        cancelAuthorityRestoreClassification()
         composeTabApplyTask?.cancel()
         composeTabApplyTask = nil
         composeTabApplyTaskTabID = nil
@@ -4592,40 +4756,28 @@ class WorkspaceManagerViewModel: ObservableObject {
     func reloadWorkspacesFromDisk() {
         if let domainWorkspaceAuthorityClient {
             reloadWorkspacesTask?.cancel()
+            let token = UUID()
+            reloadWorkspacesToken = token
             reloadWorkspacesTask = Task { @MainActor [weak self] in
                 guard let self else { return }
+                defer { if reloadWorkspacesToken == token { reloadWorkspacesTask = nil } }
+                let attempt = beginDomainCatalogAttempt()
                 let snapshot = await domainWorkspaceAuthorityClient.snapshot()
-                guard snapshot.isBootstrapped else { return }
-                let loaded = snapshot.workspaces.compactMap { authoritative -> WorkspaceModel? in
-                    do {
-                        return try Self.decodeDomainWorkspaceProjection(
-                            documentBytes: authoritative.document.documentBytes,
-                            fileURL: authoritative.document.fileURL
-                        )
-                    } catch {
-                        reportDomainProjectionFailure(error)
-                        return nil
-                    }
+                guard !Task.isCancelled, !isPreparingForWindowClose else { return }
+                let loaded: [WorkspaceModel]
+                do {
+                    loaded = try snapshot.workspaces.map { try decodeDomainWorkspaceCatalogRecord($0) }
+                } catch {
+                    // All-or-nothing: a partially decoded catalog must never remove membership.
+                    reportDomainCatalogFailure(
+                        .modelProjection(error.localizedDescription), error: error, snapshot: snapshot, attempt: attempt
+                    )
+                    return
                 }
-                applyDomainWorkspaceProjection(
-                    loaded,
-                    fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.document.fileURL)
-                    }),
-                    revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.revisions)
-                    }),
-                    digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.document.contentDigest)
-                    }),
-                    healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                        ($0.document.workspaceID, $0.health)
-                    }),
-                    catalogRevision: snapshot.catalogRevision,
-                    preferredActiveWorkspaceID: activeWorkspaceID,
-                    publicationSequence: snapshot.publicationSequence
+                applyDomainWorkspaceCatalog(
+                    snapshot, projection: .full(loaded), preferredActiveWorkspaceID: activeWorkspaceID,
+                    rootMapPolicy: .decodedModels, attempt: attempt
                 )
-                reloadWorkspacesTask = nil
             }
             return
         }
@@ -4771,13 +4923,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let domainWorkspaceAuthorityClient {
             let snapshot = await domainWorkspaceAuthorityClient.snapshot()
             if snapshot.isBootstrapped {
+                var unavailableWorkspaceIDs = snapshot.unavailableWorkspaceIDs
                 let loaded = snapshot.workspaces.compactMap { authoritative -> WorkspaceModel? in
                     do {
-                        return try Self.decodeDomainWorkspaceProjection(
-                            documentBytes: authoritative.document.documentBytes,
-                            fileURL: authoritative.document.fileURL
-                        )
+                        return try decodeDomainWorkspaceCatalogRecord(authoritative)
                     } catch {
+                        unavailableWorkspaceIDs.insert(authoritative.document.workspaceID)
                         reportDomainProjectionFailure(error)
                         return nil
                     }
@@ -4790,7 +4941,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                         ($0.document.workspaceID, $0.revisions)
                     }),
-                    publicationSequence: snapshot.publicationSequence
+                    publicationSequence: snapshot.publicationSequence,
+                    unavailableWorkspaceIDs: unavailableWorkspaceIDs
                 )
                 return loaded
             }
@@ -7501,14 +7653,31 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    private var domainAuthorityIssuePublicationGeneration: UInt64 = 0
+    private var latestDomainAuthorityIssuePublication: DomainWorkspaceAuthorityIssue?
+
     private func publishDomainAuthorityIssueIfChanged(_ issue: DomainWorkspaceAuthorityIssue?) {
-        guard domainWorkspaceAuthorityIssue?.workspaceID != issue?.workspaceID
+        let changed = domainWorkspaceAuthorityIssue?.workspaceID != issue?.workspaceID
             || domainWorkspaceAuthorityIssue?.operation != issue?.operation
             || domainWorkspaceAuthorityIssue?.kind != issue?.kind
             || domainWorkspaceAuthorityIssue?.reason != issue?.reason
             || domainWorkspaceAuthorityIssue?.diagnostic != issue?.diagnostic
-        else { return }
-        domainWorkspaceAuthorityIssue = issue
+        // Preserve the actual deduplicated ID, including a newer same-payload report during clearance.
+        let nextIssue = changed ? issue : domainWorkspaceAuthorityIssue
+        let targetChanged = latestDomainAuthorityIssuePublication != nextIssue
+        latestDomainAuthorityIssuePublication = nextIssue
+        guard changed || targetChanged else { return }
+        // An ordinary no-op needs no generation. A reentrant same-payload report can still change
+        // the pending clearance target and must advance replay, even before @Published assigns nil.
+        domainAuthorityIssuePublicationGeneration += 1
+        guard changed else { return }
+        var generation: UInt64
+        repeat {
+            generation = domainAuthorityIssuePublicationGeneration
+            domainWorkspaceAuthorityIssue = latestDomainAuthorityIssuePublication
+            // @Published sends before assignment: restore a reentrant request overwritten by this setter.
+        } while generation != domainAuthorityIssuePublicationGeneration
+            && domainWorkspaceAuthorityIssue != latestDomainAuthorityIssuePublication
     }
 
     private func synchronizeDomainAuthorityIssueForActiveWorkspace(operation: String) {
@@ -7568,6 +7737,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func reportDomainProjectionFailure(_ error: Error) {
+        domainProjectionReportGeneration += 1
         publishDomainAuthorityIssueIfChanged(DomainWorkspaceAuthorityIssue(
             workspaceID: nil,
             operation: "projection",
@@ -7715,6 +7885,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func removeConsolidatedRestoreTracking(workspaceID: UUID) {
+        cancelAuthorityRestoreClassification()
         activeConsolidatedRestoreIDs.remove(workspaceID)
         authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
         publishPendingConsolidatedRestoreIDs()
@@ -7771,63 +7942,108 @@ class WorkspaceManagerViewModel: ObservableObject {
         }.value
     }
 
+    private func cancelAuthorityRestoreClassification() {
+        authorityIncompleteRestoreClassificationTask?.cancel()
+        authorityIncompleteRestoreClassificationTask = nil
+        authorityRestoreClassificationAttemptID = nil
+    }
+
+    private func beginAuthorityRestoreClassification(publicationSequence: UInt64) -> UUID? {
+        guard !isPreparingForWindowClose, !Task.isCancelled,
+              publicationSequence >= lastDomainProjectionSequence,
+              publicationSequence >= lastAuthorityRecoveryClassificationSequence
+        else { return nil }
+        cancelAuthorityRestoreClassification()
+        let attemptID = UUID()
+        authorityRestoreClassificationAttemptID = attemptID
+        lastAuthorityRecoveryClassificationSequence = publicationSequence
+        return attemptID
+    }
+
+    private func ownsAuthorityRestoreClassification(_ attemptID: UUID, publicationSequence: UInt64) -> Bool {
+        authorityRestoreClassificationAttemptID == attemptID
+            && !isPreparingForWindowClose && !Task.isCancelled
+            && publicationSequence >= lastDomainProjectionSequence
+            && publicationSequence >= lastAuthorityRecoveryClassificationSequence
+    }
+
+    private func completedAuthorityRestoreClassification(_ result: AuthorityRestoreClassificationResult) -> Bool {
+        guard case let .completed(attemptID, publicationSequence) = result else { return false }
+        return ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence)
+    }
+
+    @discardableResult
     private func scheduleAuthorityIncompleteRestoreClassification(
         workspaces: [WorkspaceModel],
         fileURLsByWorkspaceID: [UUID: URL],
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
-        publicationSequence: UInt64
-    ) {
-        authorityIncompleteRestoreClassificationTask?.cancel()
-        authorityIncompleteRestoreClassificationTask = nil
-        guard publicationSequence >= lastDomainProjectionSequence,
-              publicationSequence >= lastAuthorityRecoveryClassificationSequence
-        else { return }
+        publicationSequence: UInt64,
+        unavailableWorkspaceIDs: Set<UUID> = []
+    ) -> Task<AuthorityRestoreClassificationResult, Never> {
+        guard let attemptID = beginAuthorityRestoreClassification(publicationSequence: publicationSequence) else {
+            return Task { .superseded }
+        }
         let candidates = authorityIncompleteRestoreCandidates(
-            workspaces: workspaces,
+            workspaces: workspaces.filter { !unavailableWorkspaceIDs.contains($0.id) },
             fileURLsByWorkspaceID: fileURLsByWorkspaceID,
             revisionsByWorkspaceID: revisionsByWorkspaceID
         )
         let candidateIDs = Set(candidates.map(\.workspaceID))
-        authorityIncompleteConsolidatedRestoreIDs.formIntersection(candidateIDs)
-        lastAuthorityRecoveryClassificationSequence = publicationSequence
+        // Unknown is not saved-phase evidence. Genuine absence/non-candidacy still clears guards.
+        authorityIncompleteConsolidatedRestoreIDs.formIntersection(candidateIDs.union(unavailableWorkspaceIDs))
         publishPendingConsolidatedRestoreIDs()
+        guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else {
+            return Task { .superseded }
+        }
         guard !candidates.isEmpty else {
-            authorityIncompleteRestoreClassificationTask = nil
-            return
+            return Task { .completed(attemptID: attemptID, publicationSequence: publicationSequence) }
         }
 
-        authorityIncompleteRestoreClassificationTask = Task { @MainActor [weak self] in
-            let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
+        let task = Task<AuthorityRestoreClassificationResult, Never> { @MainActor [weak self] in
             guard let self,
-                  !Task.isCancelled,
-                  publicationSequence >= lastDomainProjectionSequence,
-                  publicationSequence >= lastAuthorityRecoveryClassificationSequence
-            else { return }
-            authorityIncompleteConsolidatedRestoreIDs = incompleteIDs
-            lastAuthorityRecoveryClassificationSequence = publicationSequence
+                  ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence)
+            else { return .superseded }
+            #if DEBUG
+                await beforeAuthorityRestoreSavedReadForTesting?(nil)
+            #endif
+            guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
+            let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
+            guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
+            // Consult live guards, never a pre-await capture. The attempt owns both membership and results.
+            authorityIncompleteConsolidatedRestoreIDs = incompleteIDs.union(
+                authorityIncompleteConsolidatedRestoreIDs.intersection(unavailableWorkspaceIDs)
+            )
             publishPendingConsolidatedRestoreIDs()
+            guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
             authorityIncompleteRestoreClassificationTask = nil
+            return .completed(attemptID: attemptID, publicationSequence: publicationSequence)
         }
+        authorityIncompleteRestoreClassificationTask = task
+        return task
     }
 
+    @discardableResult
     private func refreshAuthorityIncompleteRestoreClassification(
         workspaces: [WorkspaceModel],
         fileURLsByWorkspaceID: [UUID: URL],
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
-        publicationSequence: UInt64
-    ) async {
-        let candidates = authorityIncompleteRestoreCandidates(
-            workspaces: workspaces,
-            fileURLsByWorkspaceID: fileURLsByWorkspaceID,
-            revisionsByWorkspaceID: revisionsByWorkspaceID
+        publicationSequence: UInt64,
+        unavailableWorkspaceIDs: Set<UUID>
+    ) async -> AuthorityRestoreClassificationResult {
+        // Cleanup/inventory supersede, then join, the same owner used by accepted projections.
+        // A scoped attempt can revoke coverage of unrelated candidates: task termination alone
+        // does not certify completion. Cleanup must require the still-current completion witness.
+        let task = scheduleAuthorityIncompleteRestoreClassification(
+            workspaces: workspaces, fileURLsByWorkspaceID: fileURLsByWorkspaceID,
+            revisionsByWorkspaceID: revisionsByWorkspaceID, publicationSequence: publicationSequence,
+            unavailableWorkspaceIDs: unavailableWorkspaceIDs
         )
-        let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
-        guard publicationSequence >= lastDomainProjectionSequence,
-              publicationSequence >= lastAuthorityRecoveryClassificationSequence
-        else { return }
-        authorityIncompleteConsolidatedRestoreIDs = incompleteIDs
-        lastAuthorityRecoveryClassificationSequence = publicationSequence
-        publishPendingConsolidatedRestoreIDs()
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        return completedAuthorityRestoreClassification(result) ? result : .superseded
     }
 
     /// Revalidates one workspace's consolidated-restore state against the authority.
@@ -7843,28 +8059,19 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceID: workspaceID,
             fileURL: workspaceFileURL(for: target)
         )
+        // Even unknown scoped evidence supersedes an older bulk classifier. It cannot authorize
+        // a saved-phase read, but must revoke that older attempt before preserving the live guard.
+        guard let attemptID = beginAuthorityRestoreClassification(publicationSequence: snapshot.publicationSequence) else { return .stale }
         guard let authoritative = snapshot.workspace else { return .unowned }
-        guard let working = try? Self.decodeDomainWorkspaceProjection(
-            documentBytes: authoritative.document.documentBytes,
-            fileURL: authoritative.document.fileURL
-        )
-        else { return .unavailable }
+        guard let working = try? decodeDomainWorkspaceCatalogRecord(authoritative) else { return .unavailable }
 
         if working.consolidatedIntoWorkspaceID != nil {
-            guard snapshot.publicationSequence >= lastDomainProjectionSequence,
-                  snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
-            else { return .stale }
             authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
-            lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
             publishPendingConsolidatedRestoreIDs()
             return .retired
         }
         guard authoritative.revisions.dirtyRevision != nil else {
-            guard snapshot.publicationSequence >= lastDomainProjectionSequence,
-                  snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
-            else { return .stale }
             authorityIncompleteConsolidatedRestoreIDs.remove(workspaceID)
-            lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
             publishPendingConsolidatedRestoreIDs()
             return .clear
         }
@@ -7873,13 +8080,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceID: workspaceID,
             savedFileURL: authoritative.document.fileURL
         )
+        #if DEBUG
+            await beforeAuthorityRestoreSavedReadForTesting?(workspaceID)
+        #endif
+        guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else { return .stale }
         let savedStatus = await Task.detached(priority: .utility) {
             Self.savedConsolidationMarkerStatus(for: candidate)
         }.value
-        guard snapshot.publicationSequence >= lastDomainProjectionSequence,
-              snapshot.publicationSequence >= lastAuthorityRecoveryClassificationSequence
-        else { return .stale }
-        lastAuthorityRecoveryClassificationSequence = snapshot.publicationSequence
+        guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else { return .stale }
         switch savedStatus {
         case .marked:
             authorityIncompleteConsolidatedRestoreIDs.insert(workspaceID)
@@ -7950,9 +8158,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func applyDomainMetadataSnapshot(
-        revisions: [UUID: DomainRevisionState], digests: [UUID: String], health: [UUID: DomainAuthorityHealth], catalogRevision: UInt64
+        revisions: [UUID: DomainRevisionState], digests: [UUID: String], health: [UUID: DomainAuthorityHealth], catalogRevision: UInt64,
+        retainingWorkspaceIDs: Set<UUID> = []
     ) {
-        for id in domainWorkspaceRevisionsByID.keys where revisions[id] == nil {
+        for id in domainWorkspaceRevisionsByID.keys where revisions[id] == nil && !retainingWorkspaceIDs.contains(id) {
             domainWorkspaceRevisionsByID.removeValue(forKey: id)
             domainWorkspaceDigestsByID.removeValue(forKey: id)
             domainWorkspaceHealthByID.removeValue(forKey: id)
@@ -7966,6 +8175,414 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
     }
 
+    // MARK: Accepted catalog application (#1142)
+
+    /// Last accepted reconciliation (full or metadata); zero means none. This is internal membership
+    /// evidence for caches and metadata eligibility, never chooser readiness by itself.
+    private(set) var domainCatalogReconciliationGeneration: UInt64 = 0
+    private var acceptedCatalogMembership: (available: Set<UUID>, unavailable: Set<UUID>)?
+    private var catalogApplicationDepth = 0
+    private var hasAcceptedCompleteChooserCatalog = false
+    /// Incomplete accepted row sets (last-complete when available) receive only local deltas.
+    private var chooserRetainsLastCompleteRows = false
+    /// Set by unaccepted bulk replacement or an uncertain save; only an accepted complete full
+    /// reconciliation clears it, so metadata/self-echo cannot certify unresolved retained state.
+    private(set) var requiresFullCatalogReconciliation = false
+
+    /// The only production boundary that may establish accepted catalog membership. Validates the
+    /// whole catalog before reconciling decoded models and last-known unavailable members.
+    @discardableResult
+    func applyDomainWorkspaceCatalog(
+        _ snapshot: DomainWorkspaceCatalogSnapshot,
+        projection: DomainCatalogProjection,
+        preferredActiveWorkspaceID: UUID?,
+        rootMapPolicy: DomainCatalogRootMapPolicy,
+        attempt: DomainCatalogAttempt? = nil
+    ) -> DomainCatalogApplicationResult {
+        let attempt = attempt ?? beginDomainCatalogAttempt()
+        if let rejection = catalogAdmissionRejection(snapshot, projection: projection, attempt: attempt) {
+            if case let .invalidCatalog(reason) = rejection {
+                reportDomainCatalogFailure(
+                    reason == "not_bootstrapped" ? .notBootstrapped : .modelProjection(reason),
+                    snapshot: snapshot, attempt: attempt
+                )
+            }
+            return .rejected(rejection)
+        }
+        let records = snapshot.workspaces
+        func map<Value>(_ value: (DomainWorkspaceSnapshot) -> Value) -> [UUID: Value] {
+            Dictionary(uniqueKeysWithValues: records.map { ($0.document.workspaceID, value($0)) })
+        }
+        let revisions = map(\.revisions)
+        let digests = map(\.document.contentDigest)
+        let health = map(\.health)
+        catalogApplicationDepth += 1
+        defer { catalogApplicationDepth -= 1 }
+        let kind: DomainCatalogApplicationReceipt.Kind
+        let applied: Bool
+        switch projection {
+        case let .full(models):
+            kind = .full
+            applied = applyDomainWorkspaceProjection(
+                models,
+                canonicalRepoPathsByWorkspaceID: rootMapPolicy == .snapshotMetadata ? map(\.document.metadata.repoPaths) : nil,
+                fileURLsByWorkspaceID: map(\.document.fileURL),
+                revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
+                catalogRevision: snapshot.catalogRevision, preferredActiveWorkspaceID: preferredActiveWorkspaceID,
+                publicationSequence: snapshot.publicationSequence,
+                unavailableWorkspaceIDs: snapshot.unavailableWorkspaceIDs
+            )
+        case .metadata:
+            kind = .metadata
+            applied = applyDomainAuthorityMetadataProjection(
+                revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
+                catalogRevision: snapshot.catalogRevision, publicationSequence: snapshot.publicationSequence,
+                canonicalSystemWorkspaceIDs: Set(records.compactMap { record in
+                    record.document.metadata.isSystemWorkspace && !record.document.metadata.isEphemeral
+                        ? record.document.workspaceID : nil
+                }),
+                unavailableWorkspaceIDs: snapshot.unavailableWorkspaceIDs
+            )
+        }
+        guard applied else { return .rejected(.stalePublication) }
+        // Synchronous reconciliation subscribers may close, cancel, or resolve a newer attempt.
+        if let rejection = catalogReadRejection(snapshot, attempt: attempt) { return .rejected(rejection) }
+        let completeness = catalogCompleteness(of: snapshot)
+        // Scoped clearance: only the failure/issue that existed when this attempt began, never a newer
+        // report with the same kind or payload. Command and record-health issues keep their owners.
+        let current = workspaceChooserPresentation.failure
+        let resolvesCurrent = current.map { failure in
+            attempt.failureWitness == .init(id: failure.id, reportVersion: failure.reportVersion)
+                && snapshot.publicationSequence >= failure.publicationSequence
+                && snapshot.catalogRevision >= failure.catalogRevision
+        } ?? true
+        let issueWitness = currentProjectionIssueWitness
+        // Full clears the projection issue that existed when the attempt began; metadata clears only
+        // the issue owned by the chooser failure it resolves.
+        let clearsProjectionIssue = switch kind {
+        case .full: attempt.projectionIssueWitness == issueWitness
+        case .metadata: resolvesCurrent && current?.legacyIssue == issueWitness
+        }
+        if issueWitness != nil, clearsProjectionIssue {
+            publishDomainAuthorityIssueIfChanged(nil)
+        }
+        // Credit only after every synchronous reconciliation/issue subscriber returned with ownership intact.
+        if let rejection = catalogReadRejection(snapshot, attempt: attempt) { return .rejected(rejection) }
+        domainCatalogReconciliationGeneration += 1
+        acceptedCatalogMembership = (Set(digests.keys), snapshot.unavailableWorkspaceIDs)
+        lastResolvedDomainCatalogAttempt = (snapshot.publicationSequence, attempt.generation)
+        lastAcceptedDomainCatalog = (snapshot.publicationSequence, snapshot.catalogRevision)
+        if kind == .full, completeness == .complete { requiresFullCatalogReconciliation = false }
+        publishAcceptedChooserCatalog(
+            stamp: .init(
+                publicationSequence: snapshot.publicationSequence, catalogRevision: snapshot.catalogRevision,
+                reconciliationGeneration: domainCatalogReconciliationGeneration, isComplete: completeness == .complete
+            ),
+            refreshFailure: resolvesCurrent ? completeness.failure : current,
+            unavailableWorkspaceIDs: snapshot.unavailableWorkspaceIDs
+        )
+        return .accepted(.init(
+            kind: kind, publicationSequence: snapshot.publicationSequence, catalogRevision: snapshot.catalogRevision,
+            reconciliationGeneration: domainCatalogReconciliationGeneration, completeness: completeness
+        ))
+    }
+
+    /// One coherent value after the whole reconciliation returned. Before any complete baseline the
+    /// accepted available rows are shown with their warning; afterwards the last complete list stays.
+    private func publishAcceptedChooserCatalog(
+        stamp: WorkspaceChooserAcceptanceStamp,
+        refreshFailure: WorkspaceChooserFailure?,
+        unavailableWorkspaceIDs: Set<UUID>
+    ) {
+        // Retained models are not newly decoded rows. Before a complete chooser baseline,
+        // show only available members; afterwards the existing last-complete policy owns rows.
+        let accepted = WorkspaceChooserCatalog(
+            workspaces: workspaces.filter { !unavailableWorkspaceIDs.contains($0.id) }, source: .authority(stamp)
+        )
+        let refresh = refreshFailure.map(WorkspaceChooserRefresh.failed) ?? .current
+        if stamp.isComplete {
+            hasAcceptedCompleteChooserCatalog = true
+            chooserRetainsLastCompleteRows = false
+            workspaceChooserPresentation = .ready(accepted, refresh: refresh)
+        } else if hasAcceptedCompleteChooserCatalog, case let .ready(retained, _) = workspaceChooserPresentation {
+            chooserRetainsLastCompleteRows = true
+            workspaceChooserPresentation = .ready(retained, refresh: refresh)
+        } else {
+            chooserRetainsLastCompleteRows = true
+            workspaceChooserPresentation = .ready(accepted, refresh: refresh)
+        }
+    }
+
+    /// Admitted local mutations update a ready chooser without an authority echo. Loading/failure are
+    /// never promoted, accepted reconciliation publishes itself, and an unaccepted import waits.
+    private func refreshChooserRowsAfterLocalMutation(from oldValue: [WorkspaceModel]) {
+        guard catalogApplicationDepth == 0, !isPreparingForWindowClose, !requiresFullCatalogReconciliation,
+              case .ready(var catalog, let refresh) = workspaceChooserPresentation
+        else { return }
+        if chooserRetainsLastCompleteRows {
+            catalog.applyLocalDelta(from: oldValue, to: workspaces)
+        } else {
+            catalog.workspaces = workspaces
+        }
+        workspaceChooserPresentation = .ready(catalog, refresh: refresh)
+    }
+
+    /// Read admission precedes decoding and ordinary failure reporting; exhaustion is reported separately.
+    func catalogReadRejection(_ snapshot: DomainWorkspaceCatalogSnapshot, attempt: DomainCatalogAttempt) -> DomainCatalogRejection? {
+        if isPreparingForWindowClose { return .closing }
+        if Task.isCancelled { return .cancelled }
+        if snapshot.publicationSequence < lastDomainProjectionSequence { return .stalePublication }
+        if snapshot.catalogRevision < domainWorkspaceCatalogRevision { return .staleCatalogRevision }
+        if !isOrderedAfterResolvedCatalogAttempt(snapshot.publicationSequence, attempt) { return .superseded }
+        return nil
+    }
+
+    private func catalogAdmissionRejection(
+        _ snapshot: DomainWorkspaceCatalogSnapshot,
+        projection: DomainCatalogProjection,
+        attempt: DomainCatalogAttempt
+    ) -> DomainCatalogRejection? {
+        if let rejection = catalogReadRejection(snapshot, attempt: attempt) { return rejection }
+        guard snapshot.isBootstrapped else { return .invalidCatalog("not_bootstrapped") }
+        // Competing complete-catalog transactions are never partially accepted; callers refetch.
+        if catalogApplicationDepth > 0 { return .reentrant }
+        let recordIDs = snapshot.workspaces.map(\.document.workspaceID)
+        let membership = Set(recordIDs)
+        guard membership.count == recordIDs.count else { return .invalidCatalog("duplicate_record_id") }
+        switch projection {
+        case let .full(models):
+            let modelIDs = models.map(\.id)
+            guard modelIDs.count == recordIDs.count, Set(modelIDs) == membership else {
+                return .invalidCatalog("model_set_mismatch")
+            }
+        case let .metadata(baselineGeneration):
+            guard domainCatalogReconciliationGeneration > 0,
+                  baselineGeneration == domainCatalogReconciliationGeneration,
+                  !requiresFullCatalogReconciliation,
+                  acceptedCatalogMembership?.available == membership,
+                  acceptedCatalogMembership?.unavailable == snapshot.unavailableWorkspaceIDs
+            else { return .fullProjectionRequired }
+        }
+        return nil
+    }
+
+    /// Bulk replacement with models the authority never supplied (backup import). In authority mode
+    /// the chooser keeps its accepted value, and metadata/self-echo cannot vouch for this baseline,
+    /// until an accepted complete full reconciliation; no accepted generation is fabricated.
+    func replaceWorkspacesFromUnacceptedImport(_ imported: [WorkspaceModel]) {
+        if domainWorkspaceAuthorityClient != nil { requiresFullCatalogReconciliation = true }
+        workspaces = imported
+        // One refresh through the Bridge's owned task; failure uses the normal warning/Retry path.
+        if requiresFullCatalogReconciliation { domainCatalogRefreshRequest?(false) }
+    }
+
+    /// Shared identity-checked record decode for catalog projection and scoped restore classification.
+    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
+        #if DEBUG
+            if let error = catalogRecordDecodeFailureForTesting?(record.document.workspaceID) { throw error }
+        #endif
+        let model = try Self.decodeDomainWorkspaceProjection(
+            documentBytes: record.document.documentBytes,
+            fileURL: record.document.fileURL
+        )
+        guard model.id == record.document.workspaceID else {
+            throw NSError(domain: "WorkspaceChooserCatalog", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Decoded workspace identity does not match authoritative record identity."
+            ])
+        }
+        return model
+    }
+
+    #if DEBUG
+        private var catalogRecordDecodeFailureForTesting: ((UUID) -> Error?)?
+        var beforeAuthorityRestoreSavedReadForTesting: ((UUID?) async -> Void)?
+
+        /// Injects a decode error for selected records on every catalog decode path of this manager.
+        func setCatalogRecordDecodeFailureForTesting(_ failure: ((UUID) -> Error?)?) {
+            catalogRecordDecodeFailureForTesting = failure
+        }
+
+        func awaitWorkspaceReloadForTesting() async {
+            await reloadWorkspacesTask?.value
+        }
+
+        func awaitAuthorityIncompleteRestoreClassificationForTesting() async {
+            _ = await authorityIncompleteRestoreClassificationTask?.value
+        }
+    #endif
+
+    /// An accepted reconciliation, not chooser health, proves the one-record baseline. A healthy
+    /// projected member can echo while other members or a refresh are unavailable; this never clears
+    /// their warnings or certifies catalog completeness. Import/uncertain-save fences still require
+    /// full reconciliation, and the Bridge separately validates event origin and canonical health.
+    func admitsDomainSelfEcho(baselineGeneration: UInt64) -> Bool {
+        guard !isPreparingForWindowClose,
+              baselineGeneration > 0,
+              baselineGeneration == domainCatalogReconciliationGeneration,
+              !requiresFullCatalogReconciliation,
+              case let .ready(catalog, _) = workspaceChooserPresentation,
+              case .authority = catalog.source
+        else { return false }
+        return true
+    }
+
+    /// Accepts a self-echo's one-record baseline; never certifies or replaces catalog membership.
+    func acceptDomainAuthoritySelfEchoBaseline(
+        workspaceID: UUID,
+        revisions: DomainRevisionState,
+        digest: String,
+        health: DomainAuthorityHealth,
+        catalogRevision: UInt64,
+        publicationSequence: UInt64,
+        baselineGeneration: UInt64
+    ) -> Bool {
+        guard admitsDomainSelfEcho(baselineGeneration: baselineGeneration),
+              !Task.isCancelled,
+              publicationSequence >= lastDomainProjectionSequence,
+              catalogRevision >= domainWorkspaceCatalogRevision,
+              !isOlderDomainRevision(revisions, workspaceID: workspaceID)
+        else { return false }
+        applyDomainAuthorityBaseline(
+            workspaceID: workspaceID, revisions: revisions, digest: digest, health: health,
+            catalogRevision: catalogRevision
+        )
+        lastDomainProjectionSequence = publicationSequence
+        return true
+    }
+
+    /// Aggregate health and member availability, evaluated after reconciliation was admitted.
+    private func catalogCompleteness(
+        of snapshot: DomainWorkspaceCatalogSnapshot
+    ) -> DomainCatalogCompleteness {
+        let kind: WorkspaceChooserFailure.Kind
+        if snapshot.health != .writable {
+            kind = .authorityUnavailable(snapshot.health)
+        } else if !snapshot.unavailableWorkspaceIDs.isEmpty {
+            kind = .unavailableMembers(snapshot.unavailableWorkspaceIDs)
+        } else {
+            return .complete
+        }
+        return .incomplete(makeChooserFailure(kind, snapshot: snapshot, legacyIssue: nil))
+    }
+
+    // MARK: Catalog failure identity (#1142)
+
+    private var domainCatalogAttemptGeneration: UInt64 = 0
+    private var domainCatalogFailureReportVersion: UInt64 = 0
+    /// Latest resolved (accepted or reported) attempt and latest accepted catalog, for ordering/coverage.
+    private var lastResolvedDomainCatalogAttempt: (sequence: UInt64, generation: UInt64) = (0, 0)
+    private var lastAcceptedDomainCatalog: (sequence: UInt64, catalogRevision: UInt64)?
+    /// Advances on every `reportDomainProjectionFailure`, even when the publisher deduplicates content.
+    private var domainProjectionReportGeneration: UInt64 = 0
+
+    /// Captured before an attempt's first await; see `DomainCatalogAttempt`.
+    func beginDomainCatalogAttempt() -> DomainCatalogAttempt {
+        domainCatalogAttemptGeneration += 1
+        return DomainCatalogAttempt(
+            generation: domainCatalogAttemptGeneration,
+            failureWitness: workspaceChooserPresentation.failure.map { .init(id: $0.id, reportVersion: $0.reportVersion) },
+            projectionIssueWitness: currentProjectionIssueWitness
+        )
+    }
+
+    /// Sequence first, then attempt generation: a late same-sequence attempt never replaces a newer one.
+    private func isOrderedAfterResolvedCatalogAttempt(_ sequence: UInt64, _ attempt: DomainCatalogAttempt) -> Bool {
+        let last = lastResolvedDomainCatalogAttempt
+        return sequence > last.sequence || (sequence == last.sequence && attempt.generation >= last.generation)
+    }
+
+    /// Whether an accepted reconciliation already covers this snapshot, so a rejected attempt needs no
+    /// refetch or failure.
+    func coversDomainCatalog(_ snapshot: DomainWorkspaceCatalogSnapshot) -> Bool {
+        guard let accepted = lastAcceptedDomainCatalog else { return false }
+        return accepted.sequence >= snapshot.publicationSequence && accepted.catalogRevision >= snapshot.catalogRevision
+    }
+
+    private var currentProjectionIssueWitness: DomainProjectionIssueWitness? {
+        guard let issue = domainWorkspaceAuthorityIssue, issue.kind == .projectionFailure else { return nil }
+        return DomainProjectionIssueWitness(issueID: issue.id, reportGeneration: domainProjectionReportGeneration)
+    }
+
+    /// Reports a rejected catalog attempt: no rows before any accepted catalog, otherwise the accepted
+    /// rows are retained with a warning. Also publishes the legacy projection issue and records the
+    /// actual (possibly deduplicated) issue it produced.
+    @discardableResult
+    func reportDomainCatalogFailure(
+        _ kind: WorkspaceChooserFailure.Kind,
+        error: Error? = nil,
+        snapshot: DomainWorkspaceCatalogSnapshot?,
+        attempt: DomainCatalogAttempt
+    ) -> Bool {
+        let sequence = snapshot?.publicationSequence ?? lastDomainProjectionSequence
+        if kind != .catalogChangedDuringRefresh, let snapshot,
+           catalogReadRejection(snapshot, attempt: attempt) != nil { return false }
+        guard !isPreparingForWindowClose, !Task.isCancelled,
+              isOrderedAfterResolvedCatalogAttempt(sequence, attempt)
+        else { return false }
+        lastResolvedDomainCatalogAttempt = (sequence, attempt.generation)
+        reportDomainProjectionFailure(error ?? NSError(
+            domain: "WorkspaceChooserCatalog",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog could not be applied (\(kind))."]
+        ))
+        // Legacy issue emission can synchronously close, cancel, or resolve a newer attempt.
+        guard !isPreparingForWindowClose, !Task.isCancelled,
+              isOrderedAfterResolvedCatalogAttempt(sequence, attempt)
+        else { return false }
+        setChooserFailure(makeChooserFailure(
+            kind, snapshot: snapshot, legacyIssue: currentProjectionIssueWitness
+        ))
+        return true
+    }
+
+    /// Equivalent causes keep their ID; every report gets a new version and an idle recovery.
+    private func makeChooserFailure(
+        _ kind: WorkspaceChooserFailure.Kind,
+        snapshot: DomainWorkspaceCatalogSnapshot?,
+        legacyIssue: DomainProjectionIssueWitness?
+    ) -> WorkspaceChooserFailure {
+        domainCatalogFailureReportVersion += 1
+        let current = workspaceChooserPresentation.failure
+        return WorkspaceChooserFailure(
+            id: current.flatMap { $0.kind == kind ? $0.id : nil } ?? UUID(),
+            kind: kind,
+            publicationSequence: snapshot?.publicationSequence ?? lastDomainProjectionSequence,
+            catalogRevision: snapshot?.catalogRevision ?? domainWorkspaceCatalogRevision,
+            reportVersion: domainCatalogFailureReportVersion,
+            legacyIssue: legacyIssue
+        )
+    }
+
+    /// Marks the current failure retrying under the Bridge's refresh ID; false when nothing to retry.
+    @discardableResult
+    func beginWorkspaceChooserRetry(_ refreshID: UUID) -> Bool {
+        guard !isPreparingForWindowClose, var failure = workspaceChooserPresentation.failure else { return false }
+        if failure.recovery != .retrying(refreshID) {
+            failure.recovery = .retrying(refreshID)
+            setChooserFailure(failure)
+        }
+        return true
+    }
+
+    /// A finished or cancelled refresh returns its still-current retrying failure to idle, rows unchanged.
+    func finishWorkspaceChooserRetry(_ refreshID: UUID) {
+        guard !isPreparingForWindowClose, var failure = workspaceChooserPresentation.failure,
+              failure.recovery == .retrying(refreshID)
+        else { return }
+        failure.recovery = .idle
+        setChooserFailure(failure)
+    }
+
+    private func setChooserFailure(_ failure: WorkspaceChooserFailure) {
+        switch workspaceChooserPresentation {
+        case .loading, .failed: workspaceChooserPresentation = .failed(failure)
+        case let .ready(catalog, _): workspaceChooserPresentation = .ready(catalog, refresh: .failed(failure))
+        }
+    }
+
+    /// Low-level reconciliation; returns whether it applied. Calling it directly never establishes
+    /// chooser readiness: production catalog callers use `applyDomainWorkspaceCatalog`.
+    @discardableResult
     func applyDomainWorkspaceProjection(
         _ projectedWorkspaces: [WorkspaceModel],
         canonicalRepoPathsByWorkspaceID: [UUID: [String]]? = nil,
@@ -7975,12 +8592,30 @@ class WorkspaceManagerViewModel: ObservableObject {
         healthByWorkspaceID: [UUID: DomainAuthorityHealth],
         catalogRevision: UInt64,
         preferredActiveWorkspaceID: UUID?,
-        publicationSequence: UInt64
-    ) {
-        guard publicationSequence >= lastDomainProjectionSequence else { return }
+        publicationSequence: UInt64,
+        unavailableWorkspaceIDs: Set<UUID> = []
+    ) -> Bool {
+        guard admitsDomainProjection(publicationSequence: publicationSequence, catalogRevision: catalogRevision) else {
+            return false
+        }
         lastDomainProjectionSequence = publicationSequence
         let persistedProjection = projectedWorkspaces.filter { !$0.isEphemeral }
-        let persistedWorkspaceIDs = Set(persistedProjection.map(\.id))
+        let decodedWorkspaceIDs = Set(persistedProjection.map(\.id))
+        // Unavailable means authority still owns the member, not that it was removed. Retain
+        // only a previously accepted model or an already-decoded established active model
+        // (including restored selection), not other startup disk rows. Retained values must
+        // not become fresh canonical/repair evidence.
+        let retainedWorkspaces = workspaces.filter { workspace in
+            !workspace.isEphemeral
+                && unavailableWorkspaceIDs.contains(workspace.id)
+                && !decodedWorkspaceIDs.contains(workspace.id)
+                && (
+                    domainWorkspaceRevisionsByID[workspace.id] != nil
+                        || (hasEstablishedWorkspaceSelection && activeWorkspaceID == workspace.id)
+                )
+        }
+        let retainedWorkspaceIDs = Set(retainedWorkspaces.map(\.id))
+        let persistedWorkspaceIDs = decodedWorkspaceIDs.union(retainedWorkspaceIDs)
         // Canonical System evidence comes from the incoming persisted projection, before any
         // local ephemeral/creation/session reconciliation can append records.
         let canonicalSystemWorkspaceIDs = Set(persistedProjection.filter(\.isSystemWorkspace).map(\.id))
@@ -7989,14 +8624,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             isOlderDomainRevision(revision, workspaceID: id) ? id : nil
         })
         var repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline] = [:]
-        for workspaceID in persistedWorkspaceIDs where !staleWorkspaceIDs.contains(workspaceID) {
+        for workspaceID in decodedWorkspaceIDs where !staleWorkspaceIDs.contains(workspaceID) {
             if let revision = revisionsByWorkspaceID[workspaceID], let digest = digestsByWorkspaceID[workspaceID] {
                 repairBaselines[workspaceID] = .working(revision: revision.workingRevision, digest: digest)
             }
         }
         for workspace in workspaces where !workspace.isEphemeral && !persistedWorkspaceIDs.contains(workspace.id) {
             // A failed decode or a still-publishing creation is not canonical absence.
-            if revisionsByWorkspaceID[workspace.id] == nil, digestsByWorkspaceID[workspace.id] == nil,
+            if !unavailableWorkspaceIDs.contains(workspace.id),
+               revisionsByWorkspaceID[workspace.id] == nil, digestsByWorkspaceID[workspace.id] == nil,
                workspaceCreationTasksByID[workspace.id] == nil,
                pendingPersistentWorkspaceCreationsByWorkspaceID[workspace.id] == nil
             {
@@ -8020,7 +8656,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             return projected
         }
         var localProjection = Self.preservingLocalEphemeralWorkspaces(
-            in: rootPreparedProjection,
+            in: rootPreparedProjection + retainedWorkspaces,
             currentWorkspaces: workspaces
         )
         // A confirmed deletion can time out while an explicitly created workspace is still
@@ -8042,13 +8678,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             // re-validated against the projected digests.
             invalidateConfirmedDomainReadRegistrations(
                 previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
-                projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+                projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter {
+                    decodedWorkspaceIDs.contains($0.key) && !unavailableWorkspaceIDs.contains($0.key)
+                }
             )
             let projectedFileURLs = fileURLsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) && !staleWorkspaceIDs.contains($0.key) }
-            domainWorkspaceFileURLsByID = projectedFileURLs.merging(domainWorkspaceFileURLsByID.filter { staleWorkspaceIDs.contains($0.key) }) { incoming, _ in incoming }
+            domainWorkspaceFileURLsByID = projectedFileURLs.merging(domainWorkspaceFileURLsByID.filter { staleWorkspaceIDs.contains($0.key) || retainedWorkspaceIDs.contains($0.key) }) { incoming, _ in incoming }
             applyDomainMetadataSnapshot(
-                revisions: revisionsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) },
-                digests: digestsByWorkspaceID, health: healthByWorkspaceID, catalogRevision: catalogRevision
+                revisions: revisionsByWorkspaceID.filter { decodedWorkspaceIDs.contains($0.key) },
+                digests: digestsByWorkspaceID, health: healthByWorkspaceID, catalogRevision: catalogRevision,
+                retainingWorkspaceIDs: retainedWorkspaceIDs
             )
         } else {
             let trackedWorkspaceIDs = Set(confirmedDomainReadRegistrationsByWorkspaceID.keys)
@@ -8068,9 +8707,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces: reconciledWorkspaces,
             fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
             revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
-            publicationSequence: publicationSequence
+            publicationSequence: publicationSequence,
+            unavailableWorkspaceIDs: unavailableWorkspaceIDs
         )
-        for workspaceID in persistedWorkspaceIDs {
+        for workspaceID in decodedWorkspaceIDs {
             if let canonical = canonicalRootStateByWorkspaceID[workspaceID] {
                 acceptRootReconciliationTarget(workspaceID: workspaceID, repoPaths: canonical.repoPaths)
                 if previousCanonicalManifests[workspaceID] != canonical.manifest {
@@ -8092,10 +8732,18 @@ class WorkspaceManagerViewModel: ObservableObject {
                 bumpStateVersion(for: workspaceID)
             }
         }
-        if domainWorkspaceAuthorityIssue?.kind == .projectionFailure {
-            publishDomainAuthorityIssueIfChanged(nil)
-        }
+        // Projection-issue recovery is scoped by witness at `applyDomainWorkspaceCatalog`.
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
+        return true
+    }
+
+    /// Rejects before any mutation: closing, cancelled, older publication, or a catalog revision below
+    /// the floor (including a newer baseline learned from a command outcome).
+    private func admitsDomainProjection(publicationSequence: UInt64, catalogRevision: UInt64) -> Bool {
+        !isPreparingForWindowClose
+            && !Task.isCancelled
+            && publicationSequence >= lastDomainProjectionSequence
+            && catalogRevision >= domainWorkspaceCatalogRevision
     }
 
     /// Canonical projections intentionally exclude ephemeral records. Preserve locally owned
@@ -8136,6 +8784,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             reconcileFirstProjectedWorkspaceSelection(
                 canonicalSystemWorkspaceIDs: canonicalSystemWorkspaceIDs
             )
+        }
+        if previousActiveWorkspaceID != activeWorkspaceID,
+           !isPreparingForWindowClose, !isSwitchingWorkspace, activeWorkspaceSwitch == nil
+        {
+            onSettledProjectedWorkspaceSelection?(activeWorkspace)
         }
         if previousActiveWorkspaceID != activeWorkspaceID, let activeWorkspaceID {
             requestRootReconciliation(workspaceID: activeWorkspaceID)
@@ -8219,26 +8872,34 @@ class WorkspaceManagerViewModel: ObservableObject {
         activeWorkspaceID = workspaceID
     }
 
+    @discardableResult
     func applyDomainAuthorityMetadataProjection(
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
         digestsByWorkspaceID: [UUID: String],
         healthByWorkspaceID: [UUID: DomainAuthorityHealth],
         catalogRevision: UInt64,
         publicationSequence: UInt64,
-        canonicalSystemWorkspaceIDs: Set<UUID>
-    ) {
-        guard publicationSequence >= lastDomainProjectionSequence else { return }
+        canonicalSystemWorkspaceIDs: Set<UUID>,
+        unavailableWorkspaceIDs: Set<UUID> = []
+    ) -> Bool {
+        guard admitsDomainProjection(publicationSequence: publicationSequence, catalogRevision: catalogRevision) else {
+            return false
+        }
         lastDomainProjectionSequence = publicationSequence
         invalidateConfirmedDomainReadRegistrations(
             previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
-            projectedDigestsByWorkspaceID: digestsByWorkspaceID
+            projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { !unavailableWorkspaceIDs.contains($0.key) }
         )
-        applyDomainMetadataSnapshot(revisions: revisionsByWorkspaceID, digests: digestsByWorkspaceID, health: healthByWorkspaceID, catalogRevision: catalogRevision)
+        applyDomainMetadataSnapshot(
+            revisions: revisionsByWorkspaceID, digests: digestsByWorkspaceID, health: healthByWorkspaceID,
+            catalogRevision: catalogRevision, retainingWorkspaceIDs: unavailableWorkspaceIDs
+        )
         scheduleAuthorityIncompleteRestoreClassification(
             workspaces: workspaces,
             fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
             revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
-            publicationSequence: publicationSequence
+            publicationSequence: publicationSequence,
+            unavailableWorkspaceIDs: unavailableWorkspaceIDs
         )
         // A later no-digest publication must still let a failed-startup window converge on
         // System. Established metadata-only behavior is unchanged. Empty evidence fails closed.
@@ -8249,6 +8910,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_health_projection")
+        return true
     }
 
     func collectComposeTabSnapshot(name: String, base: ComposeTabState? = nil) -> ComposeTabState {
@@ -11854,7 +12516,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private var duplicateCleanupExcludedWorkspaceIDs: Set<UUID> {
-        pendingConsolidatedRestoreIDs
+        pendingConsolidatedRestoreIDs.union(acceptedCatalogMembership?.unavailable ?? [])
     }
 
     @MainActor
@@ -11872,12 +12534,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     func consolidateDuplicateWorkspaces(windowStates: WindowStatesManager? = nil) async -> WorkspaceDuplicateCleanupResult {
         let windowStates = windowStates ?? WindowStatesManager.shared
         let initialWindowSnapshots = Self.duplicateWindowSnapshots(from: windowStates)
-        let initialPlans = Self.duplicateWorkspaceGroupPlans(
+        var initialPlans = Self.duplicateWorkspaceGroupPlans(
             workspaces: workspaces,
             windowSnapshots: initialWindowSnapshots,
             excludingWorkspaceIDs: duplicateCleanupExcludedWorkspaceIDs
         )
-        let groupsDetected = initialPlans.count
+        var groupsDetected = initialPlans.count
         guard !initialPlans.isEmpty else {
             return WorkspaceDuplicateCleanupResult(
                 groupsDetected: 0,
@@ -11887,6 +12549,52 @@ class WorkspaceManagerViewModel: ObservableObject {
                 skipped: [],
                 backupURL: nil
             )
+        }
+
+        // Cached groups only establish whether cleanup has work. Validate authority before any
+        // backup, save, or window reassignment; a first-observed decode failure is not removal.
+        if domainWorkspaceAuthorityClient != nil {
+            do {
+                try await refreshDuplicateCleanupAuthorityProjection()
+            } catch {
+                if !(error is DuplicateCleanupCatalogRejected || error is DuplicateCleanupClassificationSuperseded) {
+                    reportDomainProjectionFailure(error)
+                }
+                let skipped = initialPlans.flatMap { plan in
+                    plan.duplicates.map { duplicate in
+                        WorkspaceDuplicateCleanupSkippedItem(
+                            workspaceID: duplicate.id,
+                            workspaceName: duplicate.name,
+                            windowID: nil,
+                            reason: "authority_snapshot_unavailable: \(error.localizedDescription)"
+                        )
+                    }
+                }
+                return WorkspaceDuplicateCleanupResult(
+                    groupsDetected: groupsDetected,
+                    groupsConsolidated: 0,
+                    reassignedWindowIDs: [],
+                    retiredWorkspaceIDs: [],
+                    skipped: skipped,
+                    backupURL: nil
+                )
+            }
+            initialPlans = Self.duplicateWorkspaceGroupPlans(
+                workspaces: workspaces,
+                windowSnapshots: Self.duplicateWindowSnapshots(from: windowStates),
+                excludingWorkspaceIDs: duplicateCleanupExcludedWorkspaceIDs
+            )
+            groupsDetected = initialPlans.count
+            guard !initialPlans.isEmpty else {
+                return WorkspaceDuplicateCleanupResult(
+                    groupsDetected: 0,
+                    groupsConsolidated: 0,
+                    reassignedWindowIDs: [],
+                    retiredWorkspaceIDs: [],
+                    skipped: [],
+                    backupURL: nil
+                )
+            }
         }
 
         let backupURL: URL
@@ -11971,16 +12679,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         if domainWorkspaceAuthorityClient != nil {
             do {
-                let projection = try await loadDuplicateCleanupAuthorityProjection()
-                applyDuplicateCleanupAuthorityProjection(projection)
-                await refreshAuthorityIncompleteRestoreClassification(
-                    workspaces: workspaces,
-                    fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
-                    revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
-                    publicationSequence: projection.snapshot.publicationSequence
-                )
+                // Window switches await authority writes; validate again before retiring members.
+                try await refreshDuplicateCleanupAuthorityProjection()
             } catch {
-                reportDomainProjectionFailure(error)
+                // The boundary already reported invalid catalogs; closing/cancellation is not an error.
+                if !(error is DuplicateCleanupCatalogRejected || error is DuplicateCleanupClassificationSuperseded) {
+                    reportDomainProjectionFailure(error)
+                }
                 for plan in initialPlans {
                     for duplicate in plan.duplicates {
                         skipped.append(
@@ -12331,6 +13036,31 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    private func refreshDuplicateCleanupAuthorityProjection() async throws {
+        let attempt = beginDomainCatalogAttempt()
+        let projection = try await loadDuplicateCleanupAuthorityProjection()
+        // A rejected application is not a reconciliation; never classify restores against it.
+        if let rejection = applyDuplicateCleanupAuthorityProjection(projection, attempt: attempt).rejection {
+            throw DuplicateCleanupCatalogRejected(rejection: rejection)
+        }
+        let classification = await refreshAuthorityIncompleteRestoreClassification(
+            workspaces: workspaces,
+            fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
+            revisionsByWorkspaceID: domainWorkspaceRevisionsByID,
+            publicationSequence: projection.snapshot.publicationSequence,
+            unavailableWorkspaceIDs: projection.snapshot.unavailableWorkspaceIDs
+        )
+        guard completedAuthorityRestoreClassification(classification) else {
+            throw DuplicateCleanupClassificationSuperseded()
+        }
+    }
+
+    private struct DuplicateCleanupClassificationSuperseded: LocalizedError {
+        var errorDescription: String? {
+            "Runtime restore classification was superseded before completion."
+        }
+    }
+
     /// Reloads the cleanup planner from the same owner that will persist its decisions.
     /// The legacy index is intentionally not updated in authority mode and may omit live records.
     private func loadDuplicateCleanupAuthorityProjection() async throws -> (
@@ -12352,37 +13082,38 @@ class WorkspaceManagerViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog is not ready."]
             )
         }
-        let workspaces = try snapshot.workspaces.map {
-            try Self.decodeDomainWorkspaceProjection(
-                documentBytes: $0.document.documentBytes,
-                fileURL: $0.document.fileURL
-            )
-        }
+        let workspaces = try snapshot.workspaces.map { try decodeDomainWorkspaceCatalogRecord($0) }
         return (workspaces, snapshot)
     }
 
+    private struct DuplicateCleanupCatalogRejected: LocalizedError {
+        let rejection: DomainCatalogRejection
+        var errorDescription: String? {
+            "Runtime workspace catalog was not accepted (\(rejection))."
+        }
+    }
+
     private func applyDuplicateCleanupAuthorityProjection(
-        _ projection: (workspaces: [WorkspaceModel], snapshot: DomainWorkspaceCatalogSnapshot)
-    ) {
-        applyDomainWorkspaceProjection(
-            projection.workspaces,
-            fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: projection.snapshot.workspaces.map {
-                ($0.document.workspaceID, $0.document.fileURL)
-            }),
-            revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: projection.snapshot.workspaces.map {
-                ($0.document.workspaceID, $0.revisions)
-            }),
-            digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: projection.snapshot.workspaces.map {
-                ($0.document.workspaceID, $0.document.contentDigest)
-            }),
-            healthByWorkspaceID: Dictionary(uniqueKeysWithValues: projection.snapshot.workspaces.map {
-                ($0.document.workspaceID, $0.health)
-            }),
-            catalogRevision: projection.snapshot.catalogRevision,
+        _ projection: (workspaces: [WorkspaceModel], snapshot: DomainWorkspaceCatalogSnapshot),
+        attempt: DomainCatalogAttempt
+    ) -> DomainCatalogApplicationResult {
+        applyDomainWorkspaceCatalog(
+            projection.snapshot,
+            projection: .full(projection.workspaces),
             preferredActiveWorkspaceID: activeWorkspaceID,
-            publicationSequence: projection.snapshot.publicationSequence
+            rootMapPolicy: .decodedModels,
+            attempt: attempt
         )
     }
+
+    #if DEBUG
+        /// Exercises reconciliation admission only, not the persistence failure that calls it.
+        func reconcileDuplicateCleanupAuthorityAfterFailedSaveForTesting() async -> Bool {
+            await reconcileDuplicateCleanupAuthorityAfterFailedSave()
+        }
+
+        var beforeFailedSaveCatalogApplicationForTesting: ((DomainWorkspaceCatalogSnapshot) -> Void)?
+    #endif
 
     /// A domain save can commit its working document before the saved-document phase fails. The
     /// outcome is therefore uncertain: rolling back locally can teach the presentation bridge a
@@ -12390,30 +13121,53 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// bootstrapped catalog is valid here and authoritatively removes any local records.
     private func reconcileDuplicateCleanupAuthorityAfterFailedSave() async -> Bool {
         guard let domainWorkspaceAuthorityClient else { return false }
-        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
-        guard snapshot.isBootstrapped else {
-            reportDomainProjectionFailure(NSError(
-                domain: "WorkspaceDuplicateCleanup",
-                code: 7,
-                userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog is not ready after a failed cleanup save."]
-            ))
-            return false
-        }
-        do {
-            let projectedWorkspaces = try snapshot.workspaces.map {
-                try Self.decodeDomainWorkspaceProjection(
-                    documentBytes: $0.document.documentBytes,
-                    fileURL: $0.document.fileURL
-                )
+        // Until a full reconciliation is accepted, neither metadata nor self-echo may vouch for the
+        // optimistic models. An accepted incomplete receipt still counts as reconciliation here.
+        requiresFullCatalogReconciliation = true
+        for refetchBudget in [1, 0] {
+            let attempt = beginDomainCatalogAttempt()
+            let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+            #if DEBUG
+                beforeFailedSaveCatalogApplicationForTesting?(snapshot)
+            #endif
+            // Closing/cancellation: teardown owns saves; no error and no guessed rollback.
+            guard !Task.isCancelled, !isPreparingForWindowClose else { return false }
+            guard snapshot.isBootstrapped else {
+                reportDomainCatalogFailure(.notBootstrapped, error: NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog is not ready after a failed cleanup save."]
+                ), snapshot: snapshot, attempt: attempt)
+                return false
             }
-            applyDuplicateCleanupAuthorityProjection((projectedWorkspaces, snapshot))
-            return true
-        } catch {
-            // Keep the attempted prepublication until the bridge can provide a valid projection;
-            // restoring a guessed fallback is what poisons its self-echo cache.
-            reportDomainProjectionFailure(error)
-            return false
+            let result: DomainCatalogApplicationResult
+            do {
+                let projectedWorkspaces = try snapshot.workspaces.map { try decodeDomainWorkspaceCatalogRecord($0) }
+                result = applyDuplicateCleanupAuthorityProjection((projectedWorkspaces, snapshot), attempt: attempt)
+            } catch {
+                // Keep the attempted prepublication until the bridge can provide a valid projection;
+                // restoring a guessed fallback is what poisons its self-echo cache.
+                reportDomainCatalogFailure(
+                    .modelProjection(error.localizedDescription), error: error, snapshot: snapshot, attempt: attempt
+                )
+                return false
+            }
+            if result.receipt != nil { return true }
+            // A newer accepted full already replaced the optimistic state, or teardown owns saves:
+            // never roll back to a guessed fallback. Otherwise a stale floor gets one bounded refetch.
+            guard let reason = result.rejection,
+                  [.stalePublication, .staleCatalogRevision, .reentrant, .superseded].contains(reason),
+                  requiresFullCatalogReconciliation
+            else { return false }
+            if refetchBudget == 0 {
+                reportDomainCatalogFailure(.catalogChangedDuringRefresh, error: NSError(
+                    domain: "WorkspaceDuplicateCleanup",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Runtime workspace catalog changed during failed-save reconciliation."]
+                ), snapshot: snapshot, attempt: attempt)
+            }
         }
+        return false
     }
 
     private static func duplicateWindowSnapshots(from windowStates: WindowStatesManager) -> [WorkspaceDuplicateWindowSnapshot] {
@@ -13350,8 +14104,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             updated.dateModified = Date()
         }
 
-        authorityIncompleteRestoreClassificationTask?.cancel()
-        authorityIncompleteRestoreClassificationTask = nil
+        cancelAuthorityRestoreClassification()
         activeConsolidatedRestoreIDs.insert(updated.id)
         publishPendingConsolidatedRestoreIDs()
         defer {
@@ -13378,6 +14131,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 case .clear:
                     break
                 case .unowned, .retired, .incomplete, .unavailable, .stale:
+                    cancelAuthorityRestoreClassification()
                     authorityIncompleteConsolidatedRestoreIDs.insert(updated.id)
                     publishPendingConsolidatedRestoreIDs()
                 }
@@ -15683,20 +16437,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func workspacesForMenu(_ query: WorkspaceMenuQuery = .init()) -> [WorkspaceModel] {
-        var items = workspaces
-        if !query.includeSystem {
-            items = items.filter { !$0.isSystemWorkspace }
-        }
-        if !query.includeHidden {
-            items = items.filter { !$0.isHiddenInMenus }
-        }
-        if !query.includeTemporary {
-            items = items.filter { !$0.isTemporaryWorkspace }
-        }
-        if query.sortMostRecentFirst {
-            items = WorkspaceRecentOrdering.sorted(items)
-        }
-        return items
+        guard case let .ready(catalog, _) = workspaceChooserPresentation else { return [] }
+        return WorkspaceMenuPolicy.items(in: catalog.workspaces, query: query)
     }
 
     /// Only explicit UI opens advance library recency; autosave and MCP activity do not.
@@ -16727,7 +17469,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // 5) Replace your in-memory array with newly loaded (or appended) ones
         //    or you can union them if you want to keep older existing ones.
-        workspaces = newlyLoadedWorkspaces
+        replaceWorkspacesFromUnacceptedImport(newlyLoadedWorkspaces)
 
         // Rebuild and save the index to reflect the newly loaded sets
         await rebuildAndSaveIndexAsync()

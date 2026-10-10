@@ -56,7 +56,8 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     var usedTokensBeforeCompact: Int?
     /// Set when compaction completion could not be verified: an ACP command turn that ended without
     /// a vouched drop, a native command that outlived its deadline, or runtime teardown before the
-    /// command turn settled. The note stays parked. The persisted key predates the native cases.
+    /// command turn settled. The note stays parked until its live request confirms completion or
+    /// ordinary input carries it. The persisted key predates the native cases.
     var acpCompletionUnverified: Bool?
 
     init(
@@ -74,6 +75,20 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
         self.owner = owner
         self.acceptedAt = acceptedAt
         self.phase = phase
+    }
+
+    /// A timeout releases the hold, not the request's ability to accept correlated confirmation.
+    /// The live completion coordinator separately fences parked requests by its runtime binding.
+    var canAcceptCompactConfirmation: Bool {
+        guard !noteDispatchStarted else { return false }
+        switch phase {
+        case .dispatchingCompact, .awaitingCompactTurn:
+            return true
+        case .parked:
+            return acpCompletionUnverified == true
+        default:
+            return false
+        }
     }
 
     var isValid: Bool {

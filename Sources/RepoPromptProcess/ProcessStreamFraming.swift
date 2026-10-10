@@ -47,14 +47,25 @@ package struct LineFramer {
         package var maxLineBytes: Int
         /// Maximum bytes the carry buffer may accumulate across chunks before overflow.
         package var maxCarryBytes: Int
-        /// When overflow occurs, retain this many trailing bytes so downstream tail-recovery can still find embedded JSON.
+        /// Trailing bytes retained for legacy tail recovery. Zero disables recovery: feed returns
+        /// a fatal overflow and the consumer must retire the stream without flushing it.
         package var tailRetainBytes: Int
+
+        package init(maxLineBytes: Int, maxCarryBytes: Int, tailRetainBytes: Int) {
+            self.maxLineBytes = maxLineBytes
+            self.maxCarryBytes = maxCarryBytes
+            self.tailRetainBytes = tailRetainBytes
+        }
 
         package static let `default` = Limits(
             maxLineBytes: 8 * 1024 * 1024, // 8 MB
             maxCarryBytes: 16 * 1024 * 1024, // 16 MB
             tailRetainBytes: 128 * 1024 // 128 KB
         )
+    }
+
+    package struct Overflow: Error, Equatable {
+        package let limitBytes: Int
     }
 
     package enum Diagnostic {
@@ -75,15 +86,24 @@ package struct LineFramer {
 
     package let limits: Limits
 
+    /// Lines larger than this hand their carry storage to the emitted line instead of
+    /// leaving the carry buffer holding that capacity for the rest of the stream.
+    static let maxRetainedCarryCapacityBytes = 1024 * 1024
+
     package init(limits: Limits = .default) {
         self.limits = limits
     }
 
-    package mutating func feed(_ chunk: Data, onDiagnostic: (Diagnostic) -> Void = { _ in }, onLine: (Data) -> Void) {
-        guard !chunk.isEmpty else { return }
+    /// Returns a fatal overflow for consumers that disable tail recovery. No lines
+    /// from the failing feed are dispatched; the consumer must retire this stream.
+    @discardableResult
+    package mutating func feed(_ chunk: Data, onDiagnostic: (Diagnostic) -> Void = { _ in }, onLine: (Data) -> Void) -> Overflow? {
+        guard !chunk.isEmpty else { return nil }
 
         var pending: [Data] = []
         var diagnostics: [Diagnostic] = []
+        let fatalLimit = limits.tailRetainBytes == 0 ? min(limits.maxLineBytes, limits.maxCarryBytes) : nil
+        var overflow: Overflow?
 
         chunk.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
@@ -94,6 +114,11 @@ package struct LineFramer {
 
             for i in 0 ..< count {
                 let byte = base[i]
+                let isDelimiter = byte == 0x0A && (!isJSONCandidate || !inJSONString)
+                if let fatalLimit, carry.count + i - sliceStart + (isDelimiter ? 0 : 1) > fatalLimit {
+                    overflow = Overflow(limitBytes: fatalLimit)
+                    return
+                }
 
                 // Determine JSON candidacy from first non-whitespace byte of a new line.
                 if !hasSeenLineStart, !isASCIIWhitespace(byte) {
@@ -134,7 +159,10 @@ package struct LineFramer {
                             let slice = UnsafeBufferPointer(start: base + sliceStart, count: i + 1 - sliceStart)
                             carry.append(slice)
                             sliceStart = i + 1
-                            emitLine(&pending)
+                            if let failure = emitLine(&pending, fatalLimit: fatalLimit) {
+                                overflow = failure
+                                return
+                            }
                         }
                     default:
                         if inJSONString, isEscapingJSONStringCharacter {
@@ -147,7 +175,10 @@ package struct LineFramer {
                         let slice = UnsafeBufferPointer(start: base + sliceStart, count: i + 1 - sliceStart)
                         carry.append(slice)
                         sliceStart = i + 1
-                        emitLine(&pending)
+                        if let failure = emitLine(&pending, fatalLimit: fatalLimit) {
+                            overflow = failure
+                            return
+                        }
                     }
                 }
             }
@@ -157,6 +188,15 @@ package struct LineFramer {
                 let slice = UnsafeBufferPointer(start: base + sliceStart, count: count - sliceStart)
                 carry.append(slice)
             }
+        }
+
+        if let overflow {
+            carry.removeAll(keepingCapacity: false)
+            inJSONString = false
+            isEscapingJSONStringCharacter = false
+            hasSeenLineStart = false
+            isJSONCandidate = false
+            return overflow
         }
 
         // Check carry size limits after processing the full chunk (amortized).
@@ -181,6 +221,7 @@ package struct LineFramer {
         for diagnostic in diagnostics {
             onDiagnostic(diagnostic)
         }
+        return nil
     }
 
     package mutating func flush(_ onLine: (Data) -> Void) {
@@ -197,18 +238,31 @@ package struct LineFramer {
     // MARK: - Private
 
     /// Extracts the completed line from carry (stripping the trailing newline and optional CR), appends to pending, and resets line state.
-    private mutating func emitLine(_ pending: inout [Data]) {
+    private mutating func emitLine(_ pending: inout [Data], fatalLimit: Int?) -> Overflow? {
         var line = carry
+        // A large frame (e.g. a full-history resume) must not pin its buffer for the life
+        // of the stream. Releasing carry also makes `line` unique, so trimming below does
+        // not copy the whole frame.
+        let releasesCarryStorage = carry.count > Self.maxRetainedCarryCapacityBytes
+        if releasesCarryStorage {
+            carry = Data()
+        }
         line.removeLast() // remove the \n
         if line.last == 0x0D {
             line.removeLast() // remove optional \r
         }
+        if let fatalLimit, line.count > fatalLimit {
+            return Overflow(limitBytes: fatalLimit)
+        }
         pending.append(line)
-        carry.removeAll(keepingCapacity: true)
+        if !releasesCarryStorage {
+            carry.removeAll(keepingCapacity: true)
+        }
         inJSONString = false
         isEscapingJSONStringCharacter = false
         hasSeenLineStart = false
         isJSONCandidate = false
+        return nil
     }
 }
 

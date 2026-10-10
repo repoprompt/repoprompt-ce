@@ -534,6 +534,11 @@ struct AgentSessionLinkPassiveStatusNotices {
         self.queueEpoch = queueEpoch
     }
 
+    /// Same inclusion as attentionRequests, without sorting or acknowledging any occurrence.
+    var pendingAttentionOccurrenceCount: Int {
+        pendingAttentionByReference.count
+    }
+
     var snapshot: Snapshot {
         Snapshot(
             observerEndpoint: observerEndpoint,

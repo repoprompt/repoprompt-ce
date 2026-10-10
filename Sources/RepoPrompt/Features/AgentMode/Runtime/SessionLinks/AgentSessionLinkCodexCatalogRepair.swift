@@ -1,13 +1,12 @@
 import Foundation
 
 /// Vocabulary for the bounded, one-shot recovery of a Codex run whose *returned* MCP catalog is
-/// stuck saying `agent_session_link` is absent while the link authority holds any exact live grant.
+/// stuck on an old oversight surface (including activation without links and same-name upgrades).
 ///
-/// The state is produced by ordinary code: `notifyToolListChangedForAgentSession` republishes the
-/// observation with returned presence preserved and any-link presence recomputed, so a grant restored
-/// against a live run whose client has not re-read `tools/list` lands on exactly
-/// `hasAgentSessionLink == false` plus `hasAnyActiveLink == true`. An inbound-only lane needs the
-/// tool for inverse attention even though it has no outbound prompt context to repair.
+/// Ordinary invalidation preserves returned evidence and recomputes expected client-shaped
+/// definitions. Explicit activation and inbound-to-outbound upgrades therefore open the same
+/// existing cycle even when there is no grant or the tool name is already present.
+/// Membership and prompt authority remain separate from discovery.
 ///
 /// This file owns only the two predicates and the cycle value. The projection reconciler in
 /// `AgentModeViewModel+SessionLinkPrompt` opens and closes a cycle; `CodexAgentModeCoordinator`
@@ -46,23 +45,30 @@ enum AgentSessionLinkCodexCatalogRepair {
         }
     }
 
-    /// The exact mismatch this repair exists for: the returned catalog says the tool is absent while
-    /// the authority says this endpoint still holds a live grant in either direction.
+    /// Exact client-shaped expected/returned definitions disagree. Legacy test observations without
+    /// either fingerprint retain their presence-only interpretation.
     ///
     /// Both halves must be *exact current observations*. An unknown (`nil`) presence on either side
     /// is not a mismatch; it is a route torn down or not yet observed, which is not evidence of
     /// anything.
     static func isStuckProjection(_ projection: AgentSessionLinkRunCatalogProjection) -> Bool {
-        projection.hasAgentSessionLink == false && projection.hasAnyActiveLink == true
+        if let expected = projection.expectedSurface, let returned = projection.returnedSurface {
+            return expected != returned
+        }
+        guard projection.expectedSurface == nil, projection.returnedSurface == nil else { return false }
+        return projection.hasAgentSessionLink == false && projection.hasAnyActiveLink == true
     }
 
-    /// An exact current observation that ends any open cycle as *over* rather than spent: the tool
-    /// is back in the returned catalog, or the endpoint no longer holds any exact grant to repair
-    /// for.
+    /// Exact surface equality ends the cycle, including withdrawal and activation-only full.
+    /// A partly unknown fingerprint never opens or closes a cycle.
     ///
     /// Deliberately not the negation of `isStuckProjection`: an unknown observation closes nothing
     /// and leaves a cycle pending, because it is not evidence that the catalog healed.
     static func projectionResolvesCycle(_ projection: AgentSessionLinkRunCatalogProjection) -> Bool {
-        projection.hasAgentSessionLink == true || projection.hasAnyActiveLink == false
+        if let expected = projection.expectedSurface, let returned = projection.returnedSurface {
+            return expected == returned
+        }
+        guard projection.expectedSurface == nil, projection.returnedSurface == nil else { return false }
+        return projection.hasAgentSessionLink == true || projection.hasAnyActiveLink == false
     }
 }
