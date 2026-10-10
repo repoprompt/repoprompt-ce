@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
@@ -1601,7 +1602,7 @@ import XCTest
                 guard case let .incomplete(failure) = incomplete.completeness else { return XCTFail("writable+unavailable is incomplete") }
                 XCTAssertEqual(failure.kind, .unavailableMembers([Fixture.aardvarkID]))
                 XCTAssertEqual(incomplete.reconciliationGeneration, 4)
-                XCTAssertFalse(manager.workspaces.contains { $0.id == Fixture.aardvarkID }, "Internal membership still converges")
+                XCTAssertTrue(manager.workspaces.contains { $0.id == Fixture.aardvarkID }, "Unavailable authority member retains its last-known model")
                 let degradedHealth = DomainAuthorityHealth.degradedReadOnly(reason: "workspace_index_decode_failed")
                 let degraded = try XCTUnwrap(apply(f.catalog(base, sequence: 8, catalogRevision: 8, health: degradedHealth), .full(models)).receipt)
                 XCTAssertEqual(degraded.completeness.failure?.kind, .authorityUnavailable(degradedHealth))
@@ -1705,7 +1706,7 @@ import XCTest
                 )
                 let (r13, c13, refresh13) = try accept(missingAardvark)
                 XCTAssertEqual(c13, c12, "retained last-complete rows and stamp")
-                XCTAssertFalse(manager.workspaces.contains { $0.id == Fixture.aardvarkID }, "internal membership converged")
+                XCTAssertTrue(manager.workspaces.contains { $0.id == Fixture.aardvarkID }, "unknown decode is not removal")
                 let failure13 = try XCTUnwrap(r13.completeness.failure)
                 XCTAssertEqual(refresh13, .failed(failure13))
                 let (r14, _, refresh14) = try accept(f.catalog(
@@ -1922,6 +1923,940 @@ import XCTest
                 XCTAssertEqual(manager.workspaceChooserPresentation.failure?.kind, failure.kind)
                 let durable = await f.runtime.workspaceStore.snapshot()
                 XCTAssertEqual(Set(durable.workspaces.map(\.document.workspaceID)), Fixture.standardIDs)
+            }
+        }
+
+        func testEstablishedActiveMemberDecodeFailureRetainsModelSelectionAndDegradedChooser() async throws {
+            try await Fixture.run { f in
+                let (window, manager, chooser, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCaughtUpWithCatalogBaseline(window)
+                manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.aardvarkID })
+                manager.workspaces[index].currentPromptText = "Last-known local prompt"
+                let retained = try XCTUnwrap(manager.activeWorkspace)
+                let acceptedChooser = manager.workspaceChooserPresentation
+                var selections: [UUID?] = []
+                let subscription = manager.$activeWorkspaceID.sink { selections.append($0) }
+                defer { subscription.cancel() }
+                var attempts = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    guard id == Fixture.aardvarkID else { return nil }
+                    attempts += 1
+                    return InjectedDecodeFailure()
+                }
+                let authority = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12050)
+                let initialCatalog = await authority.snapshot()
+                let initialRecord = try XCTUnwrap(initialCatalog.workspaces.first { $0.document.workspaceID == retained.id })
+                var changed = Fixture.standardSeeds[1]
+                changed.name = "Updated authoritative Aardvark"
+                let changedOutcome = try await authority.replaceWorking(
+                    changed, fileURL: initialRecord.document.fileURL,
+                    expectedWorkspaceRevision: initialRecord.revisions.workingRevision
+                )
+                XCTAssertEqual(changedOutcome.disposition, .applied)
+                let changedCheckpoint = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(changedCheckpoint.catalogReceipt?.completeness.failure?.kind, .unavailableMembers([retained.id]))
+                XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                XCTAssertEqual(manager.workspace(withID: retained.id), retained, "changed-digest failure retains the local model")
+                // A new subscription incarnation cannot reuse the previous decode cache.
+                await window.joinDomainWorkspaceBridgeForTesting()
+                window.restartDomainWorkspaceProjectionForTesting()
+                let checkpoint = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(checkpoint.catalogReceipt?.completeness.failure?.kind, .unavailableMembers([retained.id]))
+                XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                XCTAssertEqual(manager.workspace(withID: retained.id), retained)
+                XCTAssertTrue(selections.allSatisfy { $0 == retained.id }, "no unload or replacement selection")
+                guard case let .ready(previous, _) = acceptedChooser,
+                      case let .ready(rows, .failed(failure)) = manager.workspaceChooserPresentation
+                else { return XCTFail("last complete rows must remain degraded") }
+                XCTAssertEqual(rows, previous)
+                for query in [WorkspaceChooserQuery.compact(maxRecent: 5), .expanded(collection: .saved, searchText: "")] {
+                    let value = try chooser.consume(query)
+                    XCTAssertTrue(value.orderedIDs.contains(retained.id))
+                    XCTAssertEqual(value.failureID, failure.id)
+                }
+                let beforeRetry = attempts
+                manager.retryWorkspaceChooser()
+                await f.awaitCatalogRefresh(window)
+                XCTAssertGreaterThan(attempts, beforeRetry, "retaining a model must not cache a failed decode as successful")
+                XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                XCTAssertEqual(manager.workspace(withID: retained.id), retained)
+                manager.setCatalogRecordDecodeFailureForTesting(nil)
+                manager.retryWorkspaceChooser()
+                await f.awaitCatalogRefresh(window)
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+                XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                XCTAssertEqual(manager.workspace(withID: retained.id)?.currentPromptText, Fixture.standardSeeds[1].currentPromptText, "successful decode replaces the retained model")
+                let durable = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(Set(durable.workspaces.map(\.document.workspaceID)), Fixture.standardIDs)
+                XCTAssertEqual(manager.workspace(withID: retained.id)?.name, changed.name)
+                let currentRecord = try XCTUnwrap(durable.workspaces.first { $0.document.workspaceID == retained.id })
+                let deleted = await authority.delete(
+                    workspaceID: retained.id, expectedCatalogRevision: durable.catalogRevision,
+                    expectedWorkspaceRevision: currentRecord.revisions.workingRevision
+                )
+                XCTAssertEqual(deleted.disposition, .applied)
+                try await f.awaitCatalogProjection(window)
+                XCTAssertNil(manager.workspace(withID: retained.id), "a real authority deletion still removes the established model")
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                for query in [WorkspaceChooserQuery.compact(maxRecent: 5), .expanded(collection: .saved, searchText: "")] {
+                    let value = try chooser.consume(query)
+                    XCTAssertFalse(value.orderedIDs.contains(retained.id))
+                    XCTAssertNil(value.failure)
+                }
+            }
+        }
+
+        func testUnavailableMemberRetainsAuthorityBaselineButTrueRemovalReconcilesSelection() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let base = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(base)
+                XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                    base, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+                let retained = try XCTUnwrap(manager.activeWorkspace)
+                let record = try XCTUnwrap(base.workspaces.first { $0.document.workspaceID == retained.id })
+                let dirtyRevision = record.revisions.workingRevision + 1
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: retained.id,
+                    revisions: .init(workingRevision: dirtyRevision, savedRevision: record.revisions.savedRevision, dirtyRevision: dirtyRevision),
+                    digest: record.document.contentDigest, health: record.health, catalogRevision: base.catalogRevision
+                )
+                // Saved bytes cannot classify a member whose current projection is unknown.
+                try Data("{unreadable saved phase".utf8).write(to: record.document.fileURL, options: .atomic)
+                let baseline = manager.debugDomainAuthorityBaseline(for: retained.id)
+                var repairBaselines: [UUID: AgentSessionLifecycleAuthority.ProjectionRepairBaseline] = [:]
+                let lifecycle = AgentSessionLifecycleAuthority()
+                manager.setAgentSessionProjectionReconciler { projected, current, baselines in
+                    repairBaselines = baselines
+                    return lifecycle.reconcileProjection(
+                        projectedWorkspaces: projected, currentWorkspaces: current, claims: [], repairBaselines: baselines
+                    )
+                }
+                let unavailable = f.catalog(
+                    base, sequence: base.publicationSequence + 1, catalogRevision: base.catalogRevision + 1,
+                    dropping: [retained.id], unavailable: [retained.id]
+                )
+                var receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                    unavailable, projection: .full(f.decoded(unavailable)), preferredActiveWorkspaceID: retained.id,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(retained.id), "unknown projection must not create a restore guard from unreadable saved bytes")
+                XCTAssertNil(repairBaselines[retained.id], "unknown is neither an absence nor a fresh working repair baseline")
+                let metadata = f.catalog(
+                    unavailable, sequence: unavailable.publicationSequence + 1, catalogRevision: unavailable.catalogRevision + 1,
+                    unavailable: [retained.id]
+                )
+                receipt = try XCTUnwrap(manager.applyDomainWorkspaceCatalog(
+                    metadata, projection: .metadata(baselineGeneration: receipt.reconciliationGeneration),
+                    preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(retained.id))
+                let repeated = f.catalog(
+                    metadata, sequence: metadata.publicationSequence + 1, catalogRevision: metadata.catalogRevision + 1,
+                    unavailable: [retained.id]
+                )
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    repeated, projection: .full(f.decoded(repeated)), preferredActiveWorkspaceID: retained.id,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                XCTAssertEqual(manager.workspace(withID: retained.id), retained)
+                let preservedBaseline = manager.debugDomainAuthorityBaseline(for: retained.id)
+                XCTAssertEqual(preservedBaseline.revisions, baseline.revisions)
+                XCTAssertEqual(preservedBaseline.digest, baseline.digest)
+                XCTAssertEqual(preservedBaseline.health, baseline.health)
+                XCTAssertEqual(manager.workspaceFileURL(for: retained), base.workspaces.first { $0.document.workspaceID == retained.id }?.document.fileURL)
+
+                // Same decoded records/digests, but the unavailable ID is now genuinely absent.
+                let absent = f.catalog(
+                    repeated, sequence: repeated.publicationSequence + 1, catalogRevision: repeated.catalogRevision + 1
+                )
+                XCTAssertEqual(manager.applyDomainWorkspaceCatalog(
+                    absent, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+                    preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).rejection, .fullProjectionRequired, "changed unknown membership must not take the metadata fast path")
+
+                // Another unavailable member must not hide the active member's genuine removal.
+                let removed = f.catalog(
+                    base, sequence: repeated.publicationSequence + 1, catalogRevision: repeated.catalogRevision + 1,
+                    dropping: [retained.id, Fixture.requestedID], unavailable: [Fixture.requestedID]
+                )
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    removed, projection: .full(f.decoded(removed)), preferredActiveWorkspaceID: retained.id,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertNil(manager.workspace(withID: retained.id))
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                XCTAssertEqual(repairBaselines[retained.id], .absent)
+                XCTAssertNil(manager.debugDomainAuthorityBaseline(for: retained.id).revisions)
+                XCTAssertNotNil(manager.workspace(withID: Fixture.requestedID), "only the still-authoritative unknown member is retained")
+                let completeRemoval = f.catalog(
+                    base, sequence: removed.publicationSequence + 1, catalogRevision: removed.catalogRevision + 1,
+                    dropping: [retained.id]
+                )
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    completeRemoval, projection: .full(f.decoded(completeRemoval)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                guard case let .ready(rows, .current) = manager.workspaceChooserPresentation else {
+                    return XCTFail("complete removal must repair the degraded chooser")
+                }
+                XCTAssertFalse(rows.workspaces.contains { $0.id == retained.id })
+            }
+        }
+
+        func testInventoryRefreshPreservesUnknownRestoreClassificationUntilDecodeRecovers() async throws {
+            for initiallyPending in [true, false] {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12051)
+                    let base = await client.snapshot()
+                    let record = try XCTUnwrap(base.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                    var working = try XCTUnwrap(f.decoded(base).first { $0.id == Fixture.aardvarkID })
+                    working.currentPromptText = "Dirty working phase"
+                    let outcome = try await client.replaceWorking(
+                        working, fileURL: record.document.fileURL, expectedWorkspaceRevision: record.revisions.workingRevision
+                    )
+                    XCTAssertEqual(outcome.disposition, .applied)
+                    let dirty = await client.snapshot()
+                    XCTAssertNotNil(dirty.workspaces.first { $0.document.workspaceID == working.id }?.revisions.dirtyRevision)
+                    var saved = working
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? Fixture.requestedID : nil
+                    try f.writeDocument(saved)
+                    XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                        dirty, projection: .full(f.decoded(dirty)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(working.id), initiallyPending)
+
+                    // Opposite saved-phase evidence is stale while this member cannot decode.
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                    try f.writeDocument(saved)
+                    manager.setCatalogRecordDecodeFailureForTesting { id in
+                        id == working.id ? NSError(domain: "InjectedMemberDecode", code: 1) : nil
+                    }
+                    let inventory = await manager.loadWorkspaceSnapshotFromDisk()
+                    XCTAssertFalse(inventory.contains { $0.id == working.id }, "inventory remains a decoded authority view")
+                    XCTAssertEqual(
+                        manager.pendingConsolidatedRestoreIDs.contains(working.id),
+                        initiallyPending,
+                        "an inventory read must neither clear nor invent unknown restore classification"
+                    )
+
+                    manager.setCatalogRecordDecodeFailureForTesting(nil)
+                    let recovered = await manager.loadWorkspaceSnapshotFromDisk()
+                    XCTAssertTrue(recovered.contains { $0.id == working.id })
+                    XCTAssertEqual(
+                        manager.pendingConsolidatedRestoreIDs.contains(working.id),
+                        !initiallyPending,
+                        "decoded recovery can classify the current saved phase again"
+                    )
+                }
+            }
+        }
+
+        func testDuplicateCleanupRefreshPreservesUnknownRestoreClassificationWithoutReadingStaleSavedPhase() async throws {
+            for initiallyPending in [true, false] {
+                var seeds = Fixture.standardSeeds
+                seeds[2].repoPaths = ["/tmp/decode-retain-cleanup-root"]
+                var peer = Fixture.model(id: Fixture.namesakeID, name: "Cleanup peer")
+                peer.repoPaths = seeds[2].repoPaths
+                seeds.append(peer)
+                try await Fixture.run(seeds: seeds, unavailableSeedIDs: [Fixture.aardvarkID]) { f in
+                    let manager = f.makeManager()
+                    let snapshot = await f.runtime.workspaceStore.snapshot()
+                    XCTAssertEqual(snapshot.unavailableWorkspaceIDs, [Fixture.aardvarkID])
+                    let retained = Fixture.standardSeeds[1]
+                    var saved = retained
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? Fixture.requestedID : nil
+                    try f.writeDocument(saved)
+                    let savedURL = f.workspaceURL(for: retained)
+                    var fileURLs = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) })
+                    var revisions = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.revisions) })
+                    var digests = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) })
+                    var health = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.health) })
+                    fileURLs[retained.id] = savedURL
+                    revisions[retained.id] = .init(workingRevision: 2, savedRevision: 1, dirtyRevision: 2)
+                    digests[retained.id] = "last-known-working-digest"
+                    health[retained.id] = .writable
+                    // Seed the previously accepted state from before the authority member became unknown.
+                    XCTAssertTrue(try manager.applyDomainWorkspaceProjection(
+                        f.decoded(snapshot) + [retained], fileURLsByWorkspaceID: fileURLs,
+                        revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
+                        catalogRevision: snapshot.catalogRevision, preferredActiveWorkspaceID: nil,
+                        publicationSequence: snapshot.publicationSequence
+                    ))
+                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(retained.id), initiallyPending)
+                    let baseline = manager.debugDomainAuthorityBaseline(for: retained.id)
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                    try f.writeDocument(saved)
+                    manager.setDuplicateCleanupBackupDirectoryForTesting(f.base.appendingPathComponent("cleanup-backups"))
+
+                    // An unrelated real duplicate group drives the awaited cleanup refresh.
+                    let result = await manager.consolidateDuplicateWorkspaces()
+                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    XCTAssertEqual(result.groupsDetected, 1)
+                    XCTAssertEqual(result.groupsConsolidated, 1, "known duplicate cleanup still operates")
+                    XCTAssertEqual(manager.workspace(withID: retained.id), retained)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: retained.id).revisions, baseline.revisions)
+                    XCTAssertEqual(
+                        manager.pendingConsolidatedRestoreIDs.contains(retained.id),
+                        initiallyPending,
+                        "cleanup must neither clear nor invent unknown restore classification from stale saved bytes"
+                    )
+                }
+            }
+        }
+
+        func testIncompleteFullKeepsUnacceptedImportFenceUntilCompleteReconciliation() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let base = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(base)
+                XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                    base, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                var imported = models
+                let index = try XCTUnwrap(imported.firstIndex { $0.id == Fixture.aardvarkID })
+                imported[index].currentPromptText = "Unaccepted imported prompt"
+                manager.replaceWorkspacesFromUnacceptedImport(imported)
+                let unknown = f.catalog(
+                    base,
+                    sequence: base.publicationSequence,
+                    catalogRevision: base.catalogRevision,
+                    dropping: [Fixture.aardvarkID],
+                    unavailable: [Fixture.aardvarkID]
+                )
+                let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                    unknown, projection: .full(f.decoded(unknown)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertEqual(manager.workspace(withID: Fixture.aardvarkID), imported[index])
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+                XCTAssertFalse(manager.admitsDomainSelfEcho(baselineGeneration: receipt.reconciliationGeneration))
+                XCTAssertEqual(manager.applyDomainWorkspaceCatalog(
+                    unknown, projection: .metadata(baselineGeneration: receipt.reconciliationGeneration),
+                    preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).rejection, .fullProjectionRequired, "even the current generation cannot certify unresolved imported state")
+                let complete = try XCTUnwrap(manager.applyDomainWorkspaceCatalog(
+                    base, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertFalse(manager.requiresFullCatalogReconciliation)
+                XCTAssertEqual(manager.workspace(withID: Fixture.aardvarkID), models[index])
+                XCTAssertTrue(manager.admitsDomainSelfEcho(baselineGeneration: complete.reconciliationGeneration))
+            }
+        }
+
+        /// Two real dirty authority members ensure the bulk read suspends even when A is unknown.
+        private func prepareRestoreClassificationRace(
+            _ f: Fixture,
+            manager: WorkspaceManagerViewModel,
+            initiallyPending: Bool
+        ) async throws -> (DomainWorkspaceCatalogSnapshot, WorkspaceModel) {
+            let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12052)
+            let base = await client.snapshot()
+            manager.workspaces = try f.decoded(base)
+            manager.activeWorkspace = manager.workspace(withID: Fixture.defaultID)
+            var target: WorkspaceModel?
+            for id in [Fixture.aardvarkID, Fixture.requestedID] {
+                let record = try XCTUnwrap(base.workspaces.first { $0.document.workspaceID == id })
+                var working = try XCTUnwrap(f.decoded(base).first { $0.id == id })
+                working.currentPromptText = "Dirty race working phase"
+                let outcome = try await client.replaceWorking(
+                    working, fileURL: record.document.fileURL, expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(outcome.disposition, .applied)
+                var saved = working
+                saved.consolidatedIntoWorkspaceID = id == Fixture.aardvarkID && initiallyPending ? Fixture.requestedID : nil
+                try f.writeDocument(saved)
+                if id == Fixture.aardvarkID { target = working }
+            }
+            let dirty = await client.snapshot()
+            XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                dirty, projection: .full(f.decoded(dirty)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+            ).receipt)
+            await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+            XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(Fixture.aardvarkID), initiallyPending)
+            manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+            return try (dirty, XCTUnwrap(target))
+        }
+
+        func testSameSequenceScopedRecoveryCannotBeOverwrittenByBulkClassification() async throws {
+            for inventoryPath in [false, true] {
+                for initiallyPending in [false, true] {
+                    try await Fixture.run { f in
+                        let manager = f.makeManager()
+                        let (dirty, target) = try await prepareRestoreClassificationRace(f, manager: manager, initiallyPending: initiallyPending)
+                        let unknown = f.catalog(
+                            dirty,
+                            sequence: dirty.publicationSequence,
+                            catalogRevision: dirty.catalogRevision,
+                            dropping: [target.id],
+                            unavailable: [target.id]
+                        )
+                        if inventoryPath {
+                            XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                                unknown, projection: .full(f.decoded(unknown)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                            ).receipt)
+                            await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                            manager.setCatalogRecordDecodeFailureForTesting { $0 == target.id ? InjectedDecodeFailure() : nil }
+                        }
+                        let entered = Signal("bulk saved-phase read captured same-sequence unknown")
+                        let gate = f.makeGate()
+                        manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                            if id == nil { await gate.wait { entered.fire() } }
+                        }
+                        defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                        let operation: Task<Void, Never>
+                        if inventoryPath {
+                            operation = f.startOwned { _ = await manager.loadWorkspaceSnapshotFromDisk() }
+                        } else {
+                            XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                                unknown, projection: .full(f.decoded(unknown)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                            ).receipt)
+                            let joining = Signal("join captured scheduled classifier")
+                            operation = f.startOwned {
+                                joining.fire()
+                                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                            }
+                            try await f.wait(joining)
+                        }
+                        try await f.wait(entered)
+                        var saved = target
+                        saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                        try f.writeDocument(saved)
+                        manager.setCatalogRecordDecodeFailureForTesting(nil)
+                        manager.activeWorkspace = manager.workspace(withID: target.id)
+                        let result = await manager.requestWorkspaceSwitch(to: target, saveState: false)
+                        XCTAssertFalse(result.didSwitch, "already-active or restore-blocked, without activation side effects")
+                        XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(target.id), !initiallyPending)
+                        gate.release()
+                        await operation.value
+                        XCTAssertEqual(
+                            manager.pendingConsolidatedRestoreIDs.contains(target.id),
+                            !initiallyPending,
+                            "older bulk must not resurrect or erase the same-sequence scoped result (inventory=\(inventoryPath))"
+                        )
+                    }
+                }
+            }
+        }
+
+        func testSameSequenceUnknownAcceptanceRevokesAwaitedAvailableClassification() async throws {
+            for initiallyPending in [false, true] {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    let (dirty, target) = try await prepareRestoreClassificationRace(f, manager: manager, initiallyPending: initiallyPending)
+                    var saved = target
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                    try f.writeDocument(saved)
+                    let entered = Signal("inventory captured available candidate")
+                    let gate = f.makeGate()
+                    var holdFirst = true
+                    manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                        if id == nil, holdFirst {
+                            holdFirst = false
+                            await gate.wait { entered.fire() }
+                        }
+                    }
+                    defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                    let inventory = f.startOwned { _ = await manager.loadWorkspaceSnapshotFromDisk() }
+                    try await f.wait(entered)
+                    let unknown = f.catalog(
+                        dirty,
+                        sequence: dirty.publicationSequence,
+                        catalogRevision: dirty.catalogRevision,
+                        dropping: [target.id],
+                        unavailable: [target.id]
+                    )
+                    XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                        unknown, projection: .full(f.decoded(unknown)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(target.id), initiallyPending)
+                    gate.release()
+                    await inventory.value
+                    XCTAssertEqual(
+                        manager.pendingConsolidatedRestoreIDs.contains(target.id),
+                        initiallyPending,
+                        "a superseded inventory read cannot publish stale saved evidence for a now-unknown member"
+                    )
+                }
+            }
+        }
+
+        func testSameSequenceBulkAcceptanceRevokesScopedSavedClassification() async throws {
+            for initiallyPending in [false, true] {
+                try await Fixture.run { f in
+                    let manager = f.makeManager()
+                    let (dirty, target) = try await prepareRestoreClassificationRace(f, manager: manager, initiallyPending: initiallyPending)
+                    var saved = target
+                    saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                    try f.writeDocument(saved)
+                    let entered = Signal("scoped saved-phase read captured available candidate")
+                    let gate = f.makeGate()
+                    manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                        if id == target.id { await gate.wait { entered.fire() } }
+                    }
+                    defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                    let scoped = f.startOwned { await manager.requestWorkspaceSwitch(to: target, saveState: false) }
+                    try await f.wait(entered)
+                    let unknown = f.catalog(
+                        dirty,
+                        sequence: dirty.publicationSequence,
+                        catalogRevision: dirty.catalogRevision,
+                        dropping: [target.id],
+                        unavailable: [target.id]
+                    )
+                    XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                        unknown, projection: .full(f.decoded(unknown)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(target.id), initiallyPending)
+                    manager.activeWorkspace = manager.workspace(withID: target.id)
+                    gate.release()
+                    let result = await scoped.value
+                    XCTAssertFalse(result.didSwitch)
+                    XCTAssertEqual(
+                        manager.pendingConsolidatedRestoreIDs.contains(target.id),
+                        initiallyPending,
+                        "new accepted unknown evidence revokes an older same-sequence scoped saved read"
+                    )
+                }
+            }
+        }
+
+        func testScopedUnknownResultRevokesOlderBulkSavedClassification() async throws {
+            for inventoryPath in [false, true] {
+                for missingRecord in [false, true] {
+                    for initiallyPending in [false, true] {
+                        try await Fixture.run { f in
+                            let manager = f.makeManager()
+                            let (dirty, target) = try await prepareRestoreClassificationRace(f, manager: manager, initiallyPending: initiallyPending)
+                            let entered = Signal("bulk captured available target before scoped unknown result")
+                            let gate = f.makeGate()
+                            manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                                if id == nil { await gate.wait { entered.fire() } }
+                            }
+                            defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                            let operation: Task<Void, Never>
+                            if inventoryPath {
+                                operation = f.startOwned { _ = await manager.loadWorkspaceSnapshotFromDisk() }
+                            } else {
+                                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                                    dirty, projection: .full(f.decoded(dirty)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                                ).receipt)
+                                let joining = Signal("joined older scheduled classifier")
+                                operation = f.startOwned {
+                                    joining.fire()
+                                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                                }
+                                try await f.wait(joining)
+                            }
+                            try await f.wait(entered)
+                            var saved = target
+                            saved.consolidatedIntoWorkspaceID = initiallyPending ? nil : Fixture.requestedID
+                            try f.writeDocument(saved)
+                            if missingRecord {
+                                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12053)
+                                let record = try XCTUnwrap(dirty.workspaces.first { $0.document.workspaceID == target.id })
+                                let outcome = await client.delete(
+                                    workspaceID: target.id,
+                                    expectedCatalogRevision: dirty.catalogRevision,
+                                    expectedWorkspaceRevision: record.revisions.workingRevision
+                                )
+                                XCTAssertEqual(outcome.disposition, .applied)
+                                // Deletion removes the saved file. Recreate stale saved bytes so an
+                                // obsolete bulk attempt can discriminate both guard directions.
+                                try f.writeDocument(saved)
+                            } else {
+                                manager.setCatalogRecordDecodeFailureForTesting { $0 == target.id ? InjectedDecodeFailure() : nil }
+                            }
+                            manager.activeWorkspace = manager.workspace(withID: target.id)
+                            let result = await manager.requestWorkspaceSwitch(to: target, saveState: false)
+                            XCTAssertFalse(result.didSwitch)
+                            XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(target.id), initiallyPending)
+                            gate.release()
+                            await operation.value
+                            XCTAssertEqual(
+                                manager.pendingConsolidatedRestoreIDs.contains(target.id),
+                                initiallyPending,
+                                "unknown scoped evidence revokes older bulk (inventory=\(inventoryPath), missing=\(missingRecord))"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        func testRetainedUnavailableMemberReregistersScopedReadAfterCanonicalTransition() async throws {
+            for metadataOnly in [false, true] {
+                for pendingRegistration in [false, true] {
+                    try await Fixture.run { f in
+                        let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                        let previousWindows = WindowStatesManager.shared.allWindows
+                        WindowStatesManager.shared.allWindows = [window]
+                        defer { WindowStatesManager.shared.allWindows = previousWindows }
+                        let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                        let base = await client.snapshot()
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            base, projection: .full(f.decoded(base)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
+                        let retained = try XCTUnwrap(manager.activeWorkspace)
+                        // Establish the retained/unknown membership before registering D1. A
+                        // subsequent unchanged membership can legitimately use the metadata path.
+                        let initiallyUnavailable = f.catalog(
+                            base, sequence: base.publicationSequence, catalogRevision: base.catalogRevision,
+                            dropping: [retained.id], unavailable: [retained.id]
+                        )
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            initiallyUnavailable, projection: .full(f.decoded(initiallyUnavailable)),
+                            preferredActiveWorkspaceID: retained.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        let tabID = try XCTUnwrap(retained.activeComposeTabID)
+                        let invocation = ToolInvocationContext.trustedLocal(
+                            toolName: "workspace_context",
+                            metadata: MCPRequestMetadata(
+                                connectionID: UUID(), clientName: "Retained read fixture", windowID: window.windowID,
+                                tabContextHint: MCPTabContextHint(tabID: tabID, workspaceID: retained.id, windowID: window.windowID)
+                            )
+                        )
+                        let firstRead = try await window.mcpServer.resolveDomainReadContext(
+                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                        )
+                        window.mcpServer.releaseDomainReadAppExecutionContext(for: firstRead)
+                        XCTAssertTrue(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id))
+                        var pending: WorkspaceManagerViewModel.DomainReadRegistrationToken?
+                        if pendingRegistration {
+                            manager.invalidateDomainReadRegistration(for: retained.id)
+                            pending = manager.domainReadRegistrationToken(for: retained, fileURL: manager.workspaceFileURL(for: retained))
+                            XCTAssertNotNil(pending)
+                            _ = try await client.registerForRead(retained, fileURL: manager.workspaceFileURL(for: retained))
+                        }
+                        let original = try XCTUnwrap(base.workspaces.first { $0.document.workspaceID == retained.id })
+                        var changed = retained
+                        changed.currentPromptText = "Canonical D2 is not the retained window D1"
+                        changed.composeTabs[0].name = "Canonical D2 context"
+                        let outcome = try await client.replaceWorking(
+                            changed, fileURL: original.document.fileURL, expectedWorkspaceRevision: original.revisions.workingRevision
+                        )
+                        XCTAssertEqual(outcome.disposition, .applied)
+                        let beforeProjectionSnapshot = await client.workspaceSnapshot(retained.id)
+                        let beforeProjectionRead = try XCTUnwrap(beforeProjectionSnapshot)
+                        XCTAssertEqual(try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                            documentBytes: beforeProjectionRead.document.documentBytes, fileURL: beforeProjectionRead.document.fileURL
+                        ).currentPromptText, changed.currentPromptText, "canonical transition removed the existing D1 read overlay")
+                        let canonical = await client.snapshot()
+                        let unavailable = f.catalog(
+                            canonical, sequence: canonical.publicationSequence, catalogRevision: canonical.catalogRevision,
+                            dropping: [retained.id], unavailable: [retained.id]
+                        )
+                        XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                            unavailable, projection: metadataOnly ? .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration) : .full(f.decoded(unavailable)),
+                            preferredActiveWorkspaceID: retained.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        XCTAssertEqual(manager.activeWorkspaceID, retained.id)
+                        XCTAssertEqual(manager.activeWorkspace?.currentPromptText, retained.currentPromptText)
+                        XCTAssertNotNil(manager.workspaceChooserPresentation.failure)
+                        XCTAssertFalse(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id))
+                        if let pending { manager.confirmDomainReadRegistration(pending) }
+                        XCTAssertFalse(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id), "old pending token cannot re-confirm after projection invalidation")
+                        let nextRead = try await window.mcpServer.resolveDomainReadContext(
+                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                        )
+                        defer { window.mcpServer.releaseDomainReadAppExecutionContext(for: nextRead) }
+                        let handle = try XCTUnwrap(nextRead.handle)
+                        let contextSnapshot = await f.runtime.contextStore.snapshot(handle.context)
+                        XCTAssertEqual(contextSnapshot?.metadata.name, retained.composeTabs[0].name, "real scoped context read must match retained window D1")
+                        let routedSnapshot = await f.runtime.contextStore.workspaceSnapshot(retained.id)
+                        let readSnapshot = try XCTUnwrap(routedSnapshot)
+                        XCTAssertEqual(
+                            try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                                documentBytes: readSnapshot.document.documentBytes, fileURL: readSnapshot.document.fileURL
+                            ).currentPromptText,
+                            retained.currentPromptText,
+                            "scoped read must represent retained D1, not canonical D2 (metadata=\(metadataOnly), pending=\(pendingRegistration))"
+                        )
+                        XCTAssertNil(manager.domainReadRegistrationToken(
+                            for: retained, fileURL: manager.workspaceFileURL(for: retained)
+                        ), "steady reads still reuse the newly confirmed registration")
+                        let canonicalRead = await client.canonicalWorkspaceSnapshot(retained.id)
+                        let durable = try XCTUnwrap(canonicalRead)
+                        XCTAssertEqual(durable.document.contentDigest, beforeProjectionRead.document.contentDigest, "read registration must not mutate canonical D2")
+                    }
+                }
+            }
+        }
+
+        func testSupersededCleanupClassificationCannotRetireUnclassifiedOtherMember() async throws {
+            for postSwitchValidation in [false, true] {
+                for missingScopedRecord in [false, true] {
+                    var a = Fixture.standardSeeds[1]
+                    a.repoPaths = ["/tmp/decode-retain-independent-scope"]
+                    var b = Fixture.standardSeeds[2]
+                    b.repoPaths = ["/tmp/decode-retain-other-member-duplicate"]
+                    var canonical = Fixture.model(id: Fixture.namesakeID, name: "Canonical B peer")
+                    canonical.repoPaths = b.repoPaths
+                    canonical.lastUsed = Date(timeIntervalSince1970: 200)
+                    b.lastUsed = Date(timeIntervalSince1970: 100)
+                    try await Fixture.run(seeds: [Fixture.standardSeeds[0], a, b, canonical]) { f in
+                        let manager = f.makeManager()
+                        let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12056)
+                        let clean = await client.snapshot()
+                        let models = try f.decoded(clean)
+                        manager.workspaces = models
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.defaultID)
+                        XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                            clean, projection: .full(models), preferredActiveWorkspaceID: Fixture.defaultID, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                        let previousWindows = WindowStatesManager.shared.allWindows
+                        WindowStatesManager.shared.allWindows = []
+                        defer { WindowStatesManager.shared.allWindows = previousWindows }
+                        let backupDirectory = f.base.appendingPathComponent("coverage-backups", isDirectory: true)
+                        manager.setDuplicateCleanupBackupDirectoryForTesting(backupDirectory)
+                        let group = try XCTUnwrap(manager.duplicateWorkspaceGroups().first)
+                        XCTAssertEqual(group.duplicateWorkspaceIDs, [b.id])
+                        XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(b.id))
+
+                        let aRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == a.id })
+                        var dirtyA = try XCTUnwrap(models.first { $0.id == a.id })
+                        dirtyA.currentPromptText = "Scoped A dirty, saved phase unmarked"
+                        let aOutcome = try await client.replaceWorking(
+                            dirtyA, fileURL: aRecord.document.fileURL, expectedWorkspaceRevision: aRecord.revisions.workingRevision
+                        )
+                        XCTAssertEqual(aOutcome.disposition, .applied)
+                        try f.writeDocument(dirtyA)
+                        let bRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == b.id })
+                        var dirtyB = try XCTUnwrap(models.first { $0.id == b.id })
+                        dirtyB.currentPromptText = "B newly dirty, saved phase still marked"
+                        var savedB = dirtyB
+                        savedB.consolidatedIntoWorkspaceID = canonical.id
+                        if !postSwitchValidation {
+                            let bOutcome = try await client.replaceWorking(
+                                dirtyB, fileURL: bRecord.document.fileURL, expectedWorkspaceRevision: bRecord.revisions.workingRevision
+                            )
+                            XCTAssertEqual(bOutcome.disposition, .applied)
+                            try f.writeDocument(savedB)
+                        }
+
+                        let preEntered = Signal("cleanup first owned bulk read")
+                        let postEntered = Signal("cleanup post-switch owned bulk read includes B")
+                        let preGate = f.makeGate()
+                        let postGate = f.makeGate()
+                        var bulkReads = 0
+                        manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                            guard id == nil else { return }
+                            bulkReads += 1
+                            if bulkReads == 1 { await preGate.wait { preEntered.fire() } }
+                            else { await postGate.wait { postEntered.fire() } }
+                        }
+                        defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                        let cleanup = f.startOwned { await manager.consolidateDuplicateWorkspaces() }
+                        try await f.wait(preEntered)
+                        if postSwitchValidation {
+                            let bOutcome = try await client.replaceWorking(
+                                dirtyB, fileURL: bRecord.document.fileURL, expectedWorkspaceRevision: bRecord.revisions.workingRevision
+                            )
+                            XCTAssertEqual(bOutcome.disposition, .applied)
+                            try f.writeDocument(savedB)
+                            preGate.release()
+                            try await f.wait(postEntered)
+                        }
+                        XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(b.id), "B has not completed its marked saved-phase read")
+                        if missingScopedRecord {
+                            let beforeDelete = await client.snapshot()
+                            let record = try XCTUnwrap(beforeDelete.workspaces.first { $0.document.workspaceID == a.id })
+                            let deleted = await client.delete(
+                                workspaceID: a.id, expectedCatalogRevision: beforeDelete.catalogRevision,
+                                expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(deleted.disposition, .applied)
+                        } else {
+                            manager.setCatalogRecordDecodeFailureForTesting { $0 == a.id ? InjectedDecodeFailure() : nil }
+                        }
+                        let scoped = await manager.requestWorkspaceSwitch(to: dirtyA, saveState: false)
+                        XCTAssertFalse(scoped.didSwitch)
+                        let beforeCleanupContinuation = await client.snapshot()
+                        preGate.release()
+                        postGate.release()
+                        let result = await cleanup.value
+                        XCTAssertEqual(result.groupsConsolidated, 0, "superseded coverage is not completed pre/post validation")
+                        XCTAssertFalse(result.retiredWorkspaceIDs.contains(b.id), "scoped A must not authorize retirement of unread B")
+                        XCTAssertTrue(result.reassignedWindowIDs.isEmpty)
+                        XCTAssertTrue(result.skipped.contains { $0.workspaceID == b.id && $0.reason.contains("superseded") })
+                        if !postSwitchValidation {
+                            XCTAssertNil(result.backupURL)
+                            XCTAssertFalse(FileManager.default.fileExists(atPath: backupDirectory.path))
+                        }
+                        let after = await client.snapshot()
+                        XCTAssertEqual(after.publicationSequence, beforeCleanupContinuation.publicationSequence, "no merge/save/retire after lost classification coverage")
+                        let retainedB = try XCTUnwrap(manager.workspace(withID: b.id))
+                        XCTAssertNil(retainedB.consolidatedIntoWorkspaceID)
+                        let authorityB = try XCTUnwrap(after.workspaces.first { $0.document.workspaceID == b.id })
+                        XCTAssertNil(try manager.decodeDomainWorkspaceCatalogRecord(authorityB).consolidatedIntoWorkspaceID)
+
+                        // Control: a fresh, unsuperseded classification covers B and excludes it.
+                        manager.beforeAuthorityRestoreSavedReadForTesting = nil
+                        manager.setCatalogRecordDecodeFailureForTesting(nil)
+                        let recovered = await manager.consolidateDuplicateWorkspaces()
+                        XCTAssertEqual(recovered.groupsConsolidated, 0)
+                        XCTAssertFalse(recovered.retiredWorkspaceIDs.contains(b.id))
+                        XCTAssertTrue(manager.pendingConsolidatedRestoreIDs.contains(b.id), "completed fresh classification discovers unrelated B's real marker")
+                        XCTAssertTrue(manager.duplicateWorkspaceGroups().isEmpty)
+                    }
+                }
+            }
+        }
+
+        func testFirstCleanupDecodeFailurePrecedesBackupAndActiveDuplicateReassignment() async throws {
+            var canonical = Fixture.standardSeeds[1]
+            var duplicate = Fixture.standardSeeds[2]
+            canonical.lastUsed = Date(timeIntervalSince1970: 200)
+            duplicate.lastUsed = Date(timeIntervalSince1970: 100)
+            try await Fixture.run(seeds: [Fixture.standardSeeds[0], canonical, duplicate], beforeRuntimeStart: { f in
+                let root = f.base.appendingPathComponent("shared-project", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                for var model in [canonical, duplicate] {
+                    model.repoPaths = [root.path]
+                    try f.writeDocument(model)
+                }
+            }) { f in
+                let (canonicalWindow, canonicalManager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let (duplicateWindow, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let snapshot = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(snapshot)
+                for (owner, id) in [(canonicalManager, canonical.id), (manager, duplicate.id)] {
+                    owner.workspaces = models
+                    owner.activeWorkspace = owner.workspace(withID: id)
+                    XCTAssertNotNil(owner.applyDomainWorkspaceCatalog(
+                        snapshot, projection: .full(models), preferredActiveWorkspaceID: id, rootMapPolicy: .snapshotMetadata
+                    ).receipt)
+                    await owner.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                    _ = try await owner.requestWorkspaceSwitch(to: XCTUnwrap(owner.workspace(withID: id)), saveState: false)
+                }
+                canonicalWindow.isCurrentlyFocused = true
+                let previousWindows = WindowStatesManager.shared.allWindows
+                WindowStatesManager.shared.allWindows = [canonicalWindow, duplicateWindow]
+                defer { WindowStatesManager.shared.allWindows = previousWindows }
+                let group = try XCTUnwrap(manager.duplicateWorkspaceGroups().first)
+                XCTAssertEqual(group.canonicalWorkspaceID, canonical.id)
+                XCTAssertEqual(group.duplicateWorkspaceIDs, [duplicate.id])
+                let retained = try XCTUnwrap(manager.activeWorkspace)
+                let selections = f.makeRecorder(manager: manager)
+                let backupDirectory = f.base.appendingPathComponent("cleanup-backups", isDirectory: true)
+                manager.setDuplicateCleanupBackupDirectoryForTesting(backupDirectory)
+                var decodeFailures = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    guard id == duplicate.id else { return nil }
+                    decodeFailures += 1
+                    return InjectedDecodeFailure()
+                }
+                let result = await manager.consolidateDuplicateWorkspaces()
+                XCTAssertGreaterThan(decodeFailures, 0, "cleanup itself must first observe the decode failure")
+                XCTAssertEqual(manager.activeWorkspaceID, duplicate.id)
+                XCTAssertEqual(manager.workspace(withID: duplicate.id), retained)
+                XCTAssertTrue(selections.emittedIDs.allSatisfy { $0 == duplicate.id }, "no temporary unload or reassignment")
+                XCTAssertTrue(result.reassignedWindowIDs.isEmpty)
+                XCTAssertEqual(result.groupsConsolidated, 0)
+                XCTAssertTrue(result.retiredWorkspaceIDs.isEmpty)
+                XCTAssertNil(result.backupURL)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: backupDirectory.path))
+                let unchanged = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(unchanged.publicationSequence, snapshot.publicationSequence, "no save before failed prevalidation")
+
+                manager.setCatalogRecordDecodeFailureForTesting(nil)
+                let recovered = await manager.consolidateDuplicateWorkspaces()
+                XCTAssertEqual(recovered.groupsConsolidated, 1, "decoded known-group cleanup still works")
+                XCTAssertEqual(manager.activeWorkspaceID, canonical.id)
+            }
+        }
+
+        func testScopedRestoreDecodeFailurePreservesGuardWithoutSavedRead() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let (_, target) = try await prepareRestoreClassificationRace(f, manager: manager, initiallyPending: true)
+                try f.writeDocument(target)
+                var savedReads = 0
+                manager.beforeAuthorityRestoreSavedReadForTesting = { id in if id == target.id { savedReads += 1 } }
+                defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                manager.setCatalogRecordDecodeFailureForTesting { $0 == target.id ? InjectedDecodeFailure() : nil }
+                let blocked = await manager.requestWorkspaceSwitch(to: target, saveState: false)
+                XCTAssertFalse(blocked.didSwitch)
+                XCTAssertTrue(manager.pendingConsolidatedRestoreIDs.contains(target.id))
+                XCTAssertEqual(savedReads, 0, "unknown working identity cannot authorize saved-phase evidence")
+                manager.setCatalogRecordDecodeFailureForTesting(nil)
+                _ = await manager.requestWorkspaceSwitch(to: target, saveState: false)
+                XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(target.id))
+                XCTAssertEqual(savedReads, 1)
+            }
+        }
+
+        func testUnknownCleanMemberIsExcludedFromKnownDuplicateGroup() async throws {
+            var seeds = Fixture.standardSeeds
+            seeds[1].repoPaths = ["/tmp/decode-retain-unknown-duplicate"]
+            seeds[2].repoPaths = seeds[1].repoPaths
+            var peer = Fixture.model(id: Fixture.namesakeID, name: "Known cleanup peer")
+            peer.repoPaths = seeds[1].repoPaths
+            seeds.append(peer)
+            try await Fixture.run(seeds: seeds, unavailableSeedIDs: [Fixture.aardvarkID]) { f in
+                let manager = f.makeManager()
+                let snapshot = await f.runtime.workspaceStore.snapshot()
+                let retained = seeds[1]
+                try f.writeDocument(retained)
+                var urls = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) })
+                var revisions = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.revisions) })
+                urls[retained.id] = f.workspaceURL(for: retained)
+                revisions[retained.id] = .init(workingRevision: 1, savedRevision: 1, dirtyRevision: nil)
+                XCTAssertTrue(try manager.applyDomainWorkspaceProjection(
+                    f.decoded(snapshot) + [retained], fileURLsByWorkspaceID: urls, revisionsByWorkspaceID: revisions,
+                    digestsByWorkspaceID: [:], healthByWorkspaceID: [:],
+                    catalogRevision: snapshot.catalogRevision, preferredActiveWorkspaceID: nil, publicationSequence: snapshot.publicationSequence
+                ))
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    snapshot, projection: .full(f.decoded(snapshot)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(retained.id))
+                let group = try XCTUnwrap(manager.duplicateWorkspaceGroups().first)
+                XCTAssertEqual(Set(group.duplicateWorkspaceIDs + [group.canonicalWorkspaceID]), [Fixture.requestedID, Fixture.namesakeID])
+                manager.setDuplicateCleanupBackupDirectoryForTesting(f.base.appendingPathComponent("cleanup-backups"))
+                let result = await manager.consolidateDuplicateWorkspaces()
+                XCTAssertEqual(result.groupsConsolidated, 1)
+                XCTAssertEqual(manager.workspace(withID: retained.id), retained, "unknown member is neither canonical evidence nor a retirement target")
+            }
+        }
+
+        func testStartupUnavailableMembersWithoutAcceptedModelsDoNotInventRows() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                XCTAssertNil(manager.activeWorkspaceID)
+                let base = await f.runtime.workspaceStore.snapshot()
+                let unknownID = UUID()
+                let unavailable = f.catalog(
+                    base, sequence: base.publicationSequence + 1, catalogRevision: base.catalogRevision + 1,
+                    dropping: [Fixture.aardvarkID], unavailable: [Fixture.aardvarkID, unknownID]
+                )
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    unavailable, projection: .full(f.decoded(unavailable)), preferredActiveWorkspaceID: Fixture.aardvarkID,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                XCTAssertNil(manager.workspace(withID: Fixture.aardvarkID), "a disk row is not an accepted model")
+                XCTAssertNil(manager.workspace(withID: unknownID))
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID, "only decoded canonical System evidence can recover startup")
+                let chooser = f.makeChooserRecorder(manager: manager)
+                for query in [WorkspaceChooserQuery.compact(maxRecent: 5), .expanded(collection: .saved, searchText: "")] {
+                    let value = try chooser.consume(query)
+                    XCTAssertEqual(value.orderedIDs, [Fixture.requestedID])
+                    XCTAssertEqual(value.failure?.kind, .unavailableMembers([Fixture.aardvarkID, unknownID]))
+                }
             }
         }
 
@@ -3222,7 +4157,7 @@ import XCTest
                     let before = try chooser.consume(saved)
                     XCTAssertEqual(before.orderedIDs, expected)
                     XCTAssertEqual(before.failureID, failure.id)
-                    XCTAssertFalse(manager.workspaces.contains { $0.id == Fixture.requestedID })
+                    XCTAssertEqual(manager.workspaces.contains { $0.id == Fixture.requestedID }, retainsComplete, "retain only a last-known accepted unavailable member")
                     XCTAssertTrue(manager.workspaces.contains { $0.id == introduced.id })
 
                     let a = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.aardvarkID })
@@ -4458,6 +5393,7 @@ import XCTest
                 manager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
                 manager.setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(nil)
                 manager.setCatalogRecordDecodeFailureForTesting(nil)
+                manager.beforeAuthorityRestoreSavedReadForTesting = nil
                 manager.beforeFailedSaveCatalogApplicationForTesting = nil
                 for id in manager.pendingConsolidatedRestoreIDs {
                     manager.setActiveConsolidatedRestoreProtectionForTesting(id, isProtected: false)
