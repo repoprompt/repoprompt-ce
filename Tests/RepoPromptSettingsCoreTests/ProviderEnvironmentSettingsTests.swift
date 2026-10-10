@@ -30,7 +30,9 @@ final class ProviderEnvironmentSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let fileURL = directory.appendingPathComponent("settings.json")
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexGoalSupportEnabled: true)))
-        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(document)) as? [String: Any])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(document)) as? [String: Any])
         var scalars = try XCTUnwrap(raw["scalarPreferences"] as? [String: Any])
         var agentMode = try XCTUnwrap(scalars["agentMode"] as? [String: Any])
         agentMode["futureSetting"] = ["keep": true]
