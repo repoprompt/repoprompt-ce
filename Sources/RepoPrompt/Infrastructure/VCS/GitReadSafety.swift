@@ -107,27 +107,27 @@ enum GitReadSafety {
         let checksMergeDrivers = command.map { ["log", "show", "merge-tree"].contains($0) } ?? true
         guard data.isEmpty || data.last == 0,
               let text = String(data: data, encoding: .utf8)
-        else { throw GitError(message: "Git inspection could not validate driver configuration") }
+        else { throw GitService.GitError(message: "Git inspection could not validate driver configuration") }
         if text.isEmpty { return }
         let fields = text.split(separator: "\0", omittingEmptySubsequences: false)
         guard fields.count % 2 == 1, fields.last?.isEmpty == true else {
-            throw GitError(message: "Git inspection could not validate driver configuration")
+            throw GitService.GitError(message: "Git inspection could not validate driver configuration")
         }
         for index in stride(from: 0, to: fields.count - 1, by: 2) {
             let scope = fields[index]
             guard ["system", "global", "local", "worktree", "command"].contains(String(scope)) else {
-                throw GitError(message: "Git inspection could not validate driver configuration")
+                throw GitService.GitError(message: "Git inspection could not validate driver configuration")
             }
             let entry = fields[index + 1].split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
             guard !entry[0].isEmpty else {
-                throw GitError(message: "Git inspection could not validate driver configuration")
+                throw GitService.GitError(message: "Git inspection could not validate driver configuration")
             }
             let key = String(entry[0]).lowercased()
             let relevant = (checksFilters && key.hasPrefix("filter."))
                 || (checksMergeDrivers && key.hasPrefix("merge."))
             if relevant, scope == "local" || scope == "worktree" {
                 guard entry.count == 2, entry[1].isEmpty else {
-                    throw GitError(message: "Passive Git inspection is unavailable for repository-configured executable filters or merge drivers. Use an explicitly trusted Git workflow for this repository.")
+                    throw GitService.GitError(message: "Passive Git inspection is unavailable for repository-configured executable filters or merge drivers. Use an explicitly trusted Git workflow for this repository.")
                 }
             }
         }
