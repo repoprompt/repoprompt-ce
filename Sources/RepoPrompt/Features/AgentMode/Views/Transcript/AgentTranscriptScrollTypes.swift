@@ -1,20 +1,6 @@
 import SwiftUI
 
-// MARK: - Scroll Placement & Reason
-
-enum AgentTranscriptScrollPlacement {
-    case top
-    case bottom
-
-    var unitPoint: UnitPoint {
-        switch self {
-        case .top:
-            .top
-        case .bottom:
-            .bottom
-        }
-    }
-}
+// MARK: - Scroll Reason
 
 enum AgentTranscriptScrollReason {
     case sessionSwitchRestore
@@ -33,21 +19,20 @@ enum AgentTranscriptScrollReason {
 
 // MARK: - Scroll Intent
 
+/// A programmatic scroll request. Executed through a `TranscriptScrollDriver`.
 enum AgentTranscriptScrollIntent {
     case bottom(animated: Bool, reason: AgentTranscriptScrollReason)
-    case anchor(AgentTranscriptAnchor, placement: AgentTranscriptScrollPlacement, animated: Bool, reason: AgentTranscriptScrollReason)
-    case viewportTarget(AgentTranscriptViewportTargetID, placement: AgentTranscriptScrollPlacement, animated: Bool, reason: AgentTranscriptScrollReason)
 
     var isAnimated: Bool {
         switch self {
-        case let .bottom(animated, _), let .anchor(_, _, animated, _), let .viewportTarget(_, _, animated, _):
+        case let .bottom(animated, _):
             animated
         }
     }
 
     var reason: AgentTranscriptScrollReason {
         switch self {
-        case let .bottom(_, reason), let .anchor(_, _, _, reason), let .viewportTarget(_, _, _, reason):
+        case let .bottom(_, reason):
             reason
         }
     }
@@ -148,12 +133,6 @@ enum AgentTranscriptRehydrateRestorePhase: Equatable {
 
 // MARK: - Viewport Types
 
-struct AgentTranscriptBlockViewportFrame: Equatable {
-    let blockID: String
-    let minY: CGFloat
-    let maxY: CGFloat
-}
-
 struct AgentTranscriptRehydrateRetryKey: Equatable {
     let tabID: UUID
     let presentationRevision: Int
@@ -170,15 +149,6 @@ struct AgentTranscriptRestoreSignal: Equatable {
     let tabID: UUID?
     let bindingsHydrated: Bool
     let presentationRevision: Int
-}
-
-struct AgentTranscriptViewportCandidate: Equatable {
-    let targetID: AgentTranscriptViewportTargetID
-    let semanticAnchor: AgentTranscriptAnchor?
-    let sequenceIndex: Int?
-    let fallbackBlockID: String?
-    let minY: CGFloat
-    let maxY: CGFloat
 }
 
 struct AgentTranscriptScrollMetrics: Equatable {
@@ -279,8 +249,7 @@ enum AgentTranscriptPinnedMaintenanceInvalidationReason: String, Equatable {
         var wasTrackingLargeStreamingHistoricalExposure = false
         var detachedJumpCount = 0
         var maxDetachedJumpMagnitude: CGFloat = 0
-        var detachedAnchorChangeCount = 0
-        var detachedSnapToTopCount = 0
+        var snapBackWhileReadingCount = 0
         var detachedAcceptedDriftCount = 0
         var detachedRestoreIntentCount = 0
         var lastDetachedRebaseAction: String?
@@ -292,8 +261,6 @@ enum AgentTranscriptPinnedMaintenanceInvalidationReason: String, Equatable {
         var smoothSendCorrectiveScrollCount = 0
         var lastSmoothSendSettleDurationMS: Double?
         var maxSmoothSendSettleDurationMS: Double = 0
-        var viewportFrameUpdateCount = 0
-        var viewportCandidateUpdateCount = 0
         var lastScrollIntentReason: String?
         var wasTrackingPinnedDrift = false
         var wasTrackingJump = false
@@ -321,18 +288,13 @@ enum AgentTranscriptPinnedMaintenanceInvalidationReason: String, Equatable {
     }
 #endif
 
-// MARK: - Detached Rebase & Viewport
+// MARK: - Detached Rebase
 
 struct AgentDetachedRebaseKey: Equatable {
     let baseTargetID: AgentTranscriptViewportTargetID?
     let baseAnchor: AgentTranscriptAnchor?
     let baseSequenceIndex: Int?
     let family: AgentDetachedAuthorityFamily?
-}
-
-struct DetachedViewportTarget {
-    let anchor: AgentTranscriptAnchor?
-    let baseSequenceIndex: Int?
 }
 
 struct RepinGraceState: Equatable {

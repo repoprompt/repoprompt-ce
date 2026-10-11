@@ -257,6 +257,37 @@ recorders at each trial; it makes no preference changes and creates no files.
 Unrelated test-runner output is not a privacy-safe shareable report: extract only
 the typed matrix records. Ordinary test runs skip the diagnostic unless opted in.
 
+## Agent transcript pipeline timing diagnostics
+
+This is an opt-in diagnostic, not a CI timing gate. Treat its output as evidence
+only, not a pass/fail result, until an acceptance threshold is added: import and
+compaction are currently super-linear in turn count, so any bound today would only
+restate the current numbers.
+
+`AgentTranscriptProjectionTimingDiagnostics` builds a synthetic Agent Mode session
+of 50, 150, 300 and 1000 turns (per turn: user request, assistant opener, four tool
+call/result pairs with ~1.5 KB JSON results, markdown conclusion) and times legacy
+import, compaction/retention, full projection, the default tail window, and the
+persistence pipeline. Each stage is a single monotonic wall-clock sample with no
+warmup, in the Debug test build, so compare samples only on the same machine,
+configuration and fixture parameters. It is self-contained in
+`Tests/RepoPromptTests/AgentMode/Transcript/AgentRetentionCompactionTests.swift` and
+uses only pre-existing transcript APIs, so the file can be copied onto another
+revision for a controlled comparison.
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test \
+  --filter RepoPromptTests.AgentTranscriptProjectionTimingDiagnostics/testTranscriptPipelineTimingAcrossSessionSizes \
+  --async --request-key transcript-timing
+./conductor job wait --request-key transcript-timing
+```
+
+The conductor log carries one `TRANSCRIPT_TIMING` and one `TRANSCRIPT_BYTES` line per
+size, each prefixed with the fixture parameters (`turns`, `itemsPerTurn`,
+`toolCallsPerTurn`, `toolResultPayloadBytes`, `items`). The only assertions are
+fixture contracts (every synthetic turn imported and retained, projections
+non-empty). Ordinary test runs skip it unless opted in.
+
 ## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.

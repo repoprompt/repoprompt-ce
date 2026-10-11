@@ -216,7 +216,6 @@ struct AgentModeChatDetailView: View {
     // Non-grouped state
     @State private var resetTextFieldTrigger = false
     @State private var isTranscriptWindowExpanded = false
-    @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
     // MARK: - Computed Shims (bridge existing references to struct members)
 
@@ -253,11 +252,6 @@ struct AgentModeChatDetailView: View {
         nonmutating set { scrollEngine.rehydrate = newValue }
     }
 
-    private var detachedSnapshot: DetachedViewportSnapshotState {
-        get { scrollEngine.detachedSnapshot }
-        nonmutating set { scrollEngine.detachedSnapshot = newValue }
-    }
-
     private var detachedRebase: DetachedRebaseCaptureState {
         get { scrollEngine.detachedRebase }
         nonmutating set { scrollEngine.detachedRebase = newValue }
@@ -276,16 +270,6 @@ struct AgentModeChatDetailView: View {
     private var programmaticScrollGate: ProgrammaticScrollGate {
         get { scrollEngine.programmaticScrollGate }
         nonmutating set { scrollEngine.programmaticScrollGate = newValue }
-    }
-
-    private var pendingProgrammaticRestoreTargetID: AgentTranscriptViewportTargetID? {
-        get { scrollEngine.pendingProgrammaticRestoreTargetID }
-        nonmutating set { scrollEngine.pendingProgrammaticRestoreTargetID = newValue }
-    }
-
-    private var pendingProgrammaticRestoreAnchor: AgentTranscriptAnchor? {
-        get { scrollEngine.pendingProgrammaticRestoreAnchor }
-        nonmutating set { scrollEngine.pendingProgrammaticRestoreAnchor = newValue }
     }
 
     // 2a: TranscriptPresentationViewState shims
@@ -498,58 +482,7 @@ struct AgentModeChatDetailView: View {
         nonmutating set { scrollEngine.rehydrate.currentLayoutSampleKey = newValue }
     }
 
-    // 2f: DetachedViewportSnapshotState shims
-    private var topVisibleBlockID: String? {
-        get { detachedSnapshot.topVisibleBlockID }
-        nonmutating set { detachedSnapshot.topVisibleBlockID = newValue }
-    }
-
-    private var topVisibleBlockAnchor: AgentTranscriptAnchor? {
-        get { detachedSnapshot.topVisibleBlockAnchor }
-        nonmutating set { detachedSnapshot.topVisibleBlockAnchor = newValue }
-    }
-
-    private var topVisibleBlockMinY: CGFloat? {
-        get { detachedSnapshot.topVisibleBlockMinY }
-        nonmutating set { detachedSnapshot.topVisibleBlockMinY = newValue }
-    }
-
-    private var topVisibleViewportTargetID: AgentTranscriptViewportTargetID? {
-        get { detachedSnapshot.topVisibleViewportTargetID }
-        nonmutating set { detachedSnapshot.topVisibleViewportTargetID = newValue }
-    }
-
-    private var topVisibleViewportAnchor: AgentTranscriptAnchor? {
-        get { detachedSnapshot.topVisibleViewportAnchor }
-        nonmutating set { detachedSnapshot.topVisibleViewportAnchor = newValue }
-    }
-
-    private var topVisibleViewportSequenceIndex: Int? {
-        get { detachedSnapshot.topVisibleViewportSequenceIndex }
-        nonmutating set { detachedSnapshot.topVisibleViewportSequenceIndex = newValue }
-    }
-
-    private var topVisibleViewportFallbackBlockID: String? {
-        get { detachedSnapshot.topVisibleViewportFallbackBlockID }
-        nonmutating set { detachedSnapshot.topVisibleViewportFallbackBlockID = newValue }
-    }
-
-    private var topVisibleViewportMinY: CGFloat? {
-        get { detachedSnapshot.topVisibleViewportMinY }
-        nonmutating set { detachedSnapshot.topVisibleViewportMinY = newValue }
-    }
-
     // 2g: DetachedRebaseCaptureState shims
-    private var pendingDetachedAnchorChangeAnchor: AgentTranscriptAnchor? {
-        get { detachedRebase.pendingAnchorChangeAnchor }
-        nonmutating set { detachedRebase.pendingAnchorChangeAnchor = newValue }
-    }
-
-    private var pendingDetachedAnchorChangeBlockID: String? {
-        get { detachedRebase.pendingAnchorChangeBlockID }
-        nonmutating set { detachedRebase.pendingAnchorChangeBlockID = newValue }
-    }
-
     private var detachedPresentationRevisionCheckToken: UInt64 {
         get { detachedRebase.presentationRevisionCheckToken }
         nonmutating set { detachedRebase.presentationRevisionCheckToken = newValue }
@@ -652,7 +585,6 @@ struct AgentModeChatDetailView: View {
     private static let bottomScrollOutcomeViewportHeightMutationThreshold: CGFloat = 2
     private static let restoreScrollResponsivenessSuppressionDuration: TimeInterval = 0.35
     private static let rawScrollHistoryAvailabilityEpsilon: CGFloat = 1
-    private static let viewportSnapshotMinYEpsilon: CGFloat = 1.0
 
     private var isHigherPriorityScrollMaintenanceActive: Bool {
         smoothPinnedSendState != nil
@@ -689,10 +621,6 @@ struct AgentModeChatDetailView: View {
         switch intent {
         case let .bottom(animated, reason):
             "bottom(animated:\(animated),reason:\(reason))"
-        case let .anchor(anchor, placement, animated, reason):
-            "anchor(anchor:\(anchor),placement:\(placement),animated:\(animated),reason:\(reason))"
-        case let .viewportTarget(targetID, placement, animated, reason):
-            "viewportTarget(target:\(targetID),placement:\(placement),animated:\(animated),reason:\(reason))"
         }
     }
 
@@ -1077,11 +1005,6 @@ struct AgentModeChatDetailView: View {
 
     private func clearLiveTranscriptViewportCaptureState(shouldResetDetachedRebaseTracking: Bool) {
         clearPendingDetachedSettleCaptureState()
-        topVisibleBlockID = nil
-        topVisibleBlockAnchor = nil
-        topVisibleBlockMinY = nil
-        clearTrackedViewportCandidateState()
-        viewportRegistry.clearBlockFrames()
         detachedPresentationRevisionCheckToken &+= 1
         if shouldResetDetachedRebaseTracking {
             resetDetachedRebaseTracking()
@@ -1376,13 +1299,12 @@ struct AgentModeChatDetailView: View {
 
     #if DEBUG
         private func debugConsoleStateSummary() -> String {
-            let topAnchor = effectiveStressTopVisibleAnchorDescription ?? "nil"
-            let topTarget = topVisibleViewportTargetID.map(String.init(describing:)) ?? "nil"
+            let topBlock = stressHarness?.readingProbe?.tracker.anchorBlockID ?? "nil"
             let pendingSource = pendingPinnedBottomSource.map(String.init(describing:)) ?? "nil"
             let deferredSource = deferredPinnedCorrectionAfterSmoothSend.map(String.init(describing:)) ?? "nil"
             let lastIntent = stressTelemetryState.lastScrollIntentReason ?? "nil"
             let lastSettled = stressTelemetryState.lastSettledBottomReason ?? "nil"
-            return "tab=\(debugShortID(currentTabID)) pinned=\(isPinnedToLiveBottom) detached=\(userDetachedAutoFollow) nearBottom=\(isNearBottom) distance=\(Int(scrollMetrics.distanceToBottom)) canHistory=\(canScrollTowardHistory) canBottom=\(canScrollTowardLiveBottom) interacting=\(isUserInteractingWithScroll) userPhase=\(currentUserScrollPhase.rawValue) sessionActive=\(activeUserScrollSession != nil) inFlight=\(programmaticScrollGate.isInFlight) blocker=\(isInteractionBlockerVisible) topAnchor=\(topAnchor) topTarget=\(topTarget) pendingSource=\(pendingSource) deferredSource=\(deferredSource) lastIntent=\(lastIntent) lastSettled=\(lastSettled) rows=\(renderedTranscriptRows.count) blocks=\(visibleTranscriptBlocks.count)"
+            return "tab=\(debugShortID(currentTabID)) pinned=\(isPinnedToLiveBottom) detached=\(userDetachedAutoFollow) nearBottom=\(isNearBottom) distance=\(Int(scrollMetrics.distanceToBottom)) canHistory=\(canScrollTowardHistory) canBottom=\(canScrollTowardLiveBottom) interacting=\(isUserInteractingWithScroll) userPhase=\(currentUserScrollPhase.rawValue) sessionActive=\(activeUserScrollSession != nil) inFlight=\(programmaticScrollGate.isInFlight) blocker=\(isInteractionBlockerVisible) topBlock=\(topBlock) pendingSource=\(pendingSource) deferredSource=\(deferredSource) lastIntent=\(lastIntent) lastSettled=\(lastSettled) rows=\(renderedTranscriptRows.count) blocks=\(visibleTranscriptBlocks.count)"
         }
 
         private func debugConsoleLog(_ event: String, details: @autoclosure () -> String = "") {
@@ -1452,6 +1374,44 @@ struct AgentModeChatDetailView: View {
             stressHarness?.note(message)
         #endif
     }
+
+    #if DEBUG
+        /// Reading state used by the stress harness reading-position telemetry.
+        private var stressReadingContext: AgentChatStressReadingPositionTracker.Context {
+            .init(
+                isDetachedReading: userDetachedAutoFollow && !isPinnedToLiveBottom,
+                hasUserScrollInput: isUserInteractingWithScroll || activeUserScrollSession != nil,
+                isProgrammaticScrollInFlight: programmaticScrollGate.isInFlight || isRehydrateRestoreActive
+            )
+        }
+
+        private func recordStressReadingFrame(blockID: String, frame: CGRect) {
+            guard let readingProbe = stressHarness?.readingProbe else { return }
+            guard let shift = readingProbe.recordFrame(blockID: blockID, frame: frame, context: stressReadingContext) else {
+                return
+            }
+            noteStressHarness(
+                "Position shift while reading: block=\(blockID) shift=\(String(format: "%.1f", shift)) count=\(readingProbe.tracker.positionShiftWhileReadingCount) distance=\(Int(scrollMetrics.distanceToBottom))"
+            )
+        }
+
+        /// Counts programmatic bottom scrolls that execute while the user is reading detached history.
+        private func recordStressSnapBackIfNeeded(_ intent: AgentTranscriptScrollIntent) {
+            guard isStressHarnessEnabled,
+                  case let .bottom(_, reason) = intent,
+                  userDetachedAutoFollow,
+                  !isPinnedToLiveBottom
+            else {
+                return
+            }
+            // Legitimate bottom scrolls (bottom button, send while detached) call pinToLiveBottom()
+            // before scrolling, so any bottom scroll that runs while still detached is a snap-back.
+            stressTelemetryState.snapBackWhileReadingCount += 1
+            noteStressHarness(
+                "Snap-back while reading: reason=\(reason) distance=\(Int(scrollMetrics.distanceToBottom)) count=\(stressTelemetryState.snapBackWhileReadingCount)"
+            )
+        }
+    #endif
 
     private var stressHarnessCatastrophicJumpThresholdPoints: CGFloat? {
         #if DEBUG
@@ -1677,98 +1637,8 @@ struct AgentModeChatDetailView: View {
         transcriptRenderMetadata(for: blocks.flatMap(renderedRows(for:)))
     }
 
-    private var renderedTranscriptRowIDs: Set<UUID> {
-        Set(renderedTranscriptRows.map(\.id))
-    }
-
-    private var detachedViewportTrackingMode: AgentDetachedViewportTrackingMode {
-        guard userDetachedAutoFollow || isUserInteractingWithScroll || isStressHarnessEnabled else {
-            return .off
-        }
-        guard activeUserScrollSession != nil
-            || detachedRestoreRowTrackingTargetID != nil
-            || isStressHarnessEnabled
-        else {
-            return .blockOnly
-        }
-        let trackedBlockIDs = detachedViewportTrackedBlockIDs
-        return trackedBlockIDs.isEmpty ? .blockOnly : .targetedRows(trackedBlockIDs)
-    }
-
-    private var shouldTrackDetachedViewportCandidates: Bool {
-        detachedViewportTrackingMode.shouldTrackCandidates
-    }
-
-    private var detachedViewportTrackedBlockIDs: Set<String> {
-        var blockIDs: Set<String> = []
-        if let topVisibleBlockID {
-            blockIDs.insert(topVisibleBlockID)
-        }
-        if let topVisibleViewportFallbackBlockID {
-            blockIDs.insert(topVisibleViewportFallbackBlockID)
-        }
-        if let pendingDetachedAnchorChangeBlockID {
-            blockIDs.insert(pendingDetachedAnchorChangeBlockID)
-        }
-        if let restoreTargetID = detachedRestoreRowTrackingTargetID,
-           let blockID = resolveVisibleBlockID(containing: restoreTargetID)
-        {
-            blockIDs.insert(blockID)
-        }
-        if blockIDs.isEmpty,
-           let firstVisibleBlockID = visibleTranscriptBlocks.first?.id
-        {
-            blockIDs.insert(firstVisibleBlockID)
-        }
-        return blockIDs.intersection(visibleTranscriptBlockIDs)
-    }
-
-    private var detachedRestoreRowTrackingTargetID: AgentTranscriptViewportTargetID? {
-        guard userDetachedAutoFollow,
-              !isPinnedToLiveBottom,
-              let explicitTargetID = pendingProgrammaticRestoreTargetID,
-              case .row = explicitTargetID
-        else {
-            return nil
-        }
-        return explicitTargetID
-    }
-
-    private func clearTrackedViewportCandidateState() {
-        topVisibleViewportTargetID = nil
-        topVisibleViewportAnchor = nil
-        topVisibleViewportSequenceIndex = nil
-        topVisibleViewportFallbackBlockID = nil
-        topVisibleViewportMinY = nil
-        viewportRegistry.clearViewportCandidates()
-    }
-
-    private var visibleTranscriptBlockIDs: Set<String> {
-        Set(visibleTranscriptBlocks.map(\.id))
-    }
-
-    private func shouldUpdateViewportMinY(_ current: CGFloat?, to next: CGFloat?) -> Bool {
-        switch (current, next) {
-        case (nil, nil):
-            false
-        case let (current?, next?):
-            abs(current - next) >= Self.viewportSnapshotMinYEpsilon
-        default:
-            true
-        }
-    }
-
     private var canScrollTowardHistory: Bool {
-        let effectiveTopVisibleBlockID = userDetachedAutoFollow
-            ? (topVisibleViewportFallbackBlockID ?? topVisibleBlockID)
-            : topVisibleBlockID
-        return AgentTranscriptScrollCapabilityResolver.canScrollTowardHistory(
-            firstVisibleBlockID: visibleTranscriptBlocks.first?.id,
-            effectiveTopVisibleBlockID: effectiveTopVisibleBlockID,
-            rawVisibleMinY: nil,
-            fallbackVisibleMinY: scrollMetrics.visibleMinY,
-            epsilon: Self.rawScrollHistoryAvailabilityEpsilon
-        )
+        scrollMetrics.visibleMinY > Self.rawScrollHistoryAvailabilityEpsilon
     }
 
     private var canScrollTowardLiveBottom: Bool {
@@ -1920,6 +1790,15 @@ struct AgentModeChatDetailView: View {
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     versionedScrollableContent(proxy: proxy, viewportHeight: geometry.size.height)
+
+                    #if DEBUG
+                        if let stressHarness {
+                            AgentChatStressFrameProbeView(sampler: stressHarness.frameIntervalSampler)
+                                .frame(width: 0, height: 0)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
+                    #endif
 
                     VStack(spacing: 10) {
                         #if DEBUG
@@ -2218,6 +2097,11 @@ struct AgentModeChatDetailView: View {
         }
 
         syncTranscriptBlockExpansion(for: newSnapshot.visibleBlocks)
+        #if DEBUG
+            if visibleBlocksChanged {
+                stressHarness?.readingProbe?.retainFrames(for: Set(newSnapshot.visibleBlocks.map(\.id)))
+            }
+        #endif
         publishGroupingSnapshot()
         publishStressTelemetrySnapshot()
 
@@ -2300,66 +2184,89 @@ struct AgentModeChatDetailView: View {
         }
         .id(transcriptScrollResetRevision)
         .accessibilityIdentifier("agentTranscript.scrollView")
-        .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
             if didChatChange { txn.disablesAnimations = true }
         }
         .onScrollGeometryChange(for: AgentTranscriptScrollMetrics.self, of: { geometry in
             scrollMetrics(from: geometry)
         }, action: { _, newMetrics in
-            let oldMetrics = applyScrollMetrics(newMetrics)
-            recordRehydrateLayoutSampleIfNeeded(metrics: newMetrics)
-            recordPendingBottomScrollOutcomeLayoutMutationIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
-            recordUserScrollProgressIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
-            recordScrollGeometryTransition(proxy: proxy, oldMetrics: oldMetrics, newMetrics: newMetrics)
-            if isRehydrateRestoreActive {
-                finishRehydrateRestoreIfSettled()
-                return
-            }
-            if !runInteractionSnapshot.runState.isActive,
-               resolveIdleBoundaryDetachIfNeeded(currentMetrics: newMetrics)
-            {
-                return
-            }
-            guard let session = activeUserScrollSession else { return }
-            guard !programmaticScrollGate.isInFlight else { return }
-            guard !isInteractionBlockerVisible else { return }
-            if AgentTranscriptAutoFollowRearmPolicy.shouldDetachFromLiveBottom(
-                runtime: makeScrollRuntimeState(distanceToBottom: newMetrics.distanceToBottom),
-                latestManualIntent: session.latestIntent,
-                progress: makeViewportProgress(
-                    baselineDistanceToBottom: session.baselineMetrics.distanceToBottom,
-                    baselineVisibleMinY: session.baselineMetrics.visibleMinY,
-                    currentDistanceToBottom: newMetrics.distanceToBottom,
-                    currentVisibleMinY: newMetrics.visibleMinY
-                ),
-                minimumViewportEscapeDistance: Self.detachDistanceThreshold,
-                suppressGeometryDetach: shouldSuppressGeometryDrivenPinnedDetach(),
-                suppressRepinGraceDetach: shouldSuppressRepinGraceDetach(newMetrics: newMetrics)
-            ) {
-                detachFromLiveBottom(markUserDetached: true)
-            }
+            handleScrollDriverEvent(.metricsChanged(newMetrics), proxy: proxy)
         })
         .onScrollPhaseChange { oldPhase, newPhase, context in
             debugLog("scrollPhase", details: "old=\(oldPhase) new=\(newPhase)")
-            currentUserScrollPhase = userScrollPhase(from: newPhase)
-            switch currentUserScrollPhase {
-            case .tracking, .interacting, .decelerating:
-                let phaseMetrics = scrollMetrics(from: context.geometry)
-                _ = applyScrollMetrics(phaseMetrics)
-                beginUserScrollInteractionIfNeeded(
-                    proxy: proxy,
-                    phase: currentUserScrollPhase,
-                    metrics: phaseMetrics
-                )
-            case .idle:
-                let finalMetrics = scrollMetrics(from: context.geometry)
-                _ = applyScrollMetrics(finalMetrics)
-                finalizeUserScrollInteraction(proxy: proxy, finalMetrics: finalMetrics)
-            case .animating:
-                if !programmaticScrollGate.isInFlight {
-                    cancelInvalidPendingBottomScrollOutcome(reason: "manualAnimation")
-                }
+            handleScrollDriverEvent(
+                .phaseChanged(userScrollPhase(from: newPhase), metrics: scrollMetrics(from: context.geometry)),
+                proxy: proxy
+            )
+        }
+    }
+
+    /// Single entry point for scroll reports coming back from the transcript scroll
+    /// container (see `TranscriptScrollDriverEvent`).
+    private func handleScrollDriverEvent(_ event: TranscriptScrollDriverEvent, proxy: ScrollViewProxy) {
+        switch event {
+        case let .metricsChanged(newMetrics):
+            handleScrollMetricsChanged(newMetrics, proxy: proxy)
+        case let .phaseChanged(phase, metrics):
+            handleScrollPhaseChanged(phase, metrics: metrics, proxy: proxy)
+        }
+    }
+
+    private func handleScrollMetricsChanged(_ newMetrics: AgentTranscriptScrollMetrics, proxy: ScrollViewProxy) {
+        let oldMetrics = applyScrollMetrics(newMetrics)
+        recordRehydrateLayoutSampleIfNeeded(metrics: newMetrics)
+        recordPendingBottomScrollOutcomeLayoutMutationIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
+        recordUserScrollProgressIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
+        recordScrollGeometryTransition(proxy: proxy, oldMetrics: oldMetrics, newMetrics: newMetrics)
+        if isRehydrateRestoreActive {
+            finishRehydrateRestoreIfSettled()
+            return
+        }
+        if !runInteractionSnapshot.runState.isActive,
+           resolveIdleBoundaryDetachIfNeeded(currentMetrics: newMetrics)
+        {
+            return
+        }
+        guard let session = activeUserScrollSession else { return }
+        guard !programmaticScrollGate.isInFlight else { return }
+        guard !isInteractionBlockerVisible else { return }
+        if AgentTranscriptAutoFollowRearmPolicy.shouldDetachFromLiveBottom(
+            runtime: makeScrollRuntimeState(distanceToBottom: newMetrics.distanceToBottom),
+            latestManualIntent: session.latestIntent,
+            progress: makeViewportProgress(
+                baselineDistanceToBottom: session.baselineMetrics.distanceToBottom,
+                baselineVisibleMinY: session.baselineMetrics.visibleMinY,
+                currentDistanceToBottom: newMetrics.distanceToBottom,
+                currentVisibleMinY: newMetrics.visibleMinY
+            ),
+            minimumViewportEscapeDistance: Self.detachDistanceThreshold,
+            suppressGeometryDetach: shouldSuppressGeometryDrivenPinnedDetach(),
+            suppressRepinGraceDetach: shouldSuppressRepinGraceDetach(newMetrics: newMetrics)
+        ) {
+            detachFromLiveBottom(markUserDetached: true)
+        }
+    }
+
+    private func handleScrollPhaseChanged(
+        _ phase: AgentTranscriptUserScrollPhase,
+        metrics: AgentTranscriptScrollMetrics,
+        proxy: ScrollViewProxy
+    ) {
+        currentUserScrollPhase = phase
+        switch phase {
+        case .tracking, .interacting, .decelerating:
+            _ = applyScrollMetrics(metrics)
+            beginUserScrollInteractionIfNeeded(
+                proxy: proxy,
+                phase: phase,
+                metrics: metrics
+            )
+        case .idle:
+            _ = applyScrollMetrics(metrics)
+            finalizeUserScrollInteraction(proxy: proxy, finalMetrics: metrics)
+        case .animating:
+            if !programmaticScrollGate.isInFlight {
+                cancelInvalidPendingBottomScrollOutcome(reason: "manualAnimation")
             }
         }
     }
@@ -2370,7 +2277,6 @@ struct AgentModeChatDetailView: View {
         }
         .id(transcriptScrollResetRevision)
         .accessibilityIdentifier("agentTranscript.scrollView")
-        .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
             if didChatChange { txn.disablesAnimations = true }
         }
@@ -2614,6 +2520,13 @@ struct AgentModeChatDetailView: View {
         ForEach(blocks) { block in
             transcriptBlockView(block: block, renderContext: renderContext)
                 .id(block.id)
+            #if DEBUG
+                .modifier(AgentChatStressReadingProbeModifier(
+                    isEnabled: stressHarness?.readingProbe != nil,
+                    blockID: block.id,
+                    onFrameChange: recordStressReadingFrame(blockID:frame:)
+                ))
+            #endif
         }
         .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
         .messageTimestampEnvironment()
@@ -3320,7 +3233,7 @@ struct AgentModeChatDetailView: View {
     private var bottomTarget: some View {
         Color.clear
             .frame(height: max(1, transcriptBottomClearance))
-            .id("bottomTarget")
+            .id(SwiftUITranscriptScrollDriver.bottomTargetID)
     }
 
     private var shouldShowRunningIndicator: Bool {
@@ -3504,20 +3417,6 @@ struct AgentModeChatDetailView: View {
         {
             interruptSmoothPinnedSend(reason: "replacedBy\(String(describing: intent.reason))")
         }
-        switch intent {
-        case .bottom:
-            pendingProgrammaticRestoreTargetID = nil
-            pendingProgrammaticRestoreAnchor = nil
-            topVisibleViewportTargetID = nil
-        case let .anchor(semanticAnchor, _, _, _):
-            pendingProgrammaticRestoreTargetID = nil
-            pendingProgrammaticRestoreAnchor = semanticAnchor
-            topVisibleViewportTargetID = nil
-        case let .viewportTarget(targetID, _, _, _):
-            pendingProgrammaticRestoreTargetID = targetID
-            pendingProgrammaticRestoreAnchor = nil
-            topVisibleViewportTargetID = targetID
-        }
         recordScrollIntent(intent.reason)
 
         debugLog("requestScroll scheduled", details: "intent=\(debugDescription(for: intent)) immediate=\(immediate) delay=\(delay)")
@@ -3619,60 +3518,32 @@ struct AgentModeChatDetailView: View {
                 return
             }
             _ = markPendingBottomScrollOutcomeExecutedIfNeeded(for: intent.reason)
+            #if DEBUG
+                recordStressSnapBackIfNeeded(intent)
+            #endif
 
-            let performScroll = {
-                switch intent {
-                case .bottom:
-                    proxy.scrollTo("bottomTarget", anchor: .bottom)
-                case let .anchor(semanticAnchor, placement, _, _):
-                    guard let resolvedBlockID = resolveVisibleBlockID(for: semanticAnchor) else { return }
-                    proxy.scrollTo(resolvedBlockID, anchor: placement.unitPoint)
-                case let .viewportTarget(targetID, placement, _, _):
-                    guard let resolvedTargetID = resolveVisibleViewportTargetID(targetID) else { return }
-                    switch resolvedTargetID {
-                    case let .row(rowID):
-                        proxy.scrollTo(rowID, anchor: placement.unitPoint)
-                    case let .block(blockID):
-                        proxy.scrollTo(blockID, anchor: placement.unitPoint)
-                    }
-                }
-            }
-
-            if intent.isAnimated {
-                withAnimation(.easeOut(duration: 0.2)) {
-                    performScroll()
-                }
-            } else {
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    performScroll()
-                }
-            }
+            perform(intent, with: SwiftUITranscriptScrollDriver(proxy: proxy))
         })
+    }
+
+    /// Executes a resolved scroll intent through the container's scroll driver.
+    /// Every programmatic transcript scroll funnels through here.
+    private func perform(_ intent: AgentTranscriptScrollIntent, with driver: some TranscriptScrollDriver) {
+        switch intent {
+        case let .bottom(animated, _):
+            driver.scrollToBottom(animated: animated)
+        }
     }
 
     private func cancelPendingScrollWork() {
         debugLog("cancelPendingScrollWork")
         programmaticScrollGate.cancel()
-        pendingProgrammaticRestoreTargetID = nil
-        pendingProgrammaticRestoreAnchor = nil
-        #if DEBUG
-            assert(
-                pendingProgrammaticRestoreTargetID == nil && pendingProgrammaticRestoreAnchor == nil,
-                "cancelPendingScrollWork: pending restore target/anchor should be cleared"
-            )
-        #endif
     }
 
     private func cancelAllScheduledScrollWork() {
         debugLog("cancelAllScheduledScrollWork")
         scrollEngine.cancelScheduledWork()
         #if DEBUG
-            assert(
-                pendingProgrammaticRestoreTargetID == nil && pendingProgrammaticRestoreAnchor == nil,
-                "cancelAllScheduledScrollWork: pending restore target/anchor should be cleared"
-            )
             assertScrollStateInvariants()
         #endif
     }
@@ -3732,96 +3603,6 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func resolveVisibleBlockID(for anchor: AgentTranscriptAnchor) -> String? {
-        guard let blockID = transcriptPresentation.anchorBlockIndex[anchor] else { return nil }
-        return visibleTranscriptBlockIDs.contains(blockID) ? blockID : nil
-    }
-
-    private func resolveVisibleViewportTargetID(_ targetID: AgentTranscriptViewportTargetID) -> AgentTranscriptViewportTargetID? {
-        switch targetID {
-        case let .row(rowID):
-            if renderedTranscriptRowIDs.contains(rowID) {
-                return targetID
-            }
-            if let semanticAnchor = transcriptPresentation.rowAnchorIndex[rowID],
-               let blockID = resolveVisibleBlockID(for: semanticAnchor)
-            {
-                return .block(blockID)
-            }
-            return nil
-        case let .block(blockID):
-            return visibleTranscriptBlockIDs.contains(blockID) ? targetID : nil
-        }
-    }
-
-    private func resolveVisibleBlockID(containing targetID: AgentTranscriptViewportTargetID) -> String? {
-        switch targetID {
-        case let .block(blockID):
-            return visibleTranscriptBlockIDs.contains(blockID) ? blockID : nil
-        case let .row(rowID):
-            if let semanticAnchor = transcriptPresentation.rowAnchorIndex[rowID],
-               let blockID = resolveVisibleBlockID(for: semanticAnchor)
-            {
-                return blockID
-            }
-            return visibleTranscriptBlocks.first(where: { block in
-                block.rows.contains(where: { $0.id == rowID })
-            })?.id
-        }
-    }
-
-    private func activeTrackedViewportTargetID() -> AgentTranscriptViewportTargetID? {
-        guard shouldTrackDetachedViewportCandidates,
-              let targetID = topVisibleViewportTargetID,
-              let resolvedTargetID = resolveVisibleViewportTargetID(targetID),
-              viewportRegistry.viewportCandidate(for: resolvedTargetID) != nil
-        else {
-            return nil
-        }
-        return resolvedTargetID
-    }
-
-    private func visibleViewportCandidate(for targetID: AgentTranscriptViewportTargetID) -> AgentTranscriptViewportCandidate? {
-        guard let resolvedTargetID = resolveVisibleViewportTargetID(targetID) else { return nil }
-        return viewportRegistry.viewportCandidate(for: resolvedTargetID)
-    }
-
-    private func groupedHistoryDescendantViewportCandidate(
-        anchor: AgentTranscriptAnchor?,
-        sequenceIndex: Int?,
-        viewportMinY: CGFloat?
-    ) -> AgentTranscriptViewportCandidate? {
-        guard case let .groupedHistory(turnID, spanID)? = anchor else { return nil }
-        let descendantCandidates = viewportRegistry.viewportCandidates.filter { candidate in
-            guard case .row = candidate.targetID,
-                  let semanticAnchor = candidate.semanticAnchor
-            else {
-                return false
-            }
-            switch semanticAnchor {
-            case let .activity(candidateTurnID, candidateSpanID, _):
-                return candidateTurnID == turnID && candidateSpanID == spanID
-            default:
-                return false
-            }
-        }
-        guard !descendantCandidates.isEmpty else { return nil }
-        let referenceMinY = viewportMinY ?? 0
-        return descendantCandidates.min { lhs, rhs in
-            let lhsSequenceDistance = sequenceIndex.map { abs((lhs.sequenceIndex ?? $0) - $0) } ?? 0
-            let rhsSequenceDistance = sequenceIndex.map { abs((rhs.sequenceIndex ?? $0) - $0) } ?? 0
-            if lhsSequenceDistance != rhsSequenceDistance {
-                return lhsSequenceDistance < rhsSequenceDistance
-            }
-            let lhsMinYDistance = abs(lhs.minY - referenceMinY)
-            let rhsMinYDistance = abs(rhs.minY - referenceMinY)
-            if lhsMinYDistance != rhsMinYDistance {
-                return lhsMinYDistance < rhsMinYDistance
-            }
-            return lhs.minY < rhs.minY
-        }
-    }
-
     private func handleDetachedPresentationRevisionChange(
         proxy: ScrollViewProxy,
         presentationRevision: Int,
@@ -3859,96 +3640,6 @@ struct AgentModeChatDetailView: View {
         requestScroll(proxy, intent: .bottom(animated: false, reason: .historyCompressionTransition), immediate: true)
         pendingCompressionRestoreStrategy = nil
         clearTransientChatChangeMarkerSoon()
-    }
-
-    private func updateTopVisibleViewportTarget(from candidates: [AgentTranscriptViewportCandidate]) {
-        guard shouldTrackDetachedViewportCandidates else {
-            clearTrackedViewportCandidateState()
-            return
-        }
-        guard pendingCompressionRestoreStrategy == nil else { return }
-        guard !isRehydrateRestoreActive else { return }
-        guard isCurrentTranscriptPresentationHydrated else { return }
-        viewportRegistry.replaceViewportCandidates(candidates)
-        let previousTargetID = topVisibleViewportTargetID
-        let previousAnchor = topVisibleViewportAnchor
-        #if DEBUG
-            if isStressHarnessEnabled {
-                stressTelemetryState.viewportCandidateUpdateCount += 1
-            }
-        #endif
-        let previousEffectiveAnchor = topVisibleViewportAnchor ?? topVisibleBlockAnchor
-        let candidate = candidates
-            .filter { $0.maxY > 0 }
-            .min { lhs, rhs in
-                let lhsDistance = lhs.minY <= 0 ? 0 : lhs.minY
-                let rhsDistance = rhs.minY <= 0 ? 0 : rhs.minY
-                if lhsDistance == rhsDistance {
-                    return lhs.minY < rhs.minY
-                }
-                return lhsDistance < rhsDistance
-            }
-        let candidateTargetID = candidate?.targetID
-        let candidateAnchor = candidate?.semanticAnchor
-        let candidateSequenceIndex = candidate?.sequenceIndex
-        let candidateFallbackBlockID = candidate?.fallbackBlockID
-        let candidateMinY = candidate?.minY
-        if topVisibleViewportTargetID != candidateTargetID {
-            topVisibleViewportTargetID = candidateTargetID
-        }
-        if topVisibleViewportAnchor != candidateAnchor {
-            topVisibleViewportAnchor = candidateAnchor
-        }
-        if topVisibleViewportSequenceIndex != candidateSequenceIndex {
-            topVisibleViewportSequenceIndex = candidateSequenceIndex
-        }
-        if topVisibleViewportFallbackBlockID != candidateFallbackBlockID {
-            topVisibleViewportFallbackBlockID = candidateFallbackBlockID
-        }
-        if shouldUpdateViewportMinY(topVisibleViewportMinY, to: candidateMinY) {
-            topVisibleViewportMinY = candidateMinY
-        }
-        let currentEffectiveAnchor = topVisibleViewportAnchor ?? topVisibleBlockAnchor
-        let currentEffectiveBlockID = topVisibleViewportFallbackBlockID ?? topVisibleBlockID
-        let detachedAnchorChanged = userDetachedAutoFollow
-            && !isPinnedToLiveBottom
-            && !isUserInteractingWithScroll
-            && !programmaticScrollGate.isInFlight
-            && !didChatChange
-            && !isInteractionBlockerVisible
-            && !isRehydrateRestoreActive
-            && previousEffectiveAnchor != nil
-            && currentEffectiveAnchor != nil
-            && currentEffectiveAnchor != previousEffectiveAnchor
-        if detachedAnchorChanged,
-           let currentEffectiveAnchor
-        {
-            if pendingDetachedAnchorChangeAnchor == currentEffectiveAnchor {
-                #if DEBUG
-                    if isStressHarnessEnabled {
-                        stressTelemetryState.detachedAnchorChangeCount += 1
-                        if pendingDetachedAnchorChangeBlockID == visibleTranscriptBlocks.first?.id {
-                            stressTelemetryState.detachedSnapToTopCount += 1
-                        }
-                    }
-                #endif
-                pendingDetachedAnchorChangeAnchor = nil
-                pendingDetachedAnchorChangeBlockID = nil
-            } else {
-                pendingDetachedAnchorChangeAnchor = currentEffectiveAnchor
-                pendingDetachedAnchorChangeBlockID = currentEffectiveBlockID
-            }
-        } else {
-            pendingDetachedAnchorChangeAnchor = nil
-            pendingDetachedAnchorChangeBlockID = nil
-        }
-        if topVisibleViewportTargetID != previousTargetID || topVisibleViewportAnchor != previousAnchor {
-            debugLog(
-                "updateTopVisibleViewportTarget",
-                details: "target=\(String(describing: topVisibleViewportTargetID)) anchor=\(String(describing: topVisibleViewportAnchor)) candidateCount=\(candidates.count)"
-            )
-            publishStressTelemetrySnapshot()
-        }
     }
 
     @available(macOS 15.0, *)
@@ -4956,13 +4647,6 @@ struct AgentModeChatDetailView: View {
             resetPinnedBottomRequestState()
             resetDetachedRebaseTracking()
             clearPendingDetachedSettleCaptureState()
-            pendingDetachedAnchorChangeAnchor = nil
-            pendingDetachedAnchorChangeBlockID = nil
-            topVisibleViewportTargetID = nil
-            topVisibleViewportAnchor = nil
-            topVisibleViewportSequenceIndex = nil
-            topVisibleViewportFallbackBlockID = nil
-            topVisibleViewportMinY = nil
             detachedPresentationRevisionCheckToken &+= 1
             if syncToSession,
                let currentTabID
@@ -5113,26 +4797,6 @@ struct AgentModeChatDetailView: View {
             stressTelemetryState.lastScrollIntentReason = String(describing: reason)
             publishStressTelemetrySnapshot()
         #endif
-    }
-
-    private var effectiveStressTopVisibleBlockID: String? {
-        userDetachedAutoFollow ? (topVisibleViewportFallbackBlockID ?? topVisibleBlockID) : topVisibleBlockID
-    }
-
-    private var effectiveStressDetachedAuthorityAnchorDescription: String? {
-        let effectiveTopVisibleAnchor = userDetachedAutoFollow
-            ? (topVisibleViewportAnchor ?? topVisibleBlockAnchor)
-            : topVisibleBlockAnchor
-        guard userDetachedAutoFollow, !isUserInteractingWithScroll else { return nil }
-        return effectiveTopVisibleAnchor.map(String.init(describing:))
-    }
-
-    private var effectiveStressTopVisibleAnchorDescription: String? {
-        let effectiveTopVisibleAnchor = userDetachedAutoFollow
-            ? (topVisibleViewportAnchor ?? topVisibleBlockAnchor)
-            : topVisibleBlockAnchor
-        return effectiveStressDetachedAuthorityAnchorDescription
-            ?? effectiveTopVisibleAnchor.map(String.init(describing:))
     }
 
     private static let largeStreamingAssistantCharacterThreshold = 12000
@@ -5476,47 +5140,22 @@ struct AgentModeChatDetailView: View {
                 stressTelemetryState.lastLargeStreamingAssistantActiveAt = now
             }
             let catastrophicJumpThreshold = stressHarnessCatastrophicJumpThresholdPoints ?? 0
-            let topVisibleBlockIndex = effectiveStressTopVisibleBlockID.flatMap { topVisibleBlockID in
-                visibleTranscriptBlocks.firstIndex(where: { $0.id == topVisibleBlockID })
-            }
             let tracksLargeStreamingExposure = isLargeStressStreamingContextActive(now: now)
 
-            let triggered: Bool
-            let blockID: String?
-            let kind: String
-            let blocksBelowTop: Int
-            if let topVisibleBlockIndex {
-                blocksBelowTop = max(0, visibleTranscriptBlocks.count - topVisibleBlockIndex - 1)
-                guard blocksBelowTop >= threshold else {
-                    stressTelemetryState.wasTrackingHistoricalExposure = false
-                    stressTelemetryState.wasTrackingLargeStreamingHistoricalExposure = false
-                    return
-                }
-                let block = visibleTranscriptBlocks[topVisibleBlockIndex]
-                triggered = true
-                blockID = block.id
-                kind = block.kind.rawValue
-            } else {
-                let unanchoredExposureTriggered = canScrollTowardHistory
-                    && catastrophicJumpThreshold > 0
-                    && (jumpDelta >= catastrophicJumpThreshold || newMetrics.distanceToBottom >= catastrophicJumpThreshold)
-                    && visibleTranscriptBlocks.count > threshold
-                guard unanchoredExposureTriggered else {
-                    stressTelemetryState.wasTrackingHistoricalExposure = false
-                    stressTelemetryState.wasTrackingLargeStreamingHistoricalExposure = false
-                    return
-                }
-                triggered = true
-                blockID = nil
-                kind = "unanchoredViewport"
-                blocksBelowTop = max(threshold, visibleTranscriptBlocks.count - 1)
-            }
-
-            guard triggered else {
+            // The transcript does not track a top-visible block while pinned, so exposure is
+            // inferred from viewport geometry alone.
+            let unanchoredExposureTriggered = canScrollTowardHistory
+                && catastrophicJumpThreshold > 0
+                && (jumpDelta >= catastrophicJumpThreshold || newMetrics.distanceToBottom >= catastrophicJumpThreshold)
+                && visibleTranscriptBlocks.count > threshold
+            guard unanchoredExposureTriggered else {
                 stressTelemetryState.wasTrackingHistoricalExposure = false
                 stressTelemetryState.wasTrackingLargeStreamingHistoricalExposure = false
                 return
             }
+            let blockID: String? = nil
+            let kind = "unanchoredViewport"
+            let blocksBelowTop = max(threshold, visibleTranscriptBlocks.count - 1)
             stressTelemetryState.maxUnexpectedHistoricalExposureBlocksBelowTop = max(
                 stressTelemetryState.maxUnexpectedHistoricalExposureBlocksBelowTop,
                 blocksBelowTop
@@ -5699,14 +5338,14 @@ struct AgentModeChatDetailView: View {
             let latestExpandedHighSignalRenderMode = latestExpandedHighSignalState?.renderMode?.rawValue
             let storedDetachedTargetDescription: String? = nil
             let storedDetachedAnchorDescription: String? = nil
-            let detachedAuthorityAnchorDescription = effectiveStressDetachedAuthorityAnchorDescription
-            let effectiveTopVisibleAnchorDescription = effectiveStressTopVisibleAnchorDescription
-            let liveDetachedTargetDescription = userDetachedAutoFollow
-                ? topVisibleViewportTargetID.map(String.init(describing:))
-                : nil
             if isLargeStressStreamingAssistantActive {
                 stressTelemetryState.lastLargeStreamingAssistantActiveAt = Date()
             }
+            let readingContext = stressReadingContext
+            stressHarness.readingProbe?.refreshAnchor(context: readingContext)
+            let readingTracker = stressHarness.readingProbe?.tracker
+            stressHarness.frameIntervalSampler.setCollecting(activeStressStreamingAssistantItem != nil)
+            let frameIntervalSummary = stressHarness.frameIntervalSampler.currentSummary()
             let activeStreamingAssistantCharacterCount = activeStressStreamingAssistantCharacterCount
             let activeStreamingAssistantLineCount = activeStressStreamingAssistantLineCount
             let isLargeStreamingAssistantActive = isLargeStressStreamingAssistantActive
@@ -5722,8 +5361,7 @@ struct AgentModeChatDetailView: View {
                     canScrollTowardLiveBottom: canScrollTowardLiveBottom,
                     isNearBottom: isNearBottom,
                     distanceToBottom: scrollMetrics.distanceToBottom,
-                    topVisibleBlockID: effectiveStressTopVisibleBlockID,
-                    topVisibleAnchorDescription: effectiveTopVisibleAnchorDescription,
+                    readingAnchorBlockID: readingContext.isDetachedReading ? readingTracker?.anchorBlockID : nil,
                     lastScrollIntentReason: stressTelemetryState.lastScrollIntentReason,
                     lastSettledBottomReason: stressTelemetryState.lastSettledBottomReason,
                     pendingPinnedBottomSourceDescription: pendingPinnedBottomSource.map(String.init(describing:)),
@@ -5752,13 +5390,16 @@ struct AgentModeChatDetailView: View {
                     lastLargeStreamingHistoricalExposureKind: stressTelemetryState.lastLargeStreamingHistoricalExposureKind,
                     detachedJumpCount: stressTelemetryState.detachedJumpCount,
                     maxDetachedJumpMagnitude: stressTelemetryState.maxDetachedJumpMagnitude,
-                    detachedAnchorChangeCount: stressTelemetryState.detachedAnchorChangeCount,
-                    detachedSnapToTopCount: stressTelemetryState.detachedSnapToTopCount,
+                    positionShiftWhileReadingCount: readingTracker?.positionShiftWhileReadingCount ?? 0,
+                    maxPositionShiftWhileReading: readingTracker?.maxPositionShiftWhileReading ?? 0,
+                    snapBackWhileReadingCount: stressTelemetryState.snapBackWhileReadingCount,
+                    streamingFrameIntervalSampleCount: frameIntervalSummary?.sampleCount ?? 0,
+                    streamingFrameIntervalP50MS: frameIntervalSummary?.p50MS,
+                    streamingFrameIntervalP95MS: frameIntervalSummary?.p95MS,
+                    streamingFrameIntervalP99MS: frameIntervalSummary?.p99MS,
                     storedDetachedTargetDescription: storedDetachedTargetDescription,
                     storedDetachedAnchorDescription: storedDetachedAnchorDescription,
                     storedDetachedViewportMinY: nil,
-                    liveDetachedTargetDescription: liveDetachedTargetDescription,
-                    liveDetachedViewportMinY: userDetachedAutoFollow ? topVisibleViewportMinY : nil,
                     detachedAcceptedDriftCount: stressTelemetryState.detachedAcceptedDriftCount,
                     detachedRestoreIntentCount: stressTelemetryState.detachedRestoreIntentCount,
                     lastDetachedRebaseAction: stressTelemetryState.lastDetachedRebaseAction,
@@ -5770,9 +5411,6 @@ struct AgentModeChatDetailView: View {
                     smoothSendCorrectiveScrollCount: stressTelemetryState.smoothSendCorrectiveScrollCount,
                     lastSmoothSendSettleDurationMS: stressTelemetryState.lastSmoothSendSettleDurationMS,
                     maxSmoothSendSettleDurationMS: stressTelemetryState.maxSmoothSendSettleDurationMS,
-                    detachedAuthorityAnchorDescription: detachedAuthorityAnchorDescription,
-                    viewportFrameUpdateCount: stressTelemetryState.viewportFrameUpdateCount,
-                    viewportCandidateUpdateCount: stressTelemetryState.viewportCandidateUpdateCount,
                     projectionBuildCount: transcriptPresentation.performanceSnapshot.projectionBuildCount,
                     projectionPublishCount: transcriptPresentation.performanceSnapshot.projectionPublishCount,
                     lastProjectionBuildDurationMS: transcriptPresentation.performanceSnapshot.lastProjectionBuildDurationMS,

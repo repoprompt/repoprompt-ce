@@ -21,64 +21,6 @@ struct AgentTranscriptViewportProgress {
     let currentVisibleMinY: CGFloat
 }
 
-enum AgentTranscriptScrollCapabilityResolver {
-    static func canScrollTowardHistory(
-        firstVisibleBlockID: String?,
-        effectiveTopVisibleBlockID: String?,
-        rawVisibleMinY: CGFloat?,
-        fallbackVisibleMinY: CGFloat?,
-        epsilon: CGFloat
-    ) -> Bool {
-        if let firstVisibleBlockID, let effectiveTopVisibleBlockID {
-            return effectiveTopVisibleBlockID != firstVisibleBlockID
-        }
-        if let rawVisibleMinY, rawVisibleMinY > epsilon {
-            return true
-        }
-        if let fallbackVisibleMinY, fallbackVisibleMinY > epsilon {
-            return true
-        }
-        return false
-    }
-}
-
-func agentDetachedViewportTarget(for block: AgentTranscriptRenderBlock) -> DetachedViewportTarget {
-    switch block.kind {
-    case .groupedHistory:
-        let groupedSequenceIndex = block.groupedHistory?.sections
-            .flatMap(\.childBlocks)
-            .flatMap(\.rows)
-            .map(\.sequenceIndex)
-            .min()
-        let groupedAnchor = block.primaryAnchor
-            ?? block.spanID.map { AgentTranscriptAnchor.groupedHistory(turnID: block.turnID, spanID: $0) }
-            ?? .request(turnID: block.turnID)
-        return DetachedViewportTarget(
-            anchor: groupedAnchor,
-            baseSequenceIndex: groupedSequenceIndex
-        )
-    case .activityCluster:
-        return DetachedViewportTarget(
-            anchor: block.primaryAnchor,
-            baseSequenceIndex: block.rows.map(\.sequenceIndex).min()
-        )
-    default:
-        return DetachedViewportTarget(
-            anchor: block.primaryAnchor ?? .request(turnID: block.turnID),
-            baseSequenceIndex: block.rows.map(\.sequenceIndex).min()
-        )
-    }
-}
-
-func agentDetachedAuthorityAnchor(for block: AgentTranscriptRenderBlock) -> AgentTranscriptAnchor {
-    switch block.kind {
-    case .request:
-        .request(turnID: block.turnID)
-    default:
-        block.primaryAnchor ?? .request(turnID: block.turnID)
-    }
-}
-
 enum AgentTranscriptManualDetachOverridePolicy {
     static func isActive(until: Date?, now: Date) -> Bool {
         guard let until else { return false }
