@@ -331,8 +331,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         for child in [a, b, c, d] {
             fixture.source.add(child, parent: overseer)
         }
-        // Threshold 1, so the narrowed applying call (two items) still requires its card.
-        let scope = try grantTree(fixture, grantee: overseer, threshold: 1)
+        // Unticking narrows to the threshold: the supplied card must still bind and apply once.
+        let scope = try grantTree(fixture, grantee: overseer, threshold: 2)
         let handler = RecordingHandler([.adminSetPin])
         fixture.core.register(handler)
         let tab = UUID()
@@ -354,7 +354,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         }
         XCTAssertEqual(card.reason, .bulkThreshold)
         XCTAssertEqual(card.scopeID, scope.id)
-        XCTAssertEqual(fixture.runtime.confirmations.pendingConfirmations(forTab: tab).map(\.id), [card.id])
+        XCTAssertEqual(fixture.runtime.confirmations.pendingConfirmations(forTab: tab, sessionID: overseer).map(\.id), [card.id])
         guard case let .pendingConfirmation(replayed, _) = try await fixture.core.perform(request([a, b, c])) else {
             return XCTFail("an identical retry returns the same card")
         }
@@ -393,12 +393,55 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(handler.batches.single?.confirmation?.approvedSessionIDs, [a, b])
 
         // The approval was consumed: replaying the carded request cannot re-authorize it.
-        guard case let .pendingConfirmation(spent, _) = try await fixture.core.perform(request([a, b, c], confirmation: card.id)) else {
-            return XCTFail("a consumed card authorizes nothing")
+        guard case .denied(.confirmationMismatch, _) = try await fixture.core.perform(request([a, b], confirmation: card.id)) else {
+            return XCTFail("a consumed card authorizes nothing, even below the threshold")
         }
-        XCTAssertEqual(spent.id, card.id)
-        XCTAssertEqual(spent.state, .consumed)
         XCTAssertEqual(handler.batches.count, 1)
+        guard case .completed = try await fixture.core.perform(request([a], key: "uncarded")) else {
+            return XCTFail("under-threshold scope authority still works without a supplied card")
+        }
+        XCTAssertEqual(handler.batches.count, 2)
+    }
+
+    func testBatchCardsCannotFollowATabRebindAndApplyingCardsRetainTheirKeys() throws {
+        let fixture = Fixture()
+        let owner = UUID()
+        let rebound = UUID()
+        let tab = UUID()
+        let scope = try grantTree(fixture, grantee: owner)
+        let coordinator = fixture.runtime.confirmations
+        func request(_ key: String) throws -> PendingBatchConfirmation {
+            guard case let .created(card) = coordinator.request(
+                scope: scope, operation: .adminRetire, idempotencyKey: key,
+                granteeTabID: tab, reason: .destructive,
+                items: [.init(sessionID: UUID(), title: "Member", effect: "Retire")]
+            ) else { throw NSError(domain: "test", code: 1) }
+            return card
+        }
+        let pending = try request("pending")
+        let applying = try request("applying")
+        XCTAssertNotNil(coordinator.approve(confirmationID: applying.id))
+        XCTAssertTrue(coordinator.beginApplying(confirmationID: applying.id))
+        XCTAssertTrue(coordinator.pendingConfirmations(forTab: tab, sessionID: rebound).isEmpty)
+        XCTAssertFalse(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: rebound))
+        // A persisted sidebar candidate is not a live requesting-session binding. With no
+        // explicit binding, even a card whose old owner still exists must not be actionable.
+        XCTAssertFalse(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: nil))
+        XCTAssertTrue(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: owner))
+        coordinator.invalidateStaleConfirmations(tabID: tab, currentSessionID: rebound)
+        XCTAssertNil(coordinator.approve(confirmationID: pending.id))
+        for index in 0 ... BatchConfirmationCoordinator.maxRetainedConfirmations {
+            let terminal = try request("terminal-\(index)")
+            coordinator.deny(confirmationID: terminal.id)
+        }
+        XCTAssertEqual(coordinator.confirmation(id: applying.id, granteeSessionID: owner)?.state, .applying)
+        guard case let .existing(retained) = coordinator.request(
+            scope: scope, operation: .adminRetire, idempotencyKey: applying.idempotencyKey,
+            granteeTabID: tab, reason: .destructive, items: applying.items
+        ) else { return XCTFail("applying card must keep its key ownership") }
+        XCTAssertEqual(retained.id, applying.id)
+        coordinator.finishApplying(confirmationID: applying.id, succeeded: true)
+        XCTAssertEqual(coordinator.confirmation(id: applying.id, granteeSessionID: owner)?.state, .consumed)
     }
 
     func testCoreDeniesNonMembersUniformlyAndRevocationInvalidatesCards() async throws {

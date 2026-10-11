@@ -57,6 +57,7 @@ extension AgentModeViewModel {
             if session.oversight.periodicEndpoint == endpoint { session.oversight.retirePeriodicScheduling() }
             return
         }
+        agentSelfCompactSettleStaleParkedNote(session)
         agentSessionLinkReleasePeriodicACPContinuationSlot(for: session)
         if session.oversight.periodicEndpoint != endpoint {
             session.oversight.retirePeriodicScheduling()

@@ -225,6 +225,9 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let catalogRevision: UInt64
     package let health: DomainAuthorityHealth
     package let workspaces: [DomainWorkspaceSnapshot]
+    /// Known, nondeleted catalog members the authority cannot currently supply a record for.
+    /// Transient: completeness is separate from aggregate `health`, which may remain writable.
+    package let unavailableWorkspaceIDs: Set<UUID>
 
     package init(
         runtimeIdentity: DomainRuntimeIdentity,
@@ -232,7 +235,8 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         publicationSequence: UInt64,
         catalogRevision: UInt64,
         health: DomainAuthorityHealth,
-        workspaces: [DomainWorkspaceSnapshot]
+        workspaces: [DomainWorkspaceSnapshot],
+        unavailableWorkspaceIDs: Set<UUID> = []
     ) {
         self.runtimeIdentity = runtimeIdentity
         self.isBootstrapped = isBootstrapped
@@ -240,6 +244,7 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         self.catalogRevision = catalogRevision
         self.health = health
         self.workspaces = workspaces
+        self.unavailableWorkspaceIDs = unavailableWorkspaceIDs
     }
 }
 

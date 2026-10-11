@@ -58,6 +58,34 @@ enum ProviderPendingCompletionStream {
         sleep: @escaping Sleep = { seconds in try await Task.sleep(for: .seconds(seconds)) },
         complete: @escaping @Sendable () async throws -> AICompletionResult
     ) -> AsyncThrowingStream<AIStreamResult, Error> {
+        // Start the request on the consumer's first pull, not here. `AsyncThrowingStream(unfolding:)`
+        // never calls `produce` for a consumer that is already cancelled when it pulls; it ends that
+        // iteration with `nil`. Starting eagerly therefore raced the consumer's first pull: a consumer
+        // cancelled before pulling saw a normal end while a request it never observed was running.
+        // Started lazily, that consumer starts no work, and a consumer cancelled while it waits
+        // inside `produce` has the cancellation rethrown. Releasing the outer stream releases
+        // `events`' iterator, which terminates it and cancels any request still in flight.
+        let iterator = PendingCompletionIterator {
+            ProviderPendingCompletionStream.startPendingCompletion(
+                heartbeatInterval: heartbeatInterval,
+                sleep: sleep,
+                complete: complete
+            )
+        }
+        return AsyncThrowingStream<AIStreamResult, Error>(unfolding: {
+            if let next = try await iterator.next() {
+                return next
+            }
+            try Task.checkCancellation()
+            return nil
+        })
+    }
+
+    private static func startPendingCompletion(
+        heartbeatInterval: TimeInterval,
+        sleep: @escaping Sleep,
+        complete: @escaping @Sendable () async throws -> AICompletionResult
+    ) -> AsyncThrowingStream<AIStreamResult, Error>.Iterator {
         let (events, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
         let heartbeat = Task {
             while !Task.isCancelled {
@@ -101,29 +129,25 @@ enum ProviderPendingCompletionStream {
             request.cancel()
         }
 
-        // Pull through the consumer's task so its cancellation reaches `events`
+        // Pulled through the consumer's task so its cancellation reaches `events`
         // (terminating it and cancelling `request`) and is rethrown rather than
         // ending the stream as if it had completed normally.
-        let iterator = PendingCompletionIterator(events.makeAsyncIterator())
-        return AsyncThrowingStream<AIStreamResult, Error>(unfolding: {
-            if let next = try await iterator.next() {
-                return next
-            }
-            try Task.checkCancellation()
-            return nil
-        })
+        return events.makeAsyncIterator()
     }
 }
 
 /// Serially consumed by the single pulling task of the outer unfolding stream.
 private final class PendingCompletionIterator: @unchecked Sendable {
-    private var iterator: AsyncThrowingStream<AIStreamResult, Error>.Iterator
+    private let start: () -> AsyncThrowingStream<AIStreamResult, Error>.Iterator
+    private var iterator: AsyncThrowingStream<AIStreamResult, Error>.Iterator?
 
-    init(_ iterator: AsyncThrowingStream<AIStreamResult, Error>.Iterator) {
-        self.iterator = iterator
+    init(start: @escaping () -> AsyncThrowingStream<AIStreamResult, Error>.Iterator) {
+        self.start = start
     }
 
     func next() async throws -> AIStreamResult? {
-        try await iterator.next()
+        var current = iterator ?? start()
+        defer { iterator = current }
+        return try await current.next()
     }
 }

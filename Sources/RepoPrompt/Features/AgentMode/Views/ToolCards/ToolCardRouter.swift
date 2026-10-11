@@ -6,7 +6,10 @@ func normalizedToolCardName(_ name: String?) -> String? {
     guard let acceptedName = AgentToolNamePolicy.accepted(name) else { return nil }
     let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !raw.isEmpty else { return nil }
-    let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
+    // Companion calls keep their server prefix in the transcript; cards show the bare action.
+    let canonical = MCPIntegrationHelper.computerUseCompanionToolName(raw)
+        ?? MCPIntegrationHelper.canonicalRepoPromptToolName(raw)
+        ?? raw
     // External tools can be namespaced (for example, "functions.bash").
     // Route by suffix so tool cards stay consistent.
     if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(canonical.lowercased()) {

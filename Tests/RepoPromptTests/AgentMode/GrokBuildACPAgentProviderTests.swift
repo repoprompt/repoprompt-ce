@@ -19,6 +19,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             modelString: config.modelString,
             includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
             alwaysApproveTools: config.alwaysApproveTools,
+            discoveryMode: config.discoveryMode,
             apiKey: config.apiKey,
             backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
         )
@@ -168,31 +169,45 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
     }
 
     func testSessionPermissionOverridesFollowEffectiveFullAccess() throws {
-        for configFullAccess in [false, true] {
-            let (provider, directory) = try makeProvider(
-                config: GrokBuildAgentConfig(alwaysApproveTools: configFullAccess)
-            )
-            for requestFullAccess in [false, true] {
-                for resumeSessionID in [nil, "sess-123"] as [String?] {
-                    let context = "configFullAccess=\(configFullAccess), requestFullAccess=\(requestFullAccess), resume=\(resumeSessionID ?? "new")"
-                    let session = try provider.makeSessionConfiguration(
-                        for: makeRequest(
-                            workspacePath: directory.path,
-                            resumeSessionID: resumeSessionID,
-                            autoApprove: requestFullAccess
-                        ),
-                        mcpServer: .repoPrompt
-                    )
-                    let fullAccess = configFullAccess || requestFullAccess
-                    let expectedMetadata: [String: AgentJSONValue] = fullAccess ? [:] : [
-                        "yoloMode": .bool(false),
-                        "autoMode": .bool(false)
-                    ]
-                    let expectedNotification: ACPSessionConfiguration.PostOpenNotification? = fullAccess ? nil : .init(
-                        method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
-                    )
-                    XCTAssertEqual(session.metadata, expectedMetadata, context)
-                    XCTAssertEqual(session.postOpenNotification, expectedNotification, context)
+        let factoryProvider = AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild)
+        let headlessProvider = try XCTUnwrap(factoryProvider as? GrokBuildACPHeadlessAgentProvider)
+        let discoveryConfig = headlessProvider.test_config
+
+        for discoveryMode in [false, true] {
+            for configFullAccess in discoveryMode ? [false] : [false, true] {
+                let config = discoveryMode ? discoveryConfig : GrokBuildAgentConfig(alwaysApproveTools: configFullAccess)
+                let (provider, directory) = try makeProvider(config: config)
+                // Discovery mirrors the production headless request, not an independent
+                // Full Access override. Agent Mode retains all existing OR combinations.
+                for requestFullAccess in discoveryMode ? [config.alwaysApproveTools] : [false, true] {
+                    for resumeSessionID in [nil, "sess-123"] as [String?] {
+                        let context = "discovery=\(discoveryMode), configFullAccess=\(config.alwaysApproveTools), requestFullAccess=\(requestFullAccess), resume=\(resumeSessionID ?? "new")"
+                        let session = try provider.makeSessionConfiguration(
+                            for: makeRequest(
+                                workspacePath: directory.path,
+                                resumeSessionID: resumeSessionID,
+                                autoApprove: requestFullAccess
+                            ),
+                            mcpServer: .repoPrompt
+                        )
+                        let fullAccess = !discoveryMode && (configFullAccess || requestFullAccess)
+                        var expectedMetadata: [String: AgentJSONValue] = fullAccess ? [:] : [
+                            "yoloMode": .bool(false),
+                            "autoMode": .bool(false)
+                        ]
+                        if discoveryMode {
+                            expectedMetadata["agentProfile"] = .object([
+                                "name": .string("repoprompt-discovery"),
+                                "description": .string("RepoPrompt Context Builder discovery"),
+                                "tools": .array([.string("search_tool"), .string("use_tool")])
+                            ])
+                        }
+                        let expectedNotification: ACPSessionConfiguration.PostOpenNotification? = fullAccess ? nil : .init(
+                            method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
+                        )
+                        XCTAssertEqual(session.metadata, expectedMetadata, context)
+                        XCTAssertEqual(session.postOpenNotification, expectedNotification, context)
+                    }
                 }
             }
         }
@@ -283,6 +298,35 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         }
         XCTAssertTrue(detail.contains("grok login"))
         XCTAssertTrue(detail.contains("XAI_API_KEY"))
+    }
+
+    @MainActor
+    func testSettingsConnectMessageMapsAuthenticationRequired() {
+        let cases: [(defect: String, input: String, expected: String)] = [
+            (
+                defect: "Reported authentication-required fallthrough",
+                input: "ACP request failed: Authentication required: no auth method id provided (code -32000)",
+                expected: "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Providers, then try Connect again."
+            ),
+            (
+                defect: "Matching on -32000, auth or authentication alone",
+                input: "ACP request failed: Authentication service unavailable (code -32000)",
+                expected: "ACP request failed: Authentication service unavailable (code -32000)"
+            )
+        ]
+
+        for row in cases {
+            let error = NSError(
+                domain: "GrokBuildSettingsConnectMessage",
+                code: -32000,
+                userInfo: [NSLocalizedDescriptionKey: row.input]
+            )
+            XCTAssertEqual(
+                APISettingsViewModel.friendlyGrokBuildMessage(for: error),
+                row.expected,
+                row.defect
+            )
+        }
     }
 
     // MARK: - ACPDirectSessionModelProvider
@@ -386,6 +430,24 @@ extension GrokBuildACPAgentProviderTests {
         )
         let grokProvider = try XCTUnwrap(provider as? GrokBuildACPAgentProvider)
         XCTAssertFalse(grokProvider.test_config.alwaysApproveTools)
+    }
+
+    func testDiscoveryFactoryUsesManagedContainment() throws {
+        let factoryProvider = AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild)
+        let headlessProvider = try XCTUnwrap(factoryProvider as? GrokBuildACPHeadlessAgentProvider)
+        let config = headlessProvider.test_config
+        XCTAssertTrue(config.discoveryMode, "Context Builder must carry explicit discovery intent")
+        XCTAssertFalse(config.alwaysApproveTools, "Discovery must not inherit the ambient Agent Mode permission preference")
+
+        let (provider, directory) = try makeProvider(config: config)
+        let launch = try provider.makeLaunchConfiguration(
+            for: makeRequest(workspacePath: directory.path, autoApprove: config.alwaysApproveTools)
+        )
+        XCTAssertFalse(launch.arguments.contains("--always-approve"))
+        for key in ["GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WORKFLOWS", "GROK_AUTO_WAKE"] {
+            XCTAssertEqual(config.backgroundFeatureEnvironment[key], "0", "Discovery config must disable \(key)")
+            XCTAssertEqual(launch.environment[key], "0", "Discovery launch must disable \(key)")
+        }
     }
 
     func testInteractiveFactoryDisablesUnmanagedBackgroundFeatures() async throws {

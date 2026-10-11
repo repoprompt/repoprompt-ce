@@ -665,16 +665,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         )
         // Only admitted items are carded or applied; with none admitted there is nothing to confirm.
         let admitted = items.admittedSessionIDs
-        if !admitted.isEmpty,
-           let reason = Self.confirmationRequirement(
-               operation: operation,
-               itemCount: admitted.count,
-               guardrails: live.grant.guardrails
-           )
-        {
-            guard let confirmation = request.confirmation else {
-                return .confirmationRequired(reason, items)
-            }
+        if let confirmation = request.confirmation {
             guard Self.confirmationMatches(
                 confirmation,
                 scope: live,
@@ -685,6 +676,14 @@ package struct DomainDelegationScopeAuthority: Sendable {
             ) else {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }
+        } else if !admitted.isEmpty,
+                  let reason = Self.confirmationRequirement(
+                      operation: operation,
+                      itemCount: admitted.count,
+                      guardrails: live.grant.guardrails
+                  )
+        {
+            return .confirmationRequired(reason, items)
         }
         return .authorized(items)
     }

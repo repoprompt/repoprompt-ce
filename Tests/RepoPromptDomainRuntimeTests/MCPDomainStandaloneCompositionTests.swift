@@ -75,6 +75,22 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             XCTAssertEqual(error, .principalMissing)
         }
 
+        let bootstrapCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.becomeOverseer,
+            scope: .standalone(id: scopeID)
+        )
+        let bootstrap = try XCTUnwrap(bootstrapCandidate).binding
+        do {
+            _ = try await bootstrap([:])
+            XCTFail("Standalone bootstrap must fail closed without an app-owned Agent session")
+        } catch let error as MCPError {
+            XCTAssertEqual(error.code, -32602)
+            guard case let .invalidParams(message) = error else {
+                return XCTFail("Expected unavailable-session denial, got \(error)")
+            }
+            XCTAssertEqual(message, "become_overseer is not available for this session.")
+        }
+
         await MCPDomainStandaloneToolInstaller.uninstall(installation, runtime: runtime)
         _ = await runtime.shutdown()
     }

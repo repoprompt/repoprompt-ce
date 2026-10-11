@@ -82,6 +82,8 @@ final class ProviderTransportActivityTests: XCTestCase {
                 return error
             }
         }
+        // The request starts only on the consumer's first pull, so once it has started the consumer
+        // is inside the stream's producer and its cancellation must be rethrown, not race the pull.
         let started = await eventually { request.isStarted }
         XCTAssertTrue(started)
 
@@ -90,6 +92,30 @@ final class ProviderTransportActivityTests: XCTestCase {
         XCTAssertTrue(outcome is CancellationError, "Expected cancellation, got \(String(describing: outcome))")
         let cancelled = await eventually { request.wasCancelled }
         XCTAssertTrue(cancelled, "Consumer cancellation must cancel the in-flight request")
+    }
+
+    func testConsumerCancelledBeforeFirstPullStartsNoRequest() async {
+        let ticker = LivenessTicker()
+        let request = PendingCompletionRequest()
+        let stream = ProviderPendingCompletionStream.make(
+            heartbeatInterval: 30,
+            sleep: { _ in try await ticker.sleep() },
+            complete: { try await request.wait() }
+        )
+        let consumer = Task { () -> Error? in
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                for try await _ in stream {}
+                return nil
+            } catch {
+                return error
+            }
+        }
+        let outcome = await consumer.value
+        // `AsyncThrowingStream(unfolding:)` ends an already-cancelled iteration without calling its
+        // producer, so the outcome may be a normal end; it must never be a delivered answer or error.
+        XCTAssertTrue(outcome == nil || outcome is CancellationError, "\(String(describing: outcome))")
+        XCTAssertFalse(request.isStarted, "A consumer that never pulled must not start the request")
     }
 
     func testReceivedBytesThrottleSpacesLivenessResults() {

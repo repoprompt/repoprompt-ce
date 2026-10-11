@@ -17,6 +17,9 @@ final class ProviderQuotaUIStoreTests: XCTestCase {
         private(set) var requestedMethods: [String] = []
         private var notificationContinuation: AsyncStream<CodexQuotaNotification>.Continuation?
         private let response: [String: CodexJSONValue]
+        /// After the first read, answer with no usage (not evidence of change) so a cached
+        /// reading keeps aging.
+        private var emptyAfterFirstRead = false
 
         init(response: [String: CodexJSONValue]) {
             self.response = response
@@ -32,7 +35,11 @@ final class ProviderQuotaUIStoreTests: XCTestCase {
 
         func request(method: String, params _: [String: CodexJSONValue]?, timeout _: TimeInterval?) async throws -> [String: CodexJSONValue] {
             requestedMethods.append(method)
-            return response
+            return emptyAfterFirstRead && requestedMethods.count > 1 ? [:] : response
+        }
+
+        func answerEmptyAfterFirstRead() {
+            emptyAfterFirstRead = true
         }
 
         func stop() async {}
@@ -257,10 +264,11 @@ final class ProviderQuotaUIStoreTests: XCTestCase {
 
     // MARK: - Freshness revalidation
 
-    func testFreshnessRevalidationAgesWordingWithoutSpendingARead() async {
+    func testFreshnessRevalidationAgesWordingAndSpendsAtMostOneGatedRead() async {
         let clock = MutableClock(start)
         let flag = SettingsFlag(true)
         let client = FakeQuotaClient(response: readResponse(usedPercent: 62))
+        await client.answerEmptyAfterFirstRead()
         // Fast interval so the test does not wait a real minute.
         let (store, service) = makeStore(
             enabled: true,
@@ -296,8 +304,13 @@ final class ProviderQuotaUIStoreTests: XCTestCase {
         }
         XCTAssertEqual(try? XCTUnwrap(staleFootnote), "Last seen 3 hours ago — may be out of date")
 
+        // Many ticks pass; the aged reading asks for an automatic refresh, which the service
+        // admits once (foreground gap) and never repeats while the clock stands still.
+        try? await Task.sleep(nanoseconds: 300_000_000)
         let readsAfterAging = await client.readCount()
-        XCTAssertEqual(readsAfterAging, readsAfterPriming, "revalidation issues no provider read")
+        XCTAssertEqual(readsAfterAging, readsAfterPriming + 1, "an aged reading spends exactly one admission-gated read")
+        guard case let .loaded(_, stillStale, _) = store.state else { return XCTFail("expected loaded") }
+        XCTAssertEqual(stillStale, "Last seen 3 hours ago — may be out of date", "an empty answer is not evidence of refill")
         _ = service
     }
 

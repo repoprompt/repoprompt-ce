@@ -203,6 +203,10 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         let confirmation = request.confirmationID.flatMap {
             scopes.confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)?.domainConfirmation
         }
+        // A supplied stale, consumed or unknown card is not equivalent to omitting a card.
+        guard request.confirmationID == nil || confirmation != nil else {
+            return .denied(.confirmationMismatch, sessionID: nil)
+        }
         let outcome = scopes.authorize(DomainDelegationScopeAuthorizationRequest(
             operation: request.operation,
             caller: request.caller,
@@ -268,16 +272,9 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         case let .denied(denial, sessionID):
             return .denied(denial, sessionID: sessionID)
         case let .authorized(batch):
-            // Only a card the authority actually required is claimed: an approved card authorizes
-            // exactly one application, claimed before the handler suspends (so a concurrent replay
-            // cannot double-apply) and marked applied only after the handler succeeds. The handler
-            // re-checks `DelegationScopeRuntime.isCurrent(_:)` after its own suspensions.
-            let cardRequired = DomainDelegationScopeAuthority.confirmationRequirement(
-                operation: request.operation,
-                itemCount: batch.admittedSessionIDs.count,
-                guardrails: batch.scope.grant.guardrails
-            ) != nil && !batch.admittedSessionIDs.isEmpty
-            let claimedCard = cardRequired ? batch.confirmation?.confirmationID : nil
+            // Every supplied approval is bound and claimed once, even if unticking items brought
+            // the application below the threshold. No-card under-threshold calls remain allowed.
+            let claimedCard = batch.confirmation?.confirmationID
             if let claimedCard, !scopes.confirmations.beginApplying(confirmationID: claimedCard) {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }

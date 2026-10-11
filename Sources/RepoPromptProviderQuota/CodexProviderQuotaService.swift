@@ -44,6 +44,17 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     private var transportGeneration: UInt64 = 0
     private var snapshot: ProviderQuotaSnapshot?
     private var status: ProviderQuotaStatus = .disabled
+    /// The latest read on the current transport failed. Upstream app-server processes cache
+    /// credentials at start, so an explicit refresh after a failure replaces the transport
+    /// instead of asking the same process again. Cleared by teardown and by a successful read.
+    private var lastReadFailed = false
+    /// Managed-auth generation the latest sign-out moved to. Authentication events from an
+    /// earlier generation predate that sign-out and are ignored, so a later sign-out always
+    /// wins over an earlier sign-in that is delivered late.
+    private var signOutAuthGeneration: UInt64?
+    /// Transport generation of the most recent read start, so a new transport's priming read
+    /// does not repeat a read that an explicit refresh already issued on it.
+    private var readStartedGeneration: UInt64?
     private var continuations: [UUID: AsyncStream<ProviderQuotaStatus>.Continuation] = [:]
     private var lastReadStartedAt: Date?
     #if DEBUG
@@ -119,6 +130,14 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     /// or retain a transport that nothing is watching and nothing will later stop.
     package func refreshNow() async {
         guard isEnabled, !continuations.isEmpty else { return }
+        // A failed read may come from a process whose cached credentials no longer match the
+        // managed account (for example, access restored or a fresh sign-in in another
+        // process). Only this explicit user action replaces it; automatic and foreground
+        // refreshes keep reusing the current transport. The snapshot is kept, so the display
+        // does not lose its last value while the replacement reads.
+        if lastReadFailed, inFlightRead == nil {
+            teardownTransport()
+        }
         // A previously failed notification loop is re-established here rather than by a timer.
         startIfPossible()
         await performRead()
@@ -139,6 +158,20 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         await performRead()
     }
 
+    /// Display-driven refresh of a reading the caller judged stale. Same gate as foreground:
+    /// a live observer, at least `foregroundRefreshMinimumGap` since the last read, and never
+    /// a second read while one is in flight.
+    package func refreshAutomatically(didStart: (@Sendable () async -> Void)?) async {
+        guard isEnabled, !continuations.isEmpty, inFlightRead == nil else { return }
+        if let lastReadStartedAt,
+           now().timeIntervalSince(lastReadStartedAt) < Self.foregroundRefreshMinimumGap
+        {
+            return
+        }
+        startIfPossible()
+        await performRead(didStart: didStart)
+    }
+
     /// Activity-triggered advisory demand, not a user click. No timer or automatic retry.
     package func refreshForAdvisory() async {
         guard !Task.isCancelled, isEnabled, !continuations.isEmpty, inFlightRead == nil else { return }
@@ -149,11 +182,46 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
 
     /// Account switch or sign-out. The prior account's snapshot is discarded rather than
     /// migrated, and the transport is torn down.
-    package func handleSignOutOrAccountChange() {
+    ///
+    /// - Parameter authGeneration: the managed-auth generation the sign-out moved to, when
+    ///   the authority reports it. Authentication events from earlier generations are
+    ///   ignored afterwards.
+    package func handleSignOutOrAccountChange(authGeneration: UInt64? = nil) {
+        if let authGeneration {
+            signOutAuthGeneration = max(signOutAuthGeneration ?? 0, authGeneration)
+        }
         snapshot = nil
         lastReadStartedAt = nil
         teardownTransport()
         publish(isEnabled ? .idle : .disabled)
+    }
+
+    /// The managed-auth authority established credentials (interactive sign-in, recovery
+    /// after an observed sign-out or failure, or an account change).
+    ///
+    /// An app-server process reads credentials once at start, so the owned transport is
+    /// replaced rather than reused. A reading for another or an unknown account is
+    /// discarded first; a same-account reading is kept so the display stays in place while
+    /// the replacement transport reads. Starts nothing unless the feature is enabled and
+    /// observed, and ignores events that predate the latest sign-out.
+    package func handleManagedAuthenticationEstablished(accountID: String?, authGeneration: UInt64) {
+        if let signOutAuthGeneration, authGeneration < signOutAuthGeneration { return }
+        if let snapshot {
+            // Kept only when both identities are known and equal: an unidentified reading
+            // could belong to any account.
+            let established = ProviderAccountKey.codex(accountID: accountID)
+            let sameAccount = established.isIdentified && snapshot.accountKey.isIdentified
+                && snapshot.accountKey.refersToSameAccount(as: established)
+            if !sameAccount {
+                self.snapshot = nil
+            }
+        }
+        lastReadStartedAt = nil
+        teardownTransport()
+        if snapshot == nil {
+            publish(isEnabled ? .idle : .disabled)
+        }
+        startIfPossible()
     }
 
     /// Restarts observation after a managed-auth transition only when the feature is still
@@ -228,6 +296,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         guard !Task.isCancelled else { return }
         // Retiring this transport invalidates any read still riding on it.
         transportGeneration &+= 1
+        lastReadFailed = false
         notificationTask = nil
         primingTask?.cancel()
         primingTask = nil
@@ -251,6 +320,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
 
     private func teardownTransport() {
         transportGeneration &+= 1
+        lastReadFailed = false
         notificationTask?.cancel()
         notificationTask = nil
         primingTask?.cancel()
@@ -270,7 +340,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     /// Every caller requires a live observer. An unobserved read would construct a transport
     /// that no `removeSubscriber` teardown will ever reclaim, so the observer check is the
     /// single admission point rather than a per-caller decision.
-    private func performRead(expectedGeneration: UInt64? = nil) async {
+    private func performRead(expectedGeneration: UInt64? = nil, didStart: (@Sendable () async -> Void)? = nil) async {
         guard !Task.isCancelled, isEnabled, !continuations.isEmpty else { return }
         if let expectedGeneration, expectedGeneration != transportGeneration { return }
         if let inFlightRead {
@@ -278,11 +348,16 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
             await inFlightRead.task.value
             return
         }
+        // The priming read only exists to give a new transport its first reading. If an
+        // explicit read on this transport already started (and possibly finished), it is
+        // satisfied.
+        if let expectedGeneration, readStartedGeneration == expectedGeneration { return }
 
         if snapshot == nil {
             publish(.loading)
         }
         lastReadStartedAt = now()
+        readStartedGeneration = transportGeneration
 
         let generation = transportGeneration
         let installedClientForThisRead = client == nil
@@ -309,6 +384,8 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
         #if DEBUG
             readCount += 1
         #endif
+        // Registered as in flight first, so a reentrant caller during this hop joins it.
+        await didStart?()
         await task.value
 
         // Only clear the registration this call created. After a teardown/restart the field
@@ -345,6 +422,8 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
                 self.snapshot = nil
             }
             if snapshot == nil {
+                // No usage from this transport; an explicit refresh may replace it.
+                lastReadFailed = true
                 publish(.unavailable(reason: "Codex did not report usage limits for this account."))
             }
             return
@@ -354,9 +433,13 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
 
     private func handleTransportFailure(_ error: Error, generation: UInt64) {
         guard isEnabled, transportGeneration == generation else { return }
+        lastReadFailed = true
         // Keep a previously observed snapshot; it becomes stale via its own horizon rather
-        // than being replaced by an error state.
-        if snapshot == nil {
+        // than being replaced by an error state. The failure is still reported alongside it
+        // so surfaces can say the last refresh did not complete.
+        if let snapshot {
+            publish(.failed(reason: Self.userSafeFailureReason(error), previous: snapshot))
+        } else {
             publish(.unavailable(reason: Self.userSafeFailureReason(error)))
         }
     }
@@ -371,6 +454,7 @@ package actor CodexProviderQuotaService: ProviderQuotaObserving {
     }
 
     private func apply(_ delta: ProviderQuotaSnapshotDelta) {
+        lastReadFailed = false
         switch ProviderQuotaMerge.apply(delta, to: snapshot) {
         case .accountMismatch:
             // The reading belongs to a different account: discard the old one entirely and

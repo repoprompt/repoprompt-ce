@@ -222,15 +222,38 @@ final class BatchConfirmationCoordinator: ObservableObject {
         return confirmation
     }
 
-    func pendingConfirmations(forTab tabID: UUID) -> [PendingBatchConfirmation] {
+    func pendingConfirmations(forTab tabID: UUID, sessionID: UUID) -> [PendingBatchConfirmation] {
         order.compactMap { confirmations[$0] }
-            .filter { $0.granteeTabID == tabID && $0.state == .pending }
+            .filter { $0.granteeTabID == tabID && $0.granteeSessionID == sessionID && $0.state == .pending }
+    }
+
+    /// Rebinding a tab cannot present or apply the previous session's unused approval.
+    func invalidateStaleConfirmations(tabID: UUID, currentSessionID: UUID?) {
+        for (id, card) in confirmations where card.granteeTabID == tabID
+            && card.granteeSessionID != currentSessionID
+            && (card.state == .pending || card.state == .approved)
+        {
+            var updated = card
+            updated.state = .invalidated
+            confirmations[id] = updated
+        }
+    }
+
+    /// UI actions re-read the live binding rather than trusting the rendered card's tab.
+    func isCurrentPresentation(confirmationID: UUID, tabID: UUID, sessionID: UUID?) -> Bool {
+        guard let card = confirmations[confirmationID] else { return false }
+        return card.granteeTabID == tabID && card.granteeSessionID == sessionID && card.state == .pending
     }
 
     private func trimRetention() {
         while order.count > Self.maxRetainedConfirmations {
-            // Never evict an undecided card; drop the oldest decided one instead.
-            guard let index = order.firstIndex(where: { confirmations[$0]?.state != .pending }) else { return }
+            // Pending, approved and applying cards retain their idempotency-key ownership.
+            guard let index = order.firstIndex(where: {
+                switch confirmations[$0]?.state {
+                case .consumed, .denied, .invalidated: true
+                default: false
+                }
+            }) else { return }
             let id = order.remove(at: index)
             if let removed = confirmations.removeValue(forKey: id) {
                 confirmationIDByKey.removeValue(forKey: Key(

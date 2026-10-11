@@ -42,7 +42,7 @@ package extension DomainAgentSessionTargetOperation {
             nil
         case .monitorList, .monitorCreateLane, .monitorRetireLane, .monitorPoll, .monitorWait, .monitorRead,
              .monitorSend, .monitorCompact, .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop,
-             .monitorSetModel:
+             .monitorSetModel, .monitorWorktreeBinding:
             nil
         case .adminRequestScope, .adminScopeStatus, .adminReleaseScope:
             nil
