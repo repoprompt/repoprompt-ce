@@ -17,7 +17,7 @@ enum GrokBuildAgentToolPreferences {
         var detailText: String {
             switch self {
             case .managedDefault:
-                "Grok Build asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."
+                "Grok Build asks before running tools that need approval, unless its own permission rules allow them. Claude Code `defaultMode` can allow many requests (`bypassPermissions`) or edit tools such as `write` (`acceptEdits`) without asking RepoPrompt. RepoPrompt MCP is injected through the ACP session."
             case .fullAccess:
                 "RepoPrompt launches Grok Build with `--always-approve`, so Grok's own shell and edit tools run without per-request confirmation. Applies to newly launched Grok processes."
             }

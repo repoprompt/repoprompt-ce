@@ -133,6 +133,29 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.captureWaitInput(for: endpoint).generation, 0)
     }
 
+    func testAttentionCountReadDoesNotAcknowledgeAndLastUnlinkClearsIt() async throws {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("link admission failed") }
+        let result = await fixture.bridge.requestAttention(
+            targetEndpoint: fixture.target.domainEndpoint, observerSessionID: fixture.observer.sessionID
+        )
+        XCTAssertEqual(result, .accepted(hasWaitingOn: false))
+        let before = try XCTUnwrap(passiveSnapshot(fixture))
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 1)
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 1)
+        XCTAssertEqual(passiveSnapshot(fixture), before, "reading must not acknowledge, refresh or re-publish")
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.target.domainEndpoint), 0)
+        let resolvedReference = await linkReference(fixture)
+        let reference = try XCTUnwrap(resolvedReference)
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID,
+            linkID: reference.linkID, generation: reference.generation
+        )
+        XCTAssertEqual(stopped, .stopped)
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(fixture.bridge.pendingAttentionOccurrenceCount(for: fixture.observer.domainEndpoint), 0)
+    }
+
     /// The popover uses this editor and the bridge's payload-free readiness publisher.
     private func makeSessionIDEditor(_ fixture: Fixture) -> AgentMonitorSessionIDEditor {
         let editor = AgentMonitorSessionIDEditor(
@@ -7835,6 +7858,60 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         release?.resume()
         await fulfillment(of: [completed], timeout: 3)
         XCTAssertEqual(first?.result, .created)
+    }
+
+    func testFinalLaneAuthorizationRecountsSettledCompetingReservation() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        for index in 0 ..< (AgentSessionLanePolicy.agentSessionLaneMaximumCount - 1) {
+            let lane = makeCandidate(windowID: 220 + index)
+            fixture.host.candidates.append(lane)
+            fixture.host.laneProvenance[lane.domainEndpoint] = fixture.observer.sessionID
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: fixture.observer.domainEndpoint,
+                targetEndpoint: lane.domainEndpoint
+            ) else { return XCTFail("seed lane \(index) failed") }
+        }
+        _ = prepareCreatedLane(fixture)
+        let allocating = expectation(description: "competitor owns the final slot")
+        var release: CheckedContinuation<Void, Never>?
+        fixture.host.beforeLaneCreationReturn = {
+            fixture.host.beforeLaneCreationReturn = nil
+            allocating.fulfill()
+            await withCheckedContinuation { release = $0 }
+        }
+        let competitor = Task { @MainActor in
+            await createLane(
+                fixture, observerEndpoint: fixture.observer.domainEndpoint,
+                request: laneRequest(fixture, key: "final-slot-competitor")
+            )
+        }
+        await fulfillment(of: [allocating], timeout: 3)
+        var authorizationInterleaved = false
+        fixture.bridge.test_beforeLaneCapCallerValidation = {
+            fixture.bridge.test_beforeLaneCapCallerValidation = nil
+            authorizationInterleaved = true
+            release?.resume()
+            release = nil
+            _ = await competitor.value
+            // Completion publishes lane 12 and releases its reservation while the other
+            // request still holds an inventory of 11. Its last authorization may suspend.
+            _ = self.prepareCreatedLane(fixture)
+        }
+        let refused = await createLane(
+            fixture, observerEndpoint: fixture.observer.domainEndpoint,
+            request: laneRequest(fixture, key: "final-slot-stale-inventory")
+        )
+        XCTAssertTrue(authorizationInterleaved, "must finish the competitor during final authorization")
+        // Settle even if admission skips the seam, so a failed witness cannot leak a parked task.
+        release?.resume()
+        release = nil
+        let created = await competitor.value
+        XCTAssertEqual(created.result, .created)
+        XCTAssertEqual(refused.reason, .laneLimitReached)
+        XCTAssertEqual(refused.laneCount, AgentSessionLanePolicy.agentSessionLaneMaximumCount)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
     }
 
     func testDuplicateLaneIncarnationDoesNotFreeACreatorSlot() async throws {

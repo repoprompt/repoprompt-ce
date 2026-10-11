@@ -1,4 +1,5 @@
 import Combine
+import enum MCP.Value
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -427,6 +428,107 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
     }
 
+    /// Clearing a saved Claude model uses Claude's catalog default without persisting it,
+    /// both immediately and after a fresh-store reload.
+    func testContextBuilderModelClearKeepsSettingsAndRuntimeProviderInAgreement() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.apiSettings.prepareForWindowClose() }
+        fixture.apiSettings.isClaudeCodeConnected = true
+        fixture.apiSettings.isCodexConnected = true
+        fixture.apiSettings.isCursorConnected = false
+        fixture.apiSettings.isGrokBuildConnected = false
+        fixture.apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: [.claudeCode, .codexExec])
+        let claudeRaw = AgentProviderKind.claudeCode.rawValue
+        fixture.store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                contextBuilderAgentRaw: claudeRaw,
+                contextBuilderModelsByAgent: [claudeRaw: AgentModel.claudeSonnet.rawValue]
+            ),
+            contextBuilderWriteIntent: .userInitiated
+        )
+        func runtimeSelection(from store: GlobalSettingsStore) -> AgentModelCatalog.NormalizedAgentSelection? {
+            let profile = store.effectiveAgentModelsProfile(workspaceID: nil)
+            let agentRaw = profile.contextBuilderAgentRaw
+            return AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: agentRaw,
+                persistedModelRaw: agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] },
+                availability: fixture.apiSettings.contextBuilderRestorationAvailabilityContext,
+                enabledRecommendationProviders: store.globalRecommendationProviderFilter()
+            )
+        }
+        XCTAssertEqual(
+            runtimeSelection(from: fixture.store),
+            AgentModelCatalog.NormalizedAgentSelection(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
+            "Precondition: runtime accepts the saved, available Claude/Sonnet pair"
+        )
+        XCTAssertTrue(fixture.store.hasUserSetGlobalContextBuilderAgentDefaults)
+
+        let clear = try await AppSettingsMCPService(store: fixture.store).handleForTesting([
+            "op": .string("set"),
+            "key": .string("context_builder.model"),
+            "value": .null
+        ])
+        XCTAssertEqual(clear.objectValue?["changed"]?.boolValue, true)
+        XCTAssertEqual(clear.objectValue?["applied"]?.boolValue, true)
+        XCTAssertNil(clear.objectValue?["persistence_blocked"])
+
+        func assertClearedSelection(in store: GlobalSettingsStore, phase: String) async throws {
+            let settings = AgentModelsSettingsViewModel(
+                apiSettingsVM: fixture.apiSettings,
+                workspaceID: nil,
+                settingsManager: store,
+                settingsStore: store,
+                notificationCenter: NotificationCenter()
+            )
+            let runtime = try XCTUnwrap(runtimeSelection(from: store), phase)
+            XCTAssertEqual(settings.selectedContextBuilderAgent, .claudeCode, phase)
+            XCTAssertEqual(runtime.agent, .claudeCode, "\(phase): a clear must keep the saved provider")
+            XCTAssertEqual(runtime, settings.selectedContextBuilderSelection, "\(phase): Settings and runtime must use the same normalized default")
+            let profile = store.globalAgentModelsProfile()
+            XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, phase)
+            XCTAssertNil(profile.contextBuilderModelsByAgent?[claudeRaw], "\(phase): the synthesized default must not be saved")
+            XCTAssertTrue(store.hasUserSetGlobalContextBuilderAgentDefaults, phase)
+            let get = try await AppSettingsMCPService(store: store).handleForTesting([
+                "op": .string("get"),
+                "keys": .array([.string("context_builder.model")])
+            ])
+            XCTAssertEqual(get.objectValue?["values"]?.objectValue?["context_builder.model"], .null, phase)
+        }
+        try await assertClearedSelection(in: fixture.store, phase: "after clear")
+        let reloaded = GlobalSettingsStore(
+            defaults: fixture.defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fixture.fileURL)
+        )
+        try await assertClearedSelection(in: reloaded, phase: "after reload")
+    }
+
+    func testContextBuilderResolverKeepsSavedProviderDefaultBeforeRecommendationFiltering() throws {
+        let invalidModel = "not-a-claude-model"
+        let available = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false
+        )
+        let codexOnly = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false
+        )
+        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: invalidModel, for: .claudeCode, availability: available))
+        let scenarios: [(
+            name: String, model: String?, availability: AgentModelCatalog.AvailabilityContext, expectedAgent: AgentProviderKind
+        )] = [
+            ("saved Claude default ignores recommendation filter", nil, available, .claudeCode),
+            ("invalid nonempty Claude model keeps fallback", invalidModel, available, .codexExec),
+            ("unavailable Claude default keeps fallback", nil, codexOnly, .codexExec)
+        ]
+        for scenario in scenarios {
+            let selection = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: AgentProviderKind.claudeCode.rawValue,
+                persistedModelRaw: scenario.model,
+                availability: scenario.availability,
+                enabledRecommendationProviders: [.codex]
+            ), scenario.name)
+            XCTAssertEqual(selection.agent, scenario.expectedAgent, scenario.name)
+        }
+    }
+
     private func recommendedOpenAIModelRaw(from engine: AutoRecommendationEngine) throws -> String {
         let recommendations = engine.computeRecommendations(
             for: AgentModelsOperationIdentity(sourceWorkspaceID: UUID(), scope: .global),
@@ -438,7 +540,9 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
     private func makeFixture() throws -> (
         store: GlobalSettingsStore,
         engine: AutoRecommendationEngine,
-        apiSettings: APISettingsViewModel
+        apiSettings: APISettingsViewModel,
+        defaults: UserDefaults,
+        fileURL: URL
     ) {
         let temp = FileManager.default.temporaryDirectory
             .appendingPathComponent("AutoRecommendationEngineScopedSettingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -454,11 +558,10 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             defaults.removePersistentDomain(forName: suiteName)
         }
 
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         let store = GlobalSettingsStore(
             defaults: defaults,
-            fileStore: GlobalSettingsFileStore(
-                fileURL: temp.appendingPathComponent("Settings/globalSettings.json")
-            )
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
         let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
         let apiSettings = APISettingsViewModel(
@@ -473,6 +576,6 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             profileSettingsManager: store,
             apiSettingsViewModel: apiSettings
         )
-        return (store, engine, apiSettings)
+        return (store, engine, apiSettings, defaults, fileURL)
     }
 }

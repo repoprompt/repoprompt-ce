@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import OrderedCollections
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 @MainActor
@@ -22,8 +23,23 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             agentExploreTool(),
             agentRunTool(),
             agentManageTool(),
-            agentSessionLinkTool()
+            agentSessionLinkTool(),
+            becomeOverseerTool()
         ]
+    }
+
+    private func becomeOverseerTool() -> Tool {
+        let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.becomeOverseer)!
+        let schema = try! JSONDecoder().decode(JSONSchema.self, from: JSONEncoder().encode(definition.inputSchema))
+        return runtime.tool(
+            name: definition.name,
+            freshnessPolicy: .none,
+            description: definition.description,
+            annotations: definition.annotations.mcpAnnotations,
+            inputSchema: schema
+        ) { [dependencies] _, args in
+            try await dependencies.executeBecomeOverseer(args)
+        }
     }
 
     /// Cross-window oversight of sessions the user explicitly granted this session access to.

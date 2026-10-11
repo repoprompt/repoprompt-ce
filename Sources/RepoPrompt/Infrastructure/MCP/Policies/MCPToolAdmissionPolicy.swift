@@ -33,7 +33,9 @@ enum MCPToolAdmissionPolicy {
         additional: Set<String>,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         allowsAgentExternalControlTools: Bool,
-        hasExactAgentSessionLinkGrant: Bool = false
+        hasExactAgentSessionLinkGrant: Bool = false,
+        canBecomeOverseer: Bool = false,
+        hasActivatedOverseer: Bool = false
     ) -> MCPDomainClientPolicySnapshot {
         let role: MCPClientTaskRole = switch taskLabelKind {
         case .explore:
@@ -48,7 +50,9 @@ enum MCPToolAdmissionPolicy {
             additionalToolNames: additional,
             role: role,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant
+            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant,
+            canBecomeOverseer: canBecomeOverseer,
+            hasActivatedOverseer: hasActivatedOverseer
         )
     }
 

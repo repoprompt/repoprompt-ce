@@ -112,6 +112,16 @@ final class ToolAvailabilityStore: ObservableObject {
         scheduleBroadcast()
     }
 
+    #if DEBUG
+        /// Exercise the synchronous published withdrawal path without persistence or debounce work.
+        /// Only an enabled tool may be temporarily withdrawn; the final store value is unchanged.
+        func debugDisableAndReenableWithoutPersistenceForTesting(_ name: String) {
+            precondition(isEnabled(name))
+            disabledTools.insert(name)
+            disabledTools.remove(name)
+        }
+    #endif
+
     /// Registers newly discovered `Tool`s so the UI can present them.
     func registerTools(_ tools: [Tool]) {
         // Evaluate default enable flags BEFORE appending to `allTools`

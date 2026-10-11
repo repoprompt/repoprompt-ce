@@ -118,6 +118,11 @@ final class AgentACPModelRegistry {
         let generation: UInt64
     }
 
+    /// Reads saved data when memory is empty, without installing it or changing warm state.
+    func resolvedSnapshotIncludingStandardStore(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+        snapshotFromMemory(for: providerID) ?? ACPDynamicModelStore.load(providerID: providerID)
+    }
+
     func resolvedSnapshotAfterWarmingStandardStore(
         for providerID: ACPProviderID
     ) async -> ACPDiscoveredSessionModels? {

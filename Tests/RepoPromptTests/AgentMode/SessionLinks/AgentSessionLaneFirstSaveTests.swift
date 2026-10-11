@@ -62,6 +62,21 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         await cleanup()
     }
 
+    /// Model denied-role ownership at the property boundary: public MCP activation correctly
+    /// refuses to capture an app-owned linked overseer. These races test proof revocation and
+    /// rollback, not capture admission; the production didSet and release path still run.
+    private func installDeniedRoleControlFixture(on session: AgentTabSession, sessionID: UUID) async {
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+        session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: sessionID, activationID: UUID(), registration: registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+        )
+    }
+
     private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -80,6 +95,711 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         window.beginClose()
         await window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(window)
+    }
+
+    func testActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let creatorOutcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Ordinary creator", selection: fixture.selection)
+            guard case let .created(creatorID, creatorTabID, _) = creatorOutcome else { return XCTFail("creator seed must save") }
+            let creator = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[creatorTabID])
+            creator.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            bridge.installIntentStore(AgentSessionOversightIntentStore(fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename), backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled))
+            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+            XCTAssertNotNil(activated)
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            try await withSecondRegisteredWindow { destinationWindow in
+                // Simulate only the destination's published CLI-availability input; never run a provider.
+                destinationWindow.apiSettingsViewModel.isClaudeCodeConnected = true
+                try await AsyncTestWait.waitUntil("fixture destination model availability") {
+                    destinationWindow.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                }
+                let workspace = destinationWindow.workspaceManager.createWorkspace(name: "Other destination", repoPaths: [fixture.root.path], ephemeral: false)
+                await destinationWindow.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "activatedFirstLaneTest")
+                let request = AgentSessionLaneCreateRequest(idempotencyKey: "real-first-lane", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Activated first lane", workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil)
+                let receipt = await bridge.createLane(observerEndpoint: endpoint, request: request, resolveDestination: { (destinationWindow.windowID, workspace.id, workspace.name) })
+                XCTAssertEqual(receipt.result, .created, "\(receipt)")
+                XCTAssertTrue(receipt.linked)
+                let laneID = try XCTUnwrap(receipt.sessionID)
+                let lane = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == laneID })
+                XCTAssertEqual(lane.windowID, destinationWindow.windowID)
+                XCTAssertEqual(lane.workspaceID, workspace.id)
+                XCTAssertTrue(lane.restorationReadiness.isAuthoritative)
+                let payload = try await AgentSessionDataService.shared.loadAgentSession(id: laneID, for: workspace)
+                XCTAssertEqual(payload?.createdByOverseerSessionID, creatorID)
+                let inventory = await authority.links(forObserver: creatorID)
+                XCTAssertEqual(inventory.items.map(\.targetSessionID), [laneID])
+                XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID, "creation never switches the creator workspace")
+            }
+        }
+    }
+
+    func testPendingActivatedFirstLaneCannotAuthorizeNestedLaneAfterControlRelease() async throws {
+        try await exerciseNestedCreationAfterControlRelease(independentDirection: nil)
+    }
+
+    func testPendingFirstLaneRollbackPreservesIndependentExactInboundAndOutboundGrants() async throws {
+        for direction in ["inbound", "outbound"] {
+            try await exerciseNestedCreationAfterControlRelease(independentDirection: direction)
+        }
+    }
+
+    func testIndependentGrantSampleRejectsRolledBackBootstrapGeneration() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "ABA caller", selection: fixture.selection
+            )
+            guard case let .created(creatorID, creatorTabID, _) = seed else { return XCTFail("creator seed must save") }
+            let creator = try XCTUnwrap(viewModel.sessions[creatorTabID])
+            creator.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            let store = AgentSessionOversightIntentStore(
+                fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+            )
+            bridge.attach(host: host)
+            defer {
+                bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            await bridge.bootstrapIntentStore(store)
+            await bridge.test_settleLaunchReconciliation()
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("ABA creation model availability") {
+                fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let start: (String) -> Task<AgentSessionLaneCreateReceipt, Never> = { key in
+                Task { @MainActor in
+                    await bridge.createLane(
+                        observerEndpoint: endpoint,
+                        request: AgentSessionLaneCreateRequest(idempotencyKey: key, role: nil, modelID: "claudeCode:sonnet:high", sessionName: key, workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil),
+                        resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+                    )
+                }
+            }
+            let consumeActivation: @MainActor () async throws -> Void = {
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
+                XCTAssertNil(creator.oversight.overseerActivation)
+                await bridge.test_auditObserverEligibility()
+                await bridge.test_settleLaunchReconciliation()
+                await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
+                let returned = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                XCTAssertNil(returned.activation, "real role release cannot restore an old opt-in")
+            }
+            let optIn: @MainActor () async throws -> AgentSessionOverseerActivation = {
+                let noLink = await authority.hasActiveLink(endpoint: endpoint)
+                XCTAssertFalse(noLink, "each explicit opt-in must occur after all prior relationships are gone")
+                let result = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+                XCTAssertNotNil(result, "use the real bootstrap eligibility/authority gates, not a stored-state assignment")
+                return try XCTUnwrap(creator.oversight.overseerActivation)
+            }
+            let parked = (0 ..< 3).map { XCTestExpectation(description: "activation-backed A\($0) is indexed and parked") }
+            var pairs: [AgentSessionOversightIntent] = []
+            var releases: [Int: CheckedContinuation<Void, Never>] = [:]
+            var tasks: [Task<AgentSessionLaneCreateReceipt, Never>] = []
+            bridge.test_afterActivationBeforeDeletionFence = { pair in
+                guard pairs.count < 3 else { return }
+                let index = pairs.count
+                pairs.append(pair)
+                await withCheckedContinuation { continuation in
+                    releases[index] = continuation
+                    parked[index].fulfill()
+                }
+            }
+            var releaseInvocation: CheckedContinuation<Void, Never>?
+            var releaseResponse: CheckedContinuation<Void, Never>?
+            let invocationParked = XCTestExpectation(description: "B captured A0's exclusion set before actor execution")
+            let responseParked = XCTestExpectation(description: "real authority sample returned A1 before B consumes it")
+            var sampled: DomainAgentSessionLinkGrant?
+            bridge.test_beforeLaneCreationIndependentGrantSample = { excluded in
+                bridge.test_beforeLaneCreationIndependentGrantSample = nil
+                XCTAssertEqual(excluded.count, 1)
+                XCTAssertEqual(excluded.first?.sessionID, pairs.first?.targetSessionID)
+                await withCheckedContinuation { continuation in
+                    releaseInvocation = continuation
+                    invocationParked.fulfill()
+                }
+            }
+            bridge.test_afterLaneCreationIndependentGrantSample = { grant in
+                bridge.test_afterLaneCreationIndependentGrantSample = nil
+                sampled = grant
+                await withCheckedContinuation { continuation in
+                    releaseResponse = continuation
+                    responseParked.fulfill()
+                }
+            }
+            do {
+                var activations = try await [optIn()]
+                let a0 = start("ABA-A0")
+                tasks.append(a0)
+                await fulfillment(of: [parked[0]], timeout: 10)
+                try await consumeActivation()
+                let b = start("ABA-B")
+                tasks.append(b)
+                await fulfillment(of: [invocationParked], timeout: 10)
+                releases.removeValue(forKey: 0)?.resume()
+                let receipt0 = await a0.value
+                XCTAssertFalse(receipt0.linked)
+                XCTAssertEqual(receipt0.reason, .addFailed)
+                try await activations.append(optIn())
+                let a1 = start("ABA-A1")
+                tasks.append(a1)
+                await fulfillment(of: [parked[1]], timeout: 10)
+                try await consumeActivation()
+                let illegalOptIn = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+                XCTAssertNil(illegalOptIn, "a new opt-in is correctly refused while provisional A1 is still indexed")
+                releaseInvocation?.resume()
+                releaseInvocation = nil
+                await fulfillment(of: [responseParked], timeout: 10)
+                let sample = try XCTUnwrap(sampled)
+                XCTAssertEqual(sample.target.sessionID, pairs[1].targetSessionID, "actual domain sample is provisional A1, not a fabricated independent grant")
+                XCTAssertEqual(sample.observer, endpoint)
+                releases.removeValue(forKey: 1)?.resume()
+                let receipt1 = await a1.value
+                XCTAssertFalse(receipt1.linked)
+                XCTAssertEqual(receipt1.reason, .addFailed)
+                let staleSample = await authority.activeGrant(for: DomainAgentSessionLinkReference(linkID: sample.id, generation: sample.generation))
+                XCTAssertNil(staleSample, "A1's sampled exact generation is revoked before B resumes")
+                try await activations.append(optIn())
+                XCTAssertEqual(Set(activations.map(\.token)).count, 3)
+                XCTAssertTrue(activations.allSatisfy { $0.endpoint == endpoint }, "the ABA uses the same session incarnation")
+                let a2 = start("ABA-A2")
+                tasks.append(a2)
+                await fulfillment(of: [parked[2]], timeout: 10)
+                try await consumeActivation()
+                let beforeB = await authority.links(forObserverEndpoint: endpoint)
+                XCTAssertEqual(beforeB.items.map(\.targetSessionID), [pairs[2].targetSessionID], "only unsettled A2 exists; there was never a settled independent grant")
+                let freshSettlement = XCTestExpectation(description: "B resamples and waits for current A2 instead of promoting stale A1")
+                freshSettlement.assertForOverFulfill = true
+                bridge.test_beforeLaneCreationBootstrapSettlement = { freshSettlement.fulfill() }
+                releaseResponse?.resume()
+                releaseResponse = nil
+                await fulfillment(of: [freshSettlement], timeout: 10)
+                let whileBWaits = await authority.links(forObserverEndpoint: endpoint)
+                XCTAssertEqual(whileBWaits.items.map(\.targetSessionID), [pairs[2].targetSessionID], "B cannot allocate/index while its only current basis is unsettled A2")
+                releases.removeValue(forKey: 2)?.resume()
+                let receipt2 = await a2.value
+                XCTAssertFalse(receipt2.linked)
+                XCTAssertEqual(receipt2.reason, .addFailed)
+                let receiptB = await b.value
+                XCTAssertEqual(receiptB.result, .refused)
+                XCTAssertEqual(receiptB.reason, .denied)
+                XCTAssertFalse(receiptB.linked)
+                XCTAssertNil(receiptB.sessionID, "no lane may be allocated from stale A1 or provisional A2")
+                let afterRollback = await authority.links(forObserverEndpoint: endpoint)
+                XCTAssertTrue(afterRollback.items.isEmpty)
+                for pair in pairs {
+                    let token = await store.token(for: pair)
+                    XCTAssertNil(token)
+                }
+                print("P1_ABA_REGRESSION: real opt-ins=3; sampled A1 stale=true; B result=\(receiptB.result) reason=\(String(describing: receiptB.reason)) linked=\(receiptB.linked); A0/A1/A2 addFailed; final relationships=\(afterRollback.items.count); B allocated=\(receiptB.sessionID != nil)")
+            } catch {
+                bridge.test_beforeLaneCreationIndependentGrantSample = nil
+                bridge.test_afterLaneCreationIndependentGrantSample = nil
+                bridge.test_afterActivationBeforeDeletionFence = nil
+                bridge.test_beforeLaneCreationBootstrapSettlement = nil
+                releaseInvocation?.resume()
+                releaseResponse?.resume()
+                for release in releases.values {
+                    release.resume()
+                }
+                for task in tasks {
+                    _ = await task.value
+                }
+                throw error
+            }
+            bridge.test_beforeLaneCreationIndependentGrantSample = nil
+            bridge.test_afterLaneCreationIndependentGrantSample = nil
+            bridge.test_afterActivationBeforeDeletionFence = nil
+            bridge.test_beforeLaneCreationBootstrapSettlement = nil
+        }
+    }
+
+    func testIndependentGrantSampleResamplesAcrossActivationBackedEntryMutations() async throws {
+        for inserting in [true, false] {
+            try await withFixture(ephemeral: false) { fixture in
+                let host = WindowStatesManager.shared
+                let viewModel = fixture.window.agentModeViewModel
+                let seed = try await host.agentSessionLinkCreateLane(
+                    destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                    creatorSessionID: UUID(), sessionName: "Lifecycle caller", selection: fixture.selection
+                )
+                guard case let .created(creatorID, creatorTabID, _) = seed else { return XCTFail("creator seed must save") }
+                let creator = try XCTUnwrap(viewModel.sessions[creatorTabID])
+                creator.createdByOverseerSessionID = nil
+                let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+                let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                    runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+                ))
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+                let store = AgentSessionOversightIntentStore(
+                    fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                    backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+                )
+                bridge.attach(host: host)
+                defer {
+                    bridge.freezeForTermination()
+                    AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+                }
+                await bridge.bootstrapIntentStore(store)
+                await bridge.test_settleLaunchReconciliation()
+                AgentAdvertisedModelCatalog.shared.record([
+                    AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+                ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+                defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                try await AsyncTestWait.waitUntil("entry lifecycle model availability") {
+                    fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                }
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let independentSeed = try await host.agentSessionLinkCreateLane(
+                    destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                    creatorSessionID: UUID(), sessionName: "Independent stable lane", selection: fixture.selection
+                )
+                guard case let .created(independentID, _, _) = independentSeed else { return XCTFail("independent seed must save") }
+                let optIn = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+                XCTAssertNotNil(optIn, "one real no-link activation backs both owned creations")
+                let start: (String) -> Task<AgentSessionLaneCreateReceipt, Never> = { key in
+                    Task { @MainActor in
+                        await bridge.createLane(
+                            observerEndpoint: endpoint,
+                            request: AgentSessionLaneCreateRequest(idempotencyKey: key, role: nil, modelID: "claudeCode:sonnet:high", sessionName: key, workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil),
+                            resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+                        )
+                    }
+                }
+                let parked = XCTestExpectation(description: "A0 indexed before sample")
+                let otherParked = XCTestExpectation(description: inserting ? "A1 assigned and saved before entry insertion" : "A1 indexed before sample")
+                var firstPair: AgentSessionOversightIntent?
+                var otherPair: AgentSessionOversightIntent?
+                var releaseFirst: CheckedContinuation<Void, Never>?
+                var releaseOther: CheckedContinuation<Void, Never>?
+                var releaseMutation: CheckedContinuation<Void, Never>?
+                var releaseSample: CheckedContinuation<Void, Never>?
+                bridge.test_afterActivationBeforeDeletionFence = { pair in
+                    if firstPair == nil {
+                        firstPair = pair
+                        await withCheckedContinuation { releaseFirst = $0
+                            parked.fulfill()
+                        }
+                    } else if !inserting, otherPair == nil {
+                        otherPair = pair
+                        await withCheckedContinuation { releaseOther = $0
+                            otherParked.fulfill()
+                        }
+                    }
+                }
+                let a0 = start("Lifecycle-A0")
+                var tasks = [a0]
+                var preflight: Task<AgentSessionLaneCreateReceipt.Reason?, Never>?
+                @MainActor func releaseAll() {
+                    bridge.test_afterActivationBeforeDeletionFence = nil
+                    bridge.test_afterAddInsertionBeforeEstablishment = nil
+                    bridge.test_afterActivationBackedEstablishmentMutation = nil
+                    bridge.test_afterLaneCreationIndependentGrantSample = nil
+                    releaseFirst?.resume()
+                    releaseFirst = nil
+                    releaseOther?.resume()
+                    releaseOther = nil
+                    releaseMutation?.resume()
+                    releaseMutation = nil
+                    releaseSample?.resume()
+                    releaseSample = nil
+                }
+                do {
+                    await fulfillment(of: [parked], timeout: 10)
+                    if inserting {
+                        bridge.test_afterAddInsertionBeforeEstablishment = { pair in
+                            bridge.test_afterAddInsertionBeforeEstablishment = nil
+                            otherPair = pair
+                            await withCheckedContinuation { releaseOther = $0
+                                otherParked.fulfill()
+                            }
+                        }
+                    }
+                    let a1 = start("Lifecycle-A1")
+                    tasks.append(a1)
+                    await fulfillment(of: [otherParked], timeout: 10)
+                    await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
+                    XCTAssertNil(creator.oversight.overseerActivation)
+                    await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
+                    XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
+                    let mutationParked = XCTestExpectation(description: "exact entry owner paused before cap release")
+                    let mutatedPair = try XCTUnwrap(inserting ? otherPair : firstPair)
+                    bridge.test_afterActivationBackedEstablishmentMutation = { pair, inserted in
+                        guard pair == mutatedPair, inserted == inserting else { return }
+                        bridge.test_afterActivationBackedEstablishmentMutation = nil
+                        await withCheckedContinuation { releaseMutation = $0
+                            mutationParked.fulfill()
+                        }
+                    }
+                    let sampleParked = XCTestExpectation(description: "real nil authority sample held across entry mutation")
+                    let freshSample = XCTestExpectation(description: "fresh sample observes independent grant without waiting for A")
+                    var sampleCount = 0
+                    var stableGrant: DomainAgentSessionLinkGrant?
+                    bridge.test_afterLaneCreationIndependentGrantSample = { grant in
+                        sampleCount += 1
+                        if sampleCount == 1 {
+                            XCTAssertNil(grant, "all real links at the original sample belong to captured bootstrap entries")
+                            await withCheckedContinuation { releaseSample = $0
+                                sampleParked.fulfill()
+                            }
+                        } else {
+                            stableGrant = grant
+                            freshSample.fulfill()
+                        }
+                    }
+                    let completed = XCTestExpectation(description: "independent preflight finishes while entry owner remains paused")
+                    var didComplete = false
+                    preflight = Task { @MainActor in
+                        let result = await bridge.laneCreationCallerPreflight(endpoint)
+                        didComplete = true
+                        completed.fulfill()
+                        return result
+                    }
+                    await fulfillment(of: [sampleParked], timeout: 10)
+                    if inserting {
+                        releaseOther?.resume()
+                        releaseOther = nil
+                    } else {
+                        releaseFirst?.resume()
+                        releaseFirst = nil
+                    }
+                    await fulfillment(of: [mutationParked], timeout: 10)
+                    // The fresh exact independent grant changes authority, not creator reservations.
+                    // The entry owner remains parked, so neither compensation nor its cap defer ran.
+                    let stablePair = AgentSessionOversightIntent(observerSessionID: creatorID, targetSessionID: independentID)
+                    let added = await bridge.addMonitorLink(pair: stablePair)
+                    guard case .added = added else { throw NSError(domain: "EntryLifecycleTest", code: 1) }
+                    releaseSample?.resume()
+                    releaseSample = nil
+                    await fulfillment(of: [freshSample, completed], timeout: 10)
+                    let bypassBeforeRelease = didComplete
+                    XCTAssertTrue(bypassBeforeRelease, "fresh independent authority must bypass still-unsettled pair owners")
+                    XCTAssertEqual(sampleCount, 2, "one invalidated sample, then one stable sample; no unbounded retry")
+                    XCTAssertEqual(stableGrant?.observer, endpoint)
+                    XCTAssertEqual(stableGrant?.target.sessionID, independentID)
+                    let duringMutation = await authority.links(forObserverEndpoint: endpoint)
+                    XCTAssertFalse(duringMutation.items.contains { $0.targetSessionID == mutatedPair.targetSessionID }, "consumed activation cannot index the pre-entry lane; a removed entry has already revoked its grant")
+                    releaseAll()
+                    for task in tasks {
+                        let receipt = await task.value
+                        XCTAssertFalse(receipt.linked)
+                        XCTAssertEqual(receipt.reason, .addFailed, "consumed activation cannot re-enter successfully")
+                    }
+                    let result = await preflight?.value
+                    XCTAssertNil(result ?? nil)
+                    let remaining = await authority.links(forObserverEndpoint: endpoint)
+                    XCTAssertEqual(remaining.items.map(\.targetSessionID), [independentID])
+                    print("P1_ENTRY_LIFECYCLE: inserting=\(inserting); real samples=\(sampleCount); independent bypass before cap release=\(bypassBeforeRelease); surviving grants=\(remaining.items.count)")
+                } catch {
+                    releaseAll()
+                    for task in tasks {
+                        _ = await task.value
+                    }
+                    _ = await preflight?.value
+                    throw error
+                }
+            }
+        }
+    }
+
+    private func exerciseNestedCreationAfterControlRelease(independentDirection: String?) async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Nested creation caller", selection: fixture.selection
+            )
+            guard case let .created(creatorID, creatorTabID, _) = seed else {
+                return XCTFail("creator seed must save")
+            }
+            let creator = try XCTUnwrap(viewModel.sessions[creatorTabID])
+            creator.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            let store = AgentSessionOversightIntentStore(
+                fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+            )
+            bridge.attach(host: host)
+            defer {
+                bridge.freezeForTermination()
+                AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+            }
+            await bridge.bootstrapIntentStore(store)
+            await bridge.test_settleLaunchReconciliation()
+            let activated = await bridge.becomeOverseer(
+                endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() }
+            )
+            XCTAssertNotNil(activated)
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("nested creation model availability") {
+                fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let request: (String) -> AgentSessionLaneCreateRequest = { key in
+                AgentSessionLaneCreateRequest(
+                    idempotencyKey: key, role: nil, modelID: "claudeCode:sonnet:high",
+                    sessionName: key, workspaceSelector: workspace.id.uuidString,
+                    message: nil, workflowReference: nil
+                )
+            }
+            let resolveDestination: @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)? = {
+                (fixture.window.windowID, workspace.id, workspace.name)
+            }
+            let firstParked = expectation(description: "A has activated and published inventory")
+            var firstPair: AgentSessionOversightIntent?
+            var resumeFirst: CheckedContinuation<Void, Never>?
+            bridge.test_afterActivationBeforeDeletionFence = { pair in
+                guard firstPair == nil else { return }
+                firstPair = pair
+                await withCheckedContinuation { continuation in
+                    resumeFirst = continuation
+                    firstParked.fulfill()
+                }
+            }
+            let first = Task { @MainActor in
+                await bridge.createLane(observerEndpoint: endpoint, request: request("nested-A"), resolveDestination: resolveDestination)
+            }
+            await fulfillment(of: [firstParked], timeout: 10)
+            // Always release and join A before the fixture tears down, including assertion failures.
+            do {
+                let pairA = try XCTUnwrap(firstPair)
+                let beforeControl = await authority.links(forObserver: creatorID)
+                XCTAssertEqual(beforeControl.items.map(\.targetSessionID), [pairA.targetSessionID])
+                XCTAssertNotNil(creator.oversight.overseerActivation)
+                await self.installDeniedRoleControlFixture(on: creator, sessionID: creatorID)
+                XCTAssertNil(creator.oversight.overseerActivation)
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                await bridge.test_auditObserverEligibility()
+                await bridge.test_settleLaunchReconciliation()
+                let duringControl = await authority.hasActiveLink(endpoint: endpoint)
+                XCTAssertTrue(duringControl, "the pending A grant is not yet in the completed-observer audit set")
+                await viewModel.mcpDeactivateControlContext(sessionID: creatorID, cleanupSessionStore: true)
+                let ordinaryAgain = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                XCTAssertNil(ordinaryAgain.activation, "real control release must not restore opt-in")
+                await bridge.test_auditObserverEligibility()
+                await bridge.test_settleLaunchReconciliation()
+                var stableReference: DomainAgentSessionLinkReference?
+                var stablePair: AgentSessionOversightIntent?
+                if let independentDirection {
+                    let independentSeed = try await host.agentSessionLinkCreateLane(
+                        destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                        creatorSessionID: UUID(), sessionName: "Independent \(independentDirection)", selection: fixture.selection
+                    )
+                    guard case let .created(independentID, _, _) = independentSeed else {
+                        throw NSError(domain: "NestedLaneTest", code: 1)
+                    }
+                    let pair = AgentSessionOversightIntent(
+                        observerSessionID: independentDirection == "inbound" ? independentID : creatorID,
+                        targetSessionID: independentDirection == "inbound" ? creatorID : independentID
+                    )
+                    let added = await bridge.addMonitorLink(pair: pair)
+                    guard case .added = added else { throw NSError(domain: "NestedLaneTest", code: 2) }
+                    let inventory = await authority.links(forObserver: pair.observerSessionID)
+                    let item = try XCTUnwrap(inventory.items.first { $0.targetSessionID == pair.targetSessionID })
+                    stableReference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+                    stablePair = pair
+                }
+                let gateEntered = XCTestExpectation(description: "preflight and claimed B wait for A's transaction")
+                gateEntered.expectedFulfillmentCount = 3
+                gateEntered.assertForOverFulfill = true
+                bridge.test_beforeLaneCreationBootstrapSettlement = {
+                    if independentDirection == nil {
+                        gateEntered.fulfill()
+                    } else {
+                        XCTFail("an independent exact grant must bypass A's settlement wait")
+                    }
+                }
+                let secondCompleted = XCTestExpectation(description: "independently authorized B completes while A remains parked")
+                var completedSecond: AgentSessionLaneCreateReceipt?
+                let preflight = Task { @MainActor in await bridge.laneCreationCallerPreflight(endpoint) }
+                let cancelledPreflightCompleted = XCTestExpectation(description: "cancelled preflight exits without settling or cancelling A")
+                let cancelledPreflight: Task<AgentSessionLaneCreateReceipt.Reason?, Never>? = independentDirection == nil ? Task { @MainActor in
+                    let result = await bridge.laneCreationCallerPreflight(endpoint)
+                    cancelledPreflightCompleted.fulfill()
+                    return result
+                } : nil
+                let second = Task { @MainActor in
+                    let receipt = await bridge.createLane(observerEndpoint: endpoint, request: request("nested-B"), resolveDestination: resolveDestination)
+                    completedSecond = receipt
+                    if independentDirection != nil { secondCompleted.fulfill() }
+                    return receipt
+                }
+                if independentDirection == nil {
+                    await fulfillment(of: [gateEntered], timeout: 10)
+                    XCTAssertNil(completedSecond, "sole-basis B remains parked without allocating")
+                    cancelledPreflight?.cancel()
+                    await fulfillment(of: [cancelledPreflightCompleted], timeout: 10)
+                    if let cancelledPreflight {
+                        let cancelledResult = await cancelledPreflight.value
+                        XCTAssertEqual(cancelledResult, .denied, "cancellation exits the wait while A remains paused")
+                    }
+                } else {
+                    await fulfillment(of: [secondCompleted], timeout: 10)
+                    XCTAssertEqual(completedSecond?.result, .created)
+                    XCTAssertEqual(completedSecond?.linked, true, "independent B must finish before A resumes")
+                }
+                let replayClaimed = expectation(description: "same-key replay joins B before settlement waits")
+                bridge.test_afterLaneCreationClaim = { XCTFail("same-key replay must not claim or wait again") }
+                let replay = Task { @MainActor in
+                    let admission = await bridge.laneCreationCallerPreflight(endpoint, idempotencyKey: "nested-B")
+                    XCTAssertNil(admission, "the service preflight must let an existing exact claim reach its digest-checked replay join")
+                    replayClaimed.fulfill()
+                    return await bridge.createLane(observerEndpoint: endpoint, request: request("nested-B"), resolveDestination: resolveDestination)
+                }
+                await fulfillment(of: [replayClaimed], timeout: 10)
+                second.cancel() // Owned creation continues; cancellation must not cancel A or duplicate B.
+                let beforeRollback = await authority.links(forObserver: creatorID)
+                if independentDirection == nil {
+                    XCTAssertEqual(beforeRollback.items.map(\.targetSessionID), [pairA.targetSessionID], "sole-basis B has not allocated/indexed a relationship")
+                } else {
+                    XCTAssertTrue(beforeRollback.items.contains { $0.targetSessionID == completedSecond?.sessionID })
+                }
+                resumeFirst?.resume()
+                resumeFirst = nil
+                let firstReceipt = await first.value
+                let preflightResult = await preflight.value
+                let secondReceipt = await second.value
+                let replayReceipt = await replay.value
+                bridge.test_afterActivationBeforeDeletionFence = nil
+                bridge.test_beforeLaneCreationBootstrapSettlement = nil
+                bridge.test_afterLaneCreationClaim = nil
+                XCTAssertFalse(firstReceipt.linked, "A must roll back its lost activation basis")
+                XCTAssertEqual(firstReceipt.reason, .addFailed)
+                XCTAssertTrue(replayReceipt.duplicate)
+                XCTAssertEqual(replayReceipt.sessionID, secondReceipt.sessionID)
+                XCTAssertEqual(replayReceipt.result, secondReceipt.result)
+                let afterRollback = await authority.links(forObserver: creatorID)
+                let tokenA = await store.token(for: pairA)
+                XCTAssertNil(tokenA, "A's exact durable intent is compensated before B chooses a fresh basis")
+                if let stableReference, let stablePair {
+                    let sampledStableGrant = await authority.activeGrant(for: stableReference)
+                    let stableGrant = try XCTUnwrap(sampledStableGrant)
+                    XCTAssertEqual(stableGrant.observer.sessionID, stablePair.observerSessionID)
+                    XCTAssertEqual(stableGrant.target.sessionID, stablePair.targetSessionID)
+                    XCTAssertTrue(stableGrant.observer == endpoint || stableGrant.target == endpoint, "independent grant must match this exact caller incarnation")
+                    XCTAssertNil(preflightResult)
+                    XCTAssertEqual(secondReceipt.result, .created)
+                    XCTAssertTrue(secondReceipt.linked)
+                    let secondID = try XCTUnwrap(secondReceipt.sessionID)
+                    let pairB = AgentSessionOversightIntent(observerSessionID: creatorID, targetSessionID: secondID)
+                    let tokenB = await store.token(for: pairB)
+                    XCTAssertNotNil(tokenB)
+                    XCTAssertTrue(afterRollback.items.contains { $0.targetSessionID == secondID })
+                    let payloadB = try await AgentSessionDataService.shared.loadAgentSession(id: secondID, for: workspace)
+                    XCTAssertEqual(payloadB?.createdByOverseerSessionID, creatorID)
+                } else {
+                    XCTAssertEqual(preflightResult, .denied)
+                    XCTAssertEqual(secondReceipt.result, .refused)
+                    XCTAssertEqual(secondReceipt.reason, .denied)
+                    XCTAssertNil(secondReceipt.sessionID, "B must not allocate using A's rolled-back relationship")
+                    XCTAssertFalse(secondReceipt.linked)
+                    XCTAssertTrue(afterRollback.items.isEmpty)
+                }
+            } catch {
+                resumeFirst?.resume()
+                resumeFirst = nil
+                _ = await first.value
+                bridge.test_afterActivationBeforeDeletionFence = nil
+                throw error
+            }
+        }
+    }
+
+    func testOverseerActivationIsIncarnationLocalAndExcludedSessionsCannotBootstrap() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let host = WindowStatesManager.shared
+            let outcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Activation state", selection: fixture.selection)
+            guard case let .created(sessionID, tabID, _) = outcome else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == sessionID }).domainEndpoint
+            XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), "lane-created sessions are excluded")
+            // Model an ordinary user-created session using the owning real memory/binding fixture.
+            session.createdByOverseerSessionID = nil
+            let initial = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            XCTAssertTrue(viewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: initial))
+            let activation = try XCTUnwrap(session.oversight.overseerActivation)
+            session.oversight.retirePeriodicScheduling()
+            session.selectedAgent = .codexExec
+            XCTAssertEqual(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation, activation, "controller/provider repair is not a binding change")
+            XCTAssertFalse(viewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: initial), "stale pre-activation state cannot activate twice")
+            let staleEndpoint = DomainAgentSessionLinkEndpointIdentity(
+                windowID: endpoint.windowID, workspaceID: endpoint.workspaceID,
+                tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+            )
+            let staleActivation = AgentSessionOverseerActivation(endpoint: staleEndpoint, token: UUID())
+            session.oversight.overseerActivation = staleActivation
+            for _ in 0 ..< 2 {
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), "stale activation cannot qualify for this binding")
+                XCTAssertEqual(session.oversight.overseerActivation, staleActivation, "bootstrap reads must not retire stored state")
+                XCTAssertNil(host.agentSessionLinkBootstrapState(for: endpoint), "catalog forwarding must refuse stale activation")
+                XCTAssertEqual(session.oversight.overseerActivation, staleActivation, "catalog reads must not retire stored state")
+            }
+            for exclusion in ["mcp-origin", "child", "lane"] {
+                session.oversight.overseerActivation = activation
+                switch exclusion {
+                case "mcp-origin": session.isMCPOriginated = true
+                case "child": session.parentSessionID = UUID()
+                case "lane": session.createdByOverseerSessionID = UUID()
+                default: XCTFail("uncovered exclusion")
+                }
+                XCTAssertNil(session.oversight.overseerActivation, exclusion)
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), exclusion)
+                session.isMCPOriginated = false
+                session.parentSessionID = nil
+                session.createdByOverseerSessionID = nil
+            }
+            session.oversight.overseerActivation = activation
+            _ = try await viewModel.mcpActivateControlContext(
+                forTabID: tabID, sessionID: sessionID, originatingConnectionID: nil,
+                taskLabelKind: .explore, markSessionAsMCPOriginated: false
+            )
+            XCTAssertEqual(session.mcpControlContext?.taskLabelKind, .explore)
+            XCTAssertFalse(session.isMCPOriginated, "exercise control ownership, not the origin hook")
+            XCTAssertNil(session.oversight.overseerActivation, "production denied-role attachment consumes activation")
+            XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            XCTAssertNil(session.mcpControlContext)
+            let returnedToDirect = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            XCTAssertNil(returnedToDirect.activation, "production role release must not resurrect the old opt-in")
+            XCTAssertTrue(viewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: returnedToDirect), "direct requires a fresh opt-in")
+            session.beginPersistentBindingTransition()
+            XCTAssertNil(session.oversight.overseerActivation, "rebind consumes activation immediately")
+            XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), "suspended binding is ineligible")
+            let restarted = AgentTabSession(tabID: tabID)
+            XCTAssertNil(restarted.oversight.overseerActivation, "new object/restart never restores activation")
+        }
     }
 
     func testPersistedDevinRoleLanesSaveLinkAndDispatchFirstTask() async throws {

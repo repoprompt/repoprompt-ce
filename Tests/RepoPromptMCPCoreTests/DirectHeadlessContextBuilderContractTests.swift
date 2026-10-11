@@ -8,6 +8,13 @@ final class DirectHeadlessContextBuilderContractTests: XCTestCase {
     func testWireAdvertisementDescribesOnlyImplementedContextBuilder() async throws {
         let fixture = try await makeFixture()
         let listed = try await fixture.client.listTools()
+        XCTAssertFalse(listed.tools.contains { $0.name == MCPWindowToolName.becomeOverseer })
+        let bootstrap = try await fixture.client.callTool(name: MCPWindowToolName.becomeOverseer, arguments: [:])
+        XCTAssertEqual(bootstrap.isError, true)
+        guard case let .text(denial, _, _)? = bootstrap.content.first else {
+            return XCTFail("Expected a policy denial for named headless bootstrap")
+        }
+        XCTAssertEqual(denial, "Tool is unavailable for this client policy: become_overseer")
         let tool = try XCTUnwrap(listed.tools.first { $0.name == "context_builder" })
         guard case let .object(schema) = tool.inputSchema,
               case let .object(properties)? = schema["properties"]

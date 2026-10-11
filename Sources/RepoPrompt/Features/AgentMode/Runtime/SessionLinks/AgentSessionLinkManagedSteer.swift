@@ -151,3 +151,31 @@ extension AgentSessionLinkSteerAdmission {
         return .steer(route)
     }
 }
+
+/// Immutable submission data shared by noncomposer callers. The exact endpoint is a dispatch
+/// fence, not a grant: each caller proves its own authority before entering submission.
+struct AgentNoncomposerTurn {
+    let endpoint: DomainAgentSessionLinkEndpointIdentity
+    let providerText: String
+    let attribution: AgentCrossSessionAttribution?
+    let sink: AgentSessionLinkManagedSteerSink
+
+    init(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        providerText: String,
+        attribution: AgentCrossSessionAttribution? = nil,
+        sink: AgentSessionLinkManagedSteerSink
+    ) {
+        self.endpoint = endpoint
+        self.providerText = providerText
+        self.attribution = attribution
+        self.sink = sink
+    }
+
+    init(managed turn: AgentSessionLinkManagedTurn) {
+        endpoint = turn.candidate.domainEndpoint
+        providerText = turn.providerText
+        attribution = turn.attribution
+        sink = turn.sink
+    }
+}

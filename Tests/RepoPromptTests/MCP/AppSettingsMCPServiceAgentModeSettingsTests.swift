@@ -685,25 +685,85 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 ("unknown-context-builder-agent", "unknown-remembered-model"),
                 (AgentProviderKind.antigravity.rawValue, "antigravity-remembered-model")
             ] {
-                store.setGlobalAgentModelsProfile(
-                    AgentModelsSettingsProfile(
-                        contextBuilderAgentRaw: agentRaw,
-                        contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
-                    ),
-                    contextBuilderWriteIntent: .userInitiated
-                )
+                for requestedModel in ["sonnet", "haiku"] {
+                    let scenario = "\(agentRaw), requested=\(requestedModel)"
+                    store.setGlobalAgentModelsProfile(
+                        AgentModelsSettingsProfile(
+                            contextBuilderAgentRaw: agentRaw,
+                            contextBuilderModelsByAgent: [agentRaw: rememberedModel, claudeRaw: "haiku"]
+                        ),
+                        contextBuilderWriteIntent: .userInitiated
+                    )
 
-                _ = try await service.handleForTesting([
-                    "op": .string("set"),
-                    "key": .string("context_builder.model"),
-                    "value": .string("sonnet")
-                ])
+                    _ = try await service.handleForTesting([
+                        "op": .string("set"),
+                        "key": .string("context_builder.model"),
+                        "value": .string(requestedModel)
+                    ])
 
-                let profile = store.globalAgentModelsProfile()
-                XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, agentRaw)
-                XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], "sonnet", agentRaw)
-                XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, agentRaw)
+                    let profile = store.globalAgentModelsProfile()
+                    XCTAssertEqual(profile.contextBuilderAgentRaw, claudeRaw, scenario)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[claudeRaw], requestedModel, scenario)
+                    XCTAssertEqual(profile.contextBuilderModelsByAgent?[agentRaw], rememberedModel, scenario)
+                }
             }
+        }
+    }
+
+    /// Reads disclose an unusable saved ID without projecting a fallback model. Clearing that
+    /// model is a no-op; an explicit valid agent choice replaces the ID durably.
+    func testContextBuilderAgentSetOfDisplayedFallbackReplacesUnknownStoredAgent() async throws {
+        try await withContextBuilderSettings { store, service, defaults, fileURL in
+            let claudeRaw = AgentProviderKind.claudeCode.rawValue
+            let unknownRaw = "unknown-context-builder-agent"
+            let rememberedModels = [unknownRaw: "unknown-remembered-model", claudeRaw: "haiku"]
+            store.setGlobalAgentModelsProfile(
+                AgentModelsSettingsProfile(
+                    contextBuilderAgentRaw: unknownRaw,
+                    contextBuilderModelsByAgent: rememberedModels
+                ),
+                contextBuilderWriteIntent: .userInitiated
+            )
+            let get = try await service.handleForTesting([
+                "op": .string("get"),
+                "keys": .array([.string("context_builder.agent"), .string("context_builder.model")])
+            ])
+            let values = try XCTUnwrap(get.objectValue?["values"]?.objectValue)
+            XCTAssertEqual(values["context_builder.agent"]?.stringValue, unknownRaw)
+            XCTAssertEqual(values["context_builder.model"], .null)
+
+            let clear = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.model"),
+                "value": .null
+            ])
+            XCTAssertEqual(clear.objectValue?["changed"]?.boolValue, false)
+            XCTAssertEqual(clear.objectValue?["applied"]?.boolValue, false)
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, unknownRaw)
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent, rememberedModels)
+
+            let options = try await service.handleForTesting([
+                "op": .string("options"),
+                "key": .string("context_builder.model")
+            ])
+            XCTAssertEqual(
+                options.objectValue?["filters"]?.objectValue?["agent"]?.stringValue,
+                "claudeCode",
+                "implicit options target the model writer's agent"
+            )
+
+            let set = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string("context_builder.agent"),
+                "value": .string(claudeRaw)
+            ])
+            XCTAssertEqual(set.objectValue?["changed"]?.boolValue, true)
+            XCTAssertEqual(set.objectValue?["applied"]?.boolValue, true)
+            XCTAssertNil(set.objectValue?["persistence_blocked"])
+            let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw)
+            XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderAgentRaw, claudeRaw)
+            XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderModelsByAgent, rememberedModels)
         }
     }
 

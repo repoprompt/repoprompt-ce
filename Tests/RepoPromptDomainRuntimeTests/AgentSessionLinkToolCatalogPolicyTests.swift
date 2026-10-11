@@ -1111,6 +1111,53 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
 
     // MARK: - Host advertisement and call gate
 
+    func testBootstrapAndActivationAdvertisementAdmissionAndDisabledCoupling() async throws {
+        let runtime = try await makeRuntime()
+        let bootstrap = MCPWindowToolName.becomeOverseer
+        _ = try await runtime.toolRegistry.register(registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1), bindings: [binding(toolName: toolName), binding(toolName: bootstrap)])
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: bootstrap))
+        XCTAssertEqual(definition.description, "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.")
+        XCTAssertEqual(definition.inputSchema.objectValue?["properties"], .object([:]))
+        XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: bootstrap))
+        for (label, eligible, activated, exact, expected) in [
+            ("plain", true, false, false, bootstrap),
+            ("activated-no-link", false, true, false, toolName),
+            ("activated-inbound", false, true, true, toolName),
+            ("linked", false, false, true, toolName),
+            ("excluded", false, false, false, "")
+        ] {
+            let policy = MCPDomainClientPolicySnapshot(restrictedToolNames: [toolName, bootstrap], additionalToolNames: [], role: .direct, allowsAgentExternalControlTools: false, hasExactAgentSessionLinkGrant: exact, canBecomeOverseer: eligible, hasActivatedOverseer: activated)
+            let catalog = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: policy, agentSessionLinkSurface: .overseenOnly))
+            XCTAssertEqual(catalog.definitions.map(\.name), expected.isEmpty ? [] : [expected], label)
+            if activated {
+                XCTAssertEqual(catalog.definitions.first, MCPDomainCanonicalToolDefinitions.definition(named: toolName), label)
+            }
+            if !expected.isEmpty {
+                try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: expected, policy: policy)
+                let admission = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(toolName: expected, policy: policy)
+                XCTAssertEqual(admission.admissionClass, .control, label)
+            }
+            if !eligible {
+                do { try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: bootstrap, policy: policy)
+                    XCTFail(label)
+                } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+                do { _ = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(toolName: bootstrap, policy: policy)
+                    XCTFail(label)
+                } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+            }
+            let disabled = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [toolName], policy: policy))
+            XCTAssertTrue(disabled.definitions.isEmpty, label)
+            let off = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: false, disabledToolNames: [], policy: policy))
+            XCTAssertTrue(off.definitions.isEmpty, label)
+        }
+        let pastedGrant = MCPDomainClientPolicySnapshot(restrictedToolNames: [], additionalToolNames: [bootstrap], role: .direct, allowsAgentExternalControlTools: true)
+        let hidden = await runtime.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: pastedGrant))
+        XCTAssertFalse(hidden.definitions.contains { $0.name == bootstrap }, "External/policy grants cannot fabricate bootstrap eligibility")
+        do { try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: bootstrap, policy: pastedGrant)
+            XCTFail("policy grant cannot bootstrap")
+        } catch let denial as MCPDomainCallPolicyDenial { XCTAssertEqual(denial, .missingAdditionalGrant(toolName: bootstrap)) }
+    }
+
     func testHostHidesTheToolWithoutAGrantAndAdvertisesItWithOne() async throws {
         let runtime = try await makeRuntime()
         _ = try await runtime.toolRegistry.register(
