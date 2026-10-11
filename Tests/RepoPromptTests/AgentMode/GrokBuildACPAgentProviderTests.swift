@@ -306,7 +306,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
             (
                 defect: "Reported authentication-required fallthrough",
                 input: "ACP request failed: Authentication required: no auth method id provided (code -32000)",
-                expected: "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Keys, then try Connect again."
+                expected: "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Providers, then try Connect again."
             ),
             (
                 defect: "Matching on -32000, auth or authentication alone",
