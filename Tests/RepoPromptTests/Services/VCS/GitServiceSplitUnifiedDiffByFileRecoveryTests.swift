@@ -439,5 +439,53 @@ final class GitRevisionArgumentTests: XCTestCase {
         }
     }
 
+    func testCommitMetadataPeelsTagsAndPreservesResolvedIDDiffs() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { fixture.cleanup() }
+        let root = try fixture.makeRepository(named: "repo", files: ["README.md": "one\n"])
+        try fixture.write("one\ntwo\n", to: "README.md", at: root)
+        try fixture.stage("README.md", at: root)
+        try fixture.commit("Tagged commit", at: root)
+        let taggedCommit = try fixture.runGit(["rev-parse", "HEAD"], at: root).trimmingCharacters(in: .whitespacesAndNewlines)
+        try fixture.runGit(["-c", "tag.gpgSign=false", "tag", "-a", "annotated", "-m", "Release annotation"], at: root)
+        try fixture.runGit(["-c", "tag.gpgSign=false", "tag", "lightweight"], at: root)
+        try fixture.write("one\ntwo\nthree\n", to: "README.md", at: root)
+        try fixture.stage("README.md", at: root)
+        try fixture.commit("Later commit", at: root)
+        let currentHead = try fixture.runGit(["rev-parse", "HEAD"], at: root).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertNotEqual(taggedCommit, currentHead)
+
+        let service = GitService()
+        let backend = GitBackend(gitService: service)
+        for ref in ["annotated", "lightweight"] {
+            let metadata = try await service.commitInfo(ref: ref, at: root)
+            XCTAssertEqual(metadata.sha, taggedCommit, ref)
+            XCTAssertEqual(metadata.message, "Tagged commit", ref)
+            // Exercise the app show flow: backend metadata ID becomes the diff revision.
+            let info = try await backend.commitInfo(ref: ref, at: root)
+            XCTAssertEqual(info.id, taggedCommit, ref)
+            let compare = GitDiffCompareSpec.revspec("\(info.id)^!")
+            let files = try await backend.getChangedFilesStats(
+                compare: compare,
+                includeUntrackedWhenApplicable: false,
+                detectRenames: false,
+                paths: nil,
+                at: root
+            )
+            XCTAssertEqual(files.map(\.path), ["README.md"], ref)
+            let patch = try await backend.getDiffText(compare: compare, paths: ["README.md"], contextLines: 3, detectRenames: false, at: root)
+            XCTAssertTrue(patch.contains("+two"), ref)
+            XCTAssertFalse(patch.contains("+three"), ref)
+        }
+        for ref in ["HEAD:README.md", "HEAD^{tree}", "missing-commit"] {
+            do {
+                _ = try await service.commitInfo(ref: ref, at: root)
+                XCTFail("Noncommit or missing revision accepted: \(ref)")
+            } catch {
+                XCTAssertTrue(error is GitService.GitError, ref)
+            }
+        }
+    }
+
     private struct UnexpectedSpawn: Error {}
 }

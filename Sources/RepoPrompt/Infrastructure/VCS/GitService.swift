@@ -7294,7 +7294,8 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref,
+            // Peel annotated tags so their headers cannot enter the commit metadata.
+            "\(ref)^{commit}",
             "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
