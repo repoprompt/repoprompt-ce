@@ -58,6 +58,9 @@ package struct AgentAttachmentStore {
         } catch {
             throw Error.failedToCopy
         }
+        // `copyItem` preserves the source's timestamps; stamp the import time so the startup sweep
+        // ages temporary copies from when they were attached, not from when the original was made.
+        try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: destinationURL.path)
 
         let attachment = AgentImageAttachment(
             source: .localFile(path: destinationURL.path),

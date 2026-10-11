@@ -357,9 +357,10 @@ struct AgentMessageBubble: View {
                 if !item.attachments.isEmpty {
                     HStack(spacing: 0) {
                         Spacer(minLength: 0)
+                        // Tagged files render once, as the badge inside the bubble below.
                         AgentAttachmentsStrip(
                             imageAttachments: item.attachments,
-                            taggedFileAttachments: item.taggedFileAttachments,
+                            taggedFileAttachments: [],
                             disabled: true,
                             allowsRemoval: false
                         )
