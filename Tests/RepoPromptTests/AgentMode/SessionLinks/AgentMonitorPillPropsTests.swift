@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// Monitor pill rendering contract: directional row labels, accessibility text, status mapping, and
@@ -622,8 +623,64 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             roleAllowsOutboundMonitoring: true
         )
         XCTAssertEqual(fresh.sessionID, observerID)
+        XCTAssertNil(fresh.endpoint)
         XCTAssertTrue(fresh.outbound.isEmpty)
         XCTAssertEqual(fresh.canAddReason, "Load this thread before adding sessions to oversee.")
+    }
+
+    func testReadyLinklessFallbackPreservesCurrentEndpointWithoutGrantingOversight() {
+        let endpoint = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID)
+        let props = AgentModeViewModel.monitorPillProps(
+            sessionID: observerID,
+            published: nil,
+            currentEndpoint: endpoint,
+            eligibility: eligibility(),
+            roleAllowsOutboundMonitoring: true
+        )
+        XCTAssertEqual(props.endpoint, endpoint)
+        XCTAssertTrue(props.canAdd)
+        XCTAssertTrue(props.outbound.isEmpty)
+        XCTAssertTrue(props.inbound.isEmpty)
+        XCTAssertTrue(props.recentNotices.isEmpty)
+        XCTAssertFalse(props.isOverseer)
+    }
+
+    @MainActor
+    func testCurrentLinklessPropsRetainEndpointAndRejectCapturedEndpointAfterRebind() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 27199,
+            testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("No provider dispatch expected") }
+        )
+        let tabID = UUID()
+        let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "First oversight link"
+        )
+        defer { withExtendedLifetime(workspace) {} }
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        // Capture the props an open popover would retain, before any link publication exists.
+        let captured = viewModel.currentMonitorPillProps()
+        XCTAssertEqual(captured.endpoint, endpoint)
+        XCTAssertTrue(captured.canAdd)
+        XCTAssertTrue(captured.outbound.isEmpty)
+        XCTAssertTrue(captured.inbound.isEmpty)
+        XCTAssertFalse(captured.isOverseer)
+
+        session.beginPersistentBindingTransition()
+        let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
+        XCTAssertNotEqual(endpoint, rebound)
+        XCTAssertEqual(viewModel.currentMonitorPillProps().endpoint, rebound)
+        let originalAutoWake = session.oversight.autoWakeOnUpdates
+        XCTAssertFalse(try viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+            !originalAutoWake, for: XCTUnwrap(captured.endpoint)
+        ))
+        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
     }
 
     func testWithCanAddReasonIsIdentityPreservingWhenUnchanged() {

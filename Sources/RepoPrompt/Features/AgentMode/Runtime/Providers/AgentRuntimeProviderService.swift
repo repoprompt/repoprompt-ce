@@ -338,7 +338,9 @@ final class AgentRuntimeProviderService {
             let config = GrokBuildAgentConfig(
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,
-                alwaysApproveTools: GrokBuildAgentToolPreferences.permissionLevel() == .fullAccess
+                alwaysApproveTools: false,
+                discoveryMode: true,
+                backgroundFeatureEnvironment: GrokBuildAgentConfig.managedBackgroundFeatureEnvironment
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")

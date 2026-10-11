@@ -781,7 +781,7 @@ final class AgentModeRunService {
         _ managed: AgentTabSession.ACPSteeringManagedContext,
         session: AgentTabSession
     ) -> Bool {
-        let candidate = managed.candidate
+        let candidate = managed.endpoint
         return session.tabID == candidate.tabID
             && session.activeAgentSessionID == candidate.sessionID
             && session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 
@@ -86,6 +87,15 @@ final class ClaudeIntegratedAgentModeRunner {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async {
+        let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
+        var handedToRunTask = false
+        defer {
+            if let dedicatedNoteID, !handedToRunTask {
+                AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                    hooks.persistence.scheduleSave(session)
+                }
+            }
+        }
         guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
@@ -124,9 +134,18 @@ final class ClaudeIntegratedAgentModeRunner {
         if let dispatchID = providerControlCommand?.selfCompactDispatchID,
            dispatchID.stage == .compact
         {
-            _ = session.selfCompactNativeCompletion?.bindCompact(
-                dispatchID, runID: runID, runAttemptID: runAttemptID
-            )
+            guard session.selfCompactDispatchIsCurrent?() != false,
+                  session.selfCompactNativeCompletion?.bindCompact(
+                      dispatchID, runID: runID, runAttemptID: runAttemptID
+                  ) == true
+            else {
+                await finalize(
+                    session: session, runID: runID, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID, terminalState: .failed,
+                    errorText: nil, notifyTurnComplete: false
+                )
+                return
+            }
         }
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -139,8 +158,16 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
-        session.agentTask = Task { [weak self, weak session] in
-            guard let self, let session else { return }
+        session.agentTask = Task { [weak self, weak session, hooks] in
+            guard let session else { return }
+            defer {
+                if let dedicatedNoteID {
+                    AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                        hooks.persistence.scheduleSave(session)
+                    }
+                }
+            }
+            guard let self else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
                 guard acquired else {
@@ -178,16 +205,10 @@ final class ClaudeIntegratedAgentModeRunner {
                         providerControlCommand: providerControlCommand,
                         selfCompactDispatchID: selfCompactDispatchID
                     )
-                    if let selfCompactDispatchID,
-                       selfCompactDispatchID.stage == .note,
-                       sendOutcome != .sent,
-                       session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
-                       session.selfCompactState.active?.noteDispatchStarted == false
-                    {
-                        var state = session.selfCompactState
-                        _ = state.noteDefinitivelyNotAttempted(selfCompactDispatchID)
-                        session.selfCompactState = state
-                        self.hooks.persistence.scheduleSave(session)
+                    if let dedicatedNoteID, sendOutcome != .sent {
+                        AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                            self.hooks.persistence.scheduleSave(session)
+                        }
                     }
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:
@@ -288,6 +309,15 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
             } onCancel: {}
         }
+        handedToRunTask = true
+    }
+
+    /// The Claude config directory the native `claude` process is launched with: the same
+    /// environment composition as `ClaudeNativeProcessSessionController` (cached shell env
+    /// layered over the app env), so `CLAUDE_CONFIG_DIR` set only in a shell profile counts.
+    private static func claudeRunUsageProfileID() async -> String {
+        let environment = await ProcessEnvironmentBuilder.build(ProcessEnvironmentRequest(purpose: .claudeNative)).environment
+        return ClaudeUsageCredentialProfile.current(environment: environment).id
     }
 
     private func consumeEvents(
@@ -303,9 +333,18 @@ final class ClaudeIntegratedAgentModeRunner {
         if session.selectedAgent == .claudeCode,
            session.runID == runID, session.activeRunAttemptID == runAttemptID
         {
-            await quotaService.setEnabled(GlobalSettingsStore.shared.claudeUsageQuotaEnabled())
+            // Diagnostics toggle OR connected Claude usage display (see
+            // `GlobalSettingsStore.claudeRunTelemetryRecordingEnabled`): the pill stays current
+            // during runs by default, and this per-run sync never switches that off.
+            let recordsTelemetry = GlobalSettingsStore.shared.claudeRunTelemetryRecordingEnabled(
+                profileID: ClaudeUsageCredentialProfile.current().id
+            )
+            await quotaService.setEnabled(recordsTelemetry)
+            // Attribute the run to its Claude config directory so the usage pill only adopts
+            // telemetry from the same profile it reads usage for.
+            let profileID = recordsTelemetry ? await Self.claudeRunUsageProfileID() : nil
             if session.runID == runID, session.activeRunAttemptID == runAttemptID {
-                quotaLease = await quotaService.beginObservation()
+                quotaLease = await quotaService.beginObservation(credentialProfileID: profileID)
             }
         }
 

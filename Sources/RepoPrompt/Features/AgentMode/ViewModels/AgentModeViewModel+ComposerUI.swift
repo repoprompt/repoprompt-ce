@@ -68,12 +68,9 @@ extension AgentModeViewModel {
 
     /// Pure presentation: no companion lookup, configuration IO, or permission probing.
     func computerUseComposerProps(session: AgentTabSession?) -> AgentComputerUseComposerProps {
-        guard let session, session.selectedAgent == .codexExec,
-              !session.isMCPRelated, session.createdByOverseerSessionID == nil,
+        guard let session, session.selectedAgent == .codexExec, session.parentSessionID == nil,
+              sessions[session.tabID] === session,
               !session.bindingTransitionInProgress else { return .hidden }
-        if let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
-           let links = monitorPillPropsByEndpoint[endpoint],
-           !links.inbound.isEmpty || !links.outbound.isEmpty { return .hidden }
         return .init(
             isVisible: true,
             isOn: session.isCodexComputerUseArmed,

@@ -275,6 +275,12 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 
     func manageWorktree(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
+        // Page controls are an app-backed contract; never silently return the full listing.
+        if (args["op"]?.stringValue ?? "list") == "list",
+           [args["limit"], args["offset"]].contains(where: { $0 != nil && $0 != .null })
+        {
+            throw MCPError.invalidParams(MCPWorktreeListPagination.headlessUnsupportedMessage)
+        }
         let snapshot = try await context.snapshot(for: request)
         guard let repo = snapshot.roots.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent(".git").path) }) else {
             throw MCPError.invalidParams("no Git repository is bound")

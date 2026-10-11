@@ -134,6 +134,107 @@ final class DevinModelCatalogTests: XCTestCase {
         }
     }
 
+    func testRepeatedWindowPickerWorkload() {
+        // Generic IDs with the current catalog's cardinality: 123 advertisements,
+        // 106 parameter sets, 37 expanding families, and 243 derived rows.
+        // The historical startup profiles did not record provider cardinality.
+        let snapshot = Self.pickerWorkloadSnapshot()
+        let beforePublication = DevinModelCatalog.test_expansionCount
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .devin))
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount - beforePublication, 1)
+        let models = ACPAIModelCatalog.devinModelsFromStore()
+        XCTAssertEqual(models.count, 243)
+        let expectedOrder = AIModel.sortedForPicker(models.reversed()).map(\.modelName)
+        let before = DevinModelCatalog.test_expansionCount
+        let start = ContinuousClock.now
+        for _ in 0 ..< 27 {
+            for model in models {
+                XCTAssertEqual(model.displayName, DevinModelCatalog.current.entry(matching: model.modelName)?.option.displayName)
+            }
+            XCTAssertEqual(AIModel.sortedForPicker(models.reversed()).map(\.modelName), expectedOrder)
+        }
+        let expansions = DevinModelCatalog.test_expansionCount - before
+        print("DEVIN_PICKER_WORKLOAD advertisements=123 parameterSets=106 expandingFamilies=37 entries=243 windows=27 expansions=\(expansions) elapsed=\(start.duration(to: .now))")
+        XCTAssertEqual(expansions, 0)
+        XCTAssertFalse(AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .devin))
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount, before)
+
+        let oldCatalog = DevinModelCatalog.current
+        let changed = Self.pickerWorkloadSnapshot(familyLabel: "Updated Family")
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(changed, for: .devin))
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount - before, 1)
+        XCTAssertEqual(DevinModelCatalog.current.entries.count, 243)
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-family-0-high").displayName, "Updated Family 0 · High")
+        let narrowed = Self.pickerWorkloadSnapshot(familyLabel: "Updated Family", includeUltra: false)
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(narrowed, for: .devin))
+        XCTAssertEqual(DevinModelCatalog.current.entries.count, 237)
+        XCTAssertNil(DevinModelCatalog.current.entry(matching: "gpt-6-family-0-ultra"))
+        XCTAssertEqual(oldCatalog.entry(matching: "gpt-6-family-0-high")?.option.displayName, "GPT-6 Family 0 · High")
+        XCTAssertEqual(oldCatalog.entries.count, 243)
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount - before, 2)
+    }
+
+    private static func pickerWorkloadSnapshot(
+        familyLabel: String = "GPT-6 Family",
+        includeUltra: Bool = true
+    ) -> ACPDiscoveredSessionModels {
+        // Effort-count distributions only; no real provider IDs or labels are copied.
+        let expandingCounts = [(6, 6), (5, 13), (4, 6), (3, 8), (2, 4)]
+            .flatMap { Array(repeating: $0.0, count: $0.1) }
+        let opaqueCounts = [(5, 63), (4, 2), (3, 2), (2, 2), (0, 17)]
+            .flatMap { Array(repeating: $0.0, count: $0.1) }
+        let counts = expandingCounts + opaqueCounts
+        let options = counts.indices.map { index in
+            let raw = index < expandingCounts.count ? "gpt-6-family-\(index)-medium" : "fusion-fixture-\(index)-medium"
+            return AgentModelOption(rawValue: raw, displayName: "\(familyLabel) \(index)", description: nil, isDefault: index == 0)
+        }
+        let parameterSets = counts.indices.compactMap { index -> ACPModelParameterSet? in
+            let count = counts[index]
+            guard count > 0 else { return nil }
+            var choices: [String] = if count == 2 {
+                ["medium", "high"]
+            } else if count == 3 {
+                ["medium", "high", "max"]
+            } else {
+                Array(["none", "low", "medium", "high", "xhigh", "ultra"].prefix(count))
+            }
+            if !includeUltra { choices.removeAll { $0 == "ultra" } }
+            return thinkingSet(options[index].rawValue, choices, current: "medium")
+        }
+        return ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: options[0].rawValue,
+            modelParameterSets: parameterSets
+        )
+    }
+
+    func testStoreWarmKeepsNewerLiveCatalogAndReadsDoNotWarm() async {
+        AgentACPModelRegistry.shared.updateDiscoveredModels(Self.snapshot, for: .devin)
+        AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .devin)
+        let before = DevinModelCatalog.test_expansionCount
+        XCTAssertTrue(DevinModelCatalog.current.entries.isEmpty)
+        XCTAssertNil(ACPAIModelCatalog.devinModelOption(for: "gpt-6-sol-high"))
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount, before)
+
+        await AgentACPModelRegistry.shared.test_warmStandardStore()
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount - before, 1)
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-sol-high").displayName, "GPT-6 Sol · High")
+
+        AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .devin)
+        let beforeRace = DevinModelCatalog.test_expansionCount
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded {
+            // Store A has finished loading. Install live B before A is committed.
+            AgentACPModelRegistry.shared.updateDiscoveredModels(Self.pickerWorkloadSnapshot(), for: .devin)
+        }
+        XCTAssertEqual(DevinModelCatalog.test_expansionCount - beforeRace, 1)
+        XCTAssertEqual(DevinModelCatalog.current.entries.count, 243)
+        XCTAssertEqual(AIModel.devinCustom(name: "gpt-6-family-0-high").displayName, "GPT-6 Family 0 · High")
+        XCTAssertNil(DevinModelCatalog.current.entry(matching: "gpt-6-sol-high"))
+
+        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
+        XCTAssertTrue(DevinModelCatalog.current.entries.isEmpty)
+    }
+
     // MARK: - ACP boundary
 
     func testEncodedIDSelectsAdvertisedModelThenThoughtLevelBeforePrompt() async throws {

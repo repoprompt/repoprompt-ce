@@ -155,7 +155,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorSteer: .manage,
             .monitorStop: .manage,
             .monitorSetModel: .manage,
-            .monitorRetireLane: .manage
+            .monitorRetireLane: .manage,
+            // Redirecting another session's execution checkout acts for the user in that target.
+            .monitorWorktreeBinding: .manage
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -340,7 +342,8 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.create_lane", "agent_session_link.retire_lane",
                 "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
                 "agent_session_link.respond",
-"agent_session_link.steer", "agent_session_link.stop", "agent_session_link.set_model"
+"agent_session_link.steer", "agent_session_link.stop", "agent_session_link.set_model",
+                "manage_worktree.binding"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {

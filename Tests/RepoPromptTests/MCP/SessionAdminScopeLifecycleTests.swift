@@ -331,8 +331,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         for child in [a, b, c, d] {
             fixture.source.add(child, parent: overseer)
         }
-        // Threshold 1, so the narrowed applying call (two items) still requires its card.
-        let scope = try grantTree(fixture, grantee: overseer, threshold: 1)
+        // Unticking narrows to the threshold: the supplied card must still bind and apply once.
+        let scope = try grantTree(fixture, grantee: overseer, threshold: 2)
         let handler = RecordingHandler([.adminSetPin])
         fixture.core.register(handler)
         let tab = UUID()
@@ -354,7 +354,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         }
         XCTAssertEqual(card.reason, .bulkThreshold)
         XCTAssertEqual(card.scopeID, scope.id)
-        XCTAssertEqual(fixture.runtime.confirmations.pendingConfirmations(forTab: tab).map(\.id), [card.id])
+        XCTAssertEqual(fixture.runtime.confirmations.pendingConfirmations(forTab: tab, sessionID: overseer).map(\.id), [card.id])
         guard case let .pendingConfirmation(replayed, _) = try await fixture.core.perform(request([a, b, c])) else {
             return XCTFail("an identical retry returns the same card")
         }
@@ -393,12 +393,55 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(handler.batches.single?.confirmation?.approvedSessionIDs, [a, b])
 
         // The approval was consumed: replaying the carded request cannot re-authorize it.
-        guard case let .pendingConfirmation(spent, _) = try await fixture.core.perform(request([a, b, c], confirmation: card.id)) else {
-            return XCTFail("a consumed card authorizes nothing")
+        guard case .denied(.confirmationMismatch, _) = try await fixture.core.perform(request([a, b], confirmation: card.id)) else {
+            return XCTFail("a consumed card authorizes nothing, even below the threshold")
         }
-        XCTAssertEqual(spent.id, card.id)
-        XCTAssertEqual(spent.state, .consumed)
         XCTAssertEqual(handler.batches.count, 1)
+        guard case .completed = try await fixture.core.perform(request([a], key: "uncarded")) else {
+            return XCTFail("under-threshold scope authority still works without a supplied card")
+        }
+        XCTAssertEqual(handler.batches.count, 2)
+    }
+
+    func testBatchCardsCannotFollowATabRebindAndApplyingCardsRetainTheirKeys() throws {
+        let fixture = Fixture()
+        let owner = UUID()
+        let rebound = UUID()
+        let tab = UUID()
+        let scope = try grantTree(fixture, grantee: owner)
+        let coordinator = fixture.runtime.confirmations
+        func request(_ key: String) throws -> PendingBatchConfirmation {
+            guard case let .created(card) = coordinator.request(
+                scope: scope, operation: .adminRetire, idempotencyKey: key,
+                granteeTabID: tab, reason: .destructive,
+                items: [.init(sessionID: UUID(), title: "Member", effect: "Retire")]
+            ) else { throw NSError(domain: "test", code: 1) }
+            return card
+        }
+        let pending = try request("pending")
+        let applying = try request("applying")
+        XCTAssertNotNil(coordinator.approve(confirmationID: applying.id))
+        XCTAssertTrue(coordinator.beginApplying(confirmationID: applying.id))
+        XCTAssertTrue(coordinator.pendingConfirmations(forTab: tab, sessionID: rebound).isEmpty)
+        XCTAssertFalse(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: rebound))
+        // A persisted sidebar candidate is not a live requesting-session binding. With no
+        // explicit binding, even a card whose old owner still exists must not be actionable.
+        XCTAssertFalse(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: nil))
+        XCTAssertTrue(coordinator.isCurrentPresentation(confirmationID: pending.id, tabID: tab, sessionID: owner))
+        coordinator.invalidateStaleConfirmations(tabID: tab, currentSessionID: rebound)
+        XCTAssertNil(coordinator.approve(confirmationID: pending.id))
+        for index in 0 ... BatchConfirmationCoordinator.maxRetainedConfirmations {
+            let terminal = try request("terminal-\(index)")
+            coordinator.deny(confirmationID: terminal.id)
+        }
+        XCTAssertEqual(coordinator.confirmation(id: applying.id, granteeSessionID: owner)?.state, .applying)
+        guard case let .existing(retained) = coordinator.request(
+            scope: scope, operation: .adminRetire, idempotencyKey: applying.idempotencyKey,
+            granteeTabID: tab, reason: .destructive, items: applying.items
+        ) else { return XCTFail("applying card must keep its key ownership") }
+        XCTAssertEqual(retained.id, applying.id)
+        coordinator.finishApplying(confirmationID: applying.id, succeeded: true)
+        XCTAssertEqual(coordinator.confirmation(id: applying.id, granteeSessionID: owner)?.state, .consumed)
     }
 
     func testCoreDeniesNonMembersUniformlyAndRevocationInvalidatesCards() async throws {
@@ -873,6 +916,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var live: [DomainAgentSessionLinkInventoryItem] = []
         var persisted: [AgentSessionOversightIntent] = []
         var stoppedLinkIDs: [UUID] = []
+        /// Links whose stop fails (and stays live), for partial-commit witnesses.
+        var failingLinkIDs: Set<UUID> = []
         /// Runs after each stop completes (the stop's suspension), before the next step.
         var afterStop: (@MainActor (DomainAgentSessionLinkInventoryItem) -> Void)?
 
@@ -889,6 +934,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         }
 
         func stopLink(_ item: DomainAgentSessionLinkInventoryItem) async -> AgentMonitorStopOutcome {
+            if failingLinkIDs.contains(item.linkID) { return .failed(message: "injected stop failure") }
             stoppedLinkIDs.append(item.linkID)
             live.removeAll { $0.linkID == item.linkID }
             persisted.removeAll { $0.observerSessionID == item.observerSessionID && $0.targetSessionID == item.targetSessionID }
@@ -897,9 +943,16 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         }
     }
 
+    /// Live tab → session bindings the front door re-reads when the user acts on a card.
+    @MainActor
+    final class FakeTabBindings {
+        var sessions: [UUID: UUID] = [:]
+    }
+
     @MainActor
     private final class Fixture {
         let window = WindowState()
+        let tabBindings = FakeTabBindings()
         let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
         let provenance = FakeProvenance()
         let organizer = FakeOrganizer()
@@ -916,9 +969,12 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
             core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
             inventory = FakeInventory(organizer: organizer, provenance: provenance, links: links, now: now)
+            let tabBindings = tabBindings
             frontDoor = AgentSessionAdministrationFrontDoor(
-                core: core, scopes: runtime, projector: projector, inventory: inventory
+                core: core, scopes: runtime, projector: projector, inventory: inventory,
+                liveBoundSession: { tabBindings.sessions[$0] }
             )
+            tabBindings.sessions[tab] = overseer
             frontDoor.registerOrganizingHandlers(backend: organizer, links: links)
             provenance.add(overseer, parent: nil, workspace: workspace)
             organizer.add(overseer, workspace: workspace, name: "Overseer")
@@ -981,6 +1037,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             )
             let value = try await service.execute(args: args)
             return try XCTUnwrap(value.objectValue)
+        }
+
+        /// The user approves the card on the tab that still shows the requesting overseer.
+        func approveAndApply(_ cardID: UUID) async {
+            await frontDoor.approveAndApply(confirmationID: cardID, presentedTabID: tab, presentedSessionID: overseer)
         }
     }
 
@@ -1160,7 +1221,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertTrue(members.allSatisfy { fixture.organizer.states[$0]?.sidebarGroup == nil })
 
         fixture.runtime.confirmations.setItem(members[2], ticked: false, confirmationID: cardID)
-        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        await fixture.approveAndApply(cardID)
         XCTAssertEqual(fixture.organizer.states[members[0]]?.sidebarGroup, "Batch")
         XCTAssertEqual(fixture.organizer.states[members[1]]?.sidebarGroup, "Batch")
         XCTAssertNil(fixture.organizer.states[members[2]]?.sidebarGroup, "an unticked item is never applied")
@@ -1178,6 +1239,58 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let again = try await fixture.call(args)
         XCTAssertEqual(again["confirmation_id"], .string(cardID.uuidString))
         XCTAssertNotNil(again["applied_result"])
+    }
+
+    func testApprovalAppliesOnlyForTheTabStillShowingTheRequestingSession() async throws {
+        let fixture = Fixture()
+        let members = (0 ..< 3).map { fixture.member("M\($0)") }
+        try fixture.grant(threshold: 2)
+        let pending = try await fixture.call([
+            "op": .string("set_group"), "targets": ids(members), "group": .string("Batch"),
+            "idempotency_key": .string("group-rebind")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let state = { fixture.runtime.confirmations.confirmation(id: cardID, granteeSessionID: fixture.overseer)?.state }
+
+        // A presentation for another session or tab acts on nothing.
+        await fixture.frontDoor.approveAndApply(confirmationID: cardID, presentedTabID: fixture.tab, presentedSessionID: UUID())
+        fixture.frontDoor.denyConfirmation(confirmationID: cardID, presentedTabID: UUID(), presentedSessionID: fixture.overseer)
+        XCTAssertEqual(state(), .pending)
+
+        // The tab was rebound after the user's tap but before the deferred apply ran (and before the
+        // view's invalidation pass): the front door re-reads the live binding and refuses.
+        fixture.tabBindings.sessions[fixture.tab] = UUID()
+        await fixture.approveAndApply(cardID)
+        fixture.frontDoor.denyConfirmation(confirmationID: cardID, presentedTabID: fixture.tab, presentedSessionID: fixture.overseer)
+        XCTAssertEqual(state(), .pending)
+        XCTAssertTrue(members.allSatisfy { fixture.organizer.states[$0]?.sidebarGroup == nil })
+
+        // Once the rebind invalidates the card, even its original presentation cannot apply it.
+        fixture.tabBindings.sessions[fixture.tab] = fixture.overseer
+        fixture.runtime.confirmations.invalidateStaleConfirmations(tabID: fixture.tab, currentSessionID: UUID())
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(state(), .invalidated)
+        XCTAssertTrue(members.allSatisfy { fixture.organizer.states[$0]?.sidebarGroup == nil })
+    }
+
+    func testCardsOnATabThatNoLongerShowsTheGranteeStopHoldingPendingSlots() async throws {
+        let fixture = Fixture()
+        let members = (0 ..< 3).map { fixture.member("M\($0)") }
+        try fixture.grant(threshold: 2)
+        let pending = try await fixture.call([
+            "op": .string("set_group"), "targets": ids(members), "group": .string("Batch"),
+            "idempotency_key": .string("group-moved")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+
+        // The grantee's old tab now shows another session while that tab's view is off screen, so the
+        // view's invalidation pass never runs. The grantee's next call releases the hidden card.
+        fixture.tabBindings.sessions[fixture.tab] = UUID()
+        _ = try await fixture.call(["op": .string("inventory")])
+        XCTAssertEqual(
+            fixture.runtime.confirmations.confirmation(id: cardID, granteeSessionID: fixture.overseer)?.state,
+            .invalidated
+        )
     }
 
     // MARK: - Undo
@@ -1291,6 +1404,41 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     // MARK: - Release and retire
 
+    func testPartiallyCommittedReleaseIsRecordedAndReplayedUnderItsKey() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A")
+        let b = fixture.member("B")
+        let c = fixture.member("C")
+        fixture.links.link(a, b)
+        fixture.links.link(a, c)
+        let failing = try XCTUnwrap(fixture.links.live.last?.linkID)
+        fixture.links.failingLinkIDs = [failing]
+        try fixture.grant([.observe, .organize, .restructure])
+        let args: [String: Value] = [
+            "op": .string("release"), "session_id": .string(a.uuidString), "idempotency_key": .string("release-partial")
+        ]
+
+        let first = try await fixture.call(args)
+        XCTAssertEqual(items(first)[a.uuidString], "failed", "a later unlink failed")
+        XCTAssertEqual(first["changed_count"], .int(0))
+        XCTAssertEqual(first["committed_changes"], .bool(true), "the first unlink still took effect")
+        XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1)
+
+        // The same key replays the partial receipt; it never re-runs the release.
+        fixture.links.failingLinkIDs = []
+        let retry = try await fixture.call(args)
+        XCTAssertEqual(retry["idempotent_replay"], .bool(true))
+        XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1, "a replay unlinks nothing further")
+        XCTAssertEqual(fixture.links.live.map(\.linkID), [failing])
+
+        // A new key is a new release and finishes the remaining link.
+        var fresh = args
+        fresh["idempotency_key"] = .string("release-partial-2")
+        let finished = try await fixture.call(fresh)
+        XCTAssertEqual(items(finished)[a.uuidString], "changed")
+        XCTAssertTrue(fixture.links.live.isEmpty)
+    }
+
     func testReleaseUnlinksOnlyAmongMembersAndRetireReportsRunningWithoutControl() async throws {
         let fixture = Fixture()
         let a = fixture.member("A")
@@ -1312,7 +1460,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(retire["result"], .string("pending_confirmation"), "retire is always carded")
         XCTAssertEqual(retire["requires_control"], ids([running]))
         let cardID = try XCTUnwrap(retire["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
-        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        await fixture.approveAndApply(cardID)
         XCTAssertEqual(fixture.organizer.states[b]?.isArchived, true)
         XCTAssertEqual(fixture.organizer.states[running]?.isArchived, false, "a running member needs control")
         XCTAssertEqual(
@@ -1324,6 +1472,31 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
     }
 
     // MARK: - Review fixes
+
+    func testApprovedRetireWhoseTargetsAllStartedRunningSettlesAndReportsRequiresControl() async throws {
+        let fixture = Fixture()
+        let lane = fixture.member("Lane")
+        try fixture.grant([.observe, .organize, .restructure])
+        let retire = try await fixture.call([
+            "op": .string("retire"), "session_id": .string(lane.uuidString), "idempotency_key": .string("retire-raced")
+        ])
+        let cardID = try XCTUnwrap(retire["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+
+        // The only approved item starts running before the approval is applied; there is no `control`.
+        fixture.provenance.add(lane, parent: fixture.overseer, workspace: fixture.workspace, state: .running)
+        fixture.organizer.states[lane]?.runState = .running
+        await fixture.approveAndApply(cardID)
+
+        XCTAssertEqual(
+            fixture.runtime.confirmations.confirmation(id: cardID, granteeSessionID: fixture.overseer)?.state,
+            .consumed,
+            "the card is settled rather than stranded as approved"
+        )
+        XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+        let status = try await fixture.call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
+        let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+        XCTAssertEqual(applied["requires_control"], ids([lane]), "reported as requires_control, not confirmation_mismatch")
+    }
 
     /// M1: archive stashes the tab (cancelling a run), so a non-idle target needs `control`, both as
     /// authorized and as re-read by the handler; undo of unarchive follows the same rule.
@@ -1376,7 +1549,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         // Starts running after the card; the projector still reports idle, the handler re-reads it.
         fixture.organizer.states[lane]?.runState = .running
-        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        await fixture.approveAndApply(cardID)
         let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
         let item = try XCTUnwrap(result["items"]?.arrayValue?.single?.objectValue)
         XCTAssertEqual(item["reason"], .string("requires_control"))
@@ -1574,7 +1747,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         let organizer = fixture.organizer
         organizer.onStashSuspension = { _ in organizer.states[lane]?.runState = .running }
-        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        await fixture.approveAndApply(cardID)
         let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
         XCTAssertEqual(reason(result, lane), "requires_control")
         XCTAssertEqual(organizer.states[lane]?.isArchived, false)
@@ -1596,7 +1769,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         let organizer = fixture.organizer
         fixture.links.afterStop = { _ in organizer.states[lane]?.runState = .running }
-        await fixture.frontDoor.approveAndApply(confirmationID: cardID)
+        await fixture.approveAndApply(cardID)
         let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
         XCTAssertEqual(reason(result, lane), "requires_control")
         XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1, "no link is stopped after the target started running")

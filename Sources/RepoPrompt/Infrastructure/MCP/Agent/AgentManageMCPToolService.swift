@@ -946,6 +946,7 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM,
             workspace: workspace
         )
+        _ = try await agentModeVM.mcpPreflightResidentActivation(sessionID: sessionID)
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,

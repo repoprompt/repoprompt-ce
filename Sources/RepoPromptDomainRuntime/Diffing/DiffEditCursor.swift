@@ -4,7 +4,7 @@ import Foundation
 /// the next line from which a subsequent match should start.
 /// The processed key is identical to the one used by `DiffGenerationUtility`.
 package struct DiffEditCursor {
-    /// processedKey → next start line (1‑based, 0 == unrestricted)
+    /// processedKey → zero-based line where the next search for that key starts scanning (0 == from the top)
     private var map: [String: Int] = [:]
 
     /// Returns the correct `searchStartLine` for the **next** search of `raw`.
@@ -13,7 +13,8 @@ package struct DiffEditCursor {
         return map[Self.key(from: raw)] ?? 0
     }
 
-    /// Advances the cursor _after_ a successful diff (first chunk only).
+    /// Advances the key's scan position after a successful diff, from the supplied chunk (the last one for a replace-all).
+    /// Unchanged matches emit no chunk, so this doesn't prove the key is exhausted.
     mutating func advanceCursor(for raw: [String]?, firstChunk: DiffChunk?) {
         guard
             let raw, !raw.isEmpty,

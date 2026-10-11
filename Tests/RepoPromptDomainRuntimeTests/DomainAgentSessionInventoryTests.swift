@@ -240,18 +240,23 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         let member = UUID()
         let outsider = UUID()
         let ghost = UUID()
+        let otherGhost = UUID()
         let child = UUID()
         let full = DomainAgentSessionInventorySnapshot(
             records: [record(member), record(outsider), record(child, parent: outsider)],
             edges: DomainAgentSessionInventoryEdge.merge(
                 live: [(outsider, member, UUID(), 1)],
-                persisted: [(ghost, member)]
+                persisted: [(ghost, member), (ghost, otherGhost)]
             ),
             isComplete: true
         )
         let view = full.restricted(to: [member, child])
         XCTAssertNil(view.records[outsider])
         XCTAssertEqual(view.edges.map(\.observerSessionID), [ghost], "edges to outside sessions are dropped")
+        XCTAssertEqual(
+            view.edges.map(\.targetSessionID), [member],
+            "an edge between two deleted sessions belongs to no visible session and is dropped"
+        )
         XCTAssertEqual(view.edges(touching: member).count, 1)
         XCTAssertFalse(view.isMissing(outsider), "hidden is not missing")
         XCTAssertTrue(view.isMissing(ghost))

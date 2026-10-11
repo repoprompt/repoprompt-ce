@@ -24,6 +24,8 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
     private let scopes: DelegationScopeRuntime
     private let projector: any DelegationMembershipProjector
     private let inventory: any AgentSessionInventorySource
+    /// The session a tab is explicitly bound to right now, or `nil` when unbound or ambiguous.
+    private let liveBoundSession: @MainActor (UUID) -> UUID?
     private var handlers: [DomainAgentSessionTargetOperation: any AgentSessionAdministrationOperationHandler] = [:]
     private weak var undoer: (any AgentSessionAdministrationUndoing)?
     private var retainedHandlers: [any AgentSessionAdministrationOperationHandler] = []
@@ -37,12 +39,22 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         core: AgentSessionAdministrationCore,
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector,
-        inventory: any AgentSessionInventorySource
+        inventory: any AgentSessionInventorySource,
+        liveBoundSession: @escaping @MainActor (UUID) -> UUID?
     ) {
         self.core = core
         self.scopes = scopes
         self.projector = projector
         self.inventory = inventory
+        self.liveBoundSession = liveBoundSession
+    }
+
+    /// The tab's explicit Agent session binding across open windows; `nil` unless exactly one window
+    /// reports one.
+    static func liveExplicitBinding(forTab tabID: UUID) -> UUID? {
+        let current = WindowStatesManager.shared.allWindows
+            .compactMap { $0.agentModeViewModel.explicitActiveSessionID(for: tabID) }
+        return current.count == 1 ? current.first : nil
     }
 
     static func production(core: AgentSessionAdministrationCore, scopes: DelegationScopeRuntime) -> AgentSessionAdministrationFrontDoor {
@@ -50,7 +62,8 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             core: core,
             scopes: scopes,
             projector: SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource()),
-            inventory: LiveAgentSessionInventorySource()
+            inventory: LiveAgentSessionInventorySource(),
+            liveBoundSession: { liveExplicitBinding(forTab: $0) }
         )
         frontDoor.registerOrganizingHandlers(
             backend: OpenWindowsAgentSessionOrganizer(),
@@ -132,6 +145,11 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
               let callerSessionID = request.caller.agentSessionID,
               let scope = selectScope(request, callerSessionID: callerSessionID)
         else { return try await core.perform(request) }
+        // Cards left behind on a tab that no longer shows the caller can never be presented again;
+        // release their pending slots before the call may need a new card.
+        scopes.confirmations.invalidateUnpresentableConfirmations(
+            granteeSessionID: callerSessionID, liveBoundSession: liveBoundSession
+        )
         prunePendingApplies()
 
         let mutating = request.operation.mutatesTarget
@@ -195,8 +213,9 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         }
         switch outcome {
         case let .completed(value):
-            // Only a call that changed something is replayable; a no-op or a refused ordering is
-            // re-evaluated on retry, so the retry sees current state.
+            // Only a call that changed something (including partially committed work on items that
+            // then failed) is replayable; a no-op or a refused ordering is re-evaluated on retry, so
+            // the retry sees current state.
             if let directKey, Self.changedSomething(value) {
                 idempotency.record(
                     granteeSessionID: callerSessionID, idempotencyKey: directKey, fingerprint: fingerprint, result: value
@@ -273,7 +292,13 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
 
     /// The user approved a card: apply its stored request with identical arguments, narrowed to the
     /// ticked items. Cards created outside this front door are only approved; their caller re-calls.
-    func approveAndApply(confirmationID: UUID) async {
+    ///
+    /// `presentedTabID`/`presentedSessionID` are the tab and the session it showed when the user acted.
+    /// The approval is decided synchronously, before any suspension, against the tab's *live* binding:
+    /// a card whose tab is now bound to another session (or that is no longer pending) is never
+    /// approved or applied.
+    func approveAndApply(confirmationID: UUID, presentedTabID: UUID, presentedSessionID: UUID?) async {
+        guard isLivePresentation(confirmationID, tabID: presentedTabID, sessionID: presentedSessionID) else { return }
         prunePendingApplies()
         // An ordered change (pins, groups) is one permutation: it applies to every item or none.
         if let pending = pendingApplies[confirmationID],
@@ -303,25 +328,15 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             targets: pending.targetSessionIDs.filter(approved.contains),
             confirmationID: confirmationID
         )
-        // The core claims the card (beginApplying/finishApplying) only when the authority still
-        // requires one for the ticked items. When unticking brought the batch to or below the
-        // threshold, the card is claimed here instead, so an approved card always ends `applied`
-        // after a successful application (or returns to `approved` after a failed one).
-        let coreClaims = scopes.record(id: card.scopeID).map { scope in
-            DomainDelegationScopeAuthority.confirmationRequirement(
-                operation: request.operation,
-                itemCount: request.targetSessionIDs.count,
-                guardrails: scope.grant.guardrails
-            ) != nil
-        } ?? true
-        let claimedHere = !coreClaims && scopes.confirmations.beginApplying(confirmationID: confirmationID)
+        // The core validates, claims, and settles every supplied confirmation exactly once
+        // (beginApplying/finishApplying), including when unticking brought the batch to or below the
+        // threshold, so an approved card ends `consumed` after a successful application or returns
+        // to `approved` after a failed one. The front door never claims it itself.
         let result: Value
-        var succeeded = false
         do {
             switch try await core.perform(request) {
             case let .completed(value):
                 result = value
-                succeeded = true
             case let .denied(denial, sessionID):
                 result = (try? SessionAdminMCPToolService.deniedValue(denial, sessionID: sessionID))
                     ?? .object(["result": .string("denied")])
@@ -331,21 +346,19 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         } catch {
             result = .object(["result": .string("failed"), "detail": .string(error.localizedDescription)])
         }
-        if claimedHere {
-            scopes.confirmations.finishApplying(confirmationID: confirmationID, succeeded: succeeded)
-        } else if succeeded,
-                  scopes.confirmations.confirmation(id: confirmationID, granteeSessionID: grantee)?.state == .approved,
-                  scopes.confirmations.beginApplying(confirmationID: confirmationID)
-        {
-            // The run state changed between card and approval so neither side claimed it; settle it.
-            scopes.confirmations.finishApplying(confirmationID: confirmationID, succeeded: true)
-        }
         recordApplied(result, confirmationID: confirmationID)
     }
 
-    func denyConfirmation(confirmationID: UUID) {
+    func denyConfirmation(confirmationID: UUID, presentedTabID: UUID, presentedSessionID: UUID?) {
+        guard isLivePresentation(confirmationID, tabID: presentedTabID, sessionID: presentedSessionID) else { return }
         scopes.confirmations.deny(confirmationID: confirmationID, reason: "Denied by user")
         pendingApplies.removeValue(forKey: confirmationID)
+    }
+
+    /// The tab still shows the session the user saw, it is the card's requester, and the card is pending.
+    private func isLivePresentation(_ confirmationID: UUID, tabID: UUID, sessionID: UUID?) -> Bool {
+        guard let sessionID, liveBoundSession(tabID) == sessionID else { return false }
+        return scopes.confirmations.isCurrentPresentation(confirmationID: confirmationID, tabID: tabID, sessionID: sessionID)
     }
 
     /// The applied result of an approved card, for `confirmation_status`.
@@ -421,7 +434,9 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
     }
 
     static func changedSomething(_ value: Value) -> Bool {
-        (value.objectValue?["changed_count"]?.intValue ?? 0) > 0
+        guard let object = value.objectValue else { return false }
+        return (object["changed_count"]?.intValue ?? 0) > 0
+            || object[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
     }
 
     private func selectScope(_ request: AgentSessionAdministrationRequest, callerSessionID: UUID) -> DomainDelegationScopeRecord? {

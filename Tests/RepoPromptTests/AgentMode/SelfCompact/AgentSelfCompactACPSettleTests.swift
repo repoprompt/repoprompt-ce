@@ -150,20 +150,48 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         await fake.finish()
     }
 
-    func testLateVouchOrCompletionAfterTimeoutDoesNotSend() async {
+    func testLateVouchedDropAfterSettleTimeoutSendsVerifiedNoteOnce() async {
         let fake = Fake()
         let coordinator = fake.coordinator()
         fake.bind(coordinator, tokensBefore: 100)
         fake.advance(.milliseconds(5))
         fake.settle(coordinator, rows: 0, vouch: nil)
         await fake.finish()
+        fake.advance(.seconds(90))
         XCTAssertEqual(fake.state.active?.phase, .parked)
+        coordinator.noteVouchedContextCount(100)
+        coordinator.noteVouchedContextCount(nil)
+        XCTAssertEqual(fake.dispatchCount, 0)
+        coordinator.noteVouchedContextCount(1)
+        coordinator.noteVouchedContextCount(0)
+        fake.settle(coordinator, rows: 0, vouch: 1)
+        await drain()
+        XCTAssertEqual(fake.dispatchCount, 1)
+        XCTAssertEqual(fake.providerBoundTexts, [AgentSelfCompactNoteEnvelope.frame(note)])
+        XCTAssertNil(fake.state.active)
+        XCTAssertEqual(fake.state.latest?.completionVerified, true)
+        XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .accepted)
+    }
+
+    func testOrdinaryInputBeforeLateACPDropRetainsTheOneShotCarry() async throws {
+        let fake = Fake()
+        let coordinator = fake.coordinator()
+        fake.bind(coordinator)
+        fake.advance(.milliseconds(5))
+        fake.settle(coordinator, rows: 0, vouch: nil)
+        await fake.finish()
+        coordinator.supersedeForOrdinaryInput()
         coordinator.noteVouchedContextCount(1)
         fake.settle(coordinator, rows: 0, vouch: 1)
         await drain()
         XCTAssertEqual(fake.dispatchCount, 0)
-        XCTAssertEqual(fake.state.active?.phase, .parked)
-        XCTAssertEqual(fake.state.active?.acpCompletionUnverified, true)
+        let parked = try XCTUnwrap(fake.state.parkedNote)
+        XCTAssertTrue(fake.state.noteWillAttempt(parked.dispatchID))
+        XCTAssertTrue(fake.state.noteAccepted(parked.dispatchID))
+        XCTAssertFalse(fake.state.noteAccepted(parked.dispatchID))
+        XCTAssertEqual(fake.state.latest?.noteDelivery, .prepended)
+        XCTAssertEqual(fake.state.latest?.completionVerified, false)
     }
 
     func testSupersedeDuringHoldParksWithoutUnverifiedAndCanCarryTheNote() async throws {

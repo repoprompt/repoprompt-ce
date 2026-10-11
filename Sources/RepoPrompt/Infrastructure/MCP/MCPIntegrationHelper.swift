@@ -36,6 +36,9 @@ enum MCPIntegrationHelper {
     }
 
     static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
+
+    /// Reserved, app-provisioned Computer Use companion MCP server name.
+    static let computerUseMCPServerName = "computer-use"
     static let repoPromptToolNames: Set<String> = Set(MCPDomainToolCatalog.orderedToolNames).union(["ask_user_question"])
 
     // MARK: - Command Install Mode
@@ -303,11 +306,35 @@ enum MCPIntegrationHelper {
     static func isComputerUseCompanionPermissionRequest(_ payload: [String: Any]) -> Bool {
         let servers = permissionRequestServerCandidates(input: payload)
         guard !servers.isEmpty,
-              servers.allSatisfy({ $0.caseInsensitiveCompare("computer-use") == .orderedSame }) else { return false }
+              servers.allSatisfy({ $0.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }) else { return false }
         return permissionRequestToolNameCandidates(input: payload).allSatisfy { tool in
             let lower = tool.lowercased()
-            return !lower.hasPrefix("mcp__") || lower.hasPrefix("mcp__computer-use__")
+            return !lower.hasPrefix("mcp__") || lower.hasPrefix("mcp__\(computerUseMCPServerName)__")
         }
+    }
+
+    /// Returns the unqualified tool name when `rawName` is qualified with the reserved
+    /// Computer Use companion server (`mcp__computer-use__<tool>`). Transcript-side
+    /// normalization rewrites `-` to `_`, so the `mcp__computer_use__` form is also accepted.
+    static func computerUseCompanionToolName(_ rawName: String?) -> String? {
+        guard let name = trimmedLowercasedToolName(rawName) else { return nil }
+        guard name.hasPrefix("mcp__") else { return nil }
+        let remainder = name.dropFirst("mcp__".count)
+        guard let separator = remainder.range(of: "__"),
+              separator.lowerBound > remainder.startIndex
+        else { return nil }
+        let server = remainder[..<separator.lowerBound]
+        let tool = remainder[separator.upperBound...]
+        let isCompanionServer = server == computerUseMCPServerName
+            || server == computerUseMCPServerName.replacingOccurrences(of: "-", with: "_")
+        guard !tool.isEmpty, isCompanionServer else { return nil }
+        return String(tool)
+    }
+
+    /// True when the tool name is qualified with the reserved Computer Use companion
+    /// server, in either the raw or the `-`→`_`-normalized prefix form.
+    static func isComputerUseCompanionToolName(_ rawName: String?) -> Bool {
+        computerUseCompanionToolName(rawName) != nil
     }
 
     static func repoPromptPermissionServerIdentifier(in requestPayload: [String: Any]) -> String? {

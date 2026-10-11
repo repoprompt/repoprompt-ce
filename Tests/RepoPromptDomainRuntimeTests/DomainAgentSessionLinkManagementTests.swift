@@ -93,6 +93,46 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         XCTAssertEqual(restricted, .failure(.capabilityDenied))
     }
 
+    func testWorktreeBindingRequiresTheExactManageGrant() async throws {
+        let operation = DomainAgentSessionTargetOperation.monitorWorktreeBinding
+        XCTAssertEqual(operation.family, .monitor)
+        XCTAssertFalse(operation.isObserverScoped)
+        XCTAssertTrue(operation.mutatesTarget)
+        XCTAssertEqual(operation.requiredMonitorCapability, .manage)
+
+        let authority = makeAuthority()
+        let observer = makeEndpoint(windowID: 1)
+        let target = makeEndpoint(windowID: 2)
+        let unlinked = makeEndpoint(windowID: 3)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: operation, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        XCTAssertEqual(lease.capability, .manage)
+        XCTAssertEqual(lease.target, target)
+
+        let notLinked = await authority.authorize(
+            operation: operation, observerEndpoint: unlinked, targetSessionID: target.sessionID
+        )
+        XCTAssertEqual(notLinked, .failure(.noActiveLink))
+        let reversed = await authority.authorize(
+            operation: operation, observerEndpoint: target, targetSessionID: observer.sessionID
+        )
+        XCTAssertEqual(reversed, .failure(.noActiveLink), "links are directional")
+
+        let watchOnlyAuthority = makeAuthority()
+        _ = try await activateLink(
+            watchOnlyAuthority,
+            observer: observer,
+            target: target,
+            restrictedCapabilities: DomainAgentSessionLinkCapability.version1
+        )
+        let watchOnly = await watchOnlyAuthority.authorize(
+            operation: operation, observerEndpoint: observer, targetSessionID: target.sessionID
+        )
+        XCTAssertEqual(watchOnly, .failure(.capabilityDenied))
+    }
+
     func testNewGrantsStartManagedAndKeepWatchOperationsAvailable() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint(windowID: 1)

@@ -11,8 +11,12 @@ import SwiftUI
 //  - The pill row passes only a value (`ProviderQuotaSettingsTarget`); quota changes re-render
 //    this pill alone, never `AgentStatusPillsRow`.
 //  - It observes exactly one per-provider indicator store whose state is already rounded,
-//    account-wide, fresh-only, and equality-gated. No timers, IO, or settings observation here.
-//  - Absence is the unknown state: with no real figure the pill is not shown at all.
+//    account-wide, and equality-gated. No timers, IO, or settings observation here.
+//  - Sticky: once shown it stays. Hide reasons (see `ProviderQuotaIndicatorStore`): display
+//    or source turned off, the agent has no usage target (decided by the row), or no value
+//    was ever observed. Stale / reset-passed / updating / failed dim the last value in place;
+//    a cleared snapshot shows a neutral "—".
+//  - Right-click "Refresh usage" uses the same user-initiated path as Settings → Refresh.
 
 struct AgentUsageLimitsPill: View {
     let target: ProviderQuotaSettingsTarget
@@ -46,16 +50,8 @@ private struct AgentUsageLimitsPillContent: View {
         // An HStack (rather than a bare conditional) keeps appear/disappear firing while hidden,
         // so the lease is released when the row goes away.
         HStack(spacing: 0) {
-            if let state = indicator.state,
-               let presentation = AgentUsageLimitsPillPresentation(
-                   usedPercent: state.usedPercent,
-                   isReached: state.isReached,
-                   resetAt: state.resetAt,
-                   providerName: providerName,
-                   now: Date()
-               )
-            {
-                pill(presentation)
+            if let state = indicator.state {
+                pill(AgentUsageLimitsPillPresentation(state: state, providerName: providerName, now: Date()))
             }
         }
         .onAppear { indicator.activate(surfaceID: surfaceID) }
@@ -87,6 +83,7 @@ private struct AgentUsageLimitsPillContent: View {
                     .monospacedDigit()
                     .foregroundStyle(tint)
             }
+            .opacity(presentation.isDimmed ? 0.55 : 1)
             .padding(.horizontal, 7)
             .frame(height: height)
             .background(.ultraThinMaterial)
@@ -97,6 +94,9 @@ private struct AgentUsageLimitsPillContent: View {
             )
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button("Refresh usage") { indicator.refresh() }
+        }
         .hoverTooltip(presentation.tooltip, .top)
         .accessibilityLabel("\(providerName) plan usage")
         .accessibilityValue(presentation.tooltip)

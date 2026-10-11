@@ -42,7 +42,7 @@ package extension DomainAgentSessionTargetOperation {
             nil
         case .monitorList, .monitorCreateLane, .monitorRetireLane, .monitorPoll, .monitorWait, .monitorRead,
              .monitorSend, .monitorCompact, .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop,
-             .monitorSetModel:
+             .monitorSetModel, .monitorWorktreeBinding:
             nil
         case .adminRequestScope, .adminScopeStatus, .adminReleaseScope:
             nil
@@ -134,10 +134,12 @@ package extension DomainAgentSessionTargetOperation {
         }
     }
 
-    /// Acting on oneself under `control`, or retiring oneself, would let an agent answer its own
-    /// prompt or stop/archive itself through delegated authority; the scope basis refuses it.
+    /// Acting on oneself under `control`, or retiring or archiving oneself, would let an agent answer
+    /// its own prompt or stop/archive itself through delegated authority; the scope basis refuses it.
+    /// Archive is included because archiving stashes the tab and cancels its run, and the caller is
+    /// always running while it makes the call. Filter targeting excludes the caller for these ops.
     var deniesScopeSelfTarget: Bool {
-        self == .adminRetire || requiredScopeCapability == .control
+        self == .adminRetire || self == .adminArchive || requiredScopeCapability == .control
     }
 
     var scopeGuardrailUse: DomainDelegationScopeGuardrailUse? {
