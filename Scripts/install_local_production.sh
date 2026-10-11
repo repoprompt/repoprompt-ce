@@ -248,8 +248,8 @@ REGISTRY_NEEDS_WRITE="$(json_field "$PLAN_PATH" registryNeedsWrite)"
 
 if [[ "$IDENTITY_ACTION" == "mint" ]]; then
     if [[ "$ROTATE_LOCAL_SIGNING_IDENTITY" == "1" || "$ROTATE_LOCAL_SIGNING_IDENTITY" == "true" ]]; then
-        printf 'WARNING: Rotating the local signing identity makes secrets in the prior local secure-storage generation inaccessible to the new app.\n' >&2
-        printf 'WARNING: The prior certificate and Keychain service are preserved for rollback; values are not copied automatically.\n' >&2
+        printf 'WARNING: Rotating the local signing identity changes signing continuity; local builds use in-memory secure storage.\n' >&2
+        printf 'WARNING: The prior certificate is preserved for rollback. Earlier Keychain items remain untouched with their previous access conditions; they are not copied or protected by this change.\n' >&2
     fi
     mint_local_identity
     inventory_local_identities "$INVENTORY_AFTER"
@@ -266,8 +266,8 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(plan["candidate"], handle)
 PY
     if [[ "$IDENTITY_ACTION" == "rotate" ]]; then
-        printf 'WARNING: Rotating the local signing identity makes secrets in the prior local secure-storage generation inaccessible to the new app.\n' >&2
-        printf 'WARNING: The prior certificate and Keychain service are preserved for rollback; values are not copied automatically.\n' >&2
+        printf 'WARNING: Rotating the local signing identity changes signing continuity; local builds use in-memory secure storage.\n' >&2
+        printf 'WARNING: The prior certificate is preserved for rollback. Earlier Keychain items remain untouched with their previous access conditions; they are not copied or protected by this change.\n' >&2
     fi
 fi
 
@@ -276,7 +276,7 @@ SELECTED_CERTIFICATE_SHA256="$(json_field "$SELECTED_CANDIDATE_PATH" sha256)"
 LOCAL_SIGNING_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$SIGN_IDENTITY\""
 printf 'Local signing identity action: %s\n' "$IDENTITY_ACTION"
 printf 'Selected local certificate SHA-256: %s\n' "$SELECTED_CERTIFICATE_SHA256"
-printf 'Selected local secure-storage generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+printf 'Selected local signing compatibility generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
 
 LOCAL_SELF_SIGNED_RELEASE=1 \
     LOCAL_SIGNING_CERTIFICATE_SHA1="$SIGN_IDENTITY" \
