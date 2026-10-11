@@ -7535,6 +7535,28 @@ final class AgentSessionLinkRuntimeBridge {
         return host?.agentSessionLinkBootstrapState(for: endpoint)
     }
 
+    /// Direct user consent from the dashboard, not an Agent/MCP invocation. Capture the displayed
+    /// incarnation and compare it synchronously at commit; the tool's route-proof path stays separate.
+    func enableOverseerFromToolbar(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        expected: AgentSessionOverseerBootstrapState,
+        isEnabled: @MainActor () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) }
+    ) async -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
+              host.agentSessionLinkBootstrapState(for: endpoint) == expected,
+              await !(authority.hasActiveLink(endpoint: endpoint))
+        else { return false }
+        // Like tool bootstrap, consent linearizes at the no-link authority sample. Any relationship
+        // committed after that sample is independently ordered; re-fence the captured incarnation.
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
+              host.agentSessionLinkBootstrapState(for: endpoint) == expected,
+              host.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
+        else { return false }
+        // Consent is already committed. Catalog publication neither grants links nor starts a turn.
+        await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+        return true
+    }
+
     func becomeOverseer(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         isEnabled: @escaping @MainActor () -> Bool,

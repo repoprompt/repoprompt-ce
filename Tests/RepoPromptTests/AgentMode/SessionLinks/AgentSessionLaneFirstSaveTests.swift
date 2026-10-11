@@ -6,6 +6,15 @@ import XCTest
 
 @MainActor
 final class AgentSessionLaneFirstSaveTests: XCTestCase {
+    @MainActor
+    private final class AdvertisementRecorder {
+        var sessionIDs: [UUID] = []
+
+        func record(_ sessionID: UUID) {
+            sessionIDs.append(sessionID)
+        }
+    }
+
     private struct Fixture {
         let window: WindowState
         let root: URL
@@ -97,7 +106,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testToolbarActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: true)
+    }
+
     func testActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
+    }
+
+    private func exerciseActivatedFirstLaneFromAnotherWindow(toolbar: Bool) async throws {
         try await withFixture(ephemeral: false) { fixture in
             let host = WindowStatesManager.shared
             let creatorOutcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Ordinary creator", selection: fixture.selection)
@@ -108,8 +125,28 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()))
             let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
             bridge.installIntentStore(AgentSessionOversightIntentStore(fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename), backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled))
-            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
-            XCTAssertNotNil(activated)
+            let viewModel = fixture.window.agentModeViewModel
+            viewModel.test_setCurrentTabIDOverride(creatorTabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let before = viewModel.currentMonitorPillProps()
+            let expected = try XCTUnwrap(before.overseerBootstrapState)
+            XCTAssertNil(expected.activation)
+            let denied = await bridge.laneCreationCallerPreflight(endpoint)
+            XCTAssertEqual(denied, .denied, "zero links alone do not authorize creation")
+            let activated: Bool = if toolbar {
+                await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            } else {
+                await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() }) != nil
+            }
+            XCTAssertTrue(activated)
+            let enabled = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertNotNil(enabled.overseerBootstrapState?.activation, "commit publishes the dashboard immediately")
+            XCTAssertFalse(enabled.isOverseer, "activation is not an outbound role badge")
+            XCTAssertNil(enabled.dashboardOutboundCount)
+            XCTAssertNil(enabled.dashboardInboundCount)
+            XCTAssertNil(creator.oversight.pendingAutoWake, "consent cannot start a turn")
+            let noLinks = await authority.links(forObserver: creatorID)
+            XCTAssertTrue(noLinks.items.isEmpty, "consent manufactures no grants")
             AgentAdvertisedModelCatalog.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
             ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
@@ -137,6 +174,102 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertEqual(inventory.items.map(\.targetSessionID), [laneID])
                 XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID, "creation never switches the creator workspace")
             }
+        }
+    }
+
+    func testToolbarActivationRejectsAlreadyLinkedIncarnationDespiteStaleDashboard() async throws {
+        for inbound in [false, true] {
+            try await withFixture(ephemeral: false) { fixture in
+                let host = WindowStatesManager.shared
+                let viewModel = fixture.window.agentModeViewModel
+                var seedIDs: [UUID] = []
+                for _ in 0 ..< 2 {
+                    let seed = try await host.agentSessionLinkCreateLane(
+                        destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                        creatorSessionID: UUID(), sessionName: "Linked consent", selection: fixture.selection
+                    )
+                    guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+                    viewModel.sessions[tabID]?.createdByOverseerSessionID = nil
+                    seedIDs.append(sessionID)
+                }
+                let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == seedIDs[0] }).domainEndpoint
+                let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                    runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+                ))
+                let invalidated = AdvertisementRecorder()
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+                bridge.installIntentStore(AgentSessionOversightIntentStore(
+                    fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                    backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+                ))
+                let pair = AgentSessionOversightIntent(
+                    observerSessionID: seedIDs[inbound ? 1 : 0], targetSessionID: seedIDs[inbound ? 0 : 1]
+                )
+                guard case .added = await bridge.addMonitorLink(pair: pair) else { return XCTFail("real link must activate") }
+                invalidated.sessionIDs.removeAll()
+                let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(enabled, "a lagging dashboard cannot opt in an already linked incarnation")
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
+                XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            }
+        }
+    }
+
+    func testToolbarActivationRejectsDisabledStaleAndIneligibleIncarnations() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Toolbar consent", selection: fixture.selection
+            )
+            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            session.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == sessionID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let invalidated = AdvertisementRecorder()
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+            let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            let disabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { false })
+            XCTAssertFalse(disabled)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            for exclusion in ["mcp-origin", "child", "lane", "mcp-control"] {
+                switch exclusion {
+                case "mcp-origin": session.isMCPOriginated = true
+                case "child": session.parentSessionID = UUID()
+                case "lane": session.createdByOverseerSessionID = UUID()
+                default: await self.installDeniedRoleControlFixture(on: session, sessionID: sessionID)
+                }
+                let refused = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(refused, exclusion)
+                XCTAssertNil(session.oversight.overseerActivation, exclusion)
+                session.isMCPOriginated = false
+                session.parentSessionID = nil
+                session.createdByOverseerSessionID = nil
+                if session.mcpControlContext != nil {
+                    await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+                }
+            }
+            let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertTrue(enabled)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            let activation = try XCTUnwrap(session.oversight.overseerActivation)
+            let stale = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(stale, "displayed pre-activation state is a CAS, not reusable consent")
+            XCTAssertEqual(session.oversight.overseerActivation, activation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            session.beginPersistentBindingTransition()
+            let rebound = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(rebound)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            let inventory = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(inventory.items.isEmpty)
         }
     }
 

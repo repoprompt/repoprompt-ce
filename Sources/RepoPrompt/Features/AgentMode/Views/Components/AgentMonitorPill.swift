@@ -102,6 +102,8 @@ struct AgentMonitorPopoverView: View {
             .map { _ in () }.eraseToAnyPublisher()
     )
     @State private var isWorking = false
+    @State private var isEnablingOverseer = false
+    @State private var overseerEnableFailure: String?
     /// One busy gate per generation-qualified row. Navigation, acknowledgement, durable Unlink, and
     /// Auto-wake changes must not race from the same stale projection.
     ///
@@ -175,6 +177,8 @@ struct AgentMonitorPopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
+                    overseerModeSection
+                    Divider()
                     ForEach(
                         AgentMonitorPopoverLinkedSection.displayOrder(
                             hasInbound: !props.inbound.isEmpty,
@@ -231,11 +235,57 @@ struct AgentMonitorPopoverView: View {
         }
         .onAppear { refreshPreview() }
         .onChange(of: props.sessionID) { _, _ in refreshPreview() }
+        .onChange(of: props.endpoint) { _, _ in overseerEnableFailure = nil }
         .onChange(of: existingOutboundTargetIDs) { _, _ in refreshPreview() }
         .onDisappear {
             // Presentation only. The revocation itself already committed and stays committed.
             undoExpiryTask?.cancel()
             undoExpiryTask = nil
+        }
+    }
+
+    // MARK: Explicit session-local opt-in
+
+    private var overseerModeSection: some View {
+        let enabled = props.isOverseer || props.overseerBootstrapState?.activation != nil
+        return VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("Overseer mode")
+            Button(enabled ? "Overseer mode enabled" : "Enable overseer mode") {
+                enableOverseer()
+            }
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            .disabled(enabled || props.hasInbound || props.overseerBootstrapState == nil || isEnablingOverseer)
+            .accessibilityHint("Enables lane creation for this session without linking an existing session")
+            Text("Create overseen lanes without linking an existing session. Enabling applies to this session until it is rebound or the app restarts; it grants no authority over existing sessions.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+            if !enabled, props.hasInbound {
+                messageText("Existing oversight relationships retain their current tools. Unlink them before enabling zero-link overseer mode.")
+            } else if !enabled, props.overseerBootstrapState == nil {
+                messageText("Requires a loaded, user-owned top-level Agent session eligible for oversight.")
+            }
+            if let overseerEnableFailure {
+                messageText(overseerEnableFailure)
+            }
+        }
+    }
+
+    private func enableOverseer() {
+        guard !isEnablingOverseer, !props.isOverseer, !props.hasInbound, let endpoint = props.endpoint,
+              let expected = props.overseerBootstrapState, expected.activation == nil
+        else { return }
+        isEnablingOverseer = true
+        overseerEnableFailure = nil
+        Task { @MainActor in
+            let enabled = await AgentSessionLinkRuntimeBridge.shared.enableOverseerFromToolbar(
+                endpoint: endpoint, expected: expected
+            )
+            isEnablingOverseer = false
+            // Feedback belongs only to the incarnation displayed when the user opted in.
+            guard props.endpoint == endpoint else { return }
+            if !enabled {
+                overseerEnableFailure = "Could not enable overseer mode. The session changed or the oversight tool is disabled; reopen this dashboard and try again."
+            }
         }
     }
 

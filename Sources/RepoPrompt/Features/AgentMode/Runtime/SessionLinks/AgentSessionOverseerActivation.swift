@@ -46,6 +46,7 @@ extension AgentModeViewModel {
               let session = sessions[endpoint.tabID]
         else { return false }
         session.oversight.overseerActivation = AgentSessionOverseerActivation(endpoint: endpoint, token: UUID())
+        syncStatusPillsUIStateIfMonitorStale()
         return true
     }
 }

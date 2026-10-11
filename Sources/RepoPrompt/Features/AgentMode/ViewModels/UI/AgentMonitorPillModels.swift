@@ -1370,6 +1370,8 @@ struct AgentMonitorPillProps: Equatable {
     /// transitions that move no link, so baking it into stored props would repaint the sidebar and
     /// window title for presentation-only churn.
     var pendingUpdates: AgentMonitorPendingUpdates?
+    /// UI-only exact-incarnation consent state, overlaid by the current tab. Not link authority.
+    var overseerBootstrapState: AgentSessionOverseerBootstrapState?
     /// Process-wide durable-oversight state, overlaid by the owning window rather than published by
     /// the bridge's per-endpoint projection.
     ///
@@ -1427,7 +1429,7 @@ struct AgentMonitorPillProps: Equatable {
     /// deliberately refreshed on different schedules.
     func withCanAddReason(_ reason: String?) -> AgentMonitorPillProps {
         guard reason != canAddReason else { return self }
-        return AgentMonitorPillProps(
+        var result = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
@@ -1444,6 +1446,8 @@ struct AgentMonitorPillProps: Equatable {
             pendingUpdates: pendingUpdates,
             persistence: persistence
         )
+        result.overseerBootstrapState = overseerBootstrapState
+        return result
     }
 
     /// Overlays the process-wide persistence level onto an authoritative or synthesized projection.
@@ -1457,7 +1461,7 @@ struct AgentMonitorPillProps: Equatable {
     ) -> AgentMonitorPillProps {
         let reason = presentation.addBlockerMessage ?? eligibilityReason
         guard reason != canAddReason || presentation != persistence else { return self }
-        return AgentMonitorPillProps(
+        var result = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
@@ -1474,6 +1478,8 @@ struct AgentMonitorPillProps: Equatable {
             pendingUpdates: pendingUpdates,
             persistence: presentation
         )
+        result.overseerBootstrapState = overseerBootstrapState
+        return result
     }
 
     /// Exact current observer role: outbound membership only.

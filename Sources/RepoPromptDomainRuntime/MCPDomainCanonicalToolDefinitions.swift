@@ -2189,6 +2189,26 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Description-only projection; preserve the frozen model-selection and earlier migration shapes.
+    private enum AgentSessionLinkOverseerActivationGuidance {
+        static let description = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
+            of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
+            with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
+        )
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == AgentSessionLinkModelSelectionMigration.inputSchema
+        }
+
+        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: definition.inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private enum AgentSessionLinkAutonomyContractState: String {
         case historicalIncomingOnly
         case historicalAutomatic
@@ -2396,13 +2416,19 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
+        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) {
+            return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
+        }
         precondition(!agentSessionLinkModelSelectionIsPartial(definition), "Partial agent_session_link model selection contract")
-        return AgentSessionLinkModelSelectionMigration.applying(to: canonicalizeAgentSessionLinkBeforeModelSelection(definition))
+        return AgentSessionLinkOverseerActivationGuidance.applying(
+            to: AgentSessionLinkModelSelectionMigration.applying(to: canonicalizeAgentSessionLinkBeforeModelSelection(definition))
+        )
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
+        !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
+            && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
                 definition.description.contains("set_model")
                     || stringOccurrenceCount(of: "set_model", in: definition.inputSchema) > 0

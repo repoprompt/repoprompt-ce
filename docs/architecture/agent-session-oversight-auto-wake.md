@@ -815,6 +815,15 @@ activated sessions receive the unchanged full definition. Eligible ordinary no-l
 memory, not a link, badge, prompt supplement, or persisted authority. It survives final unlink and
 controller repair but not rebind/restart. Prompt readiness and inventory remain outbound-only.
 
+The toolbar eye/chevron dashboard also offers **Enable overseer mode** for an eligible loaded,
+user-owned top-level session with zero links. The user's click commits the same exact
+incarnation opt-in and notifies tool discovery without starting a turn or inventing a grant. The
+dashboard displays the enabled state independently of the outbound-only role eye and counts. An
+activated session can create its first lane through the existing activation-qualified `create_lane`
+transaction; all target-bearing operations still require their ordinary exact grants. This UI path
+is direct user consent, not an MCP invocation, and does not bypass the tool bootstrap's route proof.
+Linked behavior, persistence, prompt inventory, and wake admission remain unchanged.
+
 Discovery repair is separate from route proof and current operation authority. Claude/OpenCode/Devin
 receive the existing notification route only. No live model pickup is established by protocol tests;
 Devin explicitly reports that discovery may require a new provider session. Codex repair is quiescent

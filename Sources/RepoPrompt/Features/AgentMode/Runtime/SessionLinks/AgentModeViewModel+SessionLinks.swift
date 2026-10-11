@@ -1446,6 +1446,7 @@ extension AgentModeViewModel {
                 for: endpoint,
                 outbound: props.outbound
             )
+            props.overseerBootstrapState = agentSessionLinkBootstrapState(for: endpoint)
         }
         return props
     }
