@@ -169,7 +169,59 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
-    /// Declines any surfaced approval, distinguishing manual approval from automatic selection.
+    func testPendingCursorFullAccessUsesOnlyGenuineOneTimeOptions() async throws {
+        let invalidOptions = [
+            ["optionId": "allow_always", "kind": "allow_always"],
+            ["optionId": "allow_once", "kind": "allow_always"],
+            ["optionId": "always", "kind": "allow_once"],
+            ["optionId": "allow_session", "kind": "allow_once"],
+            ["optionId": "allow_global", "kind": "allow_once"],
+            ["optionId": "allow_persistent", "kind": "allow_once"]
+        ]
+        for option in invalidOptions {
+            for genuineOptionAvailable in [false, true] {
+                var options = [option]
+                if genuineOptionAvailable { options.append(["optionId": "opaque-once", "kind": "allow_once"]) }
+                options.append(["optionId": "reject_once", "kind": "reject_once"])
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                    providerID: .cursor, options: options, pendingFullAccess: true,
+                    expectedPendingAutoApproval: genuineOptionAvailable
+                )
+                XCTAssertTrue(result.approvalRequested, "The prompt must first surface with full access disabled")
+                XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "opaque-once" : "reject_once", "\(option)")
+            }
+        }
+    }
+
+    func testPendingFullAccessRequiresCurrentFlagAndSupportedProvider() async throws {
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            for enabled in [false, true] {
+                let expectedSelection = providerID == .cursor && enabled
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                    providerID: providerID, pendingFullAccess: enabled, expectedPendingAutoApproval: expectedSelection
+                )
+                XCTAssertTrue(result.approvalRequested)
+                XCTAssertEqual(result.outcome["optionId"], expectedSelection ? "allow_once" : "reject_once", "\(providerID): \(enabled)")
+            }
+        }
+        // Full-access automation must not rewrite an explicit manual session choice.
+        for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember")] {
+            let result = try await autoApprovalOutcome(
+                toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                providerID: .cursor, options: [
+                    ["optionId": "allow_always", "kind": "allow_always"],
+                    ["optionId": "allow_once", "kind": "allow_once"],
+                    ["optionId": "reject_once", "kind": "reject_once"]
+                ], pendingFullAccess: false, manualDecision: decision
+            )
+            XCTAssertEqual(result.outcome["optionId"], "allow_always")
+        }
+    }
+
+    /// Responds through the real controller/transport, distinguishing automatic selection
+    /// from surfaced prompts. A manual response after refused automation proves it stayed pending.
     private func autoApprovalOutcome(
         toolCallJSON: String,
         providerID: ACPProviderID = .openCode,
@@ -177,7 +229,10 @@ final class ACPPermissionScopeTests: XCTestCase {
             ["optionId": "allow_once", "kind": "allow_once", "name": "Allow"],
             ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
         ],
-        fullAccess: Bool = false
+        fullAccess: Bool = false,
+        pendingFullAccess: Bool? = nil,
+        expectedPendingAutoApproval: Bool = false,
+        manualDecision: AgentApprovalDecision = .decline
     ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPAutoApprovalProvenance")
@@ -204,8 +259,8 @@ final class ACPPermissionScopeTests: XCTestCase {
                     "options": json.loads(r'\#(optionsJSON)')
                 }})
             elif request.get("id") == "permission-1":
-                with open(r"\#(record.path)", "w", encoding="utf-8") as output:
-                    json.dump(request["result"]["outcome"], output)
+                with open(r"\#(record.path)", "a", encoding="utf-8") as output:
+                    output.write(json.dumps(request["result"]["outcome"]) + "\n")
                 send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
         """#
         try script.write(to: executable, atomically: true, encoding: .utf8)
@@ -234,7 +289,18 @@ final class ACPPermissionScopeTests: XCTestCase {
             let consumer = Task { () -> Bool in
                 for await event in events {
                     if case let .approvalRequested(approval) = event {
-                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: .decline)
+                        if let pendingFullAccess {
+                            // Revoke a previously enabled flag too: the response must use
+                            // current actor-owned state, not the caller's activation snapshot.
+                            await controller.setAutoApproveAllToolPermissions(true)
+                            await controller.setAutoApproveAllToolPermissions(pendingFullAccess)
+                            let wrongIDSubmitted = await controller.respondToPendingPermissionRequestForFullAccess(id: "not-the-pending-request")
+                            XCTAssertFalse(wrongIDSubmitted)
+                            let submitted = await controller.respondToPendingPermissionRequestForFullAccess(id: approval.requestID.displayValue)
+                            XCTAssertEqual(submitted, expectedPendingAutoApproval)
+                            if submitted { return true }
+                        }
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: manualDecision)
                         return true
                     }
                 }
@@ -243,7 +309,10 @@ final class ACPPermissionScopeTests: XCTestCase {
             try await controller.prompt(AgentMessage(userMessage: "Run"), request: request)
             await controller.shutdown()
             let approvalRequested = await consumer.value
-            let outcome = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            let responses = try String(contentsOf: record, encoding: .utf8).split(separator: "\n")
+            XCTAssertEqual(responses.count, 1, "Exactly one wire response: refused automation must not send or consume the prompt")
+            let response = try XCTUnwrap(responses.first)
+            let outcome = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: String])
             return (approvalRequested, outcome)
         } catch {
             await controller.shutdown()

@@ -1520,6 +1520,26 @@ actor ACPAgentSessionController {
         }
     }
 
+    /// Applying full access to an already surfaced prompt uses the same per-request
+    /// policy as a new request. Ineligible prompts remain available for manual approval.
+    @discardableResult
+    func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
+        guard state == .promptRunning,
+              let pending = pendingPermissionRequests[id],
+              let optionID = fullAccessAutoApprovalOptionID(for: pending.options)
+        else { return false }
+        // No suspension between checking the current flag/request and sending: the
+        // actor owns both, so preference changes and cancellation cannot interleave.
+        do {
+            try sendPermissionSelectionResponse(id: pending.rpcID, optionID: optionID)
+            pendingPermissionRequests.removeValue(forKey: id)
+            return true
+        } catch {
+            log("Failed to apply full access to pending ACP permission request: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func respondToPermissionRequest(
         id: String,
         decision: AgentApprovalDecision
