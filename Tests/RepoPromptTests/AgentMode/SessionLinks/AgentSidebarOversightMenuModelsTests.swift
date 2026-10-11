@@ -1118,6 +1118,8 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             defer: false
         )
         window.isReleasedWhenClosed = false
+        // Keep capture independent of the attached display's colour profile.
+        window.colorSpace = .sRGB
         window.appearance = NSAppearance(named: appearance)
         window.contentView = host
         host.layoutSubtreeIfNeeded()
@@ -1128,6 +1130,17 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         }
         host.cacheDisplay(in: host.bounds, to: rep)
         return (rep, window)
+    }
+
+    private func pixelColor(atX x: Int, y: Int, in rep: NSBitmapImageRep) -> NSColor? {
+        guard let sample = rep.colorAt(x: x, y: y) else { return nil }
+        // colorAt can label samples calibrated RGB even when the bitmap is sRGB. Interpret the
+        // components in the bitmap's profile before converting, not the sample's label.
+        return NSColor(
+            colorSpace: rep.colorSpace,
+            components: [sample.redComponent, sample.greenComponent, sample.blueComponent, sample.alphaComponent],
+            count: 4
+        ).usingColorSpace(.sRGB)
     }
 
     /// Pixels within `tolerance` (per sRGB channel) of `expected`. A template-rendered mark
@@ -1142,7 +1155,7 @@ final class AgentOversightMarkRenderTests: XCTestCase {
         var count = 0
         for x in 0 ..< rep.pixelsWide {
             for y in 0 ..< rep.pixelsHigh {
-                guard let pixel = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                guard let pixel = pixelColor(atX: x, y: y, in: rep) else { continue }
                 if abs(pixel.redComponent - want.redComponent) < tolerance,
                    abs(pixel.greenComponent - want.greenComponent) < tolerance,
                    abs(pixel.blueComponent - want.blueComponent) < tolerance
@@ -1272,12 +1285,27 @@ final class AgentOversightMarkRenderTests: XCTestCase {
 
     /// The shared vectors must paint with the caller's foreground at the intended 16px size.
     func testRoleVectorsRespectForegroundAtSixteenPoints() {
+        let colours = [
+            NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+            NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+        ]
         for role in [AgentOversightRoleIcon.Role.overseer, .worker] {
-            let (rep, window) = rasterize(
-                AgentOversightRoleIcon(role: role, size: 16).foregroundStyle(Color(nsColor: .red))
-            )
-            XCTAssertGreaterThanOrEqual(pixelCount(near: .red, in: rep), markPixelFloor)
-            window.close()
+            for expected in colours {
+                let (rep, window) = rasterize(
+                    AgentOversightRoleIcon(role: role, size: 16).foregroundStyle(Color(nsColor: expected))
+                )
+                XCTAssertGreaterThanOrEqual(
+                    pixelCount(near: expected, in: rep), markPixelFloor,
+                    "\(role) lost caller foreground \(expected) at 16 points"
+                )
+                for other in colours where other != expected {
+                    XCTAssertEqual(
+                        pixelCount(near: other, in: rep), 0,
+                        "\(role) painted \(other) when styled \(expected) at 16 points"
+                    )
+                }
+                window.close()
+            }
         }
     }
 
@@ -1299,10 +1327,11 @@ final class AgentOversightMarkRenderTests: XCTestCase {
             )
             defer { window.close() }
             func red(atX x: CGFloat, y: CGFloat) throws -> CGFloat {
-                let pixel = try XCTUnwrap(rep.colorAt(
-                    x: Int(x * CGFloat(rep.pixelsWide) / 24),
-                    y: Int(y * CGFloat(rep.pixelsHigh) / 24)
-                )?.usingColorSpace(.sRGB))
+                let pixel = try XCTUnwrap(pixelColor(
+                    atX: Int(x * CGFloat(rep.pixelsWide) / 24),
+                    y: Int(y * CGFloat(rep.pixelsHigh) / 24),
+                    in: rep
+                ))
                 return pixel.redComponent
             }
             if role == .overseer {
