@@ -33,8 +33,8 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 30)
-        XCTAssertEqual(Set(canonicalNames).count, 30)
+        XCTAssertEqual(canonicalNames.count, 31)
+        XCTAssertEqual(Set(canonicalNames).count, 31)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
@@ -46,7 +46,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         }
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 30)
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 31)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
 
         // Delegation scopes are app-owned Agent-session authority: direct-headless keeps the canonical
