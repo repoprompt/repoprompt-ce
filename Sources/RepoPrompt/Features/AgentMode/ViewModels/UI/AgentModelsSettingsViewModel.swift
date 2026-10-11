@@ -225,7 +225,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         return AgentModelCatalog.normalizeSelection(
             agentRaw: selectedAgentRaw,
             modelRaw: selectedModelRaw,
-            availability: availability
+            availability: availability,
+            surface: .headless
         )
     }
 
