@@ -223,6 +223,10 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         let selfProof = treeProof(scope, [overseer])
         XCTAssertEqual(denial(lease(authority, scope, .adminSetModel, target: overseer, proof: selfProof)), .selfTarget)
         XCTAssertEqual(denial(lease(authority, scope, .adminRetire, target: overseer, proof: selfProof)), .selfTarget)
+        XCTAssertEqual(
+            denial(lease(authority, scope, .adminArchive, target: overseer, proof: selfProof)), .selfTarget,
+            "archiving oneself would cancel the caller's own run, like retire"
+        )
         XCTAssertNotNil(try? lease(authority, scope, .adminRename, target: overseer, proof: selfProof).get())
     }
 

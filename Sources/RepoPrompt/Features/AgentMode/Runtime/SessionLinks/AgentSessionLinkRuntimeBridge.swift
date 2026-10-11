@@ -31,6 +31,16 @@ enum AgentSessionLinkModelOutcome {
 }
 
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
+        nil
+    }
+
+    func agentSessionLinkActivateOverseer(
+        for _: DomainAgentSessionLinkEndpointIdentity, expected _: AgentSessionOverseerBootstrapState
+    ) -> Bool {
+        false
+    }
+
     func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
         .none
     }
@@ -153,6 +163,12 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         liveness: @escaping AgentSessionLinkSendLivenessProbe,
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome
+
+    /// Exact session-incarnation opt-in; default hosts fail closed. Neither method creates grants.
+    func agentSessionLinkBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState?
+    func agentSessionLinkActivateOverseer(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
+    ) -> Bool
 
     /// Count independent compose-tab bindings without hydration.
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int
@@ -352,11 +368,7 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     )
 
-    /// Captures a scoped local-only admission fence. The release is tied to the captured session,
-    /// not a later endpoint lookup, and is held through every suspension and activation exit.
-    func agentSessionLinkHoldComputerUseAdmission(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)?
-
-    /// Retires incompatible local-only operations before authority can activate either endpoint.
+    /// Waits for an already-retiring controller without revoking local Computer Use consent.
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async
 
     /// Fences one incarnation's published inventory, so nothing can be claimed against a membership
@@ -529,10 +541,6 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
-    func agentSessionLinkHoldComputerUseAdmission(_: DomainAgentSessionLinkEndpointIdentity) -> (@MainActor () -> Void)? {
-        nil
-    }
-
     func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
 
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
@@ -924,6 +932,18 @@ final class AgentSessionLinkRuntimeBridge {
     /// Pasted-ID Add and launch restoration pass no constraints and retain their existing UUID
     /// resolution semantics. Exact callers supply both endpoints so duplicate UUID incarnations do
     /// not introduce ambiguity and a stale presentation can never mint against a replacement.
+    /// Only the creator can construct this proof, after the exact new lane's durable first save.
+    private struct LaneCreationActivationBasis: Hashable {
+        let activation: AgentSessionOverseerActivation
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let bindingToken: AgentSessionRestorationBindingToken
+    }
+
+    private enum LaneCreationCallerBasis {
+        case linked
+        case activated(AgentSessionOverseerActivation)
+    }
+
     private struct AddEndpointExpectations: Equatable, Hashable {
         let observer: DomainAgentSessionLinkEndpointIdentity?
         let target: DomainAgentSessionLinkEndpointIdentity?
@@ -932,17 +952,20 @@ final class AgentSessionLinkRuntimeBridge {
         let requiresExistingOutboundLink: Bool
         /// Only lane creation needs an exact direct relationship, in either direction.
         let requiresExistingDirectLink: Bool
+        let laneCreationActivation: LaneCreationActivationBasis?
 
         init(
             observer: DomainAgentSessionLinkEndpointIdentity?,
             target: DomainAgentSessionLinkEndpointIdentity?,
             requiresExistingOutboundLink: Bool = false,
-            requiresExistingDirectLink: Bool = false
+            requiresExistingDirectLink: Bool = false,
+            laneCreationActivation: LaneCreationActivationBasis? = nil
         ) {
             self.observer = observer
             self.target = target
             self.requiresExistingOutboundLink = requiresExistingOutboundLink
             self.requiresExistingDirectLink = requiresExistingDirectLink
+            self.laneCreationActivation = laneCreationActivation
         }
 
         var isEmpty: Bool {
@@ -1054,22 +1077,35 @@ final class AgentSessionLinkRuntimeBridge {
         let task: Task<Void, Never>
     }
 
-    /// One-shot gate shared by a shutdown phase and the total deadline that bounds it.
+    /// One-shot gate shared by transaction settlement and its cancellation/deadline branch.
     ///
     /// MainActor-confined, so the single-resume guarantee is a plain flag rather than a lock, and the
     /// losing branch is abandoned rather than awaited.
     @MainActor
-    private final class ShutdownPhaseGate {
+    private final class TransactionSettlementGate {
         private var continuation: CheckedContinuation<Bool, Never>?
+        private var result: Bool?
 
-        init(_ continuation: CheckedContinuation<Bool, Never>) {
+        init(_ continuation: CheckedContinuation<Bool, Never>? = nil) {
             self.continuation = continuation
         }
 
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
         func finish(_ completed: Bool) {
-            guard let continuation else { return }
+            guard result == nil else { return }
+            result = completed
+            let continuation = continuation
             self.continuation = nil
-            continuation.resume(returning: completed)
+            continuation?.resume(returning: completed)
         }
     }
 
@@ -1180,6 +1216,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// Creator-scoped admission tickets. A settled target is the same slot as its active grant.
     private enum LaneCreationReservation { case pending, session(UUID) }
     private var laneCreationCapReservations: [UUID: [UUID: LaneCreationReservation]] = [:]
+    /// Versions reservations and exact activation-backed task membership, including outer compensation gaps.
     private var laneCreationCapGeneration: [UUID: UInt64] = [:]
     private var retiringTargets: Set<DomainAgentSessionLinkEndpointIdentity> = []
     /// One retirement lane per pair. Every durable removal for a pair — user Stop, launch
@@ -1203,6 +1240,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// of resuming a backlog its previous incarnation collected under authority it no longer holds.
     private var passiveNoticesByObserver:
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPassiveStatusNotices] = [:]
+    /// Read-only exact-incarnation count. No reducer, publication or receipt is created by a read.
+    func pendingAttentionOccurrenceCount(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Int {
+        passiveNoticesByObserver[endpoint]?.pendingAttentionOccurrenceCount ?? 0
+    }
+
     private var chains: [UUID: TargetPublicationChain] = [:]
     /// Never reset per target record. A re-installed chain therefore continues above any high-water
     /// mark a previous incarnation left behind, so its first publication is never rejected as stale.
@@ -1298,8 +1340,20 @@ final class AgentSessionLinkRuntimeBridge {
         var test_afterRetireAuthorizationBeforeFence: (@MainActor () async -> Void)?
         /// Holds a claimed key before its first admission hop; replays must join this task.
         var test_afterLaneCreationClaim: (@MainActor () async -> Void)?
+        /// Parks bootstrap after route success, before its terminal no-link authority sample.
+        var test_afterBootstrapRouteValidation: (@MainActor () async -> Void)?
+        /// Signals a linked-basis creation waiting for an exact bootstrap establishment to settle.
+        var test_beforeLaneCreationBootstrapSettlement: (@MainActor () -> Void)?
+        /// Emulates scheduling delay before the independent-grant actor hop and before its returned
+        /// value is consumed. Tests retain the real authority sample; neither seam replaces it.
+        var test_beforeLaneCreationIndependentGrantSample: (@MainActor (Set<DomainAgentSessionLinkEndpointIdentity>) async -> Void)?
+        var test_afterLaneCreationIndependentGrantSample: (@MainActor (DomainAgentSessionLinkGrant?) async -> Void)?
         var test_afterLaneCapInventoryBeforeRevision: (@MainActor () async -> Void)?
+        /// Emulates scheduling delay at the final cap-admission caller authorization hop.
+        var test_beforeLaneCapCallerValidation: (@MainActor () async -> Void)?
         var test_afterAddInsertionBeforeEstablishment: (@MainActor (AgentSessionOversightIntent) async -> Void)?
+        /// Parks the exact entry owner after its mutation, before outer compensation/cap release.
+        var test_afterActivationBackedEstablishmentMutation: (@MainActor (AgentSessionOversightIntent, Bool) async -> Void)?
         /// Signals that an Add is waiting behind another complete establishment for the same
         /// semantic UUID pair. Tests use it instead of timing assumptions.
         var test_beforePairEstablishmentWait:
@@ -1900,7 +1954,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard remaining > 0 else { return false }
         var timeout: Task<Void, Never>?
         let completed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let gate = ShutdownPhaseGate(continuation)
+            let gate = TransactionSettlementGate(continuation)
             timeout = Task { @MainActor in
                 do {
                     try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
@@ -2322,7 +2376,15 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         establishmentTasks[key] = task
+        // Membership must advance the sample witness before any suspension, independently of
+        // the earlier cap admission/target assignment and the later outer compensation/defer.
+        if expectedEndpoints.laneCreationActivation != nil {
+            laneCreationCapGeneration[pair.observerSessionID, default: 0] &+= 1
+        }
         #if DEBUG
+            if expectedEndpoints.laneCreationActivation != nil {
+                await test_afterActivationBackedEstablishmentMutation?(pair, true)
+            }
             logPairLane(pair: pair, outcome: "inserted")
         #endif
         let outcome = await validateCompletedEstablishment(
@@ -2335,6 +2397,14 @@ final class AgentSessionLinkRuntimeBridge {
         )
         if establishmentTasks[key] == task {
             establishmentTasks.removeValue(forKey: key)
+            if expectedEndpoints.laneCreationActivation != nil {
+                laneCreationCapGeneration[pair.observerSessionID, default: 0] &+= 1
+            }
+            #if DEBUG
+                if expectedEndpoints.laneCreationActivation != nil {
+                    await test_afterActivationBackedEstablishmentMutation?(pair, false)
+                }
+            #endif
         }
         return outcome
     }
@@ -2537,7 +2607,15 @@ final class AgentSessionLinkRuntimeBridge {
             requiresExistingOutboundLink: requiresExistingOutboundLink,
             requiresExistingDirectLink: requiresExistingDirectLink
         )
-        return await withPairEstablishmentLane(pair) { [weak self] in
+        return await addMonitorLink(pair: pair, expectedEndpoints: expectedEndpoints, proof: proof)
+    }
+
+    private func addMonitorLink(
+        pair: AgentSessionOversightIntent,
+        expectedEndpoints: AddEndpointExpectations,
+        proof: AgentSessionOversightRestorationProof?
+    ) async -> AgentMonitorAddOutcome {
+        await withPairEstablishmentLane(pair) { [weak self] in
             guard let self else {
                 return .rejected(message: Self.unavailableMessage)
             }
@@ -2621,6 +2699,9 @@ final class AgentSessionLinkRuntimeBridge {
                 guard let observerEndpoint = expectedEndpoints.observer,
                       await authority.hasActiveLink(endpoint: observerEndpoint)
                 else { return .refused(.failed(.closing)) }
+            }
+            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return .refused(.failed(.rebinding))
             }
             guard let store else {
                 return .inserted(
@@ -2960,10 +3041,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .failure(failure):
             return .failed(failure)
         }
-        guard expectedEndpoints.matches(
-            observer: observer.domainEndpoint,
-            target: target.domainEndpoint
-        ) else {
+        guard liveCandidatesMatch(expectedEndpoints, pair: pair, candidates: [observer, target]) else {
             return .failed(.rebinding)
         }
         return nil
@@ -3117,6 +3195,11 @@ final class AgentSessionLinkRuntimeBridge {
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
                 return EstablishmentResult(outcome: .failed(.closing))
             }
+            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                await authority.abandonReservation(pending)
+                bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
+                return EstablishmentResult(outcome: .failed(.rebinding))
+            }
             guard !isRetiringEndpoint(observerEndpoint, targetEndpoint) else {
                 await authority.abandonReservation(pending)
                 bookkeepingByReference.removeValue(forKey: Self.reference(for: pending))
@@ -3166,6 +3249,9 @@ final class AgentSessionLinkRuntimeBridge {
             if let proof, !liveCandidatesStillMatch(proof) {
                 return EstablishmentResult(outcome: .failed(.rebinding))
             }
+            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
+            }
             bookkeepingByReference[reference] = ReferenceBookkeeping(
                 pair: pair,
                 token: token,
@@ -3193,6 +3279,9 @@ final class AgentSessionLinkRuntimeBridge {
                 return EstablishmentResult(
                     outcome: .failed(.closing), preservesDurableIntentOnFailure: true
                 )
+            }
+            guard expectedEndpoints.laneCreationActivation == nil || liveCandidatesStillMatch(expectedEndpoints, pair: pair) else {
+                return EstablishmentResult(outcome: .failed(.rebinding), preservesDurableIntentOnFailure: true)
             }
             return EstablishmentResult(
                 outcome: .alreadyLinked(linkID: grant.id, targetSessionID: grant.target.sessionID),
@@ -3222,14 +3311,6 @@ final class AgentSessionLinkRuntimeBridge {
             return EstablishmentResult(outcome: .failed(.closing))
         }
 
-        // Fence both endpoints synchronously before either retirement hop: the first endpoint
-        // must not re-arm while the second retires or while token/deletion/authority checks await.
-        let releaseObserverComputerUseAdmission = host.agentSessionLinkHoldComputerUseAdmission(observerEndpoint)
-        let releaseTargetComputerUseAdmission = host.agentSessionLinkHoldComputerUseAdmission(targetEndpoint)
-        defer {
-            releaseTargetComputerUseAdmission?()
-            releaseObserverComputerUseAdmission?()
-        }
         await host.agentSessionLinkWillActivate(observerEndpoint)
         await host.agentSessionLinkWillActivate(targetEndpoint)
 
@@ -3299,14 +3380,31 @@ final class AgentSessionLinkRuntimeBridge {
             initialSnapshot: seed,
             sourcePublicationSequence: seedSequence
         )
+        /// The new first-lane exception must not publish inventory for a consumed activation.
+        /// Rollback remains in this transaction owner and compensates its own fresh durable insert.
+        func settleStaleLaneActivation(_ value: DomainAgentSessionLinkActivation) async -> EstablishmentResult? {
+            guard expectedEndpoints.laneCreationActivation != nil,
+                  !liveCandidatesStillMatch(expectedEndpoints, pair: pair) else { return nil }
+            host.agentSessionLinkReleasePromptInventoryHold(hold, for: observerEndpoint, publishing: nil)
+            bookkeepingByReference.removeValue(forKey: Self.reference(for: reservation))
+            let reference = Self.reference(for: value.grant)
+            bookkeepingByReference[reference] = ReferenceBookkeeping(
+                pair: pair, token: token, assertionGeneration: assertionGeneration,
+                observerEndpoint: value.grant.observer, targetEndpoint: value.grant.target
+            )
+            await revoke(reference: reference, settlesDurableIntent: false)
+            return EstablishmentResult(outcome: .failed(.rebinding))
+        }
         let activation: DomainAgentSessionLinkActivation
         switch disposition {
         case let .activated(value):
             activation = value
+            if let refusal = await settleStaleLaneActivation(value) { return refusal }
             // The manager-owned catalog projection must become unready before active inventory is
             // published. Awaiting the existing invalidation path keeps the prompt hold across both
             // authority activation and projection application.
             await invalidateToolAdvertisement(forObserverSession: observerEndpoint.sessionID)
+            if let refusal = await settleStaleLaneActivation(value) { return refusal }
             host.agentSessionLinkReleasePromptInventoryHold(
                 hold,
                 for: observerEndpoint,
@@ -3514,6 +3612,13 @@ final class AgentSessionLinkRuntimeBridge {
             ) == nil
         else {
             return false
+        }
+        if let basis = expectations.laneCreationActivation {
+            guard host?.agentSessionLinkBootstrapState(for: observer.domainEndpoint)?.activation == basis.activation,
+                  basis.activation.endpoint == observer.domainEndpoint,
+                  basis.target == target.domainEndpoint,
+                  target.restorationReadiness == .authoritative(basis.bindingToken, .freshBindingDurablyCreated),
+                  host?.agentSessionLinkLaneProvenance(for: target.domainEndpoint) == observer.sessionID else { return false }
         }
         return expectations.matches(
             observer: observer.domainEndpoint,
@@ -7467,20 +7572,166 @@ final class AgentSessionLinkRuntimeBridge {
         laneCreationCapGeneration[creatorSessionID, default: 0] &+= 1
     }
 
-    /// Early service gate so workspace resolution cannot disclose destinations to an unlinked caller.
+    /// Memory-only catalog fact, qualified by the current eligible session object and binding.
+    func overseerBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
+        guard !isFrozenForTermination else { return nil }
+        return host?.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    func becomeOverseer(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        isEnabled: @escaping @MainActor () -> Bool,
+        revalidateRoute: @MainActor () async -> Bool,
+        commitIfCurrent: @MainActor (_ commit: () -> Bool) -> Bool
+    ) async -> AgentProviderKind? {
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
+              let initial = host.agentSessionLinkBootstrapState(for: endpoint), initial.activation == nil,
+              await !(authority.hasActiveLink(endpoint: endpoint))
+        else { return nil }
+        guard await revalidateRoute() else { return nil }
+        #if DEBUG
+            await test_afterBootstrapRouteValidation?()
+        #endif
+        // Bootstrap may linearize at this no-link sample while the route proof is valid. A grant
+        // committed after the sample is an independently ordered inbound/outbound relationship;
+        // activation plus inbound is supported. This is not physical cross-actor atomicity.
+        guard await !(authority.hasActiveLink(endpoint: endpoint)) else { return nil }
+        guard commitIfCurrent({
+            guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
+                  host.agentSessionLinkBootstrapState(for: endpoint) == initial
+            else { return false }
+            return host.agentSessionLinkActivateOverseer(for: endpoint, expected: initial)
+        }) else { return nil }
+        await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+        return initial.provider
+    }
+
+    private func laneCreationCallerIsCurrent(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        basis: LaneCreationCallerBasis
+    ) async -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, host != nil else { return false }
+        if case .linked = basis {
+            guard await authority.hasActiveLink(endpoint: endpoint) else { return false }
+        }
+        return laneCreationCallerEndpointIsCurrent(endpoint, basis: basis)
+    }
+
+    /// Synchronous incarnation/eligibility fence after the last authority suspension.
+    private func laneCreationCallerEndpointIsCurrent(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        basis: LaneCreationCallerBasis
+    ) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, let host else { return false }
+        if case let .activated(activation) = basis {
+            guard host.agentSessionLinkBootstrapState(for: endpoint)?.activation == activation else { return false }
+        }
+        guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return false }
+        return AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) == nil
+    }
+
+    private func laneCreationCallerBasis(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> LaneCreationCallerBasis {
+        if let activation = host?.agentSessionLinkBootstrapState(for: endpoint)?.activation { return .activated(activation) }
+        return .linked
+    }
+
+    /// An activation-backed establishment exposes its indexed grant before final validation. A caller
+    /// without its own activation must not promote that provisional grant into an unrelated linked
+    /// creation. An independently indexed exact grant bypasses the wait. Otherwise wait for the
+    /// existing pair owner (including validation and compensation), not just the inner authority
+    /// task. These are exact-endpoint dependencies, never a creator-wide lock.
+    /// Called only before allocating this creation's target, so it cannot wait on itself or a child.
+    private func settledLaneCreationCallerBasis(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        initialBasis: LaneCreationCallerBasis
+    ) async -> LaneCreationCallerBasis? {
+        if case .activated = initialBasis { return initialBasis }
+        // Match the existing cap-admission stability budget. Churn cannot keep this gate retrying
+        // forever, and the generation survives removal of the last reservation/task entry.
+        for _ in 0 ..< 32 {
+            guard !isFrozenForTermination, !Task.isCancelled else { return nil }
+            let generation = laneCreationCapGeneration[endpoint.sessionID, default: 0]
+            let basis = laneCreationCallerBasis(for: endpoint)
+            if case .activated = basis { return basis }
+            let pending = laneCreationBootstrapEstablishments(for: endpoint)
+            guard !pending.isEmpty else { return basis }
+            #if DEBUG
+                await test_beforeLaneCreationIndependentGrantSample?(Set(pending.compactMap(\.expectedEndpoints.target)))
+            #endif
+            let independent = await authority.activeDirectGrant(
+                endpoint: endpoint,
+                excludingOutboundTargets: Set(pending.compactMap(\.expectedEndpoints.target))
+            )
+            #if DEBUG
+                await test_afterLaneCreationIndependentGrantSample?(independent)
+            #endif
+            guard !isFrozenForTermination, !Task.isCancelled else { return nil }
+            // A provisional generation may have entered and fully rolled back during the actor
+            // hop. Its absence from today's task table is not proof of independent authority.
+            guard generation == laneCreationCapGeneration[endpoint.sessionID, default: 0] else { continue }
+            let current = laneCreationBootstrapEstablishments(for: endpoint)
+            if let independent,
+               independent.target == endpoint || !current.contains(where: { $0.expectedEndpoints.target == independent.target })
+            {
+                return laneCreationCallerBasis(for: endpoint)
+            }
+            let pairs = Set(current.map(\.pair))
+            let owners = pairs.compactMap { pairEstablishmentBarriers[$0]?.task }
+            guard owners.count == pairs.count else { return nil }
+            guard !owners.isEmpty else { return laneCreationCallerBasis(for: endpoint) }
+            #if DEBUG
+                test_beforeLaneCreationBootstrapSettlement?()
+            #endif
+            guard await awaitLaneCreationBootstrapSettlement(owners) else { return nil }
+            // A new exact bootstrap establishment may have entered while the previous owner settled.
+            // Re-read only the bounded in-flight task table; no host census or catalog mutation.
+        }
+        return nil
+    }
+
+    /// Cancellation abandons only this wait, never the independently owned first-lane transaction.
+    /// As with shutdown settlement, the losing completion branch has no side effects after release.
+    private func awaitLaneCreationBootstrapSettlement(_ owners: [Task<Void, Never>]) async -> Bool {
+        let gate = TransactionSettlementGate()
+        Task { @MainActor in
+            for owner in owners {
+                await owner.value
+            }
+            gate.finish(true)
+        }
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { gate.finish(false) }
+            return await gate.wait()
+        } onCancel: {
+            Task { @MainActor in gate.finish(false) }
+        }
+    }
+
+    private func laneCreationBootstrapEstablishments(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> [EstablishmentKey] {
+        establishmentTasks.keys.filter {
+            $0.expectedEndpoints.observer == endpoint && $0.expectedEndpoints.laneCreationActivation != nil
+        }
+    }
+
+    /// Early service gate so workspace resolution cannot disclose destinations to an unauthorized caller.
     func laneCreationCallerPreflight(
-        _ endpoint: DomainAgentSessionLinkEndpointIdentity
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        idempotencyKey: String? = nil
     ) async -> AgentSessionLaneCreateReceipt.Reason? {
         guard !isFrozenForTermination else { return .shuttingDown }
-        guard let candidate = host?.agentSessionLinkCandidates().first(where: {
-            $0.domainEndpoint == endpoint
-        }),
-            AgentSessionLinkEndpointEligibility.addDisabledReason(
-                candidate.eligibilityInput,
-                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-            ) == nil
-        else { return .denied }
-        return await authority.hasActiveLink(endpoint: endpoint) ? nil : .denied
+        // This exact endpoint already owns the claim. The normal parser/digest check and createLane
+        // join remain authoritative; a replay cannot start a new transaction or resolve a new basis.
+        if let idempotencyKey,
+           laneCreationTasks[LaneCreationKey(endpoint: endpoint, idempotencyKey: idempotencyKey)] != nil
+        { return nil }
+        guard let basis = await settledLaneCreationCallerBasis(
+            for: endpoint, initialBasis: laneCreationCallerBasis(for: endpoint)
+        ) else { return .denied }
+        return await laneCreationCallerIsCurrent(endpoint, basis: basis) ? nil : .denied
     }
 
     func createLane(
@@ -7520,6 +7771,7 @@ final class AgentSessionLinkRuntimeBridge {
         // The claim is MainActor-local and happens before the first suspension. Replays join this
         // exact task even while authorization, persistence, or destination discovery is suspended.
         let claimID = UUID()
+        let callerBasis = laneCreationCallerBasis(for: observerEndpoint)
         let task = Task { @MainActor [weak self] in
             guard let self else { return AgentSessionLaneCreateReceipt.refused(.denied) }
             #if DEBUG
@@ -7527,8 +7779,14 @@ final class AgentSessionLinkRuntimeBridge {
             #endif
             let transaction = registerTransaction()
             defer { finishTransaction(transaction) }
+            guard let settledBasis = await settledLaneCreationCallerBasis(
+                for: observerEndpoint, initialBasis: callerBasis
+            ) else {
+                return .refused(isFrozenForTermination || Task.isCancelled ? .shuttingDown : .denied)
+            }
             return await performClaimedLaneCreation(
                 observerEndpoint: observerEndpoint,
+                callerBasis: settledBasis,
                 request: request,
                 resolveDestination: resolveDestination
             )
@@ -7550,24 +7808,18 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func performClaimedLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        callerBasis: LaneCreationCallerBasis,
         request: AgentSessionLaneCreateRequest,
         resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard let host,
-              let observer = host.agentSessionLinkCandidates().first(where: {
-                  $0.domainEndpoint == observerEndpoint
-              }),
-              AgentSessionLinkEndpointEligibility.addDisabledReason(
-                  observer.eligibilityInput,
-                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-              ) == nil,
-              await authority.hasActiveLink(endpoint: observerEndpoint)
+        guard let host, await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis)
         else { return .refused(.denied) }
         guard case .available = await intentPersistenceAdmission() else {
             return .refused(.persistenceUnavailable)
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
         guard let destination = resolveDestination()
         else { return .refused(.destinationUnavailable) }
         let selection: AgentSessionLanePolicy.RoleSelection
@@ -7587,9 +7839,10 @@ final class AgentSessionLinkRuntimeBridge {
                 )
             }
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
-        guard await authority.hasActiveLink(endpoint: observerEndpoint) else { return .refused(.denied) }
-        // No suspension between this count and the reservation: admission is creator-scoped and
-        // counts both active lanes and the pending allocations that have not linked yet.
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
+        // Admission is creator-scoped and counts active lanes plus pending allocations. The final
+        // authorization must be inside the stability fence: it can suspend while a competing
+        // reservation becomes a linked lane and is released.
         let creatorID = observerEndpoint.sessionID
         var linkedIDs: Set<UUID>
         var stabilityAttempts = 0
@@ -7602,8 +7855,14 @@ final class AgentSessionLinkRuntimeBridge {
             #if DEBUG
                 await test_afterLaneCapInventoryBeforeRevision?()
             #endif
+            #if DEBUG
+                await test_beforeLaneCapCallerValidation?()
+            #endif
+            guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
             let currentRevision = await authority.snapshot().authorityRevision
             guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
+            guard laneCreationCallerEndpointIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
             if generation == laneCreationCapGeneration[creatorID, default: 0],
                snapshot.revision == currentRevision
             {
@@ -7611,10 +7870,8 @@ final class AgentSessionLinkRuntimeBridge {
                 break
             }
         }
+        // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
-        guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
-        guard host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
-        else { return .refused(.denied) }
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
         guard admittedCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
@@ -7628,7 +7885,7 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         return await performLaneCreation(
-            observerEndpoint: observerEndpoint, request: request, selection: selection,
+            observerEndpoint: observerEndpoint, callerBasis: callerBasis, request: request, selection: selection,
             destinationWindowID: destination.windowID, workspaceID: destination.workspaceID,
             workspaceName: destination.workspaceName, reservationTicket: ticket
         )
@@ -7636,6 +7893,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func performLaneCreation(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        callerBasis: LaneCreationCallerBasis,
         request: AgentSessionLaneCreateRequest,
         selection: AgentSessionLanePolicy.RoleSelection,
         destinationWindowID: Int,
@@ -7646,13 +7904,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
             return .refused(.shuttingDown)
         }
-        guard host.agentSessionLinkCandidates().contains(where: {
-            $0.domainEndpoint == observerEndpoint
-                && AgentSessionLinkEndpointEligibility.addDisabledReason(
-                    $0.eligibilityInput,
-                    roleAllowsOutboundMonitoring: $0.roleAllowsOutboundMonitoring
-                ) == nil
-        }), await authority.hasActiveLink(endpoint: observerEndpoint) else {
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else {
             return .refused(.denied)
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
@@ -7712,6 +7964,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, !Task.isCancelled else {
             return await receipt(false, .shuttingDown)
         }
+        guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return await receipt(false, .denied) }
         let matches = host.agentSessionLinkCandidates().filter { $0.sessionID == sessionID }
         guard matches.count == 1, matches[0].tabID == tabID,
               let bindingToken,
@@ -7728,13 +7981,21 @@ final class AgentSessionLinkRuntimeBridge {
                 observer: observer, target: matches[0], requireObserverAuthoritative: false
             )
         else { return await receipt(false, .addFailed) }
+        let activationBasis: LaneCreationActivationBasis? = switch callerBasis {
+        case .linked: nil
+        case let .activated(activation):
+            LaneCreationActivationBasis(activation: activation, target: laneEndpoint, bindingToken: bindingToken)
+        }
         let add = await addMonitorLink(
             pair: AgentSessionOversightIntent(
                 observerSessionID: observerEndpoint.sessionID, targetSessionID: sessionID
             ),
-            expectedObserverEndpoint: observerEndpoint,
-            expectedTargetEndpoint: laneEndpoint,
-            requiresExistingDirectLink: true,
+            expectedEndpoints: AddEndpointExpectations(
+                observer: observerEndpoint,
+                target: laneEndpoint,
+                requiresExistingDirectLink: activationBasis == nil,
+                laneCreationActivation: activationBasis
+            ),
             proof: proof
         )
         switch add {

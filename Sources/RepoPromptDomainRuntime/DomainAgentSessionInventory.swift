@@ -244,16 +244,17 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         edgesBySession = bySession
     }
 
-    /// The view a scope may see: only `visibleSessionIDs`' records, and only edges whose every
-    /// endpoint is visible or truly missing (deleted, on a complete scan). Edges to existing sessions
-    /// outside the scope are dropped entirely, so counts, roles, and orphan reasons derived from the
-    /// view never reflect, count, or name an out-of-scope session.
+    /// The view a scope may see: only `visibleSessionIDs`' records, and only edges with at least one
+    /// visible endpoint whose other endpoint is visible or truly missing (deleted, on a complete scan).
+    /// Edges to existing sessions outside the scope, and edges between two missing sessions (which
+    /// belong to no visible session), are dropped entirely, so counts, roles, and orphan reasons
+    /// derived from the view never reflect, count, or name a session the scope cannot see.
     package func restricted(to visibleSessionIDs: Set<UUID>) -> Self {
         let visibleRecords = records.filter { visibleSessionIDs.contains($0.key) }
         let visibleEdges = edges.filter { edge in
-            [edge.observerSessionID, edge.targetSessionID].allSatisfy { id in
-                visibleRecords[id] != nil || isMissing(id)
-            }
+            let endpoints = [edge.observerSessionID, edge.targetSessionID]
+            return endpoints.contains { visibleRecords[$0] != nil }
+                && endpoints.allSatisfy { visibleRecords[$0] != nil || isMissing($0) }
         }
         return Self(
             records: visibleRecords,

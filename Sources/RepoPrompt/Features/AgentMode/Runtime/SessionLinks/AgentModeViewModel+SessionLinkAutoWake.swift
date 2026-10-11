@@ -243,6 +243,8 @@ extension AgentModeViewModel {
     ) {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint) else { return }
 
+        agentSelfCompactSettleStaleParkedNote(session)
+
         // The explicit snooze cleanup boundary, ahead of every read of the map: due records are
         // removed, references this snapshot no longer carries are pruned, and the one nearest-deadline
         // task is re-armed. This publication *is* the reevaluation the cleanup owes, so nothing here
@@ -545,11 +547,12 @@ extension AgentModeViewModel {
                 return
             }
 
+            agentSelfCompactSettleStaleParkedNote(session)
             if attempt.isPeriodic {
                 await agentSessionLinkRunPeriodicAttempt(attempt, session: session)
                 return
             }
-            guard let route = agentSessionLinkAutoWakeRoute(session) else {
+            guard let route = agentSessionLinkAutoWakeRoute(session, refusalPhase: attempt.phase) else {
                 // A manual reservation is a one-shot answer to "can this run right now?", which the
                 // entry point already answered. If the observer stopped being dispatchable before
                 // preparation, release it rather than parking it: the user would otherwise get a
@@ -1827,14 +1830,22 @@ extension AgentModeViewModel {
     /// drift. A pending approval, question, input request, permission prompt, or review is never a
     /// route: answering one is a different capability than delivering an update, and lane data is
     /// never an interaction response.
-    private func agentSessionLinkAutoWakeRoute(_ session: TabSession) -> AutoWakeRoute? {
-        guard agentSessionLinkAutoWakeIsUnblocked(session) else { return nil }
+    private func agentSessionLinkAutoWakeRoute(
+        _ session: TabSession,
+        refusalPhase: AgentSessionLinkAutoWakeAttempt.Phase? = nil
+    ) -> AutoWakeRoute? {
+        if let predicate = agentSessionLinkAutoWakeRouteRefusal(session) {
+            if let refusalPhase {
+                // Closed predicate vocabulary and the existing phase only: no endpoint or content.
+                AgentSessionLinkAutoWakeDiagnostics.routeRefused(predicate: predicate, phase: refusalPhase)
+            }
+            return nil
+        }
         // `waitingPrompt`/`instructionContinuation` is ordinary "what next?" state, which the shared
         // blocker set above has already proven carries no interaction of its own.
         if session.instructionContinuation != nil, session.runState == .waitingForUser {
             return .waitingContinuation
         }
-        guard !session.runState.isActive, session.runState != .waitingForUser else { return nil }
         return .idleFollowUp
     }
 
@@ -1843,26 +1854,33 @@ extension AgentModeViewModel {
     /// Reused rather than restated so a blocker can never be enforced for one caller and forgotten
     /// for the other. `pendingOversightAutoWake` is excluded because *this* attempt is it, and the
     /// waiting-prompt pair is excluded because it is a route rather than a blocker.
-    private func agentSessionLinkAutoWakeIsUnblocked(_ session: TabSession) -> Bool {
-        session.hasLoadedPersistedState
-            && !session.bindingTransitionInProgress
-            && !session.terminalCommitInProgress
-            && !session.mcpFollowUpRunPending
-            && !agentSelfCompactBlocksNotificationWake(session)
-            && !session.isComposerSubmissionInFlight
-            && !session.isPreparingInitialWorktree
-            && !session.isChangingExecutionLocation
-            && session.pendingInstructions.isEmpty
-            && session.pendingACPSteeringInstructions.isEmpty
-            && session.pendingClaudeSteeringInstructions.isEmpty
-            && !session.isSettlingACPBackgroundCompaction
-            && session.pendingAskUser == nil
-            && session.pendingUserInputRequest == nil
-            && session.pendingApproval == nil
-            && session.pendingPermissionsRequest == nil
-            && session.pendingMCPElicitationRequest == nil
-            && session.pendingApplyEditsReview == nil
-            && session.pendingWorktreeMergeReview == nil
+    private typealias AutoWakeRouteRefusal = AgentSessionLinkAutoWakeDiagnostics.GatePredicate
+
+    /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
+    private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
+        guard session.hasLoadedPersistedState else { return .hasLoadedPersistedState }
+        guard !session.bindingTransitionInProgress else { return .bindingTransitionInProgress }
+        guard !session.terminalCommitInProgress else { return .terminalCommitInProgress }
+        guard !session.mcpFollowUpRunPending else { return .mcpFollowUpRunPending }
+        guard !agentSelfCompactBlocksNotificationWake(session) else { return .selfCompactBlocksNotificationWake }
+        guard !session.isComposerSubmissionInFlight else { return .isComposerSubmissionInFlight }
+        guard !session.isPreparingInitialWorktree else { return .isPreparingInitialWorktree }
+        guard !session.isChangingExecutionLocation else { return .isChangingExecutionLocation }
+        guard session.pendingInstructions.isEmpty else { return .pendingInstructions }
+        guard session.pendingACPSteeringInstructions.isEmpty else { return .pendingACPSteeringInstructions }
+        guard session.pendingClaudeSteeringInstructions.isEmpty else { return .pendingClaudeSteeringInstructions }
+        guard !session.isSettlingACPBackgroundCompaction else { return .isSettlingACPBackgroundCompaction }
+        guard session.pendingAskUser == nil else { return .pendingAskUser }
+        guard session.pendingUserInputRequest == nil else { return .pendingUserInputRequest }
+        guard session.pendingApproval == nil else { return .pendingApproval }
+        guard session.pendingPermissionsRequest == nil else { return .pendingPermissionsRequest }
+        guard session.pendingMCPElicitationRequest == nil else { return .pendingMCPElicitationRequest }
+        guard session.pendingApplyEditsReview == nil else { return .pendingApplyEditsReview }
+        guard session.pendingWorktreeMergeReview == nil else { return .pendingWorktreeMergeReview }
+        if session.instructionContinuation != nil, session.runState == .waitingForUser { return nil }
+        guard !session.runState.isActive else { return .runStateIsActive }
+        guard session.runState != .waitingForUser else { return .waitingForUserWithoutContinuation }
+        return nil
     }
 
     /// All exact lanes carried by this authoritative queue publication, regardless of routine

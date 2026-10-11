@@ -61,6 +61,138 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertEqual(previous["visual_color_hex"]?.stringValue, "#7C3AED")
     }
 
+    // MARK: - List pagination (#1091)
+
+    func testListPaginationWalksSixHundredWorktreesExactlyOnce() {
+        let total = 600
+        var visited: [Int] = []
+        var offset: Int?
+        var pageCount = 0
+        repeat {
+            let page = MCPWorktreeListPagination.page(totalCount: total, limit: nil, offset: offset)
+            XCTAssertLessThanOrEqual(page.range.count, MCPWorktreeListPagination.defaultLimit)
+            XCTAssertEqual(page.totalCount, total)
+            visited.append(contentsOf: page.range)
+            offset = page.nextOffset
+            XCTAssertEqual(page.hasMore, page.nextOffset != nil)
+            pageCount += 1
+        } while offset != nil && pageCount < 100
+
+        XCTAssertEqual(pageCount, 6)
+        XCTAssertEqual(visited, Array(0 ..< total))
+    }
+
+    func testListPaginationClampsLimitAndOffset() {
+        let minimum = MCPWorktreeListPagination.page(totalCount: 600, limit: 0, offset: -5)
+        XCTAssertEqual(minimum.range, 0 ..< 1)
+        XCTAssertEqual(minimum.nextOffset, 1)
+
+        let maximum = MCPWorktreeListPagination.page(totalCount: 600, limit: 10000, offset: 550)
+        XCTAssertEqual(maximum.limit, MCPWorktreeListPagination.maxLimit)
+        XCTAssertEqual(maximum.range, 550 ..< 600)
+        XCTAssertFalse(maximum.hasMore)
+        XCTAssertNil(maximum.nextOffset)
+
+        let pastEnd = MCPWorktreeListPagination.page(totalCount: 600, limit: nil, offset: 650)
+        XCTAssertTrue(pastEnd.range.isEmpty)
+        XCTAssertFalse(pastEnd.hasMore)
+
+        let small = MCPWorktreeListPagination.page(totalCount: 3, limit: nil, offset: nil)
+        XCTAssertEqual(small.range, 0 ..< 3)
+        XCTAssertNil(small.nextOffset)
+    }
+
+    func testListAcceptsPaginationArgumentsOnlyForList() {
+        let listKeys = MCPWorktreeToolProvider.validArgumentKeys(for: .list)
+        XCTAssertTrue(listKeys.isSuperset(of: ["limit", "offset"]))
+        XCTAssertFalse(MCPWorktreeToolProvider.validArgumentKeys(for: .show).contains("limit"))
+        XCTAssertFalse(MCPWorktreeToolProvider.validArgumentKeys(for: .show).contains("offset"))
+    }
+
+    func testCanonicalManageWorktreeSchemaAdvertisesListPagination() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.manageWorktree))
+        let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        XCTAssertEqual(properties["limit"]?.objectValue?["type"], .string("integer"))
+        XCTAssertEqual(properties["offset"]?.objectValue?["type"], .string("integer"))
+        XCTAssertTrue(definition.description.contains(MCPWorktreeListPagination.outputDescriptionLine))
+    }
+
+    func testPagedListReplyEncodesPaginationFieldsAndStaysBounded() throws {
+        let total = 600
+        let allDTOs = (0 ..< total).map { Self.worktreeDTO(index: $0) }
+        let page = MCPWorktreeListPagination.page(totalCount: total, limit: nil, offset: nil)
+        let paged = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            worktrees: Array(allDTOs[page.range]),
+            totalCount: page.totalCount,
+            truncated: page.hasMore ? true : nil,
+            nextOffset: page.nextOffset
+        )
+        let unpaged = ToolResultDTOs.ManageWorktreeReplyDTO(op: "list", worktrees: allDTOs)
+
+        let object = try XCTUnwrap(Self.value(paged).objectValue)
+        XCTAssertEqual(object["worktrees"]?.arrayValue?.count, MCPWorktreeListPagination.defaultLimit)
+        XCTAssertEqual(object["total_count"]?.intValue, total)
+        XCTAssertEqual(object["truncated"]?.boolValue, true)
+        XCTAssertEqual(object["next_offset"]?.intValue, MCPWorktreeListPagination.defaultLimit)
+        XCTAssertNil(object["totalCount"])
+        XCTAssertNil(object["nextOffset"])
+
+        let pagedBytes = try JSONEncoder().encode(paged).count
+        let unpagedBytes = try JSONEncoder().encode(unpaged).count
+        XCTAssertLessThan(pagedBytes * 5, unpagedBytes)
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(paged)))
+        XCTAssertTrue(text.contains("### Worktrees (\(MCPWorktreeListPagination.defaultLimit) of \(total))"))
+    }
+
+    func testUnpagedListReplyOmitsContinuationFields() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            worktrees: [Self.worktreeDTO()],
+            totalCount: 1
+        )
+
+        let object = try XCTUnwrap(Self.value(dto).objectValue)
+        XCTAssertEqual(object["total_count"]?.intValue, 1)
+        XCTAssertNil(object["truncated"])
+        XCTAssertNil(object["next_offset"])
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(dto)))
+        XCTAssertTrue(text.contains("### Worktrees (1)"))
+    }
+
+    private static func worktreeDTO(index: Int) -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
+        .init(
+            worktreeID: "wt_\(index)",
+            specifier: "@id:wt_\(index)",
+            path: "/tmp/repo-worktrees/wt-\(index)",
+            gitDir: "/tmp/repo/.git/worktrees/wt-\(index)",
+            name: "wt-\(index)",
+            branch: "feature/wt-\(index)",
+            head: "abcdef0",
+            isMain: index == 0,
+            isCurrent: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil,
+            visual: nil,
+            status: nil
+        )
+    }
+
+    private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
+        let first = try XCTUnwrap(blocks.first)
+        guard case let .text(text, _, _) = first else {
+            XCTFail("Expected text content")
+            return ""
+        }
+        return text
+    }
+
     private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
         .init(
             worktreeID: "wt_123",
@@ -106,6 +238,180 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(dto)
         return try JSONDecoder().decode(Value.self, from: data)
+    }
+}
+
+/// Execution-time authority for `manage_worktree` binding mutations that name a session explicitly.
+///
+/// A full session UUID plus same-window routing must not let an Agent run redirect an unrelated
+/// session's execution checkout. External MCP clients keep their existing administrative access.
+@MainActor
+final class ManageWorktreeSessionAuthorityTests: XCTestCase {
+    private let callerSessionID = UUID()
+    private let targetSessionID = UUID()
+
+    private final class Probe {
+        var provenanceLookups: [UUID] = []
+        var grantChecks: [UUID] = []
+    }
+
+    func testAdministrativePrincipalKeepsExistingExternalAccess() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(window: window, runPurpose: nil, caller: nil, probe: probe)
+        }
+        XCTAssertTrue(probe.provenanceLookups.isEmpty, "external clients are not re-classified by provenance")
+        XCTAssertTrue(probe.grantChecks.isEmpty, "external clients never need an oversight grant")
+    }
+
+    func testAgentSessionMayRebindItsOwnSession() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(window: window, caller: self.targetSessionID, probe: probe)
+        }
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    func testSpawnParentMayRebindItsDirectChild() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(
+                window: window, caller: self.callerSessionID, targetParent: self.callerSessionID, probe: probe
+            )
+        }
+        XCTAssertEqual(probe.provenanceLookups, [targetSessionID])
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    func testManageGrantedOverseerMayRebindTarget() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            try await self.authorize(
+                window: window,
+                caller: self.callerSessionID,
+                observer: self.endpoint(sessionID: self.callerSessionID),
+                managedTargets: [self.targetSessionID],
+                probe: probe
+            )
+        }
+        XCTAssertEqual(probe.grantChecks, [targetSessionID])
+    }
+
+    func testUnrelatedAgentSessionIsDeniedWithUniformNotFound() async throws {
+        try await withWindow { window in
+            // Linked without management (or not linked at all), and not the spawn parent.
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: self.callerSessionID,
+                    targetParent: UUID(),
+                    observer: self.endpoint(sessionID: self.callerSessionID)
+                )
+            }
+        }
+    }
+
+    func testObserverEndpointForAnotherSessionDoesNotCarryItsGrant() async throws {
+        try await withWindow { window in
+            let otherObserver = self.endpoint(sessionID: UUID())
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: self.callerSessionID,
+                    observer: otherObserver,
+                    managedTargets: [self.targetSessionID]
+                )
+            }
+        }
+    }
+
+    func testUnresolvedAgentRunFailsClosedBeforeConsultingProvenanceOrGrants() async throws {
+        let probe = Probe()
+        try await withWindow { window in
+            await self.assertUniformDenial {
+                try await self.authorize(
+                    window: window,
+                    caller: nil,
+                    targetParent: nil,
+                    observer: self.endpoint(sessionID: self.callerSessionID),
+                    managedTargets: [self.targetSessionID],
+                    probe: probe
+                )
+            }
+        }
+        XCTAssertTrue(probe.provenanceLookups.isEmpty)
+        XCTAssertTrue(probe.grantChecks.isEmpty)
+    }
+
+    private func authorize(
+        window: WindowState,
+        runPurpose: MCPRunPurpose? = .agentModeRun,
+        caller: UUID?,
+        targetParent: UUID? = nil,
+        observer: DomainAgentSessionLinkEndpointIdentity? = nil,
+        managedTargets: Set<UUID> = [],
+        probe: Probe = Probe()
+    ) async throws {
+        try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+            targetSessionID: targetSessionID,
+            metadata: MCPRequestMetadata(
+                connectionID: nil,
+                clientName: "manage-worktree-authority-tests",
+                windowID: window.windowID,
+                runPurpose: runPurpose
+            ),
+            targetWindow: window,
+            resolveSpawnParentSessionID: { _, _ in caller },
+            resolveObserverEndpoint: { _, _ in observer },
+            resolveTargetProvenance: { sessionID in
+                probe.provenanceLookups.append(sessionID)
+                return .known(targetSessionID: sessionID, parentSessionID: targetParent)
+            },
+            hasManageGrant: { endpoint, sessionID in
+                probe.grantChecks.append(sessionID)
+                return endpoint == observer && managedTargets.contains(sessionID)
+            }
+        )
+    }
+
+    private func endpoint(sessionID: UUID) -> DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: sessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+    }
+
+    private func assertUniformDenial(
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            XCTFail("Expected a worktree binding authorization denial", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                "\(error)",
+                "\(AgentSessionTargetOperationGuard.denialError(sessionID: targetSessionID))",
+                "Denial must be indistinguishable from a missing session",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    private func withWindow(_ body: (WindowState) async throws -> Void) async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        try await body(window)
     }
 }
 
@@ -276,6 +582,33 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             }
         }
 
+        func testAgentRunWithoutAuthorityCannotBindAnExplicitSession() async throws {
+            try await withProvider { fixture in
+                do {
+                    _ = try await fixture.call(["op": .string("bind")], runPurpose: .agentModeRun)
+                    XCTFail("An Agent run without authority over the session must not rebind it")
+                } catch {
+                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                }
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+            }
+        }
+
+        func testAgentRunWithoutAuthorityCannotUnbindAnExplicitSession() async throws {
+            try await withProvider { fixture in
+                _ = try await fixture.call(["op": .string("bind")])
+                let original = fixture.session.worktreeBindings
+                XCTAssertFalse(original.isEmpty)
+                do {
+                    _ = try await fixture.call(["op": .string("unbind")], includeWorktree: false, runPurpose: .agentModeRun)
+                    XCTFail("An Agent run without authority over the session must not unbind it")
+                } catch {
+                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                }
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+            }
+        }
+
         func testRequiredSaveFailureSettlesIndeterminateWithBindingActuallyChanged() async throws {
             try await withProvider { fixture in
                 struct SaveFailure: Error {}
@@ -298,9 +631,82 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             }
         }
 
+        // MARK: - List paging through the provider boundary (#1091)
+
+        func testListPagesNonPrunableWorktreesThroughProvider() async throws {
+            try await withProvider { fixture in
+                let extras = try fixture.addWorktrees(["page-a", "page-b", "page-c"])
+                let gone = try XCTUnwrap(fixture.addWorktrees(["page-gone"]).first)
+                try FileManager.default.removeItem(at: gone)
+                let expected = Set(([fixture.logical, fixture.physical] + extras).map(Self.canonicalPath))
+
+                var seen: [String] = []
+                var offset = 0
+                var pages = 0
+                while pages < 10 {
+                    let value = try await fixture.listCall(["limit": .int(2), "offset": .int(offset)])
+                    let reply = try XCTUnwrap(value.objectValue)
+                    pages += 1
+                    XCTAssertEqual(reply["total_count"]?.intValue, expected.count)
+                    XCTAssertTrue(reply["warning"]?.stringValue?.contains("Omitted 1 stale (prunable)") == true)
+                    let worktrees = try XCTUnwrap(reply["worktrees"]?.arrayValue)
+                    XCTAssertLessThanOrEqual(worktrees.count, 2)
+                    seen += worktrees.compactMap { $0.objectValue?["path"]?.stringValue }.map {
+                        Self.canonicalPath(URL(fileURLWithPath: $0))
+                    }
+                    guard let next = reply["next_offset"]?.intValue else {
+                        XCTAssertNil(reply["truncated"])
+                        break
+                    }
+                    XCTAssertEqual(reply["truncated"]?.boolValue, true)
+                    XCTAssertEqual(next, offset + worktrees.count)
+                    offset = next
+                }
+
+                XCTAssertEqual(pages, 3)
+                XCTAssertEqual(seen.count, expected.count, "pages must not duplicate worktrees")
+                XCTAssertEqual(Set(seen), expected)
+                XCTAssertFalse(seen.contains(Self.canonicalPath(gone)))
+            }
+        }
+
+        func testPersistVisualsListOnlyPersistsReturnedPage() async throws {
+            try await withProvider { fixture in
+                let extras = try fixture.addWorktrees(["visual-a", "visual-b"])
+                let roots = [fixture.logical, fixture.physical] + extras
+                let identities = try roots.map { try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: $0)) }
+                @MainActor func persisted(_ identity: GitWorktreeIdentitySnapshot) -> Bool {
+                    GlobalSettingsStore.shared.worktreeVisualIdentity(
+                        repositoryID: identity.repository.repositoryID, worktreeID: identity.worktreeID
+                    ) != nil
+                }
+                XCTAssertFalse(identities.contains { persisted($0) })
+
+                let value = try await fixture.listCall([
+                    "limit": .int(1), "offset": .int(1), "persist_visuals": .bool(true)
+                ])
+                let reply = try XCTUnwrap(value.objectValue)
+                let page = try XCTUnwrap(reply["worktrees"]?.arrayValue)
+                XCTAssertEqual(page.count, 1)
+                let pageID = try XCTUnwrap(page.first?.objectValue?["worktree_id"]?.stringValue)
+
+                for identity in identities {
+                    XCTAssertEqual(
+                        persisted(identity), identity.worktreeID == pageID,
+                        "only the returned page may persist visuals: \(identity.worktreeID)"
+                    )
+                }
+            }
+        }
+
+        private static func canonicalPath(_ url: URL) -> String {
+            url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+
         @MainActor
         private struct Fixture {
             let driver: ContextBuilderMultiRootDiscoveryDriver
+            let git: ReviewGitRepositoryFixture
             let logical: URL
             let physical: URL
             let identity: GitWorktreeIdentitySnapshot
@@ -309,13 +715,19 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             let binding: MCPDomainToolBinding
             let security: DomainToolInvocationSecurityContext
 
-            func call(_ extra: [String: Value], includeWorktree: Bool = true, projectSession: Bool = false) async throws -> Value {
+            func call(
+                _ extra: [String: Value],
+                includeWorktree: Bool = true,
+                projectSession: Bool = false,
+                runPurpose: MCPRunPurpose? = nil
+            ) async throws -> Value {
                 var args = extra
                 args["repo_root"] = .string(logical.path)
                 args["session_id"] = .string(sessionID.uuidString)
                 if includeWorktree { args["worktree"] = .string(physical.path) }
                 let metadata = MCPRequestMetadata(
                     connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    runPurpose: runPurpose,
                     tabContextHint: projectSession ? MCPTabContextHint(
                         tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID
                     ) : nil
@@ -330,6 +742,35 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                 )
                 return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {
                     try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                }
+            }
+
+            /// `list` rejects the binding-only `session_id`/`worktree` arguments `call` injects.
+            func listCall(_ extra: [String: Value]) async throws -> Value {
+                var args = extra
+                args["op"] = .string("list")
+                args["repo_root"] = .string(logical.path)
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID, tabContextHint: nil
+                )
+                let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_worktree", metadata: metadata)
+                let requestSecurity = DomainToolInvocationSecurityContext(
+                    principal: security.principal,
+                    connectionID: security.connectionID, connectionGeneration: security.connectionGeneration,
+                    invocationID: UUID(), runtimeID: security.runtimeID, runtimeGeneration: security.runtimeGeneration,
+                    authorizedCanonicalRoots: security.authorizedCanonicalRoots,
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["manage_worktree"]
+                )
+                return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {
+                    try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                }
+            }
+
+            func addWorktrees(_ names: [String]) throws -> [URL] {
+                try names.map { name in
+                    let url = git.sandbox.appendingPathComponent(name)
+                    _ = try git.runGit(["worktree", "add", "--detach", url.path, "HEAD"], at: logical)
+                    return url
                 }
             }
         }
@@ -373,6 +814,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
                 )
                 try await body(Fixture(
                     driver: driver,
+                    git: git,
                     logical: logical,
                     physical: physical,
                     identity: identity,

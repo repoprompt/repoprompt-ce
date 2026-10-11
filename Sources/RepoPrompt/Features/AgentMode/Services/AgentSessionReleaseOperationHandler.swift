@@ -86,6 +86,10 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
         var items: [AgentSessionAdminItemResult] = []
         var released: Set<UUID> = []
         var totalUnlinked = 0
+        // Any durable side effect (a stop, an unlink, an archive), even on an item that ends `failed`
+        // or `skipped`. The reply then reports `committed_changes`, so the call's receipt is recorded
+        // for idempotent replay and a same-key retry never re-runs work that already took effect.
+        var committed = false
         let retiring = batch.request.operation == .adminRetire
         let backend = backend
         let holdsControl = holdsControl
@@ -114,7 +118,9 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                         items.append(.init(sessionID: target, status: .skipped, reason: "requires_control"))
                         continue
                     }
-                    detail["stopped"] = await .bool(backend.stopRun(target))
+                    let stopped = await backend.stopRun(target)
+                    detail["stopped"] = .bool(stopped)
+                    if stopped { committed = true }
                 }
             }
 
@@ -162,6 +168,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             )
             let dormant = inventory.persisted.count(where: { $0.touches(sessionID: target) && !liveTouching.contains($0) })
             totalUnlinked += unlinked
+            if unlinked > 0 { committed = true }
             detail["unlinked"] = .int(unlinked)
             if outsideScope > 0 { detail["links_outside_scope"] = .int(outsideScope) }
             if dormant > 0 { detail["dormant_intents"] = .int(dormant) }
@@ -191,6 +198,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     continue
                 }
                 detail["archived"] = .bool(archived)
+                if archived { committed = true }
                 let status: AgentSessionAdminItemResult.Status = archived ? .changed : (unlinked > 0 ? .changed : .failed)
                 items.append(.init(sessionID: target, status: status, reason: archived ? nil : "archive_rejected", detail: detail))
             } else {
@@ -201,6 +209,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             }
         }
         var extra: [String: Value] = ["unlinked_total": .int(totalUnlinked)]
+        if committed { extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
         if items.contains(where: { $0.detail["dormant_intents"] != nil }) {
             extra["dormant_intents_detail"] = .string(
                 "Saved links whose sessions are not live were left in place; they are released when the user stops them or deletes a session."

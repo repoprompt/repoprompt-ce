@@ -361,4 +361,107 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("endpoint identity changed"), String(describing: error))
         }
     }
+
+    // MARK: - manage_worktree list page controls are app-backed only (#1091)
+
+    func testHeadlessManageWorktreeListRejectsAppOnlyPageControls() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        for arguments: [String: Value] in [
+            ["op": .string("list"), "limit": .int(1), "offset": .int(1)],
+            ["op": .string("list"), "limit": .int(1)],
+            ["limit": .int(1)],
+            ["op": .string("list"), "offset": .int(1)]
+        ] {
+            let outcome = try await Self.callManageWorktree(fixture.client, arguments: arguments)
+            XCTAssertTrue(outcome.isError, "page controls must not silently succeed: \(arguments)")
+            XCTAssertTrue(
+                outcome.text.contains(MCPWorktreeListPagination.headlessUnsupportedMessage),
+                "expected explicit unsupported error, got: \(outcome.text)"
+            )
+        }
+    }
+
+    func testHeadlessManageWorktreeListWithoutPageControlsStillListsWorktrees() async throws {
+        let fixture = try await makeHeadlessWorktreeFixture()
+        let outcome = try await Self.callManageWorktree(fixture.client, arguments: ["op": .string("list")])
+        XCTAssertFalse(outcome.isError, outcome.text)
+        XCTAssertTrue(outcome.text.contains("worktree "), outcome.text)
+        XCTAssertTrue(outcome.text.contains(fixture.linkedWorktree.lastPathComponent), outcome.text)
+    }
+
+    private struct HeadlessWorktreeFixture {
+        let client: Client
+        let linkedWorktree: URL
+    }
+
+    private func makeHeadlessWorktreeFixture() async throws -> HeadlessWorktreeFixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-worktree-list-\(UUID().uuidString)", isDirectory: true)
+        let repo = directory.appendingPathComponent("repo", isDirectory: true)
+        let linked = directory.appendingPathComponent("linked-worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        try Data("fixture\n".utf8).write(to: repo.appendingPathComponent("README.md"))
+        try Self.runGit(["init", "--quiet"], at: repo)
+        try Self.runGit(["add", "README.md"], at: repo)
+        try Self.runGit(
+            ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Fixture"],
+            at: repo
+        )
+        try Self.runGit(["worktree", "add", "--quiet", "--detach", linked.path, "HEAD"], at: repo)
+
+        let service = DirectHeadlessMCPService(environment: [
+            "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-list-contract",
+            "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": directory.appendingPathComponent("profile").path,
+            "REPOPROMPT_MCP_WORKING_DIRS": repo.path,
+            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+        ], currentDirectory: repo)
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let transports = await InMemoryTransport.createConnectedPair()
+        let server = Server(name: "Headless worktree test", version: "1", capabilities: .init(tools: .init()))
+        await service.installHandlers(server: server, prepared: prepared, connection: .init(
+            connectionID: prepared.connectionID, connectionGeneration: prepared.connectionGeneration,
+            principal: prepared.principal, policyProfile: .direct, restrictedToolNames: [],
+            additionalToolNames: [], ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
+        ))
+        try await server.start(transport: transports.server)
+        addTeardownBlock { await server.stop() }
+        let client = Client(name: "Headless worktree client", version: "1")
+        _ = try await client.connect(transport: transports.client)
+        addTeardownBlock { await client.disconnect() }
+        return HeadlessWorktreeFixture(client: client, linkedWorktree: linked)
+    }
+
+    /// Normalizes both wire shapes: an `isError` tool result and a thrown JSON-RPC error.
+    private static func callManageWorktree(
+        _ client: Client,
+        arguments: [String: Value]
+    ) async throws -> (isError: Bool, text: String) {
+        do {
+            let result = try await client.callTool(name: "manage_worktree", arguments: arguments)
+            let text = result.content.compactMap { content -> String? in
+                guard case let .text(value, _, _) = content else { return nil }
+                return value
+            }.joined(separator: "\n")
+            return (result.isError == true, text)
+        } catch {
+            return (true, String(describing: error))
+        }
+    }
+
+    private static func runGit(_ arguments: [String], at directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "git", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed"
+            ])
+        }
+    }
 }

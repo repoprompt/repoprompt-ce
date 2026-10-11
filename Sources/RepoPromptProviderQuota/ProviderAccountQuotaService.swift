@@ -179,6 +179,15 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         await performRead(userInitiated: false)
     }
 
+    /// Display-driven refresh of a reading the caller judged stale. It is the only automatic
+    /// trigger allowed past the one-startup-read latch of a `periodicReads: false` source, and
+    /// it keeps every other automatic gate: live observer, single flight (joins an in-flight
+    /// read), failure backoff, and the `automaticInterval` gap since the last attempt of any
+    /// kind (15 minutes by default).
+    package func refreshAutomatically(didStart: (@Sendable () async -> Void)?) async {
+        await performRead(userInitiated: false, bypassStartupLatch: true, didStart: didStart)
+    }
+
     /// Activity-driven refresh, independent of the one-startup-read latch. Admission is
     /// durable and provided by the consumer; ordinary single-flight/backoff still wins.
     package func refreshForAdvisory(requestID: UUID = UUID(), admission: @Sendable () async -> Bool) async {
@@ -222,10 +231,15 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         }
     }
 
-    private func performRead(userInitiated: Bool, advisoryRequestID: UUID? = nil) async {
+    private func performRead(
+        userInitiated: Bool,
+        advisoryRequestID: UUID? = nil,
+        bypassStartupLatch: Bool = false,
+        didStart: (@Sendable () async -> Void)? = nil
+    ) async {
         await hydrateIfNeeded()
         guard enabled, !observers.isEmpty, !Task.isCancelled else { return }
-        if !userInitiated, advisoryRequestID == nil, !periodicReads, automaticConsumed { return }
+        if !userInitiated, advisoryRequestID == nil, !bypassStartupLatch, !periodicReads, automaticConsumed { return }
         if let inFlight { await inFlight.task.value
             return
         }
@@ -251,6 +265,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
             }
         }
         inFlight = (id, task)
+        // Registered as in flight first, so a reentrant caller during this hop joins it.
+        await didStart?()
         await task.value
         if inFlight?.id == id { inFlight = nil }
     }

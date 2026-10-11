@@ -2235,6 +2235,11 @@ struct CLIProvidersSettingsView: View {
             isExpanded: $isGrokBuildExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
+                Text("A Grok (xAI) API key saved under Settings → API Providers is also passed to Grok Build for Agent Mode, Context Builder, Oracle and Chat, and model discovery (including Connect), even when you're signed in with `grok login`. Grok chooses which credential each request uses; requests to the xAI API that use the key are billed to the xAI API account.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 if viewModel.isGrokBuildConnected {
                     HStack(spacing: 8) {
                         Button(action: { testGrokBuildConnection() }) {
@@ -2284,7 +2289,7 @@ struct CLIProvidersSettingsView: View {
                                 .foregroundColor(.red)
                                 .fixedSize(horizontal: false, vertical: true)
                         } else {
-                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Keys).")
+                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Providers).")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }

@@ -212,6 +212,10 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         let confirmation = request.confirmationID.flatMap {
             scopes.confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)?.domainConfirmation
         }
+        // A supplied stale, consumed or unknown card is not equivalent to omitting a card.
+        guard request.confirmationID == nil || confirmation != nil else {
+            return .denied(.confirmationMismatch, sessionID: nil)
+        }
         let outcome = scopes.authorize(DomainDelegationScopeAuthorizationRequest(
             operation: request.operation,
             caller: request.caller,
@@ -279,24 +283,25 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             return .denied(denial, sessionID: sessionID)
         case let .authorized(batch):
             // Structural refusals are decided before any card is claimed, exactly as before a card
-            // is raised in the branch above.
+            // is raised in the branch above; nothing is applied, so the card stays approved.
             if let refusal = try handler.preflight(batch) { return .completed(refusal) }
-            // Only a card the authority actually required is claimed: an approved card authorizes
-            // exactly one application, claimed before the handler suspends (so a concurrent replay
-            // cannot double-apply) and marked applied only after the handler succeeds. The handler
-            // re-checks `DelegationScopeRuntime.isCurrent(_:)` after its own suspensions.
-            let cardRequired = DomainDelegationScopeAuthority.confirmationRequirement(
-                operation: request.operation,
-                itemCount: batch.admittedSessionIDs.count,
-                guardrails: batch.scope.grant.guardrails
-            ) != nil && !batch.admittedSessionIDs.isEmpty
-            let claimedCard = cardRequired ? batch.confirmation?.confirmationID : nil
+            // Every supplied approval is bound and claimed once, even if unticking items brought
+            // the application below the threshold. No-card under-threshold calls remain allowed.
+            // The claim happens before the handler suspends (so a concurrent replay cannot
+            // double-apply); the handler re-checks `DelegationScopeRuntime.isCurrent(_:)` after its
+            // own suspensions.
+            let claimedCard = batch.confirmation?.confirmationID
             if let claimedCard, !scopes.confirmations.beginApplying(confirmationID: claimedCard) {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }
             do {
                 let value = try await handler.perform(batch)
-                if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: true) }
+                // A handler refusal after its own re-checks (state changed since the card) applied
+                // nothing: the card returns to `approved` rather than being consumed.
+                if let claimedCard {
+                    let applied = value.objectValue?["result"]?.stringValue != "denied"
+                    scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: applied)
+                }
                 return .completed(value)
             } catch {
                 if let claimedCard { scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: false) }

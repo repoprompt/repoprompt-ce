@@ -19,6 +19,10 @@ enum AgentSessionTargetOperationGuard {
     /// Resolves the caller's **exact endpoint incarnation** from server-owned run routing.
     typealias ObserverEndpointResolver =
         (MCPRequestMetadata, WindowState) async -> DomainAgentSessionLinkEndpointIdentity?
+    /// Immutable spawn provenance for one explicitly named target session.
+    typealias TargetProvenanceResolver = (UUID) async -> DomainAgentSessionTargetProvenance
+    /// True only when the exact observer endpoint holds a live Manage grant over the target.
+    typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> Bool
 
     static func denialError(reference: String) -> MCPError {
         MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
@@ -186,6 +190,52 @@ enum AgentSessionTargetOperationGuard {
         )
         guard decision.isAuthorized else {
             throw denialError(reference: reference)
+        }
+    }
+
+    /// Execution-time authority for a `manage_worktree` binding mutation that names its target
+    /// session explicitly (`bind` / `select` / `unbind`, or `create` with `bind=true`).
+    ///
+    /// Rebinding redirects where the target's provider reads and writes, so a full session UUID plus
+    /// same-window routing must not be enough to reach an unrelated session. The allowed callers are:
+    ///
+    /// - an **administrative principal** (an ordinary external MCP client with no run-scoped routing),
+    ///   exactly as before;
+    /// - the **target itself**, proven by server-owned run routing;
+    /// - the target's **spawn parent**, from immutable spawn provenance;
+    /// - an **overseer** whose exact endpoint holds a live Manage grant over the target.
+    ///
+    /// Unresolved Agent-run routing always fails closed. Every denial reuses the "not found" wording
+    /// so an unauthorized UUID is indistinguishable from a nonexistent one.
+    static func requireWorktreeBindingAuthority(
+        targetSessionID: UUID,
+        metadata: MCPRequestMetadata,
+        targetWindow: WindowState,
+        resolveSpawnParentSessionID: SpawnParentSessionResolver,
+        resolveObserverEndpoint: ObserverEndpointResolver,
+        resolveTargetProvenance: TargetProvenanceResolver,
+        hasManageGrant: ManageGrantResolver
+    ) async throws {
+        let caller = await resolveCaller(
+            metadata: metadata,
+            targetWindow: targetWindow,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+        switch caller {
+        case .administrativePrincipal:
+            return
+        case .unresolvedAgentRun:
+            throw denialError(sessionID: targetSessionID)
+        case let .agentSession(callerSessionID):
+            if callerSessionID == targetSessionID { return }
+            if await resolveTargetProvenance(targetSessionID).parentSessionID == callerSessionID { return }
+            if let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
+               endpoint.sessionID == callerSessionID,
+               await hasManageGrant(endpoint, targetSessionID)
+            {
+                return
+            }
+            throw denialError(sessionID: targetSessionID)
         }
     }
 

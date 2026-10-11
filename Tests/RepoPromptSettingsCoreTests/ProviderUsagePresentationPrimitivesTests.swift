@@ -74,5 +74,41 @@ final class ProviderUsagePresentationPrimitivesTests: XCTestCase {
 
         let withReset = AgentUsageLimitsPillPresentation(usedPercent: 42, isReached: false, resetAt: now.addingTimeInterval(3600), providerName: "Claude", now: now)
         XCTAssertTrue(withReset?.tooltip.hasPrefix("Claude plan usage: 42% used · resets ") ?? false)
+        XCTAssertEqual(withReset?.isDimmed, false, "a fresh reading is not dimmed")
+    }
+
+    func testPillKeepsLastValueAndStatesWhyItIsNotCurrent() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let stale = AgentUsageLimitsPillPresentation(
+            state: .init(usedPercent: 42, isReached: false, resetAt: nil, observedAt: now.addingTimeInterval(-3 * 3600), freshness: .stale),
+            providerName: "Claude",
+            now: now
+        )
+        XCTAssertEqual(stale.label, "42%")
+        XCTAssertTrue(stale.isDimmed)
+        XCTAssertEqual(stale.tooltip, "Claude plan usage: 42% used · Updated 3 hours ago")
+
+        let resetPassed = AgentUsageLimitsPillPresentation(
+            state: .init(usedPercent: 80, isReached: false, resetAt: now.addingTimeInterval(-60), freshness: .resetPassed, isUpdating: true),
+            providerName: "Claude",
+            now: now
+        )
+        XCTAssertEqual(resetPassed.label, "80%")
+        XCTAssertTrue(resetPassed.isDimmed)
+        XCTAssertEqual(resetPassed.tooltip, "Claude plan usage: 80% used · Reset passed · updating…")
+
+        let failed = AgentUsageLimitsPillPresentation(
+            state: .init(usedPercent: 42, isReached: false, resetAt: nil, refreshFailed: true),
+            providerName: "Codex",
+            now: now
+        )
+        XCTAssertEqual(failed.label, "42%")
+        XCTAssertEqual(failed.tooltip, "Codex plan usage: 42% used · Couldn't refresh")
+
+        let unavailable = AgentUsageLimitsPillPresentation(state: .unavailable, providerName: "Claude", now: now)
+        XCTAssertEqual(unavailable.label, "—", "a cleared snapshot is a neutral placeholder, not a removed pill")
+        XCTAssertNil(unavailable.ringFraction)
+        XCTAssertTrue(unavailable.isDimmed)
+        XCTAssertTrue(unavailable.tooltip.contains("sign in"))
     }
 }

@@ -1120,6 +1120,25 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: commit) { $0.claudeCLIUsageGrant = grant }
     }
 
+    /// The Claude usage display the user already set up: usage display on, and a ready CLI
+    /// usage grant for this credential profile. This is the consent that lets passive run
+    /// telemetry refresh the *displayed* Claude usage.
+    package func claudeUsageDisplayConsented(profileID: String) -> Bool {
+        guard usageLimitsDisplayEnabled(), let grant = claudeCLIUsageGrant() else { return false }
+        return grant.isReady && grant.applies(toProfileID: profileID)
+    }
+
+    /// Whether first-party Claude runs record their own SDK `rate_limit_event` stream output.
+    ///
+    /// Either the diagnostics toggle (`claudeUsageQuotaEnabled`, unchanged meaning) or the
+    /// connected Claude usage display is sufficient. The events are part of the run's own
+    /// output: recording them starts no read, process, or request and touches no credential,
+    /// so the display connection the user already granted covers showing them. They remain
+    /// display-only; routing and balancing never consume SDK telemetry.
+    package func claudeRunTelemetryRecordingEnabled(profileID: String) -> Bool {
+        claudeUsageQuotaEnabled() || claudeUsageDisplayConsented(profileID: profileID)
+    }
+
     /// UI-only, separately disclosed background acquisition consent. Not routing policy.
     package func setClaudeBalancingRefreshGrant(_ grant: ClaudeCLIUsageGrant?, commit: Bool = true) {
         updateAgentModeScalar(commit: commit) { $0.claudeBalancingRefreshGrant = grant }

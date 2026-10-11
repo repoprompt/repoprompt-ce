@@ -38,13 +38,14 @@ struct DelegationApprovalSlot: View {
         .task(id: "\(tabID?.uuidString ?? "-")|\(sessionID?.uuidString ?? "-")") {
             guard let tabID else { return }
             runtime.cancelStaleRequests(tabID: tabID, currentSessionID: sessionID)
+            confirmations.invalidateStaleConfirmations(tabID: tabID, currentSessionID: sessionID)
         }
     }
 
     @ViewBuilder
     private func content(tabID: UUID) -> some View {
         let requests = runtime.pendingRequests(forTab: tabID, sessionID: sessionID)
-        let cards = confirmations.pendingConfirmations(forTab: tabID)
+        let cards = sessionID.map { confirmations.pendingConfirmations(forTab: tabID, sessionID: $0) } ?? []
         if !requests.isEmpty || !cards.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(requests) { request in
@@ -61,23 +62,41 @@ struct DelegationApprovalSlot: View {
                 ForEach(cards) { card in
                     BatchConfirmationCard(
                         confirmation: card,
-                        onToggle: { sessionID, ticked in
-                            confirmations.setItem(sessionID, ticked: ticked, confirmationID: card.id)
+                        onToggle: { itemSessionID, ticked in
+                            guard currentPresentation(card, tabID: tabID) != nil else { return }
+                            confirmations.setItem(itemSessionID, ticked: ticked, confirmationID: card.id)
                         },
                         // Approval applies the stored request to the ticked items right away; the
-                        // agent reads the outcome through `confirmation_status`.
+                        // agent reads the outcome through `confirmation_status`. Both actions run
+                        // only while the tab is still bound to the session that requested the card.
                         onApprove: {
+                            guard let presented = currentPresentation(card, tabID: tabID) else { return }
                             let frontDoor = AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
-                            Task { await frontDoor.approveAndApply(confirmationID: card.id) }
+                            Task {
+                                await frontDoor.approveAndApply(
+                                    confirmationID: card.id, presentedTabID: tabID, presentedSessionID: presented
+                                )
+                            }
                         },
                         onDeny: {
-                            AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
-                                .denyConfirmation(confirmationID: card.id)
+                            guard let presented = currentPresentation(card, tabID: tabID) else { return }
+                            AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor.denyConfirmation(
+                                confirmationID: card.id, presentedTabID: tabID, presentedSessionID: presented
+                            )
                         }
                     )
                 }
             }
         }
+    }
+
+    /// The tab's live bound session when the card is still current for it, re-read from the window
+    /// state rather than trusting the rendered card. The front door re-checks it when it applies.
+    private func currentPresentation(_ card: PendingBatchConfirmation, tabID: UUID) -> UUID? {
+        guard let sessionID = AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: tabID),
+              confirmations.isCurrentPresentation(confirmationID: card.id, tabID: tabID, sessionID: sessionID)
+        else { return nil }
+        return sessionID
     }
 }
 
@@ -291,6 +310,8 @@ struct BatchConfirmationCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Confirm \(confirmation.operation.rawValue)")
                         .font(.headline)
+                    Text("Requested by \(DelegationDisplayNames.sessionTitle(confirmation.granteeSessionID) ?? confirmation.granteeSessionID.uuidString)")
+                        .font(.caption)
                     Text("\(confirmation.approvedSessionIDs.count) of \(confirmation.items.count) selected · \(reasonText)")
                         .font(.caption)
                         .foregroundStyle(.secondary)

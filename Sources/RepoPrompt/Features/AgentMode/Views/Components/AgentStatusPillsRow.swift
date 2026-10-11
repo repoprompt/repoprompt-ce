@@ -66,7 +66,7 @@ struct AgentStatusPillsRow: View {
                    target.route == .existingAgentSession
                 {
                     AgentIconTogglePill(
-                        systemImage: "cursorarrow",
+                        systemImage: "desktopcomputer",
                         isOn: computerUse.isOn,
                         isBusy: computerUse.isBusy,
                         onToggle: {

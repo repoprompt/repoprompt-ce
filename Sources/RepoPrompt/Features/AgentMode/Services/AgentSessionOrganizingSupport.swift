@@ -173,6 +173,10 @@ enum AgentSessionAdminRendering {
         ISO8601DateFormatter().string(from: date)
     }
 
+    /// Set (to `true`) when a call committed durable side effects that per-item `changed` statuses
+    /// do not show, for example a release whose first unlink succeeded before a later one failed.
+    static let committedChangesKey = "committed_changes"
+
     /// Standard reply for a mutating op.
     static func mutationValue(
         operation: DomainAgentSessionTargetOperation,

@@ -88,13 +88,24 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         }
 
         let fullAccess = config.alwaysApproveTools || request.autoApproveAllToolPermissions
+        var metadata: [String: AgentJSONValue] = fullAccess ? [:] : [
+            "yoloMode": .bool(false),
+            "autoMode": .bool(false)
+        ]
+        if config.discoveryMode {
+            metadata["agentProfile"] = .object([
+                "name": .string("repoprompt-discovery"),
+                "description": .string("RepoPrompt Context Builder discovery"),
+                "tools": .array([.string("search_tool"), .string("use_tool")])
+            ])
+        }
         // Grok 1.0.45 ignores autoMode: false on open; the notification also
         // disables auto mode inherited from Claude's permission settings.
         return try ACPSessionConfiguration(
             mode: mode,
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
             mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : [],
-            metadata: fullAccess ? [:] : ["yoloMode": .bool(false), "autoMode": .bool(false)],
+            metadata: metadata,
             postOpenNotification: fullAccess ? nil : .init(
                 method: "_x.ai/yolo_mode_changed", params: ["auto_mode": .bool(false)]
             )
