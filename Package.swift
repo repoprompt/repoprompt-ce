@@ -328,6 +328,7 @@ let package = Package(
                 "RepoPromptDomainRuntime",
                 "RepoPromptShared",
                 "RepoPromptTestSupport",
+                "RepoPromptVCS",
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Tests/RepoPromptMCPCoreTests"

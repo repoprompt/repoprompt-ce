@@ -271,9 +271,16 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: snapshot.roots) else {
                 throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
             }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: [
-                "-C", root.path, "--git-dir", layout.gitDir.path, "--work-tree", root.path
-            ] + command, isProvider: false)
+            let binding = try GitReadRepositoryBinding(layout: layout)
+            let probe = try await DirectProcess.run(
+                "/usr/bin/git", arguments: binding.ownershipProbeArguments,
+                isProvider: false, readBinding: binding
+            )
+            try binding.validateOwnershipProbe(probe)
+            let output = try await DirectProcess.run(
+                "/usr/bin/git", arguments: binding.boundArguments(command),
+                isProvider: false, readBinding: binding
+            )
             outputs.append(.object(["repo_root": .string(root.path), "output": .string(output)]))
         }
         return try .object(["op": .string(op), "repositories": .array(outputs)])
@@ -1175,7 +1182,8 @@ enum DirectProcess {
         environment: [String: String] = [:],
         currentDirectory: URL? = nil,
         isProvider: Bool = true,
-        allowsProviderProcessLaunchForTesting: Bool = false
+        allowsProviderProcessLaunchForTesting: Bool = false,
+        readBinding: GitReadRepositoryBinding? = nil
     ) async throws -> String {
         if isProvider {
             try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
@@ -1185,7 +1193,8 @@ enum DirectProcess {
             arguments: arguments,
             input: input,
             environment: environment,
-            currentDirectory: currentDirectory
+            currentDirectory: currentDirectory,
+            readBinding: readBinding
         ).run()
     }
 }
@@ -1247,6 +1256,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private let pipe = Pipe()
     private let inputPipe: Pipe?
     private let input: Data?
+    private let readBinding: GitReadRepositoryBinding?
     private var cancellationRequested = false
 
     init(
@@ -1254,13 +1264,20 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         arguments: [String],
         input: Data?,
         environment overrides: [String: String],
-        currentDirectory: URL?
+        currentDirectory: URL?,
+        readBinding: GitReadRepositoryBinding?
     ) {
         self.input = input
+        self.readBinding = readBinding
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = DirectProcess.childEnvironment(overrides: overrides)
+        let sanitizedEnvironment = DirectProcess.childEnvironment(overrides: overrides)
+        if let readBinding {
+            process.environment = readBinding.ownershipProbeEnvironment(sanitizedEnvironment)
+        } else {
+            process.environment = sanitizedEnvironment
+        }
         process.currentDirectoryURL = currentDirectory
         process.standardOutput = pipe
         process.standardError = pipe
@@ -1300,6 +1317,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                     }
                 }
                 do {
+                    try readBinding?.revalidate()
                     try process.run()
                     if let inputPipe, let input {
                         inputPipe.fileHandleForWriting.write(input)

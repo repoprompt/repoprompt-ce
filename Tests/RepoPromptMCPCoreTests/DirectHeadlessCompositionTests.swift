@@ -5,6 +5,7 @@ import RepoPromptDomainRuntime
 @testable import RepoPromptMCPCore
 import RepoPromptShared
 import RepoPromptTestSupport
+import RepoPromptVCS
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
@@ -412,6 +413,125 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let outcome = try await Self.callTool(fixture.client, name: "git", arguments: ["op": .string("status")])
         XCTAssertFalse(outcome.isError, outcome.text)
         XCTAssertFalse(outcome.text.contains("outside-only.txt"), outcome.text)
+    }
+
+    func testHeadlessReadArgumentsPreserveGitOwnershipTrustForNormalAndLinkedCheckouts() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("headless-git-ownership-\(UUID().uuidString)")
+        let root = base.appendingPathComponent("root")
+        let linked = base.appendingPathComponent("linked")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runGit(["init", "--quiet"], at: root)
+        try Self.runGit(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "Fixture"], at: root)
+        try Self.runGit(["worktree", "add", "--quiet", "--detach", linked.path, "HEAD"], at: root)
+        for checkout in [root, linked] {
+            try Data("inside".utf8).write(to: checkout.appendingPathComponent("inside-only.txt"))
+            let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: checkout, authorizedRoots: [checkout]))
+            let binding = try GitReadRepositoryBinding(layout: layout)
+            for trusted in [false, true] {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+                process.arguments = binding.ownershipProbeArguments
+                var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("GIT_") }
+                environment["GIT_CONFIG_NOSYSTEM"] = "1"
+                environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+                environment["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+                environment["GIT_CONFIG_COUNT"] = "1"
+                environment["GIT_CONFIG_KEY_0"] = "safe.directory"
+                environment["GIT_CONFIG_VALUE_0"] = trusted ? checkout.resolvingSymlinksInPath().path : ""
+                process.environment = binding.ownershipProbeEnvironment(environment)
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
+                try process.run()
+                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                process.waitUntilExit()
+                if trusted {
+                    XCTAssertEqual(process.terminationStatus, 0, output)
+                    try binding.validateOwnershipProbe(output)
+                    let status = Process()
+                    status.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+                    status.arguments = binding.boundArguments(["status", "--porcelain"])
+                    status.environment = environment
+                    let statusPipe = Pipe()
+                    status.standardOutput = statusPipe
+                    status.standardError = statusPipe
+                    try binding.revalidate()
+                    try status.run()
+                    let statusOutput = String(decoding: statusPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    status.waitUntilExit()
+                    XCTAssertEqual(status.terminationStatus, 0, statusOutput)
+                    XCTAssertTrue(statusOutput.contains("inside-only.txt"), statusOutput)
+                } else {
+                    XCTAssertNotEqual(process.terminationStatus, 0, output)
+                    XCTAssertTrue(output.contains("dubious ownership"), output)
+                }
+            }
+        }
+    }
+
+    func testReadSpawnFenceRejectsMissingMalformedAndReplacedMetadataWithoutAdoptingParent() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("headless-git-parent-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runGit(["init", "--quiet"], at: base)
+        try Data("outside".utf8).write(to: base.appendingPathComponent("outside-only.txt"))
+        for replacement in ["missing", "malformed", "redirected", "replaced"] {
+            let root = base.appendingPathComponent(replacement)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Self.runGit(["init", "--quiet"], at: root)
+            let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+            let binding = try GitReadRepositoryBinding(layout: layout)
+            try FileManager.default.moveItem(at: root.appendingPathComponent(".git"), to: root.appendingPathComponent("saved-metadata"))
+            switch replacement {
+            case "malformed": try Data("not a gitfile".utf8).write(to: root.appendingPathComponent(".git"))
+            case "redirected": try FileManager.default.createSymbolicLink(at: root.appendingPathComponent(".git"), withDestinationURL: base.appendingPathComponent(".git"))
+            case "replaced": try Self.runGit(["init", "--quiet"], at: root)
+            default: break
+            }
+            XCTAssertThrowsError(try binding.revalidate(), replacement)
+            for arguments in [binding.ownershipProbeArguments, binding.boundArguments(["status", "--porcelain"])] {
+                do {
+                    let output = try await DirectProcess.run("/usr/bin/git", arguments: arguments, isProvider: false, readBinding: binding)
+                    XCTFail("\(replacement) spawned a stale read: \(output)")
+                } catch {
+                    // The production final-spawn fence rejects this before Git can
+                    // discover the enclosing repository or read stale metadata.
+                    XCTAssertFalse(error is MCPError, "expected the binding fence, not a Git subprocess error")
+                }
+            }
+        }
+    }
+
+    func testOwnershipProbeCannotAdoptParentFromInvalidGitDirectoryAndColonParentFailsClosed() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("headless-git-ceiling-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try Self.runGit(["init", "--quiet"], at: base)
+        let invalid = base.appendingPathComponent("invalid")
+        try FileManager.default.createDirectory(at: invalid.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        let invalidLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: invalid, authorizedRoots: [invalid]))
+        let invalidBinding = try GitReadRepositoryBinding(layout: invalidLayout)
+        do {
+            let output = try await DirectProcess.run("/usr/bin/git", arguments: invalidBinding.ownershipProbeArguments, isProvider: false, readBinding: invalidBinding)
+            XCTFail("Invalid metadata adopted enclosing repo: \(output)")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not a git repository"), String(describing: error))
+        }
+        let colonParent = base.appendingPathComponent("parent:with-colon/child")
+        try FileManager.default.createDirectory(at: colonParent, withIntermediateDirectories: true)
+        try Self.runGit(["init", "--quiet"], at: colonParent)
+        let unsupportedLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: colonParent, authorizedRoots: [colonParent]))
+        XCTAssertThrowsError(try GitReadRepositoryBinding(layout: unsupportedLayout)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("canonical parent path contains ':'"))
+        }
+        let colonLeaf = base.appendingPathComponent("leaf:valid")
+        try FileManager.default.createDirectory(at: colonLeaf, withIntermediateDirectories: true)
+        try Self.runGit(["init", "--quiet"], at: colonLeaf)
+        let supportedLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: colonLeaf, authorizedRoots: [colonLeaf]))
+        let supportedBinding = try GitReadRepositoryBinding(layout: supportedLayout)
+        let probe = try await DirectProcess.run("/usr/bin/git", arguments: supportedBinding.ownershipProbeArguments, isProvider: false, readBinding: supportedBinding)
+        try supportedBinding.validateOwnershipProbe(probe)
     }
 
     private struct HeadlessWorktreeFixture {

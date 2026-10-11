@@ -3,6 +3,92 @@ import RepoPromptVCS
 import XCTest
 
 final class GitReadRootAuthorizationTests: XCTestCase {
+    func testNormalBindingIgnoresIrrelevantBackpointer() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("root")
+        let dotGit = root.appendingPathComponent(".git")
+        let outside = base.appendingPathComponent("synthetic-outside")
+        try directory(dotGit)
+        // Not Git metadata for a normal checkout; even an oversized unrelated
+        // file must not become a snapshot input merely because of its name.
+        try write(String(repeating: "synthetic", count: 600), to: outside)
+        try FileManager.default.createSymbolicLink(at: dotGit.appendingPathComponent("gitdir"), withDestinationURL: outside)
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        let binding = try GitReadRepositoryBinding(layout: layout)
+        try binding.revalidate()
+    }
+
+    func testCommonPointerFileSymlinkCannotExpandCapturedMetadataAuthority() throws {
+        let base = try fixture()
+        for usesGitfile in [false, true] {
+            let root = base.appendingPathComponent(usesGitfile ? "gitfile" : "normal")
+            let gitDir = root.appendingPathComponent(usesGitfile ? "metadata" : ".git")
+            let commonFile = gitDir.appendingPathComponent("commondir")
+            try directory(gitDir)
+            if usesGitfile { try write("gitdir: metadata\n", to: root.appendingPathComponent(".git")) }
+            try write(".\n", to: commonFile)
+            let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+            let binding = try GitReadRepositoryBinding(layout: layout)
+            let outside = base.appendingPathComponent(usesGitfile ? "outside-gitfile" : "outside-normal")
+            // The declared directory remains legitimate; only the file read escapes.
+            try write(".\n", to: outside)
+            try FileManager.default.removeItem(at: commonFile)
+            try FileManager.default.createSymbolicLink(at: commonFile, withDestinationURL: outside)
+            XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+            XCTAssertThrowsError(try binding.revalidate())
+            XCTAssertThrowsError(try GitReadRepositoryBinding(layout: layout))
+        }
+    }
+
+    func testLinkedPointerFileTargetsStayWithinCapturedMetadataAuthority() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("linked")
+        let common = base.appendingPathComponent("main/.git")
+        let gitDir = common.appendingPathComponent("worktrees/linked")
+        let dotGit = root.appendingPathComponent(".git")
+        try directory(root)
+        try directory(gitDir)
+        try write("gitdir: \(gitDir.path)\n", to: dotGit)
+        for (name, text) in [("commondir", "../..\n"), ("gitdir", "\(dotGit.path)\n")] {
+            let pointer = gitDir.appendingPathComponent(name)
+            let inside = gitDir.appendingPathComponent("\(name)-inside")
+            try write(text, to: inside)
+            try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: inside)
+        }
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        let binding = try GitReadRepositoryBinding(layout: layout)
+        try binding.revalidate()
+        for (name, text) in [("commondir", "../..\n"), ("gitdir", "\(dotGit.path)\n")] {
+            let pointer = gitDir.appendingPathComponent(name)
+            let outside = base.appendingPathComponent("synthetic-outside-\(name)")
+            try write(text, to: outside)
+            try FileManager.default.removeItem(at: pointer)
+            try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: outside)
+            XCTAssertNil(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+            XCTAssertThrowsError(try binding.revalidate())
+            XCTAssertThrowsError(try GitReadRepositoryBinding(layout: layout))
+            try FileManager.default.removeItem(at: pointer)
+            try FileManager.default.createSymbolicLink(at: pointer, withDestinationURL: gitDir.appendingPathComponent("\(name)-inside"))
+            try binding.revalidate()
+        }
+    }
+
+    func testNormalCheckoutUnderWorktreesDirectoryDoesNotInferLinkedCommonDirectory() throws {
+        let base = try fixture()
+        let root = base.appendingPathComponent("worktrees/normal")
+        let dotGit = root.appendingPathComponent(".git")
+        try directory(dotGit)
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: root))
+        XCTAssertEqual(layout.commonDir.path, dotGit.path)
+        XCTAssertFalse(layout.isLinkedWorktree)
+        XCTAssertEqual(layout.knownMainWorktreeRoot?.path, root.path)
+        let common = root.appendingPathComponent("shared")
+        try directory(common)
+        try write("../shared\n", to: dotGit.appendingPathComponent("commondir"))
+        let pointed = try XCTUnwrap(GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: [root]))
+        XCTAssertEqual(pointed.commonDir.path, common.path)
+    }
+
     func testNestedWorkspaceDoesNotAdoptEnclosingRepository() throws {
         let root = try fixture()
         let nested = root.appendingPathComponent("nested")

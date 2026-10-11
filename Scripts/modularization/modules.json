@@ -138,7 +138,8 @@
         "RepoPromptDomainRuntime",
         "RepoPromptMCPCore",
         "RepoPromptShared",
-        "RepoPromptTestSupport"
+        "RepoPromptTestSupport",
+        "RepoPromptVCS"
       ]
     },
     "RepoPromptProcess": {
