@@ -166,8 +166,9 @@ struct AgentSubagentPolicySettingsView: View {
 
     private var safeManagedBullets: some View {
         VStack(alignment: .leading, spacing: 6) {
-            bullet("File writes require approval or stay sandboxed to the workspace.")
-            bullet("Bash/shell tools are disabled for Claude and Codex.")
+            bullet("File writes require approval or stay sandboxed to the workspace, except as noted for Grok Build.")
+            bullet("Grok Build launched through MCP runs at Default. Its own permission rules, including rules from Claude Code `defaultMode`, can allow many requests (`bypassPermissions`) or edit tools such as `write` (`acceptEdits`) without asking RepoPrompt.")
+            bullet("Bash/shell tools are disabled for Claude; Codex Bash is enabled.")
             bullet("Claude is forced to strict MCP; Codex user-toggled MCP servers are suppressed.")
             bullet("ACP providers use non-auto-accept session modes.")
         }
