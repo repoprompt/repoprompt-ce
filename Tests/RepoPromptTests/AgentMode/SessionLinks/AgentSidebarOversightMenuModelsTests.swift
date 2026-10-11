@@ -2235,7 +2235,53 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
     }
 
     func testNativeSubmenuReadsReadyProjectionWithoutReopeningRoot() async throws {
+        try await trackNativeSubmenu(in: makeFixture(peerCount: 1))
+    }
+
+    func testNativeSubmenuIdentityViolationEndsRetriesAfterCleanup() async throws {
         let fixture = try await makeFixture(peerCount: 1)
+        var injectedAttempts = 0
+        do {
+            try await trackNativeSubmenu(in: fixture, afterDriverStarted: { root, submenu in
+                injectedAttempts += 1
+                // Only the first attempt is broken: a fresh later root would be valid.
+                // Mutate the actual tracked AppKit menu, not a synthetic identity model.
+                if injectedAttempts == 1 {
+                    root.items.first { $0.submenu === submenu }?.submenu = NSMenu()
+                }
+            })
+            XCTFail("A later successful opening must not mask the first identity violation")
+        } catch NativeSubmenuTrackingError.identityChanged {
+            XCTAssertEqual(injectedAttempts, 1, "Identity violations must never start a fresh attempt")
+        }
+        XCTAssertNil(fixture.window.stableMenuPresenter.openMenu, "Failure must end native tracking")
+    }
+
+    func testNativeSubmenuIdentityViolationCannotHideBehindTrackingCancellation() async throws {
+        let fixture = try await makeFixture(peerCount: 1)
+        var injectedAttempts = 0
+        do {
+            try await trackNativeSubmenu(in: fixture, afterDriverStarted: { root, submenu in
+                injectedAttempts += 1
+                if injectedAttempts == 1 {
+                    root.items.first { $0.submenu === submenu }?.submenu = NSMenu()
+                    // End tracking before the driver's next poll can see the corruption.
+                    root.cancelTracking()
+                }
+            })
+            XCTFail("Tracking cancellation must not turn an identity violation into a readiness retry")
+        } catch NativeSubmenuTrackingError.identityChanged {
+            XCTAssertEqual(injectedAttempts, 1)
+        }
+        XCTAssertNil(fixture.window.stableMenuPresenter.openMenu)
+    }
+
+    private enum NativeSubmenuTrackingError: Error { case identityChanged }
+
+    private func trackNativeSubmenu(
+        in fixture: Fixture,
+        afterDriverStarted: ((NSMenu, NSMenu) -> Void)? = nil
+    ) async throws {
         let props = try menuProps(in: fixture)
         let target = try XCTUnwrap(props.availableTargets.first)
         AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
@@ -2267,6 +2313,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = true
             await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
             var driver: Timer?
+            var identityViolation = false
+            var retainedObjectsAreValid: (@MainActor () -> Bool)?
+            defer { driver?.invalidate() }
             _ = try await open(in: fixture, cancelAfterOpening: false, timeout: 5, whileTracking: { root in
                 guard let submenu = root.items.first(where: { $0.title == AgentOversightUICopy.overseeNewTitle })?.submenu else {
                     XCTFail("Missing candidate submenu")
@@ -2277,11 +2326,29 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     return root.cancelTracking()
                 }
                 let rootItems = root.items
+                retainedObjectsAreValid = {
+                    root.items.count == rootItems.count
+                        && zip(root.items, rootItems).allSatisfy { $0 === $1 }
+                        && root.items.contains { $0.submenu === submenu }
+                }
+                @MainActor func retainedIdentityIsValid() -> Bool {
+                    let valid = retainedObjectsAreValid?() == true
+                        && fixture.window.stableMenuPresenter.openMenu === root
+                    if !valid {
+                        identityViolation = true
+                        root.cancelTracking()
+                    }
+                    return valid
+                }
                 AgentSessionLinkRuntimeBridge.shared.test_menuCatalogUnavailable = false
                 let forwarding = SubmenuOpeningObserver(delegate: submenu.delegate)
                 observer = forwarding
                 submenu.delegate = forwarding
                 forwarding.onOpen = { child in
+                    guard retainedIdentityIsValid(), child === submenu else {
+                        identityViolation = true
+                        return root.cancelTracking()
+                    }
                     openings += 1
                     XCTAssertTrue(child.items.contains { $0.title == target.menuLabel && $0.isEnabled })
                     XCTAssertTrue(zip(root.items, rootItems).allSatisfy { $0 === $1 })
@@ -2303,15 +2370,27 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     MainActor.assumeIsolated {
                         ticks += 1
                         let stillTracking = fixture.window.stableMenuPresenter.openMenu === root
-                        guard openings == 0, stillTracking, attempt == attempts, ticks <= 40 else {
+                        // Validate object identity even when tracking has just ended or the
+                        // readiness budget expired; those exits must not mask corruption.
+                        guard retainedObjectsAreValid?() == true else {
+                            identityViolation = true
                             driverTimer.invalidate()
-                            if openings == 0, stillTracking { root.cancelTracking() }
+                            root.cancelTracking()
                             return
                         }
-                        // The projection refresh can insert or replace root items while the menu
-                        // tracks, so the target's index is re-resolved every tick; if the item
-                        // itself was rebuilt, abandon this session and let a retry reopen fresh.
-                        guard let targetIndex = root.items.firstIndex(where: { $0.submenu === submenuBox.submenu }) else {
+                        guard openings == 0, stillTracking, attempt == attempts, ticks <= 40 else {
+                            driverTimer.invalidate()
+                            if openings == 0, stillTracking {
+                                root.cancelTracking()
+                            }
+                            return
+                        }
+                        // Missing/replaced objects are invariant violations, not AppKit input
+                        // readiness. Record them irreversibly before ending this tracking loop.
+                        guard retainedIdentityIsValid(),
+                              let targetIndex = root.items.firstIndex(where: { $0.submenu === submenuBox.submenu })
+                        else {
+                            identityViolation = true
                             driverTimer.invalidate()
                             root.cancelTracking()
                             return
@@ -2323,7 +2402,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                             mayStep = true
                         } else {
                             stallTicks += 1
-                            if stallTicks >= 4 { mayStep = true }
+                            if stallTicks >= 4 {
+                                mayStep = true
+                            }
                         }
                         if highlightedIndex == targetIndex {
                             postKey(124, character: "\u{F703}")
@@ -2338,19 +2419,31 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                 }
                 driver = timer
                 RunLoop.main.add(timer, forMode: .common)
+                if let afterDriverStarted {
+                    afterDriverStarted(root, submenu)
+                    return // Let the registered driver observe the injected state before keys.
+                }
                 for _ in 0 ... submenuIndex {
                     postKey(125, character: "\u{F701}")
                 }
                 postKey(124, character: "\u{F703}")
             })
             driver?.invalidate()
-            if openings == 0 {
+            // Presenter ownership normally clears on cancellation. The retained objects,
+            // however, must stay unchanged even if no timer callback observed the last state.
+            if retainedObjectsAreValid?() == false {
+                identityViolation = true
+            }
+            if openings == 0 || identityViolation {
                 // A dead tracking loop can leave a backlog of unconsumed synthetic key events
                 // that would otherwise land in the next attempt's fresh session; spinning the
                 // main run loop does not dequeue NSApplication's event queue, so drain and
                 // discard pending key events before letting the run loop settle.
                 while NSApp.nextEvent(matching: .keyDown, until: .distantPast, inMode: .default, dequeue: true) != nil {}
                 RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.4))
+            }
+            if identityViolation {
+                throw NativeSubmenuTrackingError.identityChanged
             }
         }
         withExtendedLifetime(observer) {}
@@ -2392,8 +2485,11 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         addTeardownBlock {
             await MainActor.run {
                 GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
-                if let oldShowEmpty { UserDefaults.standard.set(oldShowEmpty, forKey: key) }
-                else { UserDefaults.standard.removeObject(forKey: key) }
+                if let oldShowEmpty {
+                    UserDefaults.standard.set(oldShowEmpty, forKey: key)
+                } else {
+                    UserDefaults.standard.removeObject(forKey: key)
+                }
             }
         }
         let providerAttempts = LifecycleRecorder()
