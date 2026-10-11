@@ -7537,6 +7537,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Direct user consent from the dashboard, not an Agent/MCP invocation. Capture the displayed
     /// incarnation and compare it synchronously at commit; the tool's route-proof path stays separate.
+    /// Intentionally gates on agent_session_link only: direct user consent is not the become_overseer
+    /// MCP tool. MCP bootstrap additionally requires become_overseer availability and its route proof.
     func enableOverseerFromToolbar(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         expected: AgentSessionOverseerBootstrapState,

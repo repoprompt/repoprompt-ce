@@ -1580,6 +1580,52 @@ enum AgentMonitorNoticeFormatter {
     }
 }
 
+// MARK: - Overseer opt-in presentation
+
+/// Popover-local feedback, never activation authority. Every completion belongs to one request on
+/// one endpoint; a rebind retires it even if the async operation itself has already committed.
+struct AgentMonitorOverseerEnableState: Equatable {
+    struct Request: Equatable {
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let token: UUID
+    }
+
+    private(set) var endpoint: DomainAgentSessionLinkEndpointIdentity?
+    private(set) var request: Request?
+    private(set) var failureMessage: String?
+
+    func isBusy(for endpoint: DomainAgentSessionLinkEndpointIdentity?) -> Bool {
+        self.endpoint == endpoint && request != nil
+    }
+
+    func failure(for endpoint: DomainAgentSessionLinkEndpointIdentity?) -> String? {
+        self.endpoint == endpoint ? failureMessage : nil
+    }
+
+    mutating func rebind(to endpoint: DomainAgentSessionLinkEndpointIdentity?) {
+        guard self.endpoint != endpoint else { return }
+        self.endpoint = endpoint
+        request = nil
+        failureMessage = nil
+    }
+
+    mutating func begin(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Request? {
+        rebind(to: endpoint)
+        guard request == nil else { return nil }
+        let request = Request(endpoint: endpoint, token: UUID())
+        self.request = request
+        failureMessage = nil
+        return request
+    }
+
+    mutating func complete(_ request: Request, enabled: Bool) {
+        // Qualify all completion writes, including clearing busy state, against the live owner.
+        guard endpoint == request.endpoint, self.request == request else { return }
+        self.request = nil
+        failureMessage = enabled ? nil : "Could not enable overseer mode. The session changed or agent_session_link is disabled; reopen this dashboard and try again."
+    }
+}
+
 // MARK: - Resolved preview
 
 /// Presentation only: readiness and explicit retry re-resolve unchanged input; Add still authorizes.

@@ -102,8 +102,7 @@ struct AgentMonitorPopoverView: View {
             .map { _ in () }.eraseToAnyPublisher()
     )
     @State private var isWorking = false
-    @State private var isEnablingOverseer = false
-    @State private var overseerEnableFailure: String?
+    @State private var overseerEnableState = AgentMonitorOverseerEnableState()
     /// One busy gate per generation-qualified row. Navigation, acknowledgement, durable Unlink, and
     /// Auto-wake changes must not race from the same stale projection.
     ///
@@ -233,14 +232,18 @@ struct AgentMonitorPopoverView: View {
         .onChange(of: visibleRowKeys) { _, _ in
             pruneRetiredRowState()
         }
-        .onAppear { refreshPreview() }
+        .onAppear {
+            overseerEnableState.rebind(to: props.endpoint)
+            refreshPreview()
+        }
         .onChange(of: props.sessionID) { _, _ in refreshPreview() }
-        .onChange(of: props.endpoint) { _, _ in overseerEnableFailure = nil }
+        .onChange(of: props.endpoint) { _, endpoint in overseerEnableState.rebind(to: endpoint) }
         .onChange(of: existingOutboundTargetIDs) { _, _ in refreshPreview() }
         .onDisappear {
             // Presentation only. The revocation itself already committed and stays committed.
             undoExpiryTask?.cancel()
             undoExpiryTask = nil
+            overseerEnableState.rebind(to: nil)
         }
     }
 
@@ -254,7 +257,7 @@ struct AgentMonitorPopoverView: View {
                 enableOverseer()
             }
             .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            .disabled(enabled || props.hasInbound || props.overseerBootstrapState == nil || isEnablingOverseer)
+            .disabled(enabled || props.hasInbound || props.overseerBootstrapState == nil || overseerEnableState.isBusy(for: props.endpoint))
             .accessibilityHint("Enables lane creation for this session without linking an existing session")
             Text("Create overseen lanes without linking an existing session. Enabling applies to this session until it is rebound or the app restarts; it grants no authority over existing sessions.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -264,28 +267,23 @@ struct AgentMonitorPopoverView: View {
             } else if !enabled, props.overseerBootstrapState == nil {
                 messageText("Requires a loaded, user-owned top-level Agent session eligible for oversight.")
             }
-            if let overseerEnableFailure {
-                messageText(overseerEnableFailure)
+            if let failure = overseerEnableState.failure(for: props.endpoint) {
+                messageText(failure)
             }
         }
     }
 
     private func enableOverseer() {
-        guard !isEnablingOverseer, !props.isOverseer, !props.hasInbound, let endpoint = props.endpoint,
-              let expected = props.overseerBootstrapState, expected.activation == nil
+        guard !props.isOverseer, !props.hasInbound, let endpoint = props.endpoint,
+              let expected = props.overseerBootstrapState, expected.activation == nil,
+              let request = overseerEnableState.begin(for: endpoint)
         else { return }
-        isEnablingOverseer = true
-        overseerEnableFailure = nil
         Task { @MainActor in
             let enabled = await AgentSessionLinkRuntimeBridge.shared.enableOverseerFromToolbar(
                 endpoint: endpoint, expected: expected
             )
-            isEnablingOverseer = false
-            // Feedback belongs only to the incarnation displayed when the user opted in.
-            guard props.endpoint == endpoint else { return }
-            if !enabled {
-                overseerEnableFailure = "Could not enable overseer mode. The session changed or the oversight tool is disabled; reopen this dashboard and try again."
-            }
+            // @State is the live presentation owner; captured props cannot observe a rebind.
+            overseerEnableState.complete(request, enabled: enabled)
         }
     }
 
