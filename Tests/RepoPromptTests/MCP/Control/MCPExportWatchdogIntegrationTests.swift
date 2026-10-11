@@ -4664,6 +4664,11 @@ import XCTest
         private var responseInterceptors: [Int: @Sendable (String) async throws -> String] = [:]
         private var interceptingResponses: [Int: InterceptingResponse] = [:]
         private var isClosed = false
+        private var notificationObserver: (@Sendable (Data) -> Void)?
+
+        func observeNotifications(_ observer: @escaping @Sendable (Data) -> Void) {
+            withStateLock { notificationObserver = observer }
+        }
 
         init(fd: Int32) {
             self.fd = fd
@@ -4872,6 +4877,8 @@ import XCTest
                 guard object["method"] as? String != nil else {
                     throw ClientError.invalidResponse
                 }
+                let observer = withStateLock { notificationObserver }
+                observer?(line)
                 return true
             } catch {
                 close(with: error)

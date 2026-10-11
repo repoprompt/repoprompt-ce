@@ -26,8 +26,8 @@ public enum ProviderEndpointConsentPolicy {
         else { return nil }
         components.scheme = scheme
         components.percentEncodedHost = components.percentEncodedHost?.lowercased()
-        while components.path.hasSuffix("/") {
-            components.path.removeLast()
+        while components.percentEncodedPath.hasSuffix("/") {
+            components.percentEncodedPath.removeLast()
         }
         return components.url?.absoluteString
     }

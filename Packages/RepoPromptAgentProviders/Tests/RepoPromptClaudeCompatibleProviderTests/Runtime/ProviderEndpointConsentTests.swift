@@ -14,6 +14,38 @@ final class ProviderEndpointConsentTests: XCTestCase {
         XCTAssertNoThrow(try ProviderEndpointConsentPolicy.validate("https://provider.example/api", credentialBearing: true, consentEndpoint: nil))
     }
 
+    func testEncodedPathSeparatorsRemainDistinctForEndpointConsent() throws {
+        let encoded = "http://provider.example/team%2Fmodel"
+        let structural = "http://provider.example/team/model"
+        XCTAssertEqual(ProviderEndpointConsentPolicy.endpointIdentity(encoded + "/"), encoded)
+        XCTAssertEqual(ProviderEndpointConsentPolicy.endpointIdentity("http://provider.example/team%2F"), "http://provider.example/team%2F")
+        XCTAssertEqual(ProviderEndpointConsentPolicy.endpointIdentity("https://provider.example/api///"), "https://provider.example/api")
+        XCTAssertNotEqual(ProviderEndpointConsentPolicy.endpointIdentity(encoded), ProviderEndpointConsentPolicy.endpointIdentity(structural))
+        XCTAssertThrowsError(try ProviderEndpointConsentPolicy.validate(encoded + "/", credentialBearing: true, consentEndpoint: structural)) { error in
+            guard case ProviderEndpointConsentPolicy.ValidationError.consentRequired = error else {
+                return XCTFail("Wrong error: \(error)")
+            }
+        }
+        XCTAssertNoThrow(try ProviderEndpointConsentPolicy.validate(encoded + "/", credentialBearing: true, consentEndpoint: encoded))
+    }
+
+    func testClaudeLaunchPreservesEncodedInteriorAndTerminalSeparators() throws {
+        for endpoint in ["http://provider.example/team%2Fmodel/", "http://provider.example/team%2F"] {
+            let intendedEndpoint = endpoint.hasSuffix("/") ? String(endpoint.dropLast()) : endpoint
+            let config = ClaudeCompatibleBackendConfig(
+                id: .custom,
+                isEnabled: true,
+                displayName: "Test",
+                baseURL: endpoint,
+                auth: .anthropicAuthToken,
+                modelBehavior: .noModel,
+                httpCredentialConsentEndpoint: intendedEndpoint
+            ).normalized
+            let environment = try ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: "test-only-token")
+            XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], intendedEndpoint)
+        }
+    }
+
     func testLocalCompatibilityUsesOnlyLiteralLoopbackClassification() throws {
         for host in ["localhost", "127.0.0.1", "127.255.1.2", "[::1]"] {
             let endpoint = "http://\(host):8080/api"
