@@ -239,9 +239,13 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             notifications.append(notification)
             let stored = fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
             XCTAssertEqual(stored?.endpoint, fixture.endpoint)
-            // Queue presentation is derived live; this fixture has no pending updates.
+            XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+            // Queue and bootstrap presentation are derived live, not stored in the bridge projection.
             var expectedDisplay = stored
             expectedDisplay?.pendingUpdates = .empty
+            expectedDisplay?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+            )
             XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor, expectedDisplay)
         }
 
@@ -796,8 +800,13 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
 
         XCTAssertEqual(viewModel.test_statusPillsSnapshotBuildCount, 1)
         XCTAssertEqual(notificationCount(), 1)
-        var expected = viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+        let stored = viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
+        XCTAssertNil(stored?.overseerBootstrapState, "UI-only consent state must not enter bridge storage")
+        var expected = stored
         expected?.pendingUpdates = .empty
+        expected?.overseerBootstrapState = AgentSessionOverseerBootstrapState(
+            sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
+        )
         XCTAssertNotNil(expected)
         XCTAssertEqual(monitorAtNotification, expected)
         XCTAssertEqual(monitorAtNotification?.outbound.count, 2)
