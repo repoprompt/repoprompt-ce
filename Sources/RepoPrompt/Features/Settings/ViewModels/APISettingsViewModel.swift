@@ -3927,6 +3927,9 @@ public class APISettingsViewModel: ObservableObject {
         if lowered.contains("stdio") {
             return "Installed Grok Build CLI does not advertise the ACP stdio subcommand. Update Grok Build and ensure `grok agent --help` lists `stdio`."
         }
+        if lowered.contains("authentication required") {
+            return "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Keys, then try Connect again."
+        }
         return message
     }
 

@@ -317,7 +317,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
 
         for row in cases {
             let error = NSError(
-                domain: "APISettingsViewModelGrokBuildMessageTests",
+                domain: "GrokBuildSettingsConnectMessage",
                 code: -32000,
                 userInfo: [NSLocalizedDescriptionKey: row.input]
             )
