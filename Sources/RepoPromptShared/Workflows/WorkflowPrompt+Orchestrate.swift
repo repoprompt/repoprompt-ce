@@ -159,6 +159,22 @@ Take the plan (from \(builderName) or a user-provided plan file) and break it in
 
 ## Phase 3: Dispatch
 
+### Choose the control path before acting
+
+Child control and oversight are different authorities. `agent_run` children are the default path when oversight is unavailable; `agent_session_link` is only for an Agent caller with a current exact direct link and the advertised tool. Never use either as a workaround for a denial from the other, infer transitive grants, or fall back to an implicit primary checkout.
+
+- **Managed top-level lane:** require the existing target's current exact `manage` grant in the newest inventory. Under your own user's instruction, use `agent_session_link op=steer` for initial assignments and resumes, even while idle. `send` is bounded coordination, not managed direction. `create_lane` makes your own top-level lane without inherited grants; its optional `message` also uses coordination framing. For a managed assignment, create without a message, verify the returned lane/grant and execution location, then `steer`. A lane is not an `agent_run` child.
+- **Execution-location change:** for such a managed target, an active target cannot self-rebind. When your user's scope authorizes stopping that exact managed target, inspect its current pending interaction first; never use Stop to bypass a prompt or decision gate. Stop with a fresh key, confirm the run settled and binding readiness (idle provider, no queued work or pending interaction), then use `manage_worktree` with the exact `session_id` to create/bind. Verify the durable binding, physical path, HEAD, full porcelain, and source routing before managed `steer` resumes work. Stop is not Unlink and does not delete the session. A busy or denied binding is not permission to migrate mid-run.
+- **Child alternative:** start your own child explicitly bound at creation with `agent_run op=start` plus `worktree`/`worktree_id`, or `worktree_create=true` and explicit repository/base/branch. Verify the returned binding before relying on its results. Start-only binding arguments do not belong on `steer`.
+- **Interrupted or failed creation:** inspect exact session/worktree/operation state before retrying. A durable worktree may exist despite a failed or interrupted reply. For child-start preparation failure, reconcile provider-not-started, allocated-child cleanup/no orphan, and retained worktree/binding state; reuse a surviving intended worktree rather than create duplicates. Retry only after a reconciled, retryable state change, with a bounded attempt; identical failure without change goes to the user.
+- **Read-only progress:** binding failure need not block separately authorized explicit-path immutable source or GitHub reads. Re-attest their exact checkout/HEAD and scope; do not bypass a denied mutation or use task-aware tools with untrusted routing.
+
+### Pending interactions and outcome gates
+
+Inspect the actual current `pending_interaction` via managed `poll`/`wait` (or your child's `agent_run` snapshot), not a preview. Use `respond` only for the exact current `interaction_id` and a respondable option under your user's instruction. Handle routine, scoped prompts promptly when authorized; manual-only, ambiguous, scope-expanding, destructive, or genuine user decisions belong to the user/root coordinator through an authorized reporting path. Refresh if the ID changes; never replay an approval or route around it with a message, Stop, or another agent.
+
+Status previews may be stale. Verify current child/ticket receipts and logs: queued, running, interrupted, canceled, or no-matching-tests is not a pass. Record the actual command exit and HEAD before/after a validation-only preflight; HEAD must be unchanged. Piping a preflight to `tail` can hide its failure: capture the producer's exit (or use `pipefail`), not the last pipeline command's success. Preserve explicit approval/conflict gates: when told not to approve on conflict, do not post approval while conflict remains; report it and obtain authorized resolution. Use only operations actually advertised for this caller; do not invent pin tools.
+
 ### Default: fresh agent per item
 
 For multi-item work, dispatch a **fresh agent per item**. The plan file provides continuity — each agent reads it first, sees what's already done, and reasons with a clean context budget.

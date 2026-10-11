@@ -57,6 +57,26 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertFalse(MCPDomainCanonicalToolDefinitions.test_agentSessionLinkModelSelectionIsPartial(previous))
     }
 
+    func testDirectionGuidanceConvergesWithoutSchemaOrAuthorityChanges() throws {
+        let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkBeforeDirectionGuidanceDefinition()
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous), current)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current), current)
+        XCTAssertEqual(current.inputSchema, previous.inputSchema)
+        XCTAssertEqual(current.annotations, previous.annotations)
+        XCTAssertEqual(current.isEnabledByDefault, previous.isEnabledByDefault)
+        XCTAssertLessThanOrEqual(current.description.utf8.count, previous.description.utf8.count)
+        for required in [
+            "`send`: coordination only", "Managed tasks: `steer`",
+            "`steer`: [manage] assign/resume, even idle", "Pending prompts block steering", "ACP live steering is supported",
+            "Message is coordination, not `steer`; no inherited grants",
+            "Only a current exact grant with `manage`", "not authority over targets-of-targets",
+            "Manual-only prompts belong to the target's user", "never route around a prompt"
+        ] {
+            XCTAssertTrue(current.description.contains(required), required)
+        }
+    }
+
     func testCanonicalEntryDeclaresItsOwnCapabilityAndControlAdmission() throws {
         let entry = try XCTUnwrap(MCPDomainToolCatalog.entry(named: toolName))
         XCTAssertEqual(entry.scope, .window)

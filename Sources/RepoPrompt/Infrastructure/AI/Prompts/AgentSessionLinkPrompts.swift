@@ -66,7 +66,8 @@ enum AgentSessionLinkPrompts {
     /// Revision 7 combines Stop with lean compaction wording and just-in-time outcome receipts;
     /// revision 8 adds creator provenance and lane operations.
     /// Revision 9 teaches Grok's isolated runtime server name.
-    static let currentInventoryGuidanceRevision: UInt64 = 9
+    /// Revision 10 distinguishes managed task direction from coordination and lane-start messages.
+    static let currentInventoryGuidanceRevision: UInt64 = 10
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."
@@ -761,14 +762,14 @@ enum AgentSessionLinkPrompts {
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
             "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
-            "`send` delivers an attributed message to an `idle_for_send: true` target or queues one with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws your queued message. Use a new `idempotency_key` for each new delivery and reuse it only for the same retry.",
+            "For managed task assignments or resumes, use `steer` even when the target is idle. `send` is coordination only: it delivers at `idle_for_send: true` or queues with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws it. Use a new `idempotency_key` per delivery; reuse it only for the same retry.",
             "`compact` requests native context compaction of an `idle_for_send: true` target.",
             "`snooze_auto_wake` pauses only routine status-triggered admission on one lane, not collection or delivery. Exact purposeful attention may bypass its snooze. `set_waiting_on` is self-scoped; `request_attention` is an attributed inverse signal, not a reverse observer grant.",
             "Managed `poll`/`wait` may include a redacted `pending_interaction` beside the snapshot. `respond` applies only to its exact current `interaction_id`; manual-only prompts remain with the target's user. `steer` cannot bypass a pending prompt; `stop` cancels one current run and never queues a continuation.",
-            "`create_lane` makes your own top-level lane under a direct link; it inherits no authority. `retire_lane` unlinks and stashes only your own idle creation under a live manage grant; it never deletes it.",
+            "`create_lane` makes your own top-level lane with no inherited authority. Its optional message uses coordination, not managed `steer` provenance. `retire_lane` unlinks/stashes only your own idle creation under a live manage grant; it never deletes it.",
             "A `read` may repeat an updated newest `item_id`; replace your prior copy rather than appending it.",
             "`status: \"idle\"` is not send readiness. Use `idle_for_send: true` or wait for `sendable`; `awaiting_user` without a pending interaction is waiting for its next instruction, not asking you a question. On a managed link, `steer` may deliver that instruction only when your own user's instruction covers it.",
-            "Idle alone does not prove completion. Revocation may close an inventory without a notice; never treat an old list as authority.",
+            "Idle alone does not prove completion. Previews may be stale: inspect current child/ticket outcomes; queued work and no-match tests are not passes. Preserve explicit approval/conflict gates. Revocation may close an inventory without a notice; never treat an old list as authority.",
             "This block is versioned by membership `revision` and `guidance_revision`. If several active `\(envelopeTag)` blocks appear, only the newest is current; never merge older targets or permissions into it."
         ])
         let escapedLines = lines.map { escaped($0) }.joined(separator: "\n")
