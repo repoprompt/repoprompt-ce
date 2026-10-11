@@ -792,11 +792,17 @@ private enum AppSettingsMCPRegistry {
         stringEnumSetting(
             key: "context_builder.agent",
             group: "context_builder",
-            description: "CLI agent used by the Context Builder MCP tool.",
+            description: "CLI agent used by the Context Builder MCP tool. Reads may return a saved ID outside allowed_values, which lists accepted writes.",
             allowedValues: AgentProviderKind.allCases
                 .filter { AgentModelCatalog.AgentSelectionSurface.headless.allows($0) }
                 .map(\.rawValue),
-            read: { .string(contextBuilderAgent(in: $0.globalAgentModelsProfile()).rawValue) },
+            read: { store in
+                let profile = store.globalAgentModelsProfile()
+                if hasUnusableSavedContextBuilderAgent(in: profile), let agentRaw = profile.contextBuilderAgentRaw {
+                    return .string(agentRaw)
+                }
+                return .string(contextBuilderAgent(in: profile).rawValue)
+            },
             write: { store, value in
                 let agentRaw = try requiredString(from: value)
                 let kind = AgentProviderKind(rawValue: agentRaw) ?? .claudeCode
@@ -815,9 +821,10 @@ private enum AppSettingsMCPRegistry {
         optionalModelRawSetting(
             key: "context_builder.model",
             group: "context_builder",
-            description: "Model raw identifier used by the Context Builder MCP tool.",
+            description: "Model raw identifier used by the Context Builder MCP tool. When the saved agent is unusable, the model reads null, a null write does nothing, and a non-null write repairs the agent.",
             read: { store in
                 let profile = store.globalAgentModelsProfile()
+                guard !hasUnusableSavedContextBuilderAgent(in: profile) else { return .null }
                 let agent = contextBuilderAgent(in: profile)
                 return stringOrNull(profile.contextBuilderModelsByAgent?[agent.rawValue])
             },
@@ -835,7 +842,9 @@ private enum AppSettingsMCPRegistry {
             afterWrite: postRecommendationsDidApply,
             candidateProvider: agentModelRawCandidates,
             defaultOptionsAgent: { store in
-                contextBuilderAgent(in: store.globalAgentModelsProfile())
+                let profile = store.globalAgentModelsProfile()
+                guard !hasUnusableSavedContextBuilderAgent(in: profile) else { return nil }
+                return contextBuilderAgent(in: profile)
             }
         ),
 
@@ -1688,6 +1697,11 @@ private enum AppSettingsMCPRegistry {
             truncated: truncated,
             notes: notes
         )
+    }
+
+    private static func hasUnusableSavedContextBuilderAgent(in profile: AgentModelsSettingsProfile) -> Bool {
+        guard let agentRaw = profile.contextBuilderAgentRaw else { return false }
+        return contextBuilderAgent(in: profile).rawValue != agentRaw
     }
 
     /// Stored configuration is independent of runtime provider availability.
