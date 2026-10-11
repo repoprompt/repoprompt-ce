@@ -351,8 +351,8 @@ final class AutoRecommendationEngine {
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restores a usable saved Context Builder agent, using its catalog default when the saved model is absent or blank.
+    /// Invalid nonempty models or unavailable agents fall back through the same recommendation ranking as the wizard.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
@@ -360,19 +360,27 @@ final class AutoRecommendationEngine {
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
-           !modelRaw.isEmpty,
            AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
-           AgentModelCatalog.isAgentAvailable(agent, availability: availability),
-           isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
+           AgentModelCatalog.isAgentAvailable(agent, availability: availability)
         {
-            return AgentModelCatalog.normalizeSelection(
-                agentRaw: agent.rawValue,
-                modelRaw: modelRaw,
-                availability: availability,
-                surface: .headless
-            )
+            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if modelRaw.isEmpty {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: nil,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
+            if isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability) {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: modelRaw,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
         }
 
         let status = ProviderStatusSnapshot(
