@@ -770,7 +770,9 @@ final class DomainWorkspacePresentationBridge {
             }
         }
         // Presentation-only availability, never a write to authoritative membership. The existing
-        // incomplete-catalog warning carries the failed IDs and keeps valid rows usable.
+        // incomplete-catalog warning carries the failed IDs and keeps valid rows usable. The manager
+        // retains last-known models for unavailable members; do not cache failed decodes here,
+        // otherwise an unchanged failed digest could incorrectly take the metadata fast path.
         let available = DomainWorkspaceCatalogSnapshot(
             runtimeIdentity: snapshot.runtimeIdentity, isBootstrapped: snapshot.isBootstrapped,
             publicationSequence: snapshot.publicationSequence, catalogRevision: snapshot.catalogRevision,
