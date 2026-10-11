@@ -300,6 +300,35 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(detail.contains("XAI_API_KEY"))
     }
 
+    @MainActor
+    func testSettingsConnectMessageMapsAuthenticationRequired() {
+        let cases: [(defect: String, input: String, expected: String)] = [
+            (
+                defect: "Reported authentication-required fallthrough",
+                input: "ACP request failed: Authentication required: no auth method id provided (code -32000)",
+                expected: "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Keys, then try Connect again."
+            ),
+            (
+                defect: "Matching on -32000, auth or authentication alone",
+                input: "ACP request failed: Authentication service unavailable (code -32000)",
+                expected: "ACP request failed: Authentication service unavailable (code -32000)"
+            )
+        ]
+
+        for row in cases {
+            let error = NSError(
+                domain: "APISettingsViewModelGrokBuildMessageTests",
+                code: -32000,
+                userInfo: [NSLocalizedDescriptionKey: row.input]
+            )
+            XCTAssertEqual(
+                APISettingsViewModel.friendlyGrokBuildMessage(for: error),
+                row.expected,
+                row.defect
+            )
+        }
+    }
+
     // MARK: - ACPDirectSessionModelProvider
 
     func testSessionModelStateParsesIntoDiscoveredModels() throws {

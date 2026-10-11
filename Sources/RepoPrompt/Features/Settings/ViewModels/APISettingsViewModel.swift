@@ -3871,7 +3871,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             isGrokBuildConnected = false
             setContextBuilderProviderVerified(.grokBuild, verified: false)
-            grokBuildError = friendlyGrokBuildMessage(for: error)
+            grokBuildError = Self.friendlyGrokBuildMessage(for: error)
             UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
             stopGrokBuildModelsSubscription(clearModels: true)
             await updateAvailableModels()
@@ -3902,7 +3902,7 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
-    private func friendlyGrokBuildMessage(for error: Error) -> String {
+    static func friendlyGrokBuildMessage(for error: Error) -> String {
         if let providerError = error as? AIProviderError {
             switch providerError {
             case let .invalidConfiguration(detail):
