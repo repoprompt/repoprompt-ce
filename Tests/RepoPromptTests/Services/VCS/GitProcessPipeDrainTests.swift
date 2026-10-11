@@ -109,7 +109,69 @@ final class GitProcessPipeDrainTests: XCTestCase {
             try GitReadSafety.validateDriverConfiguration(merge, for: ["status", "--porcelain"])
             XCTAssertThrowsError(try GitReadSafety.validateDriverConfiguration(filter, for: ["status"]))
             XCTAssertThrowsError(try GitReadSafety.validateDriverConfiguration(merge, for: ["merge-tree"]))
+            XCTAssertThrowsError(try GitReadSafety.validateDriverConfiguration(filter, for: ["merge-tree"]))
             XCTAssertFalse(GitReadSafety.needsDriverCheck(["diff-tree", "HEAD"]))
+        }
+
+        func testHookPathInspectionReportsConfiguredPathWithoutExecutingHook() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "before\n"])
+            let (script, marker) = try makeMarkerScript(fixture)
+            let service = GitService()
+            for hooks in [repo.appendingPathComponent(".git/hooks"), fixture.sandbox.appendingPathComponent("custom-hooks")] {
+                try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
+                let hook = hooks.appendingPathComponent("post-checkout")
+                try FileManager.default.copyItem(at: script, to: hook)
+                if hooks.lastPathComponent == "custom-hooks" {
+                    try fixture.runGit(["config", "core.hooksPath", hooks.path], at: repo)
+                }
+                let args = ["rev-parse", "--git-path", "hooks/post-checkout"]
+                let expected = try fixture.runGit(args, at: repo)
+                let (output, _, code) = try await service.runGitDataForTesting(args, at: repo, env: ["HOME": fixture.sandbox.path])
+                XCTAssertEqual(code, 0)
+                XCTAssertEqual(String(decoding: output, as: UTF8.self), expected)
+                let path = expected.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resolved = path.hasPrefix("/") ? URL(fileURLWithPath: path) : repo.appendingPathComponent(path)
+                XCTAssertEqual(resolved.standardizedFileURL, hook.standardizedFileURL)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: resolved.path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            }
+        }
+
+        func testMergeTreeRenormalizationRefusesRepositoryFilterIncludingSpoolPath() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try fixture.makeRepository(named: "repo", files: ["file.txt": "first\nmiddle\nlast\n"])
+            try fixture.runGit(["checkout", "-b", "source"], at: repo)
+            try fixture.write("source\nmiddle\nlast\n", to: "file.txt", at: repo)
+            try fixture.stage("file.txt", at: repo)
+            try fixture.commit("Source change", at: repo)
+            try fixture.runGit(["checkout", "main"], at: repo)
+            try fixture.write("first\nmiddle\ntarget\n", to: "file.txt", at: repo)
+            try fixture.stage("file.txt", at: repo)
+            try fixture.commit("Target change", at: repo)
+            let (script, marker) = try makeMarkerScript(fixture)
+            try fixture.write("*.txt filter=inspection\n", to: ".git/info/attributes", at: repo)
+            try fixture.runGit(["config", "filter.inspection.clean", shellCommand(script.path)], at: repo)
+            try fixture.runGit(["config", "merge.renormalize", "true"], at: repo)
+            let args = ["merge-tree", "--write-tree", "--name-only", "--no-messages", "main", "source"]
+            _ = try? fixture.runGit(args, at: repo)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "renormalization positive control")
+            try FileManager.default.removeItem(at: marker)
+            let service = GitService()
+            do {
+                _ = try await service.predictWorktreeMergeConflicts(sourceHead: "source", targetHead: "main", at: repo)
+                XCTFail("Merge preview must refuse the repository filter")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("repository-configured executable"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            do {
+                _ = try await service.runGitSpoolingForTesting(args, at: repo)
+                XCTFail("Spooling merge-tree must refuse the repository filter")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("repository-configured executable"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         }
 
         func testStatusDoesNotExecuteConfiguredFsmonitorIncludingSpoolPath() async throws {

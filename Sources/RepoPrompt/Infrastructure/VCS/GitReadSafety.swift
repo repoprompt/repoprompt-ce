@@ -77,8 +77,11 @@ enum GitReadSafety {
     static func arguments(_ arguments: [String]) -> [String] {
         guard isRead(arguments), let index = commandIndex(in: arguments) else { return arguments }
         let command = arguments[index]
-        // A config read must report the real configuration, not our overrides.
-        if command == "config" { return arguments }
+        // Config and path reads must report the real configuration, not our
+        // overrides. In particular, hooksPath must not hide a post-checkout
+        // hook from the tracked-checkout clone eligibility probe. These
+        // metadata-only commands do not execute the configured hooks.
+        if command == "config" || (command == "rev-parse" && arguments[(index + 1)...].contains("--git-path")) { return arguments }
         let options: [String] = switch command {
         case "status": ["--ignore-submodules=dirty"]
         case "diff": ["--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"]
@@ -103,7 +106,10 @@ enum GitReadSafety {
     /// drivers remain user-managed. Malformed output fails closed.
     static func validateDriverConfiguration(_ data: Data, for arguments: [String]? = nil) throws {
         let command = arguments.flatMap { args in commandIndex(in: args).map { args[$0] } }
-        let checksFilters = command.map { ["status", "ls-files", "diff", "blame", "cat-file"].contains($0) } ?? true
+        // Merge renormalization can run filters. Conservatively refuse local
+        // filters for merge-tree even when renormalization is currently off;
+        // callers receive the same explicit trusted-workflow error as other reads.
+        let checksFilters = command.map { ["status", "ls-files", "diff", "blame", "cat-file", "merge-tree"].contains($0) } ?? true
         let checksMergeDrivers = command.map { ["log", "show", "merge-tree"].contains($0) } ?? true
         guard data.isEmpty || data.last == 0,
               let text = String(data: data, encoding: .utf8)
