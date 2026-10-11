@@ -746,7 +746,11 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 "op": .string("options"),
                 "key": .string("context_builder.model")
             ])
-            XCTAssertNil(options.objectValue?["filters"]?.objectValue?["agent"])
+            XCTAssertEqual(
+                options.objectValue?["filters"]?.objectValue?["agent"]?.stringValue,
+                "claudeCode",
+                "implicit options target the model writer's agent"
+            )
 
             let set = try await service.handleForTesting([
                 "op": .string("set"),

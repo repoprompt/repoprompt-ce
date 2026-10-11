@@ -821,7 +821,7 @@ private enum AppSettingsMCPRegistry {
         optionalModelRawSetting(
             key: "context_builder.model",
             group: "context_builder",
-            description: "Model raw identifier used by the Context Builder MCP tool. When the saved agent is unusable, the model reads null, a null write does nothing, and a non-null write repairs the agent.",
+            description: "Context Builder model raw ID. Unusable saved agent: reads null; null is a no-op; non-null sets agent claudeCode.",
             read: { store in
                 let profile = store.globalAgentModelsProfile()
                 guard !hasUnusableSavedContextBuilderAgent(in: profile) else { return .null }
@@ -842,9 +842,7 @@ private enum AppSettingsMCPRegistry {
             afterWrite: postRecommendationsDidApply,
             candidateProvider: agentModelRawCandidates,
             defaultOptionsAgent: { store in
-                let profile = store.globalAgentModelsProfile()
-                guard !hasUnusableSavedContextBuilderAgent(in: profile) else { return nil }
-                return contextBuilderAgent(in: profile)
+                contextBuilderAgent(in: store.globalAgentModelsProfile())
             }
         ),
 
