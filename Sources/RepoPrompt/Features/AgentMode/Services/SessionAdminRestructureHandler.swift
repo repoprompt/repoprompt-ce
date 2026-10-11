@@ -214,7 +214,16 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(.revoked(target))
                 continue
             }
-            await items.append(Self.linkItem(target, host.addLink(observer: observer, target: target)))
+            // The same write-time check as `unlink`, carried into the shared Add and re-proved at its
+            // durable insert and around reservation/activation: a caller-side pre-check alone cannot
+            // cover the Add's own suspensions.
+            let context = context
+            let scope = batch.scope
+            let outcome = await host.addLink(observer: observer, target: target) {
+                context.isStillAuthorized(lease, scope: scope) && context.isMember(observer, ofChainFrom: scope)
+            }
+            if outcome == .revoked { authorityLost = true }
+            items.append(Self.linkItem(target, outcome))
         }
         return SessionAdminReply.batch(
             op: "link", items: items, requiresControl: batch.itemsRequiringControl, preview: batch.request.preview,
@@ -259,6 +268,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         case .alreadyLinked: SessionAdminItemResult(sessionID: target, result: "already_linked")
         case .stopped: SessionAdminItemResult(sessionID: target, result: "unlinked")
         case .notLinked: SessionAdminItemResult(sessionID: target, result: "not_linked")
+        case .revoked: .revoked(target)
         case let .failed(message):
             SessionAdminItemResult(sessionID: target, result: "not_applied", code: "link_failed", fields: ["detail": .string(message)])
         }

@@ -463,6 +463,11 @@ final class AgentSessionOversightLaunchCoordinator {
         if !launchPairOrder.contains(pair) { launchPairOrder.append(pair) }
     }
 
+    /// The token a still-owed cleanup for `pair` would remove, if any.
+    func pendingCleanupToken(for pair: AgentSessionOversightIntent) -> AgentSessionOversightIntentToken? {
+        if case let .cleanupPending(token) = entries[pair]?.state { token } else { nil }
+    }
+
     var hasPendingCleanup: Bool {
         entries.values.contains { if case .cleanupPending = $0.state { true } else { false } }
     }

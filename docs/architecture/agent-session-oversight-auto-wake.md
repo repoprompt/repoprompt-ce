@@ -106,10 +106,11 @@ Rules that hold the scope design together:
 - **Batch cards apply on approval.** `AgentSessionAdministrationFrontDoor` keeps the exact request
   behind each card and, when the user approves, applies it with identical arguments narrowed to the
   ticked items (so the arguments digest the card is bound to matches); the outcome is reported by
-  `confirmation_status` (`applied_result`). The card is claimed with `beginApplying` and settled with
-  `finishApplying`: by the core when the authority still requires the card, otherwise (unticking
-  brought the batch to or below the threshold) by the front door, so a successful application
-  always ends `applied` and a failed one returns the card to `approved`. Undo tokens are
+  `confirmation_status` (`applied_result`). The core is the only claimant: every supplied card is
+  claimed with `beginApplying` and settled with `finishApplying`, including when unticking brought
+  the batch to or below the threshold, so a successful application always ends `applied` and a
+  failed one (a thrown error, or a handler result that refuses the whole batch with a top-level
+  `denied`) returns the card to `approved`. Per-item refusals inside an applied batch consume it. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
 
 Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
@@ -124,6 +125,23 @@ the user's card.
   `observe`; `send_when_idle`/`manage` need `control`). The bridge mints only the default managed set
   and durable intent restores it as such, so a scope without `observe` + `control` cannot create a
   link at all. An existing link is reported as-is and never upgraded.
+- **Delegated Add re-proves its scope inside the link owner.** A caller-side check before
+  `addMonitorLink` cannot cover the Add's own suspensions, so `link` calls
+  `addDelegatedMonitorLink` with exact endpoints and an `AgentSessionLinkDelegatedAddAuthorization`
+  (lease current, target and observer still chain members). The shared durable Add re-proves it
+  synchronously at each commit point, after the preceding hop: inside the pair lane before the
+  durable insert, before and after reservation, immediately before `activateLink`, after
+  activation, and in the caller-side completion fence. A failed proof uses the transaction's existing
+  rollback only: an unactivated reservation is abandoned, only this activation's own grant is
+  revoked, and only a row this insert freshly created is compensated (expected token and assertion
+  generation); a pre-existing or concurrently reasserted row or grant is never removed. A delegated
+  Add that reasserts a row still owing a cleanup (a Stop whose removal failed to write) settles that
+  cleanup only after the outcome: an established link retires it like an interactive Add, a failed
+  one moves it to the new assertion generation so **Retry saving** still removes the row. The
+  `activateLink` hop itself is not divisible from the MainActor: a revocation landing inside it is
+  linearized after the activation and settled by revoking that grant before inventory is published,
+  the same contract the lane-creation fence has. Ordinary user Add and launch restoration carry no
+  delegated authorization and are unchanged.
 - **Placement never moves membership elsewhere.** `reparent` needs the source and destination both
   in the caller's scope chain; `adopt` needs a user card and a user-granted (not nested) scope. Both
   are refused (`placement_affects_other_scopes`, with a count, never other scopes' IDs) if the move

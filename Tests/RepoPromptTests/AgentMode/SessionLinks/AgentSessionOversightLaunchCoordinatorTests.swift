@@ -1368,4 +1368,72 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let restored = await isRestored(fixture)
         XCTAssertTrue(restored, "The grant and the durable row must agree.")
     }
+
+    /// Finding 12 follow-through: a delegated Add that reasserts a row still owing a cleanup, and whose
+    /// scope authority ends after the insert, must not retire that cleanup. Retry still removes the row.
+    func testRevokedDelegatedReassertionKeepsTheOwedCleanupOnTheNewAssertion() async throws {
+        let (fixture, observer, target) = try await seedPendingCleanupWithTargetBack()
+        var authorized = true
+        let pair = pair
+        fixture.bridge.test_afterReservationBeforeActivation = { pendingPair in
+            guard pendingPair == pair else { return }
+            authorized = false
+        }
+
+        let outcome = await fixture.bridge.addDelegatedMonitorLink(
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: { authorized })
+        )
+
+        XCTAssertNotNil(outcome.failureMessage, "a revoked delegated Add must not report success: \(outcome)")
+        XCTAssertTrue(
+            fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry,
+            "the user's failed Stop cleanup is still owed"
+        )
+        await fixture.bridge.retryPendingIntentCleanup()
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNil(token, "Retry saving removes the row despite the delegated reassertion's generation bump")
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+    }
+
+    /// Control: with live authority the same delegated reassertion establishes and retires the cleanup.
+    func testLiveDelegatedReassertionRetiresTheOwedCleanup() async throws {
+        let (fixture, observer, target) = try await seedPendingCleanupWithTargetBack()
+
+        let outcome = await fixture.bridge.addDelegatedMonitorLink(
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: { true })
+        )
+
+        guard case .added = outcome else { return XCTFail("Expected the delegated Add to succeed, got \(outcome)") }
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        await fixture.bridge.retryPendingIntentCleanup()
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNotNil(token, "a retired cleanup never deletes the reasserted row")
+        let restored = await isRestored(fixture)
+        XCTAssertTrue(restored)
+    }
+
+    /// A saved pair whose automatic cleanup failed to write, with the target back and writes working.
+    private func seedPendingCleanupWithTargetBack() async throws -> (
+        Fixture, AgentSessionLinkEndpointCandidate, AgentSessionLinkEndpointCandidate
+    ) {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        fixture.host.candidates = [observer]
+        fixture.host.descriptors = [descriptor(for: observer)]
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        fixture.gate.failsNextWrites = true
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        fixture.gate.failsNextWrites = false
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        return (fixture, observer, target)
+    }
 }

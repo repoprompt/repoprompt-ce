@@ -545,6 +545,134 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         XCTAssertEqual(referenceAfter, referenceBefore, "The pre-existing authority grant remains live.")
     }
 
+    // MARK: - Delegated Add authority (finding 12)
+
+    private func delegatedAdd(
+        _ fixture: Fixture,
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async -> AgentMonitorAddOutcome {
+        await fixture.bridge.addDelegatedMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: isCurrent)
+        )
+    }
+
+    private func assertNothingLeftBehind(_ fixture: Fixture, _ message: String) async {
+        let token = await fixture.store.token(for: fixture.pair)
+        XCTAssertNil(token, message)
+        let snapshot = await fixture.authority.snapshot()
+        XCTAssertEqual(snapshot.activeLinkCount, 0, message)
+        XCTAssertEqual(snapshot.pendingReservationCount, 0, message)
+    }
+
+    func testDelegatedAddWithLiveAuthorityCreatesTheDurableLink() async {
+        let fixture = makeFixture()
+
+        let outcome = await delegatedAdd(fixture) { true }
+
+        guard case .added = outcome else { return XCTFail("live delegated authority must still link: \(outcome)") }
+        let token = await fixture.store.token(for: fixture.pair)
+        XCTAssertNotNil(token)
+        let reference = await liveReference(fixture)
+        XCTAssertNotNil(reference)
+    }
+
+    /// Revoked while the Add was suspended on persistence admission and its lane preconditions: the
+    /// fence immediately before the insert refuses, so nothing durable is written.
+    func testDelegatedAddRevokedBeforeTheDurableInsertWritesNothing() async {
+        let fixture = makeFixture()
+        var authorized = true
+        fixture.bridge.test_beforeDurableAddInsert = { pair in
+            guard pair == fixture.pair else { return }
+            authorized = false
+        }
+
+        let outcome = await delegatedAdd(fixture) { authorized }
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        await assertNothingLeftBehind(fixture, "a revoked delegated Add must not write durable intent")
+    }
+
+    /// Revoked during the insert hop: establishment refuses before reserving and the transaction
+    /// compensates exactly the row it freshly inserted.
+    func testDelegatedAddRevokedAfterTheInsertCompensatesItsOwnFreshRow() async {
+        let fixture = makeFixture()
+        var authorized = true
+        var tokenAtSeam: AgentSessionOversightIntentToken?
+        fixture.bridge.test_afterAddInsertionBeforeEstablishment = { pair in
+            guard pair == fixture.pair else { return }
+            tokenAtSeam = await fixture.store.token(for: pair)
+            authorized = false
+        }
+
+        let outcome = await delegatedAdd(fixture) { authorized }
+
+        XCTAssertNotNil(tokenAtSeam, "the insert committed before the revocation")
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        await assertNothingLeftBehind(fixture, "only this transaction's fresh row is compensated")
+    }
+
+    /// Revoked across the reservation hop: the reservation is abandoned, never activated.
+    func testDelegatedAddRevokedAfterReservationAbandonsIt() async {
+        let fixture = makeFixture()
+        var authorized = true
+        var pendingAtSeam = 0
+        fixture.bridge.test_afterReservationBeforeActivation = { pair in
+            guard pair == fixture.pair else { return }
+            pendingAtSeam = await fixture.authority.snapshot().pendingReservationCount
+            authorized = false
+        }
+
+        let outcome = await delegatedAdd(fixture) { authorized }
+
+        XCTAssertEqual(pendingAtSeam, 1)
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        await assertNothingLeftBehind(fixture, "an abandoned reservation leaves no grant or row")
+    }
+
+    /// Revoked across the activation hop: only this activation's own grant is revoked and only its
+    /// own fresh row compensated.
+    func testDelegatedAddRevokedAcrossActivationRevokesOnlyItsOwnGrant() async {
+        let fixture = makeFixture()
+        var authorized = true
+        var activeAtSeam = 0
+        fixture.bridge.test_afterActivationBeforeDeletionFence = { pair in
+            guard pair == fixture.pair else { return }
+            activeAtSeam = await fixture.authority.snapshot().activeLinkCount
+            authorized = false
+        }
+
+        let outcome = await delegatedAdd(fixture) { authorized }
+
+        XCTAssertEqual(activeAtSeam, 1)
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        await assertNothingLeftBehind(fixture, "the delegated grant and its fresh row are rolled back")
+    }
+
+    /// Ownership: a delegated Add that fails closed must never remove a pre-existing user link.
+    func testRevokedDelegatedAddPreservesAPreExistingUserLinkAndRow() async throws {
+        let fixture = makeFixture()
+        guard case .added = await add(fixture) else { return XCTFail("Expected the user link to be added") }
+        let storedTokenBefore = await fixture.store.token(for: fixture.pair)
+        let tokenBefore = try XCTUnwrap(storedTokenBefore)
+        let referenceBefore = await liveReference(fixture)
+        var authorized = true
+        fixture.bridge.test_afterAddInsertionBeforeEstablishment = { pair in
+            guard pair == fixture.pair else { return }
+            authorized = false
+        }
+
+        let outcome = await delegatedAdd(fixture) { authorized }
+
+        XCTAssertEqual(outcome, .failed(.rebinding))
+        let tokenAfter = await fixture.store.token(for: fixture.pair)
+        let referenceAfter = await liveReference(fixture)
+        XCTAssertEqual(tokenAfter, tokenBefore, "the user's durable row is not compensated away")
+        XCTAssertNotNil(referenceAfter)
+        XCTAssertEqual(referenceAfter, referenceBefore, "the user's live grant is not revoked")
+    }
+
     func testConcurrentExactIncarnationsCannotShareOneDurablePairToken() async throws {
         let fixture = makeFixture()
         let duplicateObserver = makeCandidate(

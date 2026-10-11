@@ -18,6 +18,8 @@ enum SessionAdminLinkOutcome: Equatable {
     case alreadyLinked
     case stopped
     case notLinked
+    /// The delegated authority behind the operation ended before it committed; nothing was left behind.
+    case revoked
     case failed(String)
 }
 
@@ -40,7 +42,14 @@ protocol SessionAdminStructureHost: AnyObject {
     func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>?
     /// Capabilities every link minted through the bridge carries.
     var mintedLinkCapabilities: Set<DomainAgentSessionLinkCapability> { get }
-    func addLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome
+    /// Adds the link through the bridge's shared durable Add with `isStillAuthorized` carried into the
+    /// transaction: it is re-proved at the durable insert and around reservation and activation, so
+    /// authority lost while the Add is suspended fails closed (`.revoked`).
+    func addLink(
+        observer: UUID,
+        target: UUID,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     /// Stops the active link through the bridge's ordinary Stop. `isStillAuthorized` is evaluated
     /// synchronously after the link lookup and right before the Stop.
     func stopLink(

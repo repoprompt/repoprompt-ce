@@ -787,6 +787,8 @@ final class SessionAdminStructureTests: XCTestCase {
         fileprivate var added: [Pair] = []
         fileprivate var stopped: [Pair] = []
         var onActiveLink: (@MainActor () -> Void)?
+        /// Runs where the shared Add suspends (insert, reservation, activation), before its commit fence.
+        var onAddLink: (@MainActor () -> Void)?
         var modelCalls: [(UUID, String)] = []
         var effortCalls: [(UUID, String)] = []
         var lastAuthorization: (@MainActor () -> Bool)?
@@ -825,7 +827,14 @@ final class SessionAdminStructureTests: XCTestCase {
             DomainAgentSessionLinkCapability.managed
         }
 
-        func addLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome {
+        func addLink(
+            observer: UUID,
+            target: UUID,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> SessionAdminLinkOutcome {
+            onAddLink?()
+            // The bridge re-proves the carried authority at its commit points and fails closed.
+            guard isStillAuthorized() else { return .revoked }
             added.append(Pair(observer: observer, target: target))
             links[Pair(observer: observer, target: target)] = DomainAgentSessionLinkCapability.managed
             return .linked
@@ -1163,6 +1172,37 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(rows[a.uuidString]?["code"], .string("scope_revoked"))
         XCTAssertEqual(rows[b.uuidString]?["code"], .string("scope_revoked"))
         XCTAssertTrue(fixture.structure.added.isEmpty, "a revocation mid-op mints nothing")
+    }
+
+    /// Finding 12: the authority checked before the Add is carried into it. Membership churn or a
+    /// revocation landing while the Add itself is suspended fails closed and ends the batch; a live
+    /// scope still links.
+    func testLinkCarriesScopeAuthorityIntoTheAddTransaction() async throws {
+        let fixture = Fixture()
+        let overseer = UUID(), a = UUID(), b = UUID(), c = UUID(), outside = UUID()
+        fixture.provenance.add(overseer, parent: nil)
+        fixture.provenance.add(a, parent: overseer)
+        fixture.provenance.add(b, parent: overseer)
+        fixture.provenance.add(c, parent: overseer)
+        fixture.provenance.add(outside, parent: nil)
+        let scope = try fixture.grant(overseer)
+
+        // Live-scope control: the carried predicate holds, so the link is created.
+        let live = try await fixture.value(.adminLink, caller: overseer, targets: [a])
+        XCTAssertEqual(items(live)[a.uuidString]?["result"], .string("linked"))
+
+        // Membership churn inside the Add: the target leaves the scope's tree mid-transaction.
+        fixture.structure.onAddLink = { fixture.provenance.add(b, parent: overseer, org: outside) }
+        let churned = try await fixture.value(.adminLink, caller: overseer, targets: [b, c])
+        XCTAssertEqual(items(churned)[b.uuidString]?["code"], .string("scope_revoked"))
+        XCTAssertEqual(items(churned)[c.uuidString]?["code"], .string("scope_revoked"), "the batch stops")
+        XCTAssertEqual(fixture.structure.added, [Pair(observer: overseer, target: a)], "nothing new minted")
+
+        // Revocation inside the Add.
+        fixture.structure.onAddLink = { fixture.runtime.revoke(scopeID: scope.id) }
+        let revoked = try await fixture.value(.adminLink, caller: overseer, targets: [c])
+        XCTAssertEqual(items(revoked)[c.uuidString]?["code"], .string("scope_revoked"))
+        XCTAssertEqual(fixture.structure.added, [Pair(observer: overseer, target: a)])
     }
 
     // MARK: - Re-parent and adopt (S9)
@@ -2101,9 +2141,12 @@ final class SessionAdminStructureTests: XCTestCase {
         let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
         let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        // The overseer's tab, live-bound to it: cards are presented and approved only there.
+        let callerTab = UUID()
         let frontDoor = AgentSessionAdministrationFrontDoor(
             core: core, scopes: runtime, projector: projector,
-            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date())
+            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
+            liveBoundSession: { $0 == callerTab ? overseer : nil }
         )
         frontDoor.registerOrganizingHandlers(backend: organizer, links: links)
         let host = StructureHost(provenance: provenance)
@@ -2125,7 +2168,7 @@ final class SessionAdminStructureTests: XCTestCase {
             preview: Bool = false
         ) async throws -> AgentSessionAdministrationOutcome {
             try await frontDoor.perform(.init(
-                operation: operation, caller: .agentSession(overseer), targetSessionIDs: targets,
+                operation: operation, caller: .agentSession(overseer), callerTabID: callerTab, targetSessionIDs: targets,
                 idempotencyKey: key, preview: preview, arguments: args
             ))
         }
@@ -2146,7 +2189,7 @@ final class SessionAdminStructureTests: XCTestCase {
         guard case let .pendingConfirmation(card, _) = try await perform(.adminAdopt, targets: [outsider], key: "adopt") else {
             return XCTFail("adopt is carded")
         }
-        await frontDoor.approveAndApply(confirmationID: card.id)
+        await frontDoor.approveAndApply(confirmationID: card.id, presentedTabID: callerTab, presentedSessionID: overseer)
         XCTAssertEqual(host.placements.single?.session, outsider)
         XCTAssertEqual(host.placements.single?.parent, overseer)
         XCTAssertNotNil(frontDoor.appliedResult(forConfirmation: card.id))
@@ -2186,9 +2229,12 @@ final class SessionAdminStructureTests: XCTestCase {
         let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
         let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        // The overseer's tab, live-bound to it: cards are presented and approved only there.
+        let callerTab = UUID()
         let frontDoor = AgentSessionAdministrationFrontDoor(
             core: core, scopes: runtime, projector: projector,
-            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date())
+            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
+            liveBoundSession: { $0 == callerTab ? overseer : nil }
         )
         var context = SessionAdminHandlerContext(scopes: runtime, projector: projector)
         context.displayName = { names.map[$0] }
@@ -2202,7 +2248,7 @@ final class SessionAdminStructureTests: XCTestCase {
 
         let window = WindowState()
         let endpoint = DomainAgentSessionLinkEndpointIdentity(
-            windowID: window.windowID, workspaceID: workspace, tabID: UUID(), sessionID: overseer,
+            windowID: window.windowID, workspaceID: workspace, tabID: callerTab, sessionID: overseer,
             persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
         )
         let service = SessionAdminMCPToolService(
@@ -2249,7 +2295,7 @@ final class SessionAdminStructureTests: XCTestCase {
 
         // After the user approves (with a descendant unticked), the applied result names the adoptee only.
         runtime.confirmations.setItem(child, ticked: false, confirmationID: cardID)
-        await frontDoor.approveAndApply(confirmationID: cardID)
+        await frontDoor.approveAndApply(confirmationID: cardID, presentedTabID: callerTab, presentedSessionID: overseer)
         let applied = try await call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
         XCTAssertNotNil(applied["applied_result"])
 

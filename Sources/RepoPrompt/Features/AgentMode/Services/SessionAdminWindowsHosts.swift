@@ -52,14 +52,35 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         await bridge().delegationActiveLink(observerSessionID: observer, targetSessionID: target)?.capabilities
     }
 
-    func addLink(observer: UUID, target: UUID) async -> SessionAdminLinkOutcome {
-        let outcome = await bridge().addMonitorLink(
-            pair: AgentSessionOversightIntent(observerSessionID: observer, targetSessionID: target)
+    func addLink(
+        observer: UUID,
+        target: UUID,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        // Exact live incarnations, so the Add's endpoint fences and the delegated authority are
+        // re-proved together at every commit point inside the shared durable transaction.
+        let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
+            forSessionIDs: [observer, target], includeLocation: false
+        )
+        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint,
+              let targetEndpoint = candidates[target]?.only?.domainEndpoint
+        else { return .failed("Both sessions must be live and unambiguous to link.") }
+        let outcome = await bridge().addDelegatedMonitorLink(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: isStillAuthorized)
         )
         switch outcome {
         case .added: return .linked
         case .alreadyLinked: return .alreadyLinked
-        case .failed, .rejected: return .failed(outcome.failureMessage ?? "The link could not be created.")
+        case .failed, .rejected:
+            let message = outcome.failureMessage ?? "The link could not be created."
+            // `.revoked` promises nothing was left behind; a compensation that could not be written
+            // left a row queued for **Retry saving**, so it is reported as the failure it is.
+            if !isStillAuthorized(), message != AgentSessionOversightPersistenceCopy.addCompensationFailed {
+                return .revoked
+            }
+            return .failed(message)
         }
     }
 
