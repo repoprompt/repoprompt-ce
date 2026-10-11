@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptShared
 import XCTest
 
 /// Rendering contract for the canonical oversight supplement.
@@ -4573,5 +4574,75 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             dispatchID: .claudeNativeSend(UUID())
         )
         XCTAssertNotNil(reissued.claim)
+    }
+}
+
+@MainActor
+final class AgentOrchestrationGuidanceTests: XCTestCase {
+    func testInventoryTeachesManagedDirectionWithoutUpgradingRestrictedGrant() {
+        let target = UUID()
+        let inventory = AgentSessionLinkPromptInventory(
+            observerSessionID: UUID(), linkSetRevision: 1,
+            items: [AgentSessionLinkPromptInventoryItem(
+                targetSessionID: target, displayName: "Restricted lane",
+                capabilityNames: ["poll", "read", "send_when_idle", "wait"]
+            )]
+        )
+        let rendered = AgentSessionLinkPrompts.render(
+            kind: .inventory, inventory: inventory, toolReference: "agent_session_link"
+        )
+        for required in [
+            "For managed task assignments or resumes, use `steer` even when the target is idle",
+            "`send` is coordination only", "message uses coordination, not managed `steer` provenance",
+            "queued work and no-match tests are not passes", "explicit approval/conflict gates"
+        ] {
+            XCTAssertTrue(rendered.contains(AgentSessionLinkMessageEnvelope.escaped(required)), required)
+        }
+        XCTAssertTrue(rendered.contains("capabilities=\"poll,read,send_when_idle,wait\" managed=\"false\""))
+        XCTAssertFalse(rendered.contains("managed=\"true\""))
+        for clause in AgentSessionLinkPrompts.autonomyContract {
+            XCTAssertTrue(rendered.contains(AgentSessionLinkMessageEnvelope.escaped(clause)), clause)
+        }
+    }
+
+    func testChangedOperationalGuidanceIsReOwedWithoutMembershipChange() {
+        XCTAssertEqual(AgentSessionLinkPrompts.currentInventoryGuidanceRevision, 10)
+        XCTAssertEqual(AgentSessionLinkPromptSupplementDecision.decide(
+            currentRevision: 7, hasLinks: true, isEligibilitySuppressed: false,
+            lastAcceptedRevision: 7, lastAcceptedHadLinks: true,
+            possiblyDeliveredLinkRevision: nil,
+            acceptedInventoryGuidanceRevision: 9,
+            currentInventoryGuidanceRevision: AgentSessionLinkPrompts.currentInventoryGuidanceRevision
+        ), .inventory)
+        XCTAssertNil(AgentSessionLinkPromptSupplementDecision.decide(
+            currentRevision: 7, hasLinks: true, isEligibilitySuppressed: false,
+            lastAcceptedRevision: 7, lastAcceptedHadLinks: true,
+            possiblyDeliveredLinkRevision: nil,
+            acceptedInventoryGuidanceRevision: AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
+            currentInventoryGuidanceRevision: AgentSessionLinkPrompts.currentInventoryGuidanceRevision
+        ))
+    }
+
+    func testEveryOrchestrateVariantTeachesRecoveryAndDecisionFences() {
+        for variant in [WorkflowPromptVariant.agent, .mcp, .cli] {
+            let rendered = RepoPromptWorkflowPrompts.render(id: .orchestrate, variant: variant)
+            for required in [
+                "`agent_session_link op=steer` for initial assignments and resumes, even while idle",
+                "optional `message` also uses coordination framing", "without inherited grants",
+                "an active target cannot self-rebind", "idle provider, no queued work or pending interaction",
+                "Verify the durable binding, physical path, HEAD, full porcelain, and source routing",
+                "`agent_run op=start` plus `worktree`/`worktree_id`", "inspect exact session/worktree/operation state before retrying",
+                "provider-not-started", "allocated-child cleanup/no orphan", "rather than create duplicates",
+                "bounded attempt", "separately authorized explicit-path immutable source or GitHub reads",
+                "do not bypass a denied mutation", "actual current `pending_interaction`",
+                "exact current `interaction_id`", "manual-only", "never replay an approval",
+                "Stop to bypass a prompt", "no-matching-tests is not a pass", "HEAD must be unchanged",
+                "capture the producer's exit", "do not post approval while conflict remains",
+                "do not invent pin tools", "infer transitive grants", "implicit primary checkout"
+            ] {
+                XCTAssertTrue(rendered.contains(required), "\(variant): \(required)")
+            }
+            XCTAssertEqual(rendered.components(separatedBy: "### Choose the control path before acting").count, 2)
+        }
     }
 }

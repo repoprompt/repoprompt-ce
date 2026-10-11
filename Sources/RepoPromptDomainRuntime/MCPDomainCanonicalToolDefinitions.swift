@@ -2393,7 +2393,54 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Wording-only projection. Keep prior migration anchors and every schema/authority unchanged.
+    private enum AgentSessionLinkDirectionGuidanceMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkModelSelectionMigration.description
+            let replacements = [
+                (
+                    "- `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: \"when_sendable\"`.",
+                    "- `send`: coordination only; `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`. Managed tasks: `steer`."
+                ),
+                (
+                    "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.",
+                    "- `steer`: [manage] assign/resume, even idle; new `idempotency_key`. Pending prompts block steering. ACP live steering is supported."
+                ),
+                (
+                    "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
+                    "- `create_lane`: own lane. Message is coordination, not `steer`; no inherited grants."
+                )
+            ]
+            return replacements.reduce(previous) { text, replacement in
+                guard let revised = replacingOneExactLine(
+                    in: text, replacements: [(from: replacement.0, to: replacement.1)]
+                ) else { preconditionFailure("Expected one exact direction-guidance anchor") }
+                return revised
+            }
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description
+                && definition.inputSchema == AgentSessionLinkModelSelectionMigration.inputSchema
+        }
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: definition.inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) { return definition }
+        return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         if AgentSessionLinkModelSelectionMigration.isCurrent(definition) { return definition }
@@ -2402,7 +2449,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
+        !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+            && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
                 definition.description.contains("set_model")
                     || stringOccurrenceCount(of: "set_model", in: definition.inputSchema) > 0
@@ -2797,6 +2845,10 @@ package enum MCPDomainCanonicalToolDefinitions {
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         canonicalizeAgentSessionLink(definition)
+    }
+
+    package static func test_agentSessionLinkBeforeDirectionGuidanceDefinition() -> MCPDomainToolDefinition {
+        canonicalizeAgentSessionLinkBeforeDirectionGuidance(test_agentSessionLinkLegacyCurrentDefinition())
     }
 
     package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {

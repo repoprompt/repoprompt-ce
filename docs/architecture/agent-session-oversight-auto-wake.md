@@ -8,7 +8,8 @@ observer — an **Auto-wake** — so the model learns about it without its user 
 This document covers the parts that are easy to break because their invariants are enforced in one
 file and depended on in another. For the tool contract a model sees, read the `agent_session_link`
 definition in `MCPDomainCanonicalToolDefinitions.swift`; for the guidance the model is taught, read
-`AgentSessionLinkPrompts.swift`.
+`AgentSessionLinkPrompts.swift`. For choosing child versus managed-lane control, binding recovery,
+exact prompt decisions, and validation receipts, see [Agent orchestration guidance](agent-orchestration-guidance.md).
 
 ## Four owners, deliberately disjoint
 
