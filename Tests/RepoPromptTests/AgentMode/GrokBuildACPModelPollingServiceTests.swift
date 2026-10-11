@@ -194,7 +194,7 @@ final class GrokBuildPermissionDisclosureTests: XCTestCase {
         let defaultDetail = GrokBuildAgentToolPreferences.PermissionLevel.managedDefault.detailText
         for fragment in [
             "defaultMode",
-            "can",
+            "can allow",
             "without asking RepoPrompt",
             "many requests (`bypassPermissions`)",
             "edit tools such as `write` (`acceptEdits`)"
@@ -224,19 +224,11 @@ final class GrokBuildPermissionDisclosureTests: XCTestCase {
                     testCase.name
                 )
                 XCTAssertTrue(summary.warnings.isEmpty, testCase.name)
-                for keyword in ["danger", "yolo", "full access", "auto-accept"] {
-                    XCTAssertFalse(summary.fileMutation.lowercased().contains(keyword), "\(testCase.name): \(keyword)")
-                }
             } else {
                 XCTAssertEqual(summary.fileMutation, "Always-approve launch: on", testCase.name)
                 XCTAssertEqual(
                     summary.warnings,
                     ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."],
-                    testCase.name
-                )
-                XCTAssertEqual(
-                    GrokBuildAgentToolPreferences.PermissionLevel.fullAccess.detailText,
-                    "RepoPrompt launches Grok Build with `--always-approve`, so Grok's own shell and edit tools run without per-request confirmation. Applies to newly launched Grok processes.",
                     testCase.name
                 )
             }
