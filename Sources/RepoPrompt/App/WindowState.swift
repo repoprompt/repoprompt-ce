@@ -223,7 +223,13 @@ class WindowState: ObservableObject {
     @Published var isCurrentlyFocused: Bool = false
 
     /// Per-window teardown guard. Not @Published (we don't want SwiftUI updates during teardown).
-    private(set) var isClosing: Bool = false
+    private(set) var isClosing: Bool = false {
+        didSet {
+            guard oldValue != isClosing else { return }
+            // Exact candidate lookup excludes this window only after the flag changes.
+            AgentSessionLinkCandidateReadinessSignal.didChange()
+        }
+    }
 
     private var focusCancellables = Set<AnyCancellable>()
     private weak var focusObservedWindow: NSWindow?
