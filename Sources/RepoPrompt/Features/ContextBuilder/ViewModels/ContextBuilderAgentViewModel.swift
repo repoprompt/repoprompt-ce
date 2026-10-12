@@ -1959,6 +1959,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Context Builder provider validation is not ready. Retry after Models settings finish loading."]
             )
         }
+        // Freeze only caller-facing policy here. Keep discovery model/effort and
+        // Oracle roster resolution at their existing post-validation boundary.
+        let reconciliationGuidance = settingsManager.effectiveAgentModelsProfile(workspaceID: identity.workspaceID).oracleReconciliationGuidance
         #if DEBUG
             if let validationOverride = runTestHooks?.validateContextBuilderProviders {
                 await validationOverride()
@@ -2014,7 +2017,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
         if let mode = parsedResponseType?.headlessMode {
-            let snapshot = OracleSelectionSnapshot.mcp(profile: profile)
+            var oracleProfile = profile
+            oracleProfile.oracleReconciliationGuidance = reconciliationGuidance
+            let snapshot = OracleSelectionSnapshot.mcp(profile: oracleProfile)
             let resolver = OracleExecutionResolver(promptViewModel: promptManager)
             let execution = try resolver.resolve(
                 choice: oraclePreset.map(OracleStartChoice.contextBuilderPreset) ?? .automatic,
@@ -5072,7 +5077,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 task.cancel()
             }
             try requireCurrentOracleRun(session: session, generation: generation)
-            let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
+            let groupReply = ContextBuilderOracleGroupReply(
+                result: completion.result, reconciliationGuidance: execution.reconciliationGuidance
+            )
             guard session.followUpOracleGroupState.matchesFinalResult(
                 groupReply.result,
                 generation: generation
@@ -5655,7 +5662,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mode: mode.mcpModeName,
             snapshot: snapshot
         )
-
         return try await runFollowUpOracleStream(
             for: tabID,
             originWorkspaceID: originWorkspaceID,
