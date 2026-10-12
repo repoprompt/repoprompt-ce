@@ -1303,6 +1303,7 @@ extension AgentModeViewModel {
             periodicIdleWakeEnabled: overlaid.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: overlaid.periodicIdleWakeIntervalSeconds,
             pendingUpdates: overlaid.pendingUpdates,
+            overseerBootstrapState: overlaid.overseerBootstrapState,
             persistence: overlaid.persistence
         )
     }

@@ -1395,6 +1395,7 @@ struct AgentMonitorPillProps: Equatable {
         periodicIdleWakeEnabled: Bool = false,
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         pendingUpdates: AgentMonitorPendingUpdates? = nil,
+        overseerBootstrapState: AgentSessionOverseerBootstrapState? = nil,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
         self.sessionID = sessionID
@@ -1411,6 +1412,7 @@ struct AgentMonitorPillProps: Equatable {
         self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
         self.periodicIdleWakeIntervalSeconds = periodicIdleWakeIntervalSeconds
         self.pendingUpdates = pendingUpdates
+        self.overseerBootstrapState = overseerBootstrapState
         self.persistence = persistence
     }
 
@@ -1429,7 +1431,7 @@ struct AgentMonitorPillProps: Equatable {
     /// deliberately refreshed on different schedules.
     func withCanAddReason(_ reason: String?) -> AgentMonitorPillProps {
         guard reason != canAddReason else { return self }
-        var result = AgentMonitorPillProps(
+        return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
@@ -1444,10 +1446,9 @@ struct AgentMonitorPillProps: Equatable {
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             pendingUpdates: pendingUpdates,
+            overseerBootstrapState: overseerBootstrapState,
             persistence: persistence
         )
-        result.overseerBootstrapState = overseerBootstrapState
-        return result
     }
 
     /// Overlays the process-wide persistence level onto an authoritative or synthesized projection.
@@ -1461,7 +1462,7 @@ struct AgentMonitorPillProps: Equatable {
     ) -> AgentMonitorPillProps {
         let reason = presentation.addBlockerMessage ?? eligibilityReason
         guard reason != canAddReason || presentation != persistence else { return self }
-        var result = AgentMonitorPillProps(
+        return AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
@@ -1476,10 +1477,9 @@ struct AgentMonitorPillProps: Equatable {
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             pendingUpdates: pendingUpdates,
+            overseerBootstrapState: overseerBootstrapState,
             persistence: presentation
         )
-        result.overseerBootstrapState = overseerBootstrapState
-        return result
     }
 
     /// Exact current observer role: outbound membership only.
