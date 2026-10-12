@@ -4806,7 +4806,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
         XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
         await factoryGate.open()
-        print("ACP_CAUSAL \(ProcessInfo.processInfo.systemUptime) waiting gate producer=\(fixture.session.agentTask != nil) phase=\(String(describing: fixture.session.oversight.pendingAutoWake?.phase))")
         try await responseGate.waitUntilEntered()
         try await AsyncTestWait.waitUntil("ACP startup to return while its producer remains gated") {
             await MainActor.run { fixture.session.oversight.pendingAutoWake?.periodicStartReturned == true }
@@ -4843,7 +4842,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.viewModel.acceptAgentSessionLinkPromptClaim(membership)
         let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
         let startup = try startPeriodicACP(fixture, harness: harness, wakeID: wakeID, endpoint: endpoint)
-        print("ACP_CAUSAL \(ProcessInfo.processInfo.systemUptime) waiting gate producer=\(fixture.session.agentTask != nil) phase=\(String(describing: fixture.session.oversight.pendingAutoWake?.phase))")
         try await responseGate.waitUntilEntered()
         XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .dispatching)
         XCTAssertEqual(
@@ -4934,8 +4932,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let gate = try AgentSessionLinkACPResponseGate(directory: directory)
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
-            "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path, "ACP_FAIL_LOAD": failLoad ? "1" : "",
-            "ACP_RPC_LOG": directory.appendingPathComponent("rpc.jsonl").path
+            "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path, "ACP_FAIL_LOAD": failLoad ? "1" : ""
         ])
         let harness = AgentSessionLinkRunnerHarness(
             headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
@@ -4943,8 +4940,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 _ = await factoryGate?.requirement()
                 return provider
             },
-            workspacePath: directory.path, sessionLinkHost: fixture.viewModel,
-            acpDiagnosticSink: { event in print("ACP_CAUSAL \(ProcessInfo.processInfo.systemUptime) \(event)") }
+            workspacePath: directory.path, sessionLinkHost: fixture.viewModel
         )
         harness.onHeadlessMessageBuilt = { [weak self] in
             // Fresh ACP startup owns a new process run; publish its exact ready catalog as the host would.

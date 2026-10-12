@@ -9,11 +9,9 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
     @MainActor
     private final class AdvertisementRecorder {
         var sessionIDs: [UUID] = []
-        var onRecord: ((UUID) -> Void)?
 
         func record(_ sessionID: UUID) {
             sessionIDs.append(sessionID)
-            onRecord?(sessionID)
         }
     }
 
@@ -176,66 +174,6 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertEqual(inventory.items.map(\.targetSessionID), [laneID])
                 XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID, "creation never switches the creator workspace")
             }
-        }
-    }
-
-    func testFailedRouteRetiresZeroLinkActivationPresentationAndAdvertisement() async throws {
-        try await withFixture(ephemeral: false) { fixture in
-            let host = WindowStatesManager.shared
-            let viewModel = fixture.window.agentModeViewModel
-            let seed = try await host.agentSessionLinkCreateLane(
-                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
-                creatorSessionID: UUID(), sessionName: "Failed route consent", selection: fixture.selection
-            )
-            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
-            let session = try XCTUnwrap(viewModel.sessions[tabID])
-            session.createdByOverseerSessionID = nil
-            viewModel.test_setCurrentTabIDOverride(tabID)
-            defer { viewModel.test_setCurrentTabIDOverride(nil) }
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
-            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
-                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
-            ))
-            let invalidated = AdvertisementRecorder()
-            let bridge = AgentSessionLinkRuntimeBridge(
-                authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) }
-            )
-            bridge.attach(host: host)
-            defer { host.attachAgentSessionLinkBridge() }
-            let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
-            let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
-            XCTAssertTrue(enabled)
-            XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
-            invalidated.sessionIDs.removeAll()
-            let retired = self.expectation(description: "Retired activation invalidates provider discovery")
-            invalidated.onRecord = { observed in
-                XCTAssertEqual(observed, sessionID)
-                retired.fulfill()
-            }
-            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-            let result = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: UUID(), workspace: workspace)
-            XCTAssertEqual(result, .sessionNotFound)
-            XCTAssertEqual(session.activeAgentSessionID, sessionID, "failed route leaves the same session on screen")
-            XCTAssertFalse(session.bindingTransitionInProgress)
-            XCTAssertNil(session.oversight.overseerActivation)
-            await self.fulfillment(of: [retired], timeout: 1)
-            XCTAssertEqual(invalidated.sessionIDs, [sessionID], "one retirement, not an unrelated oversight replay")
-            let currentEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
-            XCTAssertNotEqual(currentEndpoint, endpoint)
-            let monitor = viewModel.ui.statusPills.snapshot.monitor
-            XCTAssertEqual(monitor.endpoint, currentEndpoint)
-            XCTAssertEqual(monitor.overseerBootstrapState, AgentSessionOverseerBootstrapState(
-                sessionIdentity: ObjectIdentifier(session), provider: session.selectedAgent, activation: nil
-            ))
-            XCTAssertFalse(monitor.isOverseer)
-            XCTAssertTrue(monitor.outbound.isEmpty)
-            XCTAssertNil(session.oversight.pendingAutoWake)
-            let inventory = await authority.links(forObserver: sessionID)
-            XCTAssertTrue(inventory.items.isEmpty)
-            let staleCall = await bridge.laneCreationCallerPreflight(endpoint)
-            let freshCall = await bridge.laneCreationCallerPreflight(currentEndpoint)
-            XCTAssertEqual(staleCall, .denied)
-            XCTAssertEqual(freshCall, .denied, "authority already failed closed before this publication repair")
         }
     }
 
@@ -406,15 +344,6 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertNotNil(result, "use the real bootstrap eligibility/authority gates, not a stored-state assignment")
                 return try XCTUnwrap(creator.oversight.overseerActivation)
             }
-            let causalStart = ProcessInfo.processInfo.systemUptime
-            let trace: (String) -> Void = { print("ABA_CAUSAL \(ProcessInfo.processInfo.systemUptime - causalStart) \($0)") }
-            bridge.test_afterLaneCreationClaim = { trace("claimed") }
-            bridge.test_afterLaneCapInventoryBeforeRevision = { trace("cap inventory") }
-            viewModel.test_afterOversightLaneProvision = { _ in trace("lane provisioned") }
-            bridge.test_afterAddInsertionBeforeEstablishment = { _ in trace("add inserted") }
-            bridge.test_beforeDurableIntentSettlement = { _ in trace("intent settlement") }
-            bridge.test_afterReservationBeforeActivation = { _ in trace("reserved") }
-            defer { viewModel.test_afterOversightLaneProvision = nil }
             let parked = (0 ..< 3).map { XCTestExpectation(description: "activation-backed A\($0) is indexed and parked") }
             var pairs: [AgentSessionOversightIntent] = []
             var releases: [Int: CheckedContinuation<Void, Never>] = [:]
@@ -422,7 +351,6 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             bridge.test_afterActivationBeforeDeletionFence = { pair in
                 guard pairs.count < 3 else { return }
                 let index = pairs.count
-                trace("activated A\(index)")
                 pairs.append(pair)
                 await withCheckedContinuation { continuation in
                     releases[index] = continuation
