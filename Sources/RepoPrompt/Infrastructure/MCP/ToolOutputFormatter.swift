@@ -1164,6 +1164,11 @@ extension ToolOutputFormatter {
     }
 
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if object["scan_truncated"]?.boolValue == true
+            || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+        {
+            lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
+        }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
             guard let diagnostic = value.objectValue,
@@ -6440,6 +6445,12 @@ extension ToolOutputFormatter {
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
+            if let scope = object["scope"]?.stringValue {
+                lines.append("- Scope: `\(scope)` (not a workspace inventory)")
+            }
+            if let note = object["note"]?.stringValue {
+                lines.append("- Note: \(note)")
+            }
             lines.append("- Sessions: **\(sessions.count)**")
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }

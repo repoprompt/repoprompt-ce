@@ -29,7 +29,11 @@ struct SessionAdminMCPToolService {
     var isToolEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.sessionAdmin) }
 
     /// Identical for every unavailable caller, so the hidden tool reveals nothing when named.
-    static let unavailableError = MCPError.invalidParams("session_admin is not available for this session.")
+    static let unavailableError = MCPError.invalidParams(
+        "session_admin is not available for this session. Use request_scope to ask for user-approved authority when the tool is available."
+    )
+
+    static let inventoryGuidance = "For cleanup or organizing, request observe together with the needed mutation capabilities, then use inventory to select targets when available. A workspace scope covers only that workspace; history is not a scope inventory."
 
     private static let lifecycleKeys: [String: Set<String>] = [
         "request_scope": ["op", "kind", "workspace", "capabilities", "guardrails", "reason", "idempotency_key"],
@@ -154,7 +158,7 @@ struct SessionAdminMCPToolService {
             value["result"] = .string(request.state.label)
             if request.state == .pending {
                 value["guidance"] = .string(
-                    "Nothing is granted yet. The user sees an approval card in this session. Continue other work and check scope_status with this request_id; do not re-request."
+                    "Nothing is granted yet. The user sees an approval card in this session. Continue other work and check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
                 )
             }
             return .object(value)
@@ -384,6 +388,9 @@ struct SessionAdminMCPToolService {
         switch denial {
         case let .capabilityMissing(capability):
             value["capability"] = .string(capability.rawValue)
+            if capability == .observe {
+                value["detail"] = .string("This scope lacks observe. Request a new scope including observe; approval never adds it implicitly. \(inventoryGuidance)")
+            }
         case let .guardrailExceeded(guardrail, limit, current):
             value["guardrail"] = .string(guardrail.rawValue)
             value["limit"] = .int(limit)
@@ -399,10 +406,14 @@ struct SessionAdminMCPToolService {
     }
 
     static func scopeSelectionRequiredValue(_ scopeIDs: [UUID]) -> Value {
-        .object([
+        var value: [String: Value] = [
             "result": .string(scopeIDs.isEmpty ? "no_live_scope" : "scope_id_required"),
             "scope_ids": .array(scopeIDs.map { .string($0.uuidString) })
-        ])
+        ]
+        if scopeIDs.isEmpty {
+            value["guidance"] = .string("Use request_scope to ask for user-approved authority. \(inventoryGuidance)")
+        }
+        return .object(value)
     }
 
     static func requestValue(_ request: DelegationScopeRequest) -> [String: Value] {

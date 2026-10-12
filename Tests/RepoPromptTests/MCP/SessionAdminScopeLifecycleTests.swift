@@ -523,6 +523,68 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertTrue(handler.batches.isEmpty)
     }
 
+    func testAbsentAndUnauthorizedTargetsHaveIdenticalScopeDenials() async throws {
+        let fixture = Fixture()
+        let caller = UUID()
+        let target = UUID()
+        fixture.source.add(caller, parent: nil)
+        _ = try grantTree(fixture, grantee: caller)
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        let handler = RecordingHandler([.adminRename])
+        fixture.core.register(handler)
+        let args: [String: Value] = ["op": .string("rename"), "session_id": .string(target.uuidString)]
+        var messages: [String] = []
+        // The same target is first absent, then present but outside this caller's tree.
+        for exists in [false, true] {
+            if exists { fixture.source.add(target, parent: UUID()) }
+            do {
+                _ = try await fixture.call(args)
+                XCTFail("target must be refused")
+            } catch {
+                messages.append(String(describing: error))
+            }
+        }
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages.first, messages.last)
+        XCTAssertTrue(messages[0].contains("Session '\(target.uuidString)' is not available to this caller's scope."))
+        XCTAssertFalse(messages[0].contains("active workspace"))
+        XCTAssertTrue(handler.batches.isEmpty)
+
+        // No-scope failure remains distinct and tells the caller how to request authority.
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        do {
+            _ = try await fixture.call(args)
+            XCTFail("a scope is required")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("session_admin is not available for this session"))
+            XCTAssertTrue(message.contains("request_scope"))
+            XCTAssertFalse(message.contains(target.uuidString))
+        }
+    }
+
+    func testCleanupGuidanceDoesNotSilentlyAddObserve() async throws {
+        let fixture = Fixture()
+        let caller = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        let reply = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("workspace"),
+            "capabilities": .array([.string("organize"), .string("restructure")])
+        ])
+        let guidance = try XCTUnwrap(reply["guidance"]?.stringValue)
+        for text in ["observe", "inventory", "only that workspace", "history is not a scope inventory"] {
+            XCTAssertTrue(guidance.contains(text), guidance)
+        }
+        XCTAssertEqual(reply["capabilities"], .array([.string("organize"), .string("restructure")]))
+        let requestID = try XCTUnwrap(reply["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let grant = try fixture.runtime.approve(requestID: requestID).get()
+        XCTAssertEqual(grant.grant.capabilities, [.organize, .restructure])
+        let missingObserve = try SessionAdminMCPToolService.deniedValue(.capabilityMissing(.observe), sessionID: nil)
+        XCTAssertTrue(try XCTUnwrap(missingObserve.objectValue?["detail"]?.stringValue).contains("Request a new scope including observe"))
+        let noScope = SessionAdminMCPToolService.scopeSelectionRequiredValue([])
+        XCTAssertTrue(try XCTUnwrap(noScope.objectValue?["guidance"]?.stringValue).contains("request_scope"))
+    }
+
     func testCoreRetireCardsIdleMembersAndReportsRunningOnesWithoutControl() async throws {
         let fixture = Fixture()
         let overseer = UUID()
