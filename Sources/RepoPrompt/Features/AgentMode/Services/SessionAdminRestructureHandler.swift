@@ -491,17 +491,25 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "source_unavailable"))
                 continue
             }
-            if let refusal = try revalidate(source), let code = refusal.objectValue?["code"]?.stringValue {
-                items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: code))
-                continue
-            }
-            let reservation = reserve(source)
             let commit: DelegationPlacementCommit?
             do {
+                if let refusal = try revalidate(source), let code = refusal.objectValue?["code"]?.stringValue {
+                    items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: code))
+                    continue
+                }
+                let reservation = reserve(source)
                 defer { context.scopes.release(reservation) }
                 commit = try host.commitOrganizationalPlacement(
                     sessionID: source, parentID: destination, delegationScopeID: stampScope
                 )
+            } catch {
+                // No placement committed for this item. Keep earlier successes and their receipts,
+                // and let later items re-validate against the placement that actually landed.
+                items.append(SessionAdminItemResult(
+                    sessionID: source, result: "not_applied", code: "placement_failed",
+                    fields: ["detail": .string(error.localizedDescription)]
+                ))
+                continue
             }
             guard let commit else {
                 items.append(SessionAdminItemResult(

@@ -38,7 +38,26 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
             MCPDomainSessionAdminToolDefinition.implementedOperations,
             "Reserved identities must not be advertised before their handlers ship"
         )
-        XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.contains("confirmation_status"))
+        for operation in [
+            "confirmation_status",
+            "attenuate",
+            "link",
+            "unlink",
+            "reparent",
+            "adopt",
+            "fork",
+            "set_model",
+            "set_effort",
+            "worktree_create",
+            "worktree_bind",
+            "worktree_unbind",
+            "worktree_release",
+            "worktree_inventory",
+            "merge_preview",
+            "merge_apply"
+        ] {
+            XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.contains(operation), operation)
+        }
         for operation in MCPDomainSessionAdminToolDefinition.operations {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(" \(operation.uppercased()) ")).normalizedOperation,

@@ -829,6 +829,9 @@ final class SessionAdminStructureTests: XCTestCase {
     final class StructureHost: SessionAdminStructureHost {
         let provenance: Provenance
         var placements: [(session: UUID, parent: UUID, scope: UUID?)] = []
+        var placementAttempts: [UUID] = []
+        var placementFailures: Set<UUID> = []
+        var onPlacementAttempt: (@MainActor () -> Void)?
         fileprivate var links: [Pair: Set<DomainAgentSessionLinkCapability>] = [:]
         fileprivate var added: [Pair] = []
         fileprivate var stopped: [Pair] = []
@@ -852,6 +855,11 @@ final class SessionAdminStructureTests: XCTestCase {
             parentID: UUID,
             delegationScopeID: UUID?
         ) throws -> DelegationPlacementCommit? {
+            placementAttempts.append(sessionID)
+            onPlacementAttempt?()
+            if placementFailures.contains(sessionID) {
+                throw NSError(domain: "PlacementFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "Placement rejected before commit"])
+            }
             placements.append((sessionID, parentID, delegationScopeID))
             let old = provenance.sessions[sessionID]
             provenance.sessions[sessionID] = DelegationSessionProvenance(
@@ -1284,6 +1292,86 @@ final class SessionAdminStructureTests: XCTestCase {
             )
         }
         XCTAssertEqual(fixture.structure.placements.count, 1)
+    }
+
+    func testPlacementFailureKeepsEarlierReceiptsContinuesAndReleasesReservations() async throws {
+        for operation in [DomainAgentSessionTargetOperation.adminReparent, .adminAdopt] {
+            let fixture = Fixture()
+            let overseer = UUID(), first = UUID(), failed = UUID(), last = UUID()
+            let targets = [first, failed, last]
+            fixture.provenance.add(overseer, parent: nil)
+            for target in targets {
+                fixture.provenance.add(target, parent: operation == .adminAdopt ? nil : overseer)
+            }
+            let scope = try fixture.grant(overseer, guardrails: .init(maxLiveSessions: 4, bulkConfirmationThreshold: 1))
+            let args: [String: Value] = ["parent_session_id": .string(overseer.uuidString)]
+            let key = "placement-failure-\(operation.rawValue)"
+            typealias Organizing = SessionAdminOrganizingOperationTests
+            let organizer = Organizing.FakeOrganizer(), links = Organizing.FakeLinks()
+            let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+            // FakeInventory deliberately holds unowned references; retain its inputs through apply.
+            defer { withExtendedLifetime((organizer, inventoryProvenance, links)) {} }
+            let callerTab = UUID()
+            let frontDoor = AgentSessionAdministrationFrontDoor(
+                core: fixture.core, scopes: fixture.runtime, projector: fixture.projector,
+                inventory: Organizing.FakeInventory(
+                    organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()
+                ),
+                liveBoundSession: { $0 == callerTab ? overseer : nil }
+            )
+            frontDoor.register(SessionAdminRestructureHandler(
+                context: SessionAdminHandlerContext(scopes: fixture.runtime, projector: fixture.projector),
+                host: fixture.structure
+            ))
+            let request = AgentSessionAdministrationRequest(
+                operation: operation, caller: .agentSession(overseer), callerTabID: callerTab,
+                targetSessionIDs: targets, idempotencyKey: key, arguments: args
+            )
+            guard case let .pendingConfirmation(card, _) = try await frontDoor.perform(request)
+            else { return XCTFail("The whole placement batch must be carded") }
+            fixture.structure.placementFailures = [failed]
+            var persisted = 0
+            fixture.structure.onPersist = { persisted += 1 }
+            let projector = fixture.projector, runtime = fixture.runtime
+            var reservedAtCommit: [Int] = []
+            fixture.structure.onPlacementAttempt = {
+                let usage = projector.usage(of: scope.grant, spawnParentSessionID: nil)
+                reservedAtCommit.append(runtime.usageIncludingReservations(usage).liveSessionCount - usage.liveSessionCount)
+            }
+
+            await frontDoor.approveAndApply(confirmationID: card.id, presentedTabID: callerTab, presentedSessionID: overseer)
+            let applied = try XCTUnwrap(frontDoor.appliedResult(forConfirmation: card.id))
+            let reply = try XCTUnwrap(applied.objectValue)
+            let results = items(reply)
+            XCTAssertEqual(results.count, 3)
+            XCTAssertEqual(results[first.uuidString]?["result"], .string("moved"))
+            XCTAssertEqual(results[failed.uuidString]?["result"], .string("not_applied"))
+            XCTAssertEqual(results[failed.uuidString]?["code"], .string("placement_failed"))
+            XCTAssertEqual(results[failed.uuidString]?["detail"], .string("Placement rejected before commit"))
+            XCTAssertEqual(results[last.uuidString]?["result"], .string("moved"), "A failed item must not abort later placements")
+            XCTAssertEqual(fixture.structure.placementAttempts, targets)
+            XCTAssertEqual(
+                reservedAtCommit,
+                operation == .adminAdopt ? [1, 1, 1] : [0, 0, 0],
+                "Each adoption, including the failing item, holds a live reservation at commit"
+            )
+            XCTAssertEqual(reply["changed_count"], .int(2), "The stored approval receipt retains both committed placements")
+            XCTAssertEqual(fixture.structure.placements.map(\.session), [first, last])
+            XCTAssertEqual(persisted, 2, "Both committed placements must finish their durable writes")
+            XCTAssertNil(fixture.provenance.sessions[failed]?.organizationalParentID)
+            XCTAssertEqual(fixture.provenance.sessions[first]?.organizationalParentID, overseer)
+            XCTAssertEqual(fixture.provenance.sessions[last]?.organizationalParentID, overseer)
+            XCTAssertEqual(fixture.runtime.confirmations.confirmation(id: card.id, granteeSessionID: overseer)?.state, .consumed)
+            await frontDoor.approveAndApply(confirmationID: card.id, presentedTabID: callerTab, presentedSessionID: overseer)
+            XCTAssertEqual(frontDoor.appliedResult(forConfirmation: card.id), applied)
+            XCTAssertEqual(fixture.structure.placementAttempts, targets, "A consumed card must not apply any item twice")
+            let usage = fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil)
+            XCTAssertEqual(
+                fixture.runtime.usageIncludingReservations(usage).liveSessionCount,
+                usage.liveSessionCount,
+                "A failed adoption must release its reservation instead of consuming the last slot"
+            )
+        }
     }
 
     func testReparentUnderAnotherOverseerWouldGrowItsScopeAndIsRefused() async throws {
