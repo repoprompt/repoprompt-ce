@@ -226,12 +226,12 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
                 sessionIdentity: ObjectIdentifier(fixture.session), provider: .claudeCode, activation: nil
             )
             XCTAssertTrue(fixture.viewModel.agentSessionLinkActivateOverseer(for: fixture.endpoint, expected: expected))
-            var retiredEndpoints: [DomainAgentSessionLinkEndpointIdentity] = []
+            var retiredSessionIDs: [UUID] = []
             let retired = expectation(description: "One retirement for \(mutation)")
             let unrelated = expectation(description: "Unrelated oversight does not retire activation")
             unrelated.isInverted = true
-            AgentSessionLinkInvalidationSink.overseerActivationRetired = { endpoint in
-                retiredEndpoints.append(endpoint)
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
                 unrelated.fulfill()
             }
             var projectionNotifications = 0
@@ -240,9 +240,9 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             ).sink { _ in projectionNotifications += 1 }
             fixture.session.oversight.autoWakeOnUpdates.toggle()
             await fulfillment(of: [unrelated], timeout: 0.1)
-            XCTAssertTrue(retiredEndpoints.isEmpty, "unrelated oversight writes must not emit retirement")
-            AgentSessionLinkInvalidationSink.overseerActivationRetired = { endpoint in
-                retiredEndpoints.append(endpoint)
+            XCTAssertTrue(retiredSessionIDs.isEmpty, "unrelated oversight writes must not emit retirement")
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
                 retired.fulfill()
             }
             switch mutation {
@@ -268,20 +268,20 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
                 ))
             }
             await fulfillment(of: [retired], timeout: 1)
-            XCTAssertEqual(retiredEndpoints, [fixture.endpoint], mutation)
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], mutation)
             XCTAssertNil(fixture.session.oversight.overseerActivation)
             XCTAssertNil(fixture.viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
             let replay = expectation(description: "Nil clears and unrelated writes do not replay")
             replay.isInverted = true
-            AgentSessionLinkInvalidationSink.overseerActivationRetired = { endpoint in
-                retiredEndpoints.append(endpoint)
+            AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+                retiredSessionIDs.append(sessionID)
                 replay.fulfill()
             }
             fixture.session.oversight.overseerActivation = nil
             fixture.session.oversight.overseerActivation = nil
             fixture.session.oversight.autoWakeOnUpdates.toggle()
             await fulfillment(of: [replay], timeout: 0.1)
-            XCTAssertEqual(retiredEndpoints, [fixture.endpoint], "nil clears and unrelated writes do not replay")
+            XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], "nil clears and unrelated writes do not replay")
             XCTAssertNil(fixture.session.oversight.pendingAutoWake)
             XCTAssertEqual(projectionNotifications, 0, "activation loss is not a link/prompt inventory publication")
             if fixture.session.mcpControlContext != nil {
@@ -308,14 +308,14 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
         defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousSink }
         let retiredAdvertisement = expectation(description: "Discovery retires the outgoing endpoint despite replacement")
-        var retiredEndpoints: [DomainAgentSessionLinkEndpointIdentity] = []
-        AgentSessionLinkInvalidationSink.overseerActivationRetired = { endpoint in
-            retiredEndpoints.append(endpoint)
+        var retiredSessionIDs: [UUID] = []
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
+            retiredSessionIDs.append(sessionID)
             retiredAdvertisement.fulfill()
         }
         fixture.session.parentSessionID = UUID()
         await fulfillment(of: [retiredAdvertisement], timeout: 1)
-        XCTAssertEqual(retiredEndpoints, [fixture.endpoint])
+        XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID])
         XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot, snapshot)
         XCTAssertEqual(fixture.viewModel.ui.statusPills.revision, revision)
         XCTAssertEqual(snapshot.monitor.overseerBootstrapState?.sessionIdentity, ObjectIdentifier(successor))

@@ -830,9 +830,9 @@ enum AgentSessionLinkLocationInvalidationSink {
 @MainActor
 enum AgentSessionLinkInvalidationSink {
     static var invalidateBinding: ((Int, UUID, DomainAgentSessionLinkRevocationReason) -> Void)?
-    /// Advertisement only, never revocation or a grant. Retains the outgoing exact endpoint so an
-    /// in-place rebind cannot notify discovery for the incoming session UUID instead.
-    static var overseerActivationRetired: ((DomainAgentSessionLinkEndpointIdentity) -> Void)?
+    /// Advertisement only — never revocation or a grant. Carries the retired session UUID captured
+    /// at the clear, so an in-place replacement cannot redirect it.
+    static var overseerActivationRetired: ((UUID) -> Void)?
 
     /// Revokes only the endpoint incarnations of one exact `(window, tab)` that are no longer live.
     static func bindingEnded(
@@ -1362,10 +1362,10 @@ final class AgentSessionLinkRuntimeBridge {
                 await self.invalidateBinding(windowID: windowID, tabID: tabID, reason: reason)
             }
         }
-        AgentSessionLinkInvalidationSink.overseerActivationRetired = { [weak self] endpoint in
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { [weak self] sessionID in
             Task { @MainActor in
                 guard let self, !self.isFrozenForTermination else { return }
-                await self.invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+                await self.invalidateToolAdvertisement(forObserverSession: sessionID)
             }
         }
         AgentSessionLinkCandidateReadinessSignal.onChange = { [weak self] in
@@ -7560,7 +7560,6 @@ final class AgentSessionLinkRuntimeBridge {
         // Like tool bootstrap, consent linearizes at the no-link authority sample. Any relationship
         // committed after that sample is independently ordered; re-fence the captured incarnation.
         guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
-              host.agentSessionLinkBootstrapState(for: endpoint) == expected,
               host.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
         else { return false }
         // Consent is already committed. Catalog publication neither grants links nor starts a turn.

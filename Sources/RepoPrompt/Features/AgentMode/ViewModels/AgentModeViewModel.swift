@@ -4794,8 +4794,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
         }
-        newSession.onOverseerActivationChanged = { [weak self] session, retired in
-            self?.agentSessionLinkOverseerActivationChanged(session: session, retired: retired)
+        newSession.onOverseerActivationRetired = { [weak self] session, retired in
+            self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)
+        }
+        newSession.onBindingTransitionSettled = { [weak self] session in
+            self?.agentSessionLinkBindingTransitionSettled(session: session)
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
