@@ -15,6 +15,27 @@ struct AgentSessionOverseerBootstrapState: Equatable {
 }
 
 extension AgentModeViewModel {
+    /// Retirement is observed once at the session's mutation owner, including catalog-free sessions.
+    /// Queue the reread past the enclosing setter so binding/provenance writes have settled. Binding
+    /// transitions also send a presentation-only settlement hint, without replaying discovery.
+    func agentSessionLinkOverseerActivationChanged(
+        session: AgentTabSession,
+        retired: AgentSessionOverseerActivation?
+    ) {
+        Task { @MainActor [weak self, weak session] in
+            // Never overlay the captured retired endpoint onto a replacement. Recompute only the
+            // live current owner, with its current generation, eligibility and activation.
+            if let self, let session, sessions[session.tabID] === session, currentTabID == session.tabID {
+                syncStatusPillsUIStateIfMonitorStale()
+            }
+            // Retirement belongs to the outgoing endpoint even if its object left the owner map.
+            // Discovery reevaluates live routing; notifying it neither repaints nor grants a successor.
+            if let retired {
+                AgentSessionLinkInvalidationSink.overseerActivationRetired?(retired.endpoint)
+            }
+        }
+    }
+
     func agentSessionLinkBootstrapState(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapState? {

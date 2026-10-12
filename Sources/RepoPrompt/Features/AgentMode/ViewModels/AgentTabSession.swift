@@ -52,6 +52,12 @@ final class AgentTabSession: ObservableObject {
     var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
     var onSourceItemsChanged: ((AgentTabSession, AgentModeViewModel.SourceItemsMutation) -> Void)?
     var onRunStateChanged: ((AgentTabSession) -> Void)?
+    /// Non-replaying retirement publication. A nil retired value is presentation-only settlement
+    /// after a binding transition that already retired activation; it must not notify discovery twice.
+    var onOverseerActivationChanged: ((AgentTabSession, AgentSessionOverseerActivation?) -> Void)?
+    /// Set before begin's clear or by retirement already inside a transition; consumed only when
+    /// the current transition settles, including a later settlement of an abandoned transition.
+    private var overseerActivationNeedsBindingSettlementPublication = false
     #if DEBUG
         private(set) var test_incrementalRetentionCompactionCount = 0
         private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
@@ -263,6 +269,11 @@ final class AgentTabSession: ObservableObject {
     /// selection surfaces republish through their own authoritative refresh.
     var oversight = AgentSessionOversightState() {
         didSet {
+            if let retired = oldValue.overseerActivation, retired != oversight.overseerActivation {
+                overseerActivationNeedsBindingSettlementPublication =
+                    overseerActivationNeedsBindingSettlementPublication || bindingTransitionInProgress
+                onOverseerActivationChanged?(self, retired)
+            }
             if oldValue.hasPendingAutoWake != oversight.hasPendingAutoWake
                 || oldValue.autoWakeSnoozes != oversight.autoWakeSnoozes
             {
@@ -1360,6 +1371,10 @@ final class AgentTabSession: ObservableObject {
             if oldValue != bindingTransitionInProgress {
                 noteMonitorObservationInputsChanged()
                 AgentSessionLinkCandidateReadinessSignal.didChange()
+                if !bindingTransitionInProgress, overseerActivationNeedsBindingSettlementPublication {
+                    overseerActivationNeedsBindingSettlementPublication = false
+                    onOverseerActivationChanged?(self, nil)
+                }
             }
         }
     }
@@ -1565,9 +1580,11 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        // Keep the outgoing-proof clear before the generation moves. Its presentation also needs a
+        // settled reread when failed hydration leaves this same tab on screen without updateBindings.
+        if oversight.overseerActivation != nil { overseerActivationNeedsBindingSettlementPublication = true }
         oversight.overseerActivation = nil
-        // Clear the outgoing proof before the generation moves so it cannot be observed under the
-        // incoming incarnation.
+        // Restoration and terminal revisions remain fenced before asynchronous hydration.
         restorationReadiness = .unbound
         bindingTransitionGeneration &+= 1
         bindingTransitionInProgress = true

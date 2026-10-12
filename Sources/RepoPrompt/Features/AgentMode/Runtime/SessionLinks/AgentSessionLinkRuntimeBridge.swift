@@ -830,6 +830,9 @@ enum AgentSessionLinkLocationInvalidationSink {
 @MainActor
 enum AgentSessionLinkInvalidationSink {
     static var invalidateBinding: ((Int, UUID, DomainAgentSessionLinkRevocationReason) -> Void)?
+    /// Advertisement only, never revocation or a grant. Retains the outgoing exact endpoint so an
+    /// in-place rebind cannot notify discovery for the incoming session UUID instead.
+    static var overseerActivationRetired: ((DomainAgentSessionLinkEndpointIdentity) -> Void)?
 
     /// Revokes only the endpoint incarnations of one exact `(window, tab)` that are no longer live.
     static func bindingEnded(
@@ -1357,6 +1360,12 @@ final class AgentSessionLinkRuntimeBridge {
             guard let self else { return }
             Task { @MainActor in
                 await self.invalidateBinding(windowID: windowID, tabID: tabID, reason: reason)
+            }
+        }
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { [weak self] endpoint in
+            Task { @MainActor in
+                guard let self, !self.isFrozenForTermination else { return }
+                await self.invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
             }
         }
         AgentSessionLinkCandidateReadinessSignal.onChange = { [weak self] in

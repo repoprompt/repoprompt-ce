@@ -1291,6 +1291,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testCreateLaneServiceReplaysReceiptAndRejectsConflictingDigest() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
+        await fixture.window.workspaceManager.awaitInitialized()
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lane-service-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1370,6 +1371,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
+        await fixture.window.workspaceManager.awaitInitialized()
         let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
         let byName = AgentSessionLaneMCPToolService.resolveDestination(
             workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
