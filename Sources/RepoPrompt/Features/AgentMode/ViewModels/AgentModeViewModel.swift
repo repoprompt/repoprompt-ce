@@ -4794,6 +4794,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
         }
+        newSession.onOverseerActivationRetired = { [weak self] session, retired in
+            self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)
+        }
+        newSession.onBindingTransitionSettled = { [weak self] session in
+            self?.agentSessionLinkBindingTransitionSettled(session: session)
+        }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
             if !session.runState.isActive {
@@ -5583,7 +5589,41 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func authoritativeLiveSession(for sessionID: UUID) throws -> TabSession? {
-        switch persistentBindingResolution(for: sessionID) {
+        try authoritativeLiveSession(for: sessionID, using: makePersistentBindingResolutionSnapshot())
+    }
+
+    /// Immutable observations from one synchronous binding census. Never retain these across an
+    /// await or mutation as an authority proof; each operation must take a fresh census.
+    enum AuthoritativeLiveSessionState: Equatable {
+        case notFound
+        case idle
+        case running
+        case ambiguous
+    }
+
+    func authoritativeLiveSessionStates(for sessionIDs: Set<UUID>) -> [UUID: AuthoritativeLiveSessionState] {
+        guard !sessionIDs.isEmpty else { return [:] }
+        let snapshot = makePersistentBindingResolutionSnapshot()
+        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+            let state: AuthoritativeLiveSessionState
+            do {
+                if let session = try authoritativeLiveSession(for: sessionID, using: snapshot) {
+                    state = session.runState.isActive ? .running : .idle
+                } else {
+                    state = .notFound
+                }
+            } catch {
+                state = .ambiguous
+            }
+            return (sessionID, state)
+        })
+    }
+
+    private func authoritativeLiveSession(
+        for sessionID: UUID,
+        using snapshot: PersistentBindingResolutionSnapshot
+    ) throws -> TabSession? {
+        switch persistentBindingResolution(for: sessionID, using: snapshot) {
         case let .unique(tabID):
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
             return session
@@ -20043,10 +20083,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 {
                     var updated = session.items[index]
                     updated.kind = .toolResult
-                    updated.toolResultJSON = outputJSON
                     updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                    updated.toolIsError = result.toolIsError
-                    updated.text = outputJSON
+                    if let payload = AgentToolResultPayloadRetention.resolvedPayload(
+                        existing: updated.toolResultJSON,
+                        incoming: outputJSON,
+                        incomingIsError: result.toolIsError
+                    ) {
+                        updated.toolResultJSON = payload
+                        updated.toolIsError = result.toolIsError
+                        updated.text = payload
+                    }
                     session.replaceItem(at: index, with: updated)
                 } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
                     var updated = session.items[index]
@@ -20899,6 +20945,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if currentTabID != target.tabID {
             requestUIRefresh(tabID: target.tabID, urgent: true)
         }
+    }
+
+    func oracleToolSettlementCallbacks(tabID: UUID, sessionID: UUID?, runID: UUID?, invocationID: UUID, toolName: String) -> OracleToolSettlementCallbacks? {
+        guard let session = sessions[tabID], let sessionID, let runID,
+              session.activeAgentSessionID == sessionID, session.runID == runID else { return nil }
+        return runService.oracleToolSettlementCallbacks(session: session, invocationID: invocationID, toolName: toolName, isOwnerCurrent: { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return sessions[tabID] === session
+        })
     }
 
     /// Cancel all active MCP tool executions for a given runID.

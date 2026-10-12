@@ -2287,6 +2287,157 @@ import XCTest
             return try (dirty, XCTUnwrap(target))
         }
 
+        func testInventoryReclassifiesOnceAfterScopedSupersessionWithoutSpinning() async throws {
+            for missingScopedRecord in [false, true] {
+                // Zero completes; two supersedes the retry; three holds unfinished scoped work.
+                for supersessions in 0 ... 3 where supersessions != 3 || !missingScopedRecord {
+                    try await Fixture.run { f in
+                        let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                        let previousWindows = WindowStatesManager.shared.allWindows
+                        WindowStatesManager.shared.allWindows = [window]
+                        defer { WindowStatesManager.shared.allWindows = previousWindows }
+                        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+                        await service.prepareDomainTools()
+                        let tools = await service.tools
+                        let list = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+                        let invocation = ToolInvocationContext.trustedLocal(
+                            toolName: "manage_workspaces", metadata: MCPRequestMetadata(connectionID: UUID(), clientName: "Inventory fixture", windowID: window.windowID)
+                        )
+                        let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: window.windowID)
+                        let clean = await client.snapshot()
+                        let models = try f.decoded(clean)
+                        XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                            clean, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                        ).receipt)
+                        await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                        let aRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                        var a = try XCTUnwrap(models.first { $0.id == Fixture.aardvarkID })
+                        a.currentPromptText = "Scoped A newly dirty"
+                        let aOutcome = try await client.replaceWorking(
+                            a, fileURL: aRecord.document.fileURL, expectedWorkspaceRevision: aRecord.revisions.workingRevision
+                        )
+                        XCTAssertEqual(aOutcome.disposition, .applied)
+                        var savedA = a
+                        if supersessions == 3 { savedA.consolidatedIntoWorkspaceID = Fixture.requestedID }
+                        try f.writeDocument(savedA)
+                        let bRecord = try XCTUnwrap(clean.workspaces.first { $0.document.workspaceID == Fixture.requestedID })
+                        var b = try XCTUnwrap(models.first { $0.id == Fixture.requestedID })
+                        b.currentPromptText = "B newly dirty, saved phase still marked"
+                        let bOutcome = try await client.replaceWorking(
+                            b, fileURL: bRecord.document.fileURL, expectedWorkspaceRevision: bRecord.revisions.workingRevision
+                        )
+                        XCTAssertEqual(bOutcome.disposition, .applied)
+                        var savedB = b
+                        savedB.consolidatedIntoWorkspaceID = Fixture.aardvarkID
+                        try f.writeDocument(savedB)
+                        if missingScopedRecord {
+                            // Delete before inventory captures its snapshot: scoped unowned A
+                            // supersedes at the SAME sequence, rather than testing stale retry refusal.
+                            let current = await client.snapshot()
+                            let record = try XCTUnwrap(current.workspaces.first { $0.document.workspaceID == a.id })
+                            let deleted = await client.delete(
+                                workspaceID: a.id, expectedCatalogRevision: current.catalogRevision,
+                                expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(deleted.disposition, .applied)
+                        }
+                        XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(b.id))
+                        manager.activeWorkspace = manager.workspace(withID: Fixture.defaultID)
+                        let entered = Signal("first inventory classification gated")
+                        let retryOrFinished = Signal("retry entered or inventory returned")
+                        let scopedEntered = Signal("scoped classification still unfinished")
+                        let scopedGate = f.makeGate()
+                        var unfinishedScoped: Task<Void, Never>?
+                        let firstGate = f.makeGate()
+                        let retryGate = f.makeGate()
+                        var bulkReads = 0
+                        manager.beforeAuthorityRestoreSavedReadForTesting = { id in
+                            if id == a.id, supersessions == 3 {
+                                await scopedGate.wait { scopedEntered.fire() }
+                            }
+                            guard id == nil else { return }
+                            bulkReads += 1
+                            if bulkReads == 1, supersessions > 0 {
+                                await firstGate.wait { entered.fire() }
+                            } else if bulkReads == 2, supersessions == 2 {
+                                await retryGate.wait { retryOrFinished.fire() }
+                            }
+                        }
+                        defer { manager.beforeAuthorityRestoreSavedReadForTesting = nil }
+                        let inventory = f.startOwned { () -> [String: Any]? in
+                            defer { retryOrFinished.fire() }
+                            do {
+                                let result = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                                    try await list(["action": .string("list")])
+                                }
+                                return try JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any]
+                            } catch {
+                                XCTFail("bounded retry preserves the existing successful inventory response: \(error)")
+                                return nil
+                            }
+                        }
+                        if supersessions > 0 {
+                            try await f.wait(entered)
+                            if !missingScopedRecord, supersessions != 3 {
+                                manager.setCatalogRecordDecodeFailureForTesting { $0 == a.id ? InjectedDecodeFailure() : nil }
+                            }
+                            if supersessions == 3 {
+                                unfinishedScoped = f.startOwned {
+                                    let scoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                    XCTAssertFalse(scoped.didSwitch)
+                                }
+                                try await f.wait(scopedEntered)
+                            } else {
+                                let scoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                XCTAssertFalse(scoped.didSwitch)
+                            }
+                            firstGate.release()
+                            if supersessions == 2 {
+                                // On the broken implementation inventory finishes instead of
+                                // entering a retry; either signal makes this test finite and red.
+                                try await f.wait(retryOrFinished)
+                                if bulkReads == 2 {
+                                    let secondScoped = await manager.requestWorkspaceSwitch(to: a, saveState: false)
+                                    XCTAssertFalse(secondScoped.didSwitch)
+                                }
+                                retryGate.release()
+                            }
+                        }
+                        let inventoryResponse = await inventory.value
+                        let response = try XCTUnwrap(inventoryResponse)
+                        XCTAssertEqual(response["status"] as? String, "ok")
+                        let rows = try XCTUnwrap(response["workspaces"] as? [[String: Any]])
+                        let exposesB = rows.contains { ($0["id"] as? String)?.lowercased() == b.id.uuidString.lowercased() }
+                        let completed = supersessions < 2
+                        XCTAssertEqual(exposesB, !completed, "visible inventory (missing=\(missingScopedRecord), supersessions=\(supersessions))")
+                        XCTAssertEqual(manager.pendingConsolidatedRestoreIDs.contains(b.id), completed)
+                        XCTAssertEqual(bulkReads, supersessions == 0 || supersessions == 3 ? 1 : 2, "exactly one retry, never a third attempt")
+                        let deleteInventory = WindowRoutingService.workspaceInventoryModels(
+                            [b], authorityIncompleteWorkspaceIDs: manager.pendingConsolidatedRestoreIDs, includeHidden: true
+                        )
+                        if completed {
+                            XCTAssertThrowsError(try WindowRoutingService.test_resolveWorkspaceReference(
+                                b.name, workspaces: deleteInventory, includeHiddenForName: false, action: "delete"
+                            )) { error in
+                                XCTAssertTrue(String(describing: error).contains("hidden"))
+                            }
+                        } else {
+                            XCTAssertEqual(try WindowRoutingService.test_resolveWorkspaceReference(
+                                b.name, workspaces: deleteInventory, includeHiddenForName: false, action: "delete"
+                            ).id, b.id, "refusal or second supersession intentionally preserves today's fallback behavior")
+                        }
+                        if let unfinishedScoped {
+                            // Inventory returned without waiting for or revoking the scoped owner.
+                            XCTAssertFalse(manager.pendingConsolidatedRestoreIDs.contains(a.id))
+                            scopedGate.release()
+                            await unfinishedScoped.value
+                            XCTAssertTrue(manager.pendingConsolidatedRestoreIDs.contains(a.id), "unfinished scoped result still owns its publication")
+                        }
+                    }
+                }
+            }
+        }
+
         func testSameSequenceScopedRecoveryCannotBeOverwrittenByBulkClassification() async throws {
             for inventoryPath in [false, true] {
                 for initiallyPending in [false, true] {

@@ -253,6 +253,95 @@ final class ContextBuilderOraclePresetTests: XCTestCase {
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(marker) })
     }
 
+    @MainActor
+    func testMCPAuthorityFreezesScopedGuidanceBeforeProviderValidationAndDiscovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CBGuidance-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "CBGuidance.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        store.setMCPAutoStart(false, commit: false)
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9331, deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService(), settingsStore: store
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer {
+            composition.contextBuilderAgentViewModel.installRunTestHooks(nil)
+            composition.workspaceManager.prepareForWindowClose()
+            composition.oracleViewModel.sessions = []
+        }
+        let workspace = composition.workspaceManager.createWorkspace(name: "Guidance admission", repoPaths: [root.path], ephemeral: true)
+        let tab = ComposeTabState(name: "Guidance target")
+        let index = try XCTUnwrap(composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }))
+        composition.workspaceManager.workspaces[index].composeTabs = [tab]
+        composition.workspaceManager.workspaces[index].activeComposeTabID = tab.id
+        await composition.workspaceManager.switchWorkspace(to: composition.workspaceManager.workspaces[index], saveState: false, reason: #function)
+        composition.promptManager.loadComposeTabsFromWorkspace(composition.workspaceManager.workspaces[index])
+        composition.apiSettingsViewModel.openAIApiKey = "test-key"
+        composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        let original = "  Inspect every lane before answering.\nName uncertainty.  "
+        let later = "Use the newly selected policy on the next request."
+        var profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue],
+            oracleReconciliationGuidance: original,
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue
+        )
+        store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspace.id, mode: .useWorkspaceOverrides)
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspace.id, profile: profile)
+        let nested = MCPTabContextSnapshot(
+            tabID: tab.id, windowID: -9331, workspaceID: workspace.id,
+            promptText: "Plan", selection: tab.selection, selectedMetaPromptIDs: [],
+            tabName: tab.name, runID: UUID(), frozenLookupContext: .visibleWorkspace, explicitlyBound: true
+        )
+        var validationCount = 0
+        composition.contextBuilderAgentViewModel.installRunTestHooks(.init(
+            beforeProcessingProviderEvent: nil, providerEventDisposition: nil, teardownCompleted: nil,
+            validateContextBuilderProviders: {
+                validationCount += 1
+                await Task.yield()
+                var changed = profile
+                changed.oracleReconciliationGuidance = later
+                changed.planningModelRaw = AIModel.gpt54Mini.rawValue
+                changed.additionalOracleModelRaws = []
+                store.setWorkspaceAgentModelsProfile(workspaceID: workspace.id, profile: changed)
+                composition.apiSettingsViewModel.isClaudeCodeConnected = true
+                composition.apiSettingsViewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.claudeCode])
+            }
+        ))
+        let first = try await composition.contextBuilderAgentViewModel.resolveMCPRunAuthority(
+            identity: .init(workspaceID: workspace.id, tabID: tab.id), nestedTabContext: nested,
+            workspaceContext: nil, responseType: "plan", oraclePreset: nil
+        )
+        let captured = try XCTUnwrap(first.configuration.generatedResponseAuthority.execution)
+        XCTAssertEqual(validationCount, 1)
+        XCTAssertEqual(captured.reconciliationGuidance, original)
+        XCTAssertEqual(captured.models, [.gpt54Mini], "Guidance capture must not move existing roster-resolution timing")
+        XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspace.id).oracleReconciliationGuidance, later)
+        profile.oracleReconciliationGuidance = later
+        let next = try await composition.contextBuilderAgentViewModel.resolveMCPRunAuthority(
+            identity: .init(workspaceID: workspace.id, tabID: tab.id), nestedTabContext: nested,
+            workspaceContext: nil, responseType: "plan", oraclePreset: nil
+        )
+        XCTAssertEqual(next.configuration.generatedResponseAuthority.execution?.reconciliationGuidance, later)
+        // A custom workspace with no override uses the built-in policy, not global text.
+        profile.oracleReconciliationGuidance = nil
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspace.id, profile: profile)
+        composition.contextBuilderAgentViewModel.installRunTestHooks(.init(
+            beforeProcessingProviderEvent: nil, providerEventDisposition: nil, teardownCompleted: nil,
+            validateContextBuilderProviders: {}
+        ))
+        let builtin = try await composition.contextBuilderAgentViewModel.resolveMCPRunAuthority(
+            identity: .init(workspaceID: workspace.id, tabID: tab.id), nestedTabContext: nested,
+            workspaceContext: nil, responseType: "question", oraclePreset: nil
+        )
+        XCTAssertNil(try XCTUnwrap(builtin.configuration.generatedResponseAuthority.execution).reconciliationGuidance)
+    }
+
     private func makeTabContext(workspaceID: UUID, tabID: UUID) -> OracleViewModel.OracleSendTabContext {
         OracleViewModel.OracleSendTabContext(
             tabID: tabID,

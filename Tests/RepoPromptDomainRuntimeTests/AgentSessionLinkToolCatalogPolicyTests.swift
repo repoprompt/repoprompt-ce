@@ -21,6 +21,17 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     func testModelSelectionMigrationFullEntryBudgetAndConvergence() throws {
         let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousStopDefinition()
         let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertTrue(current.description.contains("direct link or overseer opt-in"))
+        let beforeActivationGuidance = MCPDomainToolDefinition(
+            name: current.name,
+            description: current.description.replacingOccurrences(
+                of: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`.",
+                with: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`."
+            ),
+            inputSchema: current.inputSchema, annotations: current.annotations,
+            isEnabledByDefault: current.isEnabledByDefault
+        )
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(beforeActivationGuidance), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current), current)
         let encoder = JSONEncoder()

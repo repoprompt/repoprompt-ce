@@ -49,12 +49,12 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         self.liveBoundSession = liveBoundSession
     }
 
-    /// The tab's explicit Agent session binding across open windows; `nil` unless exactly one window
-    /// reports one.
+    /// The tab's unique loaded physical presenter. Inactive catalog copies are not presenters;
+    /// genuinely loaded duplicates remain ambiguous and fail closed.
     static func liveExplicitBinding(forTab tabID: UUID) -> UUID? {
-        let current = WindowStatesManager.shared.allWindows
-            .compactMap { $0.agentModeViewModel.explicitActiveSessionID(for: tabID) }
-        return current.count == 1 ? current.first : nil
+        DelegationScopeRuntime.loadedPresentation(
+            forTab: tabID, in: WindowStatesManager.shared.allWindows
+        )?.sessionID
     }
 
     static func production(core: AgentSessionAdministrationCore, scopes: DelegationScopeRuntime) -> AgentSessionAdministrationFrontDoor {

@@ -1944,3 +1944,73 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertFalse(LiveAgentSessionInventorySource.isComplete(scan(schema: nil, readFailed: true)))
     }
 }
+
+// MARK: - DelegationCommitFenceTests regressions
+
+@MainActor
+final class DelegationCommitFenceTests: XCTestCase {
+    func testGrantApprovalReReadsBindingAndRejectsAnotherPhysicalWindow() async throws {
+        let first = WindowState(), second = WindowState()
+        addTeardownBlock { @MainActor in
+            await first.tearDown()
+            await second.tearDown()
+        }
+        await first.workspaceManager.awaitInitialized()
+        await second.workspaceManager.awaitInitialized()
+        let requester = UUID()
+        let catalogTab = ComposeTabState(name: "Catalog-only requester", activeAgentSessionID: requester)
+        let tab = catalogTab.id
+        let session = AgentModeViewModel.TabSession(tabID: tab)
+        first.agentModeViewModel.test_installLiveSession(session)
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        // A different window knows the saved carrier without presenting its Agent session.
+        // Exercise the real catalog lookup; do not fabricate a physical endpoint.
+        var catalog = WorkspaceModel(name: "Inactive catalog copy", repoPaths: [], isSavedWorkspace: false)
+        catalog.isEphemeral = true
+        catalog.composeTabs = [catalogTab]
+        second.workspaceManager.workspaces.append(catalog)
+        XCTAssertNil(second.agentModeViewModel.sessions[tab])
+        XCTAssertEqual(
+            second.agentModeViewModel.explicitActiveSessionID(for: tab),
+            requester,
+            "the old lookup sees the non-presenting catalog copy"
+        )
+        var windows = [first, second]
+        let runtime = DelegationScopeRuntime(windows: { windows }, notifyCatalogChanged: { _ in })
+        let request = try runtime.requestScope(
+            requesterSessionID: requester, requesterTabID: tab, kind: .tree(rootSessionID: requester),
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertEqual(request.requesterWindowID, first.windowID)
+        func approve(in window: WindowState) -> Bool {
+            if case .success = runtime.approve(
+                requestID: request.id, presentedWindowID: window.windowID,
+                presentedTabID: tab, presentedSessionID: requester
+            ) { return true }
+            return false
+        }
+
+        XCTAssertFalse(approve(in: second), "catalog knowledge does not grant physical presentation authority")
+        XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
+        XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
+
+        // No render/task cancellation runs between the rebind and the stale button callback.
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
+        XCTAssertFalse(approve(in: first))
+        XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
+        XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
+
+        let otherSession = AgentModeViewModel.TabSession(tabID: tab)
+        second.agentModeViewModel.test_installLiveSession(otherSession)
+        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        windows = [second]
+        XCTAssertFalse(approve(in: second), "matching IDs in a different physical window are not the presented request")
+        windows = [first]
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        windows = [first, second]
+        XCTAssertFalse(approve(in: first), "ambiguous cross-window tab ownership fails closed")
+        windows = [first]
+        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve")
+        XCTAssertTrue(runtime.hasLiveScope(grantedTo: requester))
+    }
+}

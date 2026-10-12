@@ -3229,9 +3229,12 @@ actor ServerNetworkManager {
             canBecomeOverseer: isEnabledState && oversightEnabled && eligible && !activated && !hasAnyActiveLink,
             hasActivatedOverseer: activated
         )
+        // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
+        // authority. Keep durable scope eligibility independent of activation retirement.
         snapshot.isSessionAdminEligible = holdsLiveScope
             || runState.allowsAgentExternalControlTools
             || hasActiveOutboundLink
+            || (activated && oversightEnabled)
         return snapshot
     }
 

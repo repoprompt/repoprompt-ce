@@ -9,8 +9,7 @@ import MCP
 /// exact Agent Mode run holding a live delegation scope (or, for `request_scope`, to an
 /// orchestrator/overseer run), and never to administrative principals.
 package enum MCPDomainSessionAdminToolDefinition {
-    /// Milestone 1 operations. Lane A implements the scope lifecycle; the rest are reserved
-    /// identities that currently return `not_implemented`.
+    /// Shared operation identities. Only the end-to-end implemented subset is advertised.
     package static let operations: [String] = [
         "request_scope", "scope_status", "release_scope", "attenuate",
         "inventory", "get", "tree", "links",
@@ -31,6 +30,9 @@ package enum MCPDomainSessionAdminToolDefinition {
         "release", "retire", "confirmation_status", "undo"
     ]
 
+    /// Preserve the shared operation identities for later lanes, but never advertise reserved ops.
+    package static let advertisedOperations: [String] = operations.filter { implementedOperations.contains($0) }
+
     package static let capabilityValues: [String] = DomainDelegationScopeCapability.allCases.map(\.rawValue)
 
     package static let definition = MCPDomainToolDefinition(
@@ -44,13 +46,14 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
         - `release_scope`: give up one of your scopes; revokes its nested scopes too.
+        - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
         **Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
         **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
-        Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Other ops may return `not_implemented`.
+        Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Reserved operations are not advertised.
 
-        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
+        **Rules**: `retire` and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -58,7 +61,7 @@ package enum MCPDomainSessionAdminToolDefinition {
             "properties": .object([
                 "op": .object([
                     "type": .string("string"),
-                    "enum": .array(operations.map(Value.string)),
+                    "enum": .array(advertisedOperations.map(Value.string)),
                     "description": .string("Required operation.")
                 ]),
                 "kind": .object([
@@ -83,7 +86,13 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "additionalProperties": .bool(false),
                     "properties": .object([
                         "max_live_sessions": .object(["type": .string("integer"), "minimum": .int(0)]),
-                        "max_depth": .object(["type": .string("integer"), "minimum": .int(0)]),
+                        "max_depth": .object([
+                            "type": .string("integer"),
+                            "minimum": .int(0),
+                            "description": .string(
+                                "kind=tree only: spawn depth below this session. Rejected as guardrails_malformed for workspace or all_sessions."
+                            )
+                        ]),
                         "max_worktrees": .object(["type": .string("integer"), "minimum": .int(0)]),
                         "expires_in_seconds": .object(["type": .string("integer"), "minimum": .int(60)]),
                         "bulk_confirmation_threshold": .object(["type": .string("integer"), "minimum": .int(1)])
