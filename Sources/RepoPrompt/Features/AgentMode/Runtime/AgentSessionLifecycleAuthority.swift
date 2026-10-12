@@ -419,54 +419,22 @@ final class AgentSessionLifecycleAuthority {
             let protectedTabIDs = Set(workspaceClaims.map(\.identity.tabID))
             next.stashedTabs.removeAll { protectedTabIDs.contains($0.tab.id) }
 
-            // These indexes belong to this projection attempt only. A large sidebar must not
-            // rescan every tab/stashed tab for every protected claim. Keep first-match semantics
-            // for damaged duplicate tab IDs, and update session carriers in claim order.
-            let previousTabsByID = Dictionary(previous.composeTabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            let previousStashedTabIDs = Set(previous.stashedTabs.map(\.tab.id))
-            let currentIndicesByID = Dictionary(currentWorkspace.composeTabs.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
-            var nextIndicesByID: [UUID: Int] = [:]
-            var sessionCarriers: [UUID: Set<Int>] = [:]
-            func indexTabs() {
-                nextIndicesByID.removeAll(keepingCapacity: true)
-                sessionCarriers.removeAll(keepingCapacity: true)
-                for (index, tab) in next.composeTabs.enumerated() {
-                    if nextIndicesByID[tab.id] == nil { nextIndicesByID[tab.id] = index }
-                    if let sessionID = tab.activeAgentSessionID {
-                        sessionCarriers[sessionID, default: []].insert(index)
-                    }
-                }
-            }
-            indexTabs()
             for claim in workspaceClaims {
                 let tabID = claim.identity.tabID
                 if let sessionID = claim.identity.sessionID {
-                    for tabIndex in sessionCarriers[sessionID] ?? [] where next.composeTabs[tabIndex].id != tabID {
+                    for tabIndex in next.composeTabs.indices
+                        where next.composeTabs[tabIndex].id != tabID
+                        && next.composeTabs[tabIndex].activeAgentSessionID == sessionID
+                    {
                         next.composeTabs[tabIndex].activeAgentSessionID = nil
-                        sessionCarriers[sessionID]?.remove(tabIndex)
                     }
                 }
-                if let index = nextIndicesByID[tabID] {
-                    if let previousSessionID = next.composeTabs[index].activeAgentSessionID {
-                        sessionCarriers[previousSessionID]?.remove(index)
-                    }
+                if let index = next.composeTabs.firstIndex(where: { $0.id == tabID }) {
                     next.composeTabs[index] = claim.tab
-                    if let sessionID = claim.tab.activeAgentSessionID {
-                        sessionCarriers[sessionID, default: []].insert(index)
-                    }
-                    if claim.tab.id != tabID { indexTabs() }
-                } else if let localIndex = currentIndicesByID[tabID] {
+                } else if let localIndex = currentWorkspace.composeTabs.firstIndex(where: { $0.id == tabID }) {
                     next.composeTabs.insert(claim.tab, at: min(localIndex, next.composeTabs.count))
-                    // Insertion shifts indices. Rebuild only for this structural repair, not for
-                    // the ordinary existing-tab overlay path.
-                    indexTabs()
                 } else {
-                    let index = next.composeTabs.count
                     next.composeTabs.append(claim.tab)
-                    if nextIndicesByID[claim.tab.id] == nil { nextIndicesByID[claim.tab.id] = index }
-                    if let sessionID = claim.tab.activeAgentSessionID {
-                        sessionCarriers[sessionID, default: []].insert(index)
-                    }
                 }
             }
 
@@ -480,9 +448,9 @@ final class AgentSessionLifecycleAuthority {
             reconciled[projectedIndex] = next
             protectedWorkspaceIDs.insert(workspaceID)
             let changedClaims = workspaceClaims.filter { claim in
-                let previousTab = previousTabsByID[claim.identity.tabID]
+                let previousTab = previous.composeTabs.first(where: { $0.id == claim.identity.tabID })
                 return previousTab != claim.tab
-                    || previousStashedTabIDs.contains(claim.identity.tabID)
+                    || previous.stashedTabs.contains(where: { $0.tab.id == claim.identity.tabID })
                     || (claim.isActive && previous.activeComposeTabID != claim.identity.tabID)
             }
             protectedClaimCount += changedClaims.count

@@ -13,7 +13,7 @@ protocol TerminationSignalObserving: AnyObject {
     func observe(_ signal: Int32, handler: @escaping () -> Void)
 }
 
-/// Bridges POSIX signals onto the main run loop for AppKit's graceful lifecycle.
+/// Bridges POSIX signals onto the main queue where AppKit lifecycle work is serialized.
 final class DispatchTerminationSignalObserver: TerminationSignalObserving {
     /// Dispatch sources only remain active while retained, so the observer owns them for its
     /// lifetime rather than relying on the caller to preserve an implementation detail.
@@ -25,13 +25,7 @@ final class DispatchTerminationSignalObserver: TerminationSignalObserving {
 
     func observe(_ signal: Int32, handler: @escaping () -> Void) {
         let source = DispatchSource.makeSignalSource(signal: signal, queue: .main)
-        // AppKit can run a nested termination loop for NSTerminateLater. Enter it from
-        // the run loop, not a main dispatch callback that its async reply needs to drain.
-        source.setEventHandler {
-            RunLoop.main.perform(inModes: [.common]) {
-                handler()
-            }
-        }
+        source.setEventHandler(handler: handler)
         sources[signal] = source
         source.activate()
     }
