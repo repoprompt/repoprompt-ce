@@ -23,7 +23,10 @@ package enum MCPDomainSessionAdminToolDefinition {
     ]
 
     /// Operations Lane A implements end to end.
-    package static let implementedOperations: Set<String> = ["request_scope", "scope_status", "release_scope"]
+    package static let implementedOperations: Set<String> = ["request_scope", "scope_status", "release_scope", "confirmation_status"]
+
+    /// Preserve the shared operation identities for later lanes, but never advertise reserved ops.
+    package static let advertisedOperations: [String] = operations.filter { implementedOperations.contains($0) }
 
     package static let capabilityValues: [String] = DomainDelegationScopeCapability.allCases.map(\.rawValue)
 
@@ -38,10 +41,11 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
         - `release_scope`: give up one of your scopes; revokes its nested scopes too.
+        - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
-        Other ops are reserved and may return `not_implemented`.
+        This foundation implements scope lifecycle and confirmation status only. Target-session mutations are reserved for later lanes and are not advertised here.
 
-        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. After the user approves, repeat the same call unchanged (same op, arguments, and `idempotency_key`) with `confirmation_id`; changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
+        **Rules**: Requesting a scope grants nothing until the user approves. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Use `idempotency_key` to retry an unchanged `request_scope` call.
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -49,7 +53,7 @@ package enum MCPDomainSessionAdminToolDefinition {
             "properties": .object([
                 "op": .object([
                     "type": .string("string"),
-                    "enum": .array(operations.map(Value.string)),
+                    "enum": .array(advertisedOperations.map(Value.string)),
                     "description": .string("Required operation.")
                 ]),
                 "kind": .object([

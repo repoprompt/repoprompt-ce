@@ -30,7 +30,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         try await assertRestoredGrantRepairsCatalog(outbound: true, surfaceTransition: .upgrade)
     }
 
-    private enum SurfaceTransition { case activation, upgrade }
+    func testBareOrchestratorCanDiscoverScopeRequestsWithoutAnyGrant() async throws {
+        try await assertRestoredGrantRepairsCatalog(outbound: false, surfaceTransition: .orchestrator)
+    }
+
+    func testDelegationEligibilityAndForcedRelistPreserveRoleSizedOversightSurface() async throws {
+        try await assertRestoredGrantRepairsCatalog(outbound: false, surfaceTransition: .delegation)
+    }
+
+    private enum SurfaceTransition { case activation, upgrade, orchestrator, delegation }
 
     private func assertRestoredGrantRepairsCatalog(outbound: Bool, surfaceTransition: SurfaceTransition? = nil) async throws {
         #if DEBUG
@@ -92,7 +100,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 manager: manager,
                 runID: runID,
                 tabID: tabID,
-                windowID: window.windowID
+                windowID: window.windowID,
+                allowsAgentExternalControlTools: surfaceTransition == .orchestrator
             )
             await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
             let testConnection = CatalogRepairPolicyAuthorityTestConnection()
@@ -122,6 +131,51 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertNotNil(session.codexController)
 
             let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            if surfaceTransition == .orchestrator {
+                XCTAssertTrue(names.contains(MCPWindowToolName.sessionAdmin), "Bare orchestrators can request authority, not exercise it")
+                XCTAssertFalse(AgentSessionLinkRuntimeBridge.shared.delegationScopes.hasLiveScope(grantedTo: sessionID))
+                return
+            }
+            if surfaceTransition == .delegation {
+                XCTAssertFalse(names.contains(MCPWindowToolName.sessionAdmin))
+                // Inbound oversight alone is not a scope request/administration grant.
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [])
+                let inboundNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertTrue(inboundNames.contains(MCPWindowToolName.agentSessionLink))
+                XCTAssertFalse(inboundNames.contains(MCPWindowToolName.sessionAdmin))
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [endpoint])
+                let outboundNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertTrue(outboundNames.contains(MCPWindowToolName.sessionAdmin))
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [], outbound: [])
+                let noLinkNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(noLinkNames.contains(MCPWindowToolName.sessionAdmin))
+
+                let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+                let request = try scopes.requestScope(
+                    requesterSessionID: sessionID, requesterTabID: tabID,
+                    kind: .tree(rootSessionID: sessionID), capabilities: [.observe],
+                    guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                let scope = try scopes.approve(
+                    requestID: request.id, presentedWindowID: window.windowID,
+                    presentedTabID: tabID, presentedSessionID: sessionID
+                ).get()
+                addTeardownBlock { @MainActor in scopes.revoke(scopeID: scope.id) }
+                let notificationsBeforeGrant = await testConnection.notificationCount()
+                await manager.notifyToolListChangedForAgentSession(sessionID, forceRelist: true)
+                let notificationsAfterGrant = await testConnection.notificationCount()
+                XCTAssertGreaterThan(notificationsAfterGrant, notificationsBeforeGrant, "A scope-only grant must relist even when every link fact is unchanged")
+                let scopedNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertTrue(scopedNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(scopedNames.contains(MCPWindowToolName.agentSessionLink), "A scope does not fabricate pair or activated-overseer authority")
+                scopes.revoke(scopeID: scope.id)
+                await manager.notifyToolListChangedForAgentSession(sessionID, forceRelist: true)
+                let revokedNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertFalse(revokedNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertEqual(session.runID, runID, "Scope discovery never retargets the run")
+                XCTAssertNotNil(session.codexController, "Scope changes do not recycle a running provider")
+                return
+            }
             let sourceGeneration = session.codexControllerGeneration
             if surfaceTransition == .activation {
                 let state = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint))
@@ -224,7 +278,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             manager: ServerNetworkManager,
             runID: UUID,
             tabID: UUID,
-            windowID: Int
+            windowID: Int,
+            allowsAgentExternalControlTools: Bool = false
         ) async {
             await manager.installClientConnectionPolicy(
                 for: clientName,
@@ -238,7 +293,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 additionalTools: nil,
                 purpose: .agentModeRun,
                 taskLabelKind: nil,
-                allowsAgentExternalControlTools: false,
+                allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                 requiresExpectedAgentPID: true
             )
         }
@@ -260,6 +315,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
 #if DEBUG
     private actor CatalogRepairPolicyAuthorityTestConnection: MCPServerConnection {
+        private var toolListChangedCount = 0
+
+        func notificationCount() -> Int {
+            toolListChangedCount
+        }
+
         nonisolated var isFilesystemBacked: Bool {
             false
         }
@@ -275,7 +336,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
         func stop() async {}
         func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
-        func notifyToolListChanged() async {}
+        func notifyToolListChanged() async {
+            toolListChangedCount += 1
+        }
+
         func connectionState() -> ConnectionStateSnapshot {
             .ready
         }

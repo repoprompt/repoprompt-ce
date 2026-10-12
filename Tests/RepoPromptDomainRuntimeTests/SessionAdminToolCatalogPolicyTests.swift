@@ -19,11 +19,11 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         let names = MCPDomainToolCatalog.orderedToolNames
         let linkIndex = try XCTUnwrap(names.firstIndex(of: MCPWindowToolName.agentSessionLink))
         XCTAssertEqual(names[linkIndex + 1], toolName)
-        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.filter { $0.name == toolName }.count, 1)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count(where: { $0.name == toolName }), 1)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.map(\.name), names)
     }
 
-    func testSchemaAdvertisesExactlyTheCatalogOperations() throws {
+    func testSchemaAdvertisesOnlyImplementedCatalogOperations() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         XCTAssertEqual(schema["additionalProperties"], .bool(false))
@@ -31,8 +31,14 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertEqual(
             properties["op"]?.objectValue?["enum"],
-            .array(MCPDomainSessionAdminToolDefinition.operations.map { .string($0) })
+            .array(MCPDomainSessionAdminToolDefinition.advertisedOperations.map { .string($0) })
         )
+        XCTAssertEqual(
+            Set(MCPDomainSessionAdminToolDefinition.advertisedOperations),
+            MCPDomainSessionAdminToolDefinition.implementedOperations,
+            "Reserved identities must not be advertised before their handlers ship"
+        )
+        XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.contains("confirmation_status"))
         for operation in MCPDomainSessionAdminToolDefinition.operations {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(" \(operation.uppercased()) ")).normalizedOperation,
@@ -44,7 +50,7 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
             MCPDomainToolOperationIdentity.unknownOperation,
             "session deletion is human-only and has no operation"
         )
-        for required in ["scope_capability_missing", "scope_guardrail_exceeded", "scope_expired", "confirmation_required", "human-only"] {
+        for required in ["request_scope", "scope_status", "release_scope", "confirmation_status", "human-only"] {
             XCTAssertTrue(definition.description.contains(required), required)
         }
         XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.isSubset(of: Set(MCPDomainSessionAdminToolDefinition.operations)))
