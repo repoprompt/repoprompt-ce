@@ -824,14 +824,11 @@ transaction; all target-bearing operations still require their ordinary exact gr
 is direct user consent, not an MCP invocation, and does not bypass the tool bootstrap's route proof.
 Linked behavior, persistence, prompt inventory, and wake admission remain unchanged.
 
-Activation retirement is observed at `AgentTabSession.oversight.didSet`, not inferred from the linked
-menu catalog. Its owning view model rereads the live current session after the enclosing mutation,
-fenced by session-object ownership, and the attached bridge invalidates discovery for the retired
-endpoint's session UUID even if the old object was replaced. A binding transition that retired
-activation also requests a presentation-only
-settlement reread; it never replays discovery or wakes. This covers failed routed hydration that keeps
-the same tab visible without a final binding refresh. Fresh catalog requests and calls still recompute
-live authority; provider discovery caches are a separate publication concern.
+Activation retirement is observed once at `AgentTabSession.oversight.didSet`; the owning view model
+repaints the current tab's pill after the enclosing mutation and the bridge invalidates discovery for
+the retired session UUID, without revoking or granting anything. Every binding-transition settlement
+separately repaints the current tab's pill, so a failed routed hydration never leaves a stale endpoint
+on screen.
 
 Discovery repair is separate from route proof and current operation authority. Claude/OpenCode/Devin
 receive the existing notification route only. No live model pickup is established by protocol tests;

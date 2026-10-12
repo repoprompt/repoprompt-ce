@@ -259,7 +259,7 @@ struct AgentMonitorPopoverView: View {
             .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
             .disabled(enabled || props.hasInbound || props.overseerBootstrapState == nil || overseerEnableState.isBusy(for: props.endpoint))
             .accessibilityHint("Enables lane creation for this session without linking an existing session")
-            Text("Create overseen lanes without linking an existing session. Enabling applies to this session until it is rebound or the app restarts; it grants no authority over existing sessions.")
+            Text("Create overseen lanes without linking an existing session. Enabling applies to this session until the session is rebound, changes ownership, or the app restarts; it grants no authority over existing sessions.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
             if !enabled, props.hasInbound {
