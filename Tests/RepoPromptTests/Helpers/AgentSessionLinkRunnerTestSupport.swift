@@ -79,7 +79,8 @@ final class AgentSessionLinkRunnerHarness {
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        acpDiagnosticSink: ACPAgentSessionController.DiagnosticSink? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -114,7 +115,7 @@ final class AgentSessionLinkRunnerHarness {
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+                try ACPAgentSessionController(provider: provider, runRequest: request, diagnosticSink: acpDiagnosticSink, allowsProviderProcessLaunchForTesting: true)
             },
             connectionPolicyInstaller: policyInstaller,
             expectedPIDPolicyArmer: { _ in true },

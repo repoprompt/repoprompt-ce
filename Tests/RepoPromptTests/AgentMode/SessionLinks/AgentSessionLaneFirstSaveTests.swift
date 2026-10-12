@@ -406,6 +406,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertNotNil(result, "use the real bootstrap eligibility/authority gates, not a stored-state assignment")
                 return try XCTUnwrap(creator.oversight.overseerActivation)
             }
+            let causalStart = ProcessInfo.processInfo.systemUptime
+            let trace: (String) -> Void = { print("ABA_CAUSAL \(ProcessInfo.processInfo.systemUptime - causalStart) \($0)") }
+            bridge.test_afterLaneCreationClaim = { trace("claimed") }
+            bridge.test_afterLaneCapInventoryBeforeRevision = { trace("cap inventory") }
+            viewModel.test_afterOversightLaneProvision = { _ in trace("lane provisioned") }
+            bridge.test_afterAddInsertionBeforeEstablishment = { _ in trace("add inserted") }
+            bridge.test_beforeDurableIntentSettlement = { _ in trace("intent settlement") }
+            bridge.test_afterReservationBeforeActivation = { _ in trace("reserved") }
+            defer { viewModel.test_afterOversightLaneProvision = nil }
             let parked = (0 ..< 3).map { XCTestExpectation(description: "activation-backed A\($0) is indexed and parked") }
             var pairs: [AgentSessionOversightIntent] = []
             var releases: [Int: CheckedContinuation<Void, Never>] = [:]
@@ -413,6 +422,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             bridge.test_afterActivationBeforeDeletionFence = { pair in
                 guard pairs.count < 3 else { return }
                 let index = pairs.count
+                trace("activated A\(index)")
                 pairs.append(pair)
                 await withCheckedContinuation { continuation in
                     releases[index] = continuation
