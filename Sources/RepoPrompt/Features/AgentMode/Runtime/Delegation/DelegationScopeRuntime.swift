@@ -403,12 +403,21 @@ final class DelegationScopeRuntime: ObservableObject {
         return approve(requestID: requestID, capabilities: capabilities, guardrails: guardrails)
     }
 
+    /// The physical, loaded presentation shared by scope and batch approval. Catalog copies in
+    /// inactive workspaces are knowledge, not presenters. Actual loaded duplicates fail closed.
+    static func loadedPresentation(forTab tabID: UUID, in windows: [WindowState]) -> (window: WindowState, sessionID: UUID)? {
+        let bound = windows.compactMap { window -> (window: WindowState, sessionID: UUID)? in
+            guard let sessionID = window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID else { return nil }
+            return (window, sessionID)
+        }
+        return bound.count == 1 ? bound[0] : nil
+    }
+
     private func explicitPresentationWindow(tabID: UUID, sessionID: UUID) -> WindowState? {
-        let bound = windows().filter { $0.agentModeViewModel.explicitActiveSessionID(for: tabID) != nil }
-        guard bound.count == 1, let window = bound.first,
-              window.agentModeViewModel.explicitActiveSessionID(for: tabID) == sessionID
+        guard let presentation = Self.loadedPresentation(forTab: tabID, in: windows()),
+              presentation.sessionID == sessionID
         else { return nil }
-        return window
+        return presentation.window
     }
 
     /// The user approved the grant card, optionally narrowing capabilities or adjusting guardrails.

@@ -370,6 +370,102 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         XCTAssertEqual(result.effectiveVisibleSessionCount, paged.count)
     }
 
+    func testPinnedThreadAncestorsDoNotConsumeTheOrdinaryPageBudget() {
+        let viewModel = makeViewModel()
+        let threadCount = AgentModeViewModel.sessionSidebarPageSize + 3
+        var tabs: [ComposeTabState] = []
+        var sessions: [UUID: AgentModeViewModel.TabSession] = [:]
+        var bindings: [UUID: UUID] = [:]
+        for thread in 0 ..< threadCount {
+            for level in 0 ..< 3 {
+                let tabID = id(1000 + thread * 3 + level)
+                let sessionID = id(2000 + thread * 3 + level)
+                tabs.append(ComposeTabState(id: tabID, name: "Thread \(thread) level \(level)", isPinned: level == 2))
+                let session = AgentModeViewModel.TabSession(tabID: tabID)
+                session.hasLoadedPersistedState = true
+                session.parentSessionID = level == 0 ? nil : id(2000 + thread * 3 + level - 1)
+                XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+                sessions[tabID] = session
+                bindings[tabID] = sessionID
+            }
+        }
+        let ordinary = (0 ..< AgentModeViewModel.sessionSidebarPageSize + 4).map {
+            ComposeTabState(id: id(3000 + $0), name: "Ordinary \($0)")
+        }
+        tabs.append(contentsOf: ordinary)
+        let rows = AgentModeSidebarSessionBuilder(
+            allTabs: tabs, rowTabs: tabs, sessions: sessions, authoritativeSessionIDByTabID: bindings,
+            sessionIndex: [:], sessionListSortDates: [:], sessionListCacheReady: true,
+            sidebarRestoreFrozenOrderByTabID: [:], mcpControlledTabIDs: []
+        ).build()
+        XCTAssertEqual(rows.filter(\.isPinned).map(\.depth), Array(repeating: 2, count: threadCount))
+        let paged = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: nil)
+        XCTAssertEqual(paged.filter(\.isPinned).count, threadCount, "every pin-bearing thread survives the page cap")
+        XCTAssertEqual(paged.count(where: { $0.depth < 2 && $0.sessionID != nil }), threadCount * 2)
+        XCTAssertEqual(paged.count(where: { $0.sessionID == nil }), AgentModeViewModel.sessionSidebarPageSize)
+        XCTAssertEqual(paged.count, threadCount * 3 + AgentModeViewModel.sessionSidebarPageSize)
+        let pinsOnly = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: nil, visibleSessionCount: 0)
+        XCTAssertEqual(pinsOnly.count, threadCount * 3, "even a zero ordinary budget retains pins and their ancestors")
+    }
+
+    func testOrdinarySiblingsCannotHideALaterPinnedThreadAndActiveRowsStillExpandThePage() {
+        let viewModel = makeViewModel()
+        let firstParent = row(tabID: id(1), title: "Parent one", sessionID: id(101))
+        let firstPin = row(tabID: id(2), title: "Pin one", isPinned: true, sessionID: id(102), parentSessionID: id(101), depth: 1)
+        let siblings = (0 ..< AgentModeViewModel.sessionSidebarPageSize + 3).map {
+            row(tabID: id(10 + $0), title: "Ordinary sibling \($0)", parentSessionID: id(101), depth: 1)
+        }
+        let secondParent = row(tabID: id(3), title: "Parent two", sessionID: id(103))
+        let secondPin = row(tabID: id(4), title: "Pin two", isPinned: true, sessionID: id(104), parentSessionID: id(103), depth: 1)
+        let rows = [firstParent, firstPin] + siblings + [secondParent, secondPin]
+        let paged = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: nil)
+        XCTAssertEqual(paged.map(\.tabID), [id(1), id(2)] + siblings.prefix(AgentModeViewModel.sessionSidebarPageSize).map(\.tabID) + [id(3), id(4)])
+        XCTAssertEqual(viewModel.effectiveSidebarVisibleSessionCount(filteredSessions: rows, currentTabID: nil), paged.count)
+        let pinsOnly = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: nil, visibleSessionCount: 0)
+        XCTAssertEqual(pinsOnly.map(\.tabID), [id(1), id(2), id(3), id(4)])
+        let expanded = viewModel.pagedSidebarSessions(filteredSessions: rows, currentTabID: siblings.last?.tabID)
+        XCTAssertEqual(expanded.map(\.tabID), rows.map(\.tabID), "active visibility still admits every preceding ordinary row")
+        XCTAssertEqual(
+            viewModel.effectiveSidebarVisibleSessionCount(filteredSessions: rows, currentTabID: siblings.last?.tabID),
+            expanded.count
+        )
+    }
+
+    func testSearchExpandsStoredCollapsedGroupsForRenderingSelectionAndNavigation() throws {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Matching one", sidebarGroup: "A", activeAgentSessionID: id(101)),
+            ComposeTabState(id: id(2), name: "Matching two", sidebarGroup: "A", activeAgentSessionID: id(102)),
+            ComposeTabState(id: id(3), name: "Other", sidebarGroup: "B", activeAgentSessionID: id(103))
+        ]
+        let store = viewModel.ui.sessionSidebar
+        store.toggleGroupCollapsed("A")
+        XCTAssertTrue(projection(viewModel, tabs: tabs, snapshot: store.snapshot).renderedSelectionOrder.allSatisfy {
+            $0 != .active(tabID: id(1)) && $0 != .active(tabID: id(2))
+        })
+        viewModel.setSessionSidebarSearchText("matching")
+        let result = projection(viewModel, tabs: tabs, snapshot: store.snapshot)
+        let rendered = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+            for: result.pagedSessions, collapsedGroups: store.snapshot.collapsedSidebarGroups,
+            searchText: store.snapshot.searchText
+        )
+        XCTAssertEqual(Set(rendered.filter { !$0.hidesRow }.map(\.session.tabID)), [id(1), id(2)])
+        XCTAssertTrue(rendered.allSatisfy { !$0.isGroupCollapsed })
+        XCTAssertEqual(result.renderedSelectionOrder, rendered.map { .active(tabID: $0.session.tabID) })
+        let first = try XCTUnwrap(rendered.first)
+        let second = try XCTUnwrap(rendered.dropFirst().first)
+        XCTAssertEqual(viewModel.sessionSidebarShortcutTabID(at: 0, in: tabs, currentTabID: nil), first.session.tabID)
+        XCTAssertEqual(
+            viewModel.adjacentSidebarSessionTabID(from: first.session.tabID, forward: true, in: tabs, currentTabID: nil),
+            second.session.tabID
+        )
+        viewModel.toggleSidebarGroupCollapsed("A")
+        XCTAssertEqual(store.snapshot.collapsedSidebarGroups, ["A"], "search and its disabled collapse action preserve the stored preference")
+        viewModel.setSessionSidebarSearchText("  ")
+        let cleared = projection(viewModel, tabs: tabs, snapshot: store.snapshot)
+        XCTAssertEqual(cleared.renderedSelectionOrder, [.active(tabID: id(3))], "clearing search restores the stored collapse")
+    }
+
     func testGroupSectionsRenderFirstInGroupOrderAndCollapse() {
         let viewModel = makeViewModel()
         let tabs = [
@@ -435,17 +531,20 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         )
     }
 
-    private func row(tabID: UUID, title: String) -> AgentModeViewModel.SidebarSession {
+    private func row(
+        tabID: UUID, title: String, isPinned: Bool = false,
+        sessionID: UUID? = nil, parentSessionID: UUID? = nil, depth: Int = 0
+    ) -> AgentModeViewModel.SidebarSession {
         AgentModeViewModel.SidebarSession(
             id: tabID,
             tabID: tabID,
             title: title,
             lastUserMessageAt: nil,
             activityDate: Date(timeIntervalSince1970: 0),
-            isPinned: false,
-            sessionID: nil,
-            parentSessionID: nil,
-            depth: 0,
+            isPinned: isPinned,
+            sessionID: sessionID,
+            parentSessionID: parentSessionID,
+            depth: depth,
             isMCPControlled: false,
             searchFieldSource: AgentModeSidebarSessionBuilder.searchFieldSource(
                 title: title,

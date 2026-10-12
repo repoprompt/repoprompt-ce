@@ -4794,6 +4794,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
         }
+        newSession.onOverseerActivationRetired = { [weak self] session, retired in
+            self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)
+        }
+        newSession.onBindingTransitionSettled = { [weak self] session in
+            self?.agentSessionLinkBindingTransitionSettled(session: session)
+        }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
             if !session.runState.isActive {
@@ -20100,10 +20106,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 {
                     var updated = session.items[index]
                     updated.kind = .toolResult
-                    updated.toolResultJSON = outputJSON
                     updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                    updated.toolIsError = result.toolIsError
-                    updated.text = outputJSON
+                    if let payload = AgentToolResultPayloadRetention.resolvedPayload(
+                        existing: updated.toolResultJSON,
+                        incoming: outputJSON,
+                        incomingIsError: result.toolIsError
+                    ) {
+                        updated.toolResultJSON = payload
+                        updated.toolIsError = result.toolIsError
+                        updated.text = payload
+                    }
                     session.replaceItem(at: index, with: updated)
                 } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
                     var updated = session.items[index]
@@ -20956,6 +20968,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if currentTabID != target.tabID {
             requestUIRefresh(tabID: target.tabID, urgent: true)
         }
+    }
+
+    func oracleToolSettlementCallbacks(tabID: UUID, sessionID: UUID?, runID: UUID?, invocationID: UUID, toolName: String) -> OracleToolSettlementCallbacks? {
+        guard let session = sessions[tabID], let sessionID, let runID,
+              session.activeAgentSessionID == sessionID, session.runID == runID else { return nil }
+        return runService.oracleToolSettlementCallbacks(session: session, invocationID: invocationID, toolName: toolName, isOwnerCurrent: { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return sessions[tabID] === session
+        })
     }
 
     /// Cancel all active MCP tool executions for a given runID.

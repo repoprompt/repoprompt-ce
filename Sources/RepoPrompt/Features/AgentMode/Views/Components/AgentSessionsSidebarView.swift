@@ -396,13 +396,16 @@ struct AgentModeSessionsListView: View {
     @State private var sessionLinkProjectionRevision: UInt64 = 0
     private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
         guard let name = item.groupName else { return nil }
-        return AnyView(AgentSidebarGroupSectionHeader(
-            title: name,
-            rowCount: item.groupRowCount,
-            isCollapsed: item.isGroupCollapsed,
-            isFirst: item.isFirstHeader,
-            onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
-        ))
+        return AnyView(
+            AgentSidebarGroupSectionHeader(
+                title: name,
+                rowCount: item.groupRowCount,
+                isCollapsed: item.isGroupCollapsed,
+                isFirst: item.isFirstHeader,
+                onToggle: { agentModeVM.toggleSidebarGroupCollapsed(name) }
+            )
+            .disabled(!sidebarUI.snapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        )
     }
 
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
@@ -494,6 +497,7 @@ struct AgentModeSessionsListView: View {
         let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
             for: snapshot.pagedSessions,
             collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+            searchText: sidebarUI.snapshot.searchText,
             perfRecorder: perfRecorder
         )
         let selectionState = sidebarUI.selectionState

@@ -54,11 +54,12 @@ struct DelegationApprovalSlot: View {
                     DelegationScopeApprovalCard(
                         request: request,
                         onApprove: { capabilities, threshold in
+                            guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
                             var guardrails = request.guardrails
                             guardrails.bulkConfirmationThreshold = threshold
-                            _ = runtime.approve(
+                            return runtime.approve(
                                 requestID: request.id, presentedWindowID: windowID,
-                                presentedTabID: tabID, presentedSessionID: request.requesterSessionID,
+                                presentedTabID: tabID, presentedSessionID: presentedSessionID,
                                 capabilities: capabilities, guardrails: guardrails
                             )
                         },
@@ -79,6 +80,8 @@ struct DelegationApprovalSlot: View {
                             guard let presented = currentPresentation(card, tabID: tabID) else { return }
                             let frontDoor = AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
                             Task {
+                                // The presenter can change between the button callback and this task.
+                                guard currentPresentation(card, tabID: tabID) == presented else { return }
                                 await frontDoor.approveAndApply(
                                     confirmationID: card.id, presentedTabID: tabID, presentedSessionID: presented
                                 )
@@ -96,13 +99,20 @@ struct DelegationApprovalSlot: View {
         }
     }
 
-    /// The tab's live bound session when the card is still current for it, re-read from the window
-    /// state rather than trusting the rendered card. The front door re-checks it when it applies.
+    /// Re-read the unique physical presenter, including the window and rendered session. The
+    /// front door repeats the binding check before applying the stored request.
     private func currentPresentation(_ card: PendingBatchConfirmation, tabID: UUID) -> UUID? {
-        guard let sessionID = AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: tabID),
-              confirmations.isCurrentPresentation(confirmationID: card.id, tabID: tabID, sessionID: sessionID)
+        guard let presentedSessionID = sessionID,
+              let presentation = DelegationScopeRuntime.loadedPresentation(
+                  forTab: tabID, in: WindowStatesManager.shared.allWindows
+              ),
+              presentation.window.windowID == windowID,
+              presentation.sessionID == presentedSessionID,
+              confirmations.isCurrentPresentation(
+                  confirmationID: card.id, tabID: tabID, sessionID: presentedSessionID
+              )
         else { return nil }
-        return sessionID
+        return presentedSessionID
     }
 }
 
@@ -163,16 +173,17 @@ struct DelegationActiveScopesSection: View {
 struct DelegationScopeApprovalCard: View {
     let request: DelegationScopeRequest
     /// Approved capabilities (a subset of the request) and the user's bulk-card threshold.
-    let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Void
+    let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>
     let onDeny: () -> Void
 
     @State private var selected: Set<DomainDelegationScopeCapability>
     /// Only the user may loosen the agent's (already clamped) threshold.
     @State private var threshold: Int
+    @State private var approvalFailure: DomainDelegationScopeDenial?
 
     init(
         request: DelegationScopeRequest,
-        onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Void,
+        onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>,
         onDeny: @escaping () -> Void
     ) {
         self.request = request
@@ -238,13 +249,25 @@ struct DelegationScopeApprovalCard: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
+            if let approvalFailure {
+                Label(approvalFailureMessage(approvalFailure), systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("delegation-scope-approval-error")
+            }
+
             HStack {
                 Button("Deny", action: onDeny)
                     .buttonStyle(.bordered)
                 Spacer()
-                Button("Grant") { onApprove(selected, threshold) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(selected.isEmpty)
+                Button("Grant") {
+                    switch onApprove(selected, threshold) {
+                    case .success: approvalFailure = nil
+                    case let .failure(denial): approvalFailure = denial
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selected.isEmpty)
             }
         }
         .padding(12)
@@ -263,6 +286,17 @@ struct DelegationScopeApprovalCard: View {
                 if isOn { selected.insert(capability) } else { selected.remove(capability) }
             }
         )
+    }
+
+    private func approvalFailureMessage(_ denial: DomainDelegationScopeDenial) -> String {
+        switch denial {
+        case .unknownScope:
+            "Nothing was granted. This request is no longer current for the presenting window and session."
+        case .approvalExceedsRequest:
+            "Nothing was granted. Only the capabilities in this request may be approved."
+        default:
+            "This scope could not be approved. Review its capabilities and limits, then request a new scope."
+        }
     }
 
     private var kindDescription: String {

@@ -19,11 +19,11 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         let names = MCPDomainToolCatalog.orderedToolNames
         let linkIndex = try XCTUnwrap(names.firstIndex(of: MCPWindowToolName.agentSessionLink))
         XCTAssertEqual(names[linkIndex + 1], toolName)
-        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.filter { $0.name == toolName }.count, 1)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count(where: { $0.name == toolName }), 1)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.map(\.name), names)
     }
 
-    func testSchemaAdvertisesExactlyTheCatalogOperations() throws {
+    func testSchemaAdvertisesOnlyImplementedCatalogOperations() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
         let schema = try XCTUnwrap(definition.inputSchema.objectValue)
         XCTAssertEqual(schema["additionalProperties"], .bool(false))
@@ -31,8 +31,14 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertEqual(
             properties["op"]?.objectValue?["enum"],
-            .array(MCPDomainSessionAdminToolDefinition.operations.map { .string($0) })
+            .array(MCPDomainSessionAdminToolDefinition.advertisedOperations.map { .string($0) })
         )
+        XCTAssertEqual(
+            Set(MCPDomainSessionAdminToolDefinition.advertisedOperations),
+            MCPDomainSessionAdminToolDefinition.implementedOperations,
+            "Reserved identities must not be advertised before their handlers ship"
+        )
+        XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.contains("confirmation_status"))
         for operation in MCPDomainSessionAdminToolDefinition.operations {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(" \(operation.uppercased()) ")).normalizedOperation,
@@ -44,13 +50,41 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
             MCPDomainToolOperationIdentity.unknownOperation,
             "session deletion is human-only and has no operation"
         )
-        for required in ["scope_capability_missing", "scope_guardrail_exceeded", "scope_expired", "confirmation_required", "human-only"] {
+        for required in ["request_scope", "scope_status", "release_scope", "confirmation_status", "human-only"] {
             XCTAssertTrue(definition.description.contains(required), required)
         }
         XCTAssertTrue(MCPDomainSessionAdminToolDefinition.implementedOperations.isSubset(of: Set(MCPDomainSessionAdminToolDefinition.operations)))
         // Every catalog op that is an authority action has exactly one scope identity.
         for op in MCPDomainSessionAdminToolDefinition.operations where !["confirmation_status", "undo"].contains(op) {
             XCTAssertNotNil(DomainAgentSessionTargetOperation(rawValue: "session_admin.\(op)"), op)
+        }
+    }
+
+    /// `max_depth` is measured from a tree root, so the authority rejects it on every other kind.
+    /// The advertised schema must say so, and must keep saying so only while that rule holds.
+    func testMaxDepthIsAdvertisedAsTreeOnlyMatchingAuthorityValidation() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let guardrails = try XCTUnwrap(
+            definition.inputSchema.objectValue?["properties"]?.objectValue?["guardrails"]?.objectValue?["properties"]?.objectValue
+        )
+        let maxDepth = try XCTUnwrap(guardrails["max_depth"]?.objectValue)
+        XCTAssertEqual(maxDepth["type"], .string("integer"))
+        XCTAssertEqual(maxDepth["minimum"], .int(0))
+        let text = try XCTUnwrap(maxDepth["description"]?.stringValue)
+        XCTAssertTrue(text.contains("kind=tree only"), text)
+        XCTAssertTrue(text.contains("guardrails_malformed"), text)
+
+        let depthOnly = DomainDelegationScopeGuardrails(maxDepth: 2)
+        let now = Date(timeIntervalSince1970: 0)
+        XCTAssertNil(DomainDelegationScopeAuthority.validate(
+            kind: .tree(rootSessionID: UUID()), capabilities: [.observe], guardrails: depthOnly, now: now
+        ))
+        for kind: DomainDelegationScopeKind in [.workspace(workspaceID: UUID()), .allSessions] {
+            XCTAssertEqual(
+                DomainDelegationScopeAuthority.validate(kind: kind, capabilities: [.observe], guardrails: depthOnly, now: now),
+                .guardrailsMalformed,
+                "\(kind)"
+            )
         }
     }
 

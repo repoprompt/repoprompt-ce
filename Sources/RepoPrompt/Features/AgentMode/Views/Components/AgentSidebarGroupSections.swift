@@ -16,10 +16,14 @@ extension AgentSidebarDateSectionBuilder {
     static func renderedActiveRowsWithGroups(
         for rows: [AgentModeViewModel.SidebarSession],
         collapsedGroups: Set<String>,
+        searchText: String = "",
         now: Date = Date(),
         calendar: Calendar = .current,
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) -> [AgentSidebarRenderedActiveRow] {
+        // Search temporarily expands groups without changing the user's saved collapse preference.
+        // Rendering and selection/navigation all use this same effective set.
+        let collapsedGroups = searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? collapsedGroups : []
         let threads = activeGroups(for: rows, now: now, calendar: calendar)
         func groupName(_ thread: AgentSidebarActiveDateGroup) -> String? {
             thread.rows.first?.searchFieldSource.sidebarGroup

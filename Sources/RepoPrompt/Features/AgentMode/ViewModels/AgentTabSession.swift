@@ -52,6 +52,12 @@ final class AgentTabSession: ObservableObject {
     var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
     var onSourceItemsChanged: ((AgentTabSession, AgentModeViewModel.SourceItemsMutation) -> Void)?
     var onRunStateChanged: ((AgentTabSession) -> Void)?
+    /// Activation went set → cleared/replaced. Fired synchronously from `oversight.didSet`; never
+    /// for nil → nil or nil → set.
+    var onOverseerActivationRetired: ((AgentTabSession, AgentSessionOverseerActivation) -> Void)?
+    /// `bindingTransitionInProgress` went true → false (success, failure, or abandoned-then-finished).
+    /// Presentation only.
+    var onBindingTransitionSettled: ((AgentTabSession) -> Void)?
     #if DEBUG
         private(set) var test_incrementalRetentionCompactionCount = 0
         private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
@@ -263,6 +269,9 @@ final class AgentTabSession: ObservableObject {
     /// selection surfaces republish through their own authoritative refresh.
     var oversight = AgentSessionOversightState() {
         didSet {
+            if let retired = oldValue.overseerActivation, retired != oversight.overseerActivation {
+                onOverseerActivationRetired?(self, retired)
+            }
             if oldValue.hasPendingAutoWake != oversight.hasPendingAutoWake
                 || oldValue.autoWakeSnoozes != oversight.autoWakeSnoozes
             {
@@ -1360,6 +1369,7 @@ final class AgentTabSession: ObservableObject {
             if oldValue != bindingTransitionInProgress {
                 noteMonitorObservationInputsChanged()
                 AgentSessionLinkCandidateReadinessSignal.didChange()
+                if !bindingTransitionInProgress { onBindingTransitionSettled?(self) }
             }
         }
     }

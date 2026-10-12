@@ -14,11 +14,11 @@ final class ClaudeSDKProtocolCodecTests: XCTestCase {
         for (literal, expected) in cases {
             // Enter through the production JSONSerialization -> init(any:) codec seam,
             // not Codable decoding or a manually constructed provider value.
-            let line = Data("{\"type\":\"control_request\",\"request_id\":\"numeric-input\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"mcp__RepoPrompt__session_admin\",\"input\":{\"op\":\"inventory\",\"limit\":\(literal)}}}".utf8)
+            let line = Data("{\"type\":\"control_request\",\"request_id\":\"numeric-input\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"mcp__RepoPrompt__session_admin\",\"input\":{\"op\":\"request_scope\",\"guardrails\":{\"max_live_sessions\":\(literal)}}}}".utf8)
             guard case let .controlRequest(request)? = try ClaudeSDKProtocolCodec.decodeLine(line) else {
                 return XCTFail("Expected actual control request for \(literal)")
             }
-            XCTAssertEqual(request.request["input"]?.objectValue?["limit"], expected, "literal=\(literal)")
+            XCTAssertEqual(request.request["input"]?.objectValue?["guardrails"]?.objectValue?["max_live_sessions"], expected, "literal=\(literal)")
         }
     }
 

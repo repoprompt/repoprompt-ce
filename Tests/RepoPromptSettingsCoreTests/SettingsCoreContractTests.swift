@@ -17,7 +17,7 @@ final class SettingsCoreContractTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let expected = #"{"chatSettingsByWorkspaceID":{"00000000-0000-0000-0000-000000000001":{"codeMapUsage":"auto","fileTreeOption":"Auto","gitInclusion":"none","manualPlanActMode":"Edit","planActMode":"Plan","proFileEdits":false,"workspaceID":"00000000-0000-0000-0000-000000000001"}},"copySettingsByWorkspaceID":{},"globalDefaults":{},"schemaLineage":"repoprompt-ce.global-settings","schemaVersion":10,"updatedAt":"1970-01-01T00:00:00Z"}"#
+        let expected = #"{"chatSettingsByWorkspaceID":{"00000000-0000-0000-0000-000000000001":{"codeMapUsage":"auto","fileTreeOption":"Auto","gitInclusion":"none","manualPlanActMode":"Edit","planActMode":"Plan","proFileEdits":false,"workspaceID":"00000000-0000-0000-0000-000000000001"}},"copySettingsByWorkspaceID":{},"globalDefaults":{},"schemaLineage":"repoprompt-ce.global-settings","schemaVersion":11,"updatedAt":"1970-01-01T00:00:00Z"}"#
         XCTAssertEqual(try encoder.encode(document), Data(expected.utf8))
 
         let decoder = JSONDecoder()
