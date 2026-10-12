@@ -28,13 +28,25 @@ final class MCPHistoryToolProvider {
 
     // MARK: - Reply Encoding
 
-    private nonisolated static func encode(_ reply: HistoryToolReply) throws -> Value {
-        switch reply {
+    nonisolated static func encode(_ reply: HistoryToolReply) throws -> Value {
+        let value = switch reply {
         case let .listSessions(dto): try Value(dto)
         case let .search(dto): try Value(dto)
         case let .time(dto): try Value(dto)
         case let .getSession(dto): try Value(dto)
         case let .error(dto): try Value(dto)
         }
+        guard var object = value.objectValue,
+              object["scan_truncated"]?.boolValue == true
+              || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
+        else { return value }
+        object["scan_complete"] = .bool(false)
+        if object["total_sessions"] != nil || object["total_matches"] != nil {
+            object["totals_are_lower_bounds"] = .bool(true)
+        }
+        object["scan_note"] = .string(
+            "Incomplete scan: reported totals are lower bounds. No matches does not prove there are no sessions or matches; narrow the workspace/session/date scope or refresh skipped indexes before concluding it is empty."
+        )
+        return .object(object)
     }
 }

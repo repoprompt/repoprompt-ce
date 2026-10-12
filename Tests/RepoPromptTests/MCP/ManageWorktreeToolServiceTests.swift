@@ -588,7 +588,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     _ = try await fixture.call(["op": .string("bind")], runPurpose: .agentModeRun)
                     XCTFail("An Agent run without authority over the session must not rebind it")
                 } catch {
-                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                    XCTAssertTrue("\(error)".contains("is not available to this caller's scope"), "\(error)")
                 }
                 XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
             }
@@ -603,7 +603,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     _ = try await fixture.call(["op": .string("unbind")], includeWorktree: false, runPurpose: .agentModeRun)
                     XCTFail("An Agent run without authority over the session must not unbind it")
                 } catch {
-                    XCTAssertTrue("\(error)".contains("was not found in the active workspace"), "\(error)")
+                    XCTAssertTrue("\(error)".contains("is not available to this caller's scope"), "\(error)")
                 }
                 XCTAssertEqual(fixture.session.worktreeBindings, original)
             }

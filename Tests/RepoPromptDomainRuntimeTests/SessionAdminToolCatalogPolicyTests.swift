@@ -60,6 +60,20 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         }
     }
 
+    func testCleanupCapabilityAndInventoryGuidanceIsAdvertisedConcisely() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        for text in ["request `observe` together with mutation capabilities", "use `inventory`", "covers only that workspace", "not scope membership"] {
+            XCTAssertTrue(definition.description.contains(text), text)
+        }
+        let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+        let capabilities = try XCTUnwrap(properties["capabilities"]?.objectValue?["description"]?.stringValue)
+        for text in ["observe for inventory", "organize and restructure", "Nothing is added after approval"] {
+            XCTAssertTrue(capabilities.contains(text), text)
+        }
+        // Bound guidance growth; do not turn the per-turn catalog into an operations manual.
+        XCTAssertLessThan(definition.description.utf8.count, 2300)
+    }
+
     /// `max_depth` is measured from a tree root, so the authority rejects it on every other kind.
     /// The advertised schema must say so, and must keep saying so only while that rule holds.
     func testMaxDepthIsAdvertisedAsTreeOnlyMatchingAuthorityValidation() throws {

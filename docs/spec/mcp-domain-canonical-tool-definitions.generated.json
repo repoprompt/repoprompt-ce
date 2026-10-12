@@ -2010,12 +2010,12 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.\n\nA scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.\n\n**Scope ops**\n- `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.\n- `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).\n- `release_scope`: give up one of your scopes; revokes its nested scopes too.\n- `confirmation_status`: read one of your batch cards by `confirmation_id`.\n\nThis foundation implements scope lifecycle and confirmation status only. Target-session mutations are reserved for later lanes and are not advertised here.\n\n**Rules**: Requesting a scope grants nothing until the user approves. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Use `idempotency_key` to retry an unchanged `request_scope` call.",
+      "description" : "Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.\n\nA scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.\n\nFor cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets when implemented. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.\n\n**Scope ops**\n- `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.\n- `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).\n- `release_scope`: give up one of your scopes; revokes its nested scopes too.\n- `confirmation_status`: read one of your batch cards by `confirmation_id`.\n\nThis foundation implements scope lifecycle and confirmation status only. Target-session mutations are reserved for later lanes and are not advertised here.\n\n**Rules**: Requesting a scope grants nothing until the user approves. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Use `idempotency_key` to retry an unchanged `request_scope` call.",
       "inputSchema" : {
         "additionalProperties" : false,
         "properties" : {
           "capabilities" : {
-            "description" : "[request_scope] Requested capabilities; the user may narrow them.",
+            "description" : "[request_scope] Requested capabilities; the user may narrow them. Cleanup/organizing needs observe for inventory plus mutation capabilities (retire: organize and restructure). Nothing is added after approval.",
             "items" : {
               "enum" : [
                 "observe",
@@ -2117,7 +2117,7 @@
             "type" : "array"
           },
           "workspace" : {
-            "description" : "[request_scope] Workspace UUID for kind=workspace; default this session's workspace.",
+            "description" : "[request_scope] Workspace UUID for kind=workspace; default and limited to this session's workspace.",
             "type" : "string"
           }
         },

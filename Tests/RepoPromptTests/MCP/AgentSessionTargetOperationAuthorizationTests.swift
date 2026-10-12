@@ -479,6 +479,41 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertTrue(allIDs.contains(sibling.uuidString))
     }
 
+    func testChildZeroDoesNotDescribeANonemptyWorkspaceAsEmpty() async throws {
+        let window = try await makeWindow(waitForInitialization: true)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let siblingSession = window.agentModeViewModel.session(for: tabID)
+        let sibling = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(siblingSession))
+        XCTAssertNil(siblingSession.parentSessionID, "the workspace witness is a real top-level session, not a child")
+
+        let childCaller = makeManageService(window: window, callerSessionID: callerSessionID)
+        let reply = try await childCaller.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(reply.objectValue?["sessions"], .array([]))
+        XCTAssertEqual(reply.objectValue?["scope"], .string("spawned_by_caller"))
+        let note = try XCTUnwrap(reply.objectValue?["note"]?.stringValue)
+        XCTAssertTrue(note.contains("not a workspace inventory"))
+        XCTAssertTrue(note.contains("session_admin request_scope"))
+        XCTAssertTrue(note.contains("observe"))
+        XCTAssertTrue(note.contains("inventory"))
+        let rendered = ToolOutputFormatter.formatAgentManage(args: ["op": .string("list_sessions")], value: reply)
+        guard case let .text(text, _, _) = rendered.first else { return XCTFail("expected rendered text") }
+        XCTAssertTrue(text.contains("spawned_by_caller"))
+        XCTAssertTrue(text.contains(note), "scope guidance must survive the agent-facing formatter")
+        XCTAssertFalse(text.contains(sibling.uuidString), "disclosure must not enumerate siblings")
+
+        let admin = makeManageService(window: window, callerSessionID: nil, runPurpose: nil)
+        let adminReply = try await admin.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(try Set(XCTUnwrap(adminReply.objectValue).keys), ["sessions"])
+        let adminIDs = try await sessionIDs(in: admin.execute(args: ["op": .string("list_sessions")]))
+        XCTAssertTrue(adminIDs.contains(sibling.uuidString))
+
+        let unrouted = makeManageService(window: window, callerSessionID: nil, runPurpose: .agentModeRun)
+        let unresolved = try await unrouted.execute(args: ["op": .string("list_sessions")])
+        XCTAssertEqual(unresolved.objectValue?["scope"], .string("unresolved_caller"))
+        XCTAssertEqual(unresolved.objectValue?["sessions"], .array([]))
+    }
+
     func testAdministrativePinAndReorderDoesNotResumeIndexOnlySessions() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -560,7 +595,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         } catch {
             let message = "\(error)"
             XCTAssertTrue(
-                message.contains("was not found in the active workspace"),
+                message.contains("is not available to this caller's scope"),
                 "Denial must be indistinguishable from a missing session; got: \(message)",
                 file: file,
                 line: line
@@ -678,12 +713,16 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         )
     }
 
-    private func makeWindow() async throws -> WindowState {
+    private func makeWindow(waitForInitialization: Bool = false) async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        if waitForInitialization {
+            // Establish the witness only after launch restoration can no longer switch its workspace.
+            await window.workspaceManager.awaitInitialized()
+        }
 
         let workspace = window.workspaceManager.createWorkspace(
             name: "Agent Session Authorization \(UUID().uuidString.prefix(8))",

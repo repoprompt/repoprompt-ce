@@ -37,6 +37,8 @@ package enum MCPDomainSessionAdminToolDefinition {
 
         A scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
+        For cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets when implemented. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
+
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
@@ -63,7 +65,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "workspace": .object([
                     "type": .string("string"),
-                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default this session's workspace.")
+                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default and limited to this session's workspace.")
                 ]),
                 "capabilities": .object([
                     "type": .string("array"),
@@ -71,7 +73,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                         "type": .string("string"),
                         "enum": .array(capabilityValues.map(Value.string))
                     ]),
-                    "description": .string("[request_scope] Requested capabilities; the user may narrow them.")
+                    "description": .string("[request_scope] Requested capabilities; the user may narrow them. Cleanup/organizing needs observe for inventory plus mutation capabilities (retire: organize and restructure). Nothing is added after approval.")
                 ]),
                 "guardrails": .object([
                     "type": .string("object"),

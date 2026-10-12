@@ -10,8 +10,8 @@ import RepoPromptDomainRuntime
 /// derived only from server-owned run routing, the target's immutable spawn provenance is looked up
 /// independently, and the decision matrix lives in the domain runtime.
 ///
-/// Every denial reuses the exact "not found" wording so an unauthorized UUID is indistinguishable
-/// from a nonexistent one.
+/// Every denial reuses the same scope-unavailable wording so an unauthorized UUID is
+/// indistinguishable from a nonexistent one.
 @MainActor
 enum AgentSessionTargetOperationGuard {
     typealias RequestMetadata = MCPRequestMetadata
@@ -25,7 +25,7 @@ enum AgentSessionTargetOperationGuard {
     typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> Bool
 
     static func denialError(reference: String) -> MCPError {
-        MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
+        MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope.")
     }
 
     static func denialError(sessionID: UUID) -> MCPError {
@@ -205,8 +205,8 @@ enum AgentSessionTargetOperationGuard {
     /// - the target's **spawn parent**, from immutable spawn provenance;
     /// - an **overseer** whose exact endpoint holds a live Manage grant over the target.
     ///
-    /// Unresolved Agent-run routing always fails closed. Every denial reuses the "not found" wording
-    /// so an unauthorized UUID is indistinguishable from a nonexistent one.
+    /// Unresolved Agent-run routing always fails closed. Every denial reuses the scope-unavailable
+    /// wording so an unauthorized UUID is indistinguishable from a nonexistent one.
     static func requireWorktreeBindingAuthority(
         targetSessionID: UUID,
         metadata: MCPRequestMetadata,
