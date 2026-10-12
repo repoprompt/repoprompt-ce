@@ -1336,8 +1336,21 @@ final class AgentSessionLinkRuntimeBridge {
     private var changeFeedTask: Task<Void, Never>?
     private var inboundAdvertisementCountByTargetSession: [UUID: Int] = [:]
     private var refreshTask: Task<Void, Never>?
-    // Derived UI inputs only. The coalesced authoritative refresh lane is the sole installer.
+    /// Derived UI inputs only. The coalesced authoritative refresh lane is the sole installer.
     private var menuCatalog: DomainAgentSessionLinkPresentationSnapshot?
+    /// UI-only observer census shared by closed rows, never consulted by authority or Add.
+    /// Invalidation contract: every eligibility OR existence input must synchronously emit a
+    /// candidate-readiness change after mutation, or advance the authority revision. This includes
+    /// durable binding/incarnation, hydration, parentage, MCP control/origin, role policy, binding
+    /// transitions, deletion, closing windows and live-session removal. An async teardown hop or
+    /// a pre-mutation notification cannot substitute for the post-mutation presentation fence.
+    private struct SidebarObserverIndex {
+        let authorityRevision: UInt64
+        let eligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
+        let eligibleCountBySession: [UUID: Int]
+    }
+
+    private var sidebarObserverIndex: SidebarObserverIndex?
     private var projectedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     private var candidateAvailabilityNotificationPending = false
     private var pendingRefreshScope: ProjectionRefreshScope?
@@ -1901,6 +1914,7 @@ final class AgentSessionLinkRuntimeBridge {
         pendingMonitorObserverEndpoints.removeAll()
         monitorSeenByReference.removeAll()
         menuCatalog = nil
+        sidebarObserverIndex = nil
         projectedEndpoints.removeAll()
         // Queued sends die with the process by design. They are pre-authorization for a delivery the
         // user is not present for, and quitting ends the turn that authorized them; nothing about a
@@ -4514,12 +4528,16 @@ final class AgentSessionLinkRuntimeBridge {
     private func invalidateMenuCatalog() {
         guard menuCatalog != nil else { return }
         menuCatalog = nil
+        sidebarObserverIndex = nil
         notifyCandidateAvailabilityChanged()
     }
 
     /// Payload-free shared availability invalidation, always after catalog storage. It is not a
     /// status event and never runs for ordinary target snapshots.
     private func notifyCandidateAvailabilityChanged() {
+        // Invalidate synchronously even when the repaint notification is already coalesced.
+        // Hydration, rebind, role and MCP eligibility can change without an authority revision.
+        sidebarObserverIndex = nil
         guard !candidateAvailabilityNotificationPending, !isFrozenForTermination else { return }
         candidateAvailabilityNotificationPending = true
         Task { @MainActor [weak self] in
@@ -4567,19 +4585,45 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    /// Closed-row summary: bounded exact peers only, no candidate index, labels or option arrays.
+    private func sidebarObservers(in catalog: DomainAgentSessionLinkPresentationSnapshot) -> SidebarObserverIndex {
+        if let index = sidebarObserverIndex, index.authorityRevision == catalog.authorityRevision {
+            return index
+        }
+        var eligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+        var eligibleCountBySession: [UUID: Int] = [:]
+        if let host {
+            for endpoint in catalog.activeOutboundObserverEndpoints {
+                guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+                      AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring) == nil
+                else { continue }
+                eligibleEndpoints.insert(endpoint)
+                eligibleCountBySession[endpoint.sessionID, default: 0] += 1
+            }
+        }
+        let index = SidebarObserverIndex(
+            authorityRevision: catalog.authorityRevision,
+            eligibleEndpoints: eligibleEndpoints,
+            eligibleCountBySession: eligibleCountBySession
+        )
+        sidebarObserverIndex = index
+        return index
+    }
+
+    /// Closed-row summary: O(exact linked peers), with the observer census built once per revision.
+    /// Candidate-local invalidation also retires the census; actions still resolve live candidates.
     func sidebarOversightSummary(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSidebarOversightSummary? {
         guard let host, let inputs = menuInputs(for: endpoint),
               let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
         else { return nil }
         let linked = Set(inputs.inboundObserverEndpoints.values)
         let targetReason = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)?.uiMessage
-        let available = inputs.activeOutboundObserverEndpoints.reduce(into: 0) { count, peer in
-            guard targetReason == nil, peer.sessionID != endpoint.sessionID, !linked.contains(peer),
-                  let current = host.agentSessionLinkCandidate(for: peer, includeLocation: false),
-                  AgentSessionLinkEndpointEligibility.addDisabledReason(current.eligibilityInput, roleAllowsOutboundMonitoring: current.roleAllowsOutboundMonitoring) == nil
-            else { return }
-            count += 1
+        var available = 0
+        if targetReason == nil, let catalog = menuCatalog {
+            let observers = sidebarObservers(in: catalog)
+            available = observers.eligibleEndpoints.count - observers.eligibleCountBySession[endpoint.sessionID, default: 0]
+            for peer in linked where peer.sessionID != endpoint.sessionID && observers.eligibleEndpoints.contains(peer) {
+                available -= 1
+            }
         }
         let creatorID = host.agentSessionLinkLaneProvenance(for: endpoint)
         let peerIDs = Set(inputs.inbound.items.map(\.observerSessionID)).union(inputs.outbound.items.map(\.targetSessionID)).union(creatorID.map { [$0] } ?? [])

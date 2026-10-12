@@ -342,12 +342,21 @@ final class AgentSessionLifecycleAuthority {
         }
     }
 
+    #if DEBUG
+        private(set) var test_projectionTabIndexVisits = 0
+        private(set) var test_projectionCarrierVisits = 0
+    #endif
+
     func reconcileProjection(
         projectedWorkspaces: [WorkspaceModel],
         currentWorkspaces: [WorkspaceModel],
         claims: [ProtectionClaim],
         repairBaselines: [UUID: ProjectionRepairBaseline] = [:]
     ) -> ProjectionOutcome {
+        #if DEBUG
+            test_projectionTabIndexVisits = 0
+            test_projectionCarrierVisits = 0
+        #endif
         let protectedClaims = claims.filter(\.isProtected)
         let currentByID = Dictionary(
             currentWorkspaces.map { ($0.id, $0) },
@@ -419,22 +428,74 @@ final class AgentSessionLifecycleAuthority {
             let protectedTabIDs = Set(workspaceClaims.map(\.identity.tabID))
             next.stashedTabs.removeAll { protectedTabIDs.contains($0.tab.id) }
 
+            // Attempt-local indexes preserve first-match semantics for damaged duplicate IDs.
+            // Session carriers follow replacements and insertions in claim order.
+            let previousTabsByID = Dictionary(previous.composeTabs.map { tab in
+                #if DEBUG
+                    test_projectionTabIndexVisits += 1
+                #endif
+                return (tab.id, tab)
+            }, uniquingKeysWith: { first, _ in first })
+            let previousStashedTabIDs = Set(previous.stashedTabs.map { stash in
+                #if DEBUG
+                    test_projectionTabIndexVisits += 1
+                #endif
+                return stash.tab.id
+            })
+            let currentIndicesByID = Dictionary(currentWorkspace.composeTabs.enumerated().map { index, tab in
+                #if DEBUG
+                    test_projectionTabIndexVisits += 1
+                #endif
+                return (tab.id, index)
+            }, uniquingKeysWith: { first, _ in first })
+            var nextIndicesByID: [UUID: Int] = [:]
+            var sessionCarriers: [UUID: Set<Int>] = [:]
+            func indexTabs() {
+                nextIndicesByID.removeAll(keepingCapacity: true)
+                sessionCarriers.removeAll(keepingCapacity: true)
+                for (index, tab) in next.composeTabs.enumerated() {
+                    #if DEBUG
+                        test_projectionTabIndexVisits += 1
+                    #endif
+                    if nextIndicesByID[tab.id] == nil { nextIndicesByID[tab.id] = index }
+                    if let sessionID = tab.activeAgentSessionID {
+                        sessionCarriers[sessionID, default: []].insert(index)
+                    }
+                }
+            }
+            indexTabs()
             for claim in workspaceClaims {
                 let tabID = claim.identity.tabID
                 if let sessionID = claim.identity.sessionID {
-                    for tabIndex in next.composeTabs.indices
-                        where next.composeTabs[tabIndex].id != tabID
-                        && next.composeTabs[tabIndex].activeAgentSessionID == sessionID
-                    {
+                    for tabIndex in sessionCarriers[sessionID] ?? [] {
+                        #if DEBUG
+                            test_projectionCarrierVisits += 1
+                        #endif
+                        guard next.composeTabs[tabIndex].id != tabID else { continue }
                         next.composeTabs[tabIndex].activeAgentSessionID = nil
+                        sessionCarriers[sessionID]?.remove(tabIndex)
                     }
                 }
-                if let index = next.composeTabs.firstIndex(where: { $0.id == tabID }) {
+                if let index = nextIndicesByID[tabID] {
+                    if let previousSessionID = next.composeTabs[index].activeAgentSessionID {
+                        sessionCarriers[previousSessionID]?.remove(index)
+                    }
                     next.composeTabs[index] = claim.tab
-                } else if let localIndex = currentWorkspace.composeTabs.firstIndex(where: { $0.id == tabID }) {
+                    if let sessionID = claim.tab.activeAgentSessionID {
+                        sessionCarriers[sessionID, default: []].insert(index)
+                    }
+                    if claim.tab.id != tabID { indexTabs() }
+                } else if let localIndex = currentIndicesByID[tabID] {
                     next.composeTabs.insert(claim.tab, at: min(localIndex, next.composeTabs.count))
+                    // Structural repair shifts positions; ordinary overlays never rebuild.
+                    indexTabs()
                 } else {
+                    let index = next.composeTabs.count
                     next.composeTabs.append(claim.tab)
+                    if nextIndicesByID[claim.tab.id] == nil { nextIndicesByID[claim.tab.id] = index }
+                    if let sessionID = claim.tab.activeAgentSessionID {
+                        sessionCarriers[sessionID, default: []].insert(index)
+                    }
                 }
             }
 
@@ -448,9 +509,9 @@ final class AgentSessionLifecycleAuthority {
             reconciled[projectedIndex] = next
             protectedWorkspaceIDs.insert(workspaceID)
             let changedClaims = workspaceClaims.filter { claim in
-                let previousTab = previous.composeTabs.first(where: { $0.id == claim.identity.tabID })
+                let previousTab = previousTabsByID[claim.identity.tabID]
                 return previousTab != claim.tab
-                    || previous.stashedTabs.contains(where: { $0.tab.id == claim.identity.tabID })
+                    || previousStashedTabIDs.contains(claim.identity.tabID)
                     || (claim.isActive && previous.activeComposeTabID != claim.identity.tabID)
             }
             protectedClaimCount += changedClaims.count
