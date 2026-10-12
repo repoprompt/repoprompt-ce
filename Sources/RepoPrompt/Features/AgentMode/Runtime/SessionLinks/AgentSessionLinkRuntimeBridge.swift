@@ -1255,7 +1255,11 @@ final class AgentSessionLinkRuntimeBridge {
     /// Derived UI inputs only. The coalesced authoritative refresh lane is the sole installer.
     private var menuCatalog: DomainAgentSessionLinkPresentationSnapshot?
     /// UI-only observer census shared by closed rows, never consulted by authority or Add.
-    /// Every addDisabledReason input must retain the existing candidate-readiness invalidation.
+    /// Invalidation contract: every eligibility OR existence input must synchronously emit a
+    /// candidate-readiness change after mutation, or advance the authority revision. This includes
+    /// durable binding/incarnation, hydration, parentage, MCP control/origin, role policy, binding
+    /// transitions, deletion, closing windows and live-session removal. An async teardown hop or
+    /// a pre-mutation notification cannot substitute for the post-mutation presentation fence.
     private struct SidebarObserverIndex {
         let authorityRevision: UInt64
         let eligibleEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>

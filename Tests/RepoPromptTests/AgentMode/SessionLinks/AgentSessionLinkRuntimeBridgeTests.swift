@@ -226,6 +226,15 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         private var candidatesByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkEndpointCandidate] = [:]
         private var candidatesBySession: [UUID: [AgentSessionLinkEndpointCandidate]] = [:]
+        /// Optional live source for existence/eligibility contract witnesses; ordinary fixtures
+        /// retain their indexed value lookups and operation-count semantics.
+        var resolveCurrentCandidate: ((AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointCandidate?)?
+
+        private func currentCandidate(_ candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointCandidate? {
+            if let resolveCurrentCandidate { return resolveCurrentCandidate(candidate) }
+            return candidate
+        }
+
         var boundedCandidateVisits = 0
         var modelAvailabilityByWindow: [Int: AgentModelCatalog.AvailabilityContext] = [:]
         var beforeModelFence: (() async -> Void)?
@@ -412,9 +421,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
         ) -> AgentSessionLinkEndpointCandidate? {
             exactCandidateReadCount += 1
-            let candidate = candidatesByEndpoint[endpoint]
+            let candidate = candidatesByEndpoint[endpoint].flatMap(currentCandidate)
             boundedCandidateVisits += candidate == nil ? 0 : 1
-            return candidate
+            return candidate?.domainEndpoint == endpoint ? candidate : nil
         }
 
         func agentSessionLinkCandidates(
@@ -423,7 +432,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             uuidCandidateReadCount += 1
             onUUIDCandidatesRead?(sessionIDs)
             return Dictionary(uniqueKeysWithValues: sessionIDs.map { id in
-                let matches = candidatesBySession[id] ?? []
+                let matches = (candidatesBySession[id] ?? []).compactMap(currentCandidate).filter { $0.sessionID == id }
                 boundedCandidateVisits += matches.count
                 return (id, matches)
             })
@@ -432,7 +441,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidateReadCount += 1
             onCandidatesRead?(candidateReadCount)
-            return candidates
+            return candidates.compactMap(currentCandidate)
         }
 
         func agentSessionLinkObservationSnapshot(
@@ -905,11 +914,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     /// LOCAL DIAGNOSTIC ONLY: warm Step2 bridge-with-indexed-fake-host refreshes.
-    private func makeFixture() -> Fixture {
+    private func makeFixture(observerWindowID: Int = 1, targetWindowID: Int = 2) -> Fixture {
         let authority = makeAuthority()
         let host = FakeEndpointHost()
-        let observer = makeCandidate(windowID: 1, displayName: "Planning")
-        let target = makeCandidate(windowID: 2, displayName: "Build API")
+        let observer = makeCandidate(windowID: observerWindowID, displayName: "Planning")
+        let target = makeCandidate(windowID: targetWindowID, displayName: "Build API")
         host.candidates = [observer, target]
         let advertisement = ToolAdvertisementRecorder()
         let bridge = AgentSessionLinkRuntimeBridge(
@@ -2942,6 +2951,156 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(recoveredAuthority, authorityBefore)
         XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoryBefore)
         XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passivePublicationsBefore)
+    }
+
+    func testClosingWindowInvalidatesWarmCensusAfterClosingFlagChanges() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let window = WindowState()
+        addTeardownBlock { @MainActor in
+            window.beginClose()
+            await window.tearDown()
+        }
+        let fixture = makeFixture(observerWindowID: window.windowID, targetWindowID: window.windowID + 100)
+        fixture.bridge.attach(host: fixture.host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await addLink(fixture) else { return XCTFail("setup link failed") }
+        await fixture.bridge.test_settleProjections()
+        let otherTarget = makeCandidate(windowID: window.windowID + 200)
+        fixture.host.candidates.append(otherTarget)
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: otherTarget.domainEndpoint)?.availableObserverCount, 1)
+
+        let productionSignal = AgentSessionLinkCandidateReadinessSignal.onChange
+        var closingValuesAtEmission: [Bool] = []
+        AgentSessionLinkCandidateReadinessSignal.onChange = {
+            closingValuesAtEmission.append(window.isClosing)
+            productionSignal?() // Exercise attach's real synchronous routing, not a test invalidator.
+        }
+        // Model exact lookup becoming absent without notifying the bridge ourselves.
+        fixture.host.candidates.removeAll { $0.domainEndpoint == fixture.observer.domainEndpoint }
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: otherTarget.domainEndpoint)?.availableObserverCount, 1, "Negative control: a warm census is stale until the owner emits")
+        window.beginClose()
+        XCTAssertEqual(closingValuesAtEmission.first, true, "A pre-flip emission would re-cache the closing observer")
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: otherTarget.domainEndpoint)?.availableObserverCount, 0)
+        let emissionCount = closingValuesAtEmission.count
+        window.beginClose()
+        XCTAssertEqual(closingValuesAtEmission.count, emissionCount, "Repeated close does not re-emit")
+    }
+
+    func testRemovingLinkedObserverSessionInvalidatesWarmCensusBeforeBindingEndedHop() async throws {
+        let host = FakeEndpointHost()
+        let observer = makeCandidate(windowID: 92)
+        let target = makeCandidate(windowID: 93)
+        let otherTarget = makeCandidate(windowID: 94)
+        let vm = AgentModeViewModel(
+            testWindowID: observer.windowID,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let session = vm.session(for: observer.tabID)
+        _ = vm.test_installPersistentSessionBinding(sessionID: observer.sessionID, on: session, updateWorkspaceMetadata: false)
+        host.candidates = [observer, target, otherTarget]
+        host.resolveCurrentCandidate = { candidate in
+            candidate.domainEndpoint == observer.domainEndpoint && vm.sessions[observer.tabID] == nil ? nil : candidate
+        }
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case let .added(linkID, _) = await bridge.addMonitorLink(
+            observerEndpoint: observer.domainEndpoint, targetEndpoint: target.domainEndpoint
+        ) else { return XCTFail("setup link failed") }
+        addTeardownBlock { @MainActor in
+            let remaining = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observer.sessionID)
+            if let owned = remaining.items.first(where: { $0.linkID == linkID }) {
+                await bridge.revokeLink(linkID: owned.linkID, generation: owned.generation)
+            }
+            await bridge.test_settleProjections()
+        }
+        await bridge.test_settleProjections()
+        let inventory = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observer.sessionID)
+        let item = try XCTUnwrap(inventory.items.first { $0.linkID == linkID })
+        XCTAssertEqual(bridge.sidebarOversightSummary(for: otherTarget.domainEndpoint)?.availableObserverCount, 1)
+
+        vm.test_removeSession(tabID: observer.tabID) // real sessions.removeValue and didSet
+        XCTAssertNil(host.agentSessionLinkCandidate(for: observer.domainEndpoint, includeLocation: false))
+        // No await, manual invalidation, or catalog refresh may heal this witness.
+        XCTAssertEqual(bridge.sidebarOversightSummary(for: otherTarget.domainEndpoint)?.availableObserverCount, 0)
+        XCTAssertEqual(bridge.sidebarOversightSummary(for: target.domainEndpoint)?.linkedObserverCount, 1, "The stored membership has not yet been asynchronously retired")
+        await bridge.revokeLink(linkID: item.linkID, generation: item.generation)
+        await bridge.test_settleProjections()
+    }
+
+    func testEachObserverEligibilityAndIncarnationInputInvalidatesWarmCensus() async throws {
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        // Closing-window existence and sessions.removeValue are exercised by the boundary tests
+        // above; authority membership revisions retain the existing 250-row revocation witness.
+        for input in ["durable-binding", "hydration", "parentage", "mcp-control", "mcp-origin", "binding-transition", "deletion", "role-policy", "binding-incarnation", "session-identity"] {
+            let fixture = makeFixture()
+            let observer = fixture.observer
+            let session = AgentModeViewModel.TabSession(tabID: observer.tabID)
+            session.beginPersistentBindingTransition()
+            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration)))
+            session.hasLoadedPersistedState = true
+            let registration = await AgentRunSessionStore.register(sessionID: observer.sessionID)
+            addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
+            func context(_ kind: AgentModelCatalog.TaskLabelKind) -> AgentModeViewModel.AgentMCPControlContext {
+                .init(
+                    sessionID: observer.sessionID, activationID: UUID(), registration: registration,
+                    currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                    originatingConnectionID: nil,
+                    interactionTransport: .mcp(sessionID: observer.sessionID, originatingConnectionID: nil),
+                    suppressUserNotifications: true, forceAutoEditEnabled: false,
+                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind
+                )
+            }
+            if input == "role-policy" { session.mcpControlContext = context(.pair) }
+            fixture.host.resolveCurrentCandidate = { [self] candidate in
+                guard candidate.domainEndpoint == observer.domainEndpoint else { return candidate }
+                return makeCandidate(
+                    windowID: observer.windowID, sessionID: session.activeAgentSessionID ?? observer.sessionID,
+                    workspaceID: observer.workspaceID, tabID: observer.tabID,
+                    persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
+                    bindingTransitionGeneration: session.bindingTransitionGeneration,
+                    hasLoadedPersistedState: session.hasLoadedPersistedState,
+                    bindingTransitionInProgress: session.bindingTransitionInProgress,
+                    isTopLevel: session.parentSessionID == nil,
+                    isMCPControlled: input != "role-policy" && session.mcpControlContext != nil,
+                    isMCPOriginated: session.isMCPOriginated,
+                    roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(taskLabelKind: session.mcpControlContext?.taskLabelKind),
+                    isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: observer.sessionID)
+                )
+            }
+            // For role-policy alone, mask the independently tested MCP-control predicate so a
+            // task-label-only change has to invalidate the census even when control presence is equal.
+            fixture.bridge.attach(host: fixture.host)
+            guard case .added = await addLink(fixture) else { return XCTFail("setup failed for \(input)") }
+            await fixture.bridge.test_settleProjections()
+            let target = makeCandidate(windowID: 3)
+            fixture.host.candidates.append(target)
+            XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: target.domainEndpoint)?.availableObserverCount, 1, input)
+            var deletion: AgentSessionDeletionRegistry.AttemptToken?
+            switch input {
+            case "durable-binding": session.installPersistentSessionBinding(nil)
+            case "hydration": session.hasLoadedPersistedState = false
+            case "parentage": session.parentSessionID = UUID()
+            case "mcp-control": session.mcpControlContext = context(.pair)
+            case "mcp-origin": session.isMCPOriginated = true
+            case "binding-transition": session.beginPersistentBindingTransition()
+            case "deletion": deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: observer.sessionID)
+            case "role-policy": session.mcpControlContext = context(.explore)
+            case "binding-incarnation": session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID))
+            default: session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: UUID()))
+            }
+            XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: target.domainEndpoint)?.availableObserverCount, 0, "\(input) must invalidate synchronously, without a test-issued readiness call or async revocation")
+            if let deletion {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletion)
+                XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: target.domainEndpoint)?.availableObserverCount, 1, "Deletion rollback must invalidate too")
+            }
+            await fixture.bridge.test_settleMonitorProjectionRefresh()
+        }
     }
 
     // MARK: - Activity high-water
