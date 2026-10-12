@@ -183,6 +183,52 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
+    // MARK: - undo strict keys
+
+    /// `undo` accepts only `op` and `undo_token`: any other key is refused before the caller or the
+    /// token is resolved, so an extra key can never ride a redemption. The public description and
+    /// schema must state that exception instead of the generic "mutating calls take idempotency_key".
+    func testUndoAcceptsOnlyOpAndTokenAndThePublicContractSaysSo() async throws {
+        let fixture = Fixture()
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        let base: [String: Value] = ["op": .string("undo"), "undo_token": .string(UUID().uuidString)]
+        let extras: [String: Value] = [
+            "scope_id": .string(UUID().uuidString),
+            "idempotency_key": .string("k"),
+            "preview": .bool(true),
+            "session_id": .string(UUID().uuidString)
+        ]
+        for (key, value) in extras.sorted(by: { $0.key < $1.key }) {
+            var args = base
+            args[key] = value
+            do {
+                _ = try await fixture.call(args)
+                XCTFail("undo must refuse '\(key)'")
+            } catch let MCPError.invalidParams(message) {
+                XCTAssertEqual(message, "session_admin undo does not support '\(key)'.", key)
+            }
+        }
+        // Parser contract only: the bare form passes key validation. This fixture administers through
+        // the core, not the front door, so the service then stops at its explicit not_implemented
+        // guard; no redemption is exercised here. Success or any other error fails the test.
+        do {
+            _ = try await fixture.call(base)
+            XCTFail("the bare undo form must reach the service's not_implemented guard in this fixture")
+        } catch let MCPError.invalidParams(message) {
+            XCTAssertEqual(message, "not_implemented: session_admin 'undo' is not implemented yet in this build.")
+        }
+
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.sessionAdmin))
+        XCTAssertTrue(definition.description.contains("except `undo`, which accepts only `op` and `undo_token`"))
+        let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+        for key in ["scope_id", "idempotency_key", "preview"] {
+            let text = try XCTUnwrap(properties[key]?.objectValue?["description"]?.stringValue)
+            XCTAssertTrue(text.contains("except undo"), "\(key): \(text)")
+        }
+        let token = try XCTUnwrap(properties["undo_token"]?.objectValue?["description"]?.stringValue)
+        XCTAssertTrue(token.contains("undo accepts only op and undo_token"), token)
+    }
+
     // MARK: - request_scope / scope_status / release_scope
 
     func testRequestScopeIsPendingUntilTheUserApprovesThenStatusAndReleaseFollow() async throws {
@@ -965,14 +1011,16 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let tab = UUID()
         let now = Date()
 
-        init() {
+        var physicalObserverEndpoint: (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)?
+
+        init(liveBoundSessionOverride: (@MainActor (UUID) -> UUID?)? = nil) {
             let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
             core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
             inventory = FakeInventory(organizer: organizer, provenance: provenance, links: links, now: now)
             let tabBindings = tabBindings
             frontDoor = AgentSessionAdministrationFrontDoor(
                 core: core, scopes: runtime, projector: projector, inventory: inventory,
-                liveBoundSession: { tabBindings.sessions[$0] }
+                liveBoundSession: liveBoundSessionOverride ?? { tabBindings.sessions[$0] }
             )
             tabBindings.sessions[tab] = overseer
             frontDoor.registerOrganizingHandlers(backend: organizer, links: links)
@@ -1026,7 +1074,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 captureRequestMetadata: { .init(connectionID: UUID(), clientName: "organize-test", windowID: self.window.windowID) },
                 requireTargetWindow: { self.window },
                 resolveObserverEndpoint: { _, _ in
-                    DomainAgentSessionLinkEndpointIdentity(
+                    if let physical = self.physicalObserverEndpoint { return physical() }
+                    return DomainAgentSessionLinkEndpointIdentity(
                         windowID: self.window.windowID, workspaceID: self.workspace, tabID: self.tab,
                         sessionID: self.overseer, persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
                     )
@@ -1201,7 +1250,62 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
     // MARK: - Cards, untick, apply-on-approval
 
     func testOverThresholdRaisesOneCardAndApprovalAppliesOnlyTickedItems() async throws {
-        let fixture = Fixture()
+        // Exercise the actual production allWindows presenter predicate, not the fake tab map.
+        let fixture = Fixture(liveBoundSessionOverride: { AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: $0) })
+        let second = WindowState()
+        WindowStatesManager.shared.registerWindowState(fixture.window)
+        WindowStatesManager.shared.registerWindowState(second)
+        addTeardownBlock { @MainActor in
+            await second.tearDown()
+            await fixture.window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(second)
+            WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        }
+        await fixture.window.workspaceManager.awaitInitialized()
+        await second.workspaceManager.awaitInitialized()
+        // awaitInitialized joins completion, not successful default activation. Establish our own
+        // app-owned nonpersisted presentation explicitly before creating lifecycle carriers.
+        let requestedPresentation = fixture.window.workspaceManager.createEphemeralWorkspace(
+            name: "Batch physical presenter fixture", repoPaths: []
+        )
+        let activation = await fixture.window.workspaceManager.requestWorkspaceSwitch(
+            to: requestedPresentation, saveState: false, reason: "batch physical presenter fixture"
+        )
+        guard activation.didSwitch else {
+            return XCTFail("Fixture presentation activation failed: \(activation)")
+        }
+        let presentingWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        XCTAssertEqual(presentingWorkspace.id, requestedPresentation.id)
+        XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, requestedPresentation.id)
+        XCTAssertTrue(presentingWorkspace.isEphemeral)
+        let presentingIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex { $0.id == presentingWorkspace.id })
+        fixture.window.workspaceManager.workspaces[presentingIndex].composeTabs.append(
+            ComposeTabState(id: fixture.tab, name: "Loaded batch presenter", activeAgentSessionID: fixture.overseer)
+        )
+        let presenter = AgentModeViewModel.TabSession(tabID: fixture.tab)
+        fixture.window.agentModeViewModel.test_installLiveSession(presenter)
+        _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: fixture.overseer, on: presenter
+        ))
+        let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tab))
+        XCTAssertTrue(endpoint.hasResolvedPersistentBinding)
+        XCTAssertEqual(endpoint.sessionID, fixture.overseer)
+        XCTAssertEqual(endpoint.workspaceID, presentingWorkspace.id)
+        XCTAssertEqual(endpoint.windowID, fixture.window.windowID)
+        let physicalTab = fixture.tab
+        fixture.physicalObserverEndpoint = { [weak window = fixture.window] in
+            window?.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: physicalTab)
+        }
+        var catalog = WorkspaceModel(name: "Non-presenting batch catalog", repoPaths: [], isSavedWorkspace: false)
+        catalog.isEphemeral = true
+        catalog.composeTabs = [ComposeTabState(id: fixture.tab, name: "Catalog only", activeAgentSessionID: fixture.overseer)]
+        let secondActive = second.workspaceManager.activeWorkspaceID
+        second.workspaceManager.workspaces.append(catalog)
+        XCTAssertEqual(second.workspaceManager.activeWorkspaceID, secondActive)
+        XCTAssertNotEqual(second.workspaceManager.activeWorkspaceID, catalog.id)
+        XCTAssertNil(second.agentModeViewModel.sessions[fixture.tab])
+        XCTAssertEqual(second.agentModeViewModel.explicitActiveSessionID(for: fixture.tab), fixture.overseer)
+        XCTAssertEqual(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab), fixture.overseer)
         let members = (0 ..< 3).map { fixture.member("M\($0)") }
         try fixture.grant(threshold: 2)
         let args: [String: Value] = [
@@ -1220,8 +1324,53 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         XCTAssertTrue(members.allSatisfy { fixture.organizer.states[$0]?.sidebarGroup == nil })
 
-        fixture.runtime.confirmations.setItem(members[2], ticked: false, confirmationID: cardID)
+        func cardState() -> PendingBatchConfirmation.State? {
+            fixture.runtime.confirmations.confirmation(id: cardID, granteeSessionID: fixture.overseer)?.state
+        }
+        _ = try await fixture.call(["op": .string("inventory")])
+        XCTAssertEqual(cardState(), .pending, "an inactive catalog copy cannot invalidate a pending card")
+        // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
+        let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
+        second.agentModeViewModel.test_installLiveSession(duplicate)
+        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertNil(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab))
         await fixture.approveAndApply(cardID)
+        XCTAssertEqual(cardState(), .pending)
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        _ = second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: nil, on: duplicate)
+        XCTAssertNil(duplicate.activeAgentSessionID)
+        XCTAssertEqual(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab), fixture.overseer)
+        let rebound = UUID()
+        _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: rebound, on: presenter))
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(cardState(), .pending, "a stale button cannot follow a real rebind")
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: presenter))
+        fixture.runtime.confirmations.setItem(members[2], ticked: false, confirmationID: cardID)
+        // Separate state-only card: the coordinator is an explicit approval stand-in here.
+        // Never route its already-approved state through a pending-only UI callback.
+        let stateOnly = try await fixture.call(args.merging([
+            "idempotency_key": .string("approved-state-only"), "group": .string("Approved state only")
+        ]) { $1 })
+        let approvedID = try XCTUnwrap(stateOnly["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertNotEqual(approvedID, cardID)
+        XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: approvedID))
+        _ = try await fixture.call(["op": .string("inventory")])
+        XCTAssertEqual(
+            fixture.runtime.confirmations.confirmation(id: approvedID, granteeSessionID: fixture.overseer)?.state,
+            .approved, "an inactive catalog copy cannot invalidate an approved card"
+        )
+        XCTAssertEqual(cardState(), .pending, "the real UI application card must still be pending")
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        let changed = try await fixture.call(args.merging(["group": .string("Changed")]) { $1 })
+        XCTAssertEqual(changed["result"], .string("idempotency_conflict"))
+        XCTAssertEqual(cardState(), .pending)
+        // Actual pending UI path approves, removes its stored request, applies and records result.
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(Set(fixture.organizer.written), Set(members.prefix(2)))
+        XCTAssertEqual(fixture.organizer.written.count, 2)
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.organizer.written.count, 2, "approval callback replay applies nothing twice")
         XCTAssertEqual(fixture.organizer.states[members[0]]?.sidebarGroup, "Batch")
         XCTAssertEqual(fixture.organizer.states[members[1]]?.sidebarGroup, "Batch")
         XCTAssertNil(fixture.organizer.states[members[2]]?.sidebarGroup, "an unticked item is never applied")

@@ -50,7 +50,7 @@ package enum MCPDomainSessionAdminToolDefinition {
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects. Other ops may return `not_implemented`.
 
-        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`.
+        **Rules**: `retire`, `worktree_release`, `adopt`, and bulk ops over the scope threshold (default 25) return `pending_confirmation` for one user card. When the user approves, the call is applied to the ticked items; read `applied_result` with `confirmation_status`. A repeat must be unchanged (same op, arguments, and `idempotency_key`, plus `confirmation_id`); changed arguments need a new card, and `confirmation_mismatch` lists the approved items. `retire` needs organize + restructure; running targets also need control and are otherwise listed as `requires_control`, never stopped. Recoverable denials: `scope_capability_missing`, `scope_guardrail_exceeded`, `scope_expired`, `confirmation_required`. Deleting sessions, removing worktrees, keys, permission modes, settings, and app control are human-only. Mutating calls take `idempotency_key`, except `undo`, which accepts only `op` and `undo_token` (no `scope_id`, `idempotency_key`, or `preview`).
         """,
         inputSchema: .object([
             "type": .string("object"),
@@ -91,7 +91,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "description": .string("[request_scope] Proposed guardrails; the user may tighten them.")
                 ]),
                 "reason": .stringSchema("[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes."),
-                "scope_id": .stringSchema("[scope_status, release_scope, other ops] Scope UUID; optional when you hold exactly one live scope."),
+                "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope."),
                 "request_id": .stringSchema("[scope_status] Request UUID returned by request_scope."),
                 "session_id": .stringSchema("[target ops] One target session UUID."),
                 "targets": .object([
@@ -127,12 +127,12 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "items": .object(["type": .string("string")]),
                     "description": .string("[reorder_pins, reorder_groups] Current order of the same items (compare-and-swap).")
                 ]),
-                "undo_token": .stringSchema("[undo] Token returned by a reversible call."),
+                "undo_token": .stringSchema("[undo] Token returned by a reversible call. undo accepts only op and undo_token."),
                 "preview": .object([
                     "type": .string("boolean"),
-                    "description": .string("[mutating ops] Dry run listing exact items and effects.")
+                    "description": .string("[mutating ops except undo] Dry run listing exact items and effects.")
                 ]),
-                "idempotency_key": .stringSchema("[request_scope, mutating ops] New per request; reuse only for the same retry. Max 200 UTF-8 bytes."),
+                "idempotency_key": .stringSchema("[request_scope, mutating ops except undo] New per request; reuse only for the same retry. Max 200 UTF-8 bytes."),
                 "confirmation_id": .stringSchema("[confirmation_status, applying call] Confirmation UUID from pending_confirmation; its applied_result appears once the user approves. Pass it on an unchanged repeat of the carded call.")
             ]),
             "required": .array([.string("op")])
