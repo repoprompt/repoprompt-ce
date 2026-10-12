@@ -2051,6 +2051,7 @@
                 "type" : "integer"
               },
               "max_depth" : {
+                "description" : "kind=tree only: spawn depth below this session. Rejected as guardrails_malformed for workspace or all_sessions.",
                 "minimum" : 0,
                 "type" : "integer"
               },
