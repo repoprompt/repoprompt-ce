@@ -246,7 +246,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         links: @escaping @MainActor () async -> (
             live: [DomainAgentSessionLinkInventoryItem],
             persisted: [AgentSessionOversightIntent]
-        ) = { await AgentSessionLinkRuntimeBridge.shared.oversightInventory() }
+        ) = { await AgentSessionLinkRuntimeBridge.shared.oversightInventory(includeLocation: false) }
     ) {
         self.scanner = scanner
         self.windows = windows
@@ -313,16 +313,20 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             for row in viewModel.sidebarSessions(for: workspace.composeTabs) {
                 if let sessionID = row.sessionID, let tab = tabsByID[row.tabID] { rows.append((sessionID, tab, false)) }
             }
+            var idsByTab: [UUID: UUID] = [:]
+            for entry in viewModel.sessionIndex.values where idsByTab[entry.tabID] == nil {
+                idsByTab[entry.tabID] = entry.id
+            }
             for stashed in workspace.stashedTabs {
-                let sessionID = stashed.tab.activeAgentSessionID
-                    ?? viewModel.sessionIndex.values.first { $0.tabID == stashed.tab.id }?.id
+                let sessionID = stashed.tab.activeAgentSessionID ?? idsByTab[stashed.tab.id]
                 if let sessionID { rows.append((sessionID, stashed.tab, true)) }
             }
+            let liveSessions = viewModel.authoritativeLiveSessions(for: Set(rows.filter { !$0.2 }.map(\.0)))
             for (sessionID, tab, isArchived) in rows {
                 let entry = viewModel.sessionIndex[sessionID]
                 let history = historyByID[sessionID]?.0
                 let liveState: DomainAgentSessionInventoryRunState? = isArchived ? nil : {
-                    guard let session = try? viewModel.authoritativeLiveSession(for: sessionID) else { return nil }
+                    guard case let .success(session?) = liveSessions[sessionID] else { return nil }
                     return .classify(rawValue: session.runState.rawValue)
                 }()
                 let lastActivity = entry.map {

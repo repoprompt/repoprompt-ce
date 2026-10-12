@@ -5592,6 +5592,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         try authoritativeLiveSession(for: sessionID, using: makePersistentBindingResolutionSnapshot())
     }
 
+    /// Fresh rich liveness values sharing one carrier census, for synchronous inventory projection.
+    func authoritativeLiveSessions(for sessionIDs: Set<UUID>) -> [UUID: Result<TabSession?, Error>] {
+        guard !sessionIDs.isEmpty else { return [:] }
+        let snapshot = makePersistentBindingResolutionSnapshot()
+        return Dictionary(uniqueKeysWithValues: sessionIDs.map { id in
+            (id, Result { try authoritativeLiveSession(for: id, using: snapshot) })
+        })
+    }
+
     /// Immutable observations from one synchronous binding census. Never retain these across an
     /// await or mutation as an authority proof; each operation must take a fresh census.
     enum AuthoritativeLiveSessionState: Equatable {

@@ -309,3 +309,138 @@ final class HistoryAnalyticsTests: XCTestCase {
         )
     }
 }
+
+// MARK: - HistoryInventoryScaleTests regressions
+
+final class HistoryInventoryScaleTests: XCTestCase {
+    func testScopedDiscoveryAuthorizesOnlyMatchingWorkspaceDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("history-scoped-scale-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selectedID = UUID()
+        var directories: [URL] = []
+        for index in 0 ..< 5501 {
+            let id = index == 5500 ? selectedID : UUID()
+            try directories.append(staleWorkspace(root: root, id: id))
+        }
+        let census = directories
+        let scanner = HistorySessionScanner(applicationSupportRoot: root, workspaceDirectoryProvider: { _ in census })
+        let result = try await scanner.scanWorkspaces(matching: selectedID.uuidString)
+        XCTAssertFalse(result.isTruncated)
+        XCTAssertEqual(result.workspaces.map(\.workspaceID), [selectedID])
+        let statCount = await scanner.workspaceDirectoryStatCountForTesting
+        let inspectionCount = await scanner.workspaceInspectionCountForTesting
+        XCTAssertEqual(statCount, 1, "Unrelated directories must be rejected before lstat/authority work")
+        XCTAssertEqual(inspectionCount, 1)
+    }
+
+    func testCyclicStaleIndexCensusAmortizesEvictionAndRetainsBounds() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("history-eviction-scale-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var directories: [URL] = []
+        for _ in 0 ..< 128 {
+            try directories.append(staleWorkspace(root: root, id: UUID()))
+        }
+        let census = directories
+        let scanner = HistorySessionScanner(
+            applicationSupportRoot: root,
+            scanCacheTTL: 0,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 256,
+                maxIndexDecodes: 1,
+                maxIndexBytes: 1024,
+                maxIndexCacheEntries: 16,
+                maxIndexCacheBytes: 1024
+            ),
+            workspaceDirectoryProvider: { _ in census }
+        )
+        for _ in 0 ..< 2 {
+            let result = try await scanner.scanWorkspaces(matching: nil)
+            XCTAssertFalse(result.isTruncated)
+            XCTAssertEqual(result.workspaces.count, census.count)
+            let entries = await scanner.indexScanCacheEntryCountForTesting
+            let bytes = await scanner.indexScanCacheBytesForTesting
+            XCTAssertLessThanOrEqual(entries, 16)
+            XCTAssertLessThanOrEqual(bytes, 1024)
+        }
+        let visits = await scanner.indexCacheEvictionVisitsForTesting
+        XCTAssertLessThan(visits, census.count * 2 * 5, "Eviction must not rescan the entire cache for every insert")
+        let before = await scanner.indexScanCacheEntryCountForTesting
+        let newest = try XCTUnwrap(census.last)
+        let scoped = try await scanner.scanWorkspaces(matching: newest.lastPathComponent)
+        XCTAssertEqual(scoped.workspaces.count, 1)
+        let after = await scanner.indexScanCacheEntryCountForTesting
+        XCTAssertEqual(after, before, "Newest cache entry must remain available after batch eviction")
+    }
+
+    func testUsableSessionsBeyondFiveThousandLegacyDirectoriesAndCacheOverflow() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("history-usable-scale-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var directories: [URL] = []
+        for _ in 0 ..< 5501 {
+            try directories.append(staleWorkspace(root: root, id: UUID()))
+        }
+        let selectedID = UUID()
+        let usable = try staleWorkspace(root: root, id: selectedID)
+        let date = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        let records = (0 ..< 251).map { _ in
+            let id = UUID()
+            return AgentSessionMetadataRecord(
+                id: id, filename: "AgentSession-\(id).json", workspaceID: selectedID, composeTabID: nil,
+                name: "Usable", savedAt: date, lastUserMessageAt: nil, itemCount: 1,
+                transcriptProjectionCounts: nil, hasUnknownConversationContent: false,
+                agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil, lastRunStateRaw: nil,
+                autoEditEnabled: true, parentSessionID: nil, isMCPOriginated: true, serializationVersion: nil,
+                observedFileSize: nil, observedFileModificationDate: date, lastIndexedAt: date
+            )
+        }
+        try JSONEncoder().encode(AgentSessionMetadataIndex(entries: records))
+            .write(to: usable.appendingPathComponent("AgentSessions/AgentSessionIndex.json"))
+        directories.append(usable)
+        let census = directories
+        let scanner = HistorySessionScanner(
+            applicationSupportRoot: root, scanCacheTTL: 0,
+            inventoryBudget: HistoryInventoryBudget(maxWorkspaces: 6000, maxIndexDecodes: 2, maxIndexBytes: 8 * 1024 * 1024, maxIndexCacheEntries: 16),
+            workspaceDirectoryProvider: { _ in census }
+        )
+        for _ in 0 ..< 2 {
+            let scan = try await scanner.scanWorkspaces(matching: nil)
+            XCTAssertFalse(scan.isTruncated)
+            XCTAssertEqual(Set(scan.workspaces.flatMap(\.records).map(\.id)), Set(records.map(\.id)))
+            let entries = await scanner.indexScanCacheEntryCountForTesting
+            XCTAssertLessThanOrEqual(entries, 16)
+        }
+        let visits = await scanner.indexCacheEvictionVisitsForTesting
+        XCTAssertLessThan(visits, census.count * 2 * 5)
+        let before = await scanner.workspaceDirectoryStatCountForTesting
+        let scoped = try await scanner.scanWorkspaces(matching: selectedID.uuidString)
+        let after = await scanner.workspaceDirectoryStatCountForTesting
+        XCTAssertEqual(after - before, 1)
+        XCTAssertEqual(scoped.workspaces.count, 1)
+        XCTAssertEqual(Set(scoped.workspaces.flatMap(\.records).map(\.id)), Set(records.map(\.id)))
+    }
+
+    func testBytePressureRetainsNewestFittingEntryButRejectsOversizedEntry() async {
+        let scanner = HistorySessionScanner(inventoryBudget: HistoryInventoryBudget(
+            maxWorkspaces: 16, maxIndexDecodes: 16, maxIndexBytes: 4096, maxIndexCacheEntries: 16, maxIndexCacheBytes: 1024
+        ))
+        for (key, bytes) in [("old", Int64(200)), ("new", Int64(900))] {
+            await scanner.rememberIndexScan(key, indexSignature: .init(fileSize: bytes, modificationTime: 0), workspaceSignature: nil, identity: (key, nil), indexSchemaVersion: nil, records: [], estimatedByteCount: bytes)
+        }
+        let count = await scanner.indexScanCacheEntryCountForTesting
+        let bytes = await scanner.indexScanCacheBytesForTesting
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(bytes, 900, "Low-water eviction must retain the newest index when it fits the hard cap")
+        await scanner.rememberIndexScan("oversized", indexSignature: .init(fileSize: 1025, modificationTime: 0), workspaceSignature: nil, identity: ("oversized", nil), indexSchemaVersion: nil, records: [], estimatedByteCount: 1025)
+        let boundedBytes = await scanner.indexScanCacheBytesForTesting
+        XCTAssertLessThanOrEqual(boundedBytes, 1024)
+    }
+
+    private func staleWorkspace(root: URL, id: UUID) throws -> URL {
+        let workspace = root.appendingPathComponent("Workspaces/Workspace-Scale-\(id.uuidString)")
+        let sessions = workspace.appendingPathComponent("AgentSessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try Data("{\"schemaVersion\":5,\"entries\":[]}".utf8)
+            .write(to: sessions.appendingPathComponent("AgentSessionIndex.json"))
+        return workspace
+    }
+}

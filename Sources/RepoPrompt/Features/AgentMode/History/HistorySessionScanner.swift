@@ -707,6 +707,8 @@ actor HistorySessionScanner: HistorySessionScanning {
     /// Observability counters for focused cache, cold-shape, cancellation, and direct-ID tests.
     private(set) var transcriptDecodeCountForTesting: Int = 0
     private(set) var indexDecodeCountForTesting: Int = 0
+    private(set) var indexCacheEvictionVisitsForTesting: Int = 0
+    private(set) var workspaceDirectoryStatCountForTesting: Int = 0
     private(set) var workspaceInspectionCountForTesting: Int = 0
     private(set) var directSessionFileStatCountForTesting: Int = 0
     var indexScanCacheEntryCountForTesting: Int {
@@ -891,13 +893,14 @@ actor HistorySessionScanner: HistorySessionScanning {
                 completedDiscovery = false
                 return false
             }
+            // Match the directory-derived selector before any filesystem authorization work.
+            // The matching directory still passes the same no-symlink authority gate below.
+            if let scope, !scope.matches(workspaceDir) { return true }
+            workspaceDirectoryStatCountForTesting += 1
             let isDirectory = historyPathSignature([], in: workspaceDir) != nil
             let isInjectedVirtualDirectory = workspaceDirectoryProvider != nil
                 && !fileManager.fileExists(atPath: workspaceDir.path)
             guard isDirectory || isInjectedVirtualDirectory else { return true }
-            if let scope, !scope.matches(workspaceDir) {
-                return true
-            }
             if counters.workspaces >= inventoryBudget.maxWorkspaces {
                 diagnostics.append(HistoryScanDiagnostic(
                     kind: .workspaceCount,
@@ -1732,12 +1735,13 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func pruneIndexScanCache(keeping liveKeys: Set<String>) {
         guard var cache = indexScanCache else { return }
+        indexScanCache = nil
         let originalCount = cache.entries.count
         cache.entries = cache.entries.filter { liveKeys.contains($0.key) }
         if cache.entries.count != originalCount {
             cache.estimatedByteCount = cache.entries.values.reduce(0) { $0 + $1.estimatedByteCount }
-            indexScanCache = cache
         }
+        indexScanCache = cache
     }
 
     private func cachedScanResult(
@@ -1778,6 +1782,9 @@ actor HistorySessionScanner: HistorySessionScanning {
             estimatedByteCount: 0,
             accessOrdinal: 0
         )
+        // Transfer the actor-owned dictionary, rather than copying it on every insert.
+        // There is no suspension while ownership is temporarily held by this local.
+        indexScanCache = nil
         cache.accessOrdinal &+= 1
         let normalizedBytes = max(0, estimatedByteCount)
         let entry = IndexScanCache.Entry(
@@ -1795,24 +1802,34 @@ actor HistorySessionScanner: HistorySessionScanning {
             cache.estimatedByteCount -= replaced.estimatedByteCount
         }
         cache.estimatedByteCount += normalizedBytes
-        while cache.entries.count > inventoryBudget.maxIndexCacheEntries
+        if cache.entries.count > inventoryBudget.maxIndexCacheEntries
             || cache.estimatedByteCount > inventoryBudget.maxIndexCacheBytes
         {
-            guard let evictionKey = cache.entries.min(by: { lhs, rhs in
-                if lhs.value.accessOrdinal != rhs.value.accessOrdinal {
-                    return lhs.value.accessOrdinal < rhs.value.accessOrdinal
+            // A cyclic history census must not run a full dictionary minimum for each
+            // insertion. Sort scalar keys/ordinals once and evict to a low-water mark.
+            // Bounds remain unchanged; the next overflow is amortized across new entries.
+            let entryTarget = max(1, inventoryBudget.maxIndexCacheEntries * 3 / 4)
+            let byteTarget = inventoryBudget.maxIndexCacheBytes - inventoryBudget.maxIndexCacheBytes / 4
+            indexCacheEvictionVisitsForTesting += cache.entries.count
+            let oldest = cache.entries.map { (key: $0.key, ordinal: $0.value.accessOrdinal) }
+                .sorted {
+                    $0.ordinal != $1.ordinal ? $0.ordinal < $1.ordinal : $0.key < $1.key
                 }
-                return lhs.key < rhs.key
-            })?.key,
-                let removed = cache.entries.removeValue(forKey: evictionKey)
-            else { break }
-            cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+            for candidate in oldest {
+                guard cache.entries.count > entryTarget || cache.estimatedByteCount > byteTarget else { break }
+                // Low water is an amortization target, not an admission cap. Retain the newest
+                // index when it fits the hard cap, even if it alone exceeds the byte target.
+                if candidate.key == cacheKey, normalizedBytes <= inventoryBudget.maxIndexCacheBytes { continue }
+                guard let removed = cache.entries.removeValue(forKey: candidate.key) else { continue }
+                cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+            }
         }
         indexScanCache = cache
     }
 
     private func touchCachedIndexScan(_ cacheKey: String) {
         guard var cache = indexScanCache, var entry = cache.entries[cacheKey] else { return }
+        indexScanCache = nil
         cache.accessOrdinal &+= 1
         entry.accessOrdinal = cache.accessOrdinal
         cache.entries[cacheKey] = entry
@@ -1820,8 +1837,11 @@ actor HistorySessionScanner: HistorySessionScanning {
     }
 
     private func removeCachedIndexScan(_ cacheKey: String) {
-        guard var cache = indexScanCache, let removed = cache.entries.removeValue(forKey: cacheKey) else { return }
-        cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+        guard var cache = indexScanCache else { return }
+        indexScanCache = nil
+        if let removed = cache.entries.removeValue(forKey: cacheKey) {
+            cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+        }
         indexScanCache = cache
     }
 

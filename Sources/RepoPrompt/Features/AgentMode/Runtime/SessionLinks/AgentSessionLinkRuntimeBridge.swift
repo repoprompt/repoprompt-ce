@@ -1162,13 +1162,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// Read-only oversight inventory for `session_admin links`/`tree`: every live link plus every
     /// durable intent. Authority over any of them is decided elsewhere; unlinking still goes through
     /// `stopMonitorLink`, so the link authority stays the sole owner of link lifecycle.
-    func oversightInventory() async -> (
+    func oversightInventory(includeLocation: Bool = true) async -> (
         live: [DomainAgentSessionLinkInventoryItem],
         persisted: [AgentSessionOversightIntent]
     ) {
         // Every live link's observer is a tracked observer endpoint or a current candidate.
         let observers = Set(knownObserverEndpoints.map(\.sessionID))
-            .union(host?.agentSessionLinkCandidates().map(\.sessionID) ?? [])
+            .union(host?.agentSessionLinkCandidates(includeLocation: includeLocation).map(\.sessionID) ?? [])
         let live = await authority.linkItems(forObservers: observers)
         let persisted = await intentStore?.allIntents() ?? []
         return (live, persisted)

@@ -105,18 +105,22 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     static let maxChainLength = 256
 
     let source: any DelegationProvenanceSource
+    /// Optional operation-count witness; not retained in an authority proof.
+    var onAncestryLookup: ((UUID) -> Void)?
     func withSynchronousCensus<Result>(_ body: (any DelegationMembershipProjector) -> Result) -> Result {
-        let projector = Self(source: CensusSource(records: source.allKnownSessions()))
+        let projector = Self(source: census(), onAncestryLookup: onAncestryLookup)
         return body(projector)
     }
 
     private struct CensusSource: DelegationProvenanceSource {
         let records: [DelegationSessionProvenance]
         let byID: [UUID: DelegationSessionProvenance]
+        let ancestry: DomainAgentSessionAncestryIndex
 
         init(records: [DelegationSessionProvenance]) {
             self.records = records
             byID = Dictionary(records.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+            ancestry = DomainAgentSessionAncestryIndex(parents: byID.compactMapValues(\.effectiveOrganizationalParentID))
         }
 
         func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
@@ -178,24 +182,37 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         source.provenance(for: sessionID)?.runState ?? .unknown
     }
 
+    private func census() -> CensusSource {
+        (source as? CensusSource) ?? CensusSource(records: source.allKnownSessions())
+    }
+
+    private func contains(_ record: DelegationSessionProvenance, in scope: DomainDelegationScopeGrant, census: CensusSource) -> Bool {
+        switch scope.kind {
+        case .allSessions: true
+        case let .workspace(id): record.workspaceID == id
+        case let .tree(root):
+            census.ancestry.distance(from: record.sessionID, to: root, onLookup: onAncestryLookup).map { $0 < Self.maxChainLength } ?? false
+        }
+    }
+
     func members(of scope: DomainDelegationScopeGrant) -> [UUID] {
-        let census = source.allKnownSessions()
-        let byID = Dictionary(census.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        return census
-            .filter { membershipProof(for: $0, in: scope, lookup: { byID[$0] }) != nil }
-            .map(\.sessionID)
+        let census = census()
+        return census.records.filter { contains($0, in: scope, census: census) }.map(\.sessionID)
     }
 
     func usage(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage {
         // Census and placement lookup are local immutable values. No source callback or suspension
         // can substitute a later census halfway through this guardrail computation.
-        let census = source.allKnownSessions()
-        let byID = Dictionary(census.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
-        let members = census.filter { membershipProof(for: $0, in: scope, lookup: { byID[$0] }) != nil }
-        let parentDepth = spawnParentSessionID
-            .flatMap { byID[$0] }
-            .flatMap { membershipProof(for: $0, in: scope, lookup: { byID[$0] }) }?
-            .treeDepth
+        let census = census()
+        let members = census.records.filter { contains($0, in: scope, census: census) }
+        let parentDepth: Int? = if case let .tree(root) = scope.kind, let parent = spawnParentSessionID,
+                                   census.byID[parent] != nil, let distance = census.ancestry.distance(from: parent, to: root, onLookup: onAncestryLookup),
+                                   distance < Self.maxChainLength
+        {
+            distance
+        } else {
+            nil
+        }
         return DomainDelegationScopeUsage(
             scopeID: scope.id,
             liveSessionCount: members.filter(\.isLive).count,
