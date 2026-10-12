@@ -270,7 +270,10 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             await fulfillment(of: [retired], timeout: 1)
             XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID], mutation)
             XCTAssertNil(fixture.session.oversight.overseerActivation)
-            XCTAssertNil(fixture.viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
+            // Discovery is notified synchronously; the pill repaint is deferred past the setter.
+            try await AsyncTestWait.waitUntil("retired pill repaint for \(mutation)", timeout: 10) {
+                fixture.viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation == nil
+            }
             let replay = expectation(description: "Nil clears and unrelated writes do not replay")
             replay.isInverted = true
             AgentSessionLinkInvalidationSink.overseerActivationRetired = { sessionID in
@@ -315,6 +318,9 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         }
         fixture.session.parentSessionID = UUID()
         await fulfillment(of: [retiredAdvertisement], timeout: 1)
+        // The deferred repaint hop was enqueued on the main actor before this one; MainActor jobs run
+        // FIFO, so awaiting it proves the hop ran and was fenced off the replacement owner.
+        await Task { @MainActor in }.value
         XCTAssertEqual(retiredSessionIDs, [fixture.endpoint.sessionID])
         XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot, snapshot)
         XCTAssertEqual(fixture.viewModel.ui.statusPills.revision, revision)

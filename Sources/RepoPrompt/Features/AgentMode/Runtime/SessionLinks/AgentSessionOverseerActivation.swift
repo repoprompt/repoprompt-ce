@@ -16,20 +16,17 @@ struct AgentSessionOverseerBootstrapState: Equatable {
 
 extension AgentModeViewModel {
     /// Retirement is observed once at the session's mutation owner, including catalog-free sessions.
-    /// Queue the reread past the enclosing setter so binding/provenance writes have settled.
+    /// Discovery is notified now for the outgoing session UUID; only the pill reread is queued past
+    /// the enclosing setter so binding/provenance writes have settled.
     func agentSessionLinkOverseerActivationRetired(
         session: AgentTabSession,
         retired: AgentSessionOverseerActivation
     ) {
-        // Captured now: retirement belongs to the outgoing session UUID even if an in-place rebind
-        // or replacement changes the object's identity before the hop runs.
-        let sessionID = retired.endpoint.sessionID
+        // Discovery reevaluates live routing; notifying it neither repaints nor grants a successor.
+        AgentSessionLinkInvalidationSink.overseerActivationRetired?(retired.endpoint.sessionID)
         Task { @MainActor [weak self, weak session] in
-            if let self, let session {
-                agentSessionLinkRepaintCurrentPillIfOwned(session)
-            }
-            // Discovery reevaluates live routing; notifying it neither repaints nor grants a successor.
-            AgentSessionLinkInvalidationSink.overseerActivationRetired?(sessionID)
+            guard let self, let session else { return }
+            agentSessionLinkRepaintCurrentPillIfOwned(session)
         }
     }
 
