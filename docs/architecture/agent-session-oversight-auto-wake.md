@@ -85,7 +85,11 @@ Rules that hold the scope design together:
 - **External MCP is untouched.** `session_admin` is policy-gated (`agent_session_admin`), granted by
   no static profile, recomputed live per `tools/list` and `tools/call` only for an exactly routed
   Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or
-  admitted for administrative principals, and fails closed in direct-headless.
+  admitted for administrative principals, and fails closed in direct-headless. Explicit zero-link
+  overseer opt-in (toolbar or `become_overseer`) enables scope requests without creating a scope or
+  link. Retiring that incarnation-local opt-in or disabling the oversight tool family removes this
+  opt-in-only discovery eligibility; an independently user-approved durable scope, bare orchestrator
+  policy, or exact outbound link keeps its own eligibility.
 
 Scope intent persistence is described in
 [`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
@@ -880,6 +884,21 @@ activated sessions receive the unchanged full definition. Eligible ordinary no-l
 `become_overseer`; disabling `agent_session_link` hides both tools. Activation is session-incarnation
 memory, not a link, badge, prompt supplement, or persisted authority. It survives final unlink and
 controller repair but not rebind/restart. Prompt readiness and inventory remain outbound-only.
+
+The toolbar eye/chevron dashboard also offers **Enable overseer mode** for an eligible loaded,
+user-owned top-level session with zero links. The user's click commits the same exact
+incarnation opt-in and notifies tool discovery without starting a turn or inventing a grant. The
+dashboard displays the enabled state independently of the outbound-only role eye and counts. An
+activated session can create its first lane through the existing activation-qualified `create_lane`
+transaction; all target-bearing operations still require their ordinary exact grants. This UI path
+is direct user consent, not an MCP invocation, and does not bypass the tool bootstrap's route proof.
+Linked behavior, persistence, prompt inventory, and wake admission remain unchanged.
+
+Activation retirement is observed once at `AgentTabSession.oversight.didSet`; the owning view model
+repaints the current tab's pill after the enclosing mutation and the bridge invalidates discovery for
+the retired session UUID, without revoking or granting anything. Every binding-transition settlement
+separately repaints the current tab's pill, so a failed routed hydration never leaves a stale endpoint
+on screen.
 
 Discovery repair is separate from route proof and current operation authority. Claude/OpenCode/Devin
 receive the existing notification route only. No live model pickup is established by protocol tests;

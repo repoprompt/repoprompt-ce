@@ -6,6 +6,15 @@ import XCTest
 
 @MainActor
 final class AgentSessionLaneFirstSaveTests: XCTestCase {
+    @MainActor
+    private final class AdvertisementRecorder {
+        var sessionIDs: [UUID] = []
+
+        func record(_ sessionID: UUID) {
+            sessionIDs.append(sessionID)
+        }
+    }
+
     private struct Fixture {
         let window: WindowState
         let root: URL
@@ -77,6 +86,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         )
     }
 
+    /// Routes activation retirement to a local recorder, so tests that drive activation without
+    /// attaching their own bridge never notify the shared production bridge. Install inside the
+    /// fixture body: window registration re-attaches the production bridge. Restore the result.
+    private func installLocalRetirementSink(_ recorder: AdvertisementRecorder) -> ((UUID) -> Void)? {
+        let previous = AgentSessionLinkInvalidationSink.overseerActivationRetired
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { recorder.record($0) }
+        return previous
+    }
+
     private func withSecondRegisteredWindow(_ body: (WindowState) async throws -> Void) async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -97,7 +115,15 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testToolbarActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: true)
+    }
+
     func testActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
+        try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
+    }
+
+    private func exerciseActivatedFirstLaneFromAnotherWindow(toolbar: Bool) async throws {
         try await withFixture(ephemeral: false) { fixture in
             let host = WindowStatesManager.shared
             let creatorOutcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Ordinary creator", selection: fixture.selection)
@@ -108,8 +134,28 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()))
             let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
             bridge.installIntentStore(AgentSessionOversightIntentStore(fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename), backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled))
-            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
-            XCTAssertNotNil(activated)
+            let viewModel = fixture.window.agentModeViewModel
+            viewModel.test_setCurrentTabIDOverride(creatorTabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let before = viewModel.currentMonitorPillProps()
+            let expected = try XCTUnwrap(before.overseerBootstrapState)
+            XCTAssertNil(expected.activation)
+            let denied = await bridge.laneCreationCallerPreflight(endpoint)
+            XCTAssertEqual(denied, .denied, "zero links alone do not authorize creation")
+            let activated: Bool = if toolbar {
+                await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            } else {
+                await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() }) != nil
+            }
+            XCTAssertTrue(activated)
+            let enabled = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertNotNil(enabled.overseerBootstrapState?.activation, "commit publishes the dashboard immediately")
+            XCTAssertFalse(enabled.isOverseer, "activation is not an outbound role badge")
+            XCTAssertNil(enabled.dashboardOutboundCount)
+            XCTAssertNil(enabled.dashboardInboundCount)
+            XCTAssertNil(creator.oversight.pendingAutoWake, "consent cannot start a turn")
+            let noLinks = await authority.links(forObserver: creatorID)
+            XCTAssertTrue(noLinks.items.isEmpty, "consent manufactures no grants")
             AgentAdvertisedModelCatalog.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
             ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
@@ -137,6 +183,186 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertEqual(inventory.items.map(\.targetSessionID), [laneID])
                 XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceID, "creation never switches the creator workspace")
             }
+        }
+    }
+
+    func testFailedRouteRetiresZeroLinkActivationPresentationAndAdvertisement() async throws {
+        try await exerciseFailedRouteSettlement(activated: true)
+    }
+
+    func testFailedRouteRefreshesNeverActivatedZeroLinkPillEndpoint() async throws {
+        try await exerciseFailedRouteSettlement(activated: false)
+    }
+
+    private func exerciseFailedRouteSettlement(activated: Bool) async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Failed route consent", selection: fixture.selection
+            )
+            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            session.createdByOverseerSessionID = nil
+            viewModel.test_setCurrentTabIDOverride(tabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let invalidated = AdvertisementRecorder()
+            let bridge = AgentSessionLinkRuntimeBridge(
+                authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) }
+            )
+            bridge.attach(host: host)
+            defer { host.attachAgentSessionLinkBridge() }
+            if activated {
+                let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertTrue(enabled)
+                XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
+                invalidated.sessionIDs.removeAll()
+            } else {
+                viewModel.syncStatusPillsUIState()
+                XCTAssertEqual(viewModel.ui.statusPills.snapshot.monitor.endpoint, endpoint)
+            }
+            // Counted for this session only: the fresh authority holds no links, so no revocation or
+            // readiness reconciliation should notify anything else, but those are not under test here.
+            let retirements = { invalidated.sessionIDs.count { $0 == sessionID } }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let result = await viewModel.activateRoutedAgentSession(tabID: tabID, sessionID: UUID(), workspace: workspace)
+            XCTAssertEqual(result, .sessionNotFound)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID, "failed route leaves the same session on screen")
+            XCTAssertFalse(session.bindingTransitionInProgress)
+            XCTAssertNil(session.oversight.overseerActivation)
+            if activated {
+                try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
+            }
+            let currentEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            XCTAssertNotEqual(currentEndpoint, endpoint)
+            let settledBootstrapState = AgentSessionOverseerBootstrapState(
+                sessionIdentity: ObjectIdentifier(session), provider: session.selectedAgent, activation: nil
+            )
+            // The settlement repaint is deferred past the enclosing mutation. A mid-transition
+            // repaint can already show the new endpoint without a bootstrap state, so wait for both.
+            try await AsyncTestWait.waitUntil("settled pill endpoint and bootstrap state", timeout: 10) {
+                let monitor = viewModel.ui.statusPills.snapshot.monitor
+                return monitor.endpoint == currentEndpoint && monitor.overseerBootstrapState == settledBootstrapState
+            }
+            XCTAssertEqual(retirements(), activated ? 1 : 0, "one retirement per activation, never a settlement replay")
+            let monitor = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertFalse(monitor.isOverseer)
+            XCTAssertTrue(monitor.outbound.isEmpty)
+            XCTAssertNil(session.oversight.pendingAutoWake)
+            let inventory = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(inventory.items.isEmpty)
+            let staleCall = await bridge.laneCreationCallerPreflight(endpoint)
+            let freshCall = await bridge.laneCreationCallerPreflight(currentEndpoint)
+            XCTAssertEqual(staleCall, .denied)
+            XCTAssertEqual(freshCall, .denied, "authority already failed closed before this publication repair")
+        }
+    }
+
+    func testToolbarActivationRejectsAlreadyLinkedIncarnationDespiteStaleDashboard() async throws {
+        for inbound in [false, true] {
+            try await withFixture(ephemeral: false) { fixture in
+                let host = WindowStatesManager.shared
+                let viewModel = fixture.window.agentModeViewModel
+                var seedIDs: [UUID] = []
+                for _ in 0 ..< 2 {
+                    let seed = try await host.agentSessionLinkCreateLane(
+                        destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                        creatorSessionID: UUID(), sessionName: "Linked consent", selection: fixture.selection
+                    )
+                    guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+                    viewModel.sessions[tabID]?.createdByOverseerSessionID = nil
+                    seedIDs.append(sessionID)
+                }
+                let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == seedIDs[0] }).domainEndpoint
+                let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+                let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                    runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+                ))
+                let invalidated = AdvertisementRecorder()
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+                bridge.installIntentStore(AgentSessionOversightIntentStore(
+                    fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                    backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+                ))
+                let pair = AgentSessionOversightIntent(
+                    observerSessionID: seedIDs[inbound ? 1 : 0], targetSessionID: seedIDs[inbound ? 0 : 1]
+                )
+                guard case .added = await bridge.addMonitorLink(pair: pair) else { return XCTFail("real link must activate") }
+                invalidated.sessionIDs.removeAll()
+                let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(enabled, "a lagging dashboard cannot opt in an already linked incarnation")
+                XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint)?.activation)
+                XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            }
+        }
+    }
+
+    func testToolbarActivationRejectsDisabledStaleAndIneligibleIncarnations() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let retired = AdvertisementRecorder()
+            let previousRetiredSink = self.installLocalRetirementSink(retired)
+            defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetiredSink }
+            let host = WindowStatesManager.shared
+            let viewModel = fixture.window.agentModeViewModel
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Toolbar consent", selection: fixture.selection
+            )
+            guard case let .created(sessionID, tabID, _) = seed else { return XCTFail("seed must save") }
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            session.createdByOverseerSessionID = nil
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == sessionID }).domainEndpoint
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let invalidated = AdvertisementRecorder()
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { await invalidated.record($0) })
+            let expected = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
+            let disabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { false })
+            XCTAssertFalse(disabled)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertTrue(invalidated.sessionIDs.isEmpty)
+            for exclusion in ["mcp-origin", "child", "lane", "mcp-control"] {
+                switch exclusion {
+                case "mcp-origin": session.isMCPOriginated = true
+                case "child": session.parentSessionID = UUID()
+                case "lane": session.createdByOverseerSessionID = UUID()
+                default: await self.installDeniedRoleControlFixture(on: session, sessionID: sessionID)
+                }
+                let refused = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+                XCTAssertFalse(refused, exclusion)
+                XCTAssertNil(session.oversight.overseerActivation, exclusion)
+                session.isMCPOriginated = false
+                session.parentSessionID = nil
+                session.createdByOverseerSessionID = nil
+                if session.mcpControlContext != nil {
+                    await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+                }
+            }
+            let enabled = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertTrue(enabled)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            let activation = try XCTUnwrap(session.oversight.overseerActivation)
+            let stale = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(stale, "displayed pre-activation state is a CAS, not reusable consent")
+            XCTAssertEqual(session.oversight.overseerActivation, activation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            XCTAssertTrue(retired.sessionIDs.isEmpty, "refusals and a live activation retire nothing")
+            session.beginPersistentBindingTransition()
+            XCTAssertEqual(retired.sessionIDs, [sessionID], "rebind retires the activation once, synchronously")
+            let rebound = await bridge.enableOverseerFromToolbar(endpoint: endpoint, expected: expected, isEnabled: { true })
+            XCTAssertFalse(rebound)
+            XCTAssertNil(session.oversight.overseerActivation)
+            XCTAssertEqual(invalidated.sessionIDs, [sessionID])
+            XCTAssertEqual(retired.sessionIDs, [sessionID])
+            let inventory = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(inventory.items.isEmpty)
         }
     }
 
@@ -736,6 +962,9 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
 
     func testOverseerActivationIsIncarnationLocalAndExcludedSessionsCannotBootstrap() async throws {
         try await withFixture(ephemeral: false) { fixture in
+            let retired = AdvertisementRecorder()
+            let previousRetiredSink = self.installLocalRetirementSink(retired)
+            defer { AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetiredSink }
             let viewModel = fixture.window.agentModeViewModel
             let host = WindowStatesManager.shared
             let outcome = try await host.agentSessionLinkCreateLane(destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID, creatorSessionID: UUID(), sessionName: "Activation state", selection: fixture.selection)
@@ -794,8 +1023,11 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let returnedToDirect = try XCTUnwrap(viewModel.agentSessionLinkBootstrapState(for: endpoint))
             XCTAssertNil(returnedToDirect.activation, "production role release must not resurrect the old opt-in")
             XCTAssertTrue(viewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: returnedToDirect), "direct requires a fresh opt-in")
+            let retiredBeforeRebind = retired.sessionIDs.count
             session.beginPersistentBindingTransition()
             XCTAssertNil(session.oversight.overseerActivation, "rebind consumes activation immediately")
+            XCTAssertEqual(retired.sessionIDs.count, retiredBeforeRebind + 1)
+            XCTAssertTrue(retired.sessionIDs.allSatisfy { $0 == sessionID }, "retirement names only this session")
             XCTAssertNil(viewModel.agentSessionLinkBootstrapState(for: endpoint), "suspended binding is ineligible")
             let restarted = AgentTabSession(tabID: tabID)
             XCTAssertNil(restarted.oversight.overseerActivation, "new object/restart never restores activation")

@@ -830,6 +830,9 @@ enum AgentSessionLinkLocationInvalidationSink {
 @MainActor
 enum AgentSessionLinkInvalidationSink {
     static var invalidateBinding: ((Int, UUID, DomainAgentSessionLinkRevocationReason) -> Void)?
+    /// Advertisement only — never revocation or a grant. Carries the retired session UUID captured
+    /// at the clear, so an in-place replacement cannot redirect it.
+    static var overseerActivationRetired: ((UUID) -> Void)?
 
     /// Revokes only the endpoint incarnations of one exact `(window, tab)` that are no longer live.
     static func bindingEnded(
@@ -1366,6 +1369,12 @@ final class AgentSessionLinkRuntimeBridge {
             guard let self else { return }
             Task { @MainActor in
                 await self.invalidateBinding(windowID: windowID, tabID: tabID, reason: reason)
+            }
+        }
+        AgentSessionLinkInvalidationSink.overseerActivationRetired = { [weak self] sessionID in
+            Task { @MainActor in
+                guard let self, !self.isFrozenForTermination else { return }
+                await self.invalidateToolAdvertisement(forObserverSession: sessionID)
             }
         }
         AgentSessionLinkCandidateReadinessSignal.onChange = { [weak self] in
@@ -7544,6 +7553,29 @@ final class AgentSessionLinkRuntimeBridge {
     func overseerBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         guard !isFrozenForTermination else { return nil }
         return host?.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    /// Direct user consent from the dashboard, not an Agent/MCP invocation. Capture the displayed
+    /// incarnation and compare it synchronously at commit; the tool's route-proof path stays separate.
+    /// Intentionally gates on agent_session_link only: direct user consent is not the become_overseer
+    /// MCP tool. MCP bootstrap additionally requires become_overseer availability and its route proof.
+    func enableOverseerFromToolbar(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        expected: AgentSessionOverseerBootstrapState,
+        isEnabled: @MainActor () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) }
+    ) async -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
+              host.agentSessionLinkBootstrapState(for: endpoint) == expected,
+              await !(authority.hasActiveLink(endpoint: endpoint))
+        else { return false }
+        // Like tool bootstrap, consent linearizes at the no-link authority sample. Any relationship
+        // committed after that sample is independently ordered; re-fence the captured incarnation.
+        guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
+              host.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
+        else { return false }
+        // Consent is already committed. Catalog publication neither grants links nor starts a turn.
+        await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
+        return true
     }
 
     func becomeOverseer(
