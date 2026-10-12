@@ -25,6 +25,8 @@ struct DelegationScopeRequest: Identifiable, Equatable {
     /// The tab whose Agent Mode view shows the card. The card is shown only while this tab is still
     /// bound to `requesterSessionID`; a session change cancels the request.
     let requesterTabID: UUID?
+    /// Physical window presenting the explicit binding at request time; never inferred at approval.
+    let requesterWindowID: Int?
     /// The requesting session's title at request time, for the card.
     var requesterTitle: String?
     /// Resolved name of a `.workspace` scope's workspace, for the card.
@@ -100,6 +102,7 @@ final class DelegationScopeRuntime: ObservableObject {
     private var persistChain: Task<Void, Never>?
     /// Revoked/released scope IDs, newest last. Persisted as tombstones honored by `reactivate`.
     private var revokedScopeIDs: [UUID] = []
+    private let windows: @MainActor () -> [WindowState]
     private let now: () -> Date
     private let makeUUID: () -> UUID
     private let notifyCatalogChanged: (UUID) -> Void
@@ -108,12 +111,14 @@ final class DelegationScopeRuntime: ObservableObject {
         now: @escaping () -> Date = Date.init,
         makeUUID: @escaping () -> UUID = UUID.init,
         confirmations: BatchConfirmationCoordinator? = nil,
+        windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows },
         notifyCatalogChanged: @escaping (UUID) -> Void = { sessionID in
             // Forced: a scope change alters `session_admin` eligibility without changing any link
             // fact, so the link-only change detection would otherwise skip the relist.
             Task { await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID, forceRelist: true) }
         }
     ) {
+        self.windows = windows
         self.now = now
         self.makeUUID = makeUUID
         self.confirmations = confirmations ?? BatchConfirmationCoordinator(now: now, makeUUID: makeUUID)
@@ -288,6 +293,7 @@ final class DelegationScopeRuntime: ObservableObject {
             id: makeUUID(),
             requesterSessionID: requesterSessionID,
             requesterTabID: requesterTabID,
+            requesterWindowID: requesterTabID.flatMap { explicitPresentationWindow(tabID: $0, sessionID: requesterSessionID)?.windowID },
             requesterTitle: requesterTitle,
             workspaceName: workspaceName,
             kind: kind,
@@ -303,6 +309,43 @@ final class DelegationScopeRuntime: ObservableObject {
         if let key { requestIDByKey[key] = request.id }
         trimRequestRetention()
         return .success(request)
+    }
+
+    /// Re-read the app-owned binding at the synchronous grant boundary. A stale rendered card,
+    /// a rebound tab, or a duplicate tab in another physical window can never approve a grant.
+    @discardableResult
+    func approve(
+        requestID: UUID,
+        presentedWindowID: Int,
+        presentedTabID: UUID,
+        presentedSessionID: UUID,
+        capabilities: Set<DomainDelegationScopeCapability>? = nil,
+        guardrails: DomainDelegationScopeGuardrails? = nil
+    ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
+        guard let request = requests[requestID], request.state == .pending,
+              request.requesterTabID == presentedTabID,
+              request.requesterSessionID == presentedSessionID,
+              request.requesterWindowID == presentedWindowID,
+              explicitPresentationWindow(tabID: presentedTabID, sessionID: presentedSessionID)?.windowID == presentedWindowID
+        else { return .failure(.unknownScope) }
+        return approve(requestID: requestID, capabilities: capabilities, guardrails: guardrails)
+    }
+
+    /// The physical, loaded presentation shared by scope and batch approval. Catalog copies in
+    /// inactive workspaces are knowledge, not presenters. Actual loaded duplicates fail closed.
+    static func loadedPresentation(forTab tabID: UUID, in windows: [WindowState]) -> (window: WindowState, sessionID: UUID)? {
+        let bound = windows.compactMap { window -> (window: WindowState, sessionID: UUID)? in
+            guard let sessionID = window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID else { return nil }
+            return (window, sessionID)
+        }
+        return bound.count == 1 ? bound[0] : nil
+    }
+
+    private func explicitPresentationWindow(tabID: UUID, sessionID: UUID) -> WindowState? {
+        guard let presentation = Self.loadedPresentation(forTab: tabID, in: windows()),
+              presentation.sessionID == sessionID
+        else { return nil }
+        return presentation.window
     }
 
     /// The user approved the grant card, optionally narrowing capabilities or adjusting guardrails.

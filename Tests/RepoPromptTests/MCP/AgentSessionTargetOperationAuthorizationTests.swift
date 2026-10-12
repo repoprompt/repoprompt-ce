@@ -700,3 +700,329 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         return window
     }
 }
+
+// MARK: - DelegationMembershipCensusTests regressions
+
+@MainActor
+final class DelegationMembershipCensusTests: XCTestCase {
+    func testUsageAndMembersEachReadOneCensusWithoutPerMemberSourceResolution() {
+        let root = UUID(), workspace = UUID()
+        let rows = [row(root, workspace: workspace)] + (0 ..< 1500).map { index in
+            row(
+                UUID(),
+                workspace: workspace,
+                parent: root,
+                live: index.isMultiple(of: 2),
+                worktrees: index.isMultiple(of: 3) ? ["shared"] : []
+            )
+        }
+        let source = CountingSource(rows)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        let scope = grant(.tree(rootSessionID: root), grantee: root)
+        let usage = projector.usage(of: scope, spawnParentSessionID: rows.last?.sessionID)
+        XCTAssertEqual(usage.liveSessionCount, 751)
+        XCTAssertEqual(usage.worktreeCount, 500)
+        XCTAssertEqual(usage.spawnParentDepth, 1)
+        XCTAssertEqual(source.censusReads, 1)
+        XCTAssertEqual(source.individualReads, 0)
+        XCTAssertEqual(Set(projector.members(of: scope)), Set(rows.map(\.sessionID)))
+        XCTAssertEqual(source.censusReads, 2)
+        XCTAssertEqual(source.individualReads, 0)
+
+        // A later synchronous call must see changed ownership/liveness, not a cached census.
+        source.rows = [row(root, workspace: workspace, live: false)]
+        XCTAssertEqual(projector.usage(of: scope, spawnParentSessionID: nil).liveSessionCount, 0)
+        XCTAssertEqual(source.censusReads, 3)
+    }
+
+    func testCensusMembershipMatchesIndividualProofsForCyclesMissingParentsAndDepthLimit() {
+        let root = UUID(), workspace = UUID(), cycleA = UUID(), cycleB = UUID()
+        var rows = [
+            row(root, workspace: workspace),
+            row(cycleA, workspace: workspace, parent: cycleB),
+            row(cycleB, workspace: workspace, parent: cycleA),
+            row(UUID(), workspace: workspace, parent: UUID())
+        ]
+        var parent = root
+        for _ in 0 ..< 260 {
+            let id = UUID()
+            rows.append(row(id, workspace: workspace, parent: parent))
+            parent = id
+        }
+        let source = CountingSource(rows)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        let kinds: [DomainDelegationScopeKind] = [.tree(rootSessionID: root), .workspace(workspaceID: workspace), .allSessions]
+        for kind in kinds {
+            let scope = grant(kind, grantee: root)
+            let individual = rows.filter { projector.membershipProof(for: $0.sessionID, in: scope) != nil }.map(\.sessionID)
+            source.resetCounts()
+            XCTAssertEqual(projector.members(of: scope), individual)
+            XCTAssertEqual(source.censusReads, 1)
+            XCTAssertEqual(source.individualReads, 0)
+            let usage = projector.usage(of: scope, spawnParentSessionID: parent)
+            XCTAssertEqual(usage.liveSessionCount, individual.count)
+            XCTAssertEqual(source.censusReads, 2)
+            XCTAssertEqual(source.individualReads, 0)
+            if case .tree = kind {
+                XCTAssertNil(usage.spawnParentDepth)
+                XCTAssertFalse(individual.contains(cycleA))
+                XCTAssertFalse(individual.contains(parent))
+            }
+        }
+    }
+
+    func testBatchLiveStateMatchesSingleResolutionAndSeesSameTurnAmbiguity() throws {
+        let viewModel = AgentModeViewModel(
+            testWindowID: -992, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Census tests must not start providers")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let idleID = UUID(), runningID = UUID(), ambiguousID = UUID(), missingID = UUID()
+        for (id, active) in [(idleID, false), (runningID, true), (ambiguousID, false), (ambiguousID, false)] {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            viewModel.test_installLiveSession(session)
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+            if active { session.runState = .running }
+        }
+        let ids: Set = [idleID, runningID, ambiguousID, missingID]
+        var individual: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState] = [:]
+        for id in ids {
+            do {
+                let session = try viewModel.authoritativeLiveSession(for: id)
+                individual[id] = session.map { $0.runState.isActive ? .running : .idle } ?? .notFound
+            } catch {
+                individual[id] = .ambiguous
+            }
+        }
+        viewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        XCTAssertEqual(viewModel.authoritativeLiveSessionStates(for: ids), individual)
+        XCTAssertEqual(individual[ambiguousID], .ambiguous)
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 1)
+        let secondIdle = AgentModeViewModel.TabSession(tabID: UUID())
+        viewModel.test_installLiveSession(secondIdle)
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: idleID, on: secondIdle))
+        XCTAssertEqual(viewModel.authoritativeLiveSessionStates(for: ids)[idleID], .ambiguous)
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 2)
+        XCTAssertTrue(viewModel.authoritativeLiveSessionStates(for: []).isEmpty)
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 2)
+    }
+
+    func testProductionCensusBuildsOneBindingSnapshotPerWindowAndPreservesOwnerAndLiveness() async throws {
+        let first = WindowState(), second = WindowState()
+        addTeardownBlock { @MainActor in
+            await first.tearDown()
+            await second.tearDown()
+        }
+        await first.workspaceManager.awaitInitialized()
+        await second.workspaceManager.awaitInitialized()
+        let ownerWorkspace = WorkspaceModel(name: "Index owner", repoPaths: [])
+        let otherWorkspace = WorkspaceModel(name: "Other index owner", repoPaths: [])
+        let ambiguousID = UUID(), runningID = UUID(), idleID = UUID(), absentID = UUID()
+        let ids = [ambiguousID, runningID, idleID, absentID] + (0 ..< 1500).map { _ in UUID() }
+        installIndex(ids, workspace: ownerWorkspace, on: first.agentModeViewModel)
+        installIndex([ambiguousID, runningID], workspace: otherWorkspace, on: second.agentModeViewModel)
+        for id in [ambiguousID, runningID] {
+            for _ in 0 ..< 2 {
+                let session = AgentModeViewModel.TabSession(tabID: UUID())
+                first.agentModeViewModel.test_installLiveSession(session)
+                _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+            }
+        }
+        let running = AgentModeViewModel.TabSession(tabID: UUID())
+        second.agentModeViewModel.test_installLiveSession(running)
+        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: runningID, on: running))
+        running.runState = .running
+        let idle = AgentModeViewModel.TabSession(tabID: UUID())
+        second.agentModeViewModel.test_installLiveSession(idle)
+        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: idleID, on: idle))
+        let source = OpenWindowsDelegationProvenanceSource(windows: { [first, second] })
+        let expected = Dictionary(uniqueKeysWithValues: ids.compactMap { id in source.provenance(for: id).map { (id, $0) } })
+        first.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        second.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        let census = source.allKnownSessions()
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: census.map { ($0.sessionID, $0) }), expected)
+        XCTAssertEqual(census.count, ids.count, "Duplicate indexes keep the first owning index")
+        XCTAssertEqual(expected[ambiguousID]?.workspaceID, ownerWorkspace.id)
+        XCTAssertEqual(expected[ambiguousID]?.runState, .unknown)
+        XCTAssertEqual(expected[ambiguousID]?.isLive, true)
+        XCTAssertEqual(expected[runningID]?.runState, .running, "Running beats ambiguity in another window")
+        XCTAssertEqual(expected[idleID]?.runState, .idle)
+        XCTAssertEqual(expected[idleID]?.isLive, true)
+        XCTAssertEqual(expected[absentID]?.isLive, false)
+        XCTAssertEqual(first.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+        XCTAssertEqual(second.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+
+        // A displaced index must contribute nothing, even if it still physically holds rows.
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: ownerWorkspace.id, activationEpoch: 1)
+        first.agentModeViewModel.test_installSessionIndexSnapshot(
+            first.agentModeViewModel.sessionIndex, owner: owner,
+            latestOwner: .init(workspaceID: UUID(), activationEpoch: 2), activeWorkspace: ownerWorkspace
+        )
+        XCTAssertEqual(Set(source.allKnownSessions().map(\.sessionID)), [ambiguousID, runningID])
+        XCTAssertEqual(source.provenance(for: ambiguousID)?.workspaceID, otherWorkspace.id)
+    }
+
+    func testProductionMembershipReadsPlacementWithoutBuildingLivenessAndRemainsFresh() async throws {
+        let window = WindowState()
+        addTeardownBlock { @MainActor in await window.tearDown() }
+        await window.workspaceManager.awaitInitialized()
+        let workspace = WorkspaceModel(name: "Placement only", repoPaths: [])
+        let root = UUID(), middle = UUID(), child = UUID()
+        installIndex([root, middle, child], workspace: workspace, on: window.agentModeViewModel)
+        var entries = window.agentModeViewModel.sessionIndex
+        entries[middle]?.parentSessionID = root
+        entries[child]?.parentSessionID = middle
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        let session = try AgentModeViewModel.TabSession(tabID: XCTUnwrap(entries[child]?.tabID))
+        window.agentModeViewModel.test_installLiveSession(session)
+        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: child, on: session))
+        session.runState = .running
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource(windows: { [window] }))
+        let scope = grant(.tree(rootSessionID: root), grantee: root)
+        window.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        XCTAssertEqual(projector.membershipProof(for: child, in: scope)?.basis, .treePath([child, middle, root]))
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 0, "Placement walks must not census liveness for each ancestor")
+        XCTAssertEqual(projector.targetState(for: child), .running, "State-dependent authority still resolves real liveness")
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+        entries[child]?.parentSessionID = UUID()
+        window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        XCTAssertNil(projector.membershipProof(for: child, in: scope), "A same-turn parent change cannot ride the preceding placement proof")
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+        window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: .init(workspaceID: UUID(), activationEpoch: 2), activeWorkspace: workspace)
+        XCTAssertNil(projector.membershipProof(for: child, in: grant(.workspace(workspaceID: workspace.id), grantee: root)), "Stale-owner indexes remain unavailable")
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+    }
+
+    func testBatchAuthorizationUsesOneFreshCensusAndSameTurnAmbiguityTightensSpawnGuardrail() async throws {
+        let window = WindowState()
+        addTeardownBlock { @MainActor in await window.tearDown() }
+        await window.workspaceManager.awaitInitialized()
+        let workspace = WorkspaceModel(name: "Authorization census", repoPaths: [])
+        let callerID = UUID(), targetID = UUID(), conflictID = UUID()
+        let ids = [callerID, targetID, conflictID] + (0 ..< 253).map { _ in UUID() }
+        installIndex(ids, workspace: workspace, on: window.agentModeViewModel)
+        let source = OpenWindowsDelegationProvenanceSource(windows: { [window] })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        let scopes = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let requested = try scopes.requestScope(
+            requesterSessionID: callerID, requesterTabID: nil, kind: .workspace(workspaceID: workspace.id),
+            capabilities: [.observe, .organize, .spawn],
+            guardrails: .init(maxLiveSessions: 1, bulkConfirmationThreshold: 1000),
+            reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertEqual(
+            requested.guardrails.bulkConfirmationThreshold,
+            25,
+            "An agent cannot loosen the default bulk-card threshold in its request"
+        )
+        // This fixture measures authorization census work, not the bulk-card workflow. Only the
+        // user's approval may permit this 256-item reversible batch without a separate card.
+        let scope = try scopes.approve(
+            requestID: requested.id,
+            guardrails: .init(maxLiveSessions: 1, bulkConfirmationThreshold: 1000)
+        ).get()
+        XCTAssertEqual(scope.grant.guardrails.bulkConfirmationThreshold, 1000)
+        let core = AgentSessionAdministrationCore(scopes: scopes, projector: projector)
+        window.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        guard case .authorized = core.authorize(.init(
+            operation: .adminInventory, caller: .agentSession(callerID), scopeID: scope.id
+        )) else { return XCTFail("Scope-only inventory authorization should not need a session census") }
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 0)
+        let rename = core.authorize(.init(
+            operation: .adminRename, caller: .agentSession(callerID), scopeID: scope.id,
+            targetSessionIDs: ids, arguments: ["name": .string("Batch")]
+        ))
+        guard case let .authorized(batch) = rename else {
+            return XCTFail("Every indexed workspace member should be authorized; got \(String(describing: rename))")
+        }
+        XCTAssertEqual(Set(batch.admittedSessionIDs), Set(ids))
+        XCTAssertTrue(batch.itemsRequiringControl.isEmpty)
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+
+        let fork = AgentSessionAdministrationRequest(
+            operation: .adminFork, caller: .agentSession(callerID), scopeID: scope.id, targetSessionIDs: [targetID]
+        )
+        window.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        guard case .authorized = core.authorize(fork) else { return XCTFail("No live member consumes the available slot yet") }
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+        // Two idle runtime claims are not a proven idle endpoint. Ambiguity must count as live
+        // on the very next synchronous authorization, without awaiting a publication or cache reset.
+        for _ in 0 ..< 2 {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            window.agentModeViewModel.test_installLiveSession(session)
+            _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: conflictID, on: session))
+        }
+        window.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        guard case let .denied(denial, _) = core.authorize(fork) else { return XCTFail("Ambiguous live membership must consume the last slot") }
+        XCTAssertEqual(denial, DomainDelegationScopeDenial.guardrailExceeded(guardrail: .maxLiveSessions, limit: 1, current: 1))
+        XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
+    }
+
+    private func installIndex(_ ids: [UUID], workspace: WorkspaceModel, on viewModel: AgentModeViewModel) {
+        let entries = ids.map { id in
+            AgentSessionIndexEntry(
+                id: id, tabID: UUID(), name: "Indexed", savedAt: Date(timeIntervalSince1970: 0),
+                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+        }
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        viewModel.test_installSessionIndexSnapshot(
+            Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
+            owner: owner, latestOwner: owner, activeWorkspace: workspace
+        )
+    }
+
+    private func grant(_ kind: DomainDelegationScopeKind, grantee: UUID) -> DomainDelegationScopeGrant {
+        .init(
+            id: UUID(),
+            granteeSessionID: grantee,
+            kind: kind,
+            capabilities: [.observe, .organize],
+            guardrails: .init(),
+            origin: .user,
+            grantedAt: Date(timeIntervalSince1970: 0)
+        )
+    }
+
+    private func row(_ id: UUID, workspace: UUID, parent: UUID? = nil, live: Bool = true, worktrees: Set<String> = []) -> DelegationSessionProvenance {
+        .init(
+            sessionID: id,
+            workspaceID: workspace,
+            parentSessionID: parent,
+            createdByOverseerSessionID: nil,
+            isLive: live,
+            worktreeCount: worktrees.count,
+            runState: live ? .idle : .unknown
+        )
+    }
+
+    @MainActor
+    private final class CountingSource: DelegationProvenanceSource {
+        var rows: [DelegationSessionProvenance]
+        var censusReads = 0
+        var individualReads = 0
+        init(_ rows: [DelegationSessionProvenance]) {
+            self.rows = rows
+        }
+
+        func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
+            individualReads += 1
+            return rows.first { $0.sessionID == sessionID }
+        }
+
+        func allKnownSessions() -> [DelegationSessionProvenance] {
+            censusReads += 1
+            return rows
+        }
+
+        func resetCounts() {
+            censusReads = 0
+            individualReads = 0
+        }
+    }
+}

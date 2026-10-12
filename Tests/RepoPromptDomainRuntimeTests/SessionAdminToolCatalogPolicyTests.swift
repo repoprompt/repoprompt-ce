@@ -54,6 +54,34 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         }
     }
 
+    /// `max_depth` is measured from a tree root, so the authority rejects it on every other kind.
+    /// The advertised schema must say so, and must keep saying so only while that rule holds.
+    func testMaxDepthIsAdvertisedAsTreeOnlyMatchingAuthorityValidation() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        let guardrails = try XCTUnwrap(
+            definition.inputSchema.objectValue?["properties"]?.objectValue?["guardrails"]?.objectValue?["properties"]?.objectValue
+        )
+        let maxDepth = try XCTUnwrap(guardrails["max_depth"]?.objectValue)
+        XCTAssertEqual(maxDepth["type"], .string("integer"))
+        XCTAssertEqual(maxDepth["minimum"], .int(0))
+        let text = try XCTUnwrap(maxDepth["description"]?.stringValue)
+        XCTAssertTrue(text.contains("kind=tree only"), text)
+        XCTAssertTrue(text.contains("guardrails_malformed"), text)
+
+        let depthOnly = DomainDelegationScopeGuardrails(maxDepth: 2)
+        let now = Date(timeIntervalSince1970: 0)
+        XCTAssertNil(DomainDelegationScopeAuthority.validate(
+            kind: .tree(rootSessionID: UUID()), capabilities: [.observe], guardrails: depthOnly, now: now
+        ))
+        for kind: DomainDelegationScopeKind in [.workspace(workspaceID: UUID()), .allSessions] {
+            XCTAssertEqual(
+                DomainDelegationScopeAuthority.validate(kind: kind, capabilities: [.observe], guardrails: depthOnly, now: now),
+                .guardrailsMalformed,
+                "\(kind)"
+            )
+        }
+    }
+
     // MARK: - Policy classification
 
     func testNoProfileGrantsTheToolStatically() {

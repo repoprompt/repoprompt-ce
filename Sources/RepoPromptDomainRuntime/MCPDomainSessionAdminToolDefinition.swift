@@ -74,7 +74,13 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "additionalProperties": .bool(false),
                     "properties": .object([
                         "max_live_sessions": .object(["type": .string("integer"), "minimum": .int(0)]),
-                        "max_depth": .object(["type": .string("integer"), "minimum": .int(0)]),
+                        "max_depth": .object([
+                            "type": .string("integer"),
+                            "minimum": .int(0),
+                            "description": .string(
+                                "kind=tree only: spawn depth below this session. Rejected as guardrails_malformed for workspace or all_sessions."
+                            )
+                        ]),
                         "max_worktrees": .object(["type": .string("integer"), "minimum": .int(0)]),
                         "expires_in_seconds": .object(["type": .string("integer"), "minimum": .int(60)]),
                         "bulk_confirmation_threshold": .object(["type": .string("integer"), "minimum": .int(1)])

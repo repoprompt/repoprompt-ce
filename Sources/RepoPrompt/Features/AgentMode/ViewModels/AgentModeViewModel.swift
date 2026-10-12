@@ -5583,7 +5583,41 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func authoritativeLiveSession(for sessionID: UUID) throws -> TabSession? {
-        switch persistentBindingResolution(for: sessionID) {
+        try authoritativeLiveSession(for: sessionID, using: makePersistentBindingResolutionSnapshot())
+    }
+
+    /// Immutable observations from one synchronous binding census. Never retain these across an
+    /// await or mutation as an authority proof; each operation must take a fresh census.
+    enum AuthoritativeLiveSessionState: Equatable {
+        case notFound
+        case idle
+        case running
+        case ambiguous
+    }
+
+    func authoritativeLiveSessionStates(for sessionIDs: Set<UUID>) -> [UUID: AuthoritativeLiveSessionState] {
+        guard !sessionIDs.isEmpty else { return [:] }
+        let snapshot = makePersistentBindingResolutionSnapshot()
+        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+            let state: AuthoritativeLiveSessionState
+            do {
+                if let session = try authoritativeLiveSession(for: sessionID, using: snapshot) {
+                    state = session.runState.isActive ? .running : .idle
+                } else {
+                    state = .notFound
+                }
+            } catch {
+                state = .ambiguous
+            }
+            return (sessionID, state)
+        })
+    }
+
+    private func authoritativeLiveSession(
+        for sessionID: UUID,
+        using snapshot: PersistentBindingResolutionSnapshot
+    ) throws -> TabSession? {
+        switch persistentBindingResolution(for: sessionID, using: snapshot) {
         case let .unique(tabID):
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
             return session
