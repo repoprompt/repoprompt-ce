@@ -283,6 +283,8 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         for (window, entries) in byWindow.values {
             let manager = window.workspaceManager
             let workspaceID = entries[0].1.workspaceID
+            guard window.promptManager.flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
+            else { continue }
             guard manager.activeWorkspaceID == workspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
             else { continue }
@@ -418,6 +420,8 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         _ mutate: (inout ComposeTabState) -> Bool
     ) -> Set<UUID> {
         let manager = window.workspaceManager
+        guard window.promptManager.flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
+        else { return [] }
         guard manager.activeWorkspaceID == workspaceID,
               let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
         else { return [] }

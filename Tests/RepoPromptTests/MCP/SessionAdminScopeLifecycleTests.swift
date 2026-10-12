@@ -3420,3 +3420,1836 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertFalse(LiveAgentSessionInventorySource.isComplete(scan(schema: nil, readFailed: true)))
     }
 }
+
+// MARK: - DelegationCommitFenceTests regressions
+
+@MainActor
+final class DelegationCommitFenceTests: XCTestCase {
+    func testGrantApprovalReReadsBindingAndRejectsAnotherPhysicalWindow() async throws {
+        let first = WindowState(), second = WindowState()
+        addTeardownBlock { @MainActor in
+            await first.tearDown()
+            await second.tearDown()
+        }
+        await first.workspaceManager.awaitInitialized()
+        await second.workspaceManager.awaitInitialized()
+        let tab = UUID(), requester = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: tab)
+        first.agentModeViewModel.test_installLiveSession(session)
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        var windows = [first, second]
+        let runtime = DelegationScopeRuntime(windows: { windows }, notifyCatalogChanged: { _ in })
+        let request = try runtime.requestScope(
+            requesterSessionID: requester, requesterTabID: tab, kind: .tree(rootSessionID: requester),
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertEqual(request.requesterWindowID, first.windowID)
+        func approve(in window: WindowState) -> Bool {
+            if case .success = runtime.approve(
+                requestID: request.id, presentedWindowID: window.windowID,
+                presentedTabID: tab, presentedSessionID: requester
+            ) { return true }
+            return false
+        }
+
+        // No render/task cancellation runs between the rebind and the stale button callback.
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
+        XCTAssertFalse(approve(in: first))
+        XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
+        XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
+
+        let otherSession = AgentModeViewModel.TabSession(tabID: tab)
+        second.agentModeViewModel.test_installLiveSession(otherSession)
+        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        windows = [second]
+        XCTAssertFalse(approve(in: second), "matching IDs in a different physical window are not the presented request")
+        windows = [first]
+        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        windows = [first, second]
+        XCTAssertFalse(approve(in: first), "ambiguous cross-window tab ownership fails closed")
+        windows = [first]
+        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve")
+        XCTAssertTrue(runtime.hasLiveScope(grantedTo: requester))
+    }
+
+    func testModelAndEffortCannotCommitAfterTargetLeavesScopeDuringHostSuspension() async throws {
+        for operation in [DomainAgentSessionTargetOperation.adminSetModel, .adminSetEffort] {
+            let fixture = SessionAdminStructureTests.Fixture()
+            let root = UUID(), target = UUID()
+            fixture.provenance.add(root, parent: nil)
+            fixture.provenance.add(target, parent: root)
+            let scope = try fixture.grant(root, [.control])
+            let host = ConfigurationHost()
+            let context = SessionAdminHandlerContext(scopes: fixture.runtime, projector: fixture.projector)
+            fixture.core.register(SessionAdminLifecycleHandler(context: context, host: host))
+            host.beforeCommit = {
+                await Task.yield()
+                fixture.provenance.add(target, parent: nil, org: UUID())
+            }
+            let args: [String: Value] = operation == .adminSetModel
+                ? ["model_id": .string("claudeCode:opus")] : ["effort": .string("high")]
+            let blocked = try await fixture.value(operation, caller: root, targets: [target], args: args)
+            XCTAssertEqual(blocked["changed_count"], .int(0))
+            XCTAssertEqual(host.committed, [])
+            XCTAssertEqual(host.attempts, 1)
+            XCTAssertEqual(
+                fixture.runtime.record(id: scope.id)?.generation,
+                scope.generation,
+                "the lease remains current; membership loss alone must fence the write"
+            )
+
+            fixture.provenance.add(target, parent: root)
+            host.beforeCommit = { await Task.yield() }
+            let applied = try await fixture.value(operation, caller: root, targets: [target], args: args)
+            XCTAssertEqual(applied["changed_count"], .int(1))
+            XCTAssertEqual(host.committed, [target])
+        }
+    }
+
+    private final class ConfigurationHost: SessionAdminStructureHost {
+        var beforeCommit: @MainActor () async -> Void = {}
+        var committed: [UUID] = []
+        var attempts = 0
+
+        private func commit(_ id: UUID, authorized: @escaping @MainActor () -> Bool) async -> SessionAdminLifecycleOutcome {
+            attempts += 1
+            await beforeCommit()
+            guard authorized() else { return .blocked("authority ended") }
+            committed.append(id)
+            return .applied(changed: true, fields: [:])
+        }
+
+        func setModel(sessionID: UUID, modelID _: String, isStillAuthorized: @escaping @MainActor () -> Bool) async -> SessionAdminLifecycleOutcome {
+            await commit(sessionID, authorized: isStillAuthorized)
+        }
+
+        func setEffort(sessionID: UUID, effort _: String, isStillAuthorized: @escaping @MainActor () -> Bool) async -> SessionAdminLifecycleOutcome {
+            await commit(sessionID, authorized: isStillAuthorized)
+        }
+
+        var mintedLinkCapabilities: Set<DomainAgentSessionLinkCapability> {
+            []
+        }
+
+        func commitOrganizationalPlacement(sessionID _: UUID, parentID _: UUID, delegationScopeID _: UUID?) throws -> DelegationPlacementCommit? {
+            XCTFail("unexpected placement")
+            return nil
+        }
+
+        func activeLinkCapabilities(observer _: UUID, target _: UUID) async -> Set<DomainAgentSessionLinkCapability>? {
+            XCTFail("unexpected link lookup")
+            return nil
+        }
+
+        func addLink(observer _: UUID, target _: UUID, isStillAuthorized _: @escaping @MainActor () -> Bool) async -> SessionAdminLinkOutcome {
+            XCTFail("unexpected add link")
+            return .revoked
+        }
+
+        func stopLink(observer _: UUID, target _: UUID, isStillAuthorized _: @escaping @MainActor () -> Bool) async -> SessionAdminLinkOutcome {
+            XCTFail("unexpected stop link")
+            return .revoked
+        }
+
+        func fork(sessionID _: UUID, upToItemID _: UUID?) async throws -> UUID {
+            throw SessionAdminHostError.sessionUnavailable
+        }
+    }
+}
+
+// MARK: - SessionAdminDeferredOutcomeTests regressions
+
+@MainActor
+final class SessionAdminDeferredOutcomeTests: XCTestCase {
+    func testFailedDeferredBindIsVisibleOnlyWhileTargetRemainsScopeMember() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let host = Host(base: fixture.worktrees)
+        host.failBinding = true
+        let handler = SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+        )
+        fixture.core.register(handler)
+        fixture.worktrees.idle[target] = false
+        let queued = try await fixture.value(
+            .adminWorktreeBind,
+            caller: caller,
+            targets: [target],
+            args: ["worktree": .string("test-worktree"), "apply": .string("next_boundary")]
+        )
+        XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"))
+        fixture.worktrees.becomeIdle(target)
+        await handler.settleDeferredBinds()
+        XCTAssertNil(handler.pendingBinds[target])
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        let outcome = try XCTUnwrap(inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(outcome["session_id"], .string(target.uuidString))
+        XCTAssertEqual(outcome["result"], .string("not_applied"))
+        XCTAssertEqual(outcome["code"], .string("bind_failed"))
+        XCTAssertEqual(outcome["detail"], .string("test_bind_failure"))
+        XCTAssertEqual(inventory["pending_binds"], .array([]))
+        fixture.provenance.add(target, parent: nil, org: UUID())
+        let restricted = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        XCTAssertEqual(restricted["deferred_outcomes"], .array([]), "A prior outcome must not disclose an out-of-scope target")
+    }
+
+    func testWorktreeInventoryRefusesRevocationAndMembershipChangeDuringPrunabilityAwait() async throws {
+        for revoke in [true, false] {
+            let fixture = SessionAdminStructureTests.Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            let scope = try fixture.grant(caller)
+            fixture.worktrees.bound[target] = [SessionAdminStructureTests.WorktreeHost.summary("private-worktree")]
+            let host = Host(base: fixture.worktrees)
+            host.onPrunability = {
+                if revoke { fixture.runtime.revoke(scopeID: scope.id) }
+                else { fixture.provenance.add(target, parent: nil, org: UUID()) }
+            }
+            fixture.core.register(SessionAdminWorktreeHandler(
+                context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+            ))
+            do {
+                _ = try await fixture.value(.adminWorktreeInventory, caller: caller)
+                XCTFail("A pre-await inventory must not disclose after authority changes")
+            } catch {
+                XCTAssertEqual(String(describing: error), String(describing: SessionAdminMCPToolService.unavailableError))
+            }
+        }
+    }
+
+    private final class Host: SessionAdminWorktreeHost {
+        let base: SessionAdminStructureTests.WorktreeHost
+        var failBinding = false
+        var onPrunability: (() -> Void)?
+        init(base: SessionAdminStructureTests.WorktreeHost) {
+            self.base = base
+        }
+
+        func createWorktree(forSession sessionID: UUID, repoRoot: String?, branch: String?, baseRef: String?) async throws -> SessionAdminWorktreeInfo {
+            try await base.createWorktree(forSession: sessionID, repoRoot: repoRoot, branch: branch, baseRef: baseRef)
+        }
+
+        func bindWorktree(sessionID: UUID, worktree: String, repoRoot: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> SessionAdminWorktreeInfo {
+            if failBinding { throw NSError(domain: "Test", code: 1, userInfo: [NSLocalizedDescriptionKey: "test_bind_failure"]) }
+            return try await base.bindWorktree(sessionID: sessionID, worktree: worktree, repoRoot: repoRoot, isStillAuthorized: isStillAuthorized)
+        }
+
+        func unbindWorktrees(sessionID: UUID, worktreeID: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> [String] {
+            try await base.unbindWorktrees(sessionID: sessionID, worktreeID: worktreeID, isStillAuthorized: isStillAuthorized)
+        }
+
+        func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary] {
+            base.boundWorktrees(sessionID: sessionID)
+        }
+
+        func isIdleForWorktreeTransition(sessionID: UUID) -> Bool {
+            base.isIdleForWorktreeTransition(sessionID: sessionID)
+        }
+
+        func waitForIdleBoundary(sessionID: UUID) async {
+            await base.waitForIdleBoundary(sessionID: sessionID)
+        }
+
+        func allBoundWorktrees() -> [String: Set<UUID>] {
+            base.allBoundWorktrees()
+        }
+
+        func isWorktreePrunable(path: String, repoRoot: String?) async -> Bool {
+            await Task.yield()
+            onPrunability?()
+            return false
+        }
+
+        func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?) async throws -> Value {
+            try await base.previewMerge(sessionID: sessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
+        }
+
+        func applyMerge(sessionID: UUID, operationID: String) async throws -> Value {
+            try await base.applyMerge(sessionID: sessionID, operationID: operationID)
+        }
+    }
+}
+
+// MARK: - SessionAdminInventoryReadTests regressions
+
+@MainActor
+final class SessionAdminInventoryReadTests: XCTestCase {
+    private final class Flag {
+        var value: Bool
+        init(_ value: Bool) {
+            self.value = value
+        }
+    }
+
+    /// Exercises the production inventory source, not a replacement snapshot implementation.
+    private actor Scanner: HistorySessionScanning {
+        var queries: [String?] = []
+        var budgets: [HistoryRequestBudget] = []
+        var cancelOnScan = false
+        var workspaces: [HistoryWorkspaceScanResult] = []
+        var directRecords: [UUID: AgentSessionMetadataRecord] = [:]
+        var directQueries: [UUID] = []
+
+        func setDirectRecords(_ records: [AgentSessionMetadataRecord]) {
+            directRecords = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
+        }
+
+        func capturedDirectQueries() -> [UUID] {
+            directQueries
+        }
+
+        func locateSession(sessionID: UUID, requestBudget: HistoryRequestBudget) async throws -> HistoryDirectSessionLookup {
+            directQueries.append(sessionID)
+            budgets.append(requestBudget)
+            if cancelOnScan { throw CancellationError() }
+            let location = directRecords[sessionID].map {
+                HistoryDirectSessionLocation(record: $0, workspaceName: "Exact history", workspaceDir: URL(fileURLWithPath: "/tmp/inventory-direct"))
+            }
+            return HistoryDirectSessionLookup(location: location, diagnostics: [], isComplete: true)
+        }
+
+        func setWorkspaces(_ value: [HistoryWorkspaceScanResult]) {
+            workspaces = value
+        }
+
+        func setCancellation() {
+            cancelOnScan = true
+        }
+
+        func capturedQueries() -> [String?] {
+            queries
+        }
+
+        func capturedBudgets() -> [HistoryRequestBudget] {
+            budgets
+        }
+
+        func scanWorkspaces(matching workspace: String?, requestBudget: HistoryRequestBudget) async throws -> HistoryInventoryScan {
+            queries.append(workspace)
+            budgets.append(requestBudget)
+            if cancelOnScan { throw CancellationError() }
+            return HistoryInventoryScan(workspaces: workspaces)
+        }
+
+        func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
+            XCTFail("inventory must use the budget-aware scanner seam")
+            return []
+        }
+
+        func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+            []
+        }
+
+        nonisolated func sessionsMatchingFilters(
+            _: [HistoryWorkspaceScanResult], workspace _: String?, agentKind _: String?, model _: String?,
+            filePath _: String?, from _: Date?, to _: Date?
+        ) -> [HistoryFilteredSessionRecord] {
+            []
+        }
+
+        func loadTranscriptForSearch(sessionID _: UUID, workspaceDir _: URL) async throws -> AgentTranscript {
+            throw CancellationError()
+        }
+
+        func transcriptDerivedFieldsAreStale(
+            for _: AgentSessionMetadataRecord, sessionID _: UUID, workspaceDir _: URL
+        ) async -> Bool {
+            false
+        }
+    }
+
+    private func grant(
+        runtime: DelegationScopeRuntime, caller: UUID, kind: DomainDelegationScopeKind
+    ) throws -> DomainDelegationScopeRecord {
+        let request = try runtime.requestScope(
+            requesterSessionID: caller, requesterTabID: UUID(), kind: kind,
+            capabilities: [.observe, .organize], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        return try runtime.approve(requestID: request.id).get()
+    }
+
+    func testWorkspaceReadPushesSelectorAndBudgetIntoProductionScannerWithoutClaimingGlobalCompleteness() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let workspace = UUID()
+        let budget = HistoryRequestBudget.standalone()
+        let snapshot = try await source.snapshot(read: .init(workspaceID: workspace, budget: budget))
+        let queries = await scanner.capturedQueries()
+        let budgets = await scanner.capturedBudgets()
+        XCTAssertEqual(queries.count, 1)
+        XCTAssertEqual(queries.first, workspace.uuidString)
+        XCTAssertTrue(budgets.first === budget)
+        XCTAssertFalse(snapshot.isComplete, "workspace absence is not global deletion proof")
+    }
+
+    func testLoadedOnlyReadDoesNotOpenHistoryAndCannotProveOrphans() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
+        let queries = await scanner.capturedQueries()
+        XCTAssertTrue(queries.isEmpty)
+        XCTAssertFalse(snapshot.isComplete)
+    }
+
+    func testProductionScannerCancellationPropagatesInsteadOfReturningEmptySuccess() async throws {
+        let scanner = Scanner()
+        await scanner.setCancellation()
+        let readLinks = Flag(false)
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: {
+            readLinks.value = true
+            return ([], [])
+        })
+        do {
+            _ = try await source.snapshot(read: .init())
+            XCTFail("cancelled scans must fail the operation")
+        } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+        XCTAssertFalse(readLinks.value)
+    }
+
+    func testHandlerRechecksAuthorityAfterProductionRead() async throws {
+        let scanner = Scanner()
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
+        let current = Flag(true)
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: {
+            current.value = false
+            return ([], [])
+        })
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { _ in current.value }, isLeaseCurrent: { _ in true }
+        )
+        let batch = AgentSessionAdministrationAuthorizedBatch(
+            request: .init(operation: .adminInventory, caller: .agentSession(caller)), scope: scope,
+            leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+        )
+        do {
+            _ = try await handler.perform(batch)
+            XCTFail("revoked authority must not disclose even empty inventory")
+        } catch is MCPError {} catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    private final class Handler: AgentSessionAdministrationOperationHandler {
+        let operations: Set<DomainAgentSessionTargetOperation>
+        var performed = false
+        var targets: [UUID] = []
+        init(_ operations: Set<DomainAgentSessionTargetOperation> = [.adminRename]) {
+            self.operations = operations
+        }
+
+        func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
+            performed = true
+            targets = batch.request.targetSessionIDs
+            return .object(["result": .string("ok")])
+        }
+    }
+
+    func testExactLoadedFrontDoorTargetAvoidsUnrelatedProductionHistoryScan() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(caller, parent: nil, workspace: workspace)
+        provenance.add(target, parent: nil, workspace: workspace)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core, scopes: runtime, projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let handler = Handler()
+        frontDoor.register(handler)
+        _ = try await frontDoor.perform(.init(
+            operation: .adminRename, caller: .agentSession(caller), scopeID: scope.id,
+            targetSessionIDs: [target], arguments: ["name": .string("Renamed")]
+        ))
+        let queries = await scanner.capturedQueries()
+        XCTAssertTrue(queries.isEmpty)
+        XCTAssertTrue(handler.performed)
+    }
+
+    func testAuthorizedExactGetDoesNotScanHistoryWhenLoadedProjectionDisappears() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .allSessions)
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(caller, parent: nil, workspace: workspace)
+        provenance.add(target, parent: nil, workspace: workspace)
+        let core = AgentSessionAdministrationCore(
+            scopes: runtime, projector: SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        )
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        core.register(handler)
+        do {
+            _ = try await core.perform(.init(
+                operation: .adminGet, caller: .agentSession(caller), scopeID: scope.id, targetSessionIDs: [target]
+            ))
+            XCTFail("an absent live projection must remain uniformly unavailable")
+        } catch is MCPError {} catch { XCTFail("unexpected error: \(error)") }
+        let queries = await scanner.capturedQueries()
+        XCTAssertTrue(queries.isEmpty, "authorized exact get must not fall back to a global history scan")
+    }
+
+    func testFrontDoorRechecksAuthorityBeforeEmptyFilterEarlyResult() async throws {
+        let scanner = Scanner()
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: {
+            _ = runtime.release(scopeID: scope.id, caller: .agentSession(caller))
+            return ([], [])
+        })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: SessionAdminScopeLifecycleTests.FakeProvenance())
+        let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core, scopes: runtime, projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let handler = Handler()
+        frontDoor.register(handler)
+        do {
+            _ = try await frontDoor.perform(.init(
+                operation: .adminRename, caller: .agentSession(caller), scopeID: scope.id,
+                arguments: ["filter": .object(["loaded": .bool(true)])]
+            ))
+            XCTFail("revocation must fence no_matching_sessions too")
+        } catch is MCPError {} catch { XCTFail("unexpected error: \(error)") }
+        XCTAssertFalse(handler.performed)
+    }
+
+    func testExactTabIdentityNeverUsesIndexFallbackOverDifferentActiveSession() {
+        let requested = UUID()
+        let other = UUID()
+        var tab = ComposeTabState(activeAgentSessionID: other)
+        XCTAssertFalse(LiveAgentSessionInventorySource.exactTabMatches(tab, sessionID: requested, indexTabID: tab.id))
+        tab.activeAgentSessionID = nil
+        XCTAssertTrue(LiveAgentSessionInventorySource.exactTabMatches(tab, sessionID: requested, indexTabID: tab.id))
+        XCTAssertFalse(LiveAgentSessionInventorySource.exactTabMatches(tab, sessionID: requested, indexTabID: UUID()))
+        tab.activeAgentSessionID = requested
+        XCTAssertTrue(LiveAgentSessionInventorySource.exactTabMatches(tab, sessionID: requested, indexTabID: nil))
+        // Active and stashed lookups intentionally use this same identity predicate.
+    }
+
+    private final class FailureSource: AgentSessionInventorySource {
+        var afterRead: () -> Void = {}
+        func snapshot() async -> DomainAgentSessionInventorySnapshot {
+            .init(records: [], edges: [], isComplete: false)
+        }
+
+        func snapshot(read _: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
+            afterRead()
+            throw AgentSessionInventoryReadFailure.budgetExceeded
+        }
+    }
+
+    func testGranteeGetsTypedBudgetOutcomeButRevocationStillGetsUniformDenial() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
+        let source = FailureSource()
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { record in
+                runtime.record(id: record.id).map { $0.isActive && $0.generation == record.generation } ?? false
+            }, isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        let batch = AgentSessionAdministrationAuthorizedBatch(
+            request: .init(operation: .adminInventory, caller: .agentSession(caller)), scope: scope,
+            leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+        )
+        let value = try await handler.perform(batch)
+        XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        source.afterRead = { _ = runtime.release(scopeID: scope.id, caller: .agentSession(caller)) }
+        do {
+            _ = try await handler.perform(batch)
+            XCTFail("revocation must not be mislabeled as an operational budget outcome")
+        } catch is MCPError {} catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testHistoryOnlyGetReturnsReadUnavailableInsteadOfAppliedSkippedMutation() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(caller, parent: nil, workspace: workspace)
+        let source = LoadedProjectionSource(records: [
+            .init(
+                sessionID: target,
+                name: "History member",
+                workspaceID: workspace,
+                isLoaded: false,
+                runState: .idle,
+                lastActivityAt: Date()
+            )
+        ])
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+            projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let handler = Handler([.adminGet])
+        frontDoor.register(handler)
+        guard case let .completed(value) = try await frontDoor.perform(.init(
+            operation: .adminGet, caller: .agentSession(caller), scopeID: scope.id, targetSessionIDs: [target]
+        )) else { return XCTFail("history-only scope member must get a read-shaped outcome") }
+        XCTAssertEqual(value.objectValue?["result"], .string("unavailable"))
+        XCTAssertEqual(value.objectValue?["code"], .string("workspace_not_loaded"))
+        XCTAssertNil(value.objectValue?["items"])
+        XCTAssertFalse(handler.performed)
+    }
+
+    func testIncompleteEndpointCensusRefusesFilterWithRecoverableCode() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(target, parent: nil, workspace: workspace)
+        let source = LoadedProjectionSource(records: [
+            .init(
+                sessionID: target,
+                name: "Unknown endpoints",
+                workspaceID: workspace,
+                isLoaded: true,
+                runState: .idle,
+                lastActivityAt: Date()
+            )
+        ])
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+            projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let handler = Handler()
+        frontDoor.register(handler)
+        guard case let .completed(value) = try await frontDoor.perform(.init(
+            operation: .adminRename, caller: .agentSession(caller), scopeID: scope.id,
+            arguments: ["filter": .object(["has_links": .bool(false)])]
+        )) else { return XCTFail("incomplete census must return a typed refusal") }
+        XCTAssertEqual(value.objectValue?["code"], .string("inventory_incomplete"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertFalse(handler.performed)
+    }
+
+    private final class LoadedProjectionSource: AgentSessionInventorySource {
+        let source: LiveAgentSessionInventorySource?
+        let records: [DomainAgentSessionInventoryRecord]
+        let edges: [DomainAgentSessionInventoryEdge]
+
+        init(
+            source: LiveAgentSessionInventorySource? = nil,
+            records: [DomainAgentSessionInventoryRecord], edges: [DomainAgentSessionInventoryEdge] = []
+        ) {
+            self.source = source
+            self.records = records
+            self.edges = edges
+        }
+
+        func snapshot() async -> DomainAgentSessionInventorySnapshot {
+            .init(records: records, edges: edges, isComplete: false)
+        }
+
+        func snapshot(read: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
+            if let source {
+                let snapshot = try await source.snapshot(read: read)
+                return .init(records: records, edges: snapshot.edges, isComplete: snapshot.isComplete)
+            }
+            return .init(
+                records: records.filter { read.sessionIDs?.contains($0.sessionID) ?? true },
+                edges: edges, isComplete: false
+            )
+        }
+    }
+
+    func testBoundedLoadedGetWithKnownSameScopeNeighborDoesNotPresentEmptyLinksOrChildren() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let child = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(caller, parent: nil, workspace: workspace)
+        provenance.add(target, parent: nil, workspace: workspace)
+        provenance.add(child, parent: target, workspace: workspace)
+        let edge = DomainAgentSessionInventoryEdge(
+            observerSessionID: target, targetSessionID: child, isLive: true, isPersisted: true
+        )
+        let source = LoadedProjectionSource(records: [
+            .init(sessionID: target, name: "Target", workspaceID: workspace, isLoaded: true, runState: .idle, lastActivityAt: Date()),
+            .init(
+                sessionID: child,
+                name: "Child",
+                workspaceID: workspace,
+                isLoaded: true,
+                runState: .idle,
+                parentSessionID: target,
+                lastActivityAt: Date()
+            )
+        ], edges: [edge])
+        let core = AgentSessionAdministrationCore(
+            scopes: runtime, projector: SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        )
+        core.register(AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        ))
+        guard case let .completed(value) = try await core.perform(.init(
+            operation: .adminGet, caller: .agentSession(caller), scopeID: scope.id, targetSessionIDs: [target]
+        )) else { return XCTFail("authorized loaded target must be readable") }
+        let row = try XCTUnwrap(value.objectValue?["session"]?.objectValue)
+        XCTAssertEqual(row["links_complete"], .bool(false))
+        XCTAssertEqual(row["children_complete"], .bool(false))
+        XCTAssertNil(row["links"], "unknown neighbor links must not be shown as factual empty arrays")
+        XCTAssertNil(row["children"], "unknown children must not be shown as factual empty arrays")
+        XCTAssertNil(row["link_count"])
+        XCTAssertNil(row["roles"])
+        XCTAssertEqual(value.objectValue?["history_complete"], .bool(false))
+    }
+
+    func testProjectionDeadlineCannotWidenNoLinksMutationFilter() async throws {
+        let scanner = Scanner()
+        await scanner.setWorkspaces([projectionWorkspace(count: 256)])
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let child = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(target, parent: nil, workspace: workspace)
+        provenance.add(child, parent: target, workspace: workspace)
+        let liveSource = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: {
+            ([], [.init(observerSessionID: target, targetSessionID: child)])
+        })
+        let source = LoadedProjectionSource(source: liveSource, records: [
+            .init(
+                sessionID: target,
+                name: "Linked target",
+                workspaceID: workspace,
+                isLoaded: true,
+                runState: .idle,
+                lastActivityAt: Date()
+            )
+        ])
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+            projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let handler = Handler()
+        frontDoor.register(handler)
+        let clock = ProjectionClock(stopAt: 80)
+        let outcome = try await AgentSessionInventoryInvocation.budgetTaskLocal.withValue(clock.budget()) {
+            try await frontDoor.perform(.init(
+                operation: .adminRename, caller: .agentSession(caller), scopeID: scope.id,
+                arguments: ["filter": .object(["has_links": .bool(false)])]
+            ))
+        }
+        guard case let .completed(value) = outcome else { return XCTFail("budget refusal must be a typed grantee-only outcome") }
+        XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertFalse(handler.performed)
+    }
+
+    private final class ProjectionClock: @unchecked Sendable {
+        let startedAt = ContinuousClock().now
+        let lock = NSLock()
+        var calls = 0
+        let stopAt: Int
+        let cancels: Bool
+
+        init(stopAt: Int, cancels: Bool = false) {
+            self.stopAt = stopAt
+            self.cancels = cancels
+        }
+
+        func now() -> ContinuousClock.Instant {
+            let stopped = lock.withLock {
+                calls += 1
+                return calls >= stopAt
+            }
+            if stopped, cancels { withUnsafeCurrentTask { $0?.cancel() } }
+            return stopped && !cancels ? startedAt + .seconds(2) : startedAt
+        }
+
+        func budget() -> HistoryRequestBudget {
+            HistoryRequestBudget(
+                startedAt: startedAt, deadline: startedAt + .seconds(1), maxTurns: 1000,
+                yieldEveryTurns: 64, maxIndexBytes: 1_000_000, maxIndexFileBytes: 1_000_000,
+                maxTranscriptBytes: 1_000_000, maxTranscriptFileBytes: 1_000_000,
+                nowProvider: { self.now() }
+            )
+        }
+    }
+
+    private func projectionWorkspace(count: Int) -> HistoryWorkspaceScanResult {
+        let workspaceID = UUID()
+        let records = (0 ..< count).map { index in
+            AgentSessionMetadataRecord(
+                id: UUID(), filename: "\(index).json", workspaceID: workspaceID, composeTabID: nil,
+                name: "Record \(index)", savedAt: Date(), lastUserMessageAt: nil, itemCount: 0,
+                transcriptProjectionCounts: nil, hasUnknownConversationContent: false,
+                agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil,
+                lastRunStateRaw: nil, autoEditEnabled: false, parentSessionID: nil,
+                isMCPOriginated: false, serializationVersion: nil, observedFileSize: nil,
+                observedFileModificationDate: nil, lastIndexedAt: Date()
+            )
+        }
+        return HistoryWorkspaceScanResult(
+            workspaceDir: URL(fileURLWithPath: "/tmp/inventory-projection-fixture"),
+            workspaceName: "Projection", workspaceID: workspaceID, records: records,
+            indexReadFailed: false, indexSchemaVersion: nil
+        )
+    }
+
+    func testProjectionDeadlineFailsClosedAfterSuccessfulScan() async throws {
+        let scanner = Scanner()
+        await scanner.setWorkspaces([projectionWorkspace(count: 256)])
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let clock = ProjectionClock(stopAt: 80)
+        do {
+            _ = try await source.snapshot(read: .init(budget: clock.budget()))
+            XCTFail("deadline exhaustion must not return factual empty edges")
+        } catch let failure as AgentSessionInventoryReadFailure {
+            XCTAssertEqual(failure, .budgetExceeded)
+        } catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testCancellationDuringSuccessfulScanProjectionPropagates() async throws {
+        let scanner = Scanner()
+        await scanner.setWorkspaces([projectionWorkspace(count: 256)])
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let clock = ProjectionClock(stopAt: 80, cancels: true)
+        let task = Task { @MainActor in
+            try await source.snapshot(read: .init(budget: clock.budget()))
+        }
+        do {
+            _ = try await task.value
+            XCTFail("cancellation must be checked within the record projection, not just around scan")
+        } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testCancellationDuringLinkAwaitDoesNotReturnSuccess() async throws {
+        let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { [] }, links: {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return ([], [])
+        })
+        let task = Task { @MainActor in
+            try await source.snapshot(read: .init(loadedOnly: true))
+        }
+        do {
+            _ = try await task.value
+            XCTFail("cancellation after an await must propagate")
+        } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testSuccessiveReadsShareInvocationBudget() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let budget = HistoryRequestBudget.standalone()
+        try await AgentSessionInventoryInvocation.budgetTaskLocal.withValue(budget) {
+            _ = try await source.snapshot(read: .init())
+            _ = try await source.snapshot(read: .init())
+        }
+        let budgets = await scanner.capturedBudgets()
+        XCTAssertEqual(budgets.count, 2)
+        XCTAssertTrue(budgets.allSatisfy { $0 === budget })
+    }
+
+    func testOutputWorkspaceAndLoadedPredicatesDoNotDiscardInScopeLinkEndpoints() {
+        var filter = DomainAgentSessionInventoryFilter()
+        filter.workspaceID = UUID()
+        filter.loaded = true
+        filter.hasLinks = false
+        let read = AgentSessionInventoryRead.scoped(chain: [], filter: filter)
+        XCTAssertNil(read.workspaceID, "an output workspace filter must not narrow all-sessions visibility")
+        XCTAssertFalse(read.loadedOnly, "loaded output rows still need unloaded link endpoints")
+    }
+
+    func testOrdinaryAllSessionsWorkspaceSelectorPushesDownButEdgePredicateDoesNot() async throws {
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        var filter = DomainAgentSessionInventoryFilter()
+        let workspace = UUID()
+        filter.workspaceID = workspace
+        let read = AgentSessionInventoryRead.scoped(chain: [], filter: filter)
+        XCTAssertEqual(read.workspaceID, workspace)
+        _ = try await source.snapshot(read: read)
+        let queries = await scanner.capturedQueries()
+        XCTAssertEqual(queries.count, 1)
+        XCTAssertEqual(queries.first, workspace.uuidString)
+        filter.hasLinks = false
+        XCTAssertNil(AgentSessionInventoryRead.scoped(chain: [], filter: filter).workspaceID)
+    }
+
+    func testInventoryReadPredicatesRefuseIncompleteCensusAndPartialRowsOmitNegativeFacts() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let target = UUID()
+        let workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+        let record = DomainAgentSessionInventoryRecord(
+            sessionID: target, name: "Unknown endpoints", workspaceID: workspace, isLoaded: true,
+            runState: .idle, lastActivityAt: Date()
+        )
+        let source = LoadedProjectionSource(records: [record])
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { record in
+                runtime.record(id: record.id).map { $0.isActive && $0.generation == record.generation } ?? false
+            }, isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        let predicates: [[String: Value]] = [
+            ["has_links": .bool(false)], ["orphaned": .bool(false)], ["role": .string("overseer")]
+        ]
+        for predicate in predicates {
+            let batch = AgentSessionAdministrationAuthorizedBatch(
+                request: .init(
+                    operation: .adminInventory,
+                    caller: .agentSession(caller),
+                    arguments: ["filter": .object(predicate)]
+                ), scope: scope,
+                leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+            )
+            let value = try await handler.perform(batch)
+            XCTAssertEqual(value.objectValue?["code"], .string("inventory_incomplete"))
+            XCTAssertNil(value.objectValue?["sessions"], "unknown endpoints must not yield actionable candidate IDs")
+        }
+        let snapshot = DomainAgentSessionInventorySnapshot(records: [record], edges: [], isComplete: false)
+        let row = try XCTUnwrap(AgentSessionInventoryRendering.row(record, snapshot: snapshot, now: Date()).objectValue)
+        XCTAssertNil(row["link_count"])
+        XCTAssertNil(row["roles"])
+        XCTAssertNil(row["orphaned"])
+        XCTAssertEqual(row["links_complete"], .bool(false))
+        XCTAssertEqual(row["orphan_status_complete"], .bool(false))
+    }
+
+    @MainActor
+    private final class LoadedWindowFixture {
+        let window: WindowState
+        let runtime: MCPDomainRuntime
+        let directory: URL
+        var carriers: WorkspaceModel?
+        var indexEntries: [UUID: AgentSessionIndexEntry] = [:]
+
+        /// Install a value-only census fixture after all asynchronous window activation work.
+        /// An earlier window's unpublished test projection can otherwise be refreshed while
+        /// the next fixture is being activated. No production inventory read is mocked here.
+        func installCarriers() throws {
+            let expected = try XCTUnwrap(carriers)
+            let manager = window.workspaceManager
+            let catalog = manager.workspaces.map { "\($0.id):ephemeral=\($0.isEphemeral)" }
+            var current = try XCTUnwrap(
+                manager.activeWorkspace,
+                "window=\(window.windowID) closing=\(window.isClosing) activeID=\(String(describing: manager.activeWorkspaceID)) established=\(manager.hasEstablishedWorkspaceSelectionForTesting) expected=\(expected.id) catalog=\(catalog)"
+            )
+            XCTAssertEqual(current.id, expected.id, "fixture activation must still own its workspace")
+            guard current.id == expected.id else { throw AgentSessionInventoryReadFailure.incomplete }
+            current.composeTabs = expected.composeTabs
+            current.stashedTabs = expected.stashedTabs
+            current.activeComposeTabID = expected.activeComposeTabID
+            let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == current.id })
+            window.workspaceManager.workspaces[index] = current
+            window.promptManager.loadComposeTabsFromWorkspace(current, syncPromptText: true)
+            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: current.id, activationEpoch: 1)
+            window.agentModeViewModel.test_installSessionIndexSnapshot(
+                indexEntries, owner: owner, latestOwner: owner, activeWorkspace: current
+            )
+        }
+
+        init(window: WindowState, runtime: MCPDomainRuntime, directory: URL) {
+            self.window = window
+            self.runtime = runtime
+            self.directory = directory
+        }
+
+        static func make(activeID: UUID, parentID: UUID?, stashedID: UUID? = nil) async throws -> LoadedWindowFixture {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-loaded-\(UUID())")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            // WindowState() is the legacy/no-runtime composition in these headless tests.
+            // Persistent creation requires an explicitly started app authority; give this
+            // fixture its own bounded storage and lifecycle rather than weakening that guard.
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "inventory-loaded-\(UUID())",
+                storageDirectory: directory.appendingPathComponent("runtime"),
+                workspaceStorageDirectory: directory.appendingPathComponent("Workspaces"),
+                eventDirectory: directory.appendingPathComponent("events"),
+                temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            let window = WindowState(domainRuntime: runtime)
+            let fixture = LoadedWindowFixture(window: window, runtime: runtime, directory: directory)
+            WindowStatesManager.shared.registerWindowState(window)
+            do {
+                await window.workspaceManager.awaitInitialized()
+                let active = ComposeTabState(name: "Loaded", activeAgentSessionID: activeID)
+                let stashed = stashedID.map { ComposeTabState(name: "Stashed", activeAgentSessionID: $0) }
+                // Use a durably published fixture so both windows can resolve its canonical
+                // workspace after activation; no caller-local replacement is treated as truth.
+                let creation = try window.workspaceManager.createPersistentWorkspace(name: "Inventory loaded \(activeID)", repoPaths: [])
+                var workspace = try await creation.publishedWorkspace()
+                workspace.composeTabs = [active]
+                workspace.stashedTabs = stashed.map { [StashedTab(tab: $0)] } ?? []
+                workspace.activeComposeTabID = active.id
+                let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(workspace, reason: "inventoryLoadedTreeTest")
+                XCTAssertEqual(switched, .switched)
+                // Activation reloads the manager's canonical projection; it does not publish
+                // arbitrary fields from the caller's local workspace value. Install carriers
+                // after activation has settled, rather than assuming that value was accepted.
+                var current = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                current.composeTabs = workspace.composeTabs
+                current.stashedTabs = workspace.stashedTabs
+                current.activeComposeTabID = workspace.activeComposeTabID
+                let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == current.id })
+                window.workspaceManager.workspaces[index] = current
+                window.promptManager.loadComposeTabsFromWorkspace(current, syncPromptText: true)
+                XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.map(\.activeAgentSessionID), [activeID])
+                XCTAssertEqual(window.workspaceManager.activeWorkspace?.stashedTabs.count, stashedID == nil ? 0 : 1)
+                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+                let entries = ([active] + (stashed.map { [$0] } ?? [])).map { tab in
+                    var entry = AgentSessionIndexEntry(
+                        id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name, savedAt: Date(),
+                        itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                        isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                    )
+                    entry.lastRunStateRaw = "idle"
+                    entry.parentSessionID = tab.activeAgentSessionID == activeID ? parentID : UUID()
+                    if tab.activeAgentSessionID != activeID { entry.organizationalParentID = activeID }
+                    return entry
+                }
+                fixture.carriers = current
+                fixture.indexEntries = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+                window.agentModeViewModel.test_installSessionIndexSnapshot(
+                    fixture.indexEntries, owner: owner, latestOwner: owner, activeWorkspace: current
+                )
+                return fixture
+            } catch { await fixture.cleanup()
+                throw error
+            }
+        }
+
+        func cleanup() async {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.workspaceManager.debugDrainScheduledSaves()
+            await window.tearDown()
+            let shutdown = await runtime.shutdown()
+            XCTAssertEqual(shutdown.finalLifecycle, .stopped)
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    func testOrdinaryTreeProductionReadAvoidsHistoryAndKeepsCrossWorkspaceLoadedAncestryAndEdges() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let root = UUID()
+            let child = UUID()
+            let stashed = UUID()
+            let first = try await LoadedWindowFixture.make(activeID: root, parentID: nil)
+            var second: LoadedWindowFixture?
+            do {
+                let other = try await LoadedWindowFixture.make(activeID: child, parentID: root, stashedID: stashed)
+                second = other
+                XCTAssertNotEqual(first.window.windowID, other.window.windowID, "headless windows must have distinct registered identities")
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.contains { $0 === first.window })
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.contains { $0 === other.window })
+                XCTAssertFalse(first.window.isClosing)
+                XCTAssertFalse(other.window.isClosing)
+                // Both window activations are now complete; publish the test carriers together.
+                try first.installCarriers()
+                try other.installCarriers()
+                let firstWorkspace = try XCTUnwrap(first.window.workspaceManager.activeWorkspace)
+                let otherWorkspace = try XCTUnwrap(other.window.workspaceManager.activeWorkspace)
+                XCTAssertNotEqual(firstWorkspace.id, otherWorkspace.id)
+                XCTAssertEqual(firstWorkspace.composeTabs.compactMap(\.activeAgentSessionID), [root], "root carrier precondition")
+                XCTAssertEqual(otherWorkspace.composeTabs.compactMap(\.activeAgentSessionID), [child], "cross-workspace child carrier precondition")
+                XCTAssertEqual(otherWorkspace.stashedTabs.compactMap(\.tab.activeAgentSessionID), [stashed], "archived carrier precondition")
+                XCTAssertNotNil(first.window.agentModeViewModel.test_ownerValidatedSessionIndex[root])
+                XCTAssertNotNil(other.window.agentModeViewModel.test_ownerValidatedSessionIndex[child])
+                XCTAssertNotNil(other.window.agentModeViewModel.test_ownerValidatedSessionIndex[stashed])
+                let scanner = Scanner()
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [first.window, other.window] }, links: {
+                    (
+                        [.init(
+                            linkID: UUID(),
+                            generation: 1,
+                            observerSessionID: root,
+                            targetSessionID: child,
+                            displayName: nil,
+                            capabilities: [],
+                            createdAt: Date()
+                        )],
+                        [.init(observerSessionID: child, targetSessionID: stashed)]
+                    )
+                })
+                let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+                let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
+                var filter = DomainAgentSessionInventoryFilter()
+                filter.workspaceID = try XCTUnwrap(other.window.workspaceManager.activeWorkspaceID)
+                let read = AgentSessionInventoryRead.scoped(chain: [scope], filter: filter)
+                XCTAssertTrue(read.loadedOnly)
+                XCTAssertNil(read.workspaceID, "output workspace must not remove the root or cross-workspace endpoints")
+                let snapshot = try await source.snapshot(read: read)
+                let queries = await scanner.capturedQueries()
+                XCTAssertTrue(queries.isEmpty)
+                XCTAssertNotNil(snapshot.records[root], "root record \(root) disappeared despite its current carrier")
+                XCTAssertNotNil(snapshot.records[child], "cross-workspace child record \(child) disappeared")
+                XCTAssertNotNil(snapshot.records[stashed], "archived record \(stashed) disappeared")
+                XCTAssertEqual(Set(snapshot.records.keys), Set([root, child, stashed]))
+                XCTAssertTrue(snapshot.isInTree(child, rootSessionID: root))
+                XCTAssertTrue(snapshot.isInTree(stashed, rootSessionID: root))
+                XCTAssertTrue(snapshot.records[stashed]?.isArchived == true)
+                XCTAssertFalse(snapshot.isComplete)
+                XCTAssertFalse(snapshot.isMissing(UUID()))
+                let view = snapshot.restricted(to: Set(snapshot.records.keys))
+                XCTAssertEqual(view.edges.count, 2, "live and durable same-tree endpoints must survive across workspaces")
+                await other.cleanup()
+                second = nil
+                await first.cleanup()
+            } catch {
+                if let second { await second.cleanup() }
+                await first.cleanup()
+                throw error
+            }
+        }
+    }
+
+    private func directRecord(id: UUID, parent: UUID?, workspace: UUID?) -> AgentSessionMetadataRecord {
+        AgentSessionMetadataRecord(
+            id: id, filename: "AgentSession-\(id.uuidString).json", workspaceID: workspace, composeTabID: nil,
+            name: "Exact member", savedAt: Date(), lastUserMessageAt: nil, itemCount: 0,
+            transcriptProjectionCounts: nil, hasUnknownConversationContent: false,
+            agentKindRaw: nil, agentModelRaw: nil, agentReasoningEffortRaw: nil,
+            lastRunStateRaw: "idle", autoEditEnabled: false, parentSessionID: parent,
+            isMCPOriginated: false, serializationVersion: nil, observedFileSize: nil,
+            observedFileModificationDate: nil, lastIndexedAt: Date()
+        )
+    }
+
+    func testUnloadedTreeGetAndMixedRenameUseExactPersistedAncestryWithoutGlobalScan() async throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let root = UUID(), loaded = UUID(), unloaded = UUID(), ancestor = UUID(), workspace = UUID()
+        let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(root, parent: nil, workspace: workspace)
+        provenance.add(loaded, parent: root, workspace: workspace)
+        let scanner = Scanner()
+        await scanner.setDirectRecords([
+            directRecord(id: unloaded, parent: ancestor, workspace: workspace),
+            directRecord(id: ancestor, parent: root, workspace: workspace)
+        ])
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+            projector: projector, inventory: source, liveBoundSession: { _ in root }
+        )
+        let handler = Handler([.adminGet, .adminRename])
+        frontDoor.register(handler)
+        guard case let .completed(get) = try await frontDoor.perform(.init(
+            operation: .adminGet, caller: .agentSession(root), scopeID: scope.id, targetSessionIDs: [unloaded]
+        )) else { return XCTFail("persisted tree member must have a read-shaped unavailable outcome") }
+        XCTAssertEqual(get.objectValue?["code"], .string("workspace_not_loaded"))
+        XCTAssertNil(get.objectValue?["items"])
+        XCTAssertFalse(handler.performed)
+        guard case let .completed(rename) = try await frontDoor.perform(.init(
+            operation: .adminRename, caller: .agentSession(root), scopeID: scope.id,
+            targetSessionIDs: [loaded, unloaded], arguments: ["name": .string("Renamed")]
+        )) else { return XCTFail("mixed batch must retain the proven loaded member") }
+        XCTAssertTrue(handler.performed)
+        XCTAssertEqual(handler.targets, [loaded])
+        guard case let .array(items)? = rename.objectValue?["items"] else {
+            return XCTFail("mixed mutation must include an unloaded item receipt")
+        }
+        XCTAssertEqual(items.first?.objectValue?["session_id"], .string(unloaded.uuidString))
+        XCTAssertEqual(items.first?.objectValue?["reason"], .string("workspace_not_loaded"))
+        let global = await scanner.capturedQueries()
+        let exact = await scanner.capturedDirectQueries()
+        let budgets = await scanner.capturedBudgets()
+        XCTAssertTrue(global.isEmpty)
+        XCTAssertEqual(Set(exact), Set([unloaded, ancestor, root]))
+        XCTAssertEqual(exact.count, 6)
+        XCTAssertTrue(budgets[0] === budgets[1] && budgets[1] === budgets[2])
+    }
+
+    func testColdRealScannerUnloadedTreeGetAndMixedRenameReadOnlyTheExactWorkspaceIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-cold-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = UUID(), loaded = UUID(), unloaded = UUID(), ancestor = UUID(), workspace = UUID()
+        let selected = directory.appendingPathComponent("Workspaces/Workspace-\(workspace.uuidString)")
+        let unrelated = directory.appendingPathComponent("Workspaces/Workspace-\(UUID().uuidString)")
+        let records = [
+            directRecord(id: unloaded, parent: ancestor, workspace: workspace),
+            directRecord(id: ancestor, parent: root, workspace: workspace)
+        ]
+        for location in [selected, unrelated] {
+            let sessions = location.appendingPathComponent("AgentSessions")
+            try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+            let entries = location == selected ? records : [directRecord(id: UUID(), parent: nil, workspace: UUID())]
+            try JSONEncoder().encode(AgentSessionMetadataIndex(entries: entries))
+                .write(to: sessions.appendingPathComponent("AgentSessionIndex.json"))
+            for entry in entries {
+                try JSONEncoder().encode(AgentSession(id: entry.id, name: entry.name))
+                    .write(to: sessions.appendingPathComponent(entry.filename))
+            }
+            try Data("{\"id\":\"\(workspace.uuidString)\",\"name\":\"Cold workspace\"}".utf8)
+                .write(to: location.appendingPathComponent("workspace.json"))
+        }
+        for operation in [DomainAgentSessionTargetOperation.adminGet, .adminRename] {
+            // A fresh scanner for each operation: neither receipt may depend on a warm global cache.
+            let scanner = HistorySessionScanner(
+                applicationSupportRoot: directory, workspaceDirectoryProvider: { _ in [selected, unrelated] }
+            )
+            let initialEntries = await scanner.indexScanCacheEntryCountForTesting
+            XCTAssertEqual(initialEntries, 0)
+            let cold = try await scanner.locateSession(sessionID: unloaded, requestBudget: .standalone())
+            XCTAssertEqual(cold.location?.workspaceDir, selected)
+            XCTAssertNil(cold.location?.record, "real cold lookup intentionally has location but no cached metadata")
+            let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+            let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
+            let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+            provenance.add(root, parent: nil, workspace: workspace)
+            provenance.add(loaded, parent: root, workspace: workspace)
+            let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+            let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+            let frontDoor = AgentSessionAdministrationFrontDoor(
+                core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+                projector: projector, inventory: source, liveBoundSession: { _ in root }
+            )
+            let handler = Handler([operation])
+            frontDoor.register(handler)
+            guard case let .completed(value) = try await frontDoor.perform(.init(
+                operation: operation, caller: .agentSession(root), scopeID: scope.id,
+                targetSessionIDs: operation == .adminGet ? [unloaded] : [loaded, unloaded],
+                arguments: operation == .adminGet ? [:] : ["name": .string("Renamed")]
+            )) else { return XCTFail("cold persisted ancestry must prove the unloaded tree member") }
+            if operation == .adminGet {
+                XCTAssertEqual(value.objectValue?["code"], .string("workspace_not_loaded"))
+                XCTAssertNil(value.objectValue?["items"])
+                XCTAssertFalse(handler.performed)
+            } else {
+                XCTAssertEqual(handler.targets, [loaded])
+                guard case let .array(items)? = value.objectValue?["items"] else { return XCTFail("missing unloaded receipt") }
+                XCTAssertEqual(items.first?.objectValue?["session_id"], .string(unloaded.uuidString))
+                XCTAssertEqual(items.first?.objectValue?["reason"], .string("workspace_not_loaded"))
+            }
+            let decoded = await scanner.indexDecodeCountForTesting
+            let inspected = await scanner.workspaceInspectionCountForTesting
+            let transcripts = await scanner.transcriptDecodeCountForTesting
+            XCTAssertEqual(decoded, 1, "unrelated current-schema index must not be decoded")
+            XCTAssertEqual(inspected, 1, "exact metadata fallback must not perform a global inventory")
+            XCTAssertEqual(transcripts, 0, "provenance needs only the bounded index, not transcript hydration")
+        }
+    }
+
+    func testColdAndWarmRealWorkspaceScopeResolveLegacyRecordWorkspaceFromExactIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-legacy-workspace-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let caller = UUID(), target = UUID(), workspace = UUID()
+        let selected = directory.appendingPathComponent("Workspaces/Workspace-\(workspace.uuidString)")
+        let sessions = selected.appendingPathComponent("AgentSessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let record = directRecord(id: target, parent: nil, workspace: nil)
+        try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [record]))
+            .write(to: sessions.appendingPathComponent("AgentSessionIndex.json"))
+        try JSONEncoder().encode(AgentSession(id: target, name: record.name))
+            .write(to: sessions.appendingPathComponent(record.filename))
+        try Data("{\"id\":\"\(workspace.uuidString)\",\"name\":\"Legacy placement\"}".utf8)
+            .write(to: selected.appendingPathComponent("workspace.json"))
+        for warm in [false, true] {
+            let scanner = HistorySessionScanner(applicationSupportRoot: directory, workspaceDirectoryProvider: { _ in [selected] })
+            if warm {
+                _ = try await scanner.scanWorkspaces(matching: selected.lastPathComponent, requestBudget: .standalone())
+                let lookup = try await scanner.locateSession(sessionID: target, requestBudget: .standalone())
+                XCTAssertNotNil(lookup.location?.record)
+                XCTAssertNil(lookup.location?.record?.workspaceID, "warm legacy records still need scanner-owned placement")
+            }
+            let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+            let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
+            let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+            provenance.add(caller, parent: nil, workspace: workspace)
+            let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+            let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+            let frontDoor = AgentSessionAdministrationFrontDoor(
+                core: AgentSessionAdministrationCore(scopes: runtime, projector: projector), scopes: runtime,
+                projector: projector, inventory: source, liveBoundSession: { _ in caller }
+            )
+            let handler = Handler([.adminGet])
+            frontDoor.register(handler)
+            guard case let .completed(value) = try await frontDoor.perform(.init(
+                operation: .adminGet, caller: .agentSession(caller), scopeID: scope.id, targetSessionIDs: [target]
+            )) else { return XCTFail("scanner-owned exact workspace must prove legacy placement, warm=\(warm)") }
+            XCTAssertEqual(value.objectValue?["code"], .string("workspace_not_loaded"))
+            XCTAssertFalse(handler.performed)
+            let decoded = await scanner.indexDecodeCountForTesting
+            let hydrated = await scanner.transcriptDecodeCountForTesting
+            XCTAssertEqual(decoded, 1)
+            XCTAssertEqual(hydrated, 0)
+        }
+    }
+
+    func testExactAncestryProbePropagatesCancellation() async throws {
+        let scanner = Scanner()
+        await scanner.setCancellation()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        do {
+            _ = try await source.snapshot(read: .init(loadedOnly: true, historyTargetIDs: [UUID()]))
+            XCTFail("exact provenance cancellation cannot become a missing target")
+        } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+        let global = await scanner.capturedQueries()
+        XCTAssertTrue(global.isEmpty)
+    }
+
+    func testOrdinaryInventoryDoesNotTrustSidebarRowsCachedBeforeIndexOwnerInvalidation() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let target = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: target, parentID: nil)
+            do {
+                let window = fixture.window
+                var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                var tab = try XCTUnwrap(workspace.composeTabs.first)
+                tab.activeAgentSessionID = nil
+                workspace.composeTabs = [tab]
+                let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                window.workspaceManager.workspaces[index] = workspace
+                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                let vm = window.agentModeViewModel
+                let oldOwner = try XCTUnwrap(vm.sessionIndexStore.sessionIndexOwner)
+                let primed = vm.sidebarSessions(for: workspace.composeTabs)
+                XCTAssertTrue(primed.contains { $0.sessionID == target }, "fixture must prime the indexed sidebar row")
+                vm.sessionIndexStore.test_installOwnerState(
+                    owner: oldOwner,
+                    latestOwner: .init(workspaceID: workspace.id, activationEpoch: oldOwner.activationEpoch + 1)
+                )
+                XCTAssertTrue(vm.test_ownerValidatedSessionIndex.isEmpty)
+                let cached = vm.sidebarSessions(for: workspace.composeTabs)
+                XCTAssertTrue(cached.contains { $0.sessionID == target }, "owner invalidation alone does not change the UI cache key")
+                let scanner = Scanner()
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })
+                let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
+                XCTAssertNil(snapshot.records[target], "cached sidebar identity cannot override absent physical binding and stale index ownership")
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testStaleIndexOwnerCannotSupplyExactOrArchivedFallbackOrPlacementMetadata() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let explicit = UUID(), indexedOnly = UUID(), parent = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: explicit, parentID: parent, stashedID: indexedOnly)
+            do {
+                let window = fixture.window
+                var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                let entries = window.agentModeViewModel.sessionIndex
+                XCTAssertNotNil(entries[indexedOnly], "fixture must contain the stale reverse-index candidate")
+                // Remove the archived tab's explicit binding: only the stale reverse index can name it.
+                var archived = try XCTUnwrap(workspace.stashedTabs.first, "fixture must really contain an archived carrier")
+                archived.tab.activeAgentSessionID = nil
+                workspace.stashedTabs = [archived]
+                let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                window.workspaceManager.workspaces[index] = workspace
+                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                let current = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                let vm = window.agentModeViewModel
+                let stale = AgentModeViewModel.SessionIndexOwner(workspaceID: current.id, activationEpoch: 1)
+                let latest = AgentModeViewModel.SessionIndexOwner(workspaceID: current.id, activationEpoch: 2)
+                vm.test_installSessionIndexSnapshot(entries, owner: stale, latestOwner: latest, activeWorkspace: current)
+                let scanner = Scanner()
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })
+                let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: [explicit, indexedOnly]))
+                XCTAssertNotNil(exact.records[explicit], "genuine explicit tab bindings survive a stale metadata index")
+                XCTAssertNil(exact.records[indexedOnly], "stale index cannot invent an exact tab binding")
+                XCTAssertNil(exact.records[explicit]?.parentSessionID)
+                XCTAssertNil(exact.records[explicit]?.organizationalParentID)
+                XCTAssertFalse(exact.isInTree(explicit, rootSessionID: parent))
+                let census = try await source.snapshot(read: .init(loadedOnly: true))
+                XCTAssertNil(census.records[indexedOnly], "stale reverse index cannot name archived rows")
+                XCTAssertNil(census.records[explicit]?.parentSessionID)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testOrdinaryTreeIsBoundedPartialButAbsenceAndEdgePredicatesRequireGlobalHistory() throws {
+        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let tree = try grant(runtime: runtime, caller: caller, kind: .tree(rootSessionID: caller))
+        var filter = DomainAgentSessionInventoryFilter()
+        filter.workspaceID = UUID()
+        filter.loaded = true
+        let treeRead = AgentSessionInventoryRead.scoped(chain: [tree], filter: filter)
+        XCTAssertNil(treeRead.workspaceID)
+        XCTAssertTrue(treeRead.loadedOnly)
+        var orphan = filter
+        orphan.orphaned = true
+        var links = filter
+        links.hasLinks = false
+        var role = filter
+        role.role = .overseer
+        for requiringCensus in [orphan, links, role] {
+            let read = AgentSessionInventoryRead.scoped(chain: [tree], filter: requiringCensus)
+            XCTAssertNil(read.workspaceID)
+            XCTAssertFalse(read.loadedOnly)
+        }
+    }
+}
+
+// MARK: - SessionAdminProductionOrganizerJourneyTests regressions
+
+/// Exercises the app's real organizing registration, workspace mutations and sidebar projection.
+/// Run only through dev-test's disposable HOME/TMPDIR harness; no provider or visible window opens.
+@MainActor
+final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
+    func testRenamePinGroupAndUndoReachWorkspaceAndSidebarWithoutChangingSelection() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make()
+            do {
+                let rename = try await fixture.call("rename", ["name": .string("Organized lane")])
+                try fixture.assertTarget(name: "Organized lane", pinned: false, group: nil)
+                XCTAssertEqual(rename["result"], .string("applied"))
+                let pin = try await fixture.call("set_pin", ["pinned": .bool(true)])
+                let group = try await fixture.call("set_group", ["group": .string("Review")])
+                try fixture.assertTarget(name: "Organized lane", pinned: true, group: "Review")
+
+                // The actual workspace persistence payload must carry the same metadata, not just
+                // a successful handler reply or an independently updated sidebar mock.
+                let url = fixture.directory.appendingPathComponent("workspace.json")
+                try JSONEncoder().encode(fixture.workspace()).write(to: url)
+                let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+                let savedTab = try XCTUnwrap(saved.composeTabs.first { $0.id == fixture.targetTab.id })
+                XCTAssertEqual(savedTab.name, "Organized lane")
+                XCTAssertTrue(savedTab.isPinned)
+                XCTAssertEqual(savedTab.sidebarGroup, "Review")
+
+                _ = try await fixture.undo(group)
+                _ = try await fixture.undo(pin)
+                _ = try await fixture.undo(rename)
+                try fixture.assertTarget(name: "Target", pinned: false, group: nil)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testRenameUndoPreservesLaterSidebarEditInsteadOfClobberingIt() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make()
+            do {
+                let rename = try await fixture.call("rename", ["name": .string("Agent title")])
+                fixture.window.agentModeViewModel.renameSession(tabID: fixture.targetTab.id, to: "User title")
+                let undo = try await fixture.undo(rename)
+                let item = try XCTUnwrap(undo["items"]?.arrayValue?.first?.objectValue)
+                XCTAssertEqual(item["status"], .string("skipped"))
+                XCTAssertEqual(item["reason"], .string("changed_since"))
+                XCTAssertEqual(undo["changed_count"], .int(0))
+                XCTAssertEqual(undo["result"], .string("not_undone"))
+                try fixture.assertTarget(name: "User title", pinned: false, group: nil)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testRenameOnlyAndRenameThenPinSurviveRealPersistenceReloadAndUndo() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for selectedTarget in [false, true] {
+                for pinAfterRename in [false, true] {
+                    let fixture = try await Fixture.make(ephemeral: false)
+                    do {
+                        let targetSession = fixture.window.agentModeViewModel.session(for: fixture.targetTab.id)
+                        targetSession.hasLoadedPersistedState = true
+                        _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
+                            sessionID: fixture.targetTab.activeAgentSessionID, on: targetSession, updateWorkspaceMetadata: true
+                        ))
+                        var independent = ComposeTabState(name: "Independent user lane")
+                        independent.promptText = "Unrelated user payload"
+                        independent.isPinned = true
+                        independent.sidebarGroup = "User group"
+                        independent.sidebarGroupOrder = 7
+                        let manager = fixture.window.workspaceManager
+                        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+                        manager.workspaces[index].composeTabs.append(independent)
+                        try fixture.window.promptManager.loadComposeTabsFromWorkspace(fixture.workspace())
+                        if selectedTarget { await fixture.window.promptManager.switchComposeTab(fixture.targetTab.id) }
+                        let selectedID = selectedTarget ? fixture.targetTab.id : fixture.callerTab.id
+                        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selectedID)
+                        let title = "Sequence renamed target"
+                        let rename = try await fixture.call("rename", ["name": .string(title)])
+                        XCTAssertEqual(rename["changed_count"], .int(1))
+                        try fixture.assertTarget(name: title, pinned: false, group: nil, selectedTabID: selectedID)
+                        // No sleep or save drain between the two commands: exercise the immediate
+                        // rename→pin sequence before settling the actual workspace writer.
+                        let pin = pinAfterRename ? try await fixture.call("set_pin", ["pinned": .bool(true)]) : nil
+                        if let pin { XCTAssertEqual(pin["changed_count"], .int(1)) }
+                        try fixture.assertTarget(name: title, pinned: pinAfterRename, group: nil, selectedTabID: selectedID)
+                        // Read only after the immediate pair, so this does not hide a write race
+                        // by inserting an inventory await between rename and pin.
+                        try await fixture.assertReadTarget(name: title, pinned: pinAfterRename)
+                        await manager.debugDrainScheduledSaves()
+                        let persistence = await manager.pollAndSaveStateWithOutcomeAsync()
+                        if case .rejected = persistence {
+                            XCTFail("The persistent sequence must not reject its save, got \(persistence)")
+                            await fixture.cleanup()
+                            continue
+                        }
+                        // notRequired is legitimate after the queued save already committed. The
+                        // attempt counter and decoded real file below prove this was not merely an
+                        // ephemeral/manual JSON roundtrip.
+                        XCTAssertGreaterThan(manager.workspaceSaveDiagnosticsForTesting(workspaceID: fixture.workspaceID).attemptCount, 0)
+                        let url = try manager.workspaceFileURL(for: fixture.workspace())
+                        let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+                        let savedTarget = try XCTUnwrap(saved.composeTabs.first { $0.id == fixture.targetTab.id })
+                        XCTAssertEqual(savedTarget.name, title)
+                        XCTAssertEqual(savedTarget.isPinned, pinAfterRename)
+                        XCTAssertEqual(saved.composeTabs.first { $0.id == independent.id }, independent)
+                        let currentIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == saved.id })
+                        manager.workspaces[currentIndex] = saved
+                        fixture.window.promptManager.loadComposeTabsFromWorkspace(saved, syncPromptText: true)
+                        try fixture.assertTarget(name: title, pinned: pinAfterRename, group: nil, selectedTabID: selectedID)
+                        try await fixture.assertReadTarget(name: title, pinned: pinAfterRename)
+                        if let pin {
+                            let undoPin = try await fixture.undo(pin)
+                            XCTAssertEqual(undoPin["changed_count"], .int(1))
+                            try fixture.assertTarget(name: title, pinned: false, group: nil, selectedTabID: selectedID)
+                            try await fixture.assertReadTarget(name: title, pinned: false)
+                        }
+                        let undoRename = try await fixture.undo(rename)
+                        XCTAssertEqual(undoRename["result"], .string("undone"))
+                        XCTAssertEqual(undoRename["changed_count"], .int(1))
+                        try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: selectedID)
+                        try await fixture.assertReadTarget(name: "Target", pinned: false)
+                        // A rendered row is insufficient: selecting the real runtime target and
+                        // switching back must not republish the title/pin that was just undone.
+                        await fixture.window.promptManager.switchComposeTab(fixture.targetTab.id)
+                        try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: fixture.targetTab.id)
+                        try await fixture.assertReadTarget(name: "Target", pinned: false)
+                        if selectedID != fixture.targetTab.id {
+                            await fixture.window.promptManager.switchComposeTab(selectedID)
+                            try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: selectedID)
+                            try await fixture.assertReadTarget(name: "Target", pinned: false)
+                        }
+                        XCTAssertEqual(try fixture.workspace().composeTabs.first { $0.id == independent.id }, independent)
+                        await manager.debugDrainScheduledSaves()
+                        let final = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+                        XCTAssertEqual(final.composeTabs.first { $0.id == fixture.targetTab.id }?.name, "Target")
+                        XCTAssertEqual(final.composeTabs.first { $0.id == independent.id }, independent)
+                        await fixture.cleanup()
+                    } catch {
+                        await fixture.cleanup()
+                        throw error
+                    }
+                }
+            }
+        }
+    }
+
+    func testArchiveUndoRestoresSidebarCarrierWithoutSelectingTheTarget() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make()
+            do {
+                let archived = try await fixture.call("archive", [:])
+                let workspace = try fixture.workspace()
+                XCTAssertFalse(workspace.composeTabs.contains { $0.id == fixture.targetTab.id })
+                XCTAssertEqual(workspace.stashedTabs.map(\.tab.id), [fixture.targetTab.id])
+                XCTAssertFalse(
+                    fixture.window.agentModeViewModel.sidebarSessions(for: fixture.window.promptManager.currentComposeTabs)
+                        .contains { $0.sessionID == fixture.targetTab.activeAgentSessionID }
+                )
+                XCTAssertEqual(workspace.activeComposeTabID, fixture.callerTab.id)
+                try await fixture.assertReadTarget(name: "Target", pinned: false, archived: true)
+                _ = try await fixture.undo(archived)
+                XCTAssertTrue(try fixture.workspace().stashedTabs.isEmpty)
+                try fixture.assertTarget(name: "Target", pinned: false, group: nil)
+                try await fixture.assertReadTarget(name: "Target", pinned: false)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testGroupAndUnarchiveOnAnotherTabPreserveAndCaptureTheActiveUserDraft() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for op in ["set_group", "unarchive"] {
+                let fixture = try await Fixture.make()
+                var listenerID: UUID?
+                var flushObserver: NSObjectProtocol?
+                do {
+                    if op == "unarchive" { _ = try await fixture.call("archive", [:]) }
+                    let old = try XCTUnwrap(fixture.workspace().composeTabs.first { $0.id == fixture.callerTab.id })
+                    let draft = "Unsaved user draft during \(op)"
+                    fixture.window.promptManager.promptText = draft
+                    fixture.window.promptManager.testSetDirtyTabIDs([fixture.callerTab.id])
+                    XCTAssertNotEqual(old.promptText, draft)
+                    let evidence = DraftCaptureEvidence()
+                    // Both are synchronous pre-capture boundaries. A direct UI flush may capture
+                    // the draft before a later save clears dirty state; neither path may erase it.
+                    flushObserver = NotificationCenter.default.addObserver(
+                        forName: .willSwitchComposeTab, object: nil, queue: nil
+                    ) { notification in
+                        MainActor.assumeIsolated {
+                            guard notification.userInfo?["windowID"] as? Int == fixture.window.windowID else { return }
+                            if fixture.window.promptManager.promptText == draft,
+                               fixture.window.promptManager.isTabDirty(fixture.callerTab),
+                               fixture.window.promptManager.activeComposeTabID == fixture.callerTab.id
+                            {
+                                evidence.observedDirtyDraftBeforeCapture = true
+                            }
+                        }
+                    }
+                    listenerID = fixture.window.workspaceManager.addBeforeSaveListener { workspace in
+                        guard workspace.id == fixture.workspaceID else { return }
+                        if fixture.window.promptManager.promptText == draft,
+                           fixture.window.promptManager.isTabDirty(fixture.callerTab),
+                           fixture.window.promptManager.activeComposeTabID == fixture.callerTab.id
+                        {
+                            evidence.observedDirtyDraftBeforeCapture = true
+                        }
+                    }
+                    fixture.beforeCallerResolution = {
+                        XCTAssertEqual(
+                            fixture.window.promptManager.promptText,
+                            draft,
+                            "The live draft must reach the command entry before any organizer mutation"
+                        )
+                        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                    }
+                    _ = try await fixture.call(op, op == "set_group" ? ["group": .string("Draft-safe")] : [:])
+                    XCTAssertTrue(evidence.observedDirtyDraftBeforeCapture, "\(op) must not erase dirty state before editor/save capture")
+                    XCTAssertEqual(fixture.window.promptManager.promptText, draft, op)
+                    let workspace = try fixture.workspace()
+                    XCTAssertEqual(workspace.activeComposeTabID, fixture.callerTab.id, op)
+                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id, op)
+                    XCTAssertEqual(workspace.composeTabs.first { $0.id == fixture.callerTab.id }?.promptText, draft, op)
+                    let encoded = try JSONEncoder().encode(workspace)
+                    let saved = try JSONDecoder().decode(WorkspaceModel.self, from: encoded)
+                    XCTAssertEqual(saved.composeTabs.first { $0.id == fixture.callerTab.id }?.promptText, draft, op)
+                    // A subsequent normal dirty-state update may clear the flag once the draft has
+                    // been captured. Its earlier preservation, not perpetual dirtiness, is required.
+                    if let listenerID { fixture.window.workspaceManager.removeBeforeSaveListener(listenerID) }
+                    if let flushObserver { NotificationCenter.default.removeObserver(flushObserver) }
+                    await fixture.cleanup()
+                } catch {
+                    if let listenerID { fixture.window.workspaceManager.removeBeforeSaveListener(listenerID) }
+                    if let flushObserver { NotificationCenter.default.removeObserver(flushObserver) }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private final class DraftCaptureEvidence {
+        var observedDirtyDraftBeforeCapture = false
+    }
+
+    @MainActor
+    private final class Fixture {
+        let window: WindowState
+        let directory: URL
+        let callerTab = ComposeTabState(name: "Overseer", activeAgentSessionID: UUID())
+        let targetTab = ComposeTabState(name: "Target", activeAgentSessionID: UUID())
+        let scopes = DelegationScopeRuntime()
+        let ownership = WorktreeOwnershipStore()
+        var workspaceID: UUID!
+        var frontDoor: AgentSessionAdministrationFrontDoor!
+        var beforeCallerResolution: (@MainActor () -> Void)?
+
+        private init(window: WindowState, directory: URL) {
+            self.window = window
+            self.directory = directory
+        }
+
+        static func make(ephemeral: Bool = true) async throws -> Fixture {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("session-admin-production-\(UUID())", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let window = WindowState()
+            let fixture = Fixture(window: window, directory: directory)
+            WindowStatesManager.shared.registerWindowState(window)
+            do {
+                await window.workspaceManager.awaitInitialized()
+                var workspace = window.workspaceManager.createWorkspace(
+                    name: "Organizer journey", repoPaths: [], ephemeral: ephemeral
+                )
+                workspace.customStoragePath = directory
+                workspace.composeTabs = [fixture.callerTab, fixture.targetTab]
+                workspace.activeComposeTabID = fixture.callerTab.id
+                fixture.workspaceID = workspace.id
+                let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+                    workspace, reason: "sessionAdminProductionJourney"
+                )
+                XCTAssertEqual(switched, .switched)
+                // Activation resolves the manager's canonical workspace, not every field of the
+                // caller's local replacement. Install the actual carriers only after it settles.
+                var current = try fixture.workspace()
+                XCTAssertEqual(current.id, workspace.id)
+                current.customStoragePath = directory
+                current.composeTabs = [fixture.callerTab, fixture.targetTab]
+                current.stashedTabs = []
+                current.activeComposeTabID = fixture.callerTab.id
+                let position = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == current.id })
+                window.workspaceManager.workspaces[position] = current
+                let installed = try fixture.workspace()
+                XCTAssertEqual(installed.composeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
+                XCTAssertEqual(
+                    installed.composeTabs.map(\.activeAgentSessionID),
+                    [fixture.callerTab.activeAgentSessionID, fixture.targetTab.activeAgentSessionID]
+                )
+                XCTAssertTrue(installed.stashedTabs.isEmpty)
+                XCTAssertEqual(installed.activeComposeTabID, fixture.callerTab.id)
+                window.promptManager.loadComposeTabsFromWorkspace(installed, syncPromptText: true)
+                XCTAssertEqual(window.promptManager.currentComposeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
+                XCTAssertEqual(window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+                let entries = [fixture.callerTab, fixture.targetTab].map { tab in
+                    AgentSessionIndexEntry(
+                        id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name,
+                        savedAt: Date(timeIntervalSince1970: 0), itemCount: 0, autoEditEnabled: false,
+                        hasUnknownConversationContent: false, isMCPOriginated: false,
+                        worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                    )
+                }
+                try window.agentModeViewModel.test_installSessionIndexSnapshot(
+                    Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
+                    owner: owner, latestOwner: owner, activeWorkspace: fixture.workspace()
+                )
+                let caller = window.agentModeViewModel.session(for: fixture.callerTab.id)
+                caller.hasLoadedPersistedState = true
+                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                    sessionID: fixture.callerTab.activeAgentSessionID, on: caller, updateWorkspaceMetadata: true
+                ))
+                _ = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: fixture.callerTab.id)
+                let ready = try fixture.workspace()
+                for expected in [fixture.callerTab, fixture.targetTab] {
+                    let carrier = try XCTUnwrap(ready.composeTabs.first { $0.id == expected.id })
+                    XCTAssertEqual(carrier.activeAgentSessionID, expected.activeAgentSessionID)
+                }
+                XCTAssertEqual(ready.activeComposeTabID, fixture.callerTab.id)
+                XCTAssertEqual(
+                    window.agentModeViewModel.explicitActiveSessionID(for: fixture.callerTab.id),
+                    fixture.callerTab.activeAgentSessionID
+                )
+                let core = AgentSessionAdministrationCore.makeProduction(scopes: fixture.scopes, worktreeOwnership: fixture.ownership)
+                fixture.frontDoor = AgentSessionAdministrationFrontDoor.production(core: core, scopes: fixture.scopes)
+                let requested = try fixture.scopes.requestScope(
+                    requesterSessionID: fixture.callerTab.activeAgentSessionID!, requesterTabID: fixture.callerTab.id,
+                    kind: .workspace(workspaceID: workspace.id), capabilities: [.observe, .organize],
+                    guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                _ = try fixture.scopes.approve(requestID: requested.id).get()
+                return fixture
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+
+        func workspace() throws -> WorkspaceModel {
+            try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        }
+
+        func call(_ op: String, _ fields: [String: Value]) async throws -> [String: Value] {
+            let service = SessionAdminMCPToolService(
+                captureRequestMetadata: {
+                    self.beforeCallerResolution?()
+                    return .init(connectionID: UUID(), clientName: "organizer-journey", windowID: self.window.windowID)
+                },
+                requireTargetWindow: { self.window },
+                resolveObserverEndpoint: { _, _ in
+                    self.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: self.callerTab.id)
+                },
+                scopes: { self.scopes }, administration: { self.frontDoor }, isToolEnabled: { true }
+            )
+            var arguments = fields
+            arguments["op"] = .string(op)
+            if op != "undo", op != "inventory" { arguments["session_id"] = .string(targetTab.activeAgentSessionID!.uuidString) }
+            let reply = try await service.execute(args: arguments)
+            return try XCTUnwrap(reply.objectValue)
+        }
+
+        func assertReadTarget(name: String, pinned: Bool, archived: Bool = false) async throws {
+            let get = try await call("get", [:])
+            XCTAssertEqual(get["result"], .string("ok"))
+            let exact = try XCTUnwrap(get["session"]?.objectValue)
+            let inventory = try await call("inventory", ["limit": .int(500)])
+            XCTAssertEqual(inventory["result"], .string("ok"))
+            let listed = try XCTUnwrap(inventory["sessions"]?.arrayValue?.compactMap(\.objectValue).first {
+                $0["session_id"] == .string(targetTab.activeAgentSessionID!.uuidString)
+            })
+            for row in [exact, listed] {
+                XCTAssertEqual(row["name"], .string(name))
+                XCTAssertEqual(row["pinned"], .bool(pinned))
+                XCTAssertEqual(row["archived"], .bool(archived))
+                XCTAssertEqual(row["loaded"], .bool(true))
+                XCTAssertEqual(row["workspace_id"], .string(workspaceID.uuidString))
+            }
+        }
+
+        func undo(_ reply: [String: Value]) async throws -> [String: Value] {
+            let token = try XCTUnwrap(reply["undo_token"]?.stringValue)
+            return try await call("undo", ["undo_token": .string(token)])
+        }
+
+        func assertTarget(name: String, pinned: Bool, group: String?, selectedTabID: UUID? = nil) throws {
+            let workspace = try workspace()
+            let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == targetTab.id })
+            let row = try XCTUnwrap(
+                window.agentModeViewModel.sidebarSessions(for: window.promptManager.currentComposeTabs)
+                    .first { $0.sessionID == targetTab.activeAgentSessionID }
+            )
+            let projectedTab = try XCTUnwrap(window.promptManager.currentComposeTabs.first { $0.id == targetTab.id })
+            let indexed = try XCTUnwrap(window.agentModeViewModel.ownerValidatedSessionIndex[targetTab.activeAgentSessionID!])
+            XCTAssertEqual(tab.name, name)
+            XCTAssertEqual(projectedTab.name, name)
+            XCTAssertEqual(indexed.name, name)
+            XCTAssertEqual(indexed.tabID, targetTab.id)
+            XCTAssertEqual(row.title, name)
+            XCTAssertEqual(tab.isPinned, pinned)
+            XCTAssertEqual(projectedTab.isPinned, pinned)
+            XCTAssertEqual(projectedTab.activeAgentSessionID, targetTab.activeAgentSessionID)
+            XCTAssertEqual(row.isPinned, pinned)
+            XCTAssertEqual(tab.sidebarGroup, group)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(workspace.activeComposeTabID, selectedTabID ?? callerTab.id)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, selectedTabID ?? callerTab.id)
+        }
+
+        func cleanup() async {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+}

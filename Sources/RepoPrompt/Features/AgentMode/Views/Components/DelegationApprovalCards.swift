@@ -16,13 +16,15 @@ import SwiftUI
 /// tab is still bound to that session, and a session change cancels the request so it can never be
 /// approved on behalf of whatever session the tab shows next.
 struct DelegationApprovalSlot: View {
+    let windowID: Int
     let tabID: UUID?
     /// The tab's currently bound Agent session.
     let sessionID: UUID?
     @ObservedObject var runtime: DelegationScopeRuntime
     @ObservedObject var confirmations: BatchConfirmationCoordinator
 
-    init(tabID: UUID?, sessionID: UUID?, runtime: DelegationScopeRuntime) {
+    init(windowID: Int, tabID: UUID?, sessionID: UUID?, runtime: DelegationScopeRuntime) {
+        self.windowID = windowID
         self.tabID = tabID
         self.sessionID = sessionID
         self.runtime = runtime
@@ -54,7 +56,11 @@ struct DelegationApprovalSlot: View {
                         onApprove: { capabilities, threshold in
                             var guardrails = request.guardrails
                             guardrails.bulkConfirmationThreshold = threshold
-                            _ = runtime.approve(requestID: request.id, capabilities: capabilities, guardrails: guardrails)
+                            _ = runtime.approve(
+                                requestID: request.id, presentedWindowID: windowID,
+                                presentedTabID: tabID, presentedSessionID: request.requesterSessionID,
+                                capabilities: capabilities, guardrails: guardrails
+                            )
                         },
                         onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") }
                     )

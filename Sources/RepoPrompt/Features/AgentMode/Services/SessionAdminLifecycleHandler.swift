@@ -86,7 +86,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
+            guard !authorityLost, context.isStillAuthorized(lease, scope: batch.scope) else {
                 authorityLost = true
                 items.append(.revoked(target))
                 continue
@@ -95,8 +95,8 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
                 items.append(SessionAdminItemResult(sessionID: target, result: "would_apply"))
                 continue
             }
-            let scopes = context.scopes
-            let outcome = await effect(target) { scopes.isCurrent(lease) }
+            let context = context
+            let outcome = await effect(target) { context.isStillAuthorized(lease, scope: batch.scope) }
             switch outcome {
             case let .applied(changed, fields):
                 items.append(SessionAdminItemResult(

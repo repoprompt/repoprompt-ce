@@ -1,8 +1,52 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
+    @MainActor
+    func testNativeSDKToolInputApprovalRoundTripPreservesMCPTypesAndStrictInventoryLimits() throws {
+        let cases: [(literal: String, value: Value, acceptedLimit: Int?)] = [
+            ("0", .int(0), nil), ("1", .int(1), 1), ("2", .int(2), 2),
+            ("500", .int(500), 500), ("501", .int(501), nil),
+            ("1.5", .double(1.5), nil), ("true", .bool(true), nil), ("false", .bool(false), nil)
+        ]
+        let nested: Value = .object([
+            "values": .array([.int(0), .int(1), .int(2), .int(500), .int(501), .double(1.5), .bool(true), .bool(false)])
+        ])
+        for (literal, expected, acceptedLimit) in cases {
+            let line = Data("{\"type\":\"control_request\",\"request_id\":\"numeric-input\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"mcp__RepoPrompt__session_admin\",\"input\":{\"op\":\"inventory\",\"limit\":\(literal),\"nested\":{\"values\":[0,1,2,500,501,1.5,true,false]}}}}".utf8)
+            guard case let .controlRequest(request)? = try ClaudeSDKProtocolCodec.decodeLine(line) else {
+                return XCTFail("Expected production SDK control request")
+            }
+            XCTAssertEqual(request.subtype, "can_use_tool")
+            let allow = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
+                pendingRequest: request.request, includeUpdatedPermissions: false
+            )
+            let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(requestID: request.requestID, response: allow)
+            guard case let .controlResponse(response)? = try ClaudeSDKProtocolCodec.decodeLine(encoded) else {
+                return XCTFail("Expected production SDK allow response")
+            }
+            let updatedInput = try XCTUnwrap(response.response?["updatedInput"] as? [String: Any])
+            // The SDK reuses updatedInput for the subsequent tools/call. Decode those actual
+            // parameter bytes with the MCP SDK, rather than hand-constructing Value.int(1).
+            let parameterBytes = try JSONSerialization.data(withJSONObject: ["name": "session_admin", "arguments": updatedInput])
+            let parameters = try JSONDecoder().decode(CallTool.Parameters.self, from: parameterBytes)
+            let arguments = try XCTUnwrap(parameters.arguments)
+            XCTAssertEqual(arguments["limit"], expected, "literal=\(literal)")
+            XCTAssertEqual(arguments["nested"], nested, "nested tool arguments must retain exact JSON types")
+            if let acceptedLimit {
+                XCTAssertEqual(try AgentSessionAdminArguments.limit(arguments), acceptedLimit)
+            } else {
+                XCTAssertThrowsError(try AgentSessionAdminArguments.limit(arguments)) { error in
+                    guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
+                        return XCTFail("Expected strict invalidParams, got \(error)")
+                    }
+                }
+            }
+        }
+    }
+
     func testClaudeCodeCatalogExposesOpus55AcrossAgentSelection() {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,

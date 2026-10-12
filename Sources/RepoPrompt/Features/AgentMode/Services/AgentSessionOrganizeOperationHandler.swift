@@ -584,7 +584,9 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             extra: ["undone_op": .string(entry.operation.adminOperationName)]
         )
         if case var .object(object) = value {
-            object["result"] = .string("undone")
+            // Redeeming a token is not evidence that anything was restored. Keep the per-item
+            // reasons (e.g. changed_since), but never report an all-skipped batch as undone.
+            object["result"] = .string(context.items.contains { $0.status == .changed } ? "undone" : "not_undone")
             value = .object(object)
         }
         return value

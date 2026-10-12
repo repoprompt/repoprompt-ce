@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 // Shared parsing, rendering, and inventory projection for the organizing `session_admin` ops
 // (inventory, organize, release). Handlers derive every effect from `request.arguments`, which a
@@ -226,11 +227,74 @@ struct AgentSessionScopeVisibility {
 
 // MARK: - Inventory source
 
-/// Produces inventory snapshots: every loaded session, every history-indexed session, and every
-/// live link and durable intent.
+enum AgentSessionInventoryReadFailure: Error, Equatable {
+    case budgetExceeded
+    case incomplete
+
+    var value: Value {
+        .object([
+            "result": .string("incomplete"),
+            "code": .string(self == .budgetExceeded ? "inventory_budget_exceeded" : "inventory_incomplete"),
+            "retryable": .bool(true)
+        ])
+    }
+}
+
+enum AgentSessionInventoryInvocation {
+    static let budgetTaskLocal = BoxedTaskLocal<HistoryRequestBudget?>(nil)
+    static var budget: HistoryRequestBudget? {
+        budgetTaskLocal.get()
+    }
+}
+
+/// A backend read plan, distinct from the output filter. Never use an output predicate to discard
+/// in-scope link endpoints needed by role/link filters or bulk target selection.
+struct AgentSessionInventoryRead {
+    var workspaceID: UUID?
+    var loadedOnly = false
+    var sessionIDs: Set<UUID>?
+    /// Exact history provenance probes, never a global history inventory. Ancestors are followed
+    /// only from persisted metadata, with a finite total lookup cap and the invocation budget.
+    var historyTargetIDs: Set<UUID>?
+    var budget: HistoryRequestBudget = AgentSessionInventoryInvocation.budget ?? .standalone()
+
+    /// Ordinary trees are an explicitly partial census of loaded carriers across all windows.
+    /// Absence/link/role predicates still require history; output workspace filters never discard
+    /// the loaded ancestry or endpoints needed to decide tree membership and redact links.
+    static func scoped(
+        chain: [DomainDelegationScopeRecord],
+        filter: DomainAgentSessionInventoryFilter? = nil
+    ) -> AgentSessionInventoryRead {
+        let isTree = chain.contains { if case .tree = $0.grant.kind { return true }
+            return false
+        }
+        let needsGlobal = filter?.orphaned != nil || filter?.hasLinks != nil || filter?.role != nil
+            || (!isTree && filter?.rootOverseerSessionID != nil)
+        let workspace = chain.compactMap { scope -> UUID? in
+            if case let .workspace(id) = scope.grant.kind { return id }
+            return nil
+        }.first ?? (isTree || needsGlobal ? nil : filter?.workspaceID)
+        return AgentSessionInventoryRead(
+            workspaceID: isTree || needsGlobal ? nil : workspace,
+            loadedOnly: isTree && !needsGlobal
+        )
+    }
+}
+
+/// Produces snapshots over loaded sessions, the history index, and live/durable links.
 @MainActor
 protocol AgentSessionInventorySource: AnyObject {
     func snapshot() async -> DomainAgentSessionInventorySnapshot
+    func snapshot(read: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot
+}
+
+extension AgentSessionInventorySource {
+    func snapshot(read _: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
+        try Task.checkCancellation()
+        let result = await snapshot()
+        try Task.checkCancellation()
+        return result
+    }
 }
 
 /// Production inventory over open windows, the cross-workspace history index, and the bridge.
@@ -254,25 +318,153 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
     }
 
     func snapshot() async -> DomainAgentSessionInventorySnapshot {
+        // Compatibility for nonthrowing injected consumers. Administrative reads use the throwing
+        // entry point below, so cancellation is never converted into a successful empty response.
+        await (try? snapshot(read: AgentSessionInventoryRead()))
+            ?? DomainAgentSessionInventorySnapshot(records: [], edges: [], isComplete: false)
+    }
+
+    func snapshot(read: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
+        try Task.checkCancellation()
         var records: [DomainAgentSessionInventoryRecord] = []
         var isComplete = false
         var historyByID: [UUID: (AgentSessionMetadataRecord, String)] = [:]
-        if let scan = try? await scanner.scanWorkspaces(matching: nil) {
-            isComplete = Self.isComplete(scan)
-            for workspace in scan.workspaces {
-                for record in workspace.records {
-                    historyByID[record.id] = (record, workspace.workspaceName)
-                    records.append(Self.historyRecord(record, workspace: workspace))
+        if let targets = read.historyTargetIDs {
+            var pending = Array(targets)
+            var visited: Set<UUID> = []
+            while let id = pending.popLast() {
+                guard visited.insert(id).inserted else { continue }
+                guard visited.count <= 256 else { throw AgentSessionInventoryReadFailure.incomplete }
+                try await Self.projectionCheckpoint(projected: visited.count, budget: read.budget)
+                let lookup: HistoryDirectSessionLookup
+                do {
+                    lookup = try await scanner.locateSession(sessionID: id, requestBudget: read.budget)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as HistorySessionScannerError {
+                    try Task.checkCancellation()
+                    if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
+                    throw AgentSessionInventoryReadFailure.incomplete
+                } catch {
+                    try Task.checkCancellation()
+                    throw AgentSessionInventoryReadFailure.incomplete
+                }
+                try await Self.projectionCheckpoint(projected: visited.count, budget: read.budget)
+                guard lookup.isComplete else { throw AgentSessionInventoryReadFailure.incomplete }
+                guard let location = lookup.location else { continue }
+                let metadata = try await exactMetadata(location: location, sessionID: id, budget: read.budget)
+                let record = metadata.record
+                guard record.id == id else { throw AgentSessionInventoryReadFailure.incomplete }
+                historyByID[id] = (record, location.workspaceName)
+                records.append(DomainAgentSessionInventoryRecord(
+                    sessionID: id, name: record.name, workspaceID: metadata.workspaceID,
+                    workspaceName: location.workspaceName, isLoaded: false,
+                    runState: .classify(rawValue: record.lastRunStateRaw),
+                    parentSessionID: record.parentSessionID,
+                    createdByOverseerSessionID: record.createdByOverseerSessionID,
+                    organizationalParentID: record.organizationalParentID,
+                    createdAt: record.firstActivityAt, lastActivityAt: record.activityDate,
+                    worktreeCount: record.worktreeBindingSummaries.count
+                ))
+                if let parent = record.organizationalParentID ?? record.parentSessionID ?? record.createdByOverseerSessionID {
+                    pending.append(parent)
                 }
             }
+        } else if !read.loadedOnly {
+            do {
+                let scan = try await scanner.scanWorkspaces(
+                    matching: read.workspaceID?.uuidString, requestBudget: read.budget
+                )
+                try Task.checkCancellation()
+                // A workspace-local scan cannot prove that an endpoint in another workspace is gone.
+                isComplete = read.workspaceID == nil && Self.isComplete(scan)
+                var projected = 0
+                for workspace in scan.workspaces {
+                    for record in workspace.records {
+                        try await Self.projectionCheckpoint(projected: projected, budget: read.budget)
+                        projected += 1
+                        guard read.workspaceID == nil || (record.workspaceID ?? workspace.workspaceID) == read.workspaceID else { continue }
+                        historyByID[record.id] = (record, workspace.workspaceName)
+                        records.append(Self.historyRecord(record, workspace: workspace))
+                    }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as AgentSessionInventoryReadFailure {
+                throw error
+            } catch let error as HistorySessionScannerError {
+                try Task.checkCancellation()
+                if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
+                isComplete = false
+            } catch {
+                // History I/O/budget failures never prove deletion, and must not expose filesystem
+                // details through the administration surface. Keep the app-owned loaded projection.
+                try Task.checkCancellation()
+                isComplete = false
+            }
         }
-        records.append(contentsOf: loadedRecords(historyByID: historyByID))
+        try Task.checkCancellation()
+        let loaded = try await loadedRecords(historyByID: historyByID, read: read)
+        records.append(contentsOf: loaded.records)
+        isComplete = isComplete && loaded.isComplete
+        try await Self.projectionCheckpoint(projected: records.count, budget: read.budget)
         let (live, persisted) = await links()
+        try Task.checkCancellation()
+        guard read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil else {
+            throw AgentSessionInventoryReadFailure.budgetExceeded
+        }
         let edges = DomainAgentSessionInventoryEdge.merge(
             live: live.map { ($0.observerSessionID, $0.targetSessionID, $0.linkID, $0.generation) },
             persisted: persisted.map { ($0.observerSessionID, $0.targetSessionID) }
         )
-        return DomainAgentSessionInventorySnapshot(records: records, edges: edges, isComplete: isComplete)
+        try Task.checkCancellation()
+        let snapshot = DomainAgentSessionInventorySnapshot(
+            records: records, edges: edges,
+            isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil
+        )
+        try Task.checkCancellation()
+        // The immutable snapshot's dictionary/edge indexing is synchronous. Never hand back a
+        // globally complete census if that final construction itself consumed the remaining budget.
+        guard read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil else {
+            throw AgentSessionInventoryReadFailure.budgetExceeded
+        }
+        return snapshot
+    }
+
+    /// A cold direct lookup proves the file's location, not its metadata. Read only that
+    /// signature-checked storage directory's index under the same invocation budget. Never
+    /// substitute a global census, transcript hydration, or caller-supplied ancestry.
+    private func exactMetadata(
+        location: HistoryDirectSessionLocation, sessionID: UUID, budget: HistoryRequestBudget
+    ) async throws -> (record: AgentSessionMetadataRecord, workspaceID: UUID?) {
+        if let record = location.record, let workspaceID = record.workspaceID {
+            return (record, workspaceID)
+        }
+        // Legacy records may omit workspaceID even in a warm cache. Resolve their placement
+        // only from the exact scanner-owned workspace identity, never from the grant or target.
+        let scan: HistoryInventoryScan
+        do {
+            scan = try await scanner.scanWorkspaces(
+                matching: location.workspaceDir.lastPathComponent, requestBudget: budget
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as HistorySessionScannerError {
+            try Task.checkCancellation()
+            if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
+            throw AgentSessionInventoryReadFailure.incomplete
+        } catch {
+            try Task.checkCancellation()
+            throw AgentSessionInventoryReadFailure.incomplete
+        }
+        try await Self.projectionCheckpoint(projected: 0, budget: budget)
+        guard Self.isComplete(scan),
+              let workspace = scan.workspaces.first(where: { $0.workspaceDir.standardizedFileURL == location.workspaceDir.standardizedFileURL }),
+              let record = workspace.records.first(where: { $0.id == sessionID })
+        else {
+            throw AgentSessionInventoryReadFailure.incomplete
+        }
+        return (record, record.workspaceID ?? workspace.workspaceID)
     }
 
     /// A scan is complete only when it covered every workspace and read every index in full. An
@@ -295,36 +487,109 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             runState: .classify(rawValue: record.lastRunStateRaw),
             parentSessionID: record.parentSessionID,
             createdByOverseerSessionID: record.createdByOverseerSessionID,
+            organizationalParentID: record.organizationalParentID,
             createdAt: record.firstActivityAt,
             lastActivityAt: record.activityDate,
             worktreeCount: record.worktreeBindingSummaries.count
         )
     }
 
+    /// Yield without a detached cache or a second authority. The caller rechecks leases after the
+    /// entire snapshot. Deadline exhaustion fails closed: omitted edges must never become factual
+    /// no-links predicates that widen a filtered mutation.
+    private static func projectionCheckpoint(projected: Int, budget: HistoryRequestBudget) async throws {
+        try Task.checkCancellation()
+        if projected > 0, projected.isMultiple(of: 64) {
+            await Task.yield()
+            try Task.checkCancellation()
+        }
+        let hasTime = budget.elapsedDiagnostic(phase: "session_admin_projection") == nil
+        try Task.checkCancellation()
+        guard hasTime else { throw AgentSessionInventoryReadFailure.budgetExceeded }
+    }
+
+    static func exactTabMatches(_ tab: ComposeTabState, sessionID: UUID, indexTabID: UUID?) -> Bool {
+        tab.activeAgentSessionID == sessionID || (tab.activeAgentSessionID == nil && tab.id == indexTabID)
+    }
+
     private func loadedRecords(
-        historyByID: [UUID: (AgentSessionMetadataRecord, String)]
-    ) -> [DomainAgentSessionInventoryRecord] {
+        historyByID: [UUID: (AgentSessionMetadataRecord, String)],
+        read: AgentSessionInventoryRead
+    ) async throws -> (records: [DomainAgentSessionInventoryRecord], isComplete: Bool) {
         var result: [DomainAgentSessionInventoryRecord] = []
         for window in windows() where !window.isClosing {
-            guard let workspace = window.workspaceManager.activeWorkspace else { continue }
+            try Task.checkCancellation()
+            guard let workspace = window.workspaceManager.activeWorkspace,
+                  read.workspaceID == nil || workspace.id == read.workspaceID else { continue }
             let viewModel = window.agentModeViewModel
-            var rows: [(UUID, ComposeTabState, Bool)] = []
-            let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
-            for row in viewModel.sidebarSessions(for: workspace.composeTabs) {
-                if let sessionID = row.sessionID, let tab = tabsByID[row.tabID] { rows.append((sessionID, tab, false)) }
+            let store = viewModel.sessionIndexStore
+            let owner = store.sessionIndexOwner
+            let latestOwner = store.latestSessionIndexOwner
+            let validOwner = owner.map { $0.workspaceID == workspace.id && store.isOwnerCurrent($0) } ?? false
+            let entries = validOwner ? store.ownerValidatedSessionIndex : [:]
+            func checkWindowOwner() throws {
+                guard !window.isClosing, window.workspaceManager.activeWorkspace?.id == workspace.id,
+                      store.sessionIndexOwner == owner, store.latestSessionIndexOwner == latestOwner
+                else {
+                    throw AgentSessionInventoryReadFailure.incomplete
+                }
             }
-            for stashed in workspace.stashedTabs {
-                let sessionID = stashed.tab.activeAgentSessionID
-                    ?? viewModel.sessionIndex.values.first { $0.tabID == stashed.tab.id }?.id
-                if let sessionID { rows.append((sessionID, stashed.tab, true)) }
+            try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
+            try checkWindowOwner()
+            let sessionIDByTabID = Dictionary(
+                entries.values.map { ($0.tabID, $0.id) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            var rows: [(UUID, ComposeTabState, Bool)] = []
+            if let ids = read.sessionIDs {
+                // Exact authorized reads must not materialize the whole sidebar or hydrate history.
+                for id in ids {
+                    try Task.checkCancellation()
+                    let tabID = entries[id]?.tabID
+                    if let tab = workspace.composeTabs.first(where: { Self.exactTabMatches($0, sessionID: id, indexTabID: tabID) }) {
+                        rows.append((id, tab, false))
+                    } else if let stashed = workspace.stashedTabs.first(where: { Self.exactTabMatches($0.tab, sessionID: id, indexTabID: tabID) }) {
+                        rows.append((id, stashed.tab, true))
+                    }
+                }
+            } else {
+                // Inventory is a census of physical carriers, not a cached UI/sidebar rendering.
+                // Explicit bindings win; nil bindings may use only this owner-validated index.
+                for tab in workspace.composeTabs {
+                    let sessionID = tab.activeAgentSessionID ?? sessionIDByTabID[tab.id]
+                    if let sessionID { rows.append((sessionID, tab, false)) }
+                }
+                for stashed in workspace.stashedTabs {
+                    let sessionID = stashed.tab.activeAgentSessionID ?? sessionIDByTabID[stashed.tab.id]
+                    if let sessionID { rows.append((sessionID, stashed.tab, true)) }
+                }
+            }
+            try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
+            try checkWindowOwner()
+            let bindingStates = viewModel.authoritativeLiveSessionStates(for: Set(rows.filter { !$0.2 }.map(\.0)))
+            var liveStates: [UUID: DomainAgentSessionInventoryRunState] = [:]
+            // Capture raw states synchronously alongside the one binding census, preserving waiting,
+            // failed and completed classifications. This value-only projection is not an authority
+            // proof; the handler still validates current leases after the complete awaited read.
+            for (id, tab, archived) in rows where !archived {
+                switch bindingStates[id] {
+                case .idle?, .running?:
+                    guard let session = viewModel.sessions[tab.id], session.activeAgentSessionID == id else {
+                        liveStates[id] = .unknown
+                        continue
+                    }
+                    liveStates[id] = .classify(rawValue: session.runState.rawValue)
+                case .ambiguous?: liveStates[id] = .unknown
+                case .notFound?, nil: break
+                }
             }
             for (sessionID, tab, isArchived) in rows {
-                let entry = viewModel.sessionIndex[sessionID]
-                let history = historyByID[sessionID]?.0
-                let liveState: DomainAgentSessionInventoryRunState? = isArchived ? nil : {
-                    guard let session = try? viewModel.authoritativeLiveSession(for: sessionID) else { return nil }
-                    return .classify(rawValue: session.runState.rawValue)
-                }()
+                try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
+                try checkWindowOwner()
+                let entry = entries[sessionID]
+                let candidateHistory = historyByID[sessionID]?.0
+                let history = validOwner && candidateHistory?.workspaceID == workspace.id ? candidateHistory : nil
+                let liveState = isArchived ? nil : liveStates[sessionID]
                 let lastActivity = entry.map {
                     AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: $0.lastUserMessageAt, savedAt: $0.savedAt)
                 } ?? history?.activityDate ?? tab.lastModified
@@ -340,15 +605,18 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                     sidebarGroup: tab.sidebarGroup,
                     sidebarGroupOrder: tab.sidebarGroupOrder,
                     runState: liveState ?? .classify(rawValue: entry?.lastRunStateRaw ?? history?.lastRunStateRaw),
-                    parentSessionID: entry?.parentSessionID ?? history?.parentSessionID,
-                    createdByOverseerSessionID: entry?.createdByOverseerSessionID ?? history?.createdByOverseerSessionID,
+                    // Current loaded placement is not reconstructed from an older history row.
+                    // An absent/stale owner leaves ancestry unknown, never invented tree membership.
+                    parentSessionID: entry?.parentSessionID,
+                    createdByOverseerSessionID: entry?.createdByOverseerSessionID,
+                    organizationalParentID: entry?.organizationalParentID,
                     createdAt: history?.firstActivityAt,
                     lastActivityAt: lastActivity,
                     worktreeCount: entry?.worktreeBindingSummaries.count ?? history?.worktreeBindingSummaries.count ?? 0
                 ))
             }
         }
-        return result
+        return (result, true)
     }
 }
 
@@ -397,6 +665,21 @@ enum AgentSessionInventoryRendering {
         object["orphaned"] = .bool(!orphanReasons.isEmpty)
         if !orphanReasons.isEmpty {
             object["orphan_reasons"] = .array(orphanReasons.map { .string($0.rawValue) })
+        }
+        object["links_complete"] = .bool(snapshot.isComplete)
+        object["orphan_status_complete"] = .bool(snapshot.isComplete)
+        if !snapshot.isComplete {
+            // Partial endpoints can prove positive observations, never zero links/no role/not
+            // orphaned. Name lower bounds explicitly so callers cannot treat missing census as fact.
+            let knownCount = snapshot.edges(touching: record.sessionID).count
+            if knownCount > 0 {
+                object["known_link_count"] = .int(knownCount)
+                object["known_roles"] = object["roles"]
+            }
+            if !orphanReasons.isEmpty { object["known_orphan_reasons"] = object["orphan_reasons"] }
+            for key in ["link_count", "roles", "orphaned", "orphan_reasons"] {
+                object.removeValue(forKey: key)
+            }
         }
         return .object(object)
     }

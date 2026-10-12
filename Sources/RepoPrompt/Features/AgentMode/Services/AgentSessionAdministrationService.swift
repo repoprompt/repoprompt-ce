@@ -188,6 +188,23 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             }
         }
 
+        // Scope-level reads with no target/state/usage projection must not enumerate every session.
+        guard !request.targetSessionIDs.isEmpty || request.operation.scopeGuardrailUse != nil else {
+            return authorize(request, scope: scope, projector: projector)
+        }
+        return projector.withSynchronousCensus { projector in
+            authorize(request, scope: scope, projector: projector)
+        }
+    }
+
+    private func authorize(
+        _ request: AgentSessionAdministrationRequest,
+        scope: DomainDelegationScopeRecord,
+        projector: any DelegationMembershipProjector
+    ) -> AgentSessionAdministrationAuthorization {
+        guard let callerSessionID = request.caller.agentSessionID else {
+            return .denied(.callerNotAgentSession, sessionID: nil)
+        }
         // One proof per target for the scope and each ancestor: an attenuated scope never reaches a
         // session its parents could not.
         let chain = scopes.scopeChain(from: scope.id)

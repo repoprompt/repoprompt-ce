@@ -139,6 +139,18 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
     }
 
     func perform(_ request: AgentSessionAdministrationRequest) async throws -> AgentSessionAdministrationOutcome {
+        if AgentSessionInventoryInvocation.budget != nil {
+            return try await performWithinInventoryBudget(request)
+        }
+        return try await AgentSessionInventoryInvocation.budgetTaskLocal.withValue(.standalone()) {
+            try await performWithinInventoryBudget(request)
+        }
+    }
+
+    private func performWithinInventoryBudget(
+        _ request: AgentSessionAdministrationRequest
+    ) async throws -> AgentSessionAdministrationOutcome {
+        try Task.checkCancellation()
         // Anything the front door cannot shape (no handler, no unique live scope, a non-Agent caller)
         // goes straight to the core, which owns every denial.
         guard handlers[request.operation] != nil,
@@ -171,6 +183,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             if request.arguments["filter"] != nil, let denial = filterDenial(request.operation, scope: scope) {
                 return .denied(denial, sessionID: nil)
             }
+            let shapingChain = scopes.scopeChain(from: scope.id)
             do {
                 if let targets = try await resolveTargets(shaped, scope: scope, callerSessionID: callerSessionID) {
                     guard !targets.isEmpty else {
@@ -182,7 +195,13 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     }
                     shaped = shaped.rebuilt(targets: targets)
                 } else {
-                    let split = await splitUnloadedTargets(shaped.targetSessionIDs, scope: scope)
+                    let split = try await splitUnloadedTargets(shaped.targetSessionIDs, scope: scope)
+                    if !mutating, !split.unloaded.isEmpty {
+                        return .completed(.object([
+                            "result": .string("unavailable"), "code": .string("workspace_not_loaded"),
+                            "op": .string(request.operation.adminOperationName), "retryable": .bool(true)
+                        ]))
+                    }
                     unloadedItems = split.unloaded.map {
                         AgentSessionAdminItemResult(sessionID: $0, status: .skipped, reason: "workspace_not_loaded")
                     }
@@ -198,6 +217,9 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                         shaped = shaped.rebuilt(targets: split.remaining)
                     }
                 }
+            } catch let failure as AgentSessionInventoryReadFailure {
+                try checkInventoryAuthority(scope, chain: shapingChain)
+                return .completed(failure.value)
             } catch let early as AgentSessionAdminEarlyResult {
                 return .completed(early.value)
             }
@@ -415,15 +437,36 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
     private func splitUnloadedTargets(
         _ targets: [UUID],
         scope: DomainDelegationScopeRecord
-    ) async -> (remaining: [UUID], unloaded: [UUID]) {
+    ) async throws -> (remaining: [UUID], unloaded: [UUID]) {
         let unproven = targets.filter { !isMember($0, of: scope) }
         guard !unproven.isEmpty, chainHolds(.observe, scope: scope) else { return (targets, []) }
-        let snapshot = await inventory.snapshot()
-        let visibility = AgentSessionScopeVisibility(chain: scopes.scopeChain(from: scope.id))
+        let chain = scopes.scopeChain(from: scope.id)
+        var read = AgentSessionInventoryRead.scoped(chain: chain)
+        read.loadedOnly = true
+        read.historyTargetIDs = Set(unproven)
+        let snapshot = try await inventory.snapshot(read: read)
+        try checkInventoryAuthority(scope, chain: chain)
+        let visibility = AgentSessionScopeVisibility(chain: chain)
         let unloaded = Set(unproven.filter { id in
             snapshot.records[id].map { !$0.isLoaded && visibility.isVisible($0, in: snapshot) } ?? false
         })
         return (targets.filter { !unloaded.contains($0) }, targets.filter(unloaded.contains))
+    }
+
+    /// Call shaping can return early without reaching the core, so it must fence every awaited
+    /// inventory read against revocation/attenuation, including ancestors, before disclosing data.
+    private func checkInventoryAuthority(
+        _ scope: DomainDelegationScopeRecord,
+        chain: [DomainDelegationScopeRecord]
+    ) throws {
+        try Task.checkCancellation()
+        let current = scopes.scopeChain(from: scope.id)
+        guard scopes.record(id: scope.id).map({ $0.isActive && $0.generation == scope.generation }) == true,
+              !chain.isEmpty, current.count == chain.count,
+              zip(chain, current).allSatisfy({ before, after in
+                  before.id == after.id && before.generation == after.generation && after.isActive
+              }), chainHolds(.observe, scope: scope)
+        else { throw SessionAdminMCPToolService.unavailableError }
     }
 
     private static func appending(_ items: [AgentSessionAdminItemResult], to value: Value) -> Value {
@@ -466,10 +509,17 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                 throw AgentSessionAdminArguments.invalid("filter is exclusive with targets and session_id.")
             }
             guard let filter = try AgentSessionAdminArguments.filter(rawFilter) else { return nil }
-            let full = await inventory.snapshot()
+            let chain = scopes.scopeChain(from: scope.id)
+            let full = try await inventory.snapshot(read: .scoped(chain: chain, filter: filter))
+            try checkInventoryAuthority(scope, chain: chain)
+            // Link/role/orphan predicates rely on the complete endpoint census. An incomplete
+            // read cannot turn an unknown edge into has_links:false and widen a mutation.
+            if !full.isComplete, filter.hasLinks != nil || filter.role != nil || filter.orphaned != nil {
+                throw AgentSessionInventoryReadFailure.incomplete
+            }
             // Filters see only the scope-restricted view, so link/role/orphan predicates can never
             // react to sessions outside the scope.
-            let visibility = AgentSessionScopeVisibility(chain: scopes.scopeChain(from: scope.id))
+            let visibility = AgentSessionScopeVisibility(chain: chain)
             let snapshot = full.restricted(to: Set(
                 full.records.values
                     .filter { visibility.isVisible($0, in: full) }
@@ -477,17 +527,23 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             ))
             let now = Date()
             let excludeCaller = request.operation.deniesScopeSelfTarget
-            let matches = snapshot.records.values
-                .filter(\.isLoaded)
-                .filter { filter.matchesStructured($0, in: snapshot, now: now) }
-                .filter { AgentSessionInventoryRendering.matchesQuery(filter.query, record: $0) }
-                .filter { !(excludeCaller && $0.sessionID == callerSessionID) }
-                .filter { isMember($0.sessionID, of: scope) }
-                .sorted { lhs, rhs in
-                    if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt > rhs.lastActivityAt }
-                    return lhs.sessionID.uuidString < rhs.sessionID.uuidString
-                }
-                .map(\.sessionID)
+            // One fresh synchronous region after the read/authority fence. The census cannot
+            // escape or span a suspension; handlers still re-prove live membership at each write.
+            let matches = projector.withSynchronousCensus { census in
+                snapshot.records.values
+                    .filter(\.isLoaded)
+                    .filter { filter.matchesStructured($0, in: snapshot, now: now) }
+                    .filter { AgentSessionInventoryRendering.matchesQuery(filter.query, record: $0) }
+                    .filter { !(excludeCaller && $0.sessionID == callerSessionID) }
+                    .filter { record in
+                        !chain.isEmpty && chain.allSatisfy { census.membershipProof(for: record.sessionID, in: $0.grant) != nil }
+                    }
+                    .sorted { lhs, rhs in
+                        if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt > rhs.lastActivityAt }
+                        return lhs.sessionID.uuidString < rhs.sessionID.uuidString
+                    }
+                    .map(\.sessionID)
+            }
             guard matches.count <= AgentSessionAdminArguments.maxTargets else {
                 throw AgentSessionAdminArguments.invalid(
                     "filter matched \(matches.count) sessions; at most \(AgentSessionAdminArguments.maxTargets) per call. Narrow the filter."

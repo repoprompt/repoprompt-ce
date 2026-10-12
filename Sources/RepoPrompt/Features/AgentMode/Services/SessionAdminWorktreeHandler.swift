@@ -411,6 +411,14 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             }
             return days
         }()
+        let initialChain = context.scopeChain(of: batch.scope)
+        guard let currentScope = context.scopes.record(id: batch.scope.id),
+              currentScope.generation == batch.scope.generation,
+              !initialChain.isEmpty,
+              initialChain.allSatisfy({ record in
+                  record.isActive && batch.request.operation.requiredScopeCapability.map(record.grant.capabilities.contains) == true
+              })
+        else { throw SessionAdminMCPToolService.unavailableError }
         let members = context.projector.members(of: batch.scope.grant)
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
         let memberSet = Set(members)
@@ -472,6 +480,35 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             }
             entries.append(.object(entry))
         }
+        // Prunability checks suspend. Re-prove the whole chain and every named member before
+        // returning worktree paths or deferred outcomes; a stale pre-await census is not authority.
+        try Task.checkCancellation()
+        let currentChain = context.scopeChain(of: batch.scope)
+        guard !initialChain.isEmpty, currentChain.count == initialChain.count,
+              zip(initialChain, currentChain).allSatisfy({ before, after in
+                  before.id == after.id && before.generation == after.generation && after.isActive
+              }),
+              members.allSatisfy({ context.isMember($0, ofChainFrom: batch.scope) })
+        else { throw SessionAdminMCPToolService.unavailableError }
+        let outcomes = deferredOutcomes.keys.filter(memberSet.contains)
+            .sorted { $0.uuidString < $1.uuidString }
+            .compactMap { sessionID -> Value? in
+                guard let outcome = deferredOutcomes[sessionID] else { return nil }
+                var row: [String: Value] = ["session_id": .string(sessionID.uuidString)]
+                switch outcome {
+                case let .applied(worktreeID):
+                    row["result"] = .string("applied")
+                    row["worktree_id"] = .string(worktreeID)
+                case .revoked:
+                    row["result"] = .string("not_applied")
+                    row["code"] = .string("scope_revoked")
+                case let .failed(detail):
+                    row["result"] = .string("not_applied")
+                    row["code"] = .string("bind_failed")
+                    row["detail"] = .string(detail)
+                }
+                return .object(row)
+            }
         let pending = pendingBinds.values
             .filter { members.contains($0.sessionID) }
             .sorted { $0.queuedAt < $1.queuedAt }
@@ -487,6 +524,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             "op": .string("worktree_inventory"),
             "worktrees": .array(entries),
             "pending_binds": .array(pending),
+            "deferred_outcomes": .array(outcomes),
             "note": .string("Release marks worktrees stale; removing or pruning them is up to the user.")
         ])
     }

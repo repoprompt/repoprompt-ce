@@ -2900,6 +2900,19 @@ class PromptViewModel: ObservableObject {
         snapshotActiveComposeTabIfNeeded(in: manager, workspaceIndex: index)
     }
 
+    /// Preserve the active editor before a sidebar mutation republishes workspace carriers without
+    /// selecting another tab. This is an in-memory boundary, independent of save eligibility.
+    @MainActor
+    func flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: UUID) -> Bool {
+        guard let manager = workspaceManager,
+              manager.activeWorkspaceID == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              manager.workspaces[index].activeComposeTabID == activeComposeTabID
+        else { return false }
+        flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
+        return manager.activeWorkspaceID == workspaceID
+    }
+
     @MainActor
     private func withComposeTabSwitching<T>(
         targetTabID: UUID? = nil,

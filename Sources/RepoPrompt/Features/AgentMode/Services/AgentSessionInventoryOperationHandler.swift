@@ -38,10 +38,29 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         // Validate before the (possibly slow) snapshot.
         let filter = batch.request.operation == .adminInventory ? try AgentSessionAdminArguments.filter(args["filter"]) : nil
         let limit = try AgentSessionAdminArguments.limit(args)
-        let full = await source.snapshot()
-        // Re-check authority after the suspension: a revoked or expired scope reveals nothing.
-        guard isScopeCurrent(batch.scope), batch.leases.allSatisfy(isLeaseCurrent) else {
-            throw SessionAdminMCPToolService.unavailableError
+        try Task.checkCancellation()
+        let chain = scopeChain(batch.scope.id)
+        var read = AgentSessionInventoryRead.scoped(chain: chain, filter: filter)
+        let exactGet = batch.request.operation == .adminGet && !batch.admittedSessionIDs.isEmpty
+        if exactGet {
+            read.loadedOnly = true
+            read.sessionIDs = Set(batch.admittedSessionIDs)
+        }
+        let full: DomainAgentSessionInventorySnapshot
+        do {
+            full = try await source.snapshot(read: read)
+        } catch let failure as AgentSessionInventoryReadFailure {
+            // Operational outcomes are disclosed only to the still-authorized grantee. Revocation
+            // while a read expires remains the same uniform denial, never a recoverable budget code.
+            try checkAuthority(batch, chain: chain)
+            return failure.value
+        }
+        let boundedGet = exactGet && !full.isComplete
+        try checkAuthority(batch, chain: chain)
+        if !full.isComplete, filter?.hasLinks != nil || filter?.role != nil || filter?.orphaned != nil {
+            // Read predicates can feed a later explicit mutation just as target-shaping filters can.
+            // Never report candidate IDs obtained by treating an unknown endpoint census as false.
+            return AgentSessionInventoryReadFailure.incomplete.value
         }
         // Membership is decided on the full snapshot; everything rendered, counted, filtered, or
         // classified below comes from the scope-restricted view, so no output can name, count, or
@@ -49,7 +68,11 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         let visibility = AgentSessionScopeVisibility(chain: scopeChain(batch.scope.id))
         let snapshot = full.restricted(to: Set(
             full.records.values
-                .filter { visibility.isVisible($0, in: full) }
+                .filter {
+                    // An exact get already carries current app-owned target leases. Its partial
+                    // read need not rediscover a potentially cross-workspace tree ancestry.
+                    boundedGet ? batch.admittedSessionIDs.contains($0.sessionID) : visibility.isVisible($0, in: full)
+                }
                 .map(\.sessionID)
         ))
         let date = now()
@@ -69,6 +92,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             return .object([
                 "result": .string("ok"),
                 "total": .int(matches.count),
+                "total_complete": .bool(snapshot.isComplete),
                 "truncated": .bool(matches.count > limit),
                 "history_complete": .bool(snapshot.isComplete),
                 "sessions": .array(matches.prefix(limit).map {
@@ -81,16 +105,29 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                 throw SessionAdminMCPToolService.unavailableError
             }
             var row = AgentSessionInventoryRendering.row(record, snapshot: snapshot, now: date).objectValue ?? [:]
-            row["links"] = .array(snapshot.edges(touching: target).map {
-                AgentSessionInventoryRendering.edge($0, snapshot: snapshot)
-            })
-            row["children"] = .array(
-                snapshot.records.values
-                    .filter { $0.effectiveParentID == target }
-                    .sorted { $0.lastActivityAt > $1.lastActivityAt }
-                    .map { .string($0.sessionID.uuidString) }
-            )
-            return .object(["result": .string("ok"), "session": .object(row)])
+            if boundedGet {
+                // This bounded get deliberately does not census siblings or other endpoints. Do
+                // not turn unknown link/orphan facts into authoritative zero/false fields.
+                for key in ["link_count", "roles", "orphaned", "orphan_reasons"] {
+                    row.removeValue(forKey: key)
+                }
+            }
+            row["links_complete"] = .bool(!boundedGet && snapshot.isComplete)
+            row["children_complete"] = .bool(!boundedGet && snapshot.isComplete)
+            if !boundedGet {
+                row["links"] = .array(snapshot.edges(touching: target).map {
+                    AgentSessionInventoryRendering.edge($0, snapshot: snapshot)
+                })
+                row["children"] = .array(
+                    snapshot.records.values
+                        .filter { $0.effectiveParentID == target }
+                        .sorted { $0.lastActivityAt > $1.lastActivityAt }
+                        .map { .string($0.sessionID.uuidString) }
+                )
+            }
+            return .object([
+                "result": .string("ok"), "history_complete": .bool(snapshot.isComplete), "session": .object(row)
+            ])
 
         case .adminTree:
             let rootID = batch.request.targetSessionIDs.first ?? defaultRoot(batch)
@@ -112,6 +149,8 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     "state": .string(record.runState.rawValue),
                     "archived": .bool(record.isArchived),
                     "pinned": .bool(record.isPinned),
+                    "children_complete": .bool(snapshot.isComplete),
+                    "observes_complete": .bool(snapshot.isComplete),
                     "observes": .array(
                         snapshot.edges(touching: record.sessionID)
                             .filter { $0.observerSessionID == record.sessionID && visible($0.targetSessionID) != nil }
@@ -134,7 +173,9 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                 }
                 return .object(object)
             }
-            return .object(["result": .string("ok"), "tree": node(root, depth: 0)])
+            return .object([
+                "result": .string("ok"), "history_complete": .bool(snapshot.isComplete), "tree": node(root, depth: 0)
+            ])
 
         case .adminLinks:
             let focus = batch.request.targetSessionIDs.first
@@ -145,6 +186,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             return .object([
                 "result": .string("ok"),
                 "total": .int(edges.count),
+                "total_complete": .bool(snapshot.isComplete),
                 "truncated": .bool(edges.count > limit),
                 "history_complete": .bool(snapshot.isComplete),
                 "links": .array(edges.prefix(limit).map { AgentSessionInventoryRendering.edge($0, snapshot: snapshot) })
@@ -152,6 +194,21 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
 
         default:
             throw AgentSessionAdminArguments.invalid("\(batch.request.operation.adminOperationName) is not an inventory op.")
+        }
+    }
+
+    private func checkAuthority(
+        _ batch: AgentSessionAdministrationAuthorizedBatch,
+        chain: [DomainDelegationScopeRecord]
+    ) throws {
+        try Task.checkCancellation()
+        let currentChain = scopeChain(batch.scope.id)
+        guard isScopeCurrent(batch.scope), !chain.isEmpty, chain.count == currentChain.count,
+              zip(chain, currentChain).allSatisfy({ before, after in
+                  before.id == after.id && before.generation == after.generation && isScopeCurrent(after)
+              }), batch.leases.allSatisfy(isLeaseCurrent)
+        else {
+            throw SessionAdminMCPToolService.unavailableError
         }
     }
 
