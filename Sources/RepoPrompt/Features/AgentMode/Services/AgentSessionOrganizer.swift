@@ -54,6 +54,8 @@ final class AgentSessionRunStateRefusals {
 protocol AgentSessionOrganizingBackend: AnyObject {
     /// `nil` when the session is not in any open window's active workspace.
     func state(of sessionID: UUID) -> AgentSessionOrganizeState?
+    /// Fresh values for one synchronous read region, never an authority cache.
+    func states(of sessionIDs: [UUID]) -> [UUID: AgentSessionOrganizeState]
     /// Every loaded session, active and archived.
     func loadedSessionIDs() -> [UUID]
     /// Displayed pinned order (sidebar order) for one loaded workspace.
@@ -62,6 +64,8 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     func groupEntries(workspaceID: UUID) -> [(sessionID: UUID, group: String, order: Int?)]?
 
     func rename(_ sessionID: UUID, to name: String) -> Bool
+    func rename(_ sessionIDs: [UUID], to name: String) -> Set<UUID>
+    func rename(_ names: [UUID: String]) -> Set<UUID>
     /// Returns the sessions whose pin state changed.
     func setPinned(_ pinned: Bool, sessionIDs: [UUID]) -> Set<UUID>
     /// Writes explicit pin ranks, only to sessions that are still pinned and active. Writes nothing
@@ -69,12 +73,14 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     func setPinnedRanks(_ ranks: [UUID: Int?]) -> Set<UUID>
     /// Returns the sessions whose group changed.
     func setGroup(_ group: String?, order: Int?, sessionIDs: [UUID]) -> Set<UUID>
+    func setGroups(_ groups: [UUID: (name: String?, order: Int?)]) -> Set<UUID>
     /// Writes group order values, only to sessions that are still grouped and active. Writes nothing
     /// else. Returns the sessions whose value changed.
     func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID>
     /// Run state aggregated across every open window: `running` if any window runs the session,
     /// otherwise `unknown` if any lookup fails, otherwise `idle` (also for sessions with no live run).
     func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState
+    func runStates(of sessionIDs: [UUID]) -> [UUID: DomainDelegationScopeTargetState]
     /// Archives (stashes) active sessions, one stash per session. `isAuthorized(sessionID)` is folded
     /// into that session's stash mutation-context check, which the stash re-evaluates after its own
     /// suspensions and immediately before it commits; a session it refuses is not archived. Returns
@@ -84,6 +90,36 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     func unarchive(_ sessionIDs: [UUID]) -> Set<UUID>
     /// Cancels the session's live run. Returns false when nothing could be cancelled.
     func stopRun(_ sessionID: UUID) async -> Bool
+}
+
+extension AgentSessionOrganizingBackend {
+    func rename(_ names: [UUID: String]) -> Set<UUID> {
+        Set(names.compactMap { id, name in rename(id, to: name) ? id : nil })
+    }
+
+    func setGroups(_ groups: [UUID: (name: String?, order: Int?)]) -> Set<UUID> {
+        var changed: Set<UUID> = []
+        for (id, group) in groups {
+            changed.formUnion(setGroup(group.name, order: group.order, sessionIDs: [id]))
+        }
+        return changed
+    }
+
+    func runStates(of sessionIDs: [UUID]) -> [UUID: DomainDelegationScopeTargetState] {
+        Dictionary(Set(sessionIDs).map { ($0, runState(of: $0)) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    func states(of sessionIDs: [UUID]) -> [UUID: AgentSessionOrganizeState] {
+        var result: [UUID: AgentSessionOrganizeState] = [:]
+        for id in sessionIDs {
+            result[id] = state(of: id)
+        }
+        return result
+    }
+
+    func rename(_ sessionIDs: [UUID], to name: String) -> Set<UUID> {
+        Set(sessionIDs.filter { rename($0, to: name) })
+    }
 }
 
 // MARK: - Production backend
@@ -137,8 +173,17 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
     // MARK: AgentSessionOrganizingBackend
 
     func state(of sessionID: UUID) -> AgentSessionOrganizeState? {
-        guard let location = locate(sessionID) else { return nil }
-        return state(sessionID: sessionID, location: location)
+        states(of: [sessionID])[sessionID]
+    }
+
+    func states(of sessionIDs: [UUID]) -> [UUID: AgentSessionOrganizeState] {
+        let windows = liveWindows()
+        let locations = locations(for: Set(sessionIDs), windows: windows)
+        let statesByWindow = windows.map { $0.agentModeViewModel.authoritativeLiveSessionStates(for: Set(sessionIDs)) }
+        return locations.mapValues { location in
+            let id = location.sessionID
+            return state(sessionID: id, location: location.location, runState: Self.runState(statesByWindow.compactMap { $0[id] }))
+        }
     }
 
     func loadedSessionIDs() -> [UUID] {
@@ -149,8 +194,12 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             for row in window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs) {
                 if let id = row.sessionID, seen.insert(id).inserted { result.append(id) }
             }
+            var idsByTab: [UUID: UUID] = [:]
+            for entry in window.agentModeViewModel.sessionIndex.values where idsByTab[entry.tabID] == nil {
+                idsByTab[entry.tabID] = entry.id
+            }
             for stashed in workspace.stashedTabs {
-                if let id = archivedSessionID(stashed, window: window), seen.insert(id).inserted { result.append(id) }
+                if let id = stashed.tab.activeAgentSessionID ?? idsByTab[stashed.tab.id], seen.insert(id).inserted { result.append(id) }
             }
         }
         return result
@@ -178,6 +227,22 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         guard let location = locate(sessionID), location.stashedTabID == nil else { return false }
         location.window.agentModeViewModel.renameSession(tabID: location.tabID, to: name)
         return true
+    }
+
+    func rename(_ sessionIDs: [UUID], to name: String) -> Set<UUID> {
+        rename(Dictionary(sessionIDs.map { ($0, name) }, uniquingKeysWith: { first, _ in first }))
+    }
+
+    func rename(_ names: [UUID: String]) -> Set<UUID> {
+        var changed: Set<UUID> = []
+        for (window, entries) in activeLocationsByWindow(Array(names.keys)) {
+            for entry in entries {
+                guard let name = names[entry.sessionID] else { continue }
+                window.agentModeViewModel.renameSession(tabID: entry.location.tabID, to: name)
+                changed.insert(entry.sessionID)
+            }
+        }
+        return changed
     }
 
     func setPinned(_ pinned: Bool, sessionIDs: [UUID]) -> Set<UUID> {
@@ -224,6 +289,17 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         return changed
     }
 
+    func setGroups(_ groups: [UUID: (name: String?, order: Int?)]) -> Set<UUID> {
+        writeActiveTabField(Array(groups.keys)) { tab, id in
+            guard let group = groups[id] else { return false }
+            let order = group.name == nil ? nil : group.order
+            guard tab.sidebarGroup != group.name || tab.sidebarGroupOrder != order else { return false }
+            tab.sidebarGroup = group.name
+            tab.sidebarGroupOrder = order
+            return true
+        }
+    }
+
     func setGroupOrderValues(_ values: [UUID: Int?]) -> Set<UUID> {
         writeActiveTabField(Array(values.keys)) { tab, sessionID in
             guard tab.sidebarGroup != nil, let value = values[sessionID], tab.sidebarGroupOrder != value else {
@@ -261,23 +337,27 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
     }
 
     func runState(of sessionID: UUID) -> DomainDelegationScopeTargetState {
-        var running = false
-        var unknown = false
-        for window in liveWindows() {
-            switch Result(catching: { try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) }) {
-            case let .success(session?): running = running || session.runState.isActive
-            case .success(nil): break
-            case .failure: unknown = true
-            }
-        }
-        return running ? .running : unknown ? .unknown : .idle
+        Self.runState(liveWindows().compactMap { $0.agentModeViewModel.authoritativeLiveSessionStates(for: [sessionID])[sessionID] })
+    }
+
+    func runStates(of sessionIDs: [UUID]) -> [UUID: DomainDelegationScopeTargetState] {
+        let ids = Set(sessionIDs)
+        let states = liveWindows().map { $0.agentModeViewModel.authoritativeLiveSessionStates(for: ids) }
+        return Dictionary(uniqueKeysWithValues: ids.map { id in (id, Self.runState(states.compactMap { $0[id] })) })
+    }
+
+    private static func runState(_ states: [AgentModeViewModel.AuthoritativeLiveSessionState]) -> DomainDelegationScopeTargetState {
+        if states.contains(.running) { return .running }
+        if states.contains(.ambiguous) { return .unknown }
+        return .idle
     }
 
     func unarchive(_ sessionIDs: [UUID]) -> Set<UUID> {
         var restored: Set<UUID> = []
         var byWindow: [Int: (WindowState, [(UUID, Location)])] = [:]
+        let locations = locations(for: Set(sessionIDs), windows: liveWindows())
         for sessionID in sessionIDs {
-            guard let location = locate(sessionID), location.stashedTabID != nil else { continue }
+            guard let location = locations[sessionID]?.location, location.stashedTabID != nil else { continue }
             byWindow[location.window.windowID, default: (location.window, [])].1.append((sessionID, location))
         }
         for (window, entries) in byWindow.values {
@@ -288,20 +368,27 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             guard manager.activeWorkspaceID == workspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
             else { continue }
-            var restoredInWindow = false
-            for (sessionID, location) in entries {
-                guard let stashIndex = manager.workspaces[index].stashedTabs.firstIndex(where: {
-                    $0.id == location.stashedTabID
-                }) else { continue }
-                var tab = manager.workspaces[index].stashedTabs[stashIndex].tab
-                guard !manager.workspaces[index].composeTabs.contains(where: { $0.id == tab.id }) else { continue }
-                tab.lastModified = Date()
-                manager.workspaces[index].stashedTabs.remove(at: stashIndex)
-                manager.workspaces[index].composeTabs.append(tab)
-                restored.insert(sessionID)
-                restoredInWindow = true
+            let stashes = manager.workspaces[index].stashedTabs
+            var stashIndexByID: [UUID: Int] = [:]
+            for stashIndex in stashes.indices where stashIndexByID[stashes[stashIndex].id] == nil {
+                stashIndexByID[stashes[stashIndex].id] = stashIndex
             }
-            guard restoredInWindow else { continue }
+            var tabs = manager.workspaces[index].composeTabs
+            var activeTabIDs = Set(tabs.map(\.id))
+            var removedIndexes: Set<Int> = []
+            for (sessionID, location) in entries {
+                guard let stashID = location.stashedTabID, let stashIndex = stashIndexByID[stashID],
+                      !removedIndexes.contains(stashIndex) else { continue }
+                var tab = stashes[stashIndex].tab
+                guard activeTabIDs.insert(tab.id).inserted else { continue }
+                tab.lastModified = Date()
+                removedIndexes.insert(stashIndex)
+                tabs.append(tab)
+                restored.insert(sessionID)
+            }
+            guard !removedIndexes.isEmpty else { continue }
+            manager.workspaces[index].stashedTabs = stashes.indices.filter { !removedIndexes.contains($0) }.map { stashes[$0] }
+            manager.workspaces[index].composeTabs = tabs
             manager.workspaces[index].dateModified = Date()
             window.promptManager.loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty()
@@ -331,34 +418,37 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         return nil
     }
 
-    private func archivedSessionID(_ stashed: StashedTab, window: WindowState) -> UUID? {
-        if let id = stashed.tab.activeAgentSessionID { return id }
-        return window.agentModeViewModel.sessionIndex.values.first { $0.tabID == stashed.tab.id }?.id
+    private func locate(_ sessionID: UUID) -> Location? {
+        locations(for: [sessionID], windows: liveWindows())[sessionID]?.location
     }
 
-    private func locate(_ sessionID: UUID) -> Location? {
-        for window in liveWindows() {
+    /// First carrier wins exactly as before (window order, active rows, then stashes). Duplicate
+    /// carriers remain in the separate authoritative liveness census and thus still fail closed.
+    private func locations(for requested: Set<UUID>, windows: [WindowState]) -> [UUID: LocatedSession] {
+        guard !requested.isEmpty else { return [:] }
+        var result: [UUID: LocatedSession] = [:]
+        for window in windows {
             guard let workspace = window.workspaceManager.activeWorkspace else { continue }
-            let rows = window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
-            if let row = rows.first(where: { $0.sessionID == sessionID }),
-               let tab = workspace.composeTabs.first(where: { $0.id == row.tabID })
-            {
-                return Location(window: window, workspaceID: workspace.id, tabID: tab.id, stashedTabID: nil, tab: tab)
+            let tabs = Dictionary(workspace.composeTabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for row in window.agentModeViewModel.sidebarSessions(for: workspace.composeTabs) {
+                guard let id = row.sessionID, requested.contains(id), result[id] == nil, let tab = tabs[row.tabID] else { continue }
+                result[id] = (id, Location(window: window, workspaceID: workspace.id, tabID: tab.id, stashedTabID: nil, tab: tab))
             }
-            if let stashed = workspace.stashedTabs.first(where: { archivedSessionID($0, window: window) == sessionID }) {
-                return Location(
-                    window: window, workspaceID: workspace.id, tabID: stashed.tab.id,
-                    stashedTabID: stashed.id, tab: stashed.tab
-                )
+            var archivedIDs: [UUID: UUID] = [:]
+            for entry in window.agentModeViewModel.sessionIndex.values where archivedIDs[entry.tabID] == nil {
+                archivedIDs[entry.tabID] = entry.id
+            }
+            for stashed in workspace.stashedTabs {
+                guard let id = stashed.tab.activeAgentSessionID ?? archivedIDs[stashed.tab.id],
+                      requested.contains(id), result[id] == nil else { continue }
+                result[id] = (id, Location(window: window, workspaceID: workspace.id, tabID: stashed.tab.id, stashedTabID: stashed.id, tab: stashed.tab))
             }
         }
-        return nil
+        return result
     }
 
-    private func state(sessionID: UUID, location: Location) -> AgentSessionOrganizeState {
-        // Aggregated across every window like the membership projector, and fail closed.
-        let currentRunState = runState(of: sessionID)
-        return AgentSessionOrganizeState(
+    private func state(sessionID: UUID, location: Location, runState: DomainDelegationScopeTargetState) -> AgentSessionOrganizeState {
+        AgentSessionOrganizeState(
             sessionID: sessionID,
             workspaceID: location.workspaceID,
             tabID: location.tabID,
@@ -368,7 +458,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             pinnedOrder: location.tab.pinnedOrder,
             sidebarGroup: location.tab.sidebarGroup,
             sidebarGroupOrder: location.tab.sidebarGroupOrder,
-            runState: currentRunState
+            runState: runState
         )
     }
 
@@ -378,8 +468,9 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
     private func activeLocationsByWindow(_ sessionIDs: [UUID]) -> [(WindowState, [LocatedSession])] {
         var order: [Int] = []
         var groups: [Int: (WindowState, [LocatedSession])] = [:]
+        let locations = locations(for: Set(sessionIDs), windows: liveWindows())
         for sessionID in sessionIDs {
-            guard let location = locate(sessionID), location.stashedTabID == nil else { continue }
+            guard let location = locations[sessionID]?.location, location.stashedTabID == nil else { continue }
             let key = location.window.windowID
             if groups[key] == nil {
                 order.append(key)

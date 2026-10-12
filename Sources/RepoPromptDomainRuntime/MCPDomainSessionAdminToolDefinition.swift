@@ -47,13 +47,15 @@ package enum MCPDomainSessionAdminToolDefinition {
 
         A scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
+        For cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
+
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
         - `release_scope`: give up one of your scopes; revokes its nested scopes too.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
-        **Inventory** (observe): `inventory` (filter, limit; spans every workspace's history), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
+        **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
         **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
@@ -83,7 +85,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "workspace": .object([
                     "type": .string("string"),
-                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default this session's workspace. [reorder_groups] Workspace UUID.")
+                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default and limited to this session's workspace. [reorder_groups] Workspace UUID.")
                 ]),
                 "capabilities": .object([
                     "type": .string("array"),
@@ -91,7 +93,7 @@ package enum MCPDomainSessionAdminToolDefinition {
                         "type": .string("string"),
                         "enum": .array(capabilityValues.map(Value.string))
                     ]),
-                    "description": .string("[request_scope, attenuate] Requested capabilities; the user may narrow them.")
+                    "description": .string("[request_scope, attenuate] Requested capabilities; the user may narrow them. Cleanup/organizing needs observe for inventory plus mutation capabilities (retire: organize and restructure). Nothing is added after approval.")
                 ]),
                 "guardrails": .object([
                     "type": .string("object"),

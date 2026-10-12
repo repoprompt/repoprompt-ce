@@ -456,9 +456,24 @@ struct AgentManageMCPToolService {
             return lhs > rhs
         }
 
-        return .object([
+        var result: [String: Value] = [
             "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
-        ])
+        ]
+        switch discoveryScope {
+        case .unrestricted:
+            break // Preserve the external administrative result shape.
+        case .directChildren:
+            result["scope"] = .string("spawned_by_caller")
+            if filtered.isEmpty {
+                result["note"] = .string(
+                    "No matching spawned sessions; this is not a workspace inventory. For workspace-wide listing, request observe via session_admin request_scope, then use inventory when available."
+                )
+            }
+        case .none:
+            result["scope"] = .string("unresolved_caller")
+            result["note"] = .string("Caller routing is unresolved; no sessions can be listed. This does not mean the workspace is empty.")
+        }
+        return .object(result)
     }
 
     /// Sidebar pin state is workspace-wide UI state, not a child-session control capability.

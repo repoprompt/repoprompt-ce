@@ -310,7 +310,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         links: @escaping @MainActor () async -> (
             live: [DomainAgentSessionLinkInventoryItem],
             persisted: [AgentSessionOversightIntent]
-        ) = { await AgentSessionLinkRuntimeBridge.shared.oversightInventory() }
+        ) = { await AgentSessionLinkRuntimeBridge.shared.oversightInventory(includeLocation: false) }
     ) {
         self.scanner = scanner
         self.windows = windows

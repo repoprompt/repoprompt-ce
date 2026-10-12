@@ -523,6 +523,68 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertTrue(handler.batches.isEmpty)
     }
 
+    func testAbsentAndUnauthorizedTargetsHaveIdenticalScopeDenials() async throws {
+        let fixture = Fixture()
+        let caller = UUID()
+        let target = UUID()
+        fixture.source.add(caller, parent: nil)
+        _ = try grantTree(fixture, grantee: caller)
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        let handler = RecordingHandler([.adminRename])
+        fixture.core.register(handler)
+        let args: [String: Value] = ["op": .string("rename"), "session_id": .string(target.uuidString)]
+        var messages: [String] = []
+        // The same target is first absent, then present but outside this caller's tree.
+        for exists in [false, true] {
+            if exists { fixture.source.add(target, parent: UUID()) }
+            do {
+                _ = try await fixture.call(args)
+                XCTFail("target must be refused")
+            } catch {
+                messages.append(String(describing: error))
+            }
+        }
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages.first, messages.last)
+        XCTAssertTrue(messages[0].contains("Session '\(target.uuidString)' is not available to this caller's scope."))
+        XCTAssertFalse(messages[0].contains("active workspace"))
+        XCTAssertTrue(handler.batches.isEmpty)
+
+        // No-scope failure remains distinct and tells the caller how to request authority.
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        do {
+            _ = try await fixture.call(args)
+            XCTFail("a scope is required")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("session_admin is not available for this session"))
+            XCTAssertTrue(message.contains("request_scope"))
+            XCTAssertFalse(message.contains(target.uuidString))
+        }
+    }
+
+    func testCleanupGuidanceDoesNotSilentlyAddObserve() async throws {
+        let fixture = Fixture()
+        let caller = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        let reply = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("workspace"),
+            "capabilities": .array([.string("organize"), .string("restructure")])
+        ])
+        let guidance = try XCTUnwrap(reply["guidance"]?.stringValue)
+        for text in ["observe", "inventory", "only that workspace", "history is not a scope inventory"] {
+            XCTAssertTrue(guidance.contains(text), guidance)
+        }
+        XCTAssertEqual(reply["capabilities"], .array([.string("organize"), .string("restructure")]))
+        let requestID = try XCTUnwrap(reply["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let grant = try fixture.runtime.approve(requestID: requestID).get()
+        XCTAssertEqual(grant.grant.capabilities, [.organize, .restructure])
+        let missingObserve = try SessionAdminMCPToolService.deniedValue(.capabilityMissing(.observe), sessionID: nil)
+        XCTAssertTrue(try XCTUnwrap(missingObserve.objectValue?["detail"]?.stringValue).contains("Request a new scope including observe"))
+        let noScope = SessionAdminMCPToolService.scopeSelectionRequiredValue([])
+        XCTAssertTrue(try XCTUnwrap(noScope.objectValue?["guidance"]?.stringValue).contains("request_scope"))
+    }
+
     func testCoreRetireCardsIdleMembersAndReportsRunningOnesWithoutControl() async throws {
         let fixture = Fixture()
         let overseer = UUID()
@@ -5505,6 +5567,114 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             WindowStatesManager.shared.unregisterWindowState(window)
             await window.tearDown()
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+}
+
+@MainActor
+final class AgentSessionInventoryScalingTests: XCTestCase {
+    func testTwoHundredFiftyTargetsShareCarrierAndLivenessCensusAndSeeFreshChanges() async {
+        let window = WindowState()
+        addTeardownBlock { @MainActor in await window.tearDown() }
+        await window.workspaceManager.awaitInitialized()
+        let ids = (0 ..< 250).map { _ in UUID() }
+        var tabs = (0 ..< 1500).map { ComposeTabState(name: "Tab \($0)") }
+        for index in 0 ..< 200 {
+            tabs[index].activeAgentSessionID = ids[index]
+        }
+        tabs[1250].activeAgentSessionID = ids[0] // Duplicate persisted carrier must stay ambiguous.
+        let stashes = (200 ..< 250).map { StashedTab(tab: ComposeTabState(name: "Stash \($0)")) }
+        var workspace = WorkspaceModel(name: "Scale", repoPaths: [], composeTabs: tabs, activeComposeTabID: tabs[0].id)
+        workspace.stashedTabs = stashes
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        window.promptManager.loadComposeTabsFromWorkspace(workspace)
+        let entries = ids.enumerated().map { index, id in
+            AgentSessionIndexEntry(
+                id: id, tabID: index < 200 ? tabs[index].id : stashes[index - 200].tab.id,
+                name: "Indexed \(index)", savedAt: Date(timeIntervalSince1970: 0), itemCount: 1,
+                autoEditEnabled: false, hasUnknownConversationContent: false, isMCPOriginated: false,
+                worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+        }
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        let vm = window.agentModeViewModel
+        vm.test_installSessionIndexSnapshot(Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }), owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        var windowReads = 0
+        let organizer = OpenWindowsAgentSessionOrganizer(windows: { windowReads += 1
+            return [window]
+        })
+        vm.test_resetPersistentBindingResolutionSnapshotBuildCount()
+        let states = organizer.states(of: ids)
+        XCTAssertEqual(states.count, 250)
+        XCTAssertEqual(states.values.count(where: \.isArchived), 50)
+        XCTAssertEqual(states[ids[0]]?.runState, .unknown)
+        XCTAssertEqual(states[ids[1]]?.runState, .idle)
+        XCTAssertEqual(windowReads, 1, "Do not rediscover windows/carriers per target")
+        XCTAssertEqual(vm.test_persistentBindingResolutionBuildCount, 1)
+        XCTAssertLessThanOrEqual(vm.test_sidebarSessionRowsBuildCount, 1)
+
+        windowReads = 0
+        let changed = organizer.setGroup("Grouped", order: 3, sessionIDs: ids)
+        XCTAssertEqual(changed, Set(ids.prefix(200)))
+        XCTAssertEqual(windowReads, 1, "One carrier census per synchronous mutation region")
+        let fresh = organizer.states(of: ids)
+        XCTAssertEqual(fresh[ids[1]]?.sidebarGroup, "Grouped")
+        XCTAssertNil(fresh[ids[249]]?.sidebarGroup, "Nil-bound stashes must not be mistaken for active tabs")
+
+        windowReads = 0
+        let restoredGroups = Dictionary(uniqueKeysWithValues: ids.prefix(200).map { ($0, (name: String?.none, order: Int?.none)) })
+        XCTAssertEqual(organizer.setGroups(restoredGroups), Set(ids.prefix(200)))
+        XCTAssertEqual(windowReads, 1, "Distinct undo group values must share one carrier census")
+        windowReads = 0
+        XCTAssertEqual(organizer.unarchive(Array(ids.suffix(50))), Set(ids.suffix(50)))
+        XCTAssertEqual(windowReads, 1)
+        XCTAssertTrue(window.workspaceManager.activeWorkspace?.stashedTabs.isEmpty == true)
+        XCTAssertEqual(organizer.states(of: ids).values.count(where: \.isArchived), 0)
+        XCTAssertEqual(organizer.loadedSessionIDs().count, 250)
+    }
+
+    func testChainMembershipAndUsageReuseOneFreshSynchronousCensus() {
+        let ids = (0 ..< 250).map { _ in UUID() }
+        let workspace = UUID()
+        let rows = ids.enumerated().map { index, id in
+            DelegationSessionProvenance(sessionID: id, workspaceID: workspace, parentSessionID: index == 0 ? nil : ids[index - 1], createdByOverseerSessionID: nil, isLive: true, worktreeCount: 1, runState: .idle)
+        }
+        let source = CountingSource(rows: rows)
+        var lookups = 0
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: source, onAncestryLookup: { _ in lookups += 1 })
+        let scope = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: ids[0], kind: .tree(rootSessionID: ids[0]), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date(timeIntervalSince1970: 0))
+        projector.withSynchronousCensus { census in
+            for id in ids {
+                XCTAssertEqual(census.members(of: scope), ids)
+                XCTAssertEqual(census.usage(of: scope, spawnParentSessionID: id).liveSessionCount, 250)
+                XCTAssertEqual(census.membershipProof(for: id, in: scope)?.treeDepth, ids.firstIndex(of: id))
+            }
+        }
+        XCTAssertEqual(source.censusReads, 1)
+        XCTAssertEqual(source.individualReads, 0)
+        XCTAssertEqual(lookups, 249_498, "Members, usage and parent depth share bounded scalar ancestry lookups")
+        source.rows = [rows[0]]
+        XCTAssertEqual(projector.members(of: scope), [ids[0]], "A later region must not reuse stale membership")
+        XCTAssertEqual(source.censusReads, 2)
+    }
+
+    private final class CountingSource: DelegationProvenanceSource {
+        var rows: [DelegationSessionProvenance]
+        var censusReads = 0
+        var individualReads = 0
+        init(rows: [DelegationSessionProvenance]) {
+            self.rows = rows
+        }
+
+        func provenance(for id: UUID) -> DelegationSessionProvenance? {
+            individualReads += 1
+            return rows.first { $0.sessionID == id }
+        }
+
+        func allKnownSessions() -> [DelegationSessionProvenance] {
+            censusReads += 1
+            return rows
         }
     }
 }

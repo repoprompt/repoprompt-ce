@@ -720,6 +720,40 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("Skipped workspaces"))
     }
 
+    func testIncompleteHistoryScansNeverImplyAnEmptyWorkspace() throws {
+        for (scanTruncated, skipped) in [(true, [String]()), (false, ["stale index schema v2: 1"]), (false, [])] {
+            let incomplete = scanTruncated || !skipped.isEmpty
+            let list = HistoryListSessionsReply(
+                totalSessions: 0, truncated: false, sessionsScanned: 0,
+                scanTruncated: scanTruncated, scanDiagnostics: nil, totalsAreLowerBounds: nil,
+                skippedWorkspaces: skipped, sessions: []
+            )
+            let search = HistorySearchReply(
+                totalMatches: 0, truncated: false, scanTruncated: scanTruncated,
+                scanDiagnostics: nil, totalsAreLowerBounds: nil, sessionsScanned: 0,
+                skippedWorkspaces: skipped, results: []
+            )
+            let time = HistoryTimeReply(
+                totalSessions: 0, totalActiveDurationSeconds: 0, truncated: false, sessionsScanned: 0,
+                scanTruncated: scanTruncated, scanDiagnostics: nil, totalsAreLowerBounds: nil,
+                skippedWorkspaces: skipped, groups: []
+            )
+            for (op, reply) in [("list_sessions", HistoryToolReply.listSessions(list)), ("search", .search(search)), ("time", .time(time))] {
+                let value = try MCPHistoryToolProvider.encode(reply)
+                XCTAssertEqual(value.objectValue?["scan_complete"], incomplete ? .bool(false) : nil)
+                if incomplete {
+                    XCTAssertEqual(value.objectValue?["totals_are_lower_bounds"], .bool(true))
+                    XCTAssertTrue(try XCTUnwrap(value.objectValue?["scan_note"]?.stringValue).contains("No matches does not prove"))
+                } else {
+                    XCTAssertNil(value.objectValue?["scan_note"])
+                }
+                let text = try Self.onlyText(ToolOutputFormatter.formatHistory(args: ["op": .string(op)], value: value))
+                XCTAssertEqual(text.contains("Scan completeness"), incomplete, op)
+                if incomplete { XCTAssertTrue(text.contains("No matches does not establish"), op) }
+            }
+        }
+    }
+
     func testHistoryFormatterShowsGetSessionWindow() throws {
         struct Entry: Encodable {
             let role = "assistant"

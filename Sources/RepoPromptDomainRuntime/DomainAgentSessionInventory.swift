@@ -209,6 +209,11 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     package let knownSessionIDs: Set<UUID>
 
     private let edgesBySession: [UUID: [DomainAgentSessionInventoryEdge]]
+    private let ancestry: DomainAgentSessionAncestryIndex
+
+    package var ancestryBuildEdgeVisitsForTesting: Int {
+        ancestry.buildEdgeVisits
+    }
 
     package init(
         records: [DomainAgentSessionInventoryRecord],
@@ -234,6 +239,7 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         self.edges = edges
         self.isComplete = isComplete
         self.knownSessionIDs = knownSessionIDs
+        ancestry = DomainAgentSessionAncestryIndex(parents: records.compactMapValues(\.effectiveParentID))
         var bySession: [UUID: [DomainAgentSessionInventoryEdge]] = [:]
         for edge in edges {
             bySession[edge.observerSessionID, default: []].append(edge)
@@ -310,15 +316,9 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     }
 
     /// True when `sessionID` is `rootSessionID` or its placement chain reaches it.
-    package func isInTree(_ sessionID: UUID, rootSessionID: UUID, maxChainLength: Int = 256) -> Bool {
-        var cursor = sessionID
-        var seen: Set<UUID> = []
-        while seen.count < maxChainLength {
-            if cursor == rootSessionID { return true }
-            guard seen.insert(cursor).inserted, let parent = records[cursor]?.effectiveParentID else { return false }
-            cursor = parent
-        }
-        return false
+    package func isInTree(_ sessionID: UUID, rootSessionID: UUID, maxChainLength: Int = 256, onAncestryLookup: ((UUID) -> Void)? = nil) -> Bool {
+        guard maxChainLength > 0, let distance = ancestry.distance(from: sessionID, to: rootSessionID, onLookup: onAncestryLookup) else { return false }
+        return distance < maxChainLength
     }
 
     /// Whole days since last activity, never negative.
