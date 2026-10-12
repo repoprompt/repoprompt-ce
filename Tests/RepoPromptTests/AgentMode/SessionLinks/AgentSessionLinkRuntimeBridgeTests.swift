@@ -2905,6 +2905,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertEqual(before.availableObservers.map(\.observerEndpoint), [fixture.observer.domainEndpoint])
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: fixture.target.domainEndpoint)?.availableObserverCount, 1)
         let inventoryBefore = fixture.host.publishedInventoriesByEndpoint
         let passivePublicationsBefore = fixture.host.passiveNoticePublicationCount
         let authorityBefore = await fixture.authority.snapshot()
@@ -2927,10 +2928,20 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fixture.bridge.sidebarOversightMenu(for: fixture.target.domainEndpoint)
         )
         XCTAssertTrue(repainted.availableObservers.isEmpty)
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: fixture.target.domainEndpoint)?.availableObserverCount, 0, "Candidate readiness invalidates the census without an authority revision")
         XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoryBefore)
         XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passivePublicationsBefore)
         let authorityAfter = await fixture.authority.snapshot()
         XCTAssertEqual(authorityAfter, authorityBefore)
+
+        fixture.host.candidates = [fixture.observer, fixture.target, otherTarget]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: fixture.target.domainEndpoint)?.availableObserverCount, 1, "Readiness recovery also invalidates the census at the same authority revision")
+        let recoveredAuthority = await fixture.authority.snapshot()
+        XCTAssertEqual(recoveredAuthority, authorityBefore)
+        XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint, inventoryBefore)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, passivePublicationsBefore)
     }
 
     // MARK: - Activity high-water
@@ -3847,6 +3858,51 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(targetProps.inbound.first?.displayName, "Planning")
         XCTAssertTrue(targetProps.outbound.isEmpty)
         XCTAssertTrue(targetProps.hasInbound)
+    }
+
+    func testSidebarObserverCensusIsLinearAcross250RowsAndReusedByUnchangedRenders() async throws {
+        let fixture = makeFixture()
+        let observers = (0 ..< 250).map { makeCandidate(windowID: 1, displayName: "Observer \($0)") }
+        let targets = (0 ..< 250).map { makeCandidate(windowID: 2, displayName: "Target \($0)") }
+        fixture.host.candidates = observers + targets
+        for (observer, target) in zip(observers, targets) {
+            guard case .added = await fixture.bridge.addMonitorLink(
+                observerEndpoint: observer.domainEndpoint, targetEndpoint: target.domainEndpoint
+            ) else { return XCTFail("scale link failed") }
+        }
+        await fixture.bridge.test_settleProjections()
+        await fixture.bridge.test_settleMonitorProjectionRefresh()
+        let discoveryReads = fixture.host.candidateReadCount
+        let exactReads = fixture.host.exactCandidateReadCount
+        let visits = fixture.host.boundedCandidateVisits
+        for (observer, target) in zip(observers, targets) {
+            let summary = try XCTUnwrap(fixture.bridge.sidebarOversightSummary(for: target.domainEndpoint))
+            XCTAssertEqual(summary.availableObserverCount, 249)
+            XCTAssertEqual(summary.linkedObserverCount, 1)
+            XCTAssertEqual(summary.inboundObserverNames, [observer.resolvedDisplayName])
+        }
+        XCTAssertEqual(fixture.host.candidateReadCount, discoveryReads, "Closed rows never discover the population")
+        XCTAssertEqual(fixture.host.exactCandidateReadCount - exactReads, 1000, "250 shared observer reads plus three exact reads per row, not 62,500 observer reads")
+        XCTAssertEqual(fixture.host.boundedCandidateVisits - visits, 1250)
+        let reusedExactReads = fixture.host.exactCandidateReadCount
+        let reusedVisits = fixture.host.boundedCandidateVisits
+        for _ in 0 ..< 3 {
+            for target in targets {
+                XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: target.domainEndpoint)?.availableObserverCount, 249)
+            }
+        }
+        XCTAssertEqual(fixture.host.exactCandidateReadCount - reusedExactReads, 2250, "Unchanged renders do not rebuild the observer census")
+        XCTAssertEqual(fixture.host.boundedCandidateVisits - reusedVisits, 3000)
+        XCTAssertEqual(fixture.host.candidateReadCount, discoveryReads)
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: observers[0].domainEndpoint)?.availableObserverCount, 249, "Semantic self is excluded even for an outbound-only row")
+
+        let inputs = await fixture.authority.projectionInputs(forEndpoint: observers[0].domainEndpoint)
+        let item = try XCTUnwrap(inputs.outbound.items.first)
+        await fixture.bridge.revokeLink(linkID: item.linkID, generation: item.generation)
+        await fixture.bridge.test_settleProjections()
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: targets[0].domainEndpoint)?.availableObserverCount, 249)
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: targets[0].domainEndpoint)?.linkedObserverCount, 0)
+        XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: targets[1].domainEndpoint)?.availableObserverCount, 248, "A new membership revision cannot reuse the old census")
     }
 
     func testStatusWorkIsBoundedAndFresh() async {
