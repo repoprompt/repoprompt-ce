@@ -235,7 +235,11 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(result, .sessionNotFound)
             XCTAssertEqual(session.activeAgentSessionID, sessionID, "failed route leaves the same session on screen")
             XCTAssertFalse(session.bindingTransitionInProgress)
+            XCTAssertTrue(session.permitsBoundOperationAndSave, "The failed route must leave the original saved session usable.")
+            XCTAssertNil(session.operationAdmissionFailureMessage)
             XCTAssertNil(session.oversight.overseerActivation)
+            let saveResult = await viewModel.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
+            guard case .success = saveResult else { return XCTFail("The unchanged session must remain saveable: \(saveResult)") }
             if activated {
                 try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
             }
@@ -1299,9 +1303,19 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 return XCTFail("Configured lane did not establish its durable first-save proof: \(outcome)")
             }
             let fileURL = try XCTUnwrap(savedFileURL)
-            XCTAssertTrue(fileURL.path.hasPrefix(fixture.root.path + "/"))
+            let expectedFileURL = WorkspaceSessionSidecarMigration.workspaceDirectory(
+                for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+            ).appendingPathComponent("AgentSessions").appendingPathComponent("AgentSession-\(sessionID.uuidString).json")
+            XCTAssertEqual(fileURL.resolvingSymlinksInPath().path, expectedFileURL.resolvingSymlinksInPath().path)
             let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
             XCTAssertEqual(saved.id, sessionID)
+            XCTAssertEqual(saved.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(saved.composeTabID, tabID)
+            let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            let reopened = try XCTUnwrap(loaded)
+            XCTAssertEqual(reopened.id, sessionID)
+            XCTAssertEqual(reopened.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(reopened.composeTabID, tabID)
             XCTAssertEqual(saved.createdByOverseerSessionID, creatorID)
             XCTAssertEqual(saved.agentKind, fixture.selection.agentRaw)
             XCTAssertEqual(
@@ -1623,7 +1637,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Child",
                 parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(childTarget)
+            let committedChildTarget = await viewModel.commitConfiguredSessionCreation(target: childTarget)
+            XCTAssertTrue(committedChildTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[childTarget.tabID])
             let childID = try XCTUnwrap(child.activeAgentSessionID)
             let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
@@ -1648,7 +1663,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Grandchild",
                 parentSessionID: childID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(grandchildTarget)
+            let committedGrandchildTarget = await viewModel.commitConfiguredSessionCreation(target: grandchildTarget)
+            XCTAssertTrue(committedGrandchildTarget, "The descendant fixture must finish its real first payload save.")
             let grandchild = try XCTUnwrap(viewModel.sessions[grandchildTarget.tabID])
             grandchild.runState = .waitingForApproval
             XCTAssertFalse(childrenSettled(), "an active grandchild must also block the stash cascade")
@@ -1695,7 +1711,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Live grandchild",
                 parentSessionID: diskOnlyChild.id, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let grandchild = try XCTUnwrap(viewModel.sessions[target.tabID])
             grandchild.runState = .completed
             grandchild.isDirty = true
@@ -1734,7 +1751,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Finished child",
                 parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .completed
             child.isDirty = true
@@ -2032,7 +2050,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     sessionName: "Finished child \(index)", parentSessionID: lane.sessionID,
                     expectedWorkspaceID: fixture.workspaceID
                 )
-                viewModel.mcpAcceptSessionTarget(target)
+                let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+                XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
                 let child = try XCTUnwrap(viewModel.sessions[target.tabID])
                 try children.append((XCTUnwrap(child.activeAgentSessionID), target.tabID))
                 child.runState = .running
@@ -2168,7 +2187,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Settled child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true
@@ -2250,7 +2270,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             sessionName: "Mid-hydration child", parentSessionID: laneSessionID,
             expectedWorkspaceID: fixture.workspaceID
         )
-        viewModel.mcpAcceptSessionTarget(target)
+        let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+        XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
         let child = try XCTUnwrap(viewModel.sessions[target.tabID])
         let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
         child.runState = .idle
@@ -2486,7 +2507,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Unrelated parent", parentSessionID: nil,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(otherTarget)
+            let committedOtherTarget = await viewModel.commitConfiguredSessionCreation(target: otherTarget)
+            XCTAssertTrue(committedOtherTarget, "The descendant fixture must finish its real first payload save.")
             let otherParent = try XCTUnwrap(viewModel.sessions[otherTarget.tabID])
             let otherParentSessionID = try XCTUnwrap(otherParent.activeAgentSessionID)
             let target = try await viewModel.mcpResolveOrCreateSessionTarget(
@@ -2494,7 +2516,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Cross-tier child", parentSessionID: otherParentSessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
@@ -2546,7 +2569,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Disk-orphaned child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
@@ -2598,7 +2622,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Repudiated child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true

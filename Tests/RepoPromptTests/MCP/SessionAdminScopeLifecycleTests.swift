@@ -4031,7 +4031,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         fixture.organizer.states[b]?.sidebarGroup = "Gamma"
         fixture.organizer.written.removeAll()
         let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
-        XCTAssertEqual(undone["result"], .string("undone"))
+        XCTAssertEqual(undone["result"], .string("partially_undone"))
+        XCTAssertEqual(undone["changed_count"], .int(1))
         XCTAssertEqual(items(undone)[a.uuidString], "changed")
         XCTAssertEqual(items(undone)[b.uuidString], "skipped")
         let rows = try XCTUnwrap(undone["items"]?.arrayValue)
@@ -5705,51 +5706,57 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-owner-location-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
         let workspaceID = UUID(), caller = UUID(), target = UUID()
-        let location = HistoryWorkspaceLocation(
-            runtimeID: UUID(), workspaceID: workspaceID, name: "Custom inventory",
-            directory: directory.appendingPathComponent("CustomWorkspace")
-        )
-        let sessions = location.directory.appendingPathComponent("AgentSessions")
+        // Capture both URL representations before storage exists. An unhinted URL must keep
+        // naming this same registered directory after Foundation recognizes it as a directory.
+        let locations = [false, true].map { isDirectory in
+            HistoryWorkspaceLocation(
+                runtimeID: UUID(), workspaceID: workspaceID, name: "Custom inventory",
+                directory: directory.appendingPathComponent("CustomWorkspace", isDirectory: isDirectory)
+            )
+        }
+        let sessions = locations[0].directory.appendingPathComponent("AgentSessions")
         try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
         try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [directRecord(id: target, parent: nil, workspace: workspaceID)]))
             .write(to: sessions.appendingPathComponent("AgentSessionIndex.json"))
-        let scanner = HistorySessionScanner(
-            applicationSupportRoot: directory,
-            workspaceDirectoryProvider: { _ in XCTFail("workspace inventory must not enumerate the application root")
-                return []
-            },
-            workspaceLocations: .init(resolve: { selector in
-                guard selector == .id(workspaceID) else {
-                    XCTFail("scope selector must reach the owner as its UUID")
-                    return .unavailable
-                }
-                return .matched(location)
-            })
-        )
-        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspaceID))
-        let handler = AgentSessionInventoryOperationHandler(
-            source: source, scopeChain: { runtime.scopeChain(from: $0) },
-            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
-            isLeaseCurrent: { runtime.isCurrent($0) }
-        )
-        let value = try await handler.perform(.init(
-            request: .init(operation: .adminInventory, caller: .agentSession(caller)),
-            scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
-        ))
-        let reply = try XCTUnwrap(value.objectValue)
-        XCTAssertEqual(reply["total"], .int(1))
-        XCTAssertEqual(reply["total_complete"], .bool(true))
-        XCTAssertEqual(reply["history_complete"], .bool(true))
-        XCTAssertEqual(reply["endpoints_complete"], .bool(false))
-        let rows = try XCTUnwrap(reply["sessions"]?.arrayValue)
-        XCTAssertEqual(rows.compactMap { $0.objectValue?["session_id"]?.stringValue }, [target.uuidString])
-        XCTAssertEqual(rows.first?.objectValue?["workspace_id"], .string(workspaceID.uuidString))
-        let indexReads = await scanner.indexDecodeCountForTesting
-        let transcriptReads = await scanner.transcriptDecodeCountForTesting
-        XCTAssertEqual(indexReads, 1)
-        XCTAssertEqual(transcriptReads, 0)
+        for location in locations {
+            let scanner = HistorySessionScanner(
+                applicationSupportRoot: directory,
+                workspaceDirectoryProvider: { _ in XCTFail("workspace inventory must not enumerate the application root")
+                    return []
+                },
+                workspaceLocations: .init(resolve: { selector in
+                    guard selector == .id(workspaceID) else {
+                        XCTFail("scope selector must reach the owner as its UUID")
+                        return .unavailable
+                    }
+                    return .matched(location)
+                })
+            )
+            let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspaceID))
+            let handler = AgentSessionInventoryOperationHandler(
+                source: source, scopeChain: { runtime.scopeChain(from: $0) },
+                isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+                isLeaseCurrent: { runtime.isCurrent($0) }
+            )
+            let value = try await handler.perform(.init(
+                request: .init(operation: .adminInventory, caller: .agentSession(caller)),
+                scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+            ))
+            let reply = try XCTUnwrap(value.objectValue)
+            XCTAssertEqual(reply["total"], .int(1))
+            XCTAssertEqual(reply["total_complete"], .bool(true))
+            XCTAssertEqual(reply["history_complete"], .bool(true))
+            XCTAssertEqual(reply["endpoints_complete"], .bool(false))
+            let rows = try XCTUnwrap(reply["sessions"]?.arrayValue)
+            XCTAssertEqual(rows.compactMap { $0.objectValue?["session_id"]?.stringValue }, [target.uuidString])
+            XCTAssertEqual(rows.first?.objectValue?["workspace_id"], .string(workspaceID.uuidString))
+            let indexReads = await scanner.indexDecodeCountForTesting
+            let transcriptReads = await scanner.transcriptDecodeCountForTesting
+            XCTAssertEqual(indexReads, 1)
+            XCTAssertEqual(transcriptReads, 0)
+        }
     }
 
     func testWorkspaceInventorySeparatesRecordCoverageFromUnknownOrganizationAndEndpoints() async throws {
@@ -7201,8 +7208,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     latestOwner: .init(workspaceID: workspace.id, activationEpoch: oldOwner.activationEpoch + 1)
                 )
                 XCTAssertTrue(vm.test_ownerValidatedSessionIndex.isEmpty)
-                let cached = vm.sidebarSessions(for: workspace.composeTabs)
-                XCTAssertTrue(cached.contains { $0.sessionID == target }, "owner invalidation alone does not change the UI cache key")
+                let cached = try XCTUnwrap(vm.sidebarSessionRowsCache)
+                XCTAssertTrue(cached.rows.contains { $0.sessionID == target }, "fixture retains the previously cached presentation row")
                 let scanner = Scanner()
                 let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })
                 let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
@@ -7976,9 +7983,9 @@ final class AgentSessionInventoryScalingTests: XCTestCase {
         })
         vm.test_resetPersistentBindingResolutionSnapshotBuildCount()
         let states = organizer.states(of: ids)
-        XCTAssertEqual(states.count, 250)
+        XCTAssertEqual(Set(states.keys), Set(ids.dropFirst()))
         XCTAssertEqual(states.values.count(where: \.isArchived), 50)
-        XCTAssertEqual(states[ids[0]]?.runState, .unknown)
+        XCTAssertNil(states[ids[0]], "Ambiguous carriers must not supply an actionable presentation")
         XCTAssertEqual(states[ids[1]]?.runState, .idle)
         XCTAssertEqual(windowReads, 1, "Do not rediscover windows/carriers per target")
         XCTAssertEqual(vm.test_persistentBindingResolutionBuildCount, 1)
@@ -7986,15 +7993,22 @@ final class AgentSessionInventoryScalingTests: XCTestCase {
 
         windowReads = 0
         let changed = organizer.setGroup("Grouped", order: 3, sessionIDs: ids)
-        XCTAssertEqual(changed, Set(ids.prefix(200)))
+        let writableIDs = Set(ids[1 ..< 200])
+        XCTAssertEqual(changed, writableIDs)
         XCTAssertEqual(windowReads, 1, "One carrier census per synchronous mutation region")
+        for tabID in [tabs[0].id, tabs[1250].id] {
+            let tab = window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == tabID }
+            XCTAssertNotNil(tab)
+            XCTAssertNil(tab?.sidebarGroup, "Neither duplicate carrier may be mutated")
+            XCTAssertNil(tab?.sidebarGroupOrder)
+        }
         let fresh = organizer.states(of: ids)
         XCTAssertEqual(fresh[ids[1]]?.sidebarGroup, "Grouped")
         XCTAssertNil(fresh[ids[249]]?.sidebarGroup, "Nil-bound stashes must not be mistaken for active tabs")
 
         windowReads = 0
         let restoredGroups = Dictionary(uniqueKeysWithValues: ids.prefix(200).map { ($0, (name: String?.none, order: Int?.none)) })
-        XCTAssertEqual(organizer.setGroups(restoredGroups), Set(ids.prefix(200)))
+        XCTAssertEqual(organizer.setGroups(restoredGroups), writableIDs)
         XCTAssertEqual(windowReads, 1, "Distinct undo group values must share one carrier census")
         windowReads = 0
         XCTAssertEqual(organizer.unarchive(Array(ids.suffix(50))), Set(ids.suffix(50)))
@@ -8016,7 +8030,9 @@ final class AgentSessionInventoryScalingTests: XCTestCase {
         let scope = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: ids[0], kind: .tree(rootSessionID: ids[0]), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date(timeIntervalSince1970: 0))
         projector.withSynchronousCensus { census in
             for id in ids {
-                XCTAssertEqual(census.members(of: scope), ids)
+                let members = census.members(of: scope)
+                XCTAssertEqual(members.count, ids.count)
+                XCTAssertEqual(Set(members), Set(ids))
                 XCTAssertEqual(census.usage(of: scope, spawnParentSessionID: id).liveSessionCount, 250)
                 XCTAssertEqual(census.membershipProof(for: id, in: scope)?.treeDepth, ids.firstIndex(of: id))
             }

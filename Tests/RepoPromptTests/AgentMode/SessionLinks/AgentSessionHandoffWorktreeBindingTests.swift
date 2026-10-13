@@ -11,12 +11,31 @@ import XCTest
 /// falling back to the primary checkout. Regression coverage for repoprompt-ce#1210.
 @MainActor
 final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testBoundSourceHandoffInstallsSourceMappingsBeforeFirstSaveAndActivation() async throws {
         try await withFixture(bindSource: true) { fixture in
             let sourceBindings = fixture.sourceSession.worktreeBindings
             XCTAssertFalse(sourceBindings.isEmpty)
             let cutoffItemID = try XCTUnwrap(fixture.sourceSession.items.last?.id)
             var destinationSaves: [[AgentSessionWorktreeBinding]] = []
+            var sawPublishedDestinationBinding = false
+
+            fixture.viewModel.test_afterHandoffDestinationCreation = { destination in
+                sawPublishedDestinationBinding = true
+                let sessionID = destination.activeAgentSessionID
+                XCTAssertNotNil(sessionID)
+                XCTAssertEqual(
+                    fixture.window.workspaceManager.composeTab(with: destination.tabID)?.activeAgentSessionID,
+                    sessionID,
+                    "the creation owner must publish the claimed identity before any asynchronous preparation"
+                )
+                XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
+                XCTAssertNotNil(destination.operationAdmissionFailureMessage)
+            }
 
             fixture.viewModel.test_setAgentSessionSaver { session, _, _ in
                 guard session.id != fixture.sourceSessionID else {
@@ -40,6 +59,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             )
 
             let destination = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertTrue(sawPublishedDestinationBinding)
             let destinationSessionID = try XCTUnwrap(destination.activeAgentSessionID)
             XCTAssertNotEqual(destinationSessionID, fixture.sourceSessionID)
             XCTAssertEqual(

@@ -8,7 +8,6 @@ import XCTest
 final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
     func testResidentInstructionSteerAndPollDoNotCaptureOrConsumeComposer() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
@@ -74,7 +73,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testResidentMessageAndWaitRefusesBeforeSubmission() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         let service = makeService(window: window)
@@ -103,7 +101,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
     /// snapshot, returned successfully before any timeout wait is enrolled.
     func testResidentStandaloneWaitPreservesLegacyResult() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         let service = makeService(window: window)
@@ -143,10 +140,9 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testColdResidentPollPreservesLegacySuccessShape() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
-        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
-        session.hasLoadedPersistedState = false
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID, restored: false)
+        XCTAssertFalse(session.permitsBoundOperationAndSave, "A cold binding must remain unproven")
         let service = makeService(window: window)
         let expected = legacyExpiredValue(sessionID: sessionID)
         let single = try await service.execute(args: ["op": .string("poll"), "session_id": .string(sessionID.uuidString)])
@@ -166,13 +162,35 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testReconstructedSteerAcceptsBeforeLaterBookkeepingFailure() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
+        let persistedTabID = UUID()
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let persistedItems = [
+            AgentChatItem.user("saved request", sequenceIndex: 0),
+            AgentChatItem.assistant("saved response", sequenceIndex: 1)
+        ]
+        // Reconstruction must restore a real payload; an index row cannot establish authority.
+        _ = try await AgentSessionDataService.shared.saveAgentSession(
+            AgentSession(
+                id: sessionID,
+                workspaceID: workspace.id,
+                composeTabID: persistedTabID,
+                name: "Persisted reconstructed steer",
+                items: persistedItems.map { AgentChatItemPersist(from: $0) },
+                itemCount: persistedItems.count,
+                agentKind: AgentProviderKind.codexExec.rawValue,
+                agentModel: "test-model",
+                lastRunState: AgentSessionRunState.completed.rawValue,
+                autoEditEnabled: false,
+                isMCPOriginated: true
+            ),
+            for: workspace
+        )
         viewModel.upsertSessionIndex(
             sessionID: sessionID,
-            tabID: UUID(),
+            tabID: persistedTabID,
             name: "Persisted reconstructed steer",
             lastUserMessageAt: nil,
             savedAt: Date(timeIntervalSince1970: 1_800_000_000),
@@ -189,6 +207,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
             providerDispatchCount += 1
             let session = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+            XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "saved response" })
             session.runState = .running
             agentModeVM.publishMCPStateChange(for: session)
             return .startedRun
@@ -225,7 +245,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testMCPOriginSteerReactivationDispatchFailureCleansControlContext() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
@@ -261,7 +280,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testMCPOriginSteerReactivationDispatchFailurePreservesReplacementControlContextButClearsPendingMask() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
@@ -322,7 +340,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testSteerUnknownSessionIDStillFailsWithoutCreatingRegistration() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         let viewModel = window.agentModeViewModel
         let unknownSessionID = UUID()
@@ -350,7 +367,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testMCPOriginReconstructedSteerRejectsWorkspaceDriftWhenSessionBecomesActiveDuringControlActivation() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
@@ -359,7 +375,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.runState = .completed
         let driftWorkspace = window.workspaceManager.createWorkspace(
             name: "Steer Activation Drift \(UUID().uuidString.prefix(8))",
-            repoPaths: [FileManager.default.currentDirectoryPath],
+            repoPaths: [],
             ephemeral: true
         )
         var switchSucceeded = false
@@ -402,7 +418,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testResidentSteerCancelledDuringCallerResolutionDoesNotAcceptInput() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
@@ -465,7 +480,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testResidentSteerCancellationAfterAcceptanceRetainsQueuedInput() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         session.selectedAgent = .claudeCode
@@ -514,7 +528,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testResidentActiveClaudeSessionQueuesWithoutCapture() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         session.selectedAgent = .claudeCode
@@ -549,7 +562,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testLinkedResidentResumeAndExistingTabStartRefuseBeforeActivation() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         let viewModel = window.agentModeViewModel
@@ -576,7 +588,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testLateRealGrantRefusesInstallationAndSurvivesEligibilityAudit() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
@@ -608,7 +619,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     func testActivationIdentityAndMembershipHoldRefuseButStableZeroLinkAdopts() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
@@ -627,18 +637,103 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         do {
             _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
             XCTFail("post-await target drift must refuse")
-        } catch { XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentTargetError)) }
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                String(describing: error),
+                String(describing: MCPError.invalidParams("Wait for this session to finish loading."))
+            )
+        }
         session.finishPersistentBindingTransition(generation: transitionGeneration)
-        session.markCurrentBindingHydrated()
+        establishRestoredFixture(session)
         viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in false }
         _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
         XCTAssertNotNil(session.mcpControlContext)
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testInstalledActivationRejectionRestoresOwnedStateAndPreservesSuccessorRegistration() async throws {
+        enum Interleaving: CaseIterable { case lateMembership, successorEpoch, reboundBinding }
+        for interleaving in Interleaving.allCases {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            try await AsyncTestWait.waitUntil("approval-store subscription initialized") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            await viewModel.applyEditsApprovalStore.setAutoEditEnabled(
+                false, for: viewModel.applyEditsScope(for: session.tabID), updateGlobalDefault: false
+            )
+            try await AsyncTestWait.waitUntil("approval-store auto-edit override applied") {
+                await MainActor.run { !session.autoEditEnabled }
+            }
+            let previousPermission = session.permissionProfile
+            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+            var hold: UInt64?
+            var setupAwaitCount = 0
+            var installedContext: AgentModeViewModel.AgentMCPControlContext?
+            var successorContext: AgentModeViewModel.AgentMCPControlContext?
+            viewModel.test_afterMCPControlSetupAwait = { current in
+                XCTAssertIdentical(current, session)
+                setupAwaitCount += 1
+                guard let context = current.mcpControlContext else { return XCTFail("Expected installed context") }
+                installedContext = context
+                switch interleaving {
+                case .lateMembership:
+                    guard setupAwaitCount == 2 else { return }
+                    XCTAssertTrue(current.isMCPOriginated)
+                    XCTAssertTrue(current.autoEditEnabled)
+                    hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+                case .successorEpoch:
+                    var successor = context
+                    successor.pendingEpochTransition = .init(token: UUID(), kind: .steering, expectedCurrentEpoch: nil)
+                    current.mcpControlContext = successor
+                    successorContext = successor
+                case .reboundBinding:
+                    do { try self.rebindCancelSession(current, to: UUID(), in: window) }
+                    catch { XCTFail("Could not install successor binding: \(error)") }
+                }
+            }
+            do {
+                _ = try await viewModel.mcpActivateControlContext(
+                    forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true
+                )
+                XCTFail("The changed activation must be rejected: \(interleaving)")
+            } catch let error as MCPError {
+                let expected = interleaving == .lateMembership
+                    ? AgentModeViewModel.mcpResidentTargetError
+                    : "The MCP control activation was superseded during setup."
+                XCTAssertEqual(String(describing: error), String(describing: MCPError.invalidParams(expected)))
+            }
+            viewModel.test_afterMCPControlSetupAwait = nil
+            let installed = try XCTUnwrap(installedContext)
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            if interleaving == .successorEpoch {
+                XCTAssertEqual(session.mcpControlContext, successorContext)
+                XCTAssertEqual(registration, installed.registration, "The losing activation must not clean its successor's registration")
+            } else {
+                XCTAssertNil(registration, "An abandoned activation must release its own registration")
+            }
+            if interleaving == .lateMembership {
+                XCTAssertEqual(setupAwaitCount, 2, "Exercise rejection after origin, pending state and permission were overridden")
+                XCTAssertNil(session.mcpControlContext)
+                XCTAssertFalse(session.mcpFollowUpRunPending)
+                XCTAssertFalse(session.isMCPOriginated)
+                XCTAssertEqual(session.permissionProfile, previousPermission)
+                let autoEdit = await viewModel.applyEditsApprovalStore.autoEditEnabled(for: viewModel.applyEditsScope(for: session.tabID))
+                XCTAssertFalse(autoEdit)
+                try await AsyncTestWait.waitUntil("approval-store rollback projected") {
+                    await MainActor.run { !session.autoEditEnabled }
+                }
+                XCTAssertFalse(session.autoEditEnabled)
+                if let hold { viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil) }
+            }
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+    }
+
     func testActivationFenceRejectsLossOfInitiallyRegisteredWindow() async throws {
         let window = try await makeWindow()
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         let vm = window.agentModeViewModel
@@ -780,7 +875,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                         let replacement = AgentModeViewModel.TabSession(tabID: original.tabID)
                         viewModel.test_installLiveSession(replacement)
                         try self.rebindCancelSession(replacement, to: UUID(), in: window)
-                        replacement.hasLoadedPersistedState = true
+                        self.establishRestoredFixture(replacement)
                         replacement.parentSessionID = callerID
                         replacement.selectedAgent = .claudeCode
                         _ = try await viewModel.mcpActivateControlContext(
@@ -894,8 +989,6 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let window = try await makeWindow()
         addTeardownBlock { @MainActor in
             window.agentModeViewModel.test_setBeforeCancellationCommit(nil)
-            WindowStatesManager.shared.unregisterWindowState(window)
-            await window.tearDown()
         }
         return window
     }
@@ -915,8 +1008,15 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         if startPending {
             _ = try XCTUnwrap(window.agentModeViewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
         } else {
+            await window.agentModeViewModel.prepareMCPWaitTrackingForRunStart(
+                session: session, stopFence: .init(session: session)
+            )
+            let preparedEpoch = try XCTUnwrap(session.mcpControlContext?.preparedEpoch)
+            XCTAssertEqual(session.mcpControlContext?.currentEpoch, preparedEpoch)
             session.installRunID(UUID())
-            _ = session.beginRunAttempt(source: "public-cancel-admission")
+            let ownership = session.beginRunAttempt(source: "public-cancel-admission")
+            XCTAssertEqual(ownership.turnEpoch, preparedEpoch)
+            XCTAssertNil(session.mcpControlContext?.preparedEpoch)
             session.runState = .running
         }
         window.agentModeViewModel.publishMCPStateChange(for: session)
@@ -1011,12 +1111,22 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
+        addTeardownBlock { @MainActor in
+            let viewModel = window.agentModeViewModel
+            viewModel.test_afterMCPControlActivation = nil
+            viewModel.test_afterMCPControlRegistration = nil
+            viewModel.test_afterMCPControlSetupAwait = nil
+            viewModel.test_agentSessionLinkHasActiveOutboundLink = nil
+            viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = nil
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
         await window.workspaceManager.awaitInitialized()
         let workspace = window.workspaceManager.createWorkspace(
             name: "Steer Resume \(UUID().uuidString.prefix(8))",
-            repoPaths: [FileManager.default.currentDirectoryPath],
+            repoPaths: [],
             ephemeral: true
         )
         await window.workspaceManager.switchWorkspace(
@@ -1031,7 +1141,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     private func makeWorkspaceOwnedSession(
         in window: WindowState,
-        sessionID: UUID, tabID requestedTabID: UUID? = nil
+        sessionID: UUID, tabID requestedTabID: UUID? = nil, restored: Bool = true
     ) async throws -> AgentModeViewModel.TabSession {
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(requestedTabID ?? workspace.activeComposeTabID)
@@ -1041,8 +1151,21 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             on: session,
             compareAndSetInWorkspaceID: workspace.id
         )
-        XCTAssertNotNil(binding)
+        _ = try XCTUnwrap(binding)
+        if restored {
+            establishRestoredFixture(session)
+        } else {
+            session.hasLoadedPersistedState = false
+        }
         return session
+    }
+
+    /// These management fixtures begin after restoration; binding installation alone is not proof.
+    private func establishRestoredFixture(_ session: AgentModeViewModel.TabSession) {
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.markCurrentBindingHydrated()
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
     }
 
     private func makeService(

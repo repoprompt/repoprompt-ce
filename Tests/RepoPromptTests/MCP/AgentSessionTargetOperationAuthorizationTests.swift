@@ -864,7 +864,9 @@ final class DelegationMembershipCensusTests: XCTestCase {
             let scope = grant(kind, grantee: root)
             let individual = rows.filter { projector.membershipProof(for: $0.sessionID, in: scope) != nil }.map(\.sessionID)
             source.resetCounts()
-            XCTAssertEqual(projector.members(of: scope), individual)
+            let members = projector.members(of: scope)
+            XCTAssertEqual(Set(members), Set(individual))
+            XCTAssertEqual(members.count, individual.count, "Census membership must not duplicate a session")
             XCTAssertEqual(source.censusReads, 1)
             XCTAssertEqual(source.individualReads, 0)
             let usage = projector.usage(of: scope, spawnParentSessionID: parent)
@@ -1164,6 +1166,8 @@ final class DelegationMembershipCensusTests: XCTestCase {
             default: XCTFail("Unhandled fixture")
             }
             let window = await carrierWindow(workspace: workspace, entries: [carrierEntry(target, tabID: tab.id)])
+            XCTAssertEqual(window.workspaceManager.activeWorkspace, workspace)
+            XCTAssertEqual(window.workspaceManager.sessionCarriers(sessionIDs: [target]).count, 2, conflict)
             if !workspace.composeTabs.isEmpty { installIdleCarrier(target, tabID: tab.id, on: window) }
             try await assertAmbiguousAdministrationRefused(target, workspaceID: workspace.id, windows: [window], context: conflict)
         }
@@ -1352,14 +1356,21 @@ final class DelegationMembershipCensusTests: XCTestCase {
                 ComposeTabState(name: "Unrelated \(index)", activeAgentSessionID: UUID())
             }
             let duplicate = ComposeTabState(name: "Unrelated conflict", activeAgentSessionID: conflicting)
+            let competing = ComposeTabState(name: "Other unrelated carrier", activeAgentSessionID: conflicting)
             let workspace = WorkspaceModel(
                 name: "Bounded point proof", repoPaths: [], ephemeralFlag: true,
-                composeTabs: [tab, duplicate, duplicate] + unrelated, activeComposeTabID: tab.id
+                composeTabs: [tab, duplicate, competing] + unrelated, activeComposeTabID: tab.id
             )
             let entries = [carrierEntry(target, tabID: tab.id), carrierEntry(conflicting, tabID: duplicate.id)]
                 + unrelated.map { carrierEntry($0.activeAgentSessionID!, tabID: $0.id) }
             let window = await carrierWindow(workspace: workspace, entries: entries)
             installIdleCarrier(target, tabID: tab.id, on: window)
+            XCTAssertEqual(window.workspaceManager.sessionCarriers(sessionIDs: [conflicting]).count, 2)
+            XCTAssertEqual(
+                SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource(windows: { [window] }))
+                    .pointResolutionState(for: conflicting),
+                .ambiguous
+            )
             let fixture = try carrierAdministration(windows: [window], workspaceID: workspace.id)
             let manager = window.workspaceManager
             let viewModel = window.agentModeViewModel
@@ -1403,7 +1414,11 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let entry = carrierEntry(target, tabID: tab.id)
         let owner = await carrierWindow(workspace: workspace, entries: [entry])
         let peer = await carrierWindow(workspace: otherWorkspace, entries: [])
-        peer.workspaceManager.workspaces.append(workspace)
+        let ownerChatID = await owner.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
+        XCTAssertNotNil(ownerChatID)
+        let settledOwnerWorkspace = try XCTUnwrap(owner.workspaceManager.activeWorkspace)
+        XCTAssertEqual(settledOwnerWorkspace.composeTabs.first { $0.id == keepAlive.id }?.activeChatSessionID, ownerChatID)
+        peer.workspaceManager.workspaces.append(settledOwnerWorkspace)
         installIdleCarrier(target, tabID: tab.id, on: owner)
         let windows = [owner, peer]
         let projector = SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource(windows: { windows }))
@@ -1422,14 +1437,18 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertTrue(context.isStillAuthorized(observeLease, scope: fixture.scope, requiresMutationOwner: false))
         let beforeOwnerIndex = owner.agentModeViewModel.sessionIndex
         var preflightVisits = 0
+        var beforePeerWorkspace: WorkspaceModel?
         let token = owner.promptManager.setComposeTabsRemovalPreflight { tabIDs, _, workspaceID in
             XCTAssertEqual(tabIDs, [tab.id])
             XCTAssertEqual(workspaceID, workspace.id)
             preflightVisits += 1
-            peer.workspaceManager.activeWorkspace = workspace
-            peer.promptManager.loadComposeTabsFromWorkspace(workspace)
-            self.installCarrierIndex([target: entry], workspace: workspace, on: peer)
-            await Task.yield()
+            peer.workspaceManager.activeWorkspace = settledOwnerWorkspace
+            peer.promptManager.loadComposeTabsFromWorkspace(settledOwnerWorkspace)
+            let peerChatID = await peer.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
+            XCTAssertNotNil(peerChatID)
+            beforePeerWorkspace = peer.workspaceManager.activeWorkspace
+            XCTAssertEqual(beforePeerWorkspace?.composeTabs.first { $0.id == keepAlive.id }?.activeChatSessionID, peerChatID)
+            self.installCarrierIndex([target: entry], workspace: settledOwnerWorkspace, on: peer)
             return .proceed
         }
         defer { owner.promptManager.removeComposeTabsRemovalPreflight(token) }
@@ -1439,8 +1458,8 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let archived = await organizer.archive([target], isAuthorized: { _ in true })
         XCTAssertEqual(preflightVisits, 1)
         XCTAssertTrue(archived.isEmpty)
-        XCTAssertEqual(owner.workspaceManager.activeWorkspace, workspace)
-        XCTAssertEqual(peer.workspaceManager.activeWorkspace, workspace)
+        XCTAssertEqual(owner.workspaceManager.activeWorkspace, settledOwnerWorkspace)
+        XCTAssertEqual(peer.workspaceManager.activeWorkspace, try XCTUnwrap(beforePeerWorkspace))
         XCTAssertEqual(owner.agentModeViewModel.sessionIndex, beforeOwnerIndex)
         XCTAssertEqual(peer.agentModeViewModel.sessionIndex, [target: entry])
         XCTAssertEqual(projector.pointResolutionState(for: target), .replicated)
@@ -1644,7 +1663,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let window = await carrierWindow(workspace: workspace, entries: [childEntry])
         let source = OpenWindowsDelegationProvenanceSource(windows: { [window] })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
-        let scopes = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let pending = try scopes.requestScope(
             requesterSessionID: child, requesterTabID: nil, kind: .tree(rootSessionID: root),
             capabilities: [.observe, .spawn], guardrails: .init(maxLiveSessions: 10), reason: nil, idempotencyKey: nil
@@ -1730,7 +1749,12 @@ final class DelegationMembershipCensusTests: XCTestCase {
         }
         window.workspaceManager.workspaces = [workspace]
         window.workspaceManager.activeWorkspace = workspace
-        window.promptManager.loadComposeTabsFromWorkspace(workspace)
+        // Keep every raw carrier claim in the mutation owner, including deliberately repeated
+        // tab IDs. Sidebar rendering requires one UI row per tab and is not the proof under test.
+        var presentation = workspace
+        var presentedTabIDs: Set<UUID> = []
+        presentation.composeTabs = workspace.composeTabs.filter { presentedTabIDs.insert($0.id).inserted }
+        window.promptManager.loadComposeTabsFromWorkspace(presentation)
         installCarrierIndex(Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }), workspace: workspace, on: window)
         return window
     }
@@ -1743,6 +1767,9 @@ final class DelegationMembershipCensusTests: XCTestCase {
     private func installIdleCarrier(_ sessionID: UUID, tabID: UUID, on window: WindowState) {
         let live = AgentModeViewModel.TabSession(tabID: tabID)
         live.testInstallPersistentSessionBinding(sessionID: sessionID)
+        live.hasLoadedPersistedState = true
+        live.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNil(live.operationAdmissionFailureMessage)
         window.agentModeViewModel.test_installLiveSession(live)
     }
 
@@ -1767,7 +1794,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
     ) {
         let source = OpenWindowsDelegationProvenanceSource(windows: { windows })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
-        let scopes = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let pending = try scopes.requestScope(
             requesterSessionID: callerID, requesterTabID: nil, kind: .workspace(workspaceID: workspaceID),
             capabilities: capabilities, guardrails: .init(bulkConfirmationThreshold: threshold), reason: nil, idempotencyKey: nil

@@ -481,9 +481,6 @@ import XCTest
                 let manager = fixture.networkManager
                 let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
                 let gate = MCPQueuedPolicyAdmissionGate()
-                let entered = expectation(description: "\(change.rawValue) reached its exact policy-change boundary")
-                let removalStarted = change == .removed
-                    ? expectation(description: "Exact connection removal crossed its terminal fence") : nil
                 var agents: [QueuedSessionAdminAgent] = []
                 var pendingCall: Task<PersistentMCPTestRPCResponse, Error>?
                 var removalTask: Task<Void, Never>?
@@ -537,6 +534,19 @@ import XCTest
                         ).get()
                         scopeID = grant.id
                     }
+                    var arguments = Self.queuedScopeRequestArguments(a, key: "queued-\(UUID())")
+                    if rename {
+                        arguments = try [
+                            "op": "rename", "session_id": a.sessionID.uuidString,
+                            "scope_id": XCTUnwrap(scopeID).uuidString,
+                            "name": "Renamed by admitted policy", "idempotency_key": "rename-\(UUID())",
+                            "_rawJSON": true
+                        ]
+                    }
+                    let callArguments = arguments
+                    let entered = expectation(description: "\(change.rawValue) reached its exact policy-change boundary")
+                    let removalStarted = change == .removed
+                        ? expectation(description: "Exact connection removal crossed its terminal fence") : nil
                     MCPLifecycleDiagnostics.shared.beginCapture(connectionID: a.endpoint.connectionID) { event in
                         if event.phase == .removalStarted { removalStarted?.fulfill() }
                     }
@@ -551,16 +561,6 @@ import XCTest
                             await gate.hold { entered.fulfill() }
                         }
                     }
-                    var arguments = Self.queuedScopeRequestArguments(a, key: "queued-\(UUID())")
-                    if rename {
-                        arguments = try [
-                            "op": "rename", "session_id": a.sessionID.uuidString,
-                            "scope_id": XCTUnwrap(scopeID).uuidString,
-                            "name": "Renamed by admitted policy", "idempotency_key": "rename-\(UUID())",
-                            "_rawJSON": true
-                        ]
-                    }
-                    let callArguments = arguments
                     let call = Task {
                         try await a.endpoint.callTool(name: MCPWindowToolName.sessionAdmin, arguments: callArguments)
                     }
@@ -720,26 +720,34 @@ import XCTest
             try await activateWorkspace(for: context)
             let window = context.window
             let vm = window.agentModeViewModel
-            var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            let tabPosition = try XCTUnwrap(workspace.composeTabs.firstIndex { $0.id == context.tabID })
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == context.tabID })
+            let session = vm.session(for: context.tabID)
             let sessionID = UUID()
-            workspace.composeTabs[tabPosition].activeAgentSessionID = sessionID
-            let workspacePosition = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
-            window.workspaceManager.workspaces[workspacePosition] = workspace
-            window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
-            let name = workspace.composeTabs[tabPosition].name
+            // Install runtime and carrier together. Prewriting the carrier would conflict
+            // with a runtime already materialized by workspace activation.
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspace.id
+            ))
+            let boundWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
+            window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
+            let name = tab.name
             let entry = AgentSessionIndexEntry(
                 id: sessionID, tabID: context.tabID, name: name, savedAt: Date(timeIntervalSince1970: 0),
                 itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
                 isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
             )
             let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
-            let session = vm.session(for: context.tabID)
+            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: boundWorkspace)
             session.selectedAgent = .claudeCode
             session.hasLoadedPersistedState = true
             session.oversight.autoWakeOnUpdates = false
-            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+            // This fixture starts at an explicitly restored session; it does not model
+            // fresh creation or use a missing payload as evidence of a new session.
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+            XCTAssertEqual(vm.mcpSpawnParentSessionID(sourceTabID: context.tabID), sessionID)
             let runID = UUID()
             session.installRunID(runID)
             WindowStatesManager.shared.attachAgentSessionLinkBridge()

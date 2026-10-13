@@ -3064,7 +3064,7 @@ class PromptViewModel: ObservableObject {
     private func createComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
-        blankAgentSessionID: UUID? = nil,
+        freshAgentSessionID: UUID? = nil,
         onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ForegroundComposeTabCreationResult {
         guard
@@ -3079,7 +3079,7 @@ class PromptViewModel: ObservableObject {
             explicitName: name,
             workspaceIndex: index,
             manager: manager,
-            blankAgentSessionID: blankAgentSessionID
+            freshAgentSessionID: freshAgentSessionID
         ) else { return .failed }
 
         // Flush pending editor state and snapshot current tab before switching
@@ -3127,7 +3127,7 @@ class PromptViewModel: ObservableObject {
         } else {
             creation = nil
         }
-        return await createComposeTab(strategy: .blank, blankAgentSessionID: creation?.sessionID) { tab in
+        return await createComposeTab(strategy: .blank, freshAgentSessionID: creation?.sessionID) { tab in
             if let creation { return onAgentSessionCreated?(tab, creation) ?? false }
             return true
         }
@@ -3135,16 +3135,19 @@ class PromptViewModel: ObservableObject {
 
     /// Create a fork-duplicate tab in the background (without switching to it).
     /// Copies all compose tab state (selection, prompt, expansions, overrides, etc.)
-    /// but clears agent and chat session bindings so the forked tab gets fresh sessions.
+    /// but replaces agent and chat bindings so the forked tab gets fresh sessions.
+    /// A creation owner may provide its allocated Agent identity before the tab is published.
     /// - Parameter sourceTabID: The specific tab to duplicate. Avoids racing with active-tab changes.
     @MainActor
     func createBackgroundForkComposeTab(
         sourceTabID: UUID, named name: String? = nil,
+        freshAgentSessionID: UUID? = nil,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ComposeTabState? {
         await createBackgroundComposeTab(
             strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name,
+            freshAgentSessionID: freshAgentSessionID,
             isMutationContextCurrent: isMutationContextCurrent,
             onCreated: onCreated
         )
@@ -3193,6 +3196,7 @@ class PromptViewModel: ObservableObject {
     func createBackgroundComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
+        freshAgentSessionID: UUID? = nil,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ComposeTabState? {
@@ -3203,7 +3207,10 @@ class PromptViewModel: ObservableObject {
         else { return nil }
 
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
-        guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
+        guard let newTab = makeComposeTab(
+            for: strategy, explicitName: name, workspaceIndex: index, manager: manager,
+            freshAgentSessionID: freshAgentSessionID
+        ) else { return nil }
 
         // Re-prove delegated authority inside the tab owner, after any preparation and directly
         // before the first visible mutation. Ordinary human creation has no additional predicate.
@@ -3296,7 +3303,7 @@ class PromptViewModel: ObservableObject {
                 explicitName: name,
                 workspaceIndex: index,
                 manager: manager,
-                blankAgentSessionID: sessionID
+                freshAgentSessionID: sessionID
             ) else {
                 return .rejected(
                     AgentAdmissionPersistenceReceipt(
@@ -5125,7 +5132,7 @@ class PromptViewModel: ObservableObject {
         explicitName: String?,
         workspaceIndex: Int,
         manager: WorkspaceManagerViewModel,
-        blankAgentSessionID: UUID? = nil
+        freshAgentSessionID: UUID? = nil
     ) -> ComposeTabState? {
         let existing = manager.workspaces[workspaceIndex].composeTabs
         let baseName: String = switch strategy {
@@ -5140,7 +5147,7 @@ class PromptViewModel: ObservableObject {
             guard let activeID = manager.workspaces[workspaceIndex].activeComposeTabID,
                   let activeIdx = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == activeID })
             else {
-                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, blankAgentSessionID: blankAgentSessionID)
+                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, freshAgentSessionID: freshAgentSessionID)
             }
             var snapshot = manager.collectComposeTabSnapshot(name: baseName, base: manager.workspaces[workspaceIndex].composeTabs[activeIdx])
             snapshot.id = UUID()
@@ -5151,18 +5158,18 @@ class PromptViewModel: ObservableObject {
         case let .forkDuplicate(sourceTabID):
             // Fork uses an explicit source tab ID to avoid racing with active-tab changes.
             guard let sourceIdx = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == sourceTabID }) else {
-                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, blankAgentSessionID: blankAgentSessionID)
+                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, freshAgentSessionID: freshAgentSessionID)
             }
             var snapshot = manager.collectComposeTabSnapshot(name: baseName, base: manager.workspaces[workspaceIndex].composeTabs[sourceIdx])
             snapshot.id = UUID()
             snapshot.name = baseName
             snapshot.lastModified = Date()
             snapshot.isPinned = false
-            snapshot.activeAgentSessionID = nil
+            snapshot.activeAgentSessionID = freshAgentSessionID
             snapshot.activeChatSessionID = nil
             return snapshot
         case .blank:
-            var blank = ComposeTabState(name: baseName, activeAgentSessionID: blankAgentSessionID)
+            var blank = ComposeTabState(name: baseName, activeAgentSessionID: freshAgentSessionID)
             blank.id = UUID()
             blank.lastModified = Date()
             blank.selection = StoredSelection()

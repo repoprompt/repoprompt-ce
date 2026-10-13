@@ -59,7 +59,14 @@ final class DelegationPlacementPersistenceTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Placement operates on an existing restored owner, not a provisional creation claim.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        XCTAssertNil(session.restorationAdmissionFailureMessage)
         addTeardownBlock { @MainActor in
             session.saveDebounceTask?.cancel()
             viewModel.test_setCurrentTabIDOverride(nil)
@@ -103,7 +110,11 @@ final class DelegationPlacementPersistenceTests: XCTestCase {
         var original = AgentSession(id: fixture.sessionID, name: "Original")
         original.organizationalParentID = priorParent
         _ = try await fixture.dataService.saveAgentSession(original, for: fixture.workspace)
-        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in throw SaveFailure() }
+        var saveAttempts = 0
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            saveAttempts += 1
+            throw SaveFailure()
+        }
         let commit = try XCTUnwrap(fixture.viewModel.commitDelegationPlacement(
             sessionID: fixture.sessionID, organizationalParentID: nextParent, delegationScopeID: UUID()
         ))
@@ -113,6 +124,7 @@ final class DelegationPlacementPersistenceTests: XCTestCase {
         } catch DelegationPlacementPersistenceError.saveFailed {
             // Expected: the caller can return applied-in-memory with persistence failure.
         }
+        XCTAssertEqual(saveAttempts, 1, "The durable acknowledgement must reach the injected failing saver")
         XCTAssertEqual(fixture.session.organizationalParentID, nextParent)
         XCTAssertTrue(fixture.session.isDirty, "The failed owner remains dirty for recovery")
         let restored = try await reopen(fixture)

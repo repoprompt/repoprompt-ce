@@ -3230,7 +3230,8 @@ final class AgentSidebarRestoreStabilityTests: XCTestCase {
             let viewModel = fixture.viewModel
             viewModel.setAgentModeActive(true)
             let revision = try XCTUnwrap(viewModel.test_ownerValidatedSidebarRestoreBaseline?.revision)
-            viewModel.ensureSession(for: fixture.tabID)
+            let session = viewModel.session(for: fixture.tabID)
+            _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
             viewModel.clearChat(tabID: fixture.tabID)
             XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreBaseline?.revision, revision, "user mutations never drop coverage")
             await indexGate.open()

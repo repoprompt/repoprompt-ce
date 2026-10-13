@@ -39,14 +39,118 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    func testRejectedRoutePreservesOnlyTheSourceBindingsPreviouslyEarnedReadiness() async throws {
+        for priorState in ["authoritative", "pending", "terminal"] {
+            let fixture = try await makeFixture()
+            let sourceTabID = await fixture.vm.createAndActivateSessionTab()
+            let targetTabID = await fixture.vm.createAndActivateSessionTab()
+            let source = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(sourceTabID)])
+            let target = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(targetTabID)])
+            XCTAssertTrue(source.permitsBoundOperationAndSave)
+            XCTAssertTrue(target.permitsBoundOperationAndSave)
+            let sourceID = try XCTUnwrap(source.activeAgentSessionID)
+            let sourceBinding = try XCTUnwrap(source.persistentSessionBindingIdentity)
+            let oldToken = try XCTUnwrap(source.currentRestorationBindingToken)
+            let targetBinding = target.persistentSessionBindingIdentity
+            if priorState == "pending" {
+                let generation = source.beginPersistentBindingTransition()
+                source.finishPersistentBindingTransition(generation: generation)
+            }
+            if priorState == "terminal" { source.recordRestorationTerminal(.loadFailed) }
+            let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+            // Legacy payloads without a saved tab reach the real move-owner check. The source's
+            // live carrier remains authoritative and its active run must refuse that move.
+            var payload = try readPayload(fixture, sessionID: sourceID)
+            payload.composeTabID = nil
+            _ = try await fixture.writer.saveAgentSession(payload, for: workspace)
+            source.runState = .running
+            let result = await fixture.vm.activateRoutedAgentSession(
+                tabID: target.tabID, sessionID: sourceID, workspace: workspace
+            )
+            XCTAssertEqual(result, .blockedByActiveDifferentSession, priorState)
+            XCTAssertEqual(source.persistentSessionBindingIdentity, sourceBinding, priorState)
+            XCTAssertEqual(target.persistentSessionBindingIdentity, targetBinding, priorState)
+            XCTAssertNotEqual(source.currentRestorationBindingToken, oldToken, "The refused move still retires its old incarnation.")
+            XCTAssertEqual(source.permitsBoundOperationAndSave, priorState == "authoritative", priorState)
+            XCTAssertTrue(target.permitsBoundOperationAndSave, priorState)
+            XCTAssertNil(source.oversight.overseerActivation, priorState)
+            source.runState = .idle
+            if priorState == "authoritative" {
+                let save = await fixture.vm.flushSaveRequired(for: source.tabID, workspaceID: workspace.id)
+                guard case .success = save else { return XCTFail("The unchanged source must remain saveable: \(save)") }
+            }
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty, priorState)
+        }
+    }
+
+    func testFailedRouteCannotRestoreReadinessToUnreadyOrSupersededBinding() async throws {
+        for change in ["pending", "terminal", "replaced", "rebound", "carrier", "revision"] {
+            let fixture = try await makeFixture()
+            let createdTabID = await fixture.vm.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(createdTabID)
+            let original = try XCTUnwrap(fixture.vm.sessions[tabID])
+            let sessionID = try XCTUnwrap(original.activeAgentSessionID)
+            XCTAssertTrue(original.permitsBoundOperationAndSave, "The fixture must start from a durably created session.")
+            if change == "pending" {
+                let generation = original.beginPersistentBindingTransition()
+                original.finishPersistentBindingTransition(generation: generation)
+            }
+            if change == "terminal" { original.recordRestorationTerminal(.loadFailed) }
+            let missingSessionID = UUID()
+            let gate = TestReleaseFence(name: "failed route before \(change)")
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                if id == missingSessionID { await gate.enterAndWait() }
+            }
+            let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+            let route = Task { @MainActor in
+                await fixture.vm.activateRoutedAgentSession(
+                    tabID: tabID, sessionID: missingSessionID, workspace: workspace
+                )
+            }
+            addTeardownBlock {
+                gate.release()
+                _ = await route.value
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            }
+            guard await gate.waitUntilEntered() else { return }
+            switch change {
+            case "replaced":
+                let replacement = AgentModeViewModel.TabSession(tabID: tabID)
+                replacement.testInstallPersistentSessionBinding(sessionID: sessionID)
+                fixture.vm.test_replaceSessionForDeferredHydration(tabID: tabID, with: replacement)
+            case "rebound":
+                original.testInstallPersistentSessionBinding(sessionID: sessionID)
+            case "carrier":
+                XCTAssertTrue(fixture.manager.compareAndSetActiveAgentSessionID(
+                    expected: sessionID, replacement: UUID(), forTabID: tabID, inWorkspaceID: workspace.id
+                ))
+            case "revision":
+                let previousRevision = original.sourceItemsRevision
+                original.appendItem(AgentChatItem.user("A newer local transcript", sequenceIndex: 0))
+                XCTAssertGreaterThan(original.sourceItemsRevision, previousRevision, "The fixture must supersede the admitted payload revision.")
+            default:
+                break
+            }
+            gate.release()
+            let result = await route.value
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            XCTAssertEqual(result, .sessionNotFound, change)
+            let current = try XCTUnwrap(fixture.vm.sessions[tabID])
+            XCTAssertFalse(current.permitsBoundOperationAndSave, change)
+            XCTAssertFalse(original.permitsBoundOperationAndSave, "The outgoing object cannot regain proof after \(change).")
+            XCTAssertNil(current.oversight.overseerActivation, change)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty, change)
+        }
+    }
+
     func testFailedFirstPayloadWriteLeavesCarrierUnavailableAfterFreshRuntimeReopen() async throws {
         let fixture = try await makeFixture()
         let initialTabIDs = Set(fixture.prompt.currentComposeTabs.map(\.id))
         // This is the actual atomic writer's boundary. A nonempty directory at the file path
         // deterministically rejects the write without replacing the saver with a success/failure stub.
-        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").standardizedFileURL
+        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").resolvingSymlinksInPath().standardizedFileURL
         await fixture.writer.test_setBeforeSessionWriteHook { url in
-            guard url.deletingLastPathComponent() == sessionFolder else { return }
+            guard url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path == sessionFolder.path else { return }
             try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             try? Data("retained obstruction".utf8).write(to: url.appendingPathComponent("keep"))
         }
@@ -484,11 +588,11 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         }
         let fixture = try await makeFixture()
         let gate = TestReleaseFence(name: "configured first payload writer")
-        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").standardizedFileURL
+        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").resolvingSymlinksInPath().standardizedFileURL
         var captured: AgentSessionCreationHandle?
         fixture.vm.test_afterFreshForegroundSessionCreation = { captured = $0 }
         await fixture.writer.test_setBeforeSessionWriteHook { url in
-            guard url.deletingLastPathComponent() == sessionFolder else { return }
+            guard url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path == sessionFolder.path else { return }
             await gate.enterAndWait()
         }
         let creation = Task { @MainActor in await fixture.vm.createAndActivateSessionTab() }
@@ -531,11 +635,11 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         for mutation in ConfigurationMutation.allCases {
             let fixture = try await makeFixture()
             let gate = TestReleaseFence(name: "configured payload before \(mutation) mutation")
-            let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").standardizedFileURL
+            let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").resolvingSymlinksInPath().standardizedFileURL
             var captured: AgentSessionCreationHandle?
             fixture.vm.test_afterFreshForegroundSessionCreation = { captured = $0 }
             await fixture.writer.test_setBeforeSessionWriteHook { url in
-                guard url.deletingLastPathComponent() == sessionFolder else { return }
+                guard url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path == sessionFolder.path else { return }
                 await gate.enterAndWait()
             }
             let creation = Task { @MainActor in await fixture.vm.createAndActivateSessionTab() }
@@ -729,9 +833,9 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
 
     private func failConfiguredCreation(_ fixture: Fixture) async throws -> (session: AgentModeViewModel.TabSession, sessionID: UUID) {
         let initialTabIDs = Set(fixture.prompt.currentComposeTabs.map(\.id))
-        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").standardizedFileURL
+        let sessionFolder = fixture.root.appendingPathComponent("AgentSessions").resolvingSymlinksInPath().standardizedFileURL
         await fixture.writer.test_setBeforeSessionWriteHook { url in
-            guard url.deletingLastPathComponent() == sessionFolder else { return }
+            guard url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path == sessionFolder.path else { return }
             try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             try? Data("retained obstruction".utf8).write(to: url.appendingPathComponent("keep"))
         }

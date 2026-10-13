@@ -1678,7 +1678,12 @@ actor HistorySessionScanner: HistorySessionScanning {
         let workspacesRoot = applicationSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
         let parent = workspaceDir.deletingLastPathComponent()
         if let location {
-            guard workspaceDir.standardizedFileURL == location.directory else {
+            // Directory hints can differ before and after creation without changing the path.
+            // Compare file identity here; retain the supplied URL for the lstat checks below.
+            guard workspaceDir.isFileURL, location.directory.isFileURL,
+                  workspaceDir.host == location.directory.host,
+                  workspaceDir.standardizedFileURL.path == location.directory.standardizedFileURL.path
+            else {
                 return .rejected("workspace directory does not match registered location")
             }
         } else if parent.standardizedFileURL.path != workspacesRoot.standardizedFileURL.path {

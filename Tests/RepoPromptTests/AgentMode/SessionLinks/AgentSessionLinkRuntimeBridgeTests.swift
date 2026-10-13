@@ -98,9 +98,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: fixture.target.tabID, name: "Consent test")
         let session = vm.session(for: fixture.target.tabID)
         session.selectedAgent = .codexExec
-        session.hasLoadedPersistedState = true
         session.runState = .idle
-        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        _ = try installRestoredFixtureBinding(session, in: vm)
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
         fixture.host.beforeActivation = { activating in
             if activating == fixture.target.domainEndpoint { await vm.agentSessionLinkWillActivate(endpoint) }
@@ -896,7 +895,23 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         locationLabel: String? = "worktree/main",
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        // This fake models an already restored endpoint unless the caller asks for loading or
+        // unbound state. The proof must identify the same incarnation as the candidate.
+        let readiness: AgentSessionRestorationReadiness
+        if let persistentBindingGeneration {
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: tabID, sessionID: sessionID, generation: persistentBindingGeneration
+                ),
+                bindingTransitionGeneration: bindingTransitionGeneration
+            )
+            readiness = hasLoadedPersistedState
+                ? .authoritative(token, .persistedPayloadApplied)
+                : .pending(token)
+        } else {
+            readiness = .unbound
+        }
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
@@ -913,8 +928,28 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
+            restorationReadiness: readiness,
             isDeletionInProgress: isDeletionInProgress
         )
+    }
+
+    /// These interaction fixtures supply the restored in-memory payload themselves. Install that
+    /// payload's durable identity and current-generation proof before exercising link authority;
+    /// allocating a fresh creation alone deliberately leaves ordinary operations unavailable.
+    private func installRestoredFixtureBinding(
+        _ session: AgentModeViewModel.TabSession,
+        in viewModel: AgentModeViewModel,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> UUID {
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ), file: file, line: line)
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative, file: file, line: line)
+        return sessionID
     }
 
     private struct Fixture {
@@ -1019,9 +1054,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
-        session.hasLoadedPersistedState = true
         session.codexController = controller
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -1207,9 +1241,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
-        session.hasLoadedPersistedState = true
         session.codexController = controller
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -1366,8 +1399,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
-        session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -1452,8 +1484,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
-        session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -2301,7 +2332,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: "Build API (duplicate)",
             providerDisplayName: "Claude Code",
-            locationLabel: "worktree/duplicate"
+            locationLabel: "worktree/duplicate",
+            restorationReadiness: duplicateTarget.restorationReadiness
         )
         let duplicateObserver = makeCandidate(
             windowID: fixture.observer.windowID + 10,
@@ -3349,6 +3381,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             session.beginPersistentBindingTransition()
             try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration)))
             session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             let registration = await AgentRunSessionStore.register(sessionID: observer.sessionID)
             addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
             func context(_ kind: AgentModelCatalog.TaskLabelKind) -> AgentModeViewModel.AgentMCPControlContext {
@@ -3364,7 +3397,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             if input == "role-policy" { session.mcpControlContext = context(.pair) }
             fixture.host.resolveCurrentCandidate = { [self] candidate in
                 guard candidate.domainEndpoint == observer.domainEndpoint else { return candidate }
-                return makeCandidate(
+                var current = makeCandidate(
                     windowID: observer.windowID, sessionID: session.activeAgentSessionID ?? observer.sessionID,
                     workspaceID: observer.workspaceID, tabID: observer.tabID,
                     persistentBindingGeneration: session.persistentSessionBindingIdentity?.generation,
@@ -3377,6 +3410,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                     roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(taskLabelKind: session.mcpControlContext?.taskLabelKind),
                     isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: observer.sessionID)
                 )
+                current.restorationReadiness = session.qualifiedRestorationReadiness
+                return current
             }
             // For role-policy alone, mask the independently tested MCP-control predicate so a
             // task-label-only change has to invalidate the census even when control presence is equal.
@@ -6012,8 +6047,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
-        session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
         ))
@@ -7922,57 +7956,70 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(inbound.items.isEmpty)
     }
 
-    func testLaneObserverPendingToAuthoritativeSameBindingDoesNotTombstoneAdd() async throws {
+    func testLaneObserverPendingAtEntryRefusesBeforeAllocationAndCanRetryAfterRestoration() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture)
-        let token = try AgentSessionRestorationBindingToken(
-            bindingIdentity: AgentPersistentSessionBindingIdentity(
-                tabID: fixture.observer.tabID, sessionID: fixture.observer.sessionID,
-                generation: XCTUnwrap(fixture.observer.persistentBindingGeneration)
-            ), bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration
-        )
+        let token = try XCTUnwrap(fixture.observer.restorationReadiness.bindingToken)
         fixture.host.candidates[0].restorationReadiness = .pending(token)
-        fixture.bridge.test_afterReservationBeforeActivation = { pair in
-            guard pair.targetSessionID == lane.sessionID else { return }
-            fixture.host.candidates[0].restorationReadiness = .authoritative(
-                token, .persistedPayloadApplied
-            )
-        }
-        let receipt = await createLane(
-            fixture, observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "observer-hydration")
+        let request = laneRequest(fixture, key: "observer-hydration")
+
+        // Existing link authority cannot substitute for the caller's missing payload proof.
+        let refused = await createLane(
+            fixture, observerEndpoint: fixture.observer.domainEndpoint, request: request
         )
-        XCTAssertEqual(receipt.result, .created)
-        XCTAssertTrue(receipt.linked)
+        XCTAssertEqual(refused.result, .refused)
+        XCTAssertEqual(refused.reason, .denied)
+        XCTAssertNil(refused.sessionID)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+        XCTAssertFalse(fixture.host.candidates.contains { $0.sessionID == lane.sessionID })
+        let beforeRestoration = await fixture.authority.links(forTarget: lane.sessionID)
+        XCTAssertTrue(beforeRestoration.items.isEmpty)
+
+        fixture.host.candidates[0].restorationReadiness = .authoritative(token, .persistedPayloadApplied)
+        let created = await createLane(
+            fixture, observerEndpoint: fixture.observer.domainEndpoint, request: request
+        )
+        XCTAssertEqual(created.result, .created)
+        XCTAssertTrue(created.linked)
+        XCTAssertEqual(created.sessionID, lane.sessionID)
+        XCTAssertFalse(created.duplicate, "Pre-allocation refusal must not spend the request key")
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
     }
 
-    func testLaneObserverPendingToTerminalSameBindingTombstonesAdd() async throws {
+    func testLaneReadyObserverBecomingTerminalAfterReservationTombstonesAdd() async throws {
         let fixture = makeFixture()
         try installLaneIntentStore(fixture)
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         let lane = prepareCreatedLane(fixture)
-        let token = try AgentSessionRestorationBindingToken(
-            bindingIdentity: AgentPersistentSessionBindingIdentity(
-                tabID: fixture.observer.tabID, sessionID: fixture.observer.sessionID,
-                generation: XCTUnwrap(fixture.observer.persistentBindingGeneration)
-            ), bindingTransitionGeneration: fixture.observer.bindingTransitionGeneration
-        )
-        fixture.host.candidates[0].restorationReadiness = .pending(token)
+        let token = try XCTUnwrap(fixture.observer.restorationReadiness.bindingToken)
+        var reservationReached = false
         fixture.bridge.test_afterReservationBeforeActivation = { pair in
             guard pair.targetSessionID == lane.sessionID else { return }
+            reservationReached = true
             fixture.host.candidates[0].restorationReadiness = .terminal(token, .loadFailed)
         }
+        let request = laneRequest(fixture, key: "observer-terminal")
         let receipt = await createLane(
-            fixture, observerEndpoint: fixture.observer.domainEndpoint,
-            request: laneRequest(fixture, key: "observer-terminal")
+            fixture, observerEndpoint: fixture.observer.domainEndpoint, request: request
         )
+        XCTAssertTrue(reservationReached, "The observer must become unavailable after allocation and reservation")
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
         XCTAssertEqual(receipt.result, .creationIncomplete)
         XCTAssertEqual(receipt.reason, .addFailed)
         XCTAssertFalse(receipt.linked)
         let inbound = await fixture.authority.links(forTarget: lane.sessionID)
         XCTAssertTrue(inbound.items.isEmpty)
+
+        let replay = await createLane(
+            fixture, observerEndpoint: fixture.observer.domainEndpoint, request: request
+        )
+        XCTAssertEqual(replay.result, .creationIncomplete)
+        XCTAssertEqual(replay.reason, .addFailed)
+        XCTAssertTrue(replay.duplicate)
+        XCTAssertEqual(replay.sessionID, lane.sessionID)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1, "An allocated request stays tombstoned after readiness loss")
     }
 
     func testPublishedHydrationFailureSpendsKeyAndReplayCannotAllocateAgain() async throws {

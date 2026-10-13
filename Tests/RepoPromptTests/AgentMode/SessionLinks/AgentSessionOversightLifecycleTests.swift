@@ -161,12 +161,13 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
     }
 
     private func makeCandidate(windowID: Int, displayName: String) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: UUID(),
-            tabID: UUID(),
-            sessionID: UUID(),
-            persistentBindingGeneration: UUID(),
+            tabID: binding.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -177,7 +178,11 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: displayName,
             providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/main"
+            locationLabel: "worktree/main",
+            restorationReadiness: .authoritative(
+                AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1),
+                .persistedPayloadApplied
+            )
         )
     }
 
@@ -285,7 +290,8 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: fixture.observer.displayName,
             providerDisplayName: fixture.observer.providerDisplayName,
-            locationLabel: fixture.observer.locationLabel
+            locationLabel: fixture.observer.locationLabel,
+            restorationReadiness: fixture.observer.restorationReadiness
         )
         XCTAssertEqual(
             captured.domainEndpoint,

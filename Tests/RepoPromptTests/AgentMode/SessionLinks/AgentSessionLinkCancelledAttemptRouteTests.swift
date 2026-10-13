@@ -722,7 +722,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             let target = vm.session(for: tabID)
             target.selectedAgent = .claudeCode
             target.hasLoadedPersistedState = true
-            let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(target))
+            let sessionID = try installRestoredBinding(on: target, in: vm)
             let identity = try XCTUnwrap(vm.agentSessionLinkModelIdentity(workspaceID: workspaceID, tabID: tabID, sessionID: sessionID))
             let endpoint = try XCTUnwrap(identity.monitorEndpoint(windowID: window.windowID))
             let host = WindowStatesManager.shared
@@ -802,6 +802,21 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             observer.window.agentModeViewModel
         }
 
+        /// Model an already restored payload; these fixtures exercise routing, not initial creation.
+        private func installRestoredBinding(
+            on session: AgentModeViewModel.TabSession, in viewModel: AgentModeViewModel
+        ) throws -> UUID {
+            let sessionID = UUID()
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+            ))
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.markCurrentBindingHydrated()
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+            return sessionID
+        }
+
         /// An established Claude observer whose reused process run is routed on one live connection
         /// and whose catalog projection is ready for exactly this endpoint.
         private func makeRoutedObserver(assertModelRoutePending: Bool = false) async throws -> RoutedObserver {
@@ -832,6 +847,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 await manager.removeConnection(connectionID)
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
 
@@ -842,7 +858,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.hasLoadedPersistedState = true
             session.oversight.autoWakeOnUpdates = false
             session.installRunID(runID)
-            let sessionID = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+            let sessionID = try installRestoredBinding(on: session, in: window.agentModeViewModel)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
             window.agentModeViewModel.agentSessionLinkPublishPromptInventory(
                 AgentSessionLinkPromptInventory(

@@ -252,12 +252,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         windowID: Int, sessionID: UUID, workspaceID: UUID = UUID()
     ) -> AgentSessionLinkEndpointCandidate {
         let tabID = UUID()
+        let binding = AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: sessionID)
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
             sessionID: sessionID,
-            persistentBindingGeneration: UUID(),
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -271,10 +272,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             locationLabel: "worktree/main",
             restorationReadiness: .authoritative(
                 AgentSessionRestorationBindingToken(
-                    bindingIdentity: AgentPersistentSessionBindingIdentity(
-                        tabID: tabID,
-                        sessionID: sessionID
-                    ),
+                    bindingIdentity: binding,
                     bindingTransitionGeneration: 1
                 ),
                 .persistedPayloadApplied
@@ -284,8 +282,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
     /// The same live incarnation with a different hydration proof.
     ///
-    /// Byte-for-byte identical endpoint identity is the whole point: the resolver cannot tell these
-    /// apart, because it gates on the legacy `hasLoadedPersistedState` latch, which stays `true`.
+    /// The endpoint identity and legacy loaded flag stay unchanged. Readiness must still refuse
+    /// an operation or restoration against a pending or terminal payload proof.
     private func withReadiness(
         _ candidate: AgentSessionLinkEndpointCandidate,
         _ readiness: AgentSessionRestorationReadiness
@@ -1159,7 +1157,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     func testSupersessionDuringEstablishmentKeepsIntentWithoutGranting() async throws {
-        for bothEndpoints in [false, true] {
+        for (supersedeObserver, supersedeTarget) in [(false, true), (true, false), (true, true)] {
             try seedSavedPair()
             let fixture = makeFixture()
             let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
@@ -1169,14 +1167,15 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             else {
                 return XCTFail("Expected authoritative fixtures")
             }
-            let superseded = withReadiness(target, .terminal(targetToken, .sourceRevisionSuperseded))
-            let currentObserver = bothEndpoints
+            let currentTarget = supersedeTarget
+                ? withReadiness(target, .terminal(targetToken, .sourceRevisionSuperseded)) : target
+            let currentObserver = supersedeObserver
                 ? withReadiness(observer, .terminal(observerToken, .loadFailed)) : observer
             fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
             // Classification sees completed payloads; the shared path sees their supersession.
             fixture.host.candidates = [observer, target]
             fixture.host.beforeUUIDCensus = {
-                fixture.host.candidates = [currentObserver, superseded]
+                fixture.host.candidates = [currentObserver, currentTarget]
             }
 
             await fixture.bridge.bootstrapIntentStore(fixture.store)

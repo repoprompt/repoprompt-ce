@@ -49,7 +49,24 @@ extension AgentModeViewModel {
         target.window != nil && mcpActivationTargetIsCurrent(target)
     }
 
-    private func mcpActivationTargetIsCurrent(_ target: MCPResidentTarget) -> Bool {
+    enum MCPActivationOwnership {
+        case resident
+        case installed(context: AgentMCPControlContext, generation: UInt64)
+
+        @MainActor
+        func matches(_ session: TabSession) -> Bool {
+            switch self {
+            case .resident:
+                AgentModeViewModel.isMCPResidentAppOwned(session)
+            case let .installed(context, generation):
+                session.mcpControlContext == context && session.mcpControlActivationGeneration == generation
+            }
+        }
+    }
+
+    private func mcpActivationTargetIsCurrent(
+        _ target: MCPResidentTarget, ownership: MCPActivationOwnership = .resident
+    ) -> Bool {
         guard !WindowStatesManager.shared.isTerminating,
               target.endpoint.windowID == windowID,
               let current = try? authoritativeLiveSession(for: target.endpoint.sessionID)
@@ -62,7 +79,7 @@ extension AgentModeViewModel {
             // Internal admission may start before UI registration, never against its successor.
             return false
         }
-        return current === target.session && Self.isMCPResidentAppOwned(current)
+        return current === target.session && ownership.matches(current)
             && current.permitsBoundOperationAndSave
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target.endpoint.sessionID)
@@ -91,12 +108,13 @@ extension AgentModeViewModel {
     /// Membership writers withhold inventory before their authority hop. Re-reading that existing
     /// fence immediately before acting prevents a previously negative query admitting a new grant.
     func mcpRequireResidentActivationFence(
-        _ target: MCPResidentTarget, authoritativeHasLinks: Bool = false
+        _ target: MCPResidentTarget, authoritativeHasLinks: Bool = false,
+        ownership: MCPActivationOwnership = .resident
     ) throws {
         if let failure = target.session.restorationAdmissionFailureMessage {
             throw MCPError.invalidParams(failure)
         }
-        guard mcpActivationTargetIsCurrent(target),
+        guard mcpActivationTargetIsCurrent(target, ownership: ownership),
               agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
         else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
         let published = agentSessionLinkPromptInventoryBySessionID[target.endpoint.sessionID]
@@ -108,10 +126,14 @@ extension AgentModeViewModel {
         }
     }
 
-    func mcpRequireActivationOwnerFence(_ target: MCPResidentTarget?, session: TabSession) throws {
+    func mcpRequireActivationOwnerFence(
+        _ target: MCPResidentTarget?, session: TabSession, ownership: MCPActivationOwnership = .resident
+    ) throws {
         if let target {
             guard target.session === session else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
-            try mcpRequireResidentActivationFence(target)
+            try mcpRequireResidentActivationFence(target, ownership: ownership)
+        } else if case .installed = ownership {
+            guard ownership.matches(session) else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
         } else if Self.isMCPResidentAppOwned(session) {
             // A previously non-app-owned admission cannot silently capture its new owner.
             throw MCPError.invalidParams(Self.mcpResidentTargetError)

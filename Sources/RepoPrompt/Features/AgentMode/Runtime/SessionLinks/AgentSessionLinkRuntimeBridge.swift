@@ -3253,10 +3253,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// link is ever visible in an uninitialized state.
     /// - Parameter proof: the exact incarnations and binding-qualified hydration outcomes an
     ///   automatic restoration was classified against, or `nil` for a manual Add. Restoration adds
-    ///   this precondition on top of the shared path rather than beside it: the resolver deliberately
-    ///   gates on the legacy `hasLoadedPersistedState` latch, which is also true for a missing
-    ///   payload, a superseded revision, and a thrown load error, so re-deriving readiness here would
-    ///   authorize exactly the state the proof exists to exclude.
+    ///   this precondition on top of the shared path rather than beside it. Compare a unique raw
+    ///   candidate pair before eligibility so a superseded hydration proof retains its typed drift
+    ///   outcome instead of being relabeled as a generic loading refusal.
     private func performFreshEstablishment(
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken?,
@@ -3284,6 +3283,17 @@ final class AgentSessionLinkRuntimeBridge {
         let candidates = host.agentSessionLinkCandidates(
             forSessionIDs: [observerSessionID, targetSessionID], includeLocation: true
         ).values.flatMap(\.self)
+        if let proof, proof.requireObserverAuthoritative {
+            let observers = candidates.filter { $0.sessionID == observerSessionID }
+            let targets = candidates.filter { $0.sessionID == targetSessionID }
+            if observers.count == 1, targets.count == 1,
+               !proof.matches(observer: observers[0], target: targets[0])
+            {
+                // Preserve the restoration drift classification before readiness-aware resolution
+                // rejects either endpoint. Missing and duplicate candidates keep resolver semantics.
+                return EstablishmentResult(outcome: .failed(.rebinding))
+            }
+        }
         let observer: AgentSessionLinkEndpointCandidate
         switch resolveAddCandidate(
             sessionID: observerSessionID,

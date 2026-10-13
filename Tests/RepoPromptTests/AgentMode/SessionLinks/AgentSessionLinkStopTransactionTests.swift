@@ -320,6 +320,9 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.installPersistentSessionBinding(
             AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: fixture.candidate.sessionID)
         )
+        XCTAssertFalse(fixture.session.permitsBoundOperationAndSave, "The old binding's hydration must not transfer to its successor")
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(fixture.session.permitsBoundOperationAndSave, "Stop targets the explicitly restored successor")
         let reboundCandidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkCandidate(
             tabID: fixture.tabID, sessionID: fixture.candidate.sessionID,
             tabName: "Stop target", isWindowClosing: false

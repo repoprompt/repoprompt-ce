@@ -111,7 +111,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             session.codexConversationID = conversationID
             session.codexRolloutPath = rolloutPath
             session.codexController = controller
-            _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+            // Catalog repair begins with an existing restored conversation.
+            _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
                 window.agentModeViewModel,
                 tabID: tabID
@@ -635,31 +638,41 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 await window.workspaceManager.awaitInitialized()
                 let observerTab = UUID()
                 let targetTab = UUID()
+                let observerID = UUID()
+                let targetID = UUID()
                 var workspace = WorkspaceModel(name: "Live discovery", repoPaths: [])
                 workspace.isEphemeral = true
                 workspace.composeTabs = [
-                    ComposeTabState(id: observerTab, name: "User-created planning chat"),
-                    ComposeTabState(id: targetTab, name: "Harmless idle target")
+                    ComposeTabState(id: observerTab, name: "User-created planning chat", activeAgentSessionID: observerID),
+                    ComposeTabState(id: targetTab, name: "Harmless idle target", activeAgentSessionID: targetID)
                 ]
                 workspace.activeComposeTabID = observerTab
+                // Restoration must earn both runtime readiness and owner-valid placement metadata.
+                // A fabricated loaded latch has no index row until an unrelated debounced save wins.
+                for tab in workspace.composeTabs {
+                    let payload = try AgentSession(
+                        id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id,
+                        composeTabID: tab.id, name: tab.name, agentKind: AgentProviderKind.claudeCode.rawValue,
+                        autoWakeOnOversightUpdates: false
+                    )
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                }
                 window.workspaceManager.workspaces.append(workspace)
                 let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
                 XCTAssertTrue(switched.didSwitch)
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
                 let vm = window.agentModeViewModel
-                vm.test_setAgentSessionSaver { _, _, _ in
-                    FileManager.default.temporaryDirectory.appendingPathComponent("discovery-\(UUID()).json")
+                let observer = await vm.ensureSessionReady(tabID: observerTab, reconnectActiveProviders: false)
+                let target = await vm.ensureSessionReady(tabID: targetTab, reconnectActiveProviders: false)
+                for (session, expectedID) in [(observer, observerID), (target, targetID)] {
+                    XCTAssertEqual(session.activeAgentSessionID, expectedID)
+                    XCTAssertEqual(session.selectedAgent, .claudeCode)
+                    XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                    XCTAssertEqual(vm.ownerValidatedSessionIndex[expectedID]?.tabID, session.tabID)
+                    let projector = SpawnProvenanceDelegationMembershipProjector.production(worktreeOwnership: bridge.worktreeOwnership)
+                    XCTAssertEqual(projector.pointResolutionState(for: expectedID), .unique)
+                    XCTAssertFalse(projector.authorityConflictInAncestry(of: expectedID))
                 }
-                let observer = vm.session(for: observerTab)
-                let target = vm.session(for: targetTab)
-                for session in [observer, target] {
-                    session.selectedAgent = .claudeCode
-                    session.hasLoadedPersistedState = true
-                    session.oversight.autoWakeOnUpdates = false
-                    _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
-                }
-                let observerID = try XCTUnwrap(observer.activeAgentSessionID)
-                let targetID = try XCTUnwrap(target.activeAgentSessionID)
                 let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: observerTab)
                 XCTAssertNil(observer.parentSessionID)
                 XCTAssertFalse(observer.isMCPOriginated)
@@ -894,6 +907,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
                     XCTAssertNotEqual(result["isError"] as? Bool, true, created.rawJSON)
+                    let createdContent = try XCTUnwrap(result["content"] as? [[String: Any]])
+                    let createdText = createdContent.compactMap { $0["text"] as? String }.joined()
+                    let createdReceipt = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(createdText.utf8)) as? [String: Any])
+                    XCTAssertEqual(createdReceipt["result"] as? String, "created", created.rawJSON)
+                    XCTAssertEqual(createdReceipt["linked"] as? Bool, true, created.rawJSON)
                     let inventory = await authority.links(forObserver: observerID)
                     expectedTargetID = try XCTUnwrap(inventory.items.first?.targetSessionID)
                     XCTAssertNil(observer.oversight.overseerActivation, "Inbound creation needs no bootstrap")
@@ -1026,6 +1044,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
                     XCTAssertNotEqual(result["isError"] as? Bool, true, created.rawJSON)
+                    let createdContent = try XCTUnwrap(result["content"] as? [[String: Any]])
+                    let createdText = createdContent.compactMap { $0["text"] as? String }.joined()
+                    let createdReceipt = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(createdText.utf8)) as? [String: Any])
+                    XCTAssertEqual(createdReceipt["result"] as? String, "created", created.rawJSON)
+                    XCTAssertEqual(createdReceipt["linked"] as? Bool, true, created.rawJSON)
                     let inventory = await authority.links(forObserver: observerID)
                     XCTAssertEqual(inventory.items.count, 1)
                     let link = try XCTUnwrap(inventory.items.first)

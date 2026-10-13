@@ -113,6 +113,7 @@ enum AgentSessionCarrierResolver {
         let workspace: WorkspaceModel?
         let entries: [UUID: AgentSessionIndexEntry]
         let hasCurrentOwner: Bool
+        let directCarriers: [WorkspaceManagerViewModel.SessionCarrier]
     }
 
     static func capture(windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil) -> Snapshot {
@@ -180,7 +181,10 @@ enum AgentSessionCarrierResolver {
             }
             let direct = manager.sessionCarriers(sessionIDs: ids)
             tabIDs.formUnion(direct.map(\.tab.id))
-            captures.append(WindowCapture(window: window, workspace: workspace, entries: entries, hasCurrentOwner: validOwner))
+            captures.append(WindowCapture(
+                window: window, workspace: workspace, entries: entries, hasCurrentOwner: validOwner,
+                directCarriers: direct
+            ))
         }
 
         // Read competing live identities at every discovered address, even when the physical
@@ -202,7 +206,12 @@ enum AgentSessionCarrierResolver {
             let activeWorkspaceID = capture.workspace?.id
             // Address closure spans windows as well as workspaces: a requested identity cannot
             // ignore another owner's explicit claim on the address through which it will mutate.
-            for carrier in window.workspaceManager.sessionCarriers(sessionIDs: ids, tabIDs: tabIDs) {
+            // Capture is synchronous: reuse this manager's direct physical rows within this
+            // request, retaining every duplicate. This is not a cache across awaits or mutations.
+            let additionalCarriers = window.workspaceManager.sessionCarriers(
+                sessionIDs: [], tabIDs: tabIDs, excludingSessionIDs: ids
+            )
+            for carrier in capture.directCarriers + additionalCarriers {
                 let tab = carrier.tab
                 let isActiveWorkspace = carrier.workspaceID == activeWorkspaceID
                 // Another window's inactive catalog copy is not a second physical owner of a

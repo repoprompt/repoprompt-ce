@@ -1317,13 +1317,20 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Physical claims, preserving duplicates and conflicting identities. Reads never rebuild the
     /// index; generic model replacement and the identity mutation owner maintain it synchronously.
-    func sessionCarriers(sessionIDs: Set<UUID>, tabIDs: Set<UUID> = []) -> [SessionCarrier] {
+    func sessionCarriers(
+        sessionIDs: Set<UUID>, tabIDs: Set<UUID> = [], excludingSessionIDs: Set<UUID> = []
+    ) -> [SessionCarrier] {
         var positions: Set<SessionCarrierPosition> = []
         for id in sessionIDs {
             positions.formUnion(sessionCarrierPositionsBySessionID[id] ?? [])
         }
         for id in tabIDs {
             positions.formUnion(sessionCarrierPositionsByTabID[id] ?? [])
+        }
+        // A synchronous caller retaining the direct rows can expand their address closure
+        // without materializing those same positions again. Competing positions remain included.
+        for id in excludingSessionIDs {
+            positions.subtract(sessionCarrierPositionsBySessionID[id] ?? [])
         }
         return positions.sorted {
             if $0.workspace != $1.workspace { return $0.workspace < $1.workspace }

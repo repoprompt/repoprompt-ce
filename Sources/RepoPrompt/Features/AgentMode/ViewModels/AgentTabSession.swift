@@ -1751,6 +1751,24 @@ final class AgentTabSession: ObservableObject {
         restorationReadiness = .authoritative(current, source)
     }
 
+    /// Remap an earned proof only across the single refused transition that invalidated it.
+    /// The view model additionally checks runtime-map ownership and the workspace carrier.
+    func restoreReadinessAfterRefusedTransition(
+        _ previousReadiness: AgentSessionRestorationReadiness,
+        expectedTransition: AgentModeViewModel.PersistentBindingTransitionToken
+    ) {
+        guard !bindingTransitionInProgress,
+              persistentBindingTransitionToken() == expectedTransition,
+              restorationReadiness == .unbound,
+              case let .authoritative(previous, source) = previousReadiness,
+              let current = currentRestorationBindingToken,
+              previous.bindingIdentity == current.bindingIdentity,
+              previous.bindingTransitionGeneration &+ 1 == current.bindingTransitionGeneration
+        else { return }
+        restorationReadiness = .authoritative(current, source)
+        markCurrentBindingHydrated()
+    }
+
     func recordRestorationAuthoritativeIfNeeded(_ source: AgentSessionRestorationReadiness.Source) {
         guard !qualifiedRestorationReadiness.isAuthoritative else { return }
         recordRestorationAuthoritative(source)

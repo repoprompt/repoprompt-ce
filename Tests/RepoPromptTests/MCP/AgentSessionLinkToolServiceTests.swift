@@ -1123,6 +1123,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let reference = try XCTUnwrap(referenceValue)
         _ = await fixture.bridge.stopMonitorLink(observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID, linkID: reference.linkID, generation: reference.generation)
         let original = fixture.observer
+        let token = try XCTUnwrap(original.restorationReadiness.bindingToken)
         for exclusion in ["explore", "mcp-controlled", "mcp-origin", "child", "nested", "lane", "loading", "closing", "rebinding"] {
             let candidate = AgentSessionLinkEndpointCandidate(
                 windowID: original.windowID, workspaceID: original.workspaceID, tabID: original.tabID, sessionID: original.sessionID,
@@ -1130,7 +1131,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 isTopLevel: exclusion != "child" && exclusion != "nested", hasLoadedPersistedState: exclusion != "loading",
                 bindingTransitionInProgress: exclusion == "rebinding", isClosing: exclusion == "closing", isMCPControlled: exclusion == "mcp-controlled",
                 isMCPOriginated: exclusion == "mcp-origin", roleAllowsOutboundMonitoring: exclusion != "explore",
-                displayName: original.displayName, providerDisplayName: original.providerDisplayName, locationLabel: original.locationLabel
+                displayName: original.displayName, providerDisplayName: original.providerDisplayName, locationLabel: original.locationLabel,
+                restorationReadiness: exclusion == "loading" ? .pending(token) : original.restorationReadiness
             )
             fixture.host.candidates = [candidate, fixture.target]
             fixture.host.laneCreatorByEndpoint = exclusion == "lane" ? [candidate.domainEndpoint: UUID()] : [:]
@@ -3694,12 +3696,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         windowID: Int,
         displayName: String
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        let token = AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1)
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: UUID(),
-            tabID: UUID(),
-            sessionID: UUID(),
-            persistentBindingGeneration: UUID(),
+            tabID: binding.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -3710,7 +3714,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: displayName,
             providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/main"
+            locationLabel: "worktree/main",
+            restorationReadiness: .authoritative(token, .persistedPayloadApplied)
         )
     }
 
@@ -3959,7 +3964,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             observer.oversight.autoWakeOnUpdates = false
             let runID = UUID()
             observer.installRunID(runID)
-            _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(observer))
+            // This transport fixture starts from an already restored session, not a fresh creation.
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: UUID(), on: observer, updateWorkspaceMetadata: true))
+            observer.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(observer.qualifiedRestorationReadiness.isAuthoritative)
             let observerEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
             let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == context.workspaceID })
             let targetTabID = UUID()
@@ -3967,7 +3975,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let target = vm.session(for: targetTabID)
             target.selectedAgent = .claudeCode
             target.hasLoadedPersistedState = true
-            let targetSessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(target))
+            let targetBinding = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: UUID(), on: target, updateWorkspaceMetadata: true))
+            target.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(target.qualifiedRestorationReadiness.isAuthoritative)
+            let targetSessionID = targetBinding.sessionID
             let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: targetTabID)
             let host = WindowStatesManager.shared
             host.attachAgentSessionLinkBridge()
