@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptC
 
-/// Exclusively owned by SessionCatalogStore. No SQLite statement/connection escapes its actor.
+/// Owned by one catalog core. No SQLite statement or connection escapes its actor/lock owner.
 final class SessionCatalogDatabase {
     enum Binding {
         case text(String)
@@ -14,7 +14,7 @@ final class SessionCatalogDatabase {
     private let connection: OpaquePointer
     private(set) var counters = SessionCatalogReadCounters()
 
-    init(url: URL) throws {
+    init(url: URL, readOnly: Bool = false) throws {
         guard url.isFileURL else { throw SessionCatalogError.invalidRecord }
         // macOS temporary roots use /var -> /private/var. Resolve only the existing parent:
         // SQLite's NOFOLLOW must still reject a symlink at the database file itself.
@@ -22,10 +22,13 @@ final class SessionCatalogDatabase {
         let resolved = url.deletingLastPathComponent().path.withCString { rpce_catalog_resolve_directory($0, &resolvedParent) }
         guard resolved == 0 else { throw SessionCatalogError.filesystem(resolved) }
         let path = String(cString: resolvedParent) + "/" + url.lastPathComponent
-        let created = path.withCString { rpce_catalog_create_private($0) }
-        guard created == 0 else { throw SessionCatalogError.filesystem(created) }
+        if !readOnly {
+            let created = path.withCString { rpce_catalog_create_private($0) }
+            guard created == 0 else { throw SessionCatalogError.filesystem(created) }
+        }
         var pointer: OpaquePointer?
-        let result = sqlite3_open_v2(path, &pointer, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nil)
+        let access = readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+        let result = sqlite3_open_v2(path, &pointer, access | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nil)
         guard result == SQLITE_OK, let pointer else {
             if let pointer { sqlite3_close_v2(pointer) }
             throw SessionCatalogError.database(result)

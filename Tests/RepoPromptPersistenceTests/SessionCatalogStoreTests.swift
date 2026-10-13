@@ -39,6 +39,77 @@ final class SessionCatalogStoreTests: XCTestCase {
         XCTAssertEqual(generation, 0)
     }
 
+    private enum OwnerTestError: Error { case revoked, incoherentSnapshot }
+
+    @MainActor
+    func testOwnerCommitRevalidatesEvenForReplayAndDenialChangesNothing() async throws {
+        let (root, _, catalog) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = workspace(root)
+        let record = session(workspace.id)
+        let mutations: [SessionCatalogMutation] = [.workspace(workspace, expected: .absent), .session(record, expected: .absent)]
+        let operationID = UUID()
+        var live = true
+        var checks = 0
+        let revalidate: @MainActor () throws -> Void = {
+            checks += 1
+            guard live else { throw OwnerTestError.revoked }
+        }
+        let first = try catalog.commitFromOwner(operationID: operationID, mutations: mutations, revalidate: revalidate)
+        live = false
+        do {
+            _ = try catalog.commitFromOwner(operationID: operationID, mutations: mutations, revalidate: revalidate)
+            XCTFail("A persisted replay receipt cannot replace live owner authorization")
+        } catch {
+            guard case OwnerTestError.revoked = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(checks, 2)
+        let unchanged = try await catalog.session(id: record.id)
+        let generation = try await catalog.currentGeneration()
+        XCTAssertEqual(unchanged?.revision, first.generation)
+        XCTAssertEqual(generation, first.generation)
+    }
+
+    @MainActor
+    func testOwnerPointWritesStayConstantAndReaderSnapshotsRemainCoherent() async throws {
+        let (root, _, catalog) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = workspace(root)
+        var target = session(workspace.id)
+        let targetID = target.id
+        let others = (0 ..< 249).map { session(workspace.id, time: Double($0)) }
+        _ = try await catalog.commit(operationID: UUID(), mutations: [
+            .workspace(workspace, expected: .absent), .session(target, expected: .absent)
+        ] + others.map { .session($0, expected: .absent) })
+        await catalog.resetWriteCounters()
+        let snapshots = Task.detached(priority: .utility) {
+            for _ in 0 ..< 25 {
+                let page = try await catalog.sessions(workspaceID: workspace.id, limit: 1000)
+                guard page.totalKnown == 250, page.records.count == 250,
+                      page.records.first(where: { $0.id == targetID })?.revision == page.generation
+                else { throw OwnerTestError.incoherentSnapshot }
+            }
+        }
+        var checks = 0
+        for index in 0 ..< 100 {
+            target.name = "Renamed-\(index)"
+            _ = try catalog.commitFromOwner(
+                operationID: UUID(), mutations: [.session(target, expected: .revision(Int64(index + 1)))],
+                revalidate: { checks += 1 }
+            )
+        }
+        try await snapshots.value
+        let counters = await catalog.writeCounters()
+        let renamed = try await catalog.session(id: targetID)
+        XCTAssertEqual(checks, 100)
+        XCTAssertEqual(renamed?.name, "Renamed-99")
+        XCTAssertEqual(renamed?.revision, 101)
+        // Eleven indexed statements and at most four rows per write, regardless of the other 249
+        // sessions. Concurrent reader work is on a separate read-only connection, not this lock.
+        XCTAssertLessThanOrEqual(counters.statements, 100 * 11)
+        XCTAssertLessThanOrEqual(counters.returnedRows, 100 * 4)
+    }
+
     func testDurableTransactionReplayAndConflict() async throws {
         let (root, databaseURL, catalog) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
