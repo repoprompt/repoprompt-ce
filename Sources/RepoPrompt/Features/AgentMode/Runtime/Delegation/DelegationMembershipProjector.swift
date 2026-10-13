@@ -273,16 +273,16 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         } else {
             nil
         }
-        let distinct = DomainDelegationWorktreeStaleness.guardrailCount(
-            boundWorktreeIDs: members.reduce(into: Set<String>()) { $0.formUnion($1.boundWorktreeIDs) },
-            ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs(memberIDs)
-        )
+        let identities = members.reduce(into: Set<String>()) { $0.formUnion($1.boundWorktreeIDs) }
+            .union(ownedUnreleasedWorktreeIDs(memberIDs))
+        let distinct = identities.count
         let anonymous = members.filter(\.boundWorktreeIDs.isEmpty).reduce(0) { $0 + $1.worktreeCount }
         return DomainDelegationScopeUsage(
             scopeID: scope.id,
             liveSessionCount: members.filter(\.isLive).count,
             worktreeCount: distinct + anonymous,
-            spawnParentDepth: parentDepth
+            spawnParentDepth: parentDepth,
+            countedWorktreeIDs: identities
         )
     }
 

@@ -123,7 +123,8 @@ enum DelegationSpawnAdmission {
                     scopeID: projected.scopeID,
                     liveSessionCount: projected.liveSessionCount + max(joining.liveSessions - 1, 0),
                     worktreeCount: projected.worktreeCount + max(joining.worktrees - 1, 0),
-                    spawnParentDepth: projected.spawnParentDepth.map { $0 + joining.height }
+                    spawnParentDepth: projected.spawnParentDepth.map { $0 + joining.height },
+                    countedWorktreeIDs: projected.countedWorktreeIDs
                 )
                 scopeIDs.insert(scope.id)
             }

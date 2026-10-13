@@ -176,6 +176,8 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     private struct TargetContext {
         let viewModel: AgentModeViewModel
         let session: AgentTabSession
+        let workspaceID: UUID
+        let repoPaths: [String]
         let roots: [WorkspaceRootRef]
         let repos: [GitRepoDescriptor]
         let repo: GitRepoDescriptor
@@ -184,6 +186,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     /// Repositories and roots come from the target's own workspace, never the caller's routing.
     private func targetContext(_ sessionID: UUID, repoRoot: String?) async throws -> TargetContext {
         guard let (viewModel, session) = SessionAdminWindows.liveSession(sessionID),
+              let workspace = viewModel.workspaceManager?.activeWorkspace,
               let store = viewModel.promptManager?.workspaceFileContextStore
         else { throw SessionAdminHostError.sessionUnavailable }
         let roots = await store.rootRefs(scope: .visibleWorkspace)
@@ -208,7 +211,10 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         } else {
             repo = defaultRepo
         }
-        return TargetContext(viewModel: viewModel, session: session, roots: roots, repos: repos, repo: repo)
+        return TargetContext(
+            viewModel: viewModel, session: session, workspaceID: workspace.id, repoPaths: workspace.repoPaths,
+            roots: roots, repos: repos, repo: repo
+        )
     }
 
     private func logicalRoot(for repo: GitRepoDescriptor, in context: TargetContext) async throws -> WorkspaceRootRef {
@@ -228,9 +234,19 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         forSession sessionID: UUID,
         repoRoot: String?,
         branch: String?,
-        baseRef: String?
+        baseRef: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> SessionAdminWorktreeInfo {
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
+        let authorize: @MainActor () throws -> Void = {
+            guard isStillAuthorized(),
+                  SessionAdminWindows.owningViewModel(for: sessionID) === context.viewModel,
+                  (try? context.viewModel.authoritativeLiveSession(for: sessionID)) === context.session,
+                  context.viewModel.workspaceManager?.activeWorkspace?.id == context.workspaceID,
+                  context.viewModel.workspaceManager?.activeWorkspace?.repoPaths == context.repoPaths
+            else { throw SessionAdminHostError.authorityEnded }
+        }
+        try authorize()
         let existing = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRoot = existing.first(where: \.isMain)?.path ?? context.repo.rootPath
         // On-behalf creation is app-managed only: no explicit or external destination.
@@ -258,6 +274,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         )
         // Step 2: the container is derived from that admitted repository (never from arguments), so it
         // is created only now, then the destination is admitted under it.
+        try authorize()
         try FileManager.default.createDirectory(at: plan.appManagedContainer, withIntermediateDirectories: true)
         let snapshot = try await DomainMutationPathFence.admit(
             requestedPaths: [context.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
@@ -268,7 +285,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let vcsService = vcsService
         let repoURL = context.repo.rootURL
         let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
-            try await vcsService.createGitWorktreeWithResult(request: plan.createRequest, at: repoURL)
+            try await vcsService.createGitWorktreeWithResult(
+                request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
+            )
         }
         let created = result.descriptor
         return SessionAdminWorktreeInfo(
@@ -287,7 +306,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         sessionID: UUID,
         worktree selector: String,
         repoRoot: String?,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
+        bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo {
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         guard isIdle(context.viewModel, context.session) else { throw SessionAdminHostError.notIdle }
@@ -325,7 +346,20 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                 source: "session_admin.worktree_bind"
             ))
         }
-        try await transition(desired, sessionID: sessionID, viewModel: context.viewModel, isStillAuthorized: isStillAuthorized)
+        let desiredIDs = Set(desired.map(\.worktreeID))
+        let admit: @MainActor () throws -> Void = { try admitBindings(desiredIDs) }
+        let committed: @MainActor () -> Void = { bindingsCommitted(desiredIDs) }
+        // The transition's exact no-op path has no beforeCommit callback. A released ownership row
+        // may still be reactivated by that bind, so even this path receives identity admission.
+        if existing == desired {
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            try admit()
+            committed()
+        }
+        try await transition(
+            desired, sessionID: sessionID, viewModel: context.viewModel,
+            isStillAuthorized: isStillAuthorized, admitBindings: admit, bindingsCommitted: committed
+        )
         return SessionAdminWorktreeInfo(
             worktreeID: worktree.worktreeID,
             repositoryID: worktree.repository.repositoryID,
@@ -361,13 +395,19 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         _ desired: [AgentSessionWorktreeBinding],
         sessionID: UUID,
         viewModel: AgentModeViewModel,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        admitBindings: @escaping @MainActor () throws -> Void = {},
+        bindingsCommitted: @escaping @MainActor () -> Void = {}
     ) async throws {
         guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         do {
             _ = try await viewModel.transitionWorktreeBindings(
                 desired, forSessionID: sessionID, intent: .externalManagement,
-                beforeCommit: { guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded } }
+                beforeCommit: {
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+                    try admitBindings()
+                },
+                afterCommit: bindingsCommitted
             )
         } catch SessionAdminHostError.authorityEnded {
             throw SessionAdminHostError.authorityEnded
@@ -419,6 +459,19 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             }
         }
         return result
+    }
+
+    func retainedWorktreeIDsAfterReplacingBinding(sessionID: UUID) -> Set<String> {
+        let selected = SessionAdminWindows.owningViewModel(for: sessionID)
+        var retained: Set<String> = []
+        for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+            let viewModel = window.agentModeViewModel
+            guard viewModel !== selected,
+                  let entry = viewModel.ownerValidatedSessionIndex[sessionID]
+            else { continue }
+            retained.formUnion(entry.worktreeBindingSummaries.map(\.worktreeID))
+        }
+        return retained
     }
 
     /// Git's own prunable status (the same `git worktree list` the `manage_worktree list` op reads).

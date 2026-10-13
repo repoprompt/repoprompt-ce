@@ -97,22 +97,28 @@ struct SessionAdminWorktreeInfo: Equatable {
 protocol SessionAdminWorktreeHost: AnyObject {
     /// Creates an app-managed worktree for the repository `repoRoot` in the **target** session's
     /// workspace. Admission is fenced to that workspace's roots plus the app-managed container.
+    /// Re-proves `isStillAuthorized` after preparation, at the final Git creation fence.
     func createWorktree(
         forSession sessionID: UUID,
         repoRoot: String?,
         branch: String?,
-        baseRef: String?
+        baseRef: String?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> SessionAdminWorktreeInfo
     /// Binds `worktree` (selector: `@id:`, path, branch, or name) for the target now. Throws when the
     /// target is not idle; the handler decides whether to defer. `isStillAuthorized` is evaluated
     /// synchronously right before the binding transition and again at its `beforeCommit` fence; `false`
     /// throws `SessionAdminHostError.authorityEnded` and nothing changes. Work after that fence
-    /// (recovery handoff, publication) is not re-checked, as with `manage_worktree`.
+    /// (recovery handoff, publication) is not re-checked, as with `manage_worktree`. `admitBindings`
+    /// runs once at that fence with resolved desired identities; `bindingsCommitted` runs at actual
+    /// publication, before any required persistence await (or immediately for an admitted exact no-op).
     func bindWorktree(
         sessionID: UUID,
         worktree: String,
         repoRoot: String?,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
+        bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo
     /// Removes the binding for `worktreeID`, or every binding when `nil`. Returns removed IDs.
     func unbindWorktrees(
@@ -123,6 +129,8 @@ protocol SessionAdminWorktreeHost: AnyObject {
     func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary]
     /// Every worktree bound by any session in any loaded workspace, with its binding sessions.
     func allBoundWorktrees() -> [String: Set<UUID>]
+    /// Bindings of the same session retained outside the window selected for replacement.
+    func retainedWorktreeIDsAfterReplacingBinding(sessionID: UUID) -> Set<String>
     /// Whether a binding transition would be admitted right now (no active run or queued work).
     func isIdleForWorktreeTransition(sessionID: UUID) -> Bool
     /// Suspends until the target next reaches an idle boundary (or disappears). Never mutates.
@@ -139,6 +147,7 @@ enum SessionAdminHostError: LocalizedError, Equatable {
     case notIdle
     /// Delegated authority (lease or membership) ended before the write; nothing changed.
     case authorityEnded
+    case guardrailExceeded(limit: Int, current: Int)
     case invalid(String)
 
     var errorDescription: String? {
@@ -149,6 +158,8 @@ enum SessionAdminHostError: LocalizedError, Equatable {
             "The target session is busy; worktree bindings change only at an idle boundary."
         case .authorityEnded:
             "Delegated authority over the target ended before the change; nothing was changed."
+        case let .guardrailExceeded(limit, current):
+            "The worktree binding would exceed max_worktrees (limit \(limit), current \(current))."
         case let .invalid(message):
             message
         }
