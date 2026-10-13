@@ -10552,12 +10552,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             admissionID: UUID(),
             refreshCanonicalState: true
         ) {
+            let admissionWorkspace = workspaceManager.workspaces.first { $0.id == expectedWorkspaceID }
+            let hasUnboundTargetTab: Bool = admissionWorkspace?.composeTabs.contains {
+                $0.id == session.tabID && $0.activeAgentSessionID == nil
+            } ?? false
             guard workspaceManager.activeWorkspaceID == expectedWorkspaceID,
-                  workspaceManager.workspaces.first(where: {
-                      $0.id == expectedWorkspaceID
-                  })?.composeTabs.contains(where: {
-                      $0.id == session.tabID && $0.activeAgentSessionID == nil
-                  }) == true,
+                  hasUnboundTargetTab,
                   sessions[session.tabID] === session,
                   session.activeAgentSessionID == nil
             else {
@@ -19775,7 +19775,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         if let message = hydratedSession.operationAdmissionFailureMessage {
             finishNativeSlashControlProgress(progressRestoreState, session: hydratedSession)
-            return .failed(message: message)
+            return .failed(message)
         }
         let result = await codexCoordinator.executeNativeSlashCommand(
             invocation.command,
