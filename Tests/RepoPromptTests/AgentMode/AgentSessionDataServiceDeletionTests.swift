@@ -161,6 +161,67 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path))
     }
 
+    func testDeletingSessionRemovesItsRetainedAttachmentFolderOnly() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.storageURL) }
+        let sessionURL = fixture.agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: fixture.sessionID))
+        try writeSession(
+            AgentSession(
+                id: fixture.sessionID,
+                workspaceID: fixture.workspace.id,
+                composeTabID: fixture.tabID,
+                name: "Session with images",
+                itemCount: 0
+            ),
+            to: sessionURL
+        )
+        try writeMetadataIndex(filename: sessionURL.lastPathComponent, fixture: fixture)
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: fixture.agentSessionsFolder)
+        let ownImage = try writeRetainedImage(in: store, sessionID: fixture.sessionID)
+        let otherImage = try writeRetainedImage(in: store, sessionID: UUID())
+
+        let failures = await fixture.service.deleteAgentSessions(
+            forComposeTabIDs: [fixture.tabID],
+            for: fixture.workspace
+        )
+
+        XCTAssertTrue(failures.isEmpty, "\(failures)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownImage.deletingLastPathComponent().path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: otherImage.path))
+    }
+
+    func testDeletingSessionByIDRemovesItsRetainedAttachmentFolder() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.storageURL) }
+        let sessionURL = fixture.agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: fixture.sessionID))
+        try writeSession(
+            AgentSession(
+                id: fixture.sessionID,
+                workspaceID: fixture.workspace.id,
+                composeTabID: fixture.tabID,
+                name: "Session with images",
+                itemCount: 0
+            ),
+            to: sessionURL
+        )
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: fixture.agentSessionsFolder)
+        let ownImage = try writeRetainedImage(in: store, sessionID: fixture.sessionID)
+
+        try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownImage.path))
+    }
+
+    private func writeRetainedImage(in store: AgentSessionAttachmentStore, sessionID: UUID) throws -> URL {
+        let folder = store.sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let imageURL = folder.appendingPathComponent("\(UUID().uuidString).png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imageURL)
+        return imageURL
+    }
+
     private struct BatchDeleteFixture {
         let service: AgentSessionDataService
         let workspace: WorkspaceModel

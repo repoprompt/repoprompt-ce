@@ -1877,6 +1877,7 @@ actor AgentSessionDataService {
             throw error
         }
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
+        AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
         // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
     }
 
