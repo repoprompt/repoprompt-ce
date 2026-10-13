@@ -24,7 +24,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         let compactAttemptID = UUID()
 
         func arm(support: AgentSessionLinkCompactSupport = .claudeCode, note: String = "alpha\nβeta") -> UUID {
-            _ = state.reserve(note: note, idempotencyKey: "key", owner: owner)
+            _ = state.reserve(note: note, idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.admittedSupport = support
             state.active?.phase = .dispatchingCompact
             state.active?.compactProviderConversation = "provider-conversation"
@@ -114,7 +114,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         for error in definitive {
             XCTAssertTrue(error.definitivelyRejectsInput)
             var state = AgentSelfCompactState()
-            _ = state.reserve(note: "recover", idempotencyKey: "key")
+            _ = state.reserve(note: "recover", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             state.active?.phase = .dispatchingNote
             let dispatchID = try AgentSelfCompactionDispatchID(requestID: XCTUnwrap(state.active?.id), stage: .note)
             XCTAssertTrue(state.noteWillAttempt(dispatchID))
@@ -272,8 +272,8 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
         XCTAssertEqual(fake.dispatchCount, 1)
-        XCTAssertEqual(fake.state.reserve(note: "alpha\nβeta", idempotencyKey: "key", owner: fake.owner), .duplicate(id))
-        guard case .scheduled = fake.state.reserve(note: "next note", idempotencyKey: "next-key", owner: fake.owner) else {
+        XCTAssertEqual(fake.state.reserve(note: "alpha\nβeta", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner), .duplicate(id))
+        guard case .scheduled = fake.state.reserve(note: "next note", idempotencyKey: "next-key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner) else {
             return XCTFail("A settled transport failure must not block a new compaction request")
         }
     }
@@ -428,7 +428,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         let coordinator = fake.coordinator()
         await parkAtDeadline(fake, coordinator: coordinator, requestID: id)
         fake.state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-        _ = fake.state.reserve(note: "new request", idempotencyKey: "new", owner: fake.owner)
+        _ = fake.state.reserve(note: "new request", idempotencyKey: "new", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner)
         fake.state.active?.phase = .parked
         fake.state.active?.acpCompletionUnverified = true
         fake.state.active?.compactRunID = fake.compactRunID

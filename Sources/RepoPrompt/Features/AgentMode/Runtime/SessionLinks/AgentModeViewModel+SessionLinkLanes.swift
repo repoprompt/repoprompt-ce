@@ -23,7 +23,8 @@ extension AgentModeViewModel {
         var records = ownerValidatedSessionIndex.values.filter { !loadedSessionIDs.contains($0.id) }.map { entry in
             AgentSessionLaneChildRetirementRecord(
                 sessionID: entry.id, parentSessionID: entry.parentSessionID,
-                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true
+                blocksRetirement: entry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))?.isActive ?? true,
+                source: .sessionIndex
             )
         }
         for session in sessions.values {
@@ -33,7 +34,8 @@ extension AgentModeViewModel {
                 sessionID: sessionID,
                 parentSessionID: session.hasLoadedPersistedState
                     ? session.parentSessionID : session.parentSessionID ?? indexed?.parentSessionID,
-                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session)
+                blocksRetirement: !agentSessionLinkLaneSessionIsQuiescent(session),
+                source: session.hasLoadedPersistedState ? .hydratedSession : .unhydratedSession
             ))
         }
         return records
@@ -270,8 +272,11 @@ extension AgentModeViewModel {
             ?? AgentMonitorSessionIDFormatter.short(creatorID)
     }
 
-    /// Preflight or stash one exact inactive lane. Both removal CAS hooks repeat the check around
-    /// the required session flush; a prompt or run starting during that await keeps the tab open.
+    /// Preflight or stash one exact inactive lane. The commit:false phase runs the same required
+    /// flush, cascade, and post-preflight CAS checks as the stash, plus a non-mutating save-admission
+    /// probe — it only skips the projection mutation. The flush is deliberately effectful: real
+    /// save I/O is what freshens the stale child headers the post-preflight rescan relies on.
+    /// Commit re-runs every check with fresh claims.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
@@ -292,8 +297,7 @@ extension AgentModeViewModel {
             else { return false }
             return true
         }
-        guard canRetire(), let promptManager else { return false }
-        guard commit else { return true }
+        guard canRetire(), let promptManager, let workspaceManager else { return false }
         let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
             tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
         }).union([endpoint.tabID])
@@ -301,22 +305,44 @@ extension AgentModeViewModel {
             withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
             postPreflightValidation: canRetire,
-            expandCascade: true
+            expandCascade: true,
+            validateOnly: !commit
         )
-        guard report.rejections.isEmpty,
-              report.removedComposeTabIDs.contains(endpoint.tabID),
-              workspaceManager?.activeWorkspace?.stashedTabs.contains(where: {
+        guard report.rejections.isEmpty else { return false }
+        guard commit else {
+            return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+        }
+        guard report.removedComposeTabIDs.contains(endpoint.tabID),
+              workspaceManager.activeWorkspace?.stashedTabs.contains(where: {
                   $0.tab.id == endpoint.tabID
-              }) == true,
-              let workspaceManager
+              }) == true
         else { return false }
         didStash(report.removedComposeTabIDs)
-        // The retirement activation claim stays held by the bridge until this canonical save
-        // settles, so another window cannot reload the pre-stash binding in the meantime.
-        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+        // The stash has committed in memory, so the lane is retired even when this canonical save
+        // is not admitted: the normal save cadence persists it later, and the accepted worst case
+        // is the tab returning unlinked after a crash. The save still runs — the retirement
+        // activation claim stays held by the bridge until it settles, so another window cannot
+        // reload the pre-stash binding in the meantime — but its admission no longer gates the
+        // outcome; only an uncommitted stash may report `unlinked_not_stashed`.
+        _ = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
             workspaceID: endpoint.workspaceID,
             source: WorkspaceSaveSource("oversightLaneRetirement")
         )
-        return persistence.acceptedForLifecycleAdmission
+        return true
+    }
+
+    /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and the save-admission probe.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = session(for: endpoint.tabID, createIfNeeded: false),
+              session.activeAgentSessionID == endpoint.sessionID,
+              agentSessionLinkLaneSessionIsQuiescent(session),
+              !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
+                  of: endpoint.sessionID, in: agentSessionLinkChildRetirementRecords()
+              ),
+              let workspaceManager
+        else { return false }
+        return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
     }
 }

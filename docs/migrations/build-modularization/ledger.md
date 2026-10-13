@@ -1048,6 +1048,25 @@ This in-place C1/C2 slice removes WorkspaceContext, Search, and CodeMap's outbou
 Compiler-index readiness baseline on 101 files: 55 outbound target files, 168 outbound file edges, 1,040 symbols. The final index and validation tickets are recorded in `/tmp/rpce-pr-reviews/pr3-impl.md` for this worktree. FileSystem/VCS and other Infrastructure remain for subsequent milestones.
 
 
+## #1112 restoration-presentation test ownership exception — 2026-10-02
+
+Atila approved one increase of `tests_testable_import_app_files`, from 333 to
+334, for exactly
+`Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift`.
+It owns the classifier, persisted-restoration lifecycle, and snapshot-publication
+suites for one cohesive restoration-presentation contract. The nearest existing
+transcript-policy tests own repaint/remount behavior; appending the new contract
+there solely to satisfy the file count would harm ownership and navigation.
+Existing title and sidebar suites remain in their owning test files.
+
+This exception does not raise the app-source line baseline or its 2,000-line
+headroom, change other ratchets, or authorize wider production visibility.
+The approval was relayed by Atila's delegated #1112 overseer during implementation.
+Guardrails must still pass on the integrated change.
+
+2026-10-09: Atila reaffirmed the same single-file exception for `Tests/RepoPromptTests/AgentMode/Transcript/AgentTranscriptRestorationPresentationTests.swift` against main’s lowered baseline (327→328); the exception was not widened.
+
+
 ## PR 4 MCP server prep — bounded source handoff (2026-10-02)
 
 Base/current fetched origin/main at start: `61ab8b285fa5a9281587ec9712404bfe7b5c528f`;
@@ -1290,3 +1309,6 @@ supplied by these owning writer or neutral container suites. The historical
 final-materialization and graph authority failures remain unattributed; subsequent
 GREEN execution is not causal explanation. No typed-path claimed source or
 separately owned reliability source was modified.
+
+
+**2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.

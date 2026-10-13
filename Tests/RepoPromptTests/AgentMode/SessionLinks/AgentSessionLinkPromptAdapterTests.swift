@@ -828,7 +828,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         let note = "resume βeta\nwithout edits"
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "codex-native-note", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "codex-native-note", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .dispatchingNote
         state.active?.compactProviderConversation = fixture.session.codexConversationID
         let dispatchID = try AgentSelfCompactionDispatchID(

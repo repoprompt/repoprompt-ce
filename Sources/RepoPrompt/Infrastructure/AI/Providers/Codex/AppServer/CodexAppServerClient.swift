@@ -89,6 +89,7 @@ actor CodexAppServerClient {
         let isDefault: Bool
         let supportedReasoningEfforts: [RemoteReasoningEffort]
         let defaultReasoningEffort: String?
+        var serviceTiers: [CodexModelServiceTier] = []
     }
 
     struct ServerRequest {
@@ -1488,6 +1489,7 @@ actor CodexAppServerClient {
                         let effortDescription = (effortEntry["description"] as? String) ?? ""
                         return RemoteReasoningEffort(reasoningEffort: reasoningEffort, description: effortDescription)
                     }
+                let serviceTiers = CodexServiceTierVariantCatalog.advertisedTiers(from: entry)
                 models.append(
                     RemoteModel(
                         id: id,
@@ -1496,7 +1498,8 @@ actor CodexAppServerClient {
                         description: description,
                         isDefault: isDefault,
                         supportedReasoningEfforts: supportedReasoningEfforts,
-                        defaultReasoningEffort: defaultReasoningEffort
+                        defaultReasoningEffort: defaultReasoningEffort,
+                        serviceTiers: serviceTiers
                     )
                 )
             }

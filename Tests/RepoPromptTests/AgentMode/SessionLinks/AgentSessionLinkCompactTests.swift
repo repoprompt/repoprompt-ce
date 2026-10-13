@@ -308,6 +308,41 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim is released")
     }
 
+    func testAgentSelfOversizeAdmissionReportsEnforcedWindowBasis() async throws {
+        let fixture = try makeFixture()
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        fixture.session.runState = .running
+        let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.noteLimit")
+        let endpoint = fixture.candidate.domainEndpoint
+        let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        let cases: [(Int?, Int, String)] = [
+            (1000, 400, "10% of context window at 4 UTF-8 bytes/token"),
+            (nil, 65536, "unknown context window fallback")
+        ]
+        for (window, maximum, basis) in cases {
+            fixture.session.contextUsageSnapshot = nil
+            if let window {
+                fixture.session.contextUsageSnapshot = ContextUsageSnapshot(
+                    used: 1, window: window, confidence: .exact, source: .claudeUsageEvent, compactedAt: nil
+                )
+                fixture.session.noteLiveContextUsageReport(contextUsedTokens: 1, promptTokens: nil, modelContextWindow: window)
+            }
+            let admission = await fixture.viewModel.agentSelfCompactMCPAdmission(
+                endpoint: endpoint, origin: origin,
+                note: String(repeating: "x", count: maximum + 1), idempotencyKey: "oversized"
+            )
+            guard case let .noteTooLong(byteCount, enforcedMaximum, enforcedBasis) = admission else {
+                return XCTFail("Expected an oversized-note refusal from real VM admission")
+            }
+            XCTAssertEqual(byteCount, maximum + 1)
+            XCTAssertEqual(enforcedMaximum, maximum)
+            XCTAssertEqual(enforcedBasis, basis)
+            XCTAssertNil(fixture.session.selfCompactState.active)
+        }
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testSelfTerminalBoundaryStartsNativeCommandPipelineAfterPersistingFixedRow() async throws {
         let fixture = try makeFixture()
         let runID = UUID()
@@ -1106,7 +1141,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             runAttemptID: XCTUnwrap(session.activeRunAttemptID)
         )
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "native-note-test", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "native-note-test", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .dispatchingNote
         state.active?.compactProviderConversation = "monitor-native-session"
         let id = try XCTUnwrap(state.active?.id)

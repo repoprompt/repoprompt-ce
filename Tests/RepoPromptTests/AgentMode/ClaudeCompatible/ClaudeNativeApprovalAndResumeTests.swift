@@ -826,7 +826,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 acceptAgentSessionLinkPromptClaim: { _, _, _ in accepted += 1 }
             ), providerBindingService: AgentModeProviderBindingService())
             var state = session.selfCompactState
-            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race")
+            guard case let .scheduled(noteAttempt) = state.reserve(note: "keep this exact note", idempotencyKey: "proof-race", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             else { return XCTFail("Expected parked note reservation") }
             let noteID = noteAttempt.id
             state.active?.phase = .parked

@@ -19,26 +19,6 @@ enum AgentSessionDataError: Error {
     case noActiveWorkspace
 }
 
-// MARK: - Agent Session Metadata
-
-/// Lightweight metadata for agent session listing
-struct AgentSessionMeta {
-    let id: UUID
-    let composeTabID: UUID?
-    let name: String
-    let lastModified: Date
-    let itemCount: Int
-    let agentKind: String?
-    let agentModel: String?
-    let lastRunState: String?
-    let acpModelParameterSelections: [ACPModelParameterSelection]
-    let parentSessionID: UUID?
-    let createdByOverseerSessionID: UUID?
-    let isMCPOriginated: Bool
-    let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
-    let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
-}
-
 private actor AgentSessionDiskWriter {
     private struct PendingWrite {
         var pendingData: Data?
@@ -217,6 +197,8 @@ actor AgentSessionDataService {
         private var testWorktreeMergeReconciliationHooks: AgentSessionWorktreeMergeReconciliationHooks?
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
         private var testBeforeDeletionAdmissionHook: (@Sendable (URL) async -> Void)?
+        /// Passive gate run inside `preparePersistedHydration` once the load result is known.
+        private var testAfterHydrationPrepareHook: (@Sendable (UUID) async throws -> Void)?
     #endif
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
@@ -1924,6 +1906,16 @@ actor AgentSessionDataService {
 
         func test_setBeforeLoadRepairWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
             testBeforeLoadRepairWriteHook = hook
+        }
+
+        /// Holds or fails real hydration preparation after its disk result is known (nil or payload);
+        /// it never alters the prepared result. Fixtures must reset it to nil.
+        func test_setAfterHydrationPrepareHook(_ hook: (@Sendable (UUID) async throws -> Void)?) {
+            testAfterHydrationPrepareHook = hook
+        }
+
+        func runAfterHydrationPrepareHookForTesting(sessionID: UUID) async throws {
+            try await testAfterHydrationPrepareHook?(sessionID)
         }
 
         func test_waitUntilDeletionTombstone(for fileURL: URL) async {

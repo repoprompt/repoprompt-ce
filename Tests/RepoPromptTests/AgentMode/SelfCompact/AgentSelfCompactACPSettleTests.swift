@@ -301,7 +301,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testEveryRestoredPhaseIsRecoveryRequired() {
         for phase in AgentSelfCompactAttempt.Phase.allCases {
             var state = AgentSelfCompactState()
-            _ = state.reserve(note: note, idempotencyKey: "key-\(phase.rawValue)")
+            _ = state.reserve(note: note, idempotencyKey: "key-\(phase.rawValue)", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
             state.active?.phase = phase
             state.active?.acpCompletionUnverified = true
             XCTAssertTrue(state.reconcileDecodedRecord(), phase.rawValue)
@@ -317,7 +317,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testParkedPrefixCarriesTheFrameOnceAndExactNoteIsUnmodified() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "carry")
+        _ = state.reserve(note: note, idempotencyKey: "carry", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .parked
         state.active?.acpCompletionUnverified = true
         session.selfCompactState = state
@@ -335,7 +335,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertTrue(session.items.contains { $0.kind == .system && !$0.text.contains(note) && !$0.text.contains("<note>") })
 
         var exactState = AgentSelfCompactState()
-        _ = exactState.reserve(note: note, idempotencyKey: "exact")
+        _ = exactState.reserve(note: note, idempotencyKey: "exact", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         exactState.active?.phase = .dispatchingNote
         session.selfCompactState = exactState
         let exact = AgentSelfCompactParkedPrefix.prepare(frame, session: session, scheduleSave: {})
@@ -384,7 +384,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
 
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "raced-note")
+        _ = state.reserve(note: note, idempotencyKey: "raced-note", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
         let frame = AgentSelfCompactNoteEnvelope.frame(note)
@@ -457,7 +457,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testStaleDedicatedACPNoteCannotReparkAnOrdinarySendInFlight() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "ordinary-in-flight")
+        _ = state.reserve(note: note, idempotencyKey: "ordinary-in-flight", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
         let frame = AgentSelfCompactNoteEnvelope.frame(note)
@@ -482,7 +482,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
 
     func testUnverifiedACPNoteTransportFailureDoesNotClaimVerifiedCompaction() throws {
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "unverified-failure")
+        _ = state.reserve(note: note, idempotencyKey: "unverified-failure", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         let attempt = try XCTUnwrap(state.active)
         state.active?.phase = .parked
         state.active?.acpCompletionUnverified = true
@@ -498,7 +498,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testUnattemptedACPNoteStartupReparksAndSaves() throws {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "startup")
+        _ = state.reserve(note: note, idempotencyKey: "startup", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
         session.isDirty = false
@@ -519,7 +519,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
 
         state = session.selfCompactState
         state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-        _ = state.reserve(note: "newer", idempotencyKey: "newer")
+        _ = state.reserve(note: "newer", idempotencyKey: "newer", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
         XCTAssertFalse(AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
@@ -532,7 +532,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testStaleParkedNoteCancellationSchedulesPersistence() {
         let session = AgentTabSession(tabID: UUID())
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "stale", owner: Fake().owner)
+        _ = state.reserve(note: note, idempotencyKey: "stale", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: Fake().owner)
         state.active?.phase = .parked
         session.selfCompactState = state
         session.isDirty = false
@@ -564,13 +564,13 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             XCTAssertEqual(fake.dispatchCount, 0)
             XCTAssertEqual(fake.state.status?.outcome, .completionUnverified)
             XCTAssertEqual(fake.state.status?.completionVerified, false)
-            let same = fake.state.reserve(note: body, idempotencyKey: "key", owner: fake.owner)
+            let same = fake.state.reserve(note: body, idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner)
             guard case .duplicate = same else {
                 XCTFail("iteration \(index) expected duplicate, got \(same)")
                 return
             }
             XCTAssertEqual(
-                fake.state.reserve(note: body, idempotencyKey: "other-key", owner: fake.owner),
+                fake.state.reserve(note: body, idempotencyKey: "other-key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: fake.owner),
                 .alreadyPending
             )
         }
@@ -599,7 +599,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         let compactAttemptID = UUID()
 
         func arm(note: String = "alpha\nβeta", tokensBefore: Int? = 100) -> UUID {
-            _ = state.reserve(note: note, idempotencyKey: "key", owner: owner)
+            _ = state.reserve(note: note, idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.admittedSupport = .acpAdvertisedCommand
             state.active?.phase = .dispatchingCompact
             state.active?.usedTokensBeforeCompact = tokensBefore

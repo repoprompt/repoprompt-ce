@@ -98,14 +98,14 @@ struct AgentSessionRow: View {
         DomainAgentSessionLinkEndpointIdentity,
         DomainAgentSessionLinkReference
     ) async -> AgentSidebarOversightActionOutcome)?
-    /// General exact-endpoint Add for the inverse direction (this row as observer). Unlike
-    /// `onAddSidebarOversight` it may create the row's *first* outbound link.
-    var onAddOutboundOversight: (@MainActor (
-        DomainAgentSessionLinkEndpointIdentity,
-        DomainAgentSessionLinkEndpointIdentity
+    /// General exact-endpoint Add for a chosen observer → target pair. Unlike
+    /// `onAddSidebarOversight` it may create the observer's *first* outbound link.
+    var onAddOversightLink: (@MainActor (
+        _ observer: DomainAgentSessionLinkEndpointIdentity,
+        _ target: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome)?
     /// Read-only pasted-ID resolution for the row's Session-ID sheets. Inbound resolves the
-    /// prospective overseer (existing-overseer rule); outbound resolves the prospective target.
+    /// prospective overseer (any eligible session); outbound resolves the prospective target.
     var resolveOverseerSessionIDCandidate: (@MainActor (
         String
     ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)?
@@ -144,12 +144,21 @@ struct AgentSessionRow: View {
     /// captured when the menu item was chosen.
     @State private var oversightSessionIDSheet: OversightIDSheetRequest?
 
-    private struct OversightIDSheetRequest: Identifiable {
+    struct OversightIDSheetRequest: Identifiable {
         enum Direction {
             /// The pasted ID names the prospective overseer of this row.
             case chooseOverseer
             /// The pasted ID names the prospective target for this row.
             case chooseTarget
+
+            /// Orders the row and the pasted peer as observer → target for this sheet, so the
+            /// confirmation labels and the submitted endpoints cannot disagree.
+            func ordering<Party>(row: Party, peer: Party) -> (observer: Party, target: Party) {
+                switch self {
+                case .chooseOverseer: (observer: peer, target: row)
+                case .chooseTarget: (observer: row, target: peer)
+                }
+            }
         }
 
         let direction: Direction
@@ -515,7 +524,7 @@ struct AgentSessionRow: View {
 
     /// Inverse-direction Add: this row becomes the observer of the chosen target. Uses the general
     /// exact-endpoint Add so a row can acquire its *first* outbound link — the inbound menu's
-    /// existing-overseer precondition does not apply to this direction.
+    /// existing-overseer precondition applies only to that menu's own picks.
     private func addOutboundOversight(
         _ option: AgentSidebarOversightMenuProps.TargetOption,
         menu: AgentSidebarOversightMenuProps
@@ -531,7 +540,7 @@ struct AgentSessionRow: View {
               current.availableTargets.contains(where: {
                   $0.peerEndpoint == option.peerEndpoint
               }),
-              let onAddOutboundOversight
+              let onAddOversightLink
         else {
             sidebarOversightBusyKeys.remove(key)
             setSynchronousSidebarOversightFailure(
@@ -554,7 +563,7 @@ struct AgentSessionRow: View {
                 sidebarOversightBusyKeys.remove(key)
                 return
             }
-            let outcome = await onAddOutboundOversight(
+            let outcome = await onAddOversightLink(
                 menu.targetEndpoint,
                 option.peerEndpoint
             )
@@ -685,32 +694,21 @@ struct AgentSessionRow: View {
         guard resolveSidebarOversightTargetEndpoint?() == request.rowEndpoint else {
             return .failed(AgentOversightUICopy.staleSelectionMessage)
         }
-        let confirmed: Bool
-        let outcome: AgentSidebarOversightActionOutcome
-        switch direction {
-        case .chooseOverseer:
-            confirmed = await AgentOversightLinkConfirmation.confirm(
-                observerLabel: peer.displayName,
-                targetLabel: request.rowDisplayName,
-                windowID: request.rowEndpoint.windowID
-            )
-            guard confirmed else { return .cancelled }
-            guard let onAddSidebarOversight else {
-                return .failed(AgentOversightUICopy.staleSelectionMessage)
-            }
-            outcome = await onAddSidebarOversight(peer.endpoint, request.rowEndpoint)
-        case .chooseTarget:
-            confirmed = await AgentOversightLinkConfirmation.confirm(
-                observerLabel: request.rowDisplayName,
-                targetLabel: peer.displayName,
-                windowID: request.rowEndpoint.windowID
-            )
-            guard confirmed else { return .cancelled }
-            guard let onAddOutboundOversight else {
-                return .failed(AgentOversightUICopy.staleSelectionMessage)
-            }
-            outcome = await onAddOutboundOversight(request.rowEndpoint, peer.endpoint)
+        // Both directions submit through the general Add: a pasted overseer need not hold an
+        // outbound link yet (the Link-overseer menu's existing-overseer precondition applies
+        // only to its own picks). `ordering` keeps the confirmation labels and the submitted
+        // endpoints in the same observer → target order.
+        guard let onAddOversightLink else {
+            return .failed(AgentOversightUICopy.staleSelectionMessage)
         }
+        let labels = direction.ordering(row: request.rowDisplayName, peer: peer.displayName)
+        let endpoints = direction.ordering(row: request.rowEndpoint, peer: peer.endpoint)
+        guard await AgentOversightLinkConfirmation.confirm(
+            observerLabel: labels.observer,
+            targetLabel: labels.target,
+            windowID: request.rowEndpoint.windowID
+        ) else { return .cancelled }
+        let outcome = await onAddOversightLink(endpoints.observer, endpoints.target)
         switch outcome {
         case .changed, .alreadyInRequestedState:
             return .succeeded

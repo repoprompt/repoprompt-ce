@@ -210,24 +210,30 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         XCTAssertEqual(menu.availableObservers.map(\.peerEndpoint), [eligibleOverseer.domainEndpoint])
     }
 
-    /// Ordering contract: the row's own workspace cohort first, then folded name — flat across
-    /// linked and available observers in the inbound list.
-    func testInboundListOrdersOwnWorkspaceFirstThenName() {
+    /// Ordering contract: one alphabetical order by the visible label — workspace, branch, then
+    /// chat name — flat across linked and available observers and across workspaces.
+    func testInboundListOrdersAlphabeticallyByVisibleLabelAcrossWorkspaces() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
         let target = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Target")
-        // In the row's workspace but sorts last by name; a linked observer elsewhere sorts first
-        // among the other-workspace group but still after every same-workspace option.
+        // Same workspace as the row but its label sorts last — no own-workspace priority.
+        let availableLocal = candidate(
+            windowID: 3,
+            workspaceID: ownWorkspace,
+            displayName: "Zed",
+            locationLabel: "zeta (main)"
+        )
         let linkedRemote = candidate(
             windowID: 2,
             workspaceID: otherWorkspace,
-            displayName: "AAA linked remote"
+            displayName: "Chat",
+            locationLabel: "beta (main)"
         )
-        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Zeta local")
         let availableRemote = candidate(
             windowID: 4,
             workspaceID: otherWorkspace,
-            displayName: "BBB remote"
+            displayName: "Able",
+            locationLabel: "beta (main)"
         )
         let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 3)
 
@@ -246,47 +252,155 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            menu.observerOptions.map(\.displayName),
-            ["Zeta local", "AAA linked remote", "BBB remote"]
+            menu.observerOptions.map(\.menuLabel),
+            ["beta (main): Able", "beta (main): Chat", "zeta (main): Zed"]
         )
         guard case .linked = menu.observerOptions[1].relationship else {
             return XCTFail("expected the remote option to stay linked after sorting")
         }
     }
 
-    /// The inverse list keeps ticked (linked) targets first, then applies the same
-    /// own-workspace/name ordering inside each group.
-    func testOutboundListKeepsLinkedFirstThenWorkspaceThenName() {
+    /// The inverse list keeps ticked (linked) targets first, then applies the same label
+    /// ordering inside each group — again without own-workspace priority.
+    func testOutboundListKeepsLinkedFirstThenLabelOrder() {
         let ownWorkspace = id("10000000-0000-0000-0000-000000000001")
         let otherWorkspace = id("20000000-0000-0000-0000-000000000002")
-        let observer = candidate(windowID: 10, workspaceID: ownWorkspace, displayName: "Observer")
-        let linkedRemote = candidate(
-            windowID: 2,
-            workspaceID: otherWorkspace,
-            displayName: "Linked target"
+        let observer = candidate(
+            windowID: 10,
+            workspaceID: ownWorkspace,
+            displayName: "Observer",
+            locationLabel: "zeta (main)"
         )
-        let availableLocal = candidate(windowID: 3, workspaceID: ownWorkspace, displayName: "Alpha local")
+        let linkedZeta = candidate(
+            windowID: 2,
+            workspaceID: ownWorkspace,
+            displayName: "Linked zeta",
+            locationLabel: "zeta (main)"
+        )
+        let linkedAlpha = candidate(
+            windowID: 8,
+            workspaceID: otherWorkspace,
+            displayName: "Linked alpha",
+            locationLabel: "alpha (main)"
+        )
+        let availableLocal = candidate(
+            windowID: 3,
+            workspaceID: ownWorkspace,
+            displayName: "Alpha local",
+            locationLabel: "alpha (dev)"
+        )
         let selfSession = candidate(windowID: 5, sessionID: observer.sessionID, displayName: "Self")
         let ineligibleTarget = candidate(
             windowID: 6,
             hasLoadedPersistedState: false,
             displayName: "Loading target"
         )
-        let relationship = Linked(endpoint: linkedRemote.domainEndpoint, linkID: UUID(), generation: 9)
+        let relationships = [
+            Linked(endpoint: linkedZeta.domainEndpoint, linkID: UUID(), generation: 9),
+            Linked(endpoint: linkedAlpha.domainEndpoint, linkID: UUID(), generation: 4)
+        ]
 
         let menu = AgentSidebarOversightMenuProjection.make(
             target: observer,
-            inputs: inputs(target: observer, linkedTargets: [relationship]),
-            candidates: [observer, linkedRemote, availableLocal, selfSession, ineligibleTarget]
+            inputs: inputs(target: observer, linkedTargets: relationships),
+            candidates: [
+                observer, linkedZeta, linkedAlpha, availableLocal, selfSession, ineligibleTarget
+            ]
         )
 
         XCTAssertEqual(
-            menu.targetOptions.map(\.peerEndpoint),
-            [linkedRemote.domainEndpoint, availableLocal.domainEndpoint]
+            menu.targetOptions.map(\.menuLabel),
+            [
+                "alpha (main): Linked alpha",
+                "zeta (main): Linked zeta",
+                "alpha (dev): Alpha local"
+            ]
         )
         XCTAssertTrue(menu.isOverseer)
-        XCTAssertEqual(menu.outboundTargetNames, ["Linked target"])
+        XCTAssertEqual(menu.outboundTargetNames, ["Linked zeta", "Linked alpha"])
         XCTAssertNil(menu.observerIneligibleReason)
+    }
+
+    /// Label ordering folds case and diacritics in a fixed locale and orders embedded numbers
+    /// naturally — in the chat name ("Chat 2" before "Chat 10") and in the workspace name
+    /// ("ws2" before "ws10", even when the chat names invert).
+    func testAvailableListOrdersCaseDiacriticAndNumberInsensitiveNaturally() {
+        let target = candidate(windowID: 10, displayName: "Target")
+        func peer(_ windowID: Int, _ name: String, _ location: String) -> AgentSessionLinkEndpointCandidate {
+            candidate(windowID: windowID, displayName: name, locationLabel: location)
+        }
+        // "Beta" before "alpha" under raw byte order, so this pair pins case folding;
+        // "Étude" lands after ASCII names without diacritic folding.
+        let peers = [
+            peer(2, "Beta", "ws (main)"),
+            peer(3, "alpha", "ws (main)"),
+            peer(4, "Chat 10", "ws (main)"),
+            peer(5, "Chat 2", "ws (main)"),
+            peer(6, "delta", "ws (main)"),
+            peer(7, "Étude", "ws (main)"),
+            peer(8, "foxtrot", "ws (main)"),
+            peer(9, "zzz", "ws2 (main)"),
+            peer(11, "aaa", "ws10 (main)")
+        ]
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                activeOutboundObserverEndpoints: Set(peers.map(\.domainEndpoint))
+            ),
+            candidates: [target] + peers
+        )
+
+        XCTAssertEqual(
+            menu.availableObservers.map(\.menuLabel),
+            [
+                "ws2 (main): zzz",
+                "ws10 (main): aaa",
+                "ws (main): alpha",
+                "ws (main): Beta",
+                "ws (main): Chat 2",
+                "ws (main): Chat 10",
+                "ws (main): delta",
+                "ws (main): Étude",
+                "ws (main): foxtrot"
+            ]
+        )
+    }
+
+    /// Identical visible labels stay deterministic: exact identity breaks the tie, so menu order
+    /// never depends on dictionary or input ordering.
+    func testDuplicateLabelsBreakTiesDeterministically() {
+        let target = candidate(windowID: 10, displayName: "Target")
+        let lowSession = candidate(
+            windowID: 2,
+            sessionID: id("10000000-0000-0000-0000-00000000000A"),
+            displayName: "Same",
+            locationLabel: "ws (main)"
+        )
+        let highSession = candidate(
+            windowID: 3,
+            sessionID: id("F0000000-0000-0000-0000-00000000000B"),
+            displayName: "Same",
+            locationLabel: "ws (main)"
+        )
+
+        let menu = AgentSidebarOversightMenuProjection.make(
+            target: target,
+            inputs: inputs(
+                target: target,
+                activeOutboundObserverEndpoints: [
+                    highSession.domainEndpoint,
+                    lowSession.domainEndpoint
+                ]
+            ),
+            candidates: [target, highSession, lowSession]
+        )
+
+        XCTAssertEqual(
+            menu.availableObservers.map(\.peerSessionID),
+            [lowSession.sessionID, highSession.sessionID]
+        )
     }
 
     /// An ineligible target keeps its menu with a greyed reason and retains linked observers for
@@ -2800,6 +2914,21 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         await fulfillment(of: [finished], timeout: timeout)
         return try XCTUnwrap(tracked, "Actual native opening must track a menu")
+    }
+
+    /// Both Session-ID sheet directions submit through the shared general-Add callback, so the
+    /// direction's ordering is the only place observer → target can be inverted. Pin it.
+    func testOversightSessionIDSheetDirectionOrdersObserverAndTarget() {
+        let row = "row-party"
+        let peer = "peer-party"
+        let inbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseOverseer
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(inbound.observer, peer)
+        XCTAssertEqual(inbound.target, row)
+        let outbound = AgentSessionRow.OversightIDSheetRequest.Direction.chooseTarget
+            .ordering(row: row, peer: peer)
+        XCTAssertEqual(outbound.observer, row)
+        XCTAssertEqual(outbound.target, peer)
     }
 
     private func mountedRegion(in fixture: Fixture) throws -> StableMenuContextView {

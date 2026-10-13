@@ -3,6 +3,38 @@ import Foundation
 import XCTest
 
 final class AgentCodexModelRegistryCacheTests: XCTestCase {
+    func testSpeedOnlyRefreshInvalidatesPickerAndPersistsCapabilities() {
+        let registry = AgentCodexModelRegistry()
+        let persistenceKey = "CodexDynamicModelRecords"
+        let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
+        defer { UserDefaults.standard.set(originalPersistence, forKey: persistenceKey) }
+        let standard = CodexAppServerClient.RemoteModel(
+            id: "future-model", model: "future-model", displayName: "Future", description: "", isDefault: true,
+            supportedReasoningEfforts: [
+                .init(reasoningEffort: "low", description: ""),
+                .init(reasoningEffort: "max", description: "")
+            ], defaultReasoningEffort: "max"
+        )
+        var ultrafast = standard
+        ultrafast.serviceTiers = [.init(id: "ultrafast", name: "Ultrafast", description: "")]
+        XCTAssertTrue(registry.updateLiveModels([standard]))
+        XCTAssertFalse(registry.resolvedOptions(staticOptions: []).contains { $0.rawValue.hasPrefix("future-model-ultrafast") })
+        XCTAssertTrue(registry.updateLiveModels([ultrafast]))
+        XCTAssertFalse(registry.updateLiveModels([ultrafast]))
+        XCTAssertTrue(registry.resolvedOptions(staticOptions: []).contains { $0.rawValue.hasPrefix("future-model-ultrafast") })
+        XCTAssertEqual(CodexDynamicModelStore.load().first?.serviceTiers, ultrafast.serviceTiers)
+        XCTAssertEqual(
+            registry.resolvedOptions(staticOptions: []).first {
+                $0.rawValue == "future-model-ultrafast-low"
+            }?.defaultReasoningEffort, .max
+        )
+        XCTAssertTrue(CodexAIModelCatalog.modelsForPicker(staticModels: []).contains {
+            $0.modelName.hasPrefix("future-model-ultrafast")
+        })
+        XCTAssertTrue(registry.updateLiveModels([standard]))
+        XCTAssertFalse(registry.resolvedOptions(staticOptions: []).contains { $0.rawValue.hasPrefix("future-model-ultrafast") })
+    }
+
     func testPreferredModelSnapshotsDoNotReuseAnotherCatalogsOptions() {
         let registry = AgentCodexModelRegistry()
         let first = remoteModel(id: "future-alpha", displayName: "Alpha", isDefault: true)

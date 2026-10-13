@@ -2,6 +2,49 @@ import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 final class CodexDiscoveredEffortTests: XCTestCase {
+    func testStructuredSpeedCatalogWinsAndLegacyCatalogStillWorks() {
+        XCTAssertEqual(CodexServiceTierVariantCatalog.advertisedTiers(from: [
+            "serviceTiers": [["id": "ultrafast", "name": "Ultrafast", "description": "Account access"]],
+            "additionalSpeedTiers": ["fast"]
+        ]), [.init(id: "ultrafast", name: "Ultrafast", description: "Account access")])
+        XCTAssertTrue(CodexServiceTierVariantCatalog.advertisedTiers(from: [
+            "serviceTiers": [[String: Any]](), "additionalSpeedTiers": ["ultrafast"]
+        ]).isEmpty)
+        XCTAssertEqual(CodexServiceTierVariantCatalog.advertisedTiers(from: [
+            "additionalSpeedTiers": ["ultrafast"]
+        ]).map(\.id), ["ultrafast"])
+        XCTAssertTrue(CodexServiceTierVariantCatalog.advertisedTiers(from: [:]).isEmpty)
+    }
+
+    func testUltrafastAppearsOnlyAfterCapabilityRefreshAndPreservesRequestSelection() throws {
+        let tier = CodexModelServiceTier(id: "ultrafast", name: "Ultrafast", description: "Account speed tier")
+        for id in ["gpt-6-astra", "gpt-6.1-sol", "future-model"] {
+            let without = CodexDynamicModelRecord(
+                id: id, model: id, displayName: id, description: "", isDefault: true,
+                supportedReasoningEfforts: [.init(reasoningEffort: "max", description: "")],
+                defaultReasoningEffort: "max"
+            )
+            let with = CodexDynamicModelRecord(
+                id: id, model: id, displayName: id, description: "", isDefault: true,
+                supportedReasoningEfforts: without.supportedReasoningEfforts,
+                defaultReasoningEffort: "max", serviceTiers: [tier]
+            )
+            XCTAssertFalse(CodexDynamicModelMapper.options(from: [without]).contains { $0.id.contains("ultrafast") })
+            let options = CodexDynamicModelMapper.options(from: [with])
+            let option = try XCTUnwrap(options.first { $0.id == "\(id)-ultrafast-max" })
+            XCTAssertFalse(option.isDefault)
+            let selection = CodexModelSpecifier(raw: option.id, discoveredRecords: [with])
+            XCTAssertEqual(selection.appServerModelParam, id)
+            XCTAssertEqual(selection.appServerEffortParam, "max")
+            XCTAssertEqual(selection.appServerServiceTierParam, "ultrafast")
+            XCTAssertEqual(selection.cliServiceTierConfigArgs, ["-c", "service_tier=ultrafast"])
+            let roundTrip = try JSONDecoder().decode([CodexDynamicModelRecord].self, from: JSONEncoder().encode([with]))
+            XCTAssertEqual(roundTrip, [with])
+            XCTAssertEqual(CodexDynamicModelMapper.options(from: roundTrip), options)
+            XCTAssertFalse(CodexDynamicModelMapper.options(from: [without]).contains { $0.id.contains("ultrafast") })
+        }
+    }
+
     func testDiscoveredPickerEffortsBecomeRequestParameters() throws {
         let records = [record("gpt-future", efforts: ["high", "max", "ultra"])]
         let options = CodexDynamicModelMapper.options(from: records)

@@ -516,7 +516,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         XCTAssertTrue(owner.matchesLocalBinding(session))
         let note = "private parked continuation"
         var state = AgentSelfCompactState()
-        _ = state.reserve(note: note, idempotencyKey: "acp-steer-late-writer", owner: owner)
+        _ = state.reserve(note: note, idempotencyKey: "acp-steer-late-writer", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
         state.active?.phase = .parked
         session.selfCompactState = state
         let dispatchID = try AgentSelfCompactionDispatchID(

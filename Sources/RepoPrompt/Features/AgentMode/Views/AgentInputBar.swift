@@ -817,7 +817,7 @@ struct AgentComposerView: View, Equatable {
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
 
-    private var isSelectedCodexFastModel: Bool {
+    private var isSelectedCodexSpeedTier: Bool {
         AgentModelSelectionWarningVisuals.showsWarning(
             agent: props.selectedAgent,
             rawModel: props.selectedModelRaw
@@ -832,8 +832,8 @@ struct AgentComposerView: View, Equatable {
         } else {
             "Choose agent and model"
         }
-        guard isSelectedCodexFastModel else { return baseTooltip }
-        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.warningTooltip)"
+        guard isSelectedCodexSpeedTier else { return baseTooltip }
+        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.tooltip(agent: props.selectedAgent, rawModel: props.selectedModelRaw))"
     }
 
     private var inputBarSelectedModelDisplayName: String {
@@ -875,10 +875,11 @@ struct AgentComposerView: View, Equatable {
             HStack(spacing: 4) {
                 Image(systemName: props.selectedAgent.iconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                if isSelectedCodexFastModel {
-                    Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                if isSelectedCodexSpeedTier {
+                    AgentModelSpeedIcon(
+                        agent: props.selectedAgent, rawModel: props.selectedModelRaw,
+                        font: fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold)
+                    )
                 }
                 Text(providerChipTitle)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -893,7 +894,7 @@ struct AgentComposerView: View, Equatable {
                     .foregroundColor(.secondary)
             }
             .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
-            .foregroundColor(isSelectedCodexFastModel ? .orange : .primary)
+            .foregroundColor(isSelectedCodexSpeedTier ? AgentModelSelectionWarningVisuals.color(agent: props.selectedAgent, rawModel: props.selectedModelRaw) : .primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }

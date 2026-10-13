@@ -1302,7 +1302,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     /// Returns the Codex service tier override for this model, if any.
-    /// Currently only GPT-5.4 Fast variants request the "fast" service tier.
+    /// Fast and catalog-advertised Ultrafast variants preserve their selected tier.
     var codexServiceTier: String? {
         switch self {
         case let .codexCustom(name):

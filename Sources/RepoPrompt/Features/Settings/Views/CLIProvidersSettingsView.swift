@@ -74,6 +74,8 @@ struct CLIProvidersSettingsView: View {
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
+    @State private var detectedCodexExecutables: [CLIExecutableDiscovery.DetectedExecutable]?
+    @State private var isDetectingCodexExecutables = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
     @State private var isGrokBuildExpanded: Bool = false
@@ -1721,15 +1723,59 @@ struct CLIProvidersSettingsView: View {
                     }
 
                     HStack(spacing: 8) {
-                        Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
-                            .buttonStyle(CustomButtonStyle())
-
-                        if codexCustomRuntimeIsConfigured {
-                            Button("Restore Included Runtime") {
+                        Menu {
+                            Button {
                                 setCodexRuntimeSelection(.bundled)
+                            } label: {
+                                let title = "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+                                if CodexRuntimePreferences.areSemanticallyEquivalent(codexRuntimePendingSelection, .bundled) {
+                                    Label(title, systemImage: "checkmark")
+                                } else {
+                                    Text(title)
+                                }
                             }
-                            .buttonStyle(CustomButtonStyle())
+
+                            if isDetectingCodexExecutables, detectedCodexExecutables == nil {
+                                Text("Detecting Codex executables…")
+                            }
+
+                            ForEach(detectedCodexExecutables ?? [], id: \.path) { detected in
+                                Button {
+                                    setCodexRuntimeSelection(.external(path: detected.path))
+                                } label: {
+                                    let title = CodexExecutableDetection.menuItemTitle(for: detected.path)
+                                    if CodexExecutableDetection.isSelected(
+                                        externalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection),
+                                        detected: detected
+                                    ) {
+                                        Label(title, systemImage: "checkmark")
+                                    } else {
+                                        Text(title)
+                                    }
+                                }
+                            }
+
+                            if let customPath = CodexExecutableDetection.undetectedCustomPath(
+                                pendingExternalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection),
+                                detected: detectedCodexExecutables ?? []
+                            ) {
+                                Button {
+                                    setCodexRuntimeSelection(.external(path: customPath))
+                                } label: {
+                                    Label(
+                                        CodexExecutableDetection.menuItemTitle(for: customPath),
+                                        systemImage: "checkmark"
+                                    )
+                                }
+                            }
+
+                            Divider()
+
+                            Button("Choose…", action: chooseLocalCodexExecutable)
+                        } label: {
+                            Text(codexRuntimeMenuLabel)
                         }
+                        .buttonStyle(CustomButtonStyle())
                     }
 
                     Text("Runtime changes apply after the next RepoPrompt launch and then refresh the model list. Existing saved model selections are not changed.")
@@ -1739,11 +1785,31 @@ struct CLIProvidersSettingsView: View {
                 }
                 .padding(.top, 2)
                 .transition(.opacity.combined(with: .move(edge: .top)))
+                .task { await loadDetectedCodexExecutables() }
             }
         }
         .task(id: codexRuntimeSelectionTaskID) {
             await refreshCodexRuntimePreflight()
         }
+    }
+
+    private var codexRuntimeMenuLabel: String {
+        switch codexRuntimePendingSelection {
+        case .inherited, .bundled:
+            "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+        case let .external(path):
+            CodexExecutableDetection.abbreviatedPath(path)
+        case .invalidExternalPreference:
+            "Invalid custom executable"
+        }
+    }
+
+    private func loadDetectedCodexExecutables() async {
+        guard detectedCodexExecutables == nil, !isDetectingCodexExecutables else { return }
+        isDetectingCodexExecutables = true
+        defer { isDetectingCodexExecutables = false }
+        let detected = await CodexExecutableDetection.detectOnSystem()
+        detectedCodexExecutables = detected
     }
 
     private var codexRuntimeProjection: CodexRuntimePreferences.RuntimeSelectionProjection {
@@ -2664,16 +2730,11 @@ struct CLIProvidersSettingsView: View {
 
     private func chooseLocalCodexExecutable() {
         let panel = NSOpenPanel()
-        panel.title = "Choose Codex Executable"
-        panel.message = "Select an installed Codex CLI executable. RepoPrompt validates its version before use."
-        panel.prompt = "Choose"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.resolvesAliases = false
-        if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
-            panel.directoryURL = URL(fileURLWithPath: pendingPath).deletingLastPathComponent()
-        }
+        CodexExecutableDetection.configureExecutablePanel(
+            panel,
+            detected: detectedCodexExecutables ?? [],
+            pendingExternalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection)
+        )
         guard panel.runModal() == .OK, let url = panel.url else { return }
         setCodexRuntimeSelection(.external(path: url.path))
     }

@@ -33,11 +33,37 @@ extension WindowStatesManager {
     func agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: UUID) async -> Bool {
         do {
             let records = try await agentSessionLinkPersistedChildRetirementRecords()
-                + agentSessionLinkLiveChildRetirementRecords()
             return isTerminating || AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(
-                of: parentSessionID, in: records
+                of: parentSessionID, in: agentSessionLinkMergedChildRetirementRecords(persisted: records)
             )
         } catch { return true }
+    }
+
+    /// A hydrated session's live quiescence is newer than its unflushed disk header, so hydrated
+    /// records may shadow persisted or index rows for the same session ID under coherent lineage;
+    /// index and unhydrated records can only add evidence.
+    /// `AgentSessionLaneChildRetirementRecord.merging` owns the per-session verdict, including
+    /// ambiguous-lineage fail-closed handling.
+    private func agentSessionLinkMergedChildRetirementRecords(
+        persisted: [AgentSessionLaneChildRetirementRecord]
+    ) -> [AgentSessionLaneChildRetirementRecord] {
+        var persistedBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
+        for record in persisted {
+            persistedBySessionID[record.sessionID, default: []].append(record)
+        }
+        var liveBySessionID: [UUID: [AgentSessionLaneChildRetirementRecord]] = [:]
+        for record in agentSessionLinkLiveChildRetirementRecords() {
+            liveBySessionID[record.sessionID, default: []].append(record)
+        }
+        var merged: [AgentSessionLaneChildRetirementRecord] = []
+        for sessionID in Set(persistedBySessionID.keys).union(liveBySessionID.keys) {
+            merged += AgentSessionLaneChildRetirementRecord.merging(
+                sessionID: sessionID,
+                live: liveBySessionID[sessionID] ?? [],
+                persisted: persistedBySessionID[sessionID] ?? []
+            )
+        }
+        return merged
     }
 
     private func agentSessionLinkPersistedChildRetirementRecords() async throws -> [AgentSessionLaneChildRetirementRecord] {
@@ -148,11 +174,11 @@ extension WindowStatesManager {
         do { persisted = try await agentSessionLinkPersistedChildRetirementRecords() }
         catch { return false }
         let descendants = AgentSessionLaneChildRetirementRecord.descendantIDs(
-            of: endpoint.sessionID, in: persisted + agentSessionLinkLiveChildRetirementRecords()
+            of: endpoint.sessionID, in: agentSessionLinkMergedChildRetirementRecords(persisted: persisted)
         )
         let subtreeIsRetirable: @MainActor () -> Bool = { [weak self, weak window] in
             guard let self, let window, !self.isTerminating, !window.isClosing, isStillRetirable() else { return false }
-            let records = persisted + agentSessionLinkLiveChildRetirementRecords()
+            let records = agentSessionLinkMergedChildRetirementRecords(persisted: persisted)
             guard !AgentSessionLaneChildRetirementRecord.hasBlockingDescendant(of: endpoint.sessionID, in: records),
                   AgentSessionLaneChildRetirementRecord.descendantIDs(of: endpoint.sessionID, in: records) == descendants
             else { return false }
@@ -215,6 +241,14 @@ extension WindowStatesManager {
             if changed { manager.workspaces = projected }
         }
         return true
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isTerminating,
+              let window = window(withID: endpoint.windowID),
+              !window.isClosing
+        else { return false }
+        return window.agentModeViewModel.agentSessionLinkRetirementReadiness(endpoint: endpoint)
     }
 
     func agentSessionLinkLaneProvenance(

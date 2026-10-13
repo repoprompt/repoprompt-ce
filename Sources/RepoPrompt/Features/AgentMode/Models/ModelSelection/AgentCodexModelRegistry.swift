@@ -211,7 +211,8 @@ final class AgentCodexModelRegistry {
                 displayName: model.displayName,
                 description: model.description,
                 isPlaceholderDefault: false,
-                isProviderDefault: model.isDefault
+                isProviderDefault: model.isDefault,
+                defaultReasoningEffort: model.defaultReasoningEffort
             )
         }
         options.append(contentsOf: mapped)
@@ -293,7 +294,8 @@ final class AgentCodexModelRegistry {
                         description: $0.description
                     )
                 },
-                defaultReasoningEffort: record.defaultReasoningEffort
+                defaultReasoningEffort: record.defaultReasoningEffort,
+                serviceTiers: record.serviceTiers
             )
         }
     }

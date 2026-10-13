@@ -11,7 +11,8 @@ enum AgentOversightSessionIDSubmitOutcome {
 }
 
 /// Small sheet reached from a sidebar row's `Session ID…` menu item, in either direction:
-/// choosing a session for this row to oversee, or choosing an existing overseer for this row.
+/// choosing a session for this row to oversee, or choosing an overseer for this row — the
+/// overseer need only be eligible, it does not have to hold a link yet.
 ///
 /// All wording comes from `AgentOversightUICopy`; the directional caller supplies the title,
 /// field label, resolver, and submit action. Submitting goes through the shared confirmation

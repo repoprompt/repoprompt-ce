@@ -1,6 +1,26 @@
 import Foundation
 import RepoPromptSettingsCore
 
+// MARK: - Agent Session Metadata
+
+/// Lightweight metadata for agent session listing
+struct AgentSessionMeta {
+    let id: UUID
+    let composeTabID: UUID?
+    let name: String
+    let lastModified: Date
+    let itemCount: Int
+    let agentKind: String?
+    let agentModel: String?
+    let lastRunState: String?
+    let acpModelParameterSelections: [ACPModelParameterSelection]
+    let parentSessionID: UUID?
+    let createdByOverseerSessionID: UUID?
+    let isMCPOriginated: Bool
+    let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
+    let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+}
+
 struct AgentSessionMetadataIndex: Codable, Equatable {
     /// 8 adds canonical transcript-turn counts for history analytics.
     ///

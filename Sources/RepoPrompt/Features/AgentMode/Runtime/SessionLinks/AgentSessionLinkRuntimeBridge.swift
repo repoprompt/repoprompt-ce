@@ -185,12 +185,17 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         selection: AgentSessionLanePolicy.RoleSelection
     ) async throws -> AgentSessionLaneHostCreationOutcome
 
-    /// `commit: false` is an inactivity preflight; `true` stashes under the supplied CAS fence.
+    /// `commit: false` runs the full non-mutating retirement preflight (required flush, stash
+    /// cascade claims, save admission); `true` stashes under the supplied CAS fence.
     func agentSessionLinkRetireLane(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         commit: Bool,
         isStillRetirable: @escaping @MainActor () -> Bool
     ) async -> Bool
+
+    /// The synchronous slice of retirement readiness run immediately before unlinking: endpoint
+    /// currentness, target quiescence, live subtree settlement, and save admission.
+    func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool
 
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
@@ -565,6 +570,10 @@ extension AgentSessionLinkEndpointHost {
         endpoint _: DomainAgentSessionLinkEndpointIdentity, commit _: Bool,
         isStillRetirable _: @escaping @MainActor () -> Bool
     ) async -> Bool {
+        false
+    }
+
+    func agentSessionLinkRetirementReadiness(endpoint _: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         false
     }
 
@@ -1361,6 +1370,8 @@ final class AgentSessionLinkRuntimeBridge {
     private var sidebarObserverIndex: SidebarObserverIndex?
     private var projectedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     private var candidateAvailabilityNotificationPending = false
+    /// Collapses readiness bursts into one queued settle.
+    private var candidatePresentationRefreshPending = false
     private var pendingRefreshScope: ProjectionRefreshScope?
     /// Exact target incarnations whose effective location label changed and whose observers still
     /// have to be repainted. Coalesced: a burst of worktree/branch/workspace edits costs one pass.
@@ -1378,10 +1389,29 @@ final class AgentSessionLinkRuntimeBridge {
         /// another catalog or blocking AppKit's nested run loop on an async authority turn.
         var test_menuCatalogUnavailable = false
 
-        func test_settleCandidateAvailabilityNotifications() async {
-            while candidateAvailabilityNotificationPending {
+        /// True while any candidate-presentation work is queued or a sibling task (monitor
+        /// repaint, availability notification) is still outstanding.
+        private var test_presentationRefreshUnsettled: Bool {
+            candidatePresentationRefreshPending
+                || monitorProjectionRefreshTask != nil || candidateAvailabilityNotificationPending
+        }
+
+        /// Polls until presentation work is quiescent; returns false once `maxYields` polls are
+        /// spent. Polls also elapse while the monitor lane awaits the authority actor, so a bounded
+        /// call measures scheduling opportunities, not progress — keep budgets generous.
+        private func test_drainPresentationPipelines(maxYields: Int) async -> Bool {
+            var remainingYields = maxYields
+            while test_presentationRefreshUnsettled {
+                guard remainingYields > 0 else { return false }
+                remainingYields -= 1
                 await Task.yield()
             }
+            return true
+        }
+
+        @discardableResult
+        func test_settleCandidateAvailabilityNotifications(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
         }
 
         func test_enqueueProjectionRefresh(sessionIDs: Set<UUID>) {
@@ -2674,6 +2704,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// least one outbound link. The same authority that projects the menu enforces the precondition
     /// again at reservation and activation, closing a stale-menu race without preventing other
     /// surfaces from creating an observer's first link.
+    ///
+    /// For "Link overseer" menu picks — that list only offers active observers.
     func addSidebarMonitorLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -5165,6 +5197,22 @@ final class AgentSessionLinkRuntimeBridge {
     /// uses the presentation-only lane so the repaint cannot publish prompt inventory, consume its
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
+        // Retire the census at emission time, before the coalesced hop: eligibility and existence
+        // inputs can change without an authority revision, and a queued settle cannot stand in for
+        // the synchronous presentation fence the census contract requires.
+        sidebarObserverIndex = nil
+        guard !isFrozenForTermination, host != nil, !candidatePresentationRefreshPending else { return }
+        // Queued, not inline: the settle's own publish re-signals readiness, which would nest a
+        // full candidate pass on the caller's stack.
+        candidatePresentationRefreshPending = true
+        Task { @MainActor [weak self] in
+            self?.performCandidatePresentationRefresh()
+        }
+    }
+
+    /// Must stay synchronous: coalescing relies on each settle being atomic.
+    private func performCandidatePresentationRefresh() {
+        candidatePresentationRefreshPending = false
         guard !isFrozenForTermination, let host else { return }
         // Keep creator-name publication with its existing owner; it is not menu materialization.
         settleCreatorNames(host.agentSessionLinkCandidates())
@@ -5224,11 +5272,11 @@ final class AgentSessionLinkRuntimeBridge {
 
     #if DEBUG
         /// Test seam: drains queued presentation-only projection refreshes, including work a drain
-        /// enqueues, so assertions observe settled rows.
-        func test_settleMonitorProjectionRefresh() async {
-            while let task = monitorProjectionRefreshTask {
-                await task.value
-            }
+        /// enqueues, so assertions observe settled rows. Tests that must fail rather than hang on
+        /// non-convergence pass `maxYields`; the drain then reports false instead of looping.
+        @discardableResult
+        func test_settleMonitorProjectionRefresh(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
         }
     #endif
 
@@ -8264,6 +8312,23 @@ final class AgentSessionLinkRuntimeBridge {
         return await receipt(true, nil, firstTask, firstTaskReason)
     }
 
+    /// Exact-inventory proof that the granted link is still the target's only live relationship and
+    /// no send is in flight on it. Runs before preflight and again immediately before unlinking.
+    private func retireRelationshipFence(
+        targetSessionID: UUID,
+        lease: DomainAgentSessionLinkLease
+    ) async -> AgentSessionLaneRetireOutcome.Reason? {
+        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
+        guard relationships.inbound.items.count == 1 else { return .laneInUseInboundCount }
+        guard relationships.inbound.items[0].linkID == lease.linkID else { return .laneInUseInboundLink }
+        guard relationships.inbound.items[0].generation == lease.linkGeneration else {
+            return .laneInUseInboundGeneration
+        }
+        guard relationships.outbound.items.isEmpty else { return .laneInUseOutbound }
+        guard pendingSendsByReference[lease.reference] == nil else { return .laneInUsePending }
+        return nil
+    }
+
     func retireLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
@@ -8321,21 +8386,8 @@ final class AgentSessionLinkRuntimeBridge {
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
-        let relationships = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard relationships.inbound.items.count == 1 else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundCount)
-        }
-        guard relationships.inbound.items[0].linkID == target.lease.linkID else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundLink)
-        }
-        guard relationships.inbound.items[0].generation == target.lease.linkGeneration else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseInboundGeneration)
-        }
-        guard relationships.outbound.items.isEmpty else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUseOutbound)
-        }
-        guard pendingSendsByReference[target.lease.reference] == nil else {
-            return .notRetired(sessionID: targetSessionID, reason: .laneInUsePending)
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
         #if DEBUG
             await test_afterRetireRelationshipPrecheck?()
@@ -8355,9 +8407,31 @@ final class AgentSessionLinkRuntimeBridge {
             let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
+        // Preflight performs the required-session flush, the stash cascade's claim checks, and the
+        // workspace-save admission probe without mutating anything; a refusal leaves link and tab.
         guard await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: false, isStillRetirable: stillRetirable
         ) else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
+        // The flush may have settled a stale persisted child header; rescan before unlinking.
+        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
+        // Preflight's awaits kept the grant live: re-run the cheap fence immediately before unlink.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable() else {
+            return .notRetired(sessionID: targetSessionID, reason: .laneBusy)
+        }
+        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+            return .notRetired(sessionID: targetSessionID, reason: refusal)
+        }
+        // The fence's awaits kept the grant live, so revalidate synchronously before unlinking.
+        // The residual window inside stopMonitorLink stays covered by post-unlink revalidation.
+        guard !isFrozenForTermination else {
+            return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
+        }
+        guard stillRetirable(), host.agentSessionLinkRetirementReadiness(endpoint: endpoint)
+        else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // Stop owns the pair-retirement lane. Wrapping it here would wait on our own barrier.
         let stop = await stopMonitorLink(
             observerEndpoint: observerEndpoint,
@@ -8432,12 +8506,14 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Resolves a pasted Session ID for the *inbound* direction: the pasted session is the
-    /// prospective overseer of the row's target, and "Link overseer" only offers sessions that
-    /// already hold an outbound link. Returns user-facing message text on failure.
+    /// prospective overseer of the row's target. Unlike the "Link overseer" menu list — which only
+    /// offers sessions that already hold an outbound link — the pasted-ID path accepts any
+    /// eligible session, so a session can be linked as overseer before it holds its first link.
+    /// Returns user-facing message text on failure.
     ///
-    /// Observer eligibility reuses `addDisabledReason` (child/MCP-controlled/MCP-originated and
-    /// role-policy sessions can never observe), then `hasActiveOutboundLink` applies the same
-    /// existing-overseer precondition `addSidebarMonitorLink` enforces at reservation.
+    /// New links require observer eligibility via `addDisabledReason` (child/MCP-controlled/
+    /// MCP-originated sessions, and a role policy that denies outbound monitoring, can never
+    /// observe); an existing exact link resolves as `.alreadyLinked` before that check.
     func resolveSidebarOverseerCandidate(
         rawSessionID: String,
         excludingTargetSessionID: UUID
@@ -8478,11 +8554,6 @@ final class AgentSessionLinkRuntimeBridge {
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
         ) {
             return .failure(AgentOversightResolutionMessage(message: reason))
-        }
-        guard await authority.hasActiveOutboundLink(observerEndpoint: candidate.domainEndpoint) else {
-            return .failure(AgentOversightResolutionMessage(
-                message: Self.existingOverseerRequiredMessage
-            ))
         }
         return .success(.candidate(candidate))
     }

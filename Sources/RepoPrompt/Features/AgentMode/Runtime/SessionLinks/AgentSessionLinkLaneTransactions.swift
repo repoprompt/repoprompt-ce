@@ -83,9 +83,88 @@ struct AgentSessionLaneCreateReceipt: Equatable {
 
 /// Retirement may stash a settled subtree, but must preserve every descendant that still owns work.
 struct AgentSessionLaneChildRetirementRecord {
+    /// Which evidence produced the record. Only a hydrated session is newer than its unflushed disk
+    /// header, so only it may shadow persisted or index blocking state; the rest can add edges and
+    /// blocking evidence but never erase them.
+    enum Source {
+        case persisted
+        case sessionIndex
+        case unhydratedSession
+        case hydratedSession
+        /// Merge output: the verdict's provenance, not fresh evidence of its own.
+        case merged
+
+        var isSessionDerived: Bool {
+            self == .unhydratedSession || self == .hydratedSession
+        }
+    }
+
     let sessionID: UUID
     let parentSessionID: UUID?
     let blocksRetirement: Bool
+    let source: Source
+
+    init(sessionID: UUID, parentSessionID: UUID?, blocksRetirement: Bool, source: Source = .persisted) {
+        self.sessionID = sessionID
+        self.parentSessionID = parentSessionID
+        self.blocksRetirement = blocksRetirement
+        self.source = source
+    }
+
+    /// Merge all evidence for one session ID. Parent claims are tiered — session-derived, then
+    /// index, then persisted. A nil parent is a real "no parent" vote only where the source is
+    /// authoritative: a hydrated session knows its own lineage, and a decoded disk header is the
+    /// complete persisted lineage. Index and unhydrated nils stay "unknown" and never vote. When
+    /// the non-nil claims disagree across tiers, or an authoritative nil conflicts with a claimed
+    /// edge, the lineage is ambiguous: the merge keeps every claimed edge and forces the block
+    /// rather than guessing which subtree owns the session. Only coherent lineage lets a hydrated
+    /// session's quiescence shadow a stale disk or index block.
+    static func merging(sessionID: UUID, live: [Self], persisted: [Self]) -> [Self] {
+        var sessionParents = Set<UUID>()
+        var indexParents = Set<UUID>()
+        var persistedParents = Set<UUID>()
+        var hydratedNilVote = false
+        var persistedNilVote = false
+        for record in live {
+            switch record.source {
+            case .hydratedSession:
+                if let parent = record.parentSessionID { sessionParents.insert(parent) } else { hydratedNilVote = true }
+            case .unhydratedSession:
+                if let parent = record.parentSessionID { sessionParents.insert(parent) }
+            case .sessionIndex:
+                if let parent = record.parentSessionID { indexParents.insert(parent) }
+            case .persisted, .merged:
+                if record.source == .merged {
+                    assertionFailure("merged records must never re-enter merging")
+                }
+                if let parent = record.parentSessionID {
+                    persistedParents.insert(parent)
+                } else { persistedNilVote = true }
+            }
+        }
+        for record in persisted {
+            if record.source == .merged {
+                assertionFailure("merged records must never re-enter merging")
+            }
+            if let parent = record.parentSessionID { persistedParents.insert(parent) } else { persistedNilVote = true }
+        }
+        let edges = sessionParents.union(indexParents).union(persistedParents)
+        let authoritativeNilVote = hydratedNilVote || persistedNilVote
+        let ambiguous = edges.count > 1 || (authoritativeNilVote && !edges.isEmpty)
+        let hydrated = live.contains { $0.source == .hydratedSession }
+        let sessionBlocks = live.contains { $0.source.isSessionDerived && $0.blocksRetirement }
+        let blocks = ambiguous || (
+            hydrated
+                ? sessionBlocks
+                : live.contains { $0.blocksRetirement } || persisted.contains { $0.blocksRetirement }
+        )
+        guard !edges.isEmpty else {
+            return [Self(sessionID: sessionID, parentSessionID: nil, blocksRetirement: blocks, source: .merged)]
+        }
+        return edges.sorted { $0.uuidString < $1.uuidString }.map {
+            Self(sessionID: sessionID, parentSessionID: $0, blocksRetirement: blocks, source: .merged)
+        }
+    }
 
     static func hasBlockingDescendant(of parentSessionID: UUID, in records: [Self]) -> Bool {
         let descendants = descendantIDs(of: parentSessionID, in: records)
