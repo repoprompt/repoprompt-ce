@@ -444,6 +444,9 @@ package enum DomainAgentSessionOperationAuthorizer {
         case .unresolvedAgentRun:
             return .denied(.callerRoutingUnresolved)
         case let .agentSession(callerSessionID):
+            // Deleting saved conversations is human-only, including directly spawned children.
+            // Reject before provenance lookup so no grant or parent relationship can widen it.
+            guard operation != .manageCleanup else { return .denied(.humanOnlyOperation) }
             guard case let .known(targetSessionID, parentSessionID) = target else {
                 return .denied(.targetProvenanceUnknown)
             }

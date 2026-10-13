@@ -1382,7 +1382,7 @@ extension AgentModeViewModel {
         }
         return AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: identity?.persistentBindingGeneration != nil,
-            hasLoadedPersistedState: session.hasLoadedPersistedState,
+            hasLoadedPersistedState: session.hasLoadedPersistedState && session.permitsBoundOperationAndSave,
             isChildSession: session.parentSessionID != nil,
             isMCPControlled: session.mcpControlContext != nil,
             isMCPOriginated: session.isMCPOriginated,

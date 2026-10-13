@@ -110,7 +110,7 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     ///
     /// - Parameter proof: the binding-qualified hydration proof this entry was classified against.
     ///   It travels *through* the shared path rather than being re-derived inside it, because the
-    ///   resolver there deliberately gates on the legacy `hasLoadedPersistedState` latch.
+    ///   endpoint eligibility alone does not preserve the exact hydration outcome across awaits.
     func launchCoordinatorEstablish(
         pair: AgentSessionOversightIntent,
         token: AgentSessionOversightIntentToken?,
@@ -741,7 +741,9 @@ final class AgentSessionOversightLaunchCoordinator {
                 case 1:
                     switch matches[0].restorationReadiness {
                     case .pending, .unbound: true
-                    case .authoritative, .terminal: false
+                    // An owned creation must finish its configured first save. Loading a missing
+                    // payload cannot establish that preparation or authorize its replacement.
+                    case .creating, .authoritative, .terminal: false
                     }
                 default:
                     false
@@ -837,7 +839,7 @@ final class AgentSessionOversightLaunchCoordinator {
                     // Still inspect the other endpoint for a proven terminal reason.
                     continue
                 }
-            case .pending, .unbound:
+            case .creating, .pending, .unbound:
                 return .wait
             }
         }

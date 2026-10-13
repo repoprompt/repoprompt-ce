@@ -1127,7 +1127,11 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let bootstrap = MCPWindowToolName.becomeOverseer
         _ = try await runtime.toolRegistry.register(registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1), bindings: [binding(toolName: toolName), binding(toolName: bootstrap)])
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: bootstrap))
-        XCTAssertEqual(definition.description, "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.")
+        XCTAssertTrue(definition.description.contains("tool discovery"))
+        XCTAssertTrue(definition.description.contains("next turn"))
+        XCTAssertTrue(definition.description.contains("Grants no authority"))
+        XCTAssertTrue(definition.description.contains("user-approved workspace scope with observe"))
+        XCTAssertFalse(definition.description.contains("in any workspace"))
         XCTAssertEqual(definition.inputSchema.objectValue?["properties"], .object([:]))
         XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: bootstrap))
         for (label, eligible, activated, exact, expected) in [

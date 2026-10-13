@@ -119,6 +119,18 @@ package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
 package struct DomainDelegationScopeAuthority: Sendable {
     private var records: [UUID: DomainDelegationScopeRecord] = [:]
     private var lastGeneration: UInt64 = 0
+    // Derived addresses only; records remain the sole scope authority.
+    private var scopeIDsByGrantee: [UUID: Set<UUID>] = [:]
+    private var childScopeIDs: [UUID: Set<UUID>] = [:]
+    private struct Expiry: Sendable {
+        let scopeID: UUID
+        let date: Date
+    }
+
+    private var expiries: [Expiry] = []
+    #if DEBUG
+        package private(set) var expiryCandidateChecksForTesting = 0
+    #endif
 
     package init() {}
 
@@ -137,8 +149,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
     }
 
     package func liveScopes(grantedTo sessionID: UUID, now: Date) -> [DomainDelegationScopeRecord] {
-        records.values
-            .filter { $0.grant.granteeSessionID == sessionID && liveRecord(id: $0.id, now: now) != nil }
+        (scopeIDsByGrantee[sessionID] ?? [])
+            .compactMap { liveRecord(id: $0, now: now) }
             .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
     }
 
@@ -151,17 +163,33 @@ package struct DomainDelegationScopeAuthority: Sendable {
     }
 
     package func hasLiveScope(grantedTo sessionID: UUID, now: Date) -> Bool {
-        records.values.contains {
-            $0.grant.granteeSessionID == sessionID && liveRecord(id: $0.id, now: now) != nil
+        hasLiveScope(grantedTo: sessionID, now: now, recordVisited: nil)
+    }
+
+    private func hasLiveScope(grantedTo sessionID: UUID, now: Date, recordVisited: ((UUID) -> Void)?) -> Bool {
+        for id in scopeIDsByGrantee[sessionID] ?? [] {
+            recordVisited?(id)
+            if liveRecord(id: id, now: now) != nil { return true }
         }
+        return false
+    }
+
+    #if DEBUG
+        package func eligibilityRecordVisitsForTesting(grantedTo sessionID: UUID, now: Date) -> Int {
+            var visits = 0
+            _ = hasLiveScope(grantedTo: sessionID, now: now, recordVisited: { _ in visits += 1 })
+            return visits
+        }
+    #endif
+
+    private func recordsGrantedTo(_ sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        (scopeIDsByGrantee[sessionID] ?? []).compactMap { records[$0] }
     }
 
     /// Every record the caller was ever granted in this process, including revoked/expired ones,
     /// so `scope_status` can report why a scope stopped working.
     package func scopes(grantedTo sessionID: UUID) -> [DomainDelegationScopeRecord] {
-        records.values
-            .filter { $0.grant.granteeSessionID == sessionID }
-            .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
+        recordsGrantedTo(sessionID).sorted { $0.grant.grantedAt < $1.grant.grantedAt }
     }
 
     /// Durable payload: the grants of every currently active record.
@@ -186,9 +214,9 @@ package struct DomainDelegationScopeAuthority: Sendable {
         var frontier = [scopeID]
         var seen: Set<UUID> = [scopeID]
         while let next = frontier.popLast() {
-            for record in records.values where record.grant.parentScopeID == next && seen.insert(record.id).inserted {
-                result.append(record.id)
-                frontier.append(record.id)
+            for id in childScopeIDs[next] ?? [] where seen.insert(id).inserted {
+                result.append(id)
+                frontier.append(id)
             }
         }
         return result
@@ -332,10 +360,19 @@ package struct DomainDelegationScopeAuthority: Sendable {
     /// Marks every active scope whose expiry has passed, plus its descendants, as expired.
     @discardableResult
     package mutating func expire(now: Date) -> [DomainDelegationScopeRecord] {
-        let due = records.values
-            .filter { $0.isActive && $0.grant.guardrails.isExpired(at: now) }
-            .map(\.id)
-            .sorted { $0.uuidString < $1.uuidString }
+        var due: [UUID] = []
+        while let first = expiries.first, first.date <= now {
+            let expiry = removeFirstExpiry()
+            #if DEBUG
+                expiryCandidateChecksForTesting += 1
+            #endif
+            if let record = records[expiry.scopeID], record.isActive,
+               record.grant.guardrails.isExpired(at: now)
+            {
+                due.append(expiry.scopeID)
+            }
+        }
+        due.sort { $0.uuidString < $1.uuidString }
         var ids: [UUID] = []
         for id in due {
             ids.append(id)
@@ -378,7 +415,13 @@ package struct DomainDelegationScopeAuthority: Sendable {
         revokedScopeIDs: Set<UUID> = [],
         now: Date
     ) -> [DomainDelegationScopeRecord] {
-        var pending = grants.filter { records[$0.id] == nil && !revokedScopeIDs.contains($0.id) }
+        // Match the durable store's first-record rule before deferring children for their
+        // parents. Otherwise a duplicate can be installed twice and leave grantee/parent
+        // addresses pointing at a different grant than the authoritative record.
+        var seen: Set<UUID> = []
+        var pending = grants.filter {
+            records[$0.id] == nil && !revokedScopeIDs.contains($0.id) && seen.insert($0.id).inserted
+        }
         var installed: [DomainDelegationScopeRecord] = []
         var progressed = true
         while progressed {
@@ -817,7 +860,45 @@ package struct DomainDelegationScopeAuthority: Sendable {
     ) -> DomainDelegationScopeRecord {
         let record = DomainDelegationScopeRecord(grant: grant, generation: nextGeneration(), state: state)
         records[grant.id] = record
+        scopeIDsByGrantee[grant.granteeSessionID, default: []].insert(grant.id)
+        if let parentID = grant.parentScopeID {
+            childScopeIDs[parentID, default: []].insert(grant.id)
+        }
+        if record.isActive, let date = grant.guardrails.expiresAt {
+            insertExpiry(Expiry(scopeID: grant.id, date: date))
+        }
         return record
+    }
+
+    // Deadlines are immutable for a granted identity. Revoked entries are discarded lazily
+    // at their deadline; reads never scan unrelated records looking for the next expiration.
+    private mutating func insertExpiry(_ expiry: Expiry) {
+        expiries.append(expiry)
+        var index = expiries.count - 1
+        while index > 0 {
+            let parent = (index - 1) / 2
+            guard expiries[index].date < expiries[parent].date else { break }
+            expiries.swapAt(index, parent)
+            index = parent
+        }
+    }
+
+    private mutating func removeFirstExpiry() -> Expiry {
+        let first = expiries[0]
+        let last = expiries.removeLast()
+        guard !expiries.isEmpty else { return first }
+        expiries[0] = last
+        var index = 0
+        while index * 2 + 1 < expiries.count {
+            var child = index * 2 + 1
+            if child + 1 < expiries.count, expiries[child + 1].date < expiries[child].date {
+                child += 1
+            }
+            guard expiries[child].date < expiries[index].date else { break }
+            expiries.swapAt(index, child)
+            index = child
+        }
+        return first
     }
 
     private mutating func transition(

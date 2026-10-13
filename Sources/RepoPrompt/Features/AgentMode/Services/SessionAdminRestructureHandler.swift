@@ -394,9 +394,10 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             $0.formUnion(context.projector.knownProvenance(for: $1)?.boundWorktreeIDs ?? [])
         }.count
         for record in context.scopeChain(of: batch.scope) {
-            let usage = context.scopes.usageIncludingReservations(
-                context.projector.usage(of: record.grant, spawnParentSessionID: nil)
-            )
+            guard let evidence = context.projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
+                return try SessionAdminMCPToolService.deniedValue(.usageProofMissing, sessionID: nil)
+            }
+            let usage = context.scopes.usageIncludingReservations(evidence)
             if let denial = DomainDelegationScopePlacementPolicy.adoptionGuardrailViolation(
                 guardrails: record.grant.guardrails, usage: usage,
                 addedLiveSessions: addedLive, addedWorktrees: addedWorktrees
@@ -484,6 +485,12 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // callers); every write is decided against current state.
             guard context.isMember(destination, ofChainFrom: batch.scope) else {
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "destination_unavailable"))
+                continue
+            }
+            // A preceding item's durable write may have suspended while a peer opened the
+            // source workspace. Read membership alone cannot authorize a replicated write.
+            if context.projector.pointResolutionState(for: source) == .replicated {
+                items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "source_unavailable"))
                 continue
             }
             // A re-parent source must still be a member at the write (an adoptee is not one yet).

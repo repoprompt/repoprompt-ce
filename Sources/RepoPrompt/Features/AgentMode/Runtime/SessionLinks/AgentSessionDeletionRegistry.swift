@@ -14,7 +14,9 @@ import RepoPromptInstrumentation
 /// intent reauthorize against a resurrected binding that reused the identifier.
 @MainActor
 final class AgentSessionDeletionRegistry {
-    static let shared = AgentSessionDeletionRegistry()
+    static let shared = AgentSessionDeletionRegistry(
+        scopePersistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
+    )
 
     private var restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
 
@@ -30,6 +32,16 @@ final class AgentSessionDeletionRegistry {
         case committed
     }
 
+    enum AdmissionError: LocalizedError {
+        case scopePersistenceUnavailable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .scopePersistenceUnavailable(reason): reason
+            }
+        }
+    }
+
     /// Identifies one deletion attempt so a failure can clear *only* its own in-progress mark.
     ///
     /// A retry after a failure allocates a new attempt, and a late failure report from the previous
@@ -40,10 +52,14 @@ final class AgentSessionDeletionRegistry {
     }
 
     private var statesBySession: [UUID: State] = [:]
-    /// Every overlapping reversible attempt. The transient fence clears only after the last one fails.
+    /// Every admitted physical deletion, including overlaps and retries of an already-committed UUID.
     private var activeAttemptIDsBySession: [UUID: Set<UUID>] = [:]
     /// Shared completion for committed cleanup. Duplicate commit callers await the same authority/store work.
     private var commitTasksBySession: [UUID: Task<Void, Never>] = [:]
+    /// The first termination proof is permanent: settling later cannot make an uncertain freeze clean.
+    private var terminationFreezeAllowsRestoration: Bool?
+    private let scopePersistenceMode: DelegationScopeRuntime.PersistenceMode
+    private var scopePersistenceAdmission: (@MainActor () -> String?)?
     /// Establishments that were already admitted before deletion began wait here for its reversible
     /// phase to settle. Fresh Add/restore never waits: admission refuses `.inProgress` immediately.
     private var settlementWaitersBySession: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
@@ -59,19 +75,59 @@ final class AgentSessionDeletionRegistry {
     /// Fired on every transition so candidate eligibility and launch reconciliation can re-read.
     var changeObserver: (@MainActor () -> Void)?
 
-    private init() {}
+    private init(scopePersistenceMode: DelegationScopeRuntime.PersistenceMode) {
+        self.scopePersistenceMode = scopePersistenceMode
+    }
+
+    /// The existing scope owner decides readiness live; a missing owner never permits deletion.
+    func installScopePersistenceAdmission(for scopes: DelegationScopeRuntime) {
+        scopePersistenceAdmission = { [weak scopes] in
+            guard let scopes else {
+                return "Session deletion is unavailable because scope authority persistence is not ready."
+            }
+            return scopes.durableDeletionUnavailableReason
+        }
+    }
+
+    private var scopePersistenceUnavailableReason: String? {
+        if let scopePersistenceAdmission { return scopePersistenceAdmission() }
+        switch scopePersistenceMode {
+        case .ephemeral: return nil
+        case .requiresStore:
+            return "Session deletion is unavailable because scope authority persistence is not ready."
+        }
+    }
 
     // MARK: - Reporter phases
+
+    /// Closes reported per-session deletion admission and proves that those removals have settled.
+    /// Whole-workspace deletion and storage replacement do not report through this registry.
+    ///
+    /// An admitted removal or its committed callback can still revoke scope authority after the
+    /// caller freezes it. If either is pending, this launch must leave its scope file open instead.
+    /// The proof and admission fence are synchronous on MainActor, and repeated calls keep the first
+    /// result even after pending work settles.
+    func freezeNewDeletionAdmissionForTermination() -> Bool {
+        if let terminationFreezeAllowsRestoration { return terminationFreezeAllowsRestoration }
+        let allowsRestoration = activeAttemptIDsBySession.isEmpty && commitTasksBySession.isEmpty
+        terminationFreezeAllowsRestoration = allowsRestoration
+        return allowsRestoration
+    }
 
     /// Marks a deletion in progress **before** any irreversible work begins.
     ///
     /// Already-committed sessions stay committed: a second delete of the same UUID must not downgrade
     /// a permanent tombstone back to a reversible in-progress mark.
+    /// Throws `CancellationError` after termination closes admission; no token is admitted then.
     @discardableResult
-    func beginDurableDeletion(sessionID: UUID) -> AttemptToken {
+    func beginDurableDeletion(sessionID: UUID) throws -> AttemptToken {
+        guard terminationFreezeAllowsRestoration == nil else { throw CancellationError() }
+        if let reason = scopePersistenceUnavailableReason {
+            throw AdmissionError.scopePersistenceUnavailable(reason)
+        }
         let token = AttemptToken(sessionID: sessionID, attemptID: UUID())
-        guard statesBySession[sessionID] != .committed else { return token }
         activeAttemptIDsBySession[sessionID, default: []].insert(token.attemptID)
+        guard statesBySession[sessionID] != .committed else { return token }
         statesBySession[sessionID] = .inProgress(attemptID: token.attemptID)
         #if DEBUG
             logTransition("begin", sessionID: sessionID)
@@ -83,6 +139,12 @@ final class AgentSessionDeletionRegistry {
     /// Clears only the matching attempt. Durable intent is preserved: nothing was deleted.
     func didFailDurableDeletion(_ token: AttemptToken) {
         guard activeAttemptIDsBySession[token.sessionID]?.remove(token.attemptID) != nil else { return }
+        if statesBySession[token.sessionID] == .committed {
+            if activeAttemptIDsBySession[token.sessionID]?.isEmpty == true {
+                activeAttemptIDsBySession.removeValue(forKey: token.sessionID)
+            }
+            return
+        }
         if let remaining = activeAttemptIDsBySession[token.sessionID], let attemptID = remaining.first {
             statesBySession[token.sessionID] = .inProgress(attemptID: attemptID)
             return
@@ -104,11 +166,18 @@ final class AgentSessionDeletionRegistry {
     func didCommitDurableDeletion(_ token: AttemptToken) async {
         if statesBySession[token.sessionID] == .committed {
             await commitTasksBySession[token.sessionID]?.value
+            activeAttemptIDsBySession[token.sessionID]?.remove(token.attemptID)
+            if activeAttemptIDsBySession[token.sessionID]?.isEmpty == true {
+                activeAttemptIDsBySession.removeValue(forKey: token.sessionID)
+            }
             return
         }
         guard activeAttemptIDsBySession[token.sessionID]?.contains(token.attemptID) == true else { return }
         statesBySession[token.sessionID] = .committed
-        activeAttemptIDsBySession.removeValue(forKey: token.sessionID)
+        activeAttemptIDsBySession[token.sessionID]?.remove(token.attemptID)
+        if activeAttemptIDsBySession[token.sessionID]?.isEmpty == true {
+            activeAttemptIDsBySession.removeValue(forKey: token.sessionID)
+        }
         // Release in-flight establishment fences before awaiting the bridge's commit observer. They
         // will observe `.committed`, abandon/revoke their own work, and therefore cannot deadlock the
         // observer that is waiting to invalidate the same UUID process-wide.
@@ -208,8 +277,16 @@ final class AgentSessionDeletionRegistry {
     }
 
     #if DEBUG
+        static func test_instance(
+            scopePersistenceMode: DelegationScopeRuntime.PersistenceMode
+        ) -> AgentSessionDeletionRegistry {
+            AgentSessionDeletionRegistry(scopePersistenceMode: scopePersistenceMode)
+        }
+
         /// Test seam. Tombstones are permanent by design, so only tests may clear them.
         func test_reset() {
+            terminationFreezeAllowsRestoration = nil
+            scopePersistenceAdmission = nil
             statesBySession.removeAll()
             activeAttemptIDsBySession.removeAll()
             commitTasksBySession.removeAll()
@@ -227,8 +304,8 @@ final class AgentSessionDeletionRegistry {
 /// registry has to be MainActor-isolated because everything that consumes it — candidate
 /// construction, the runtime bridge, the launch coordinator — already is.
 enum AgentSessionDurableDeletionReporter {
-    static func beginDurableDeletion(sessionID: UUID) async -> AgentSessionDeletionRegistry.AttemptToken {
-        await MainActor.run { AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: sessionID) }
+    static func beginDurableDeletion(sessionID: UUID) async throws -> AgentSessionDeletionRegistry.AttemptToken {
+        try await MainActor.run { try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: sessionID) }
     }
 
     static func didFailDurableDeletion(_ token: AgentSessionDeletionRegistry.AttemptToken) async {

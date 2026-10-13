@@ -6351,9 +6351,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let cycleRunID = session.runID
         // Re-sampled rather than inherited from the open. A cycle opened while the tool was enabled
         // can be spent much later, at a terminal commit that never passes through the projection
-        // reconciler's own gate. Once the tool is disabled the absent catalog is truthful, so the
-        // cycle closes and nothing reconnects.
-        guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
+        // reconciler's own gate. Disabled oversight alone does not withdraw independently granted
+        // session administration; both paths use the same current-surface decision.
+        guard viewModel?.agentSessionLinkCatalogRepairIsEnabled(for: session) == true else {
             session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
             catalogDiagnosticsSink.record(.repairTransition(
@@ -6659,6 +6659,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         startupClaimToken: UUID? = nil,
         renewBootstrapForReplacement: (@MainActor () async -> Bool)? = nil
     ) async {
+        guard session.operationAdmissionFailureMessage == nil else { return }
         let managedSessionFence = CodexManagedSessionFence.shared
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
         guard session.selectedAgent == .codexExec,
@@ -7732,6 +7733,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> NativeSendOutcome {
+        if let message = session.operationAdmissionFailureMessage {
+            return .preDispatchRejected(message: message)
+        }
         let effectiveStopFence = stopFence ?? fallbackContext?.stopFence ?? AgentRunStartStopFence(session: session)
         guard effectiveStopFence.permitsStart(of: session) else { return .cancelled }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")

@@ -66,8 +66,15 @@ enum DelegationSpawnAdmission {
         forCreator creator: UUID,
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
-    ) -> [DomainDelegationScopeRecord] {
-        scopes.allLiveScopes().filter { record in
+    ) throws -> [DomainDelegationScopeRecord] {
+        // Ambiguous ancestry can hide the scope that should count this spawn. It must never
+        // become the absence of delegation and consequently an unscoped admission.
+        guard projector.pointResolutionState(for: creator) != .replicated,
+              !projector.authorityConflictInAncestry(of: creator)
+        else {
+            throw error(for: .usageProofMissing)
+        }
+        return scopes.allLiveScopes().filter { record in
             switch record.grant.kind {
             case .allSessions:
                 false
@@ -114,9 +121,10 @@ enum DelegationSpawnAdmission {
         for record in records {
             var usage: [UUID: DomainDelegationScopeUsage] = [:]
             for scope in scopes.scopeChain(from: record.id) {
-                let projected = scopes.usageIncludingReservations(
-                    projector.usage(of: scope.grant, spawnParentSessionID: creator)
-                )
+                guard let evidence = projector.usageEvidence(of: scope.grant, spawnParentSessionID: creator) else {
+                    return (.usageProofMissing, scopeIDs)
+                }
+                let projected = scopes.usageIncludingReservations(evidence)
                 // The guardrail adds one; a joining subtree adds the rest of its live sessions or
                 // worktrees, and its height below the joining root.
                 usage[scope.id] = DomainDelegationScopeUsage(
@@ -171,7 +179,12 @@ enum DelegationSpawnAdmission {
         case let .unplacedSession(sessionID):
             joiningSessionID = sessionID
         }
-        let records = guardrailScopes(forCreator: creator, scopes: scopes, projector: projector)
+        let records: [DomainDelegationScopeRecord]
+        do {
+            records = try guardrailScopes(forCreator: creator, scopes: scopes, projector: projector)
+        } catch {
+            return .denied(.usageProofMissing)
+        }
         guard !records.isEmpty else { return .unscoped }
 
         var joining = Joining()
@@ -333,19 +346,31 @@ enum DelegationSpawnAdmission {
 
     /// Auto-join after creation. Skipped silently if the scope lapsed meanwhile or the session already
     /// has a placement of its own (`stampDelegationPlacementIfUnplaced`): the session was created
-    /// under the surface's own authority and simply does not join by stamp.
+    /// under the surface's own authority and simply does not join by stamp. For a creating target,
+    /// `true` acknowledges in-memory staging under its exact owner; its configured first save
+    /// persists that placement. Existing targets still acknowledge their required placement write.
     @discardableResult
     static func stamp(
         _ admission: Admission?,
         newSessionID: UUID,
         viewModel: AgentModeViewModel,
-        scopes: DelegationScopeRuntime = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+        scopes: DelegationScopeRuntime = AgentSessionLinkRuntimeBridge.shared.delegationScopes,
+        creationHandle: AgentSessionCreationHandle? = nil
     ) async -> Bool {
         guard let admission, let scopeID = admission.stampScopeID, let lease = admission.stampLease,
-              scopes.isCurrent(lease),
-              let commit = try? viewModel.stampDelegationPlacementIfUnplaced(
-                  sessionID: newSessionID, creatorSessionID: admission.creatorSessionID, delegationScopeID: scopeID
-              )
+              scopes.isCurrent(lease)
+        else { return false }
+        if let creationHandle {
+            return (try? viewModel.stageCreationDelegationPlacementIfUnplaced(
+                creationHandle: creationHandle,
+                sessionID: newSessionID,
+                creatorSessionID: admission.creatorSessionID,
+                delegationScopeID: scopeID
+            )) ?? false
+        }
+        guard let commit = try? viewModel.stampDelegationPlacementIfUnplaced(
+            sessionID: newSessionID, creatorSessionID: admission.creatorSessionID, delegationScopeID: scopeID
+        )
         else { return false }
         do {
             try await commit.persisted()

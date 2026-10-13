@@ -154,9 +154,13 @@ final class AgentTabSession: ObservableObject {
 
     /// These gate delivery readiness and published `idle_for_send`, so wake observers when either
     /// non-published transition changes.
-    var isPreparingInitialWorktree: Bool = false {
-        didSet {
-            if oldValue != isPreparingInitialWorktree {
+    private var initialWorktreePreparationInProgress = false
+    var isPreparingInitialWorktree: Bool {
+        get { initialWorktreePreparationInProgress || pendingHandoff.executionLocationFailure != nil }
+        set {
+            let wasPreparing = isPreparingInitialWorktree
+            initialWorktreePreparationInProgress = newValue
+            if wasPreparing != isPreparingInitialWorktree {
                 noteMonitorObservationInputsChanged()
             }
         }
@@ -1313,7 +1317,13 @@ final class AgentTabSession: ObservableObject {
 
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
-    var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init()
+    var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
+        didSet {
+            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
 
     /// Session-owned self-compaction state. No restored attempt is executable.
     var selfCompactState = AgentSelfCompactState() {
@@ -1358,6 +1368,8 @@ final class AgentTabSession: ObservableObject {
     }
 
     // Persistence
+    /// Synchronous derived-index maintenance for the window owning this live object.
+    var persistentSessionBindingDidChange: (() -> Void)?
     private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
     var activeAgentSessionID: UUID? {
         persistentSessionBindingIdentity?.sessionID
@@ -1411,7 +1423,18 @@ final class AgentTabSession: ObservableObject {
     private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
     private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
     /// Binding-qualified hydration proof for automatic oversight restoration.
-    private(set) var restorationReadiness: AgentSessionRestorationReadiness = .unbound
+    private(set) var restorationReadiness: AgentSessionRestorationReadiness = .unbound {
+        willSet {
+            if newValue != restorationReadiness { objectWillChange.send() }
+        }
+        didSet {
+            if oldValue != restorationReadiness {
+                noteMonitorObservationInputsChanged()
+                AgentSessionLinkCandidateReadinessSignal.didChange()
+            }
+        }
+    }
+
     var persistedLoadTask: Task<Void, Never>?
     var lastActivityAt: Date = .init()
     var lastUserMessageAt: Date?
@@ -1598,9 +1621,9 @@ final class AgentTabSession: ObservableObject {
         precondition(binding == nil || binding?.tabID == tabID)
         if persistentSessionBindingIdentity != binding { oversight.overseerActivation = nil }
         persistentSessionBindingIdentity = binding
+        persistentSessionBindingDidChange?()
         bindingTransitionInProgress = false
         restorationReadiness = currentRestorationBindingToken.map { .pending($0) } ?? .unbound
-        AgentSessionLinkCandidateReadinessSignal.didChange()
     }
 
     var currentRestorationBindingToken: AgentSessionRestorationBindingToken? {
@@ -1617,10 +1640,115 @@ final class AgentTabSession: ObservableObject {
         return restorationReadiness
     }
 
+    /// Only a fully restored or configured-and-saved binding admits ordinary operations and saves.
+    var permitsBoundOperationAndSave: Bool {
+        !bindingTransitionInProgress && qualifiedRestorationReadiness.permitsBoundOperationAndSave
+    }
+
+    var restorationAdmissionFailureMessage: String? {
+        guard !bindingTransitionInProgress else { return "Wait for this session to finish loading." }
+        return qualifiedRestorationReadiness.operationAdmissionFailureMessage
+    }
+
+    /// Persisted handoff recovery remains its own blocker after payload restoration succeeds.
+    var operationAdmissionFailureMessage: String? {
+        restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
+    }
+
+    var creationState: AgentSessionRestorationReadiness.CreationState? {
+        qualifiedRestorationReadiness.creationState
+    }
+
+    var creationConfigurationStamp: Data? {
+        guard let state = creationState,
+              case let .readyToPersist(configurationStamp) = state.phase else { return nil }
+        return configurationStamp
+    }
+
+    /// Consume actual allocation provenance before exposing a new session to other operations.
+    @discardableResult
+    func acceptFreshCreation(
+        _ claim: AgentSessionCreationClaim,
+        workspaceID: UUID
+    ) -> AgentSessionCreationHandle? {
+        guard let token = claim.consume(for: self, workspaceID: workspaceID) else { return nil }
+        restorationReadiness = .creating(token, .init(
+            workspaceID: workspaceID, ownerID: claim.ownerID, phase: .preparing
+        ))
+        hasLoadedPersistedState = true
+        isDirty = true
+        let handle = AgentSessionCreationHandle(
+            workspaceID: workspaceID, session: self, bindingToken: token,
+            ownerID: claim.ownerID, expectedConfigurationStamp: nil
+        )
+        claim.creationHandle = handle
+        return handle
+    }
+
+    func creationHandleIsCurrent(_ handle: AgentSessionCreationHandle) -> Bool {
+        guard handle.session === self, !bindingTransitionInProgress,
+              currentRestorationBindingToken == handle.bindingToken,
+              let state = creationState,
+              state.workspaceID == handle.workspaceID, state.ownerID == handle.ownerID else { return false }
+        if let expected = handle.expectedConfigurationStamp {
+            return creationConfigurationStamp == expected
+        }
+        return true
+    }
+
+    @discardableResult
+    func markCreationReady(_ handle: AgentSessionCreationHandle, configurationStamp: Data) -> Bool {
+        guard creationHandleIsCurrent(handle), let state = creationState else { return false }
+        switch state.phase {
+        case .preparing:
+            restorationReadiness = .creating(handle.bindingToken, .init(
+                workspaceID: state.workspaceID, ownerID: state.ownerID,
+                phase: .readyToPersist(configurationStamp: configurationStamp)
+            ))
+            return true
+        case let .readyToPersist(existing):
+            return existing == configurationStamp
+        case .failedBeforeConfiguration:
+            return false
+        }
+    }
+
+    /// The saver supplies the stamp of its actual payload after its exact commit fence succeeds.
+    @discardableResult
+    func acknowledgeConfiguredCreationSave(
+        _ handle: AgentSessionCreationHandle,
+        configurationStamp: Data
+    ) -> Bool {
+        guard creationHandleIsCurrent(handle), creationConfigurationStamp == configurationStamp else { return false }
+        restorationReadiness = .authoritative(handle.bindingToken, .freshBindingDurablyCreated)
+        return true
+    }
+
+    func failCreationPreparation(_ handle: AgentSessionCreationHandle, message: String) {
+        guard creationHandleIsCurrent(handle), let state = creationState,
+              case .preparing = state.phase else { return }
+        restorationReadiness = .creating(handle.bindingToken, .init(
+            workspaceID: state.workspaceID, ownerID: state.ownerID,
+            phase: .failedBeforeConfiguration(message)
+        ))
+    }
+
+    /// A retry captures existing ready provenance; it cannot mint or reconstruct preparation.
+    func captureCreationRetryHandle() -> AgentSessionCreationHandle? {
+        guard !bindingTransitionInProgress,
+              let token = currentRestorationBindingToken, let state = creationState,
+              case let .readyToPersist(configurationStamp) = state.phase else { return nil }
+        return AgentSessionCreationHandle(
+            workspaceID: state.workspaceID, session: self, bindingToken: token,
+            ownerID: state.ownerID, expectedConfigurationStamp: configurationStamp
+        )
+    }
+
     func recordRestorationAuthoritative(_ source: AgentSessionRestorationReadiness.Source) {
-        guard let current = currentRestorationBindingToken else { return }
+        // Fresh authority requires the owner's configured payload stamp, never a generic save.
+        guard source == .persistedPayloadApplied, !qualifiedRestorationReadiness.isCreating,
+              let current = currentRestorationBindingToken else { return }
         restorationReadiness = .authoritative(current, source)
-        AgentSessionLinkCandidateReadinessSignal.didChange()
     }
 
     func recordRestorationAuthoritativeIfNeeded(_ source: AgentSessionRestorationReadiness.Source) {
@@ -1629,9 +1757,9 @@ final class AgentTabSession: ObservableObject {
     }
 
     func recordRestorationTerminal(_ failure: AgentSessionRestorationReadiness.Failure) {
-        guard let current = currentRestorationBindingToken else { return }
+        guard !qualifiedRestorationReadiness.isCreating,
+              let current = currentRestorationBindingToken else { return }
         restorationReadiness = .terminal(current, failure)
-        AgentSessionLinkCandidateReadinessSignal.didChange()
     }
 
     func finishPersistentBindingTransition(generation: UInt64) {
@@ -2699,6 +2827,65 @@ final class AgentTabSession: ObservableObject {
         bashLiveExecutionByKey.removeAll()
         bashLiveExecutionKeyByTranscriptItemID.removeAll()
         lastActivityAt = Date()
+    }
+}
+
+/// A captured creation owner. Construction stays with allocation consumption or an exact ready retry.
+struct AgentSessionCreationHandle: Equatable {
+    let workspaceID: UUID
+    let session: AgentTabSession
+    let bindingToken: AgentSessionRestorationBindingToken
+    let ownerID: UUID
+    let expectedConfigurationStamp: Data?
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspaceID == rhs.workspaceID
+            && lhs.session === rhs.session
+            && lhs.bindingToken == rhs.bindingToken
+            && lhs.ownerID == rhs.ownerID
+            && lhs.expectedConfigurationStamp == rhs.expectedConfigurationStamp
+    }
+
+    fileprivate init(
+        workspaceID: UUID,
+        session: AgentTabSession,
+        bindingToken: AgentSessionRestorationBindingToken,
+        ownerID: UUID,
+        expectedConfigurationStamp: Data?
+    ) {
+        self.workspaceID = workspaceID
+        self.session = session
+        self.bindingToken = bindingToken
+        self.ownerID = ownerID
+        self.expectedConfigurationStamp = expectedConfigurationStamp
+    }
+}
+
+/// A single-use proof from the owner that actually allocates the new session and creation owner IDs.
+@MainActor
+final class AgentSessionCreationClaim {
+    let workspaceID: UUID
+    let sessionID = UUID()
+    let ownerID = UUID()
+    fileprivate(set) var creationHandle: AgentSessionCreationHandle?
+    private var wasConsumed = false
+
+    init(workspaceID: UUID) {
+        self.workspaceID = workspaceID
+    }
+
+    fileprivate func consume(
+        for session: AgentTabSession,
+        workspaceID currentWorkspaceID: UUID
+    ) -> AgentSessionRestorationBindingToken? {
+        guard !wasConsumed else { return nil }
+        wasConsumed = true
+        guard workspaceID == currentWorkspaceID, !session.bindingTransitionInProgress,
+              let token = session.currentRestorationBindingToken,
+              token.bindingIdentity.sessionID == sessionID,
+              token.bindingIdentity.tabID == session.tabID,
+              session.qualifiedRestorationReadiness == .pending(token) else { return nil }
+        return token
     }
 }
 

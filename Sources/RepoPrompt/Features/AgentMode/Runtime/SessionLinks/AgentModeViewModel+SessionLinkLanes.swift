@@ -91,14 +91,15 @@ extension AgentModeViewModel {
         guard let sessionID = target.sessionID ?? target.recoveryClaim?.identity.sessionID else {
             throw MCPError.internalError("The new lane has no session ID.")
         }
-        // A published lane is an ordinary session even if later configuration or persistence fails.
+        // A published lane keeps its visible identity even if configuration or persistence fails.
         // Accept the provisional admission rather than invoking MCP's discard/delete recovery path.
         mcpAcceptSessionTarget(target)
         // Acceptance settles the recovery claim. Subsequent configuration checks must use the
         // claimless exact lifecycle identity, not ask a settled claim to still be provisional.
         let settledTarget = MCPSessionTarget(
             tabID: target.tabID, sessionID: target.sessionID,
-            origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity
+            origin: .existingSession, lifecycleIdentity: target.lifecycleIdentity,
+            creationHandle: target.creationHandle
         )
         let incomplete: MCPOversightLaneCreationOutcome = .creationIncomplete(
             sessionID: sessionID,
@@ -110,8 +111,18 @@ extension AgentModeViewModel {
               session.parentSessionID == nil,
               !session.isMCPOriginated,
               session.mcpControlContext == nil
-        else { return incomplete }
+        else {
+            failSessionCreation(target.creationHandle, message: "This lane changed before its initial configuration completed.")
+            return incomplete
+        }
 
+        do {
+            try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
+            try requireSessionConfigurationAdmission(session, creationHandle: target.creationHandle)
+        } catch {
+            failSessionCreation(target.creationHandle, message: "This lane changed before its initial configuration completed.")
+            return incomplete
+        }
         if let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
            AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease),
            DelegationSpawnTargetPlacement(
@@ -143,31 +154,38 @@ extension AgentModeViewModel {
                     target: settledTarget,
                     expectedWorkspaceID: expectedWorkspaceID,
                     allowMatchingControlledSession: false
-                )
+                ),
+                creationHandle: target.creationHandle
             )
             try requireCurrentMCPWorkspaceTarget(settledTarget, expectedWorkspaceID: expectedWorkspaceID)
             try mcpApplyModelParameterSelections(
                 tabID: target.tabID,
-                selections: selection.modelParameterSelections
+                selections: selection.modelParameterSelections,
+                creationHandle: target.creationHandle
             )
             guard mcpOversightLaneSelectionMatches(selection, session: session)
             else {
-                scheduleSave(for: session)
+                failSessionCreation(target.creationHandle, message: "This lane's initial model selection could not be configured.")
                 return incomplete
             }
+            try Task.checkCancellation()
         } catch {
-            scheduleSave(for: session)
+            failSessionCreation(target.creationHandle, message: "This lane did not finish its initial configuration. Create a new lane.")
             return incomplete
         }
 
         guard await mcpCommitOversightLaneFirstSave(
             session: session,
             sessionID: sessionID,
-            workspaceID: expectedWorkspaceID
+            workspaceID: expectedWorkspaceID,
+            creationHandle: target.creationHandle
         ) else {
-            scheduleSave(for: session)
+            // A configured write failure retains the same owner's ready-to-persist snapshot.
+            // Only a still-preparing creation can be failed here; ordinary autosave stays blocked.
+            failSessionCreation(target.creationHandle, message: "This lane did not finish its initial configuration. Create a new lane.")
             return incomplete
         }
+        guard !Task.isCancelled else { return incomplete }
         guard session.activeAgentSessionID == sessionID,
               session.createdByOverseerSessionID == creatorSessionID,
               session.parentSessionID == nil,

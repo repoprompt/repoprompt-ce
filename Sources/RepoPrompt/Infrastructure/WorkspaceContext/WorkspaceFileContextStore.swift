@@ -1681,10 +1681,12 @@ actor WorkspaceFileContextStore {
                     let observedManifestMeasurements = await engine.debugManifestMeasurementSnapshot(
                         rootEpoch: capture.rootEpoch
                     )
+                    let writerActivity = await engine.debugManifestWriterActivity(rootEpoch: capture.rootEpoch)
                     manifest = CodemapGraphStatusManifestSnapshot(
                         failureCounts: observedManifest.counts,
                         lastFailure: observedManifest.lastFailure,
-                        measurements: observedManifestMeasurements
+                        measurements: observedManifestMeasurements,
+                        writerActivity: writerActivity
                     )
                     engineEvents = includeEvents
                         ? await engine.debugGraphIndexEvents(
@@ -3287,6 +3289,26 @@ actor WorkspaceFileContextStore {
     private var pendingSeededRootVisibilityWaitersByPath: [
         String: [UUID: CheckedContinuation<Void, Error>]
     ] = [:]
+    private struct RepositoryExcludeObservation {
+        let lifetimeID: UUID
+        let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+        let token: GitWorkspaceMetadataMonitor.RetainToken
+        var appliedDigest: String?
+        var invalidationGeneration: UInt64 = 0
+        var isBlocked = false
+    }
+
+    private enum RepositoryExcludeReconciliationError: Error {
+        case unstableIgnorePolicy
+    }
+
+    #if DEBUG
+        private var repositoryExcludeWillPublishHandlerForTesting: (@Sendable () async -> Void)?
+    #endif
+    private var repositoryExcludeObservations: [UUID: RepositoryExcludeObservation] = [:]
+    private var repositoryExcludeRootsByRepository: [GitWorkspaceAuthorityRepositoryKey: Set<UUID>] = [:]
+    private var repositoryExcludeReconciliationTasks: [UUID: Task<Void, Never>] = [:]
+    private var repositoryExcludeDirtyRoots: Set<UUID> = []
     private var seededAuthorityInvalidationListenerTask: Task<Void, Never>?
     private var publishedSeededAuthorityFencesByRootID: [UUID: GitWorkspacePendingInitializationAuthorityFence] = [:]
     private var publishedSeededAuthorityClaimsByRootID: [UUID: WorkspaceRootSeedServingAuthorityClaim] = [:]
@@ -3470,6 +3492,15 @@ actor WorkspaceFileContextStore {
     #endif
 
     deinit {
+        seededAuthorityInvalidationListenerTask?.cancel()
+        for task in repositoryExcludeReconciliationTasks.values {
+            task.cancel()
+        }
+        let excludeTokens = repositoryExcludeObservations.values.map(\.token)
+        let authority = workspaceStateAuthority
+        Task { for token in excludeTokens {
+            await authority.releaseMetadataObservation(token)
+        } }
         for token in rootLifetimeTokensByID.values {
             token.revoke()
         }
@@ -4722,13 +4753,244 @@ actor WorkspaceFileContextStore {
     private func ensureSeededAuthorityInvalidationListener() async {
         guard seededAuthorityInvalidationListenerTask == nil else { return }
         let events = await workspaceStateAuthority.invalidationEvents()
+        guard seededAuthorityInvalidationListenerTask == nil else { return }
         seededAuthorityInvalidationListenerTask = Task { [weak self] in
             for await event in events {
                 guard !Task.isCancelled else { break }
+                await self?.handleRepositoryExcludeInvalidation(event)
                 await self?.handleSeededAuthorityInvalidation(event)
             }
         }
     }
+
+    /// Ordinary loaded roots share the existing Git metadata owner with seeded worktrees.
+    /// In particular, a linked worktree's info/exclude lives outside its watched source root.
+    private func repositoryExcludeLayout(for state: RootState) throws -> GitRepositoryLayout? {
+        guard case let .gitRoot(prefix) = state.service.ignoreRulePolicy else { return nil }
+        var repositoryRoot = URL(fileURLWithPath: state.root.standardizedFullPath)
+            .resolvingSymlinksInPath().standardizedFileURL
+        for _ in prefix.value.split(separator: "/") {
+            repositoryRoot.deleteLastPathComponent()
+        }
+        guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repositoryRoot) else {
+            throw IgnoreRulePolicyResolutionError.ambiguousGitTopology
+        }
+        return layout
+    }
+
+    private func observeRepositoryExcludes(rootID: UUID) async throws {
+        guard let state = rootStatesByID[rootID],
+              let layout = try repositoryExcludeLayout(for: state)
+        else { return }
+        if repositoryExcludeObservations[rootID]?.lifetimeID == state.lifetimeID {
+            try await reconcileRepositoryExcludes(rootID: rootID, lifetimeID: state.lifetimeID)
+            return
+        }
+        await ensureSeededAuthorityInvalidationListener()
+        let token = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+        let appliedDigest = await state.service.repositoryExcludeDigest
+        guard rootStatesByID[rootID]?.lifetimeID == state.lifetimeID, !Task.isCancelled else {
+            await workspaceStateAuthority.releaseMetadataObservation(token)
+            throw CancellationError()
+        }
+        let key = GitWorkspaceAuthorityRepositoryKey(layout: layout)
+        repositoryExcludeObservations[rootID] = RepositoryExcludeObservation(
+            lifetimeID: state.lifetimeID,
+            repositoryKey: key,
+            token: token,
+            appliedDigest: appliedDigest
+        )
+        repositoryExcludeRootsByRepository[key, default: []].insert(rootID)
+        // Observation precedes this check, closing the initial crawl-to-watch gap without
+        // rescanning an unchanged root each time it is loaded.
+        try await reconcileRepositoryExcludes(rootID: rootID, lifetimeID: state.lifetimeID)
+    }
+
+    private func rebindRepositoryExcludeObservation(
+        rootID: UUID,
+        lifetimeID: UUID,
+        layout: GitRepositoryLayout
+    ) async throws {
+        guard let previous = repositoryExcludeObservations[rootID], previous.lifetimeID == lifetimeID else {
+            throw CancellationError()
+        }
+        let key = GitWorkspaceAuthorityRepositoryKey(layout: layout)
+        guard previous.repositoryKey != key else { return }
+        let token = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+        guard rootStatesByID[rootID]?.lifetimeID == lifetimeID,
+              repositoryExcludeObservations[rootID]?.token == previous.token,
+              !Task.isCancelled
+        else {
+            await workspaceStateAuthority.releaseMetadataObservation(token)
+            throw CancellationError()
+        }
+        repositoryExcludeRootsByRepository[previous.repositoryKey]?.remove(rootID)
+        if repositoryExcludeRootsByRepository[previous.repositoryKey]?.isEmpty == true {
+            repositoryExcludeRootsByRepository.removeValue(forKey: previous.repositoryKey)
+        }
+        repositoryExcludeRootsByRepository[key, default: []].insert(rootID)
+        repositoryExcludeObservations[rootID] = RepositoryExcludeObservation(
+            lifetimeID: lifetimeID,
+            repositoryKey: key,
+            token: token,
+            appliedDigest: previous.appliedDigest,
+            invalidationGeneration: previous.invalidationGeneration &+ 1,
+            isBlocked: previous.isBlocked
+        )
+        await workspaceStateAuthority.releaseMetadataObservation(previous.token)
+    }
+
+    private func handleRepositoryExcludeInvalidation(_ event: GitWorkspaceAuthorityInvalidationEvent) {
+        guard case let .metadata(kinds) = event.kind,
+              !kinds.isDisjoint(with: [.ignoreAuthority, .dotGit, .monitorGap])
+        else { return }
+        for rootID in repositoryExcludeRootsByRepository[event.repositoryKey] ?? [] {
+            guard var observation = repositoryExcludeObservations[rootID] else { continue }
+            observation.invalidationGeneration &+= 1
+            repositoryExcludeObservations[rootID] = observation
+            repositoryExcludeDirtyRoots.insert(rootID)
+            guard repositoryExcludeReconciliationTasks[rootID] == nil else { continue }
+            repositoryExcludeReconciliationTasks[rootID] = Task { [weak self] in
+                await self?.drainRepositoryExcludeChanges(rootID: rootID, lifetimeID: observation.lifetimeID)
+            }
+        }
+    }
+
+    private func drainRepositoryExcludeChanges(rootID: UUID, lifetimeID: UUID) async {
+        defer { repositoryExcludeReconciliationTasks.removeValue(forKey: rootID) }
+        while !Task.isCancelled,
+              rootStatesByID[rootID]?.lifetimeID == lifetimeID,
+              repositoryExcludeDirtyRoots.remove(rootID) != nil
+        {
+            do {
+                try await reconcileRepositoryExcludes(rootID: rootID, lifetimeID: lifetimeID)
+            } catch {
+                // Retry an invalidation that arrived during the failed attempt; without a
+                // newer event leave the root unavailable instead of spinning on a bad control.
+                if !repositoryExcludeDirtyRoots.contains(rootID) { return }
+            }
+        }
+    }
+
+    private func setRepositoryExcludeBlocked(rootID: UUID, lifetimeID: UUID, blocked: Bool) {
+        guard rootStatesByID[rootID]?.lifetimeID == lifetimeID,
+              repositoryExcludeObservations[rootID]?.lifetimeID == lifetimeID,
+              repositoryExcludeObservations[rootID]?.isBlocked != blocked,
+              let root = rootStatesByID[rootID]?.root
+        else { return }
+        repositoryExcludeObservations[rootID]?.isBlocked = blocked
+        invalidatePathMatchSnapshot(
+            affectedRootKinds: [root.kind],
+            reason: .catalogMutation,
+            affectedRootIDs: [rootID]
+        )
+    }
+
+    private func reconcileRepositoryExcludes(rootID: UUID, lifetimeID: UUID) async throws {
+        guard let state = rootStatesByID[rootID], state.lifetimeID == lifetimeID else { return }
+        do {
+            guard let layout = try repositoryExcludeLayout(for: state) else { return }
+            try await rebindRepositoryExcludeObservation(rootID: rootID, lifetimeID: lifetimeID, layout: layout)
+            let currentDigest = try await state.service.currentRepositoryExcludeDigest()
+            guard let observation = repositoryExcludeObservations[rootID], observation.lifetimeID == lifetimeID else {
+                throw CancellationError()
+            }
+            guard currentDigest != observation.appliedDigest || observation.isBlocked else { return }
+            setRepositoryExcludeBlocked(rootID: rootID, lifetimeID: lifetimeID, blocked: true)
+            guard let fence = await beginCodemapRootMutationFence(rootID: rootID, command: .repositoryAuthority),
+                  fence.rootEpoch.rootLifetimeID == lifetimeID
+            else { throw CancellationError() }
+            var committed = false
+            defer { finishCodemapRootMutationFence(fence, didCommitMutation: committed) }
+            for _ in 0 ..< 3 {
+                try Task.checkCancellation()
+                guard let current = rootStatesByID[rootID], current.lifetimeID == lifetimeID,
+                      let currentLayout = try repositoryExcludeLayout(for: current)
+                else { throw CancellationError() }
+                try await rebindRepositoryExcludeObservation(rootID: rootID, lifetimeID: lifetimeID, layout: currentLayout)
+                guard let captured = repositoryExcludeObservations[rootID], captured.lifetimeID == lifetimeID else {
+                    throw CancellationError()
+                }
+                let watermark = workspaceStateAuthority.acceptedMetadataWatermark(for: captured.repositoryKey)
+                try await current.service.refreshIgnoreRules()
+                let policy = await current.service.repositoryExcludePolicyRevision()
+                guard let baseline = rootStatesByID[rootID], baseline.lifetimeID == lifetimeID else {
+                    throw CancellationError()
+                }
+                let indexGeneration = appliedIndexGenerationsByRootID[rootID] ?? 0
+                var publishedItems = Dictionary(
+                    uniqueKeysWithValues: baseline.folderIDsByRelativePath.keys
+                        .filter { !$0.isEmpty }.map { ($0, true) }
+                )
+                for path in baseline.fileIDsByRelativePath.keys {
+                    publishedItems[path] = false
+                }
+                // Each attempt diffs against the published Store inventory. The service may
+                // have advanced its private inventory during an earlier rejected attempt.
+                let deltas = try await current.service.reconcileEntireTreeAfterRecoveryFailure(
+                    publishedBaseline: publishedItems
+                )
+                let prepared = prepareObservedFileSystemDeltas(deltas, root: current.root)
+                let applicable = await preflightPreparedIndexDeltas(
+                    rootID: rootID,
+                    deltas: prepared,
+                    expectedLifetimeID: lifetimeID
+                )
+                #if DEBUG
+                    if let handler = repositoryExcludeWillPublishHandlerForTesting { await handler() }
+                #endif
+                let policyCurrent = try await current.service.repositoryExcludePolicyIsCurrent(policy)
+                let observationCurrent = await workspaceStateAuthority.metadataObservationIsCurrent(
+                    captured.token,
+                    for: currentLayout,
+                    expectedAcceptedWatermark: watermark
+                )
+                guard !Task.isCancelled,
+                      rootStatesByID[rootID]?.lifetimeID == lifetimeID,
+                      rootStatesByID[rootID]?.service === current.service
+                else { throw CancellationError() }
+                guard policyCurrent, observationCurrent,
+                      workspaceStateAuthority.acceptedMetadataWatermark(for: captured.repositoryKey) == watermark,
+                      repositoryExcludeObservations[rootID]?.invalidationGeneration == captured.invalidationGeneration,
+                      (appliedIndexGenerationsByRootID[rootID] ?? 0) == indexGeneration
+                else { continue }
+                // Already owns the root mutation fence: entering the ordinary path-fence
+                // route would wait for the fence held by this same operation.
+                repositoryExcludeObservations[rootID]?.appliedDigest = policy.digest
+                setRepositoryExcludeBlocked(rootID: rootID, lifetimeID: lifetimeID, blocked: false)
+                applyPreparedIndexDeltaMutations(rootID: rootID, deltas: applicable, requiresFullResync: true)
+                committed = true
+                for delta in deltas {
+                    yieldFileSystemDeltaEvent(WorkspaceFileSystemDeltaEvent(
+                        rootID: rootID,
+                        rootPath: current.root.standardizedFullPath,
+                        delta: delta
+                    ))
+                }
+                return
+            }
+            throw RepositoryExcludeReconciliationError.unstableIgnorePolicy
+        } catch {
+            setRepositoryExcludeBlocked(rootID: rootID, lifetimeID: lifetimeID, blocked: true)
+            throw error
+        }
+    }
+
+    #if DEBUG
+        func handleRepositoryExcludeInvalidationForTesting(_ event: GitWorkspaceAuthorityInvalidationEvent) {
+            handleRepositoryExcludeInvalidation(event)
+        }
+
+        func waitForRepositoryExcludeReconciliationForTesting(rootID: UUID) async {
+            while let task = repositoryExcludeReconciliationTasks[rootID] {
+                await task.value
+            }
+        }
+
+        func setRepositoryExcludeWillPublishHandlerForTesting(_ handler: (@Sendable () async -> Void)?) {
+            repositoryExcludeWillPublishHandlerForTesting = handler
+        }
+    #endif
 
     private func handleSeededAuthorityInvalidation(
         _ event: GitWorkspaceAuthorityInvalidationEvent
@@ -4969,6 +5231,9 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             publishedSeededAuthorityFullCrawlCountsByRootID[rootID, default: 0] += 1
         #endif
+        do {
+            try await state.service.refreshIgnoreRules()
+        } catch { return false }
         guard await state.service.reconcileEntireTreeForAuthorityChange() else { return false }
         publishedSeededAuthorityStatesByRootID[rootID]?.fullCrawlCompletedGeneration = capturedGeneration
         await waitForCurrentPublisherIngress(rootIDs: [rootID])
@@ -5146,6 +5411,15 @@ actor WorkspaceFileContextStore {
               authority.fullCrawlCompletedGeneration != nil
         else { return false }
 
+        // The seeded authority retires after a successful full crawl. Transfer ongoing
+        // exclude observation to the ordinary loaded-root owner before releasing its token.
+        do {
+            try await observeRepositoryExcludes(rootID: rootID)
+        } catch { return false }
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: state.lifetimeID),
+              publishedSeededAuthorityStatesByRootID[rootID]?.epoch == authority.epoch,
+              publishedSeededAuthorityStatesByRootID[rootID]?.activeMutationDepth == 0
+        else { return false }
         seededAuthorityPendingGenerationByRootID.removeValue(forKey: rootID)
         let claim = publishedSeededAuthorityClaimsByRootID.removeValue(forKey: rootID)
         let fence = publishedSeededAuthorityFencesByRootID.removeValue(forKey: rootID)
@@ -5184,6 +5458,7 @@ actor WorkspaceFileContextStore {
     #endif
 
     private func publishedSeededAuthorityIsQueryable(rootID: UUID) -> Bool {
+        if repositoryExcludeObservations[rootID]?.isBlocked == true { return false }
         #if DEBUG
             if primaryRootQueryabilityFailuresForTesting[rootID] != nil { return false }
         #endif
@@ -5196,6 +5471,10 @@ actor WorkspaceFileContextStore {
     }
 
     private func requirePublishedSeededAuthorityFresh(rootID: UUID) async throws {
+        if repositoryExcludeObservations[rootID]?.isBlocked == true {
+            let path = rootStatesByID[rootID]?.root.standardizedFullPath ?? rootID.uuidString
+            throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(path)
+        }
         while publishedSeededAuthorityFencesByRootID[rootID] != nil {
             if publishedSeededAuthorityIsQueryable(rootID: rootID) { return }
             guard let state = publishedSeededAuthorityStatesByRootID[rootID],
@@ -11029,7 +11308,8 @@ actor WorkspaceFileContextStore {
     }
 
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch)
+        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
+            repositoryExcludeObservations[rootEpoch.rootID]?.isBlocked == true
     }
 
     /// True when the deltas being applied on *this* call chain are the ones produced by the root's
@@ -11598,6 +11878,12 @@ actor WorkspaceFileContextStore {
             rootAppliedIndexGeneration: appliedIndexGenerationsByRootID[root.id],
             kind: .rootLoaded
         ))
+        do {
+            try await observeRepositoryExcludes(rootID: root.id)
+        } catch {
+            await unloadRoot(id: root.id)
+            throw error
+        }
         if root.kind == .sessionWorktree,
            startupFeatureFlags.observeDiffSeededWorktreeStartup
         {
@@ -11791,6 +12077,16 @@ actor WorkspaceFileContextStore {
         var ownershipResourcesReleasedByUnload = SessionWorktreeOwnershipRemoval()
         var invalidatedOwnershipTokens = Set<WorkspaceSessionWorktreeOwnershipToken>()
         for rootID in orderedRootIDs {
+            repositoryExcludeReconciliationTasks.removeValue(forKey: rootID)?.cancel()
+            repositoryExcludeDirtyRoots.remove(rootID)
+            if let observation = repositoryExcludeObservations.removeValue(forKey: rootID) {
+                repositoryExcludeRootsByRepository[observation.repositoryKey]?.remove(rootID)
+                if repositoryExcludeRootsByRepository[observation.repositoryKey]?.isEmpty == true {
+                    repositoryExcludeRootsByRepository.removeValue(forKey: observation.repositoryKey)
+                }
+                let authority = workspaceStateAuthority
+                Task { await authority.releaseMetadataObservation(observation.token) }
+            }
             if let claim = publishedSeededAuthorityClaimsByRootID.removeValue(forKey: rootID) {
                 seededAuthorityClaimsToRelease.append(claim)
                 publishedSeededAuthorityFencesByRootID.removeValue(forKey: rootID)

@@ -29,7 +29,21 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         locationLabel: String? = "worktree/feature",
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let readiness: AgentSessionRestorationReadiness
+        if let persistentBindingGeneration {
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: tabID, sessionID: sessionID, generation: persistentBindingGeneration
+                ),
+                bindingTransitionGeneration: bindingTransitionGeneration
+            )
+            readiness = hasLoadedPersistedState
+                ? .authoritative(token, .persistedPayloadApplied)
+                : .pending(token)
+        } else {
+            readiness = .unbound
+        }
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
@@ -46,6 +60,7 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
+            restorationReadiness: readiness,
             isDeletionInProgress: isDeletionInProgress
         )
     }
@@ -75,6 +90,59 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         XCTAssertEqual(resolved, target)
     }
 
+    func testCompletedLoadLatchRequiresAuthoritativeReadinessForResolution() throws {
+        var candidate = makeCandidate()
+        let token = try XCTUnwrap(candidate.restorationReadiness.bindingToken)
+        let ownerID = UUID()
+        let unavailable: [(String, AgentSessionRestorationReadiness)] = [
+            ("unbound", .unbound),
+            ("pending", .pending(token)),
+            ("preparing", .creating(token, .init(
+                workspaceID: candidate.workspaceID, ownerID: ownerID, phase: .preparing
+            ))),
+            ("ready to persist", .creating(token, .init(
+                workspaceID: candidate.workspaceID, ownerID: ownerID,
+                phase: .readyToPersist(configurationStamp: Data("configured".utf8))
+            ))),
+            ("failed configuration", .creating(token, .init(
+                workspaceID: candidate.workspaceID, ownerID: ownerID,
+                phase: .failedBeforeConfiguration("Configuration failed.")
+            ))),
+            ("missing payload", .terminal(token, .missingPayload)),
+            ("load failed", .terminal(token, .loadFailed)),
+            ("superseded source", .terminal(token, .sourceRevisionSuperseded))
+        ]
+        for (name, readiness) in unavailable {
+            candidate.restorationReadiness = readiness
+            XCTAssertTrue(candidate.hasLoadedPersistedState, name)
+            XCTAssertEqual(
+                AgentSessionLinkEndpointResolver.resolve(sessionID: candidate.sessionID, candidates: [candidate]).failure,
+                .loading,
+                name
+            )
+            XCTAssertFalse(AgentSessionCopyIDPolicy.isOfferable(candidate), name)
+            XCTAssertEqual(
+                AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+                    candidate.eligibilityInput, roleAllowsOutboundMonitoring: true
+                ),
+                .transientlyUnavailable,
+                name
+            )
+        }
+
+        let authoritativeSources: [AgentSessionRestorationReadiness.Source] = [
+            .persistedPayloadApplied, .freshBindingDurablyCreated
+        ]
+        for source in authoritativeSources {
+            candidate.restorationReadiness = .authoritative(token, source)
+            XCTAssertEqual(
+                try AgentSessionLinkEndpointResolver.resolve(sessionID: candidate.sessionID, candidates: [candidate]).get(),
+                candidate
+            )
+            XCTAssertTrue(AgentSessionCopyIDPolicy.isOfferable(candidate))
+        }
+    }
+
     func testUnknownSessionIsNotFound() {
         let failure = AgentSessionLinkEndpointResolver
             .resolve(sessionID: UUID(), candidates: [makeCandidate()])
@@ -98,7 +166,7 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
             (makeCandidate(isClosing: true), .closing),
             (makeCandidate(bindingTransitionInProgress: true), .rebinding),
             (makeCandidate(hasLoadedPersistedState: false), .loading),
-            (makeCandidate(persistentBindingGeneration: nil), .bindingUnresolved)
+            (makeCandidate(persistentBindingGeneration: nil), .loading)
         ]
         for (candidate, expected) in cases {
             let failure = AgentSessionLinkEndpointResolver
@@ -175,7 +243,7 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
                 makeCandidate(persistentBindingGeneration: nil, hasLoadedPersistedState: false),
                 .loading
             ),
-            ("binding", makeCandidate(persistentBindingGeneration: nil), .bindingUnresolved),
+            ("unbound", makeCandidate(persistentBindingGeneration: nil), .loading),
             ("eligible", makeCandidate(), nil)
         ]
 

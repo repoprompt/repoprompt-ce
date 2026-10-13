@@ -177,6 +177,8 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             let lease = makeAttemptLease(observer)
             let acquired = await lease.acquire()
             XCTAssertTrue(acquired)
+            let cachedRoute = await observer.manager.cachedModelRunRoute(connectionID: observer.connectionID)
+            XCTAssertNotNil(cachedRoute, "A renewed same-run policy must retain the exact committed workspace route before any catalog relist")
 
             // Cancelled after the policy install bumped the routing generation but before any relist.
             await lease.cancelAndCleanup(preservingCommittedRoute: true)
@@ -193,6 +195,28 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             )
             _ = try await observer.manager.debugListToolNames(for: observer.connectionID)
             try await assertRouteAndCatalogReady(observer, "after the next relist")
+        #else
+            throw XCTSkip("Requires DEBUG MCP routing fixtures.")
+        #endif
+    }
+
+    func testRenewalCannotRetainWorkspaceForAChangedRouteOrPurpose() async throws {
+        #if DEBUG
+            for changedIdentity in 0 ..< 3 {
+                let observer = try await makeRoutedObserver()
+                await observer.manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: changedIdentity == 0 ? observer.window.windowID + 1000 : observer.window.windowID,
+                    restrictedTools: [],
+                    tabID: changedIdentity == 1 ? UUID() : observer.tabID,
+                    runID: observer.runID,
+                    purpose: changedIdentity == 2 ? .discoverRun : .agentModeRun
+                )
+                let cached = await observer.manager.cachedModelRunRoute(connectionID: observer.connectionID)
+                XCTAssertNil(cached, "A changed window, tab or purpose must require fresh admission")
+                let policy = await observer.manager.debugRunPolicyState(for: observer.runID)
+                XCTAssertNil(policy?.workspaceID)
+            }
         #else
             throw XCTSkip("Requires DEBUG MCP routing fixtures.")
         #endif

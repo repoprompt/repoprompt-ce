@@ -576,6 +576,33 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         }
     }
 
+    func testDelegatedUnlinkRechecksAuthorityInsideOwningPairLane() async throws {
+        let (fixture, _, _) = try await makeRestoredFixture()
+        let original = await liveReference(fixture)
+        let reference = try XCTUnwrap(original)
+        let originalToken = await fixture.store.token(for: pair)
+        let fence = TestReleaseFence(name: "Delegated unlink after admission")
+        var authorized = true
+        fixture.bridge.test_afterStopAdmission = { await fence.enterAndWait() }
+        let stop = Task { @MainActor in
+            await fixture.bridge.stopMonitorLink(
+                observerSessionID: self.observerSessionID, targetSessionID: self.targetSessionID,
+                linkID: reference.linkID, generation: reference.generation,
+                isStillAuthorized: { authorized }
+            )
+        }
+        await fence.waitUntilEntered()
+        authorized = false
+        fixture.bridge.test_afterStopAdmission = nil
+        fence.release()
+        let outcome = await stop.value
+        XCTAssertNotNil(outcome.failureMessage)
+        let remainingToken = await fixture.store.token(for: pair)
+        let remainingGrant = await fixture.authority.activeGrant(for: reference)
+        XCTAssertEqual(remainingToken, originalToken, "expired authority must not remove the durable intent")
+        XCTAssertNotNil(remainingGrant, "the uncommitted Stop must not retire the live grant")
+    }
+
     func testUnlinkAdmittedBeforeCloseRetiresItsParkedIntentAfterGrantRemoval() async throws {
         let (fixture, observer, target) = try await makeRestoredFixture()
         let original = await liveReference(fixture)
@@ -620,7 +647,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.invalidateWindow(2, reason: .windowClosed)
             await fixture.bridge.test_settleLaunchReconciliation()
             fixture.gate.failsNextWrites = failsWrite
-            let deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
+            let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: targetSessionID)
             await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
             replaceTopology(fixture, with: [observer, makeReadyCandidate(windowID: 3, sessionID: targetSessionID)])
             fixture.bridge.noteTopologyMayHaveChanged()
@@ -857,7 +884,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let fixture = makeFixture()
         let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
         var target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        let attempt = AgentSessionDeletionRegistry.shared
+        let attempt = try AgentSessionDeletionRegistry.shared
             .beginDurableDeletion(sessionID: targetSessionID)
         target.isDeletionInProgress = true
         fixture.host.candidates = [observer, target]

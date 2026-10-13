@@ -38,7 +38,7 @@ struct SessionAdminMCPToolService {
     private static let lifecycleKeys: [String: Set<String>] = [
         "request_scope": ["op", "kind", "workspace", "capabilities", "guardrails", "reason", "idempotency_key"],
         "scope_status": ["op", "scope_id", "request_id"],
-        "release_scope": ["op", "scope_id"],
+        "release_scope": ["op", "scope_id", "request_id"],
         "confirmation_status": ["op", "confirmation_id"],
         "undo": ["op", "undo_token"]
     ]
@@ -161,7 +161,7 @@ struct SessionAdminMCPToolService {
                     "Nothing is granted yet. The user sees an approval card in this session. Continue other work and check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
                 )
             }
-            return .object(value)
+            return Self.withScopeAvailability(value, runtime: scopes())
         case let .failure(.invalid(denial)):
             return .object([
                 "result": .string("invalid_request"),
@@ -196,20 +196,23 @@ struct SessionAdminMCPToolService {
             if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
                 value["scope"] = Self.scopeValue(record, now: now())
             }
-            return .object(value)
+            return Self.withScopeAvailability(value, runtime: runtime)
+        }
+        guard runtime.canUseAuthority else {
+            return Self.withScopeAvailability(["result": .string("scope_authority_unavailable")], runtime: runtime)
         }
         if let scopeID = try Self.parseUUID(args["scope_id"], field: "scope_id") {
             guard let record = runtime.record(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
                 throw Self.unavailableError
             }
-            return .object(["result": .string("ok"), "scope": Self.scopeValue(record, now: now())])
+            return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now())], runtime: runtime)
         }
         let scopes = runtime.scopes(grantedTo: callerSessionID)
-        return .object([
+        return Self.withScopeAvailability([
             "result": .string("ok"),
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
             "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) })
-        ])
+        ], runtime: runtime)
     }
 
     // MARK: - release_scope
@@ -217,6 +220,26 @@ struct SessionAdminMCPToolService {
     private func releaseScope(args: [String: Value], caller: DomainAgentSessionCallerIdentity) throws -> Value {
         guard let callerSessionID = caller.agentSessionID else { throw Self.unavailableError }
         let runtime = scopes()
+        if args["request_id"] != nil, args["scope_id"] != nil {
+            throw MCPError.invalidParams("session_admin release_scope takes request_id or scope_id, not both.")
+        }
+        if let requestID = try Self.parseUUID(args["request_id"], field: "request_id") {
+            guard let before = runtime.request(id: requestID, requesterSessionID: callerSessionID),
+                  let request = runtime.withdrawRequest(id: requestID, requesterSessionID: callerSessionID)
+            else { throw Self.unavailableError }
+            var value = Self.requestValue(request)
+            if case .cancelled = request.state {
+                value["result"] = .string(before.state == .pending ? "cancelled" : "already_cancelled")
+                value["detail"] = .string("The pending request was withdrawn; no authority was granted.")
+            } else {
+                value["result"] = .string("request_not_pending")
+                value["detail"] = .string("This request was already decided. Use scope_id to release a granted scope.")
+            }
+            return .object(value)
+        }
+        guard runtime.canUseAuthority else {
+            return Self.withScopeAvailability(["result": .string("scope_authority_unavailable")], runtime: runtime)
+        }
         let scopeID: UUID
         if let explicit = try Self.parseUUID(args["scope_id"], field: "scope_id") {
             scopeID = explicit
@@ -229,15 +252,26 @@ struct SessionAdminMCPToolService {
         }
         switch runtime.release(scopeID: scopeID, caller: caller) {
         case let .success(changed):
-            return .object([
+            return Self.withScopeAvailability([
                 "result": .string(changed.isEmpty ? "already_inactive" : "released"),
                 "scope_id": .string(scopeID.uuidString),
                 "revoked_scope_ids": .array(changed.map { .string($0.id.uuidString) }),
                 "detail": .string("Authority stops immediately. Sessions keep running and links stay until released.")
-            ])
+            ], runtime: runtime)
         case .failure:
             throw Self.unavailableError
         }
+    }
+
+    private static func withScopeAvailability(
+        _ value: [String: Value], runtime: DelegationScopeRuntime
+    ) -> Value {
+        var value = value
+        value["authority_available"] = .bool(runtime.canUseAuthority)
+        if let message = runtime.persistenceStatusMessage {
+            value["authority_status_detail"] = .string(message)
+        }
+        return .object(value)
     }
 
     // MARK: - confirmation_status
@@ -255,10 +289,23 @@ struct SessionAdminMCPToolService {
     /// Adds the result of an apply-on-approval card, when the front door applied it.
     private func withAppliedResult(_ value: Value, confirmationID: UUID) -> Value {
         guard case var .object(object) = value,
-              let frontDoor = administration() as? AgentSessionAdministrationFrontDoor,
-              let result = frontDoor.appliedResult(forConfirmation: confirmationID)
+              let frontDoor = administration() as? AgentSessionAdministrationFrontDoor
         else { return value }
-        object["applied_result"] = result
+        if let result = frontDoor.appliedResult(forConfirmation: confirmationID) {
+            object["applied_result"] = result
+            // The stored receipt already combines exact item outcomes with captured selection coverage.
+            if object["confirmation_state"] == .string("consumed"),
+               let outcome = result.objectValue?["result"]?.stringValue
+            {
+                object["result"] = .string(outcome)
+            }
+        }
+        if let selection = frontDoor.selectionCoverage(forConfirmation: confirmationID) {
+            object["selection"] = selection
+            if selection.objectValue?["records_complete"] == .bool(false) {
+                object["selection_complete"] = .bool(false)
+            }
+        }
         return .object(object)
     }
 
@@ -465,13 +512,14 @@ struct SessionAdminMCPToolService {
         case .pending: "pending_confirmation"
         case .approved: "approved"
         case .applying: "applying"
-        case .consumed: "applied"
+        case .consumed: "consumed"
         case .denied: "denied"
         case .invalidated: "invalidated"
         }
         var value: [String: Value] = [
             "result": .string(state),
             "confirmation_id": .string(card.id.uuidString),
+            "confirmation_state": .string(state),
             "op": .string(card.operation.rawValue),
             "reason": .string(card.reason.rawValue),
             "items": .array(card.items.map { item in

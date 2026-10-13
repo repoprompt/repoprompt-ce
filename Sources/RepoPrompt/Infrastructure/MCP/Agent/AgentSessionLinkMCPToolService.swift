@@ -2241,7 +2241,7 @@ enum AgentSessionLinkResponseRenderer {
              .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
              .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
              .endpointPostWindow, .endpointPostReadiness,
-             .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
+             .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
              .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
             failure.message

@@ -973,8 +973,9 @@ extension ToolOutputFormatter {
         }
 
         let op = args["op"]?.stringValue ?? "history"
-        let status = object["scan_truncated"]?.boolValue == true ? "⚠️" : statusIcon(success: true)
-        let lowerBoundSuffix = object["totals_are_lower_bounds"]?.boolValue == true ? " (lower bound)" : ""
+        let incomplete = isHistoryScanIncomplete(object)
+        let status = incomplete ? "⚠️" : statusIcon(success: true)
+        let lowerBoundSuffix = incomplete ? " (lower bound)" : ""
         var lines: [String] = []
         switch op {
         case "list_sessions":
@@ -982,7 +983,7 @@ extension ToolOutputFormatter {
             let sessions = object["sessions"]?.arrayValue ?? []
             lines.append("## History Sessions \(status)")
             lines.append("- **Total sessions**: \(total)\(lowerBoundSuffix) • **Returned**: \(sessions.count)")
-            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
                 lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
@@ -1009,7 +1010,7 @@ extension ToolOutputFormatter {
             let results = object["results"]?.arrayValue ?? []
             lines.append("## History Search \(status)")
             lines.append("- **Total matches**: \(total)\(lowerBoundSuffix) • **Returned**: \(results.count)")
-            if total == 0 { lines.append("- **Status**: No matching turns found") }
+            if total == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching turns found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results {
@@ -1033,7 +1034,7 @@ extension ToolOutputFormatter {
             let groups = object["groups"]?.arrayValue ?? []
             lines.append("## History Time \(status)")
             lines.append("- **Total sessions**: \(totalSessions)\(lowerBoundSuffix) • **Active duration**: \(totalDuration)s\(lowerBoundSuffix) • **Groups**: \(groups.count)")
-            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
+            if totalSessions == 0 { lines.append(incomplete ? "- **Status**: No matches in the scanned portion" : "- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups {
@@ -1163,10 +1164,15 @@ extension ToolOutputFormatter {
         return max(1, min(value, 20000))
     }
 
-    private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
-        if object["scan_truncated"]?.boolValue == true
+    private static func isHistoryScanIncomplete(_ object: [String: Value]) -> Bool {
+        object["scan_complete"]?.boolValue == false
+            || object["scan_truncated"]?.boolValue == true
+            || object["totals_are_lower_bounds"]?.boolValue == true
             || object["skipped_workspaces"]?.arrayValue?.isEmpty == false
-        {
+    }
+
+    private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if isHistoryScanIncomplete(object) {
             lines.append("- **Scan completeness**: Incomplete; totals are lower bounds. No matches does not establish that the workspace or matching set is empty.")
         }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
@@ -6451,7 +6457,17 @@ extension ToolOutputFormatter {
             if let note = object["note"]?.stringValue {
                 lines.append("- Note: \(note)")
             }
-            lines.append("- Sessions: **\(sessions.count)**")
+            if object["scope"]?.stringValue == "spawned_by_caller" {
+                let matching = object["matching_child_count"]?.intValue ?? sessions.count
+                lines.append("- Matching child sessions: **\(matching)** · returned **\(sessions.count)**; workspace inventory not requested")
+                if let workspaceID = object["workspace_id"]?.stringValue {
+                    lines.append("- Current workspace: `\(workspaceID)`")
+                }
+            } else if object["scope"]?.stringValue == "unresolved_caller" {
+                lines.append("- Session discovery unavailable; no workspace count was determined")
+            } else {
+                lines.append("- Sessions: **\(sessions.count)**")
+            }
             for entry in sessions {
                 guard let session = entry.objectValue else { continue }
                 let name = session["name"]?.stringValue ?? "Unnamed"

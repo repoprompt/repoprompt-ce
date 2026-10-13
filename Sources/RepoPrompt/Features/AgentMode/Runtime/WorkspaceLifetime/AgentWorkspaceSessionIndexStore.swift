@@ -5,6 +5,8 @@ import RepoPromptInstrumentation
 /// delegate (the view model) so it can trigger sidebar UI sync.
 enum SessionIndexStateChangeReason {
     case sessionIndex
+    /// A row changed without changing the child-parent census.
+    case sessionMetadata
     case sortDates
     case sessionList
 }
@@ -74,11 +76,22 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     weak var delegate: AgentWorkspaceSessionIndexStoreDelegate?
 
     private var suppressDelegateNotifications = false
+    private var isApplyingSessionIndexDelta = false
+    private var sessionIDsByTabID: [UUID: Set<UUID>] = [:]
+    #if DEBUG
+        var test_metadataRowsVisited = 0
+    #endif
 
     // MARK: - Published data (formerly @Published on AgentModeViewModel)
 
     @Published private(set) var sessionIndex: [UUID: AgentSessionIndexEntry] = [:] {
         didSet {
+            if !isApplyingSessionIndexDelta {
+                sessionIDsByTabID.removeAll(keepingCapacity: true)
+                for entry in sessionIndex.values {
+                    sessionIDsByTabID[entry.tabID, default: []].insert(entry.id)
+                }
+            }
             guard !suppressDelegateNotifications else { return }
             delegate?.sessionIndexStore(self, didChangeStateWithReason: .sessionIndex)
         }
@@ -175,6 +188,16 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
             return [:]
         }
         return sessionIndex
+    }
+
+    func ownerValidatedEntries(forTabID tabID: UUID) -> [AgentSessionIndexEntry] {
+        guard let owner = sessionIndexOwner, isOwnerCurrent(owner) else { return [] }
+        return (sessionIDsByTabID[tabID] ?? []).compactMap { id in
+            #if DEBUG
+                test_metadataRowsVisited += 1
+            #endif
+            return sessionIndex[id]
+        }
     }
 
     var ownerValidatedSessionListSortDates: [UUID: Date] {
@@ -303,19 +326,38 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     }
 
     func applyLocalUpsert(_ entry: AgentSessionIndexEntry) {
-        guard let owner = sessionIndexOwner,
-              isOwnerCurrent(owner)
-        else {
-            return
-        }
+        guard let owner = sessionIndexOwner, isOwnerCurrent(owner) else { return }
         sessionIndexLocalRemovals.remove(entry.id)
         sessionIndexLocalUpserts[entry.id] = entry
-        var updated = sessionIndex
-        updated[entry.id] = entry
-        if sessionIndex != updated {
-            sessionIndex = updated
+        let previous = sessionIndex[entry.id]
+        guard previous != entry else { return }
+        let wasSuppressed = suppressDelegateNotifications
+        suppressDelegateNotifications = true
+        isApplyingSessionIndexDelta = true
+        if let previous {
+            sessionIDsByTabID[previous.tabID]?.remove(entry.id)
+            if sessionIDsByTabID[previous.tabID]?.isEmpty == true { sessionIDsByTabID.removeValue(forKey: previous.tabID) }
         }
-        rebuildSessionSortDatesFromIndex()
+        sessionIDsByTabID[entry.tabID, default: []].insert(entry.id)
+        sessionIndex[entry.id] = entry
+        isApplyingSessionIndexDelta = false
+        sessionListSortDatesOwner = sessionIndexOwner
+        if previous?.tabID != entry.tabID || previous?.lastUserMessageAt != entry.lastUserMessageAt || previous?.savedAt != entry.savedAt {
+            let affectedTabs = Set([previous?.tabID, entry.tabID].compactMap(\.self))
+            for tabID in affectedTabs {
+                let entries = ownerValidatedEntries(forTabID: tabID)
+                let dates = AgentSessionRestoreSupport.sidebarSortDates(from: Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }))
+                if sessionListSortDates[tabID] != dates[tabID] { sessionListSortDates[tabID] = dates[tabID] }
+            }
+        }
+        suppressDelegateNotifications = wasSuppressed
+        if !wasSuppressed {
+            delegate?.sessionIndexStore(
+                self,
+                didChangeStateWithReason:
+                previous != nil && previous?.parentSessionID == entry.parentSessionID ? .sessionMetadata : .sessionIndex
+            )
+        }
     }
 
     func applyLocalRemoval(sessionID: UUID) {

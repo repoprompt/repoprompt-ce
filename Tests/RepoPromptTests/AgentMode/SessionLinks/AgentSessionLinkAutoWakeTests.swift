@@ -4501,7 +4501,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.oversight.retirePeriodicScheduling()
         }
         fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { bridge.isPeriodicWakeObserverLive(for: $0) }
-        let failed = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let failed = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         registry.didFailDurableDeletion(failed)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
         _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
@@ -4516,7 +4516,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             _ = await gate.requirement()
             await cleanup?(sessionID)
         }
-        let token = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let token = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
         await gate.waitUntilEntered()
         // Assert the contested state, so an unrelated inventory withdrawal cannot make this pass.

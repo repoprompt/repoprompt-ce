@@ -33,6 +33,7 @@ extension AgentModeViewModel {
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
+            restorationReadiness: session.qualifiedRestorationReadiness,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,
             endpointMatchesGrant: endpointMatchesGrant,
@@ -255,6 +256,13 @@ extension AgentModeViewModel {
         stopFence: AgentRunStartStopFence,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
+        // Every noncomposer caller shares this pre-row fence. A completed but failed restoration
+        // must never become a replacement transcript merely because it reached an idle runtime.
+        guard liveSession.permitsBoundOperationAndSave else {
+            releaseComposerSubmitClaim(claim)
+            let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
+            return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
+        }
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
             displayText,
@@ -318,7 +326,7 @@ extension AgentModeViewModel {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        guard dispatchIsCurrent() else {
+        guard liveSession.permitsBoundOperationAndSave, dispatchIsCurrent() else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }

@@ -2034,7 +2034,9 @@ final class MCPServerViewModel: ObservableObject {
         selection: windowToolSelectionCapabilities
     )
     @MainActor
-    private lazy var historyToolProvider = MCPHistoryToolProvider(runtime: windowToolRuntime)
+    private lazy var historyToolProvider = MCPHistoryToolProvider(
+        runtime: windowToolRuntime, workspaceStore: domainWorkspaceAuthorityClient?.store
+    )
     @MainActor
     private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
         resolveContext: { [weak self] toolName, requirement in

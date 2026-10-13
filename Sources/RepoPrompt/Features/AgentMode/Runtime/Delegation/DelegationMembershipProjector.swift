@@ -73,12 +73,37 @@ extension DelegationSessionProvenance {
 @MainActor
 protocol DelegationProvenanceSource {
     func provenance(for sessionID: UUID) -> DelegationSessionProvenance?
+    func provenance(for sessionIDs: Set<UUID>) -> [UUID: DelegationSessionProvenance]
     /// Fresh placement only; ancestry checks do not need a live-binding census per ancestor.
     func placement(for sessionID: UUID) -> DelegationSessionPlacement?
     func allKnownSessions() -> [DelegationSessionProvenance]
+    /// Carries conflicts separately from accounting; ambiguity is never absence.
+    func pointSnapshot(for sessionIDs: Set<UUID>) -> DelegationProvenanceSnapshot
+    func resolutionState(for sessionID: UUID) -> DelegationSessionResolutionState
+    func censusSnapshot() -> DelegationProvenanceSnapshot
 }
 
 extension DelegationProvenanceSource {
+    func resolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+        provenance(for: sessionID) == nil ? .absent : .indexOnly
+    }
+
+    func pointSnapshot(for sessionIDs: Set<UUID>) -> DelegationProvenanceSnapshot {
+        let records = provenance(for: sessionIDs)
+        return .init(records: records, states: records.mapValues { _ in .indexOnly })
+    }
+
+    func censusSnapshot() -> DelegationProvenanceSnapshot {
+        let records = Dictionary(allKnownSessions().map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+        return .init(records: records, states: records.mapValues { _ in .indexOnly })
+    }
+
+    func provenance(for sessionIDs: Set<UUID>) -> [UUID: DelegationSessionProvenance] {
+        Dictionary(uniqueKeysWithValues: sessionIDs.compactMap { id in
+            provenance(for: id).map { (id, $0) }
+        })
+    }
+
     func placement(for sessionID: UUID) -> DelegationSessionPlacement? {
         provenance(for: sessionID)?.placement
     }
@@ -92,6 +117,8 @@ protocol DelegationMembershipProjector {
     /// One fresh synchronous read region. Its projector must not escape the closure or be retained
     /// across an await/mutation; return derived values only, never an authority cache.
     func withSynchronousCensus<Result>(_ body: (any DelegationMembershipProjector) -> Result) -> Result
+    /// Fresh point reads for explicit targets and their ancestry; no global usage projection.
+    func withSynchronousTargets<Result>(_ targets: Set<UUID>, _ body: (any DelegationMembershipProjector) -> Result) -> Result
     func membershipProof(
         for targetSessionID: UUID,
         in scope: DomainDelegationScopeGrant
@@ -108,9 +135,29 @@ protocol DelegationMembershipProjector {
     func organizationalSubtree(of sessionID: UUID) -> [DomainDelegationSubtreeNode]?
     /// The loaded provenance of one session (liveness, bound worktrees, placement), if any.
     func knownProvenance(for sessionID: UUID) -> DelegationSessionProvenance?
+    func pointResolutionState(for sessionID: UUID) -> DelegationSessionResolutionState
+    func authorityConflictInAncestry(of sessionID: UUID) -> Bool
+    /// Capacity decisions consume this optional proof, never an incomplete numeric projection.
+    func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage?
 }
 
 extension DelegationMembershipProjector {
+    func pointResolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+        knownProvenance(for: sessionID) == nil ? .absent : .indexOnly
+    }
+
+    func authorityConflictInAncestry(of _: UUID) -> Bool {
+        false
+    }
+
+    func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
+        usage(of: scope, spawnParentSessionID: spawnParentSessionID)
+    }
+
+    func withSynchronousTargets<Result>(_: Set<UUID>, _ body: (any DelegationMembershipProjector) -> Result) -> Result {
+        body(self)
+    }
+
     func withSynchronousCensus<Result>(_ body: (any DelegationMembershipProjector) -> Result) -> Result {
         body(self)
     }
@@ -148,54 +195,152 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         return body(projector)
     }
 
+    func withSynchronousTargets<Result>(_ targets: Set<UUID>, _ body: (any DelegationMembershipProjector) -> Result) -> Result {
+        let points = TargetSource(source: source, targets: targets)
+        var projector = Self(source: points, onAncestryLookup: onAncestryLookup)
+        projector.ownedUnreleasedWorktreeIDs = ownedUnreleasedWorktreeIDs
+        return body(projector)
+    }
+
+    /// Memoized only for this synchronous call. A later call must reread ownership and liveness.
+    private final class TargetSource: DelegationProvenanceSource {
+        let source: any DelegationProvenanceSource
+        let targets: Set<UUID>
+        let snapshot: DelegationProvenanceSnapshot
+        var placements: [UUID: DelegationSessionPlacement] = [:]
+        var readPlacements: Set<UUID> = []
+
+        init(source: any DelegationProvenanceSource, targets: Set<UUID>) {
+            self.source = source
+            self.targets = targets
+            snapshot = source.pointSnapshot(for: targets)
+        }
+
+        func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
+            targets.contains(sessionID) ? snapshot.authorityRecord(for: sessionID) : source.provenance(for: sessionID)
+        }
+
+        func placement(for sessionID: UUID) -> DelegationSessionPlacement? {
+            if readPlacements.insert(sessionID).inserted {
+                placements[sessionID] = targets.contains(sessionID)
+                    ? snapshot.authorityRecord(for: sessionID)?.placement : source.placement(for: sessionID)
+            }
+            return placements[sessionID]
+        }
+
+        func allKnownSessions() -> [DelegationSessionProvenance] {
+            source.allKnownSessions()
+        }
+
+        func pointSnapshot(for ids: Set<UUID>) -> DelegationProvenanceSnapshot {
+            if ids.isSubset(of: targets) { return snapshot.restricted(to: ids) }
+            return source.pointSnapshot(for: ids)
+        }
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            source.censusSnapshot()
+        }
+
+        func resolutionState(for id: UUID) -> DelegationSessionResolutionState {
+            targets.contains(id) ? snapshot.states[id] ?? .absent : source.resolutionState(for: id)
+        }
+    }
+
     private struct CensusSource: DelegationProvenanceSource {
+        let snapshot: DelegationProvenanceSnapshot
         let records: [DelegationSessionProvenance]
         let byID: [UUID: DelegationSessionProvenance]
         let ancestry: DomainAgentSessionAncestryIndex
 
-        init(records: [DelegationSessionProvenance]) {
-            self.records = records
-            byID = Dictionary(records.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+        init(snapshot: DelegationProvenanceSnapshot) {
+            self.snapshot = snapshot
+            records = Array(snapshot.records.values)
+            byID = snapshot.records
             ancestry = DomainAgentSessionAncestryIndex(parents: byID.compactMapValues(\.effectiveOrganizationalParentID))
         }
 
         func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
-            byID[sessionID]
+            snapshot.authorityRecord(for: sessionID)
         }
 
         func allKnownSessions() -> [DelegationSessionProvenance] {
             records
+        }
+
+        func pointSnapshot(for ids: Set<UUID>) -> DelegationProvenanceSnapshot {
+            snapshot.restricted(to: ids)
+        }
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            snapshot
+        }
+
+        func resolutionState(for id: UUID) -> DelegationSessionResolutionState {
+            snapshot.states[id] ?? .absent
         }
     }
 
     /// Target-first organizational ancestry over this source. A session with no loaded provenance is
     /// `.unknown` (the chain is truncated there), never mistaken for a root.
     func organizationalAncestry(of sessionID: UUID) -> DomainDelegationOrganizationalAncestry? {
-        DomainDelegationOrganizationalChain.ancestry(of: sessionID) { id in
+        var conflict = false
+        let result = DomainDelegationOrganizationalChain.ancestry(of: sessionID) { id in
+            let state = pointResolutionState(for: id)
+            if state == .ambiguous || state == .unproven { conflict = true
+                return .unknown
+            }
             guard let provenance = source.placement(for: id) else { return .unknown }
             return provenance.effectiveOrganizationalParentID.map { .parent($0) } ?? .root
         }
+        return conflict ? nil : result
     }
 
     func knownProvenance(for sessionID: UUID) -> DelegationSessionProvenance? {
         source.provenance(for: sessionID)
     }
 
+    func pointResolutionState(for sessionID: UUID) -> DelegationSessionResolutionState {
+        source.resolutionState(for: sessionID)
+    }
+
+    func authorityConflictInAncestry(of sessionID: UUID) -> Bool {
+        var cursor: UUID? = sessionID
+        var seen: Set<UUID> = []
+        while let id = cursor, seen.count < Self.maxChainLength, seen.insert(id).inserted {
+            let state = pointResolutionState(for: id)
+            if state == .ambiguous || state == .unproven { return true }
+            cursor = source.placement(for: id)?.effectiveOrganizationalParentID
+        }
+        return false
+    }
+
+    func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
+        let census = census()
+        guard census.snapshot.hasCompletePlacement(for: scope) else { return nil }
+        return Self(source: census, ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs, onAncestryLookup: onAncestryLookup)
+            .usage(of: scope, spawnParentSessionID: spawnParentSessionID)
+    }
+
     func organizationalSubtree(of sessionID: UUID) -> [DomainDelegationSubtreeNode]? {
+        let snapshot = source.censusSnapshot()
+        guard snapshot.placementConflicts.isEmpty else { return nil }
         var children: [UUID: [UUID]] = [:]
-        for session in source.allKnownSessions() {
+        for session in snapshot.records.values {
             if let parent = session.effectiveOrganizationalParentID {
                 children[parent, default: []].append(session.sessionID)
             }
         }
-        return DomainDelegationOrganizationalChain.subtree(of: sessionID) { children[$0] ?? [] }
+        guard let result = DomainDelegationOrganizationalChain.subtree(of: sessionID, children: { children[$0] ?? [] }),
+              result.allSatisfy({ snapshot.states[$0.sessionID] != .ambiguous && snapshot.states[$0.sessionID] != .unproven }) else { return nil }
+        return result
     }
 
     func membershipProof(
         for targetSessionID: UUID,
         in scope: DomainDelegationScopeGrant
     ) -> DomainDelegationScopeMembershipProof? {
-        guard let target = source.placement(for: targetSessionID) else { return nil }
+        guard pointResolutionState(for: targetSessionID) != .ambiguous,
+              let target = source.placement(for: targetSessionID) else { return nil }
         return membershipProof(for: target, in: scope, lookup: { source.placement(for: $0) })
     }
 
@@ -215,7 +360,9 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         let targetSessionID = target.sessionID
         switch scope.kind {
         case let .tree(rootSessionID):
-            guard let path = treePath(from: target, to: rootSessionID, lookup: lookup) else { return nil }
+            let rootState = pointResolutionState(for: rootSessionID)
+            guard rootState != .ambiguous, rootState != .unproven,
+                  let path = treePath(from: target, to: rootSessionID, lookup: lookup) else { return nil }
             return DomainDelegationScopeMembershipProof(
                 scopeID: scope.id,
                 targetSessionID: targetSessionID,
@@ -242,7 +389,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     }
 
     private func census() -> CensusSource {
-        (source as? CensusSource) ?? CensusSource(records: source.allKnownSessions())
+        (source as? CensusSource) ?? CensusSource(snapshot: source.censusSnapshot())
     }
 
     private func contains(_ record: DelegationSessionProvenance, in scope: DomainDelegationScopeGrant, census: CensusSource) -> Bool {
@@ -300,124 +447,14 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
                   let parentID = cursor.effectiveOrganizationalParentID,
                   seen.insert(parentID).inserted
             else { return nil }
+            let parentState = pointResolutionState(for: parentID)
+            guard parentState != .ambiguous, parentState != .unproven else { return nil }
             path.append(parentID)
             if parentID == rootSessionID { break }
             guard let parent = lookup(parentID) else { return nil }
             cursor = parent
         }
         return path
-    }
-}
-
-/// Production provenance over every open window's loaded workspace session index.
-///
-/// Mutations target loaded workspaces only (design §3.1), so unloaded workspaces contribute no
-/// members here; history-wide inventory is Lane B's concern.
-@MainActor
-struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
-    private let windows: @MainActor () -> [WindowState]
-
-    init(windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows }) {
-        self.windows = windows
-    }
-
-    func placement(for sessionID: UUID) -> DelegationSessionPlacement? {
-        // Identical first owning index and fresh owner fence to the full provenance read, without
-        // resolving liveness. This value is used only synchronously, never retained across an await.
-        for window in windows() {
-            let store = window.agentModeViewModel.sessionIndexStore
-            guard let entry = store.ownerValidatedSessionIndex[sessionID] else { continue }
-            return .init(
-                sessionID: entry.id,
-                workspaceID: store.sessionIndexOwner?.workspaceID,
-                effectiveOrganizationalParentID: entry.organizationalParentID ?? entry.parentSessionID ?? entry.createdByOverseerSessionID
-            )
-        }
-        return nil
-    }
-
-    func provenance(for sessionID: UUID) -> DelegationSessionProvenance? {
-        // The entry's workspace is the workspace that owns the index it came from, never the
-        // window's currently active workspace; only owner-validated (current) indexes are read.
-        let windows = windows()
-        for window in windows {
-            let store = window.agentModeViewModel.sessionIndexStore
-            guard let entry = store.ownerValidatedSessionIndex[sessionID] else { continue }
-            return Self.provenance(
-                entry: entry, workspaceID: store.sessionIndexOwner?.workspaceID,
-                liveness: Self.liveness(of: sessionID, windows: windows)
-            )
-        }
-        return nil
-    }
-
-    func allKnownSessions() -> [DelegationSessionProvenance] {
-        var seen: Set<UUID> = []
-        var entries: [(AgentSessionIndexEntry, UUID?)] = []
-        let windows = windows()
-        for window in windows {
-            let store = window.agentModeViewModel.sessionIndexStore
-            let workspaceID = store.sessionIndexOwner?.workspaceID
-            for entry in store.ownerValidatedSessionIndex.values where seen.insert(entry.id).inserted {
-                entries.append((entry, workspaceID))
-            }
-        }
-        let sessionIDs = Set(entries.map(\.0.id))
-        let statesByWindow = windows.map { $0.agentModeViewModel.authoritativeLiveSessionStates(for: sessionIDs) }
-        return entries.map { entry, workspaceID in
-            Self.provenance(
-                entry: entry, workspaceID: workspaceID,
-                liveness: Self.liveness(states: statesByWindow.compactMap { $0[entry.id] })
-            )
-        }
-    }
-
-    private static func provenance(
-        entry: AgentSessionIndexEntry,
-        workspaceID: UUID?,
-        liveness: (isLive: Bool, runState: DomainDelegationScopeTargetState)
-    ) -> DelegationSessionProvenance {
-        let (isLive, runState) = liveness
-        return DelegationSessionProvenance(
-            sessionID: entry.id,
-            workspaceID: workspaceID,
-            parentSessionID: entry.parentSessionID,
-            createdByOverseerSessionID: entry.createdByOverseerSessionID,
-            organizationalParentID: entry.organizationalParentID,
-            delegationScopeID: entry.delegationScopeID,
-            isLive: isLive,
-            worktreeCount: entry.worktreeBindingSummaries.count,
-            boundWorktreeIDs: Set(entry.worktreeBindingSummaries.map(\.worktreeID)),
-            runState: runState
-        )
-    }
-
-    /// Aggregated across every window, because one session can be live in more than one. Both facts
-    /// fail closed: running if any window runs it; otherwise unknown (treated as running) if any
-    /// lookup throws; a lookup failure also counts as live, so `maxLiveSessions` only gets stricter.
-    private static func liveness(of sessionID: UUID, windows: [WindowState]) -> (isLive: Bool, runState: DomainDelegationScopeTargetState) {
-        liveness(states: windows.flatMap { $0.agentModeViewModel.authoritativeLiveSessionStates(for: [sessionID]).values })
-    }
-
-    private static func liveness(states: [AgentModeViewModel.AuthoritativeLiveSessionState]) -> (isLive: Bool, runState: DomainDelegationScopeTargetState) {
-        var isLive = false
-        var running = false
-        var unknown = false
-        for state in states {
-            switch state {
-            case .running:
-                isLive = true
-                running = true
-            case .idle:
-                isLive = true
-            case .notFound:
-                break
-            case .ambiguous:
-                isLive = true
-                unknown = true
-            }
-        }
-        return (isLive, running ? .running : unknown ? .unknown : .idle)
     }
 }
 

@@ -186,7 +186,11 @@ enum AgentSessionAdminRendering {
         extra: [String: Value] = [:]
     ) -> Value {
         var object = extra
-        object["result"] = .string("applied")
+        object["result"] = .string(mutationResult(
+            statuses: items.map(\.status),
+            requiresControl: !itemsRequiringControl.isEmpty,
+            committedChanges: extra[committedChangesKey] == .bool(true)
+        ))
         object["op"] = .string(operation.adminOperationName)
         object["items"] = .array(items.map(\.value))
         object["changed_count"] = .int(items.count(where: { $0.status == .changed }))
@@ -194,6 +198,42 @@ enum AgentSessionAdminRendering {
             object["requires_control"] = .array(itemsRequiringControl.map { .string($0.uuidString) })
         }
         return .object(object)
+    }
+
+    /// Recompute only the organizing/release receipt family after the front door appends targets.
+    /// Structural replies have their own item/effect semantics and are not interpreted here.
+    static func refreshingOrganizingResult(_ object: [String: Value]) -> [String: Value] {
+        let operations: Set = [
+            "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups",
+            "archive", "unarchive", "release", "retire"
+        ]
+        guard let operation = object["op"]?.stringValue, operations.contains(operation),
+              let items = object["items"]?.arrayValue else { return object }
+        let statuses = items.compactMap { item -> AgentSessionAdminItemResult.Status? in
+            guard let status = item.objectValue?["status"]?.stringValue else { return nil }
+            return AgentSessionAdminItemResult.Status(rawValue: status)
+        }
+        guard statuses.count == items.count else { return object }
+        var result = object
+        result["result"] = .string(mutationResult(
+            statuses: statuses,
+            requiresControl: !(object["requires_control"]?.arrayValue ?? []).isEmpty,
+            committedChanges: object[committedChangesKey] == .bool(true)
+        ))
+        result["changed_count"] = .int(statuses.count(where: { $0 == .changed }))
+        return result
+    }
+
+    private static func mutationResult(
+        statuses: [AgentSessionAdminItemResult.Status], requiresControl: Bool, committedChanges: Bool
+    ) -> String {
+        let effects = committedChanges || statuses.contains(.changed)
+        let failed = statuses.contains(.failed)
+        let incomplete = failed || statuses.contains(.skipped) || requiresControl
+        if effects { return incomplete ? "partial" : "applied" }
+        if failed { return "failed" }
+        if incomplete || statuses.isEmpty { return "not_applied" }
+        return "unchanged"
     }
 }
 
@@ -328,6 +368,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         try Task.checkCancellation()
         var records: [DomainAgentSessionInventoryRecord] = []
         var isComplete = false
+        var recordsComplete = false
         var historyByID: [UUID: (AgentSessionMetadataRecord, String)] = [:]
         if let targets = read.historyTargetIDs {
             var pending = Array(targets)
@@ -359,6 +400,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 records.append(DomainAgentSessionInventoryRecord(
                     sessionID: id, name: record.name, workspaceID: metadata.workspaceID,
                     workspaceName: location.workspaceName, isLoaded: false,
+                    organizationStateIsKnown: false,
                     runState: .classify(rawValue: record.lastRunStateRaw),
                     parentSessionID: record.parentSessionID,
                     createdByOverseerSessionID: record.createdByOverseerSessionID,
@@ -377,7 +419,8 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 )
                 try Task.checkCancellation()
                 // A workspace-local scan cannot prove that an endpoint in another workspace is gone.
-                isComplete = read.workspaceID == nil && Self.isComplete(scan)
+                recordsComplete = Self.isComplete(scan)
+                isComplete = read.workspaceID == nil && recordsComplete
                 var projected = 0
                 for workspace in scan.workspaces {
                     for record in workspace.records {
@@ -420,7 +463,8 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         try Task.checkCancellation()
         let snapshot = DomainAgentSessionInventorySnapshot(
             records: records, edges: edges,
-            isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil
+            isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil,
+            recordsComplete: recordsComplete && loaded.isComplete
         )
         try Task.checkCancellation()
         // The immutable snapshot's dictionary/edge indexing is synchronous. Never hand back a
@@ -484,6 +528,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             workspaceID: record.workspaceID ?? workspace.workspaceID,
             workspaceName: workspace.workspaceName,
             isLoaded: false,
+            organizationStateIsKnown: false,
             runState: .classify(rawValue: record.lastRunStateRaw),
             parentSessionID: record.parentSessionID,
             createdByOverseerSessionID: record.createdByOverseerSessionID,
@@ -512,111 +557,156 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         tab.activeAgentSessionID == sessionID || (tab.activeAgentSessionID == nil && tab.id == indexTabID)
     }
 
+    private enum LoadedRuntimeObservation {
+        case live(DomainAgentSessionInventoryRunState)
+        case fallback(DomainAgentSessionInventoryRunState)
+        case bindingConflict
+    }
+
+    /// Keep evidence rather than just the chosen value: a fallback between two disagreeing live
+    /// observations must not hide the conflict. Fallback disagreement matters only without live
+    /// evidence, so resolution happens after every window has contributed, independent of order.
+    private struct LoadedRuntimeEvidence {
+        var liveStates: Set<DomainAgentSessionInventoryRunState> = []
+        var fallbackStates: Set<DomainAgentSessionInventoryRunState> = []
+        var hasBindingConflict = false
+
+        mutating func observe(_ observation: LoadedRuntimeObservation) {
+            switch observation {
+            case let .live(state): liveStates.insert(state)
+            case let .fallback(state): fallbackStates.insert(state)
+            case .bindingConflict: hasBindingConflict = true
+            }
+        }
+
+        func resolved() throws -> DomainAgentSessionInventoryRunState {
+            guard !hasBindingConflict, liveStates.count <= 1 else {
+                throw AgentSessionInventoryReadFailure.incomplete
+            }
+            if let live = liveStates.first { return live }
+            guard fallbackStates.count == 1, let fallback = fallbackStates.first else {
+                throw AgentSessionInventoryReadFailure.incomplete
+            }
+            return fallback
+        }
+    }
+
+    private struct LoadedCarrierProjection {
+        /// Physical uniqueness is established by the shared carrier capture. Runtime is compared
+        /// separately here; every other rendered fact must still agree across window replicas.
+        let record: DomainAgentSessionInventoryRecord
+        var runtime = LoadedRuntimeEvidence()
+
+        mutating func merge(
+            record: DomainAgentSessionInventoryRecord, observation: LoadedRuntimeObservation
+        ) throws {
+            guard self.record == record else { throw AgentSessionInventoryReadFailure.incomplete }
+            runtime.observe(observation)
+        }
+
+        func resolvedRecord() throws -> DomainAgentSessionInventoryRecord {
+            try DomainAgentSessionInventoryRecord(
+                sessionID: record.sessionID, name: record.name,
+                workspaceID: record.workspaceID, workspaceName: record.workspaceName,
+                isLoaded: record.isLoaded, organizationStateIsKnown: record.organizationStateIsKnown,
+                isArchived: record.isArchived, isPinned: record.isPinned,
+                pinnedOrder: record.pinnedOrder, sidebarGroup: record.sidebarGroup,
+                sidebarGroupOrder: record.sidebarGroupOrder,
+                runState: runtime.resolved(),
+                parentSessionID: record.parentSessionID,
+                createdByOverseerSessionID: record.createdByOverseerSessionID,
+                organizationalParentID: record.organizationalParentID,
+                createdAt: record.createdAt, lastActivityAt: record.lastActivityAt,
+                worktreeCount: record.worktreeCount
+            )
+        }
+    }
+
     private func loadedRecords(
         historyByID: [UUID: (AgentSessionMetadataRecord, String)],
         read: AgentSessionInventoryRead
     ) async throws -> (records: [DomainAgentSessionInventoryRecord], isComplete: Bool) {
-        var result: [DomainAgentSessionInventoryRecord] = []
-        for window in windows() where !window.isClosing {
-            try Task.checkCancellation()
-            guard let workspace = window.workspaceManager.activeWorkspace,
-                  read.workspaceID == nil || workspace.id == read.workspaceID else { continue }
-            let viewModel = window.agentModeViewModel
-            let store = viewModel.sessionIndexStore
-            let owner = store.sessionIndexOwner
-            let latestOwner = store.latestSessionIndexOwner
-            let validOwner = owner.map { $0.workspaceID == workspace.id && store.isOwnerCurrent($0) } ?? false
-            let entries = validOwner ? store.ownerValidatedSessionIndex : [:]
-            func checkWindowOwner() throws {
-                guard !window.isClosing, window.workspaceManager.activeWorkspace?.id == workspace.id,
-                      store.sessionIndexOwner == owner, store.latestSessionIndexOwner == latestOwner
-                else {
-                    throw AgentSessionInventoryReadFailure.incomplete
-                }
-            }
-            try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
-            try checkWindowOwner()
-            let sessionIDByTabID = Dictionary(
-                entries.values.map { ($0.tabID, $0.id) },
-                uniquingKeysWith: { first, _ in first }
-            )
-            var rows: [(UUID, ComposeTabState, Bool)] = []
-            if let ids = read.sessionIDs {
-                // Exact authorized reads must not materialize the whole sidebar or hydrate history.
-                for id in ids {
-                    try Task.checkCancellation()
-                    let tabID = entries[id]?.tabID
-                    if let tab = workspace.composeTabs.first(where: { Self.exactTabMatches($0, sessionID: id, indexTabID: tabID) }) {
-                        rows.append((id, tab, false))
-                    } else if let stashed = workspace.stashedTabs.first(where: { Self.exactTabMatches($0.tab, sessionID: id, indexTabID: tabID) }) {
-                        rows.append((id, stashed.tab, true))
-                    }
-                }
-            } else {
-                // Inventory is a census of physical carriers, not a cached UI/sidebar rendering.
-                // Explicit bindings win; nil bindings may use only this owner-validated index.
-                for tab in workspace.composeTabs {
-                    let sessionID = tab.activeAgentSessionID ?? sessionIDByTabID[tab.id]
-                    if let sessionID { rows.append((sessionID, tab, false)) }
-                }
-                for stashed in workspace.stashedTabs {
-                    let sessionID = stashed.tab.activeAgentSessionID ?? sessionIDByTabID[stashed.tab.id]
-                    if let sessionID { rows.append((sessionID, stashed.tab, true)) }
-                }
-            }
-            try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
-            try checkWindowOwner()
-            let bindingStates = viewModel.authoritativeLiveSessionStates(for: Set(rows.filter { !$0.2 }.map(\.0)))
-            var liveStates: [UUID: DomainAgentSessionInventoryRunState] = [:]
-            // Capture raw states synchronously alongside the one binding census, preserving waiting,
-            // failed and completed classifications. This value-only projection is not an authority
-            // proof; the handler still validates current leases after the complete awaited read.
-            for (id, tab, archived) in rows where !archived {
-                switch bindingStates[id] {
-                case .idle?, .running?:
-                    guard let session = viewModel.sessions[tab.id], session.activeAgentSessionID == id else {
-                        liveStates[id] = .unknown
-                        continue
-                    }
-                    liveStates[id] = .classify(rawValue: session.runState.rawValue)
-                case .ambiguous?: liveStates[id] = .unknown
-                case .notFound?, nil: break
-                }
-            }
-            for (sessionID, tab, isArchived) in rows {
-                try await Self.projectionCheckpoint(projected: result.count, budget: read.budget)
-                try checkWindowOwner()
-                let entry = entries[sessionID]
-                let candidateHistory = historyByID[sessionID]?.0
-                let history = validOwner && candidateHistory?.workspaceID == workspace.id ? candidateHistory : nil
-                let liveState = isArchived ? nil : liveStates[sessionID]
-                let lastActivity = entry.map {
-                    AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: $0.lastUserMessageAt, savedAt: $0.savedAt)
-                } ?? history?.activityDate ?? tab.lastModified
-                result.append(DomainAgentSessionInventoryRecord(
-                    sessionID: sessionID,
-                    name: tab.name,
-                    workspaceID: workspace.id,
-                    workspaceName: workspace.name,
-                    isLoaded: true,
-                    isArchived: isArchived,
-                    isPinned: tab.isPinned,
-                    pinnedOrder: tab.pinnedOrder,
-                    sidebarGroup: tab.sidebarGroup,
-                    sidebarGroupOrder: tab.sidebarGroupOrder,
-                    runState: liveState ?? .classify(rawValue: entry?.lastRunStateRaw ?? history?.lastRunStateRaw),
-                    // Current loaded placement is not reconstructed from an older history row.
-                    // An absent/stale owner leaves ancestry unknown, never invented tree membership.
-                    parentSessionID: entry?.parentSessionID,
-                    createdByOverseerSessionID: entry?.createdByOverseerSessionID,
-                    organizationalParentID: entry?.organizationalParentID,
-                    createdAt: history?.firstActivityAt,
-                    lastActivityAt: lastActivity,
-                    worktreeCount: entry?.worktreeBindingSummaries.count ?? history?.worktreeBindingSummaries.count ?? 0
-                ))
+        try Task.checkCancellation()
+        let capture = AgentSessionCarrierResolver.capture(windows: windows(), sessionIDs: read.sessionIDs)
+        let rows = capture.rows.filter { read.workspaceID == nil || $0.workspaceID == read.workspaceID }
+        var affectedIDs = read.sessionIDs ?? Set(rows.map(\.sessionID))
+        if read.sessionIDs == nil {
+            for id in capture.ambiguousSessionIDs {
+                if let workspaceID = read.workspaceID, !capture.affectedWorkspaceIDs(for: id).contains(workspaceID) { continue }
+                affectedIDs.insert(id)
             }
         }
-        return (result, true)
+        guard capture.ambiguousSessionIDs.isDisjoint(with: affectedIDs) else {
+            throw AgentSessionInventoryReadFailure.incomplete
+        }
+        let rowsByWindow = Dictionary(grouping: rows) { ObjectIdentifier($0.window) }
+        var bindingStates: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
+        for (windowID, windowRows) in rowsByWindow {
+            guard let window = windowRows.first?.window else { continue }
+            bindingStates[windowID] = window.agentModeViewModel.authoritativeLiveSessionStates(
+                for: Set(windowRows.filter { $0.stashedTabID == nil }.map(\.sessionID))
+            )
+        }
+        // Capture runtime beside the synchronous physical/binding capture. A replacement live
+        // object after a yield must never inherit the earlier object's binding proof.
+        let observations: [LoadedRuntimeObservation] = rows.map { row in
+            let candidateHistory = historyByID[row.sessionID]?.0
+            let history = row.hasCurrentMetadataOwner && candidateHistory?.workspaceID == row.workspaceID ? candidateHistory : nil
+            let fallback = DomainAgentSessionInventoryRunState.classify(rawValue: row.entry?.lastRunStateRaw ?? history?.lastRunStateRaw)
+            if row.stashedTabID != nil { return .fallback(fallback) }
+            let state = bindingStates[ObjectIdentifier(row.window)]?[row.sessionID]
+            if state == .ambiguous { return .bindingConflict }
+            if state == .idle || state == .running {
+                guard let session = row.window.agentModeViewModel.sessions[row.tab.id], session.activeAgentSessionID == row.sessionID else {
+                    return .fallback(.unknown)
+                }
+                return .live(.classify(rawValue: session.runState.rawValue))
+            }
+            return .fallback(fallback)
+        }
+        var projections: [UUID: LoadedCarrierProjection] = [:]
+        var projected = 0
+        for (row, observation) in zip(rows, observations) {
+            try await Self.projectionCheckpoint(projected: projected, budget: read.budget)
+            guard capture.isCurrent() else { throw AgentSessionInventoryReadFailure.incomplete }
+            projected += 1
+            let sessionID = row.sessionID
+            let tab = row.tab
+            let entry = row.entry
+            let candidateHistory = historyByID[sessionID]?.0
+            let history = row.hasCurrentMetadataOwner && candidateHistory?.workspaceID == row.workspaceID ? candidateHistory : nil
+            let lastActivity = entry.map {
+                AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: $0.lastUserMessageAt, savedAt: $0.savedAt)
+            } ?? history?.activityDate ?? tab.lastModified
+            let record = DomainAgentSessionInventoryRecord(
+                sessionID: sessionID,
+                name: tab.name,
+                workspaceID: row.workspaceID,
+                workspaceName: row.workspaceName,
+                isLoaded: true,
+                isArchived: row.stashedTabID != nil,
+                isPinned: tab.isPinned,
+                pinnedOrder: tab.pinnedOrder,
+                sidebarGroup: tab.sidebarGroup,
+                sidebarGroupOrder: tab.sidebarGroupOrder,
+                runState: .unknown,
+                parentSessionID: entry?.parentSessionID,
+                createdByOverseerSessionID: entry?.createdByOverseerSessionID,
+                organizationalParentID: entry?.organizationalParentID,
+                createdAt: history?.firstActivityAt,
+                lastActivityAt: lastActivity,
+                worktreeCount: entry?.worktreeBindingSummaries.count ?? history?.worktreeBindingSummaries.count ?? 0
+            )
+            if var existing = projections[sessionID] {
+                try existing.merge(record: record, observation: observation)
+                projections[sessionID] = existing
+            } else {
+                var projection = LoadedCarrierProjection(record: record)
+                projection.runtime.observe(observation)
+                projections[sessionID] = projection
+            }
+        }
+        return try (projections.values.map { try $0.resolvedRecord() }, true)
     }
 }
 
@@ -635,8 +725,7 @@ enum AgentSessionInventoryRendering {
             "session_id": .string(record.sessionID.uuidString),
             "name": .string(record.name),
             "loaded": .bool(record.isLoaded),
-            "archived": .bool(record.isArchived),
-            "pinned": .bool(record.isPinned),
+            "organization_complete": .bool(record.organizationStateIsKnown),
             "state": .string(record.runState.rawValue),
             "last_activity_at": .string(AgentSessionAdminRendering.iso(record.lastActivityAt)),
             "idle_days": .int(snapshot.idleDays(record.sessionID, now: now) ?? 0),
@@ -648,11 +737,15 @@ enum AgentSessionInventoryRendering {
             ),
             "link_count": .int(snapshot.edges(touching: record.sessionID).count)
         ]
+        if record.organizationStateIsKnown {
+            object["archived"] = .bool(record.isArchived)
+            object["pinned"] = .bool(record.isPinned)
+            if let order = record.pinnedOrder { object["pinned_order"] = .int(order) }
+            if let group = record.sidebarGroup { object["group"] = .string(group) }
+            if let order = record.sidebarGroupOrder { object["group_order"] = .int(order) }
+        }
         if let workspaceID = record.workspaceID { object["workspace_id"] = .string(workspaceID.uuidString) }
         if let workspaceName = record.workspaceName { object["workspace_name"] = .string(workspaceName) }
-        if let order = record.pinnedOrder { object["pinned_order"] = .int(order) }
-        if let group = record.sidebarGroup { object["group"] = .string(group) }
-        if let order = record.sidebarGroupOrder { object["group_order"] = .int(order) }
         // Provenance pointing outside the scope is redacted; orphan reasons cover deleted ones.
         if let parent = record.parentSessionID, snapshot.records[parent] != nil {
             object["parent_session_id"] = .string(parent.uuidString)
@@ -667,7 +760,13 @@ enum AgentSessionInventoryRendering {
             object["orphan_reasons"] = .array(orphanReasons.map { .string($0.rawValue) })
         }
         object["links_complete"] = .bool(snapshot.isComplete)
-        object["orphan_status_complete"] = .bool(snapshot.isComplete)
+        let orphanComplete = snapshot.orphanStatusIsComplete(for: record.sessionID)
+        object["orphan_status_complete"] = .bool(orphanComplete)
+        if !orphanComplete {
+            if !orphanReasons.isEmpty { object["known_orphan_reasons"] = .array(orphanReasons.map { .string($0.rawValue) }) }
+            object.removeValue(forKey: "orphaned")
+            object.removeValue(forKey: "orphan_reasons")
+        }
         if !snapshot.isComplete {
             // Partial endpoints can prove positive observations, never zero links/no role/not
             // orphaned. Name lower bounds explicitly so callers cannot treat missing census as fact.
@@ -698,7 +797,9 @@ enum AgentSessionInventoryRendering {
                 object[role] = .string("missing")
             }
         }
-        if snapshot.records[edge.observerSessionID]?.isArchived == true { object["observer_archived"] = .bool(true) }
+        if let observer = snapshot.records[edge.observerSessionID], observer.organizationStateIsKnown, observer.isArchived {
+            object["observer_archived"] = .bool(true)
+        }
         return .object(object)
     }
 
@@ -707,10 +808,11 @@ enum AgentSessionInventoryRendering {
         guard let query else { return true }
         let parsed = AgentSessionSearchQuery.parse(query)
         guard !parsed.isEmpty else { return true }
+        guard record.organizationStateIsKnown || !parsed.hasFacets else { return false }
         let fields = AgentSessionSearchFields(
             title: record.name,
-            status: [record.runState.rawValue, record.isArchived ? "archived" : nil],
-            secondary: [record.workspaceName, record.sidebarGroup],
+            status: [record.runState.rawValue, record.organizationStateIsKnown && record.isArchived ? "archived" : nil],
+            secondary: [record.workspaceName, record.organizationStateIsKnown ? record.sidebarGroup : nil],
             identifier: [record.sessionID.uuidString]
         ).withFacets(isPinned: record.isPinned, group: record.sidebarGroup)
         return AgentSessionSearchMatcher.matches(query: parsed, fields: fields)

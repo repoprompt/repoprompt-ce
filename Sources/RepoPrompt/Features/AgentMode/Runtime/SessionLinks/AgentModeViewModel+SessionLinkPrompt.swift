@@ -351,9 +351,7 @@ extension AgentModeViewModel {
         guard session.selectedAgent == .codexExec,
               AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection),
               session.codexController != nil,
-              // Disablement is a reason not to repair, never a reason to reconnect: the returned
-              // catalog is then truthfully absent and the user asked for that.
-              ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink)
+              agentSessionLinkCatalogRepairIsEnabled(for: session)
         else {
             return
         }
@@ -368,6 +366,21 @@ extension AgentModeViewModel {
             ))
         }
         codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
+    }
+
+    /// Shared by opening and spending a repair cycle, so a later tool disablement is
+    /// rechecked. Scope-only administration discovery remains independent of oversight.
+    func agentSessionLinkCatalogRepairIsEnabled(for session: TabSession) -> Bool {
+        let availability = ToolAvailabilityStore.shared
+        if availability.isEnabled(MCPWindowToolName.agentSessionLink) { return true }
+        guard availability.isEnabled(MCPWindowToolName.sessionAdmin),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let projection = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+              projection.runID == session.runID else { return false }
+        return AgentSessionLinkCatalogSurface.differs(
+            toolName: MCPWindowToolName.sessionAdmin,
+            expected: projection.expectedSurface, returned: projection.returnedSurface
+        )
     }
 
     /// Stores one exact incarnation's passive status-notice queue.

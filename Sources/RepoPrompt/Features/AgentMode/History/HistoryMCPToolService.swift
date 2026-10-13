@@ -552,7 +552,8 @@ enum HistoryMCPToolService {
                 transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -883,7 +884,8 @@ enum HistoryMCPToolService {
                         for: session.record,
                         sessionID: session.record.id,
                         workspaceDir: session.workspaceDir,
-                        requestBudget: requestBudget
+                        requestBudget: requestBudget,
+                        workspaceLocation: session.registeredLocation
                     )
                 } catch is CancellationError {
                     throw CancellationError()
@@ -917,13 +919,15 @@ enum HistoryMCPToolService {
                 let transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
                 enriched.append(
                     HistoryFilteredSessionRecord(
                         record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
                         workspaceName: session.workspaceName,
-                        workspaceDir: session.workspaceDir
+                        workspaceDir: session.workspaceDir,
+                        registeredLocation: session.registeredLocation
                     )
                 )
                 sessionsScanned += 1
@@ -1118,7 +1122,8 @@ enum HistoryMCPToolService {
                 transcript = try await scanner.loadTranscriptForSearch(
                     sessionID: session.record.id,
                     workspaceDir: session.workspaceDir,
-                    requestBudget: requestBudget
+                    requestBudget: requestBudget,
+                    workspaceLocation: session.registeredLocation
                 )
             } catch is CancellationError {
                 throw CancellationError()

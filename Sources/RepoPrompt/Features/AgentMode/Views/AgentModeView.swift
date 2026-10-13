@@ -1875,6 +1875,9 @@ struct AgentModeChatDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let currentTabID, let session = agentModeVM.sessions[currentTabID] {
+                AgentSessionRestorationRecoveryView(session: session, viewModel: agentModeVM)
+            }
             // Main content area with floating input bar
             ZStack(alignment: .bottom) {
                 // Background layer: scroll view + fixed spacer for the base bar
@@ -6048,5 +6051,56 @@ private struct AgentRunningElapsedText: View {
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         return "\(minutes)m \(String(format: "%02d", seconds))s"
+    }
+}
+
+/// A failed restore must remain visible and recoverable without overwriting its original identity.
+private struct AgentSessionRestorationRecoveryView: View {
+    @ObservedObject var session: AgentTabSession
+    let viewModel: AgentModeViewModel
+
+    var body: some View {
+        if let failure = session.qualifiedRestorationReadiness.terminalFailure {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(
+                    failure == .missingPayload
+                        ? "This session's saved conversation is unavailable. Its identity has been preserved."
+                        : "This session could not be restored. Its saved data has not been replaced."
+                )
+                .font(.callout)
+                Spacer(minLength: 8)
+                Button("Retry Loading") {
+                    let expectedSession = session
+                    Task { await viewModel.retrySessionRestoration(tabID: expectedSession.tabID, expectedSession: expectedSession) }
+                }
+                Button("New Session") {
+                    Task { await viewModel.createAndActivateSessionTab() }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        } else if let creation = session.creationState {
+            HStack(spacing: 12) {
+                switch creation.phase {
+                case .preparing:
+                    Text("This new session is being prepared.").font(.callout)
+                case .readyToPersist:
+                    Text("This prepared session has not been saved yet.").font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Retry Saving") {
+                        guard let handle = viewModel.captureSessionCreationRetry(for: session) else { return }
+                        Task { await viewModel.retrySessionInitialSave(handle) }
+                    }
+                case let .failedBeforeConfiguration(message):
+                    Text(message).font(.callout)
+                    Spacer(minLength: 8)
+                    Button("New Session") {
+                        Task { await viewModel.createAndActivateSessionTab() }
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.1))
+        }
     }
 }

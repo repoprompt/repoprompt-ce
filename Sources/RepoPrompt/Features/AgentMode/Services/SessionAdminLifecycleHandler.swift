@@ -20,7 +20,9 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         let sourceSessionID: UUID
         let upToItemID: UUID?
         let forkedSessionID: UUID
-        let joinedScope: Bool
+        var joinedScope: Bool
+        var failureCode: String?
+        var failureDetail: String?
     }
 
     private let context: SessionAdminHandlerContext
@@ -132,7 +134,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
                     "detail": .string("This idempotency_key is bound to a different fork; use a new key.")
                 ])
             }
-            return Self.forkValue(source: source, forked: receipt.forkedSessionID, replayed: true, joinedScope: receipt.joinedScope)
+            return Self.forkValue(receipt, replayed: true)
         }
         if batch.request.preview {
             return .object(["result": .string("preview"), "op": .string("fork"), "session_id": .string(source.uuidString)])
@@ -143,7 +145,7 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         defer { forksInFlight.remove(ledgerKey) }
         // The fork is placed under the caller, so it counts toward every scope a session the caller
         // spawns would join, not only the caller's own chain (which the core already checked).
-        let evaluation = DelegationSpawnAdmission.evaluate(
+        let evaluation = try DelegationSpawnAdmission.evaluate(
             DelegationSpawnAdmission.guardrailScopes(forCreator: caller, scopes: context.scopes, projector: context.projector),
             creator: caller, operation: .adminFork, scopes: context.scopes, projector: context.projector
         )
@@ -156,25 +158,47 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
             scopeIDs: Array(evaluation.scopeIDs.union(context.scopeChain(of: batch.scope).map(\.id))), sessions: 1
         )
         defer { context.scopes.release(reservation) }
-        guard context.scopes.isCurrent(lease) else { return SessionAdminReply.batch(op: "fork", items: [.revoked(source)]) }
-        let forked = try await host.fork(sessionID: source, upToItemID: upToItemID)
+        let context = context
+        let forked: UUID
+        var creationFailure: SessionAdminPartialForkError?
+        do {
+            forked = try await host.fork(sessionID: source, upToItemID: upToItemID) {
+                context.isStillAuthorized(lease, scope: batch.scope)
+            }
+        } catch SessionAdminHostError.authorityEnded {
+            return SessionAdminReply.batch(op: "fork", items: [.revoked(source)])
+        } catch let partial as SessionAdminPartialForkError {
+            forked = partial.sessionID
+            creationFailure = partial
+        }
         // Recorded as soon as the fork exists, so a retry after a later failure replays it instead
         // of forking twice; `joined_scope` is updated once placement settles.
-        var receipt = ForkReceipt(sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: false)
+        var receipt = ForkReceipt(
+            sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: false,
+            failureCode: creationFailure?.code, failureDetail: creationFailure?.detail
+        )
         recordForkReceipt(receipt, key: ledgerKey)
-        // The fork exists either way; only joining the scope needs live authority.
-        if context.scopes.isCurrent(lease) {
-            let commit = try host.commitOrganizationalPlacement(
-                sessionID: forked, parentID: caller, delegationScopeID: batch.scope.id
-            )
-            // The fork is a member now; the reservation is not held through the durable write.
-            context.scopes.release(reservation)
-            try await commit?.persisted()
-            let joined = commit != nil
-            receipt = ForkReceipt(sourceSessionID: source, upToItemID: upToItemID, forkedSessionID: forked, joinedScope: joined)
+        // The fork exists either way; only joining the scope needs live authority. An incomplete
+        // first save cannot become a normal joined-scope success merely because placement can run.
+        if creationFailure == nil, context.isStillAuthorized(lease, scope: batch.scope),
+           context.isMember(caller, ofChainFrom: batch.scope)
+        {
+            do {
+                let commit = try host.commitOrganizationalPlacement(
+                    sessionID: forked, parentID: caller, delegationScopeID: batch.scope.id
+                )
+                receipt.joinedScope = commit != nil
+                // Placement has committed in memory; preserve it even if its required save fails.
+                if forkReceipts[ledgerKey] != nil { forkReceipts[ledgerKey] = receipt }
+                context.scopes.release(reservation)
+                try await commit?.persisted()
+            } catch {
+                receipt.failureCode = receipt.joinedScope ? "persist_failed" : "placement_failed"
+                receipt.failureDetail = "The fork exists, but its scope placement did not complete: \(error.localizedDescription)"
+            }
             if forkReceipts[ledgerKey] != nil { forkReceipts[ledgerKey] = receipt }
         }
-        return Self.forkValue(source: source, forked: forked, replayed: false, joinedScope: receipt.joinedScope)
+        return Self.forkValue(receipt, replayed: false)
     }
 
     private func recordForkReceipt(_ receipt: ForkReceipt, key: String) {
@@ -185,14 +209,17 @@ final class SessionAdminLifecycleHandler: AgentSessionAdministrationOperationHan
         }
     }
 
-    private static func forkValue(source: UUID, forked: UUID, replayed: Bool, joinedScope: Bool) -> Value {
-        .object([
-            "result": .string(replayed ? "replayed" : "forked"),
+    private static func forkValue(_ receipt: ForkReceipt, replayed: Bool) -> Value {
+        var value: [String: Value] = [
+            "result": .string(replayed ? "replayed" : (receipt.failureCode == nil ? "forked" : "partial")),
             "op": .string("fork"),
-            "session_id": .string(source.uuidString),
-            "forked_session_id": .string(forked.uuidString),
-            "joined_scope": .bool(joinedScope),
+            "session_id": .string(receipt.sourceSessionID.uuidString),
+            "forked_session_id": .string(receipt.forkedSessionID.uuidString),
+            "joined_scope": .bool(receipt.joinedScope),
             "changed_count": .int(replayed ? 0 : 1)
-        ])
+        ]
+        if let code = receipt.failureCode { value["code"] = .string(code) }
+        if let detail = receipt.failureDetail { value["detail"] = .string(detail) }
+        return .object(value)
     }
 }

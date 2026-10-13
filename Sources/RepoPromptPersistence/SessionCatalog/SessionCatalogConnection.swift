@@ -123,8 +123,9 @@ final class SessionCatalogConnection {
         case let .workspace(input, expected):
             guard input.directory.isFileURL, !input.name.isEmpty else { throw SessionCatalogError.invalidRecord }
             try checkRevision(table: "workspaces", kind: "workspace", id: input.id, expected: expected)
+            let previous = try workspace(id: input.id)
             var record = input
-            record.coverage = try workspace(id: input.id)?.coverage ?? .pending
+            record.coverage = previous?.directory == input.directory ? previous?.coverage ?? .pending : .pending
             record.revision = generation
             if record.coverage != .complete {
                 try database.execute("UPDATE catalog_state SET coverage = 'pending' WHERE singleton = 1 AND coverage = 'complete'")
@@ -308,6 +309,127 @@ final class SessionCatalogConnection {
                 [.integer(progress.generation), .bytes(encoder.encode(progress))]
             )
         }
+    }
+
+    /// Beginning/resuming a job is an indexed metadata operation, not storage discovery. A completed
+    /// job is returned untouched unless an explicit drift-repair event requests a new generation.
+    func beginReconciliation(restart: Bool) throws -> SessionCatalogReconciliation {
+        try transaction {
+            let previous = try reconciliation()
+            if let previous, !restart { return previous }
+            let progress = SessionCatalogReconciliation(generation: (previous?.generation ?? 0) + 1, phase: "registry")
+            let coverage = try database.rows("SELECT coverage FROM catalog_state WHERE singleton = 1") { try SessionCatalogDatabase.string($0) }.first
+            guard let coverage else { throw SessionCatalogError.corruptSchema }
+            if coverage != SessionCatalogCoverage.pending.rawValue {
+                try database.execute("UPDATE catalog_state SET coverage = 'pending', generation = generation + 1 WHERE singleton = 1")
+            }
+            try writeReconciliation(progress)
+            return progress
+        }
+    }
+
+    /// Imports and the worker cursor advance in one transaction. Disk-derived migration facts may
+    /// only fill absent identities: a concurrent owner write or tombstone always wins. There is no
+    /// general 'upsert whatever was on disk' path and no authorization is inferred from an import.
+    func applyReconciliationBatch(
+        _ batch: SessionCatalogReconciliationBatch,
+        expected: SessionCatalogReconciliation
+    ) throws -> SessionCatalogReconciliationReceipt {
+        guard !expected.finished, batch.next.generation == expected.generation,
+              batch.itemCount <= SessionCatalogReconciliationBatch.maximumItems,
+              batch.next.processed >= expected.processed,
+              batch.next.processed - expected.processed <= Int64(SessionCatalogReconciliationBatch.maximumItems),
+              batch.next.failed >= 0, batch.next.failed <= batch.next.processed,
+              !batch.next.phase.isEmpty, batch.next.phase.utf8.count <= 128,
+              (batch.next.cursor?.utf8.count ?? 0) <= 16 * 1024,
+              batch.next != expected
+        else { throw SessionCatalogError.invalidRecord }
+        try Task.checkCancellation()
+        return try transaction {
+            guard try reconciliation() == expected else { throw SessionCatalogError.staleGeneration }
+            let generation = try currentGeneration() + 1
+            var importedWorkspaceIDs: Set<UUID> = []
+            var importedSessions = 0
+            var skipped = 0
+            for workspace in batch.workspaces {
+                try Task.checkCancellation()
+                if try importIdentityIsAbsent(kind: "workspace", table: "workspaces", id: workspace.id) {
+                    try apply(.workspace(workspace, expected: .absent), generation: generation)
+                    importedWorkspaceIDs.insert(workspace.id)
+                } else { skipped += 1 }
+            }
+            for candidate in batch.sessions {
+                try Task.checkCancellation()
+                let session = candidate.record
+                guard try importIdentityIsAbsent(kind: "session", table: "sessions", id: session.id) else {
+                    skipped += 1
+                    continue
+                }
+                guard try database.integer("SELECT revision FROM workspaces WHERE id = ?", [.text(session.workspaceID.uuidString)]) != nil else {
+                    guard try database.integer("SELECT generation FROM tombstones WHERE kind = 'workspace' AND id = ?", [.text(session.workspaceID.uuidString)]) != nil else {
+                        throw SessionCatalogError.unknownWorkspace
+                    }
+                    skipped += 1
+                    continue
+                }
+                let workspaceRevision = try database.integer("SELECT revision FROM workspaces WHERE id = ?", [.text(session.workspaceID.uuidString)])
+                let matchesWorkspace: Bool = switch candidate.expectedWorkspaceRevision {
+                case .absent: importedWorkspaceIDs.contains(session.workspaceID)
+                case let .revision(value): workspaceRevision == value
+                }
+                guard matchesWorkspace else { skipped += 1
+                    continue
+                }
+                try apply(.session(session, expected: .absent), generation: generation)
+                importedSessions += 1
+            }
+            for directory in batch.directories {
+                guard !directory.path.isEmpty, directory.path.utf8.count <= 16 * 1024,
+                      directory.signature.utf8.count <= 1024, directory.classification.utf8.count <= 128
+                else { throw SessionCatalogError.invalidRecord }
+                try classify(path: directory.path, signature: directory.signature, classification: directory.classification, reconciliationGeneration: expected.generation)
+            }
+            var appliedCoverage = 0
+            for claim in batch.coverage {
+                let current = try workspace(id: claim.workspaceID)
+                let matches: Bool = switch claim.expectedRevision {
+                case .absent: importedWorkspaceIDs.contains(claim.workspaceID)
+                case let .revision(value): current?.revision == value
+                }
+                guard matches, current != nil else {
+                    skipped += 1
+                    continue
+                }
+                try apply(.coverage(workspaceID: claim.workspaceID, state: claim.state), generation: generation)
+                appliedCoverage += 1
+            }
+            if batch.next.finished {
+                let incomplete = try database.integer("SELECT 1 FROM workspaces WHERE coverage != 'complete' LIMIT 1") != nil
+                try apply(.coverage(workspaceID: nil, state: batch.next.failed == 0 && !incomplete ? .complete : .degraded), generation: generation)
+            }
+            let changedFacts = importedWorkspaceIDs.count + importedSessions > 0 || appliedCoverage > 0 || batch.next.finished
+            if changedFacts {
+                try database.execute("UPDATE catalog_state SET generation = ? WHERE singleton = 1", [.integer(generation)])
+            }
+            try writeReconciliation(batch.next)
+            return SessionCatalogReconciliationReceipt(
+                catalogGeneration: changedFacts ? generation : generation - 1,
+                importedWorkspaces: importedWorkspaceIDs.count, importedSessions: importedSessions,
+                skippedOwnerFacts: skipped, progress: batch.next
+            )
+        }
+    }
+
+    private func importIdentityIsAbsent(kind: String, table: String, id: UUID) throws -> Bool {
+        if try database.integer("SELECT generation FROM tombstones WHERE kind = ? AND id = ?", [.text(kind), .text(id.uuidString)]) != nil { return false }
+        return try database.integer("SELECT revision FROM \(table) WHERE id = ?", [.text(id.uuidString)]) == nil
+    }
+
+    private func writeReconciliation(_ progress: SessionCatalogReconciliation) throws {
+        try database.execute(
+            "INSERT INTO reconciliation VALUES (1, ?, ?) ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation, record = excluded.record",
+            [.integer(progress.generation), .bytes(encoder.encode(progress))]
+        )
     }
 
     func readCounters() -> SessionCatalogReadCounters {

@@ -23,6 +23,14 @@ enum SessionAdminLinkOutcome: Equatable {
     case failed(String)
 }
 
+/// A fork crossed its creation boundary but a later required step failed. Its identity must be
+/// returned and retained for idempotent retries; a delegated caller must never delete it as rollback.
+struct SessionAdminPartialForkError: Error {
+    let sessionID: UUID
+    let code: String
+    let detail: String
+}
+
 enum SessionAdminLifecycleOutcome: Equatable {
     case applied(changed: Bool, fields: [String: String])
     /// The target is not in a state that accepts the change (busy, closing, revoked).
@@ -69,7 +77,9 @@ protocol SessionAdminStructureHost: AnyObject {
     ) async -> SessionAdminLifecycleOutcome
     /// Forks `sessionID` into a new background tab without focusing it and without inheriting
     /// oversight links. Returns the new session's ID.
-    func fork(sessionID: UUID, upToItemID: UUID?) async throws -> UUID
+    func fork(
+        sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> UUID
 }
 
 struct SessionAdminWorktreeInfo: Equatable {

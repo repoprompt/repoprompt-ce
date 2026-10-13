@@ -157,9 +157,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // The worktree is owned by the caller, so it counts toward every scope the caller's creations
         // count toward (and, once bound, the target's), not only the caller's own chain (which the core
         // already checked).
-        var records = DelegationSpawnAdmission.guardrailScopes(forCreator: caller, scopes: context.scopes, projector: context.projector)
+        var records = try DelegationSpawnAdmission.guardrailScopes(forCreator: caller, scopes: context.scopes, projector: context.projector)
         if bindAfter {
-            records += DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
+            records += try DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
         }
         let evaluation = DelegationSpawnAdmission.evaluate(
             records, creator: caller, operation: .adminWorktreeCreate, scopes: context.scopes, projector: context.projector
@@ -310,16 +310,19 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     ) throws -> [DelegationScopeReservation] {
         let reactivated = desiredIDs.compactMap { ownership.record(worktreeID: $0) }
             .filter { $0.releasedAt != nil && $0.createdBySessionID != nil }
-        var records = context.scopeChain(of: scope)
+        var records = try context.scopeChain(of: scope)
             + DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
         for creator in Set(reactivated.compactMap(\.createdBySessionID)) {
-            records += DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: context.scopes, projector: context.projector)
+            records += try DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: context.scopes, projector: context.projector)
         }
         let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let bound = host.allBoundWorktrees()
         let retainedTargetIDs = host.retainedWorktreeIDsAfterReplacingBinding(sessionID: target)
         var admitted: [(UUID, Set<String>)] = []
         for record in byID.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            guard let projected = context.projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
+                throw DelegationSpawnAdmission.error(for: .usageProofMissing)
+            }
             let members = Set(context.projector.members(of: record.grant))
             let owned = ownership.ownedUnreleasedWorktreeIDs(createdBy: members)
             let currentIDs = Set(bound.filter { !$0.value.isDisjoint(with: members) }.keys).union(owned)
@@ -330,7 +333,6 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             let postIDs = Set(bound.filter { !$0.value.subtracting([target]).isDisjoint(with: members) }.keys)
                 .union(members.contains(target) ? retainedTargetIDs : [])
                 .union(owned).union(addedIDs)
-            let projected = context.projector.usage(of: record.grant, spawnParentSessionID: nil)
             let anonymous = max(0, projected.worktreeCount - projected.countedWorktreeIDs.count)
             let postUsage = context.scopes.usageIncludingReservations(DomainDelegationScopeUsage(
                 scopeID: record.id, liveSessionCount: projected.liveSessionCount,
@@ -505,6 +507,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                   record.isActive && batch.request.operation.requiredScopeCapability.map(record.grant.capabilities.contains) == true
               })
         else { throw SessionAdminMCPToolService.unavailableError }
+        guard context.projector.usageEvidence(of: batch.scope.grant, spawnParentSessionID: nil) != nil else {
+            throw DelegationSpawnAdmission.error(for: .usageProofMissing)
+        }
         let members = context.projector.members(of: batch.scope.grant)
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
         let memberSet = Set(members)
@@ -623,7 +628,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         let mergeTarget = try SessionAdminArguments.string(batch.request.arguments, "merge_target", op: "merge_preview")
         let preview = try await host.previewMerge(sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
         try Task.checkCancellation()
-        guard context.isStillAuthorized(lease, scope: batch.scope) else {
+        guard context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget) else {
             throw SessionAdminMCPToolService.unavailableError
         }
         return .object([

@@ -242,6 +242,53 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         }
     }
 
+    func testEligibilityAndExpiryVisitOnlyRelevantScopes() throws {
+        for unrelatedCount in [0, 1500] {
+            var authority = DomainDelegationScopeAuthority()
+            let selected = try grantTree(&authority, guardrails: .init(expiresAt: now.addingTimeInterval(60)))
+            for _ in 0 ..< unrelatedCount {
+                _ = try grantTree(
+                    &authority, guardrails: .init(expiresAt: now.addingTimeInterval(7200)), grantee: UUID()
+                )
+            }
+            XCTAssertTrue(authority.hasLiveScope(grantedTo: overseer, now: now))
+            XCTAssertEqual(authority.liveScopes(grantedTo: overseer, now: now).map(\.id), [selected.id])
+            XCTAssertEqual(authority.scopes(grantedTo: overseer).map(\.id), [selected.id])
+            #if DEBUG
+                XCTAssertEqual(authority.eligibilityRecordVisitsForTesting(grantedTo: overseer, now: now), 1)
+                XCTAssertEqual(authority.eligibilityRecordVisitsForTesting(grantedTo: UUID(), now: now), 0)
+            #endif
+            XCTAssertTrue(authority.expire(now: now.addingTimeInterval(59)).isEmpty)
+            #if DEBUG
+                XCTAssertEqual(authority.expiryCandidateChecksForTesting, 0)
+            #endif
+            let afterDeadline = now.addingTimeInterval(61)
+            XCTAssertFalse(authority.hasLiveScope(grantedTo: overseer, now: afterDeadline))
+            XCTAssertEqual(authority.record(id: selected.id)?.generation, selected.generation, "Eligibility does not mutate authority")
+            XCTAssertEqual(authority.expire(now: afterDeadline).map(\.id), [selected.id])
+            #if DEBUG
+                XCTAssertEqual(authority.expiryCandidateChecksForTesting, 1, "Unrelated future grants are not inspected")
+            #endif
+            XCTAssertTrue(authority.expire(now: afterDeadline).isEmpty)
+            XCTAssertEqual(authority.activeGrants.count, unrelatedCount)
+        }
+    }
+
+    func testDeadlineIndexSurvivesReloadAndSkipsRevokedGrants() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let late = try grantTree(&authority, guardrails: .init(expiresAt: now.addingTimeInterval(180)))
+        let early = try grantTree(&authority, guardrails: .init(expiresAt: now.addingTimeInterval(60)))
+        let middle = try grantTree(&authority, guardrails: .init(expiresAt: now.addingTimeInterval(120)))
+        var restored = DomainDelegationScopeAuthority()
+        XCTAssertEqual(restored.reactivate(authority.activeGrants, now: now).count, 3)
+        restored.revoke(scopeID: early.id)
+        XCTAssertTrue(restored.expire(now: now.addingTimeInterval(61)).isEmpty)
+        XCTAssertEqual(restored.record(id: early.id)?.state, .revoked)
+        XCTAssertEqual(restored.expire(now: now.addingTimeInterval(121)).map(\.id), [middle.id])
+        XCTAssertEqual(restored.expire(now: now.addingTimeInterval(181)).map(\.id), [late.id])
+        XCTAssertFalse(restored.hasLiveScope(grantedTo: overseer, now: now.addingTimeInterval(181)))
+    }
+
     // MARK: - Expiry, revocation, generations
 
     func testExpiryStopsAuthorityAndIsReportedAsScopeExpired() throws {
@@ -331,6 +378,39 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         // Past expiry: nothing reactivates.
         var late = DomainDelegationScopeAuthority()
         XCTAssertTrue(late.reactivate([parent.grant], now: now.addingTimeInterval(7200)).isEmpty)
+    }
+
+    func testReactivateDuplicateChildKeepsOneGranteeAndParentAcrossDeferredInstallation() throws {
+        var original = DomainDelegationScopeAuthority()
+        let firstParent = try grantTree(&original)
+        let otherParent = try grantTree(&original, grantee: outsider)
+        let childID = UUID()
+        let first = DomainDelegationScopeGrant(
+            id: childID, granteeSessionID: child, kind: .tree(rootSessionID: child),
+            capabilities: [.observe], guardrails: .init(),
+            origin: .attenuatedFrom(scopeID: firstParent.id), grantedAt: now
+        )
+        let duplicate = DomainDelegationScopeGrant(
+            id: childID, granteeSessionID: grandchild, kind: .tree(rootSessionID: grandchild),
+            capabilities: [.observe], guardrails: .init(),
+            origin: .attenuatedFrom(scopeID: otherParent.id), grantedAt: now
+        )
+        var restored = DomainDelegationScopeAuthority()
+        // The first child is deferred until its parent is installed. A later duplicate must
+        // not enter a second parent/grantee index while that first record is pending.
+        let installed = restored.reactivate(
+            [first, firstParent.grant, otherParent.grant, duplicate], now: now
+        )
+        XCTAssertEqual(installed.count, 3)
+        XCTAssertEqual(restored.record(id: childID)?.grant, first)
+        XCTAssertEqual(restored.scopes(grantedTo: child).map(\.id), [childID])
+        XCTAssertTrue(restored.scopes(grantedTo: grandchild).isEmpty)
+        XCTAssertFalse(restored.hasLiveScope(grantedTo: grandchild, now: now))
+        XCTAssertEqual(restored.descendants(of: firstParent.id), [childID])
+        XCTAssertTrue(restored.descendants(of: otherParent.id).isEmpty)
+        XCTAssertEqual(restored.revoke(scopeID: otherParent.id).map(\.id), [otherParent.id])
+        XCTAssertNotNil(restored.liveRecord(id: childID, now: now))
+        XCTAssertEqual(Set(restored.revoke(scopeID: firstParent.id).map(\.id)), [firstParent.id, childID])
     }
 
     func testReactivateHonorsTombstonesAndCascadesThemToChildren() throws {

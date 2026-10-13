@@ -70,6 +70,9 @@ package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
     /// The session's workspace is the active workspace of an open window. Only loaded sessions can
     /// be mutated.
     package let isLoaded: Bool
+    /// Pin/archive/group state comes from workspace carriers, not session history metadata.
+    /// Values below are usable only when this is true; unknown state cannot satisfy a filter.
+    package let organizationStateIsKnown: Bool
     package let isArchived: Bool
     package let isPinned: Bool
     package let pinnedOrder: Int?
@@ -91,6 +94,7 @@ package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
         workspaceID: UUID?,
         workspaceName: String? = nil,
         isLoaded: Bool,
+        organizationStateIsKnown: Bool = true,
         isArchived: Bool = false,
         isPinned: Bool = false,
         pinnedOrder: Int? = nil,
@@ -109,6 +113,7 @@ package struct DomainAgentSessionInventoryRecord: Hashable, Sendable {
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
         self.isLoaded = isLoaded
+        self.organizationStateIsKnown = organizationStateIsKnown
         self.isArchived = isArchived
         self.isPinned = isPinned
         self.pinnedOrder = pinnedOrder
@@ -204,6 +209,9 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     /// The history scan covered every workspace. Absence-based orphan reasons ("missing") are only
     /// reported when this is true: an incomplete scan cannot tell "deleted" from "not scanned".
     package let isComplete: Bool
+    /// All records in the requested selection were read. A workspace can be complete while
+    /// endpoints elsewhere remain unknown; this must never be used as global deletion proof.
+    package let recordsComplete: Bool
     /// Every session known to exist, including ones a restricted view hides. Absence from this set
     /// (on a complete scan) is what "missing" means; a session hidden by scope is never missing.
     package let knownSessionIDs: Set<UUID>
@@ -218,7 +226,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     package init(
         records: [DomainAgentSessionInventoryRecord],
         edges: [DomainAgentSessionInventoryEdge],
-        isComplete: Bool
+        isComplete: Bool,
+        recordsComplete: Bool? = nil
     ) {
         var byID: [UUID: DomainAgentSessionInventoryRecord] = [:]
         for record in records {
@@ -226,18 +235,23 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             if let existing = byID[record.sessionID], existing.isLoaded, !record.isLoaded { continue }
             byID[record.sessionID] = record
         }
-        self.init(records: byID, edges: edges, isComplete: isComplete, knownSessionIDs: Set(byID.keys))
+        self.init(
+            records: byID, edges: edges, isComplete: isComplete,
+            recordsComplete: recordsComplete ?? isComplete, knownSessionIDs: Set(byID.keys)
+        )
     }
 
     private init(
         records: [UUID: DomainAgentSessionInventoryRecord],
         edges: [DomainAgentSessionInventoryEdge],
         isComplete: Bool,
+        recordsComplete: Bool,
         knownSessionIDs: Set<UUID>
     ) {
         self.records = records
         self.edges = edges
         self.isComplete = isComplete
+        self.recordsComplete = recordsComplete
         self.knownSessionIDs = knownSessionIDs
         ancestry = DomainAgentSessionAncestryIndex(parents: records.compactMapValues(\.effectiveParentID))
         var bySession: [UUID: [DomainAgentSessionInventoryEdge]] = [:]
@@ -266,6 +280,7 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             records: visibleRecords,
             edges: visibleEdges,
             isComplete: isComplete,
+            recordsComplete: recordsComplete,
             knownSessionIDs: knownSessionIDs
         )
     }
@@ -292,6 +307,16 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         !edges(touching: sessionID).isEmpty
     }
 
+    /// An observer's unknown archive state can hide an orphan reason even when every endpoint
+    /// identity is known. Keep this separate from the global absence proof.
+    package func orphanStatusIsComplete(for sessionID: UUID) -> Bool {
+        isComplete && edges(touching: sessionID).allSatisfy { edge in
+            edge.targetSessionID != sessionID || edge.observerSessionID == sessionID
+                || isMissing(edge.observerSessionID)
+                || records[edge.observerSessionID]?.organizationStateIsKnown == true
+        }
+    }
+
     /// Orphan reasons, in a stable order. See `DomainAgentSessionOrphanReason`.
     package func orphanReasons(for sessionID: UUID) -> [DomainAgentSessionOrphanReason] {
         guard let record = records[sessionID] else { return [] }
@@ -301,7 +326,10 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
                 reasons.insert(.linkIntentMissingSession)
             }
             if edge.targetSessionID == sessionID, edge.observerSessionID != sessionID {
-                if isMissing(edge.observerSessionID) || records[edge.observerSessionID]?.isArchived == true {
+                let observer = records[edge.observerSessionID]
+                if isMissing(edge.observerSessionID)
+                    || (observer?.organizationStateIsKnown == true && observer?.isArchived == true)
+                {
                     reasons.insert(.observerArchivedOrDeleted)
                 }
             }
@@ -386,6 +414,10 @@ package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
         self.loaded = loaded
     }
 
+    package var requiresOrganizationState: Bool {
+        pinned != nil || group != nil || archived != nil
+    }
+
     /// Every structured predicate except `query`. Unknown facts fail closed: a record with no
     /// creation date never matches a creation bound.
     package func matchesStructured(
@@ -400,6 +432,7 @@ package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
             return false
         }
         if let states, !states.contains(record.runState) { return false }
+        if requiresOrganizationState, !record.organizationStateIsKnown { return false }
         if let pinned, record.isPinned != pinned { return false }
         switch group {
         case let .named(name):
@@ -424,7 +457,11 @@ package struct DomainAgentSessionInventoryFilter: Hashable, Sendable {
         }
         if let hasLinks, snapshot.hasLinks(record.sessionID) != hasLinks { return false }
         if let role, !snapshot.roles(of: record.sessionID).contains(role) { return false }
-        if let orphaned, snapshot.orphanReasons(for: record.sessionID).isEmpty == orphaned { return false }
+        if let orphaned {
+            let reasons = snapshot.orphanReasons(for: record.sessionID)
+            if !orphaned, !snapshot.orphanStatusIsComplete(for: record.sessionID) { return false }
+            if reasons.isEmpty == orphaned { return false }
+        }
         if let archived, record.isArchived != archived { return false }
         if let loaded, record.isLoaded != loaded { return false }
         return true

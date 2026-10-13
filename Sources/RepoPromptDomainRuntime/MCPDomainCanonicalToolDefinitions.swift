@@ -1129,11 +1129,29 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseModelParameters)
             .map(advertiseOracleImageAttachments)
             .map(advertiseWorktreeListPagination)
+            .map(advertiseSessionDiscovery)
+    }
+
+    private static func advertiseSessionDiscovery(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.agentManage else { return definition }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description + """
+
+
+            **Agent Mode discovery**: `list_sessions` returns only matching direct child sessions, never a workspace-wide count. Zero children does not mean the current workspace is empty. The result provides the exact current `workspace_id`. For workspace-wide discovery, use `become_overseer` if needed, then on the next turn use `session_admin request_scope` with `kind=workspace`, that workspace UUID, and capabilities including `observe` plus the needed mutation capabilities. After the user approves the scope card, use `session_admin inventory`. Discovery and session IDs grant no authority. Unresolved routing returns no workspace identity or session count.
+
+            **Deletion**: `cleanup_sessions` is administrative/human control only. Agent Mode sessions may retire or archive targets under user-approved scopes; they cannot delete persisted sessions, including their own children.
+            """,
+            inputSchema: definition.inputSchema,
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
     }
 
     private static let becomeOverseerDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.becomeOverseer,
-        description: "Unlock oversight: create, message, steer and monitor persistent agents (lanes) in any workspace.",
+        description: "Enable oversight tool discovery for this Agent Mode session, normally on the next turn. Grants no authority. To list or organize this workspace, then request a user-approved workspace scope with observe plus the needed mutation capabilities through session_admin request_scope, and use inventory after approval.",
         inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
         annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
     )
@@ -1365,9 +1383,32 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
+    /// Registered selection semantics are shared by history and scoped session inventory.
+    private static func canonicalizeHistoryWorkspaceDiscovery(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"],
+              case var .object(workspace)? = properties["workspace"]
+        else { return definition }
+        workspace["description"] = .string("Registered workspace UUID or unique exact current name (case-insensitive, trimmed); otherwise bounded legacy partial-name or Workspace-* directory discovery. Ambiguous/unavailable selections are incomplete.")
+        properties["workspace"] = .object(workspace)
+        schema["properties"] = .object(properties)
+        let description = definition.description
+            .replacingOccurrences(of: "**Scope**: Window routing does not imply workspace scope; history scans all saved workspaces by default. Use `workspace` to filter by saved name, UUID, or `Workspace-*` storage directory. Stale indexes are skipped and reported in `skipped_workspaces`.", with: "**Scope**: Window routing does not imply workspace scope; history scans all saved workspaces by default. A registered workspace UUID or unique exact current name selects that workspace directly, including registered custom storage. Exact names ignore case and surrounding whitespace. Ambiguous, unavailable, or not-yet-ready selections are explicitly incomplete; use the workspace UUID to disambiguate. A name with no exact registered match retains bounded legacy partial-name/storage-directory discovery. Stale indexes are skipped and reported in `skipped_workspaces`.")
+            .replacingOccurrences(of: "**Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires.", with: "**Caching**: Registered workspace selections bypass the ~90-second cross-workspace inventory cache and validate that workspace index signature on each read. Unfiltered and legacy partial-name discovery retain that cache, so recent sessions may not appear there until it expires.")
+        return MCPDomainToolDefinition(
+            name: definition.name, description: description, inputSchema: .object(schema),
+            annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPWindowToolName.history {
+            return canonicalizeHistoryWorkspaceDiscovery(definition)
+        }
         if definition.name == MCPWindowToolName.readFile {
             return MCPDomainToolDefinition(
                 name: definition.name,

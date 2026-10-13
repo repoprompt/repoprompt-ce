@@ -136,6 +136,42 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         XCTAssertEqual(DomainAgentSessionInventoryRunState.classify(rawValue: "waitingForApproval"), .waiting)
     }
 
+    func testUnknownOrganizationStateNeverMatchesPinArchiveOrGroupPredicates() {
+        let id = UUID()
+        let unknown = DomainAgentSessionInventoryRecord(
+            sessionID: id, name: "History only", workspaceID: UUID(), isLoaded: false,
+            organizationStateIsKnown: false, lastActivityAt: now
+        )
+        let snapshot = DomainAgentSessionInventorySnapshot(records: [unknown], edges: [], isComplete: true)
+        let filters: [DomainAgentSessionInventoryFilter] = [
+            .init(pinned: false), .init(pinned: true), .init(archived: false), .init(archived: true),
+            .init(group: DomainAgentSessionInventoryFilter.GroupMatch.none), .init(group: .named("Lanes"))
+        ]
+        for filter in filters {
+            XCTAssertFalse(filter.matchesStructured(unknown, in: snapshot, now: now), "unknown state cannot supply a positive or negative fact")
+        }
+        XCTAssertTrue(DomainAgentSessionInventoryFilter(loaded: false).matchesStructured(unknown, in: snapshot, now: now))
+        let target = record(UUID())
+        let observed = DomainAgentSessionInventorySnapshot(
+            records: [unknown, target],
+            edges: DomainAgentSessionInventoryEdge.merge(live: [], persisted: [(id, target.sessionID)]), isComplete: true
+        )
+        XCTAssertFalse(observed.orphanStatusIsComplete(for: target.sessionID))
+        XCTAssertFalse(DomainAgentSessionInventoryFilter(orphaned: false).matchesStructured(target, in: observed, now: now))
+    }
+
+    func testCompleteSelectedRecordsNeverBecomeGlobalAbsenceProof() {
+        let child = UUID(), unseenParent = UUID()
+        let snapshot = DomainAgentSessionInventorySnapshot(
+            records: [record(child, parent: unseenParent)], edges: [], isComplete: false, recordsComplete: true
+        )
+        let restricted = snapshot.restricted(to: [child])
+        XCTAssertTrue(restricted.recordsComplete)
+        XCTAssertFalse(restricted.isComplete)
+        XCTAssertFalse(restricted.isMissing(unseenParent))
+        XCTAssertEqual(restricted.orphanReasons(for: child), [])
+    }
+
     func testTreeMembershipFollowsOrganizationalThenSpawnThenCreatorAndSurvivesCycles() {
         let root = UUID()
         let viaCreator = UUID()

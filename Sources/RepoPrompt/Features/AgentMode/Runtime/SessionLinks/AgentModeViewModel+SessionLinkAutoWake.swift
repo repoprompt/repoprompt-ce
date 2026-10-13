@@ -1223,6 +1223,7 @@ extension AgentModeViewModel {
               let endpoint = claim.passive?.observerEndpoint,
               let session = sessions[endpoint.tabID],
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              session.permitsBoundOperationAndSave,
               !session.items.contains(where: { $0.id == wakeID })
         else {
             return
@@ -1858,8 +1859,8 @@ extension AgentModeViewModel {
 
     /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
     private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
-        guard session.hasLoadedPersistedState else { return .hasLoadedPersistedState }
         guard !session.bindingTransitionInProgress else { return .bindingTransitionInProgress }
+        guard session.permitsBoundOperationAndSave else { return .hasLoadedPersistedState }
         guard !session.terminalCommitInProgress else { return .terminalCommitInProgress }
         guard !session.mcpFollowUpRunPending else { return .mcpFollowUpRunPending }
         guard !agentSelfCompactBlocksNotificationWake(session) else { return .selfCompactBlocksNotificationWake }

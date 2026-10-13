@@ -15,11 +15,24 @@ struct MCPWindowToolDispatchIdentity {
     var modelRouteToken: AgentSessionLinkRunCatalogRouteToken?
 }
 
+/// Immutable policy admission for a queued internal-management call. The manager is
+/// the sole policy owner; this value confers no delegation-scope authority.
+struct MCPToolPolicyAdmissionToken {
+    let connectionID: UUID
+    let connectionIdentity: ObjectIdentifier
+    let lifecycleGeneration: UInt64
+    let policyGeneration: UInt64
+    let runID: UUID?
+    let runRoutingAuthorityGeneration: UInt64?
+    let runPolicyRevision: UUID?
+}
+
 struct MCPToolDispatchAuthorization {
     let connectionID: UUID
     let connectionIdentity: ObjectIdentifier
     let lifecycleGeneration: UInt64
     let windowIdentity: MCPWindowToolDispatchIdentity?
+    var policyAdmissionToken: MCPToolPolicyAdmissionToken?
 }
 
 /// Immutable app-host evidence carried across the unchanged canonical args-only binding.

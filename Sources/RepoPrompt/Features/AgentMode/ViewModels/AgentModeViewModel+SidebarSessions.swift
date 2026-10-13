@@ -124,7 +124,39 @@ extension AgentModeViewModel {
         AgentModeSidebarSessionBuilder.preferredSidebarEntry(
             for: tabID,
             tabName: tabName,
-            sessionIndex: ownerValidatedSessionIndex
+            entries: sessionIndexStore.ownerValidatedEntries(forTabID: tabID)
+        )
+    }
+
+    /// Matches active-sidebar fallback identity without visiting unrelated tabs or metadata.
+    /// A candidate already presented by another active tab is unavailable here. Re-read live
+    /// bindings after the indexed lookup: a live override can supersede a persisted claim.
+    func preferredActiveSidebarEntry(
+        for tabID: UUID,
+        tabName: String? = nil,
+        workspaceID: UUID
+    ) -> AgentSessionIndexEntry? {
+        guard let workspaceManager, workspaceManager.activeWorkspaceID == workspaceID else { return nil }
+        let entries = sessionIndexStore.ownerValidatedEntries(forTabID: tabID)
+        let candidateIDs = Set(entries.map(\.id))
+        var liveTabIDs: Set<UUID> = []
+        for id in candidateIDs {
+            liveTabIDs.formUnion(liveSessionTabIDs(for: id))
+        }
+        var presentedElsewhere: Set<UUID> = []
+        for carrier in workspaceManager.sessionCarriers(sessionIDs: candidateIDs, tabIDs: liveTabIDs) {
+            guard carrier.workspaceID == workspaceID,
+                  carrier.stashedTabID == nil,
+                  carrier.tab.id != tabID,
+                  let sessionID = authoritativeSessionID(for: carrier.tab),
+                  candidateIDs.contains(sessionID)
+            else { continue }
+            presentedElsewhere.insert(sessionID)
+        }
+        return AgentModeSidebarSessionBuilder.preferredSidebarEntry(
+            for: tabID,
+            tabName: tabName,
+            entries: entries.filter { !presentedElsewhere.contains($0.id) }
         )
     }
 

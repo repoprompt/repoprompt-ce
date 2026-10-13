@@ -194,6 +194,10 @@ final class AgentModeRunService {
             return nil
         }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
+        if let message = session.operationAdmissionFailureMessage {
+            startOutcome?.recordStartFailure(message: message)
+            return session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil
+        }
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
             guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
@@ -355,6 +359,7 @@ final class AgentModeRunService {
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController
     ) async -> Bool {
+        guard session.operationAdmissionFailureMessage == nil else { return false }
         let selectedAgent = session.selectedAgent
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         guard selectedAgent.acpProviderID != nil,

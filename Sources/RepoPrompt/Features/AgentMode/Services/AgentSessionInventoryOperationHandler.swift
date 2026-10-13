@@ -89,12 +89,18 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt > rhs.lastActivityAt }
                     return lhs.sessionID.uuidString < rhs.sessionID.uuidString
                 }
+            // Unknown organization fields can hide matches, including free text matching a group.
+            let needsOrganization = filter?.requiresOrganizationState == true || filter?.query != nil
+            let totalComplete = snapshot.recordsComplete
+                && (!needsOrganization || snapshot.records.values.allSatisfy(\.organizationStateIsKnown))
+                && (filter?.orphaned == nil || snapshot.records.keys.allSatisfy { snapshot.orphanStatusIsComplete(for: $0) })
             return .object([
                 "result": .string("ok"),
                 "total": .int(matches.count),
-                "total_complete": .bool(snapshot.isComplete),
+                "total_complete": .bool(totalComplete),
                 "truncated": .bool(matches.count > limit),
-                "history_complete": .bool(snapshot.isComplete),
+                "history_complete": .bool(snapshot.recordsComplete),
+                "endpoints_complete": .bool(snapshot.isComplete),
                 "sessions": .array(matches.prefix(limit).map {
                     AgentSessionInventoryRendering.row($0, snapshot: snapshot, now: date)
                 })
@@ -126,7 +132,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                 )
             }
             return .object([
-                "result": .string("ok"), "history_complete": .bool(snapshot.isComplete), "session": .object(row)
+                "result": .string("ok"), "history_complete": .bool(snapshot.recordsComplete), "session": .object(row)
             ])
 
         case .adminTree:
@@ -147,8 +153,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     "session_id": .string(record.sessionID.uuidString),
                     "name": .string(record.name),
                     "state": .string(record.runState.rawValue),
-                    "archived": .bool(record.isArchived),
-                    "pinned": .bool(record.isPinned),
+                    "organization_complete": .bool(record.organizationStateIsKnown),
                     "children_complete": .bool(snapshot.isComplete),
                     "observes_complete": .bool(snapshot.isComplete),
                     "observes": .array(
@@ -157,7 +162,11 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                             .map { .string($0.targetSessionID.uuidString) }
                     )
                 ]
-                if let group = record.sidebarGroup { object["group"] = .string(group) }
+                if record.organizationStateIsKnown {
+                    object["archived"] = .bool(record.isArchived)
+                    object["pinned"] = .bool(record.isPinned)
+                    if let group = record.sidebarGroup { object["group"] = .string(group) }
+                }
                 let children = (childrenByParent[record.sessionID] ?? [])
                     .filter { !seen.contains($0.sessionID) }
                     .sorted { $0.lastActivityAt > $1.lastActivityAt }
@@ -174,7 +183,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                 return .object(object)
             }
             return .object([
-                "result": .string("ok"), "history_complete": .bool(snapshot.isComplete), "tree": node(root, depth: 0)
+                "result": .string("ok"), "history_complete": .bool(snapshot.recordsComplete), "tree": node(root, depth: 0)
             ])
 
         case .adminLinks:

@@ -96,7 +96,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         // The lookup suspended: authority is re-checked right before the ordinary Stop.
         guard isStillAuthorized() else { return .failed("Delegated authority ended before the unlink.") }
         switch await bridge.stopMonitorLink(
-            observerSessionID: observer, targetSessionID: target, linkID: link.linkID, generation: link.generation
+            observerSessionID: observer, targetSessionID: target, linkID: link.linkID, generation: link.generation,
+            isStillAuthorized: isStillAuthorized
         ) {
         case .stopped: return .stopped
         case .alreadyStopped: return .notLinked
@@ -149,11 +150,15 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         return viewModel.delegationSetReasoningEffort(sessionID: sessionID, effort: effort, isStillAuthorized: isStillAuthorized)
     }
 
-    func fork(sessionID: UUID, upToItemID: UUID?) async throws -> UUID {
+    func fork(
+        sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> UUID {
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
-        return try await viewModel.delegationFork(sessionID: sessionID, upToItemID: upToItemID)
+        return try await viewModel.delegationFork(
+            sessionID: sessionID, upToItemID: upToItemID, isStillAuthorized: isStillAuthorized
+        )
     }
 }
 

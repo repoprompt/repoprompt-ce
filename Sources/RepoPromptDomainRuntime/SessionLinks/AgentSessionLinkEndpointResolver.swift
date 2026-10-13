@@ -29,7 +29,7 @@ package struct AgentSessionRestorationBindingToken: Equatable, Hashable {
     }
 }
 
-/// Binding-qualified hydration outcome, used by automatic restoration and fresh lane Add.
+/// Binding-qualified creation and hydration outcome, used by operation admission and oversight.
 ///
 /// `hasLoadedPersistedState` cannot serve this purpose: it is a completion latch, and a missing
 /// payload, a superseded source revision, and a thrown load error all set it true. Reauthorizing a
@@ -51,16 +51,72 @@ package enum AgentSessionRestorationReadiness: Equatable {
         case sourceRevisionSuperseded
     }
 
+    /// One creation owner's progress for this binding. Preparation and its first payload save
+    /// remain owned operations; ordinary operations cannot act on a partially created session.
+    package struct CreationState: Equatable {
+        package enum Phase: Equatable {
+            case preparing
+            case readyToPersist(configurationStamp: Data)
+            case failedBeforeConfiguration(String)
+        }
+
+        package let workspaceID: UUID
+        package let ownerID: UUID
+        package let phase: Phase
+
+        package init(workspaceID: UUID, ownerID: UUID, phase: Phase) {
+            self.workspaceID = workspaceID
+            self.ownerID = ownerID
+            self.phase = phase
+        }
+    }
+
     /// No durable binding to prove anything about.
     case unbound
     case pending(AgentSessionRestorationBindingToken)
+    case creating(AgentSessionRestorationBindingToken, CreationState)
     case authoritative(AgentSessionRestorationBindingToken, Source)
     case terminal(AgentSessionRestorationBindingToken, Failure)
 
     package var bindingToken: AgentSessionRestorationBindingToken? {
         switch self {
         case .unbound: nil
-        case let .pending(token), let .authoritative(token, _), let .terminal(token, _): token
+        case let .pending(token), let .creating(token, _), let .authoritative(token, _), let .terminal(token, _): token
+        }
+    }
+
+    package var creationState: CreationState? {
+        if case let .creating(_, state) = self { return state }
+        return nil
+    }
+
+    package var isCreating: Bool {
+        creationState != nil
+    }
+
+    /// Generic bound operations and saves require a completed payload. The creation owner uses
+    /// its exact binding, owner identity and prepared configuration to authorize the first save.
+    package var permitsBoundOperationAndSave: Bool {
+        isAuthoritative
+    }
+
+    package var operationAdmissionFailureMessage: String? {
+        switch self {
+        case .unbound, .authoritative:
+            nil
+        case .pending:
+            "Wait for this session to finish loading."
+        case .terminal:
+            "This session could not be restored. Retry loading it or create a new session; its saved data has not been replaced."
+        case let .creating(_, state):
+            switch state.phase {
+            case .preparing:
+                "This session is still being created. Wait for preparation to finish."
+            case .readyToPersist:
+                "This session has not been saved. Retry saving it before starting a turn."
+            case let .failedBeforeConfiguration(message):
+                message + " Create a new session to try again."
+            }
         }
     }
 
@@ -79,8 +135,8 @@ package enum AgentSessionRestorationReadiness: Equatable {
 
 /// The exact incarnations and binding-qualified hydration outcomes carried into an Add.
 ///
-/// Manual Add carries none of this: pasting a UUID keeps the resolver's existing behaviour. Automatic
-/// restoration and fresh lane creation differ, because they are authorized on a proof read at
+/// Manual Add requires an eligible endpoint with a complete payload. Automatic restoration and
+/// fresh lane creation additionally carry a proof read at
 /// classification time and every authority hop between then and activation is a chance for that
 /// endpoint to rebind, go terminal, or be replaced by an incarnation whose legacy
 /// `hasLoadedPersistedState` latch is true while its proof is pending or terminal. Carrying the proof
@@ -236,8 +292,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     /// Binding-qualified hydration proof, already resolved against this candidate's *current*
     /// binding state by its owning window.
     ///
-    /// Consumed only by automatic restoration. Manual Add keeps using the resolver's existing
-    /// `hasLoadedPersistedState` gate, so pasting a UUID behaves exactly as before.
+    /// Both manual Add and automatic restoration require a completed payload. The legacy load
+    /// completion latch alone cannot admit an incomplete creation or a failed restoration.
     package var restorationReadiness: AgentSessionRestorationReadiness = .unbound
 
     /// Whether a durable deletion of this session has begun or committed.
@@ -290,7 +346,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
     package var eligibilityInput: AgentSessionLinkEndpointEligibility.Input {
         AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: persistentBindingGeneration != nil,
-            hasLoadedPersistedState: hasLoadedPersistedState,
+            hasLoadedPersistedState: hasLoadedPersistedState
+                && restorationReadiness.permitsBoundOperationAndSave,
             isChildSession: !isTopLevel,
             isMCPControlled: isMCPControlled,
             isMCPOriginated: isMCPOriginated,

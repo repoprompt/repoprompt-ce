@@ -1133,43 +1133,68 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @Published var workspaces: [WorkspaceModel] = [] {
         didSet {
-            // Workspace IDs should be unique, but a corrupted index or
-            // migration bug must not SIGTRAP every workspace assignment.
-            // Last-wins matches the array-order lookup semantics below.
-            workspaceIndexMap = Dictionary(
-                workspaces.enumerated().map { ($1.id, $0) },
-                uniquingKeysWith: { _, last in last }
-            )
-            // Derived only on mutation; exact model-routing reads never sweep or repair state.
-            // An ambiguous workspace or tab is deliberately unresolvable, not last-wins.
-            modelRoutingTabIndexes = Dictionary(
-                workspaces.map { workspace in
-                    (workspace.id, Dictionary(
-                        workspace.composeTabs.enumerated().map { ($1.id, $0) },
-                        uniquingKeysWith: { _, _ in -1 }
-                    ))
-                },
-                uniquingKeysWith: { _, _ in [:] }
-            )
-            // Lifecycle lookup has different duplicate semantics from model routing: preserve the
-            // first exact tab/session match in array order, including across duplicate workspace IDs.
-            // These positions are derived alongside the routing indexes, never a second authority.
-            lifecycleBindingPositions.removeAll(keepingCapacity: true)
-            lifecycleSessionPositions.removeAll(keepingCapacity: true)
-            for (workspaceIndex, workspace) in workspaces.enumerated() {
-                for (tabIndex, tab) in workspace.composeTabs.enumerated() {
-                    guard let sessionID = tab.activeAgentSessionID else { continue }
-                    lifecycleSessionPositions[workspace.id, default: [:]][sessionID, default: []].append((workspaceIndex, tabIndex))
-                    let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
-                    if lifecycleBindingPositions[key] == nil {
-                        lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
-                    }
+            if let presentation = composeTabPresentationPublication {
+                // Consume before notifying observers: any re-entrant generic replacement must
+                // rebuild its own identities rather than inheriting this publication's exemption.
+                composeTabPresentationPublication = nil
+                refreshChooserRowsAfterLocalMutation(from: oldValue)
+                refreshAgentCreatorNames(workspaceID: presentation.workspaceID, tabIDs: presentation.tabIDs)
+            } else {
+                rebuildSessionCarrierIndexes()
+                refreshSelectionMirrorContextRevision()
+                refreshChooserRowsAfterLocalMutation(from: oldValue)
+                refreshAgentCreatorNameSource()
+            }
+        }
+    }
+
+    private func rebuildSessionCarrierIndexes() {
+        // Workspace IDs should be unique, but a corrupted index or
+        // migration bug must not SIGTRAP every workspace assignment.
+        // Last-wins matches the array-order lookup semantics below.
+        workspaceIndexMap = Dictionary(
+            workspaces.enumerated().map { ($1.id, $0) },
+            uniquingKeysWith: { _, last in last }
+        )
+        // Derived only on mutation; exact model-routing reads never sweep or repair state.
+        // An ambiguous workspace or tab is deliberately unresolvable, not last-wins.
+        modelRoutingTabIndexes = Dictionary(
+            workspaces.map { workspace in
+                (workspace.id, Dictionary(
+                    workspace.composeTabs.enumerated().map { ($1.id, $0) },
+                    uniquingKeysWith: { _, _ in -1 }
+                ))
+            },
+            uniquingKeysWith: { _, _ in [:] }
+        )
+        // Lifecycle lookup has different duplicate semantics from model routing: preserve the
+        // first exact tab/session match in array order, including across duplicate workspace IDs.
+        // These positions are derived alongside the routing indexes, never a second authority.
+        lifecycleBindingPositions.removeAll(keepingCapacity: true)
+        lifecycleSessionPositions.removeAll(keepingCapacity: true)
+        for (workspaceIndex, workspace) in workspaces.enumerated() {
+            for (tabIndex, tab) in workspace.composeTabs.enumerated() {
+                guard let sessionID = tab.activeAgentSessionID else { continue }
+                lifecycleSessionPositions[workspace.id, default: [:]][sessionID, default: []].append((workspaceIndex, tabIndex))
+                let key = LifecycleBindingKey(tabID: tab.id, sessionID: sessionID)
+                if lifecycleBindingPositions[key] == nil {
+                    lifecycleBindingPositions[key] = (workspaceIndex, tabIndex)
                 }
             }
-            refreshSelectionMirrorContextRevision()
-            refreshChooserRowsAfterLocalMutation(from: oldValue)
-            refreshAgentCreatorNameSource()
         }
+        sessionCarrierPositionsByTabID.removeAll(keepingCapacity: true)
+        sessionCarrierPositionsBySessionID.removeAll(keepingCapacity: true)
+        for (workspaceIndex, workspace) in workspaces.enumerated() {
+            for (tabIndex, tab) in workspace.composeTabs.enumerated() {
+                indexSessionCarrier(tab, position: .init(workspace: workspaceIndex, tab: tabIndex, isStashed: false))
+            }
+            for (tabIndex, stash) in workspace.stashedTabs.enumerated() {
+                indexSessionCarrier(stash.tab, position: .init(workspace: workspaceIndex, tab: tabIndex, isStashed: true))
+            }
+        }
+        #if DEBUG
+            test_sessionCarrierIndexRebuildCount += 1
+        #endif
     }
 
     /// The chooser's coherent rows (#1142). Authority-backed managers start loading; constructor
@@ -1226,6 +1251,179 @@ class WorkspaceManagerViewModel: ObservableObject {
         if oldIdentities != newIdentities {
             bridge.noteTopologyMayHaveChanged()
         }
+    }
+
+    private func refreshAgentCreatorNames(workspaceID: UUID, tabIDs: Set<UUID>) {
+        guard activeWorkspaceID == workspaceID else { return }
+        var changed = false
+        for tabID in tabIDs {
+            guard let tab = modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+                  let sessionID = tab.activeAgentSessionID else { continue }
+            let source = AgentSessionCreatorNames.Source(workspaceID: workspaceID, sessionID: sessionID, name: tab.name)
+            if agentCreatorNameSource[tabID] != source {
+                agentCreatorNameSource[tabID] = source
+                changed = true
+            }
+        }
+        if changed {
+            AgentSessionLinkRuntimeBridge.shared.noteCreatorNameSourceChanged(
+                windowID: promptViewModel.windowID, sources: agentCreatorNameSource
+            )
+        }
+    }
+
+    private struct SessionCarrierPosition: Hashable {
+        let workspace: Int
+        let tab: Int
+        let isStashed: Bool
+    }
+
+    struct SessionCarrier {
+        let workspaceID: UUID
+        let tab: ComposeTabState
+        let stashedTabID: UUID?
+    }
+
+    private var sessionCarrierPositionsByTabID: [UUID: [SessionCarrierPosition]] = [:]
+    private var sessionCarrierPositionsBySessionID: [UUID: [SessionCarrierPosition]] = [:]
+    private var composeTabPresentationPublication: (workspaceID: UUID, tabIDs: Set<UUID>)?
+
+    #if DEBUG
+        var test_sessionCarrierRowsVisited = 0
+        var test_sessionCarrierIndexRebuildCount = 0
+    #endif
+
+    private func indexSessionCarrier(_ tab: ComposeTabState, position: SessionCarrierPosition) {
+        sessionCarrierPositionsByTabID[tab.id, default: []].append(position)
+        if let sessionID = tab.activeAgentSessionID {
+            sessionCarrierPositionsBySessionID[sessionID, default: []].append(position)
+        }
+    }
+
+    private func sessionCarrier(at position: SessionCarrierPosition) -> SessionCarrier? {
+        guard workspaces.indices.contains(position.workspace) else { return nil }
+        let workspace = workspaces[position.workspace]
+        #if DEBUG
+            test_sessionCarrierRowsVisited += 1
+        #endif
+        if position.isStashed {
+            guard workspace.stashedTabs.indices.contains(position.tab) else { return nil }
+            let stash = workspace.stashedTabs[position.tab]
+            return SessionCarrier(workspaceID: workspace.id, tab: stash.tab, stashedTabID: stash.id)
+        }
+        guard workspace.composeTabs.indices.contains(position.tab) else { return nil }
+        return SessionCarrier(workspaceID: workspace.id, tab: workspace.composeTabs[position.tab], stashedTabID: nil)
+    }
+
+    /// Physical claims, preserving duplicates and conflicting identities. Reads never rebuild the
+    /// index; generic model replacement and the identity mutation owner maintain it synchronously.
+    func sessionCarriers(sessionIDs: Set<UUID>, tabIDs: Set<UUID> = []) -> [SessionCarrier] {
+        var positions: Set<SessionCarrierPosition> = []
+        for id in sessionIDs {
+            positions.formUnion(sessionCarrierPositionsBySessionID[id] ?? [])
+        }
+        for id in tabIDs {
+            positions.formUnion(sessionCarrierPositionsByTabID[id] ?? [])
+        }
+        return positions.sorted {
+            if $0.workspace != $1.workspace { return $0.workspace < $1.workspace }
+            if $0.isStashed != $1.isStashed { return !$0.isStashed }
+            return $0.tab < $1.tab
+        }.compactMap { sessionCarrier(at: $0) }
+    }
+
+    /// Reads every persisted claim touching the requested identities and all competing claims on
+    /// their tab IDs. This is the same conflict closure as a full binding census, bounded by targets.
+    func sessionBindingCarrierSnapshot(
+        sessionIDs: Set<UUID>, additionalTabIDs: Set<UUID>
+    ) -> (claims: [UUID: Set<UUID>], composeTabIDs: Set<UUID>) {
+        let direct = sessionCarriers(sessionIDs: sessionIDs)
+        let tabIDs = additionalTabIDs.union(direct.map(\.tab.id))
+        var claims: [UUID: Set<UUID>] = [:]
+        var composeTabIDs: Set<UUID> = []
+        for carrier in sessionCarriers(sessionIDs: [], tabIDs: tabIDs) {
+            if carrier.stashedTabID == nil { composeTabIDs.insert(carrier.tab.id) }
+            if let id = carrier.tab.activeAgentSessionID { claims[carrier.tab.id, default: []].insert(id) }
+        }
+        return (claims, composeTabIDs)
+    }
+
+    /// Presentation-only values. The API cannot edit a carrier identity or array membership, so
+    /// routing/binding indexes remain valid without an unrelated-carrier traversal.
+    struct ComposeTabPresentation: Equatable {
+        let id: UUID
+        var name: String
+        var lastModified: Date
+        var isPinned: Bool
+        var pinnedOrder: Int?
+        var sidebarGroup: String?
+        var sidebarGroupOrder: Int?
+
+        init(_ tab: ComposeTabState) {
+            id = tab.id
+            name = tab.name
+            lastModified = tab.lastModified
+            isPinned = tab.isPinned
+            pinnedOrder = tab.pinnedOrder
+            sidebarGroup = tab.sidebarGroup
+            sidebarGroupOrder = tab.sidebarGroupOrder
+        }
+
+        func apply(to tab: inout ComposeTabState) {
+            tab.name = name
+            tab.lastModified = lastModified
+            tab.isPinned = isPinned
+            tab.pinnedOrder = pinnedOrder
+            tab.sidebarGroup = sidebarGroup
+            tab.sidebarGroupOrder = sidebarGroupOrder
+        }
+    }
+
+    @discardableResult
+    func updateComposeTabPresentation(
+        workspaceID: UUID, tabIDs: Set<UUID>,
+        _ update: (UUID, inout ComposeTabPresentation) -> Void
+    ) -> Set<UUID> {
+        guard let index = workspaceIndexMap[workspaceID], workspaces.indices.contains(index),
+              workspaces[index].id == workspaceID else { return [] }
+        var updates: [(Int, ComposeTabPresentation)] = []
+        var changed: Set<UUID> = []
+        for id in tabIDs {
+            guard let tabIndex = modelRoutingTabIndexes[workspaceID]?[id],
+                  workspaces[index].composeTabs.indices.contains(tabIndex) else { continue }
+            let tab = workspaces[index].composeTabs[tabIndex]
+            guard tab.id == id else { continue }
+            var value = ComposeTabPresentation(tab)
+            update(id, &value)
+            guard value != ComposeTabPresentation(tab) else { continue }
+            updates.append((tabIndex, value))
+            changed.insert(id)
+        }
+        guard !updates.isEmpty else { return [] }
+        var workspace = workspaces[index]
+        for (tabIndex, value) in updates {
+            value.apply(to: &workspace.composeTabs[tabIndex])
+        }
+        composeTabPresentationPublication = (workspaceID, changed)
+        workspaces[index] = workspace
+        return changed
+    }
+
+    /// Active-editor snapshots may change arbitrary tab content, but an unchanged persistent
+    /// identity cannot invalidate any routing/carrier index. Identity edits still take the full path.
+    @discardableResult
+    func updateStoredComposeTabSnapshot(_ tab: ComposeTabState, workspaceID: UUID) -> Bool {
+        guard let index = workspaceIndexMap[workspaceID], workspaces.indices.contains(index),
+              let tabIndex = modelRoutingTabIndexes[workspaceID]?[tab.id],
+              workspaces[index].composeTabs.indices.contains(tabIndex) else { return false }
+        let previous = workspaces[index].composeTabs[tabIndex]
+        guard previous.id == tab.id else { return false }
+        if previous == tab { return true }
+        if previous.activeAgentSessionID == tab.activeAgentSessionID {
+            composeTabPresentationPublication = (workspaceID, [tab.id])
+        }
+        workspaces[index].composeTabs[tabIndex] = tab
+        return true
     }
 
     private struct LifecycleBindingKey: Hashable {
@@ -9050,7 +9248,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if touchModified {
             updatedTab.lastModified = Date()
         }
-        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
+        _ = updateStoredComposeTabSnapshot(updatedTab, workspaceID: activeWorkspaceID)
         recordSelectionRevisionIfChanged(
             workspaceIndex: workspaceIndex,
             tabIndex: tabIndex,
@@ -9720,8 +9918,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         return false
     }
 
-    func updateComposeTab(_ tab: ComposeTabState, markDirty: Bool = true) {
-        for workspaceIndex in workspaces.indices {
+    func updateComposeTab(_ tab: ComposeTabState, workspaceID: UUID? = nil, markDirty: Bool = true) {
+        for workspaceIndex in workspaces.indices where workspaceID == nil || workspaces[workspaceIndex].id == workspaceID {
             if let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id }) {
                 let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
                 workspaces[workspaceIndex].composeTabs[tabIndex] = tab
@@ -10150,6 +10348,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 &workspace,
                 with: (snapshot.expandedFolders, snapshot.selection, snapshot.promptText, snapshot.selectedMetaPromptIDs)
             )
+            if workspaces[index].composeTabs[tabIndex].activeAgentSessionID == snapshot.activeAgentSessionID,
+               workspaces[index].composeTabs[tabIndex].id == snapshot.id
+            {
+                composeTabPresentationPublication = (workspace.id, [snapshot.id])
+            }
             workspaces[index] = workspace
             publishWorkingDocumentToDomainAuthority(workspace)
             #if DEBUG
@@ -10171,6 +10374,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             let legacy = collectWorkspaceState()
             updateWorkspaceState(&workspace, with: legacy)
+            composeTabPresentationPublication = (workspace.id, [])
             workspaces[index] = workspace
             publishWorkingDocumentToDomainAuthority(workspace)
             #if DEBUG

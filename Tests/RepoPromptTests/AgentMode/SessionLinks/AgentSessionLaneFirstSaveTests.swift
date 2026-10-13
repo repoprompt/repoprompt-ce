@@ -1229,65 +1229,103 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
-    func testDrivenFirstSaveWaitsForPreviouslyEnteredSaveAndPersistsProvenance() async throws {
-        try await withFixture { fixture in
+    func testPreparingLaneRejectsGenericSaveAndSubmitBeforeConfiguredFirstSave() async throws {
+        try await withFixture(ephemeral: false) { fixture in
             let viewModel = fixture.window.agentModeViewModel
             let creatorID = UUID()
-            let fileURL = fixture.root.appendingPathComponent("lane.json")
-            let firstSaveEntered = expectation(description: "ordinary save entered")
-            let completed = expectation(description: "driven lane save settled")
-            var provisionRelease: CheckedContinuation<Void, Never>?
-            var staleSaveRelease: CheckedContinuation<Void, Never>?
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             var saveCount = 0
-            viewModel.test_afterOversightLaneProvision = { tabID in
-                Task { @MainActor in await viewModel.flushSave(for: tabID) }
-                await withCheckedContinuation { provisionRelease = $0 }
-            }
-            viewModel.test_setAgentSessionSaver { session, _, _ in
+            var savedFileURL: URL?
+            var provisionedSession: AgentTabSession?
+            var provisionedBindingToken: AgentSessionRestorationBindingToken?
+            viewModel.test_setAgentSessionSaver { session, workspace, canonicalItemCount in
                 saveCount += 1
-                if saveCount == 1 {
-                    provisionRelease?.resume()
-                    firstSaveEntered.fulfill()
-                    await withCheckedContinuation { staleSaveRelease = $0 }
-                }
-                let data = try JSONEncoder().encode(session)
-                try data.write(to: fileURL, options: .atomic)
+                let fileURL = try await AgentSessionDataService.shared.saveAgentSession(
+                    session, for: workspace, preparation: .alreadyCanonicalTranscript,
+                    trustedCanonicalItemCount: canonicalItemCount
+                )
+                savedFileURL = fileURL
                 return fileURL
             }
-            var outcome: AgentModeViewModel.MCPOversightLaneCreationOutcome?
-            Task { @MainActor in
-                outcome = try? await viewModel.mcpCreateOversightLane(
-                    creatorSessionID: creatorID, sessionName: "Persisted lane",
-                    selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
-                )
-                completed.fulfill()
+            viewModel.test_afterOversightLaneProvision = { tabID in
+                do {
+                    let lane = try XCTUnwrap(viewModel.sessions[tabID])
+                    let sessionID = try XCTUnwrap(lane.activeAgentSessionID)
+                    provisionedSession = lane
+                    provisionedBindingToken = try XCTUnwrap(lane.currentRestorationBindingToken)
+                    XCTAssertTrue(lane.qualifiedRestorationReadiness.isCreating)
+                    XCTAssertFalse(lane.restorationReadiness.isAuthoritative)
+                    XCTAssertNil(viewModel.captureSessionCreationRetry(for: lane), "Preparation has no configured payload to retry.")
+                    XCTAssertTrue(lane.items.isEmpty)
+
+                    let requiredSave = await viewModel.flushSaveRequired(
+                        for: tabID, workspaceID: fixture.workspaceID
+                    )
+                    guard case let .failure(failure) = requiredSave else {
+                        return XCTFail("A generic required save must not persist a preparing lane.")
+                    }
+                    XCTAssertEqual(failure.operation, .save)
+                    XCTAssertEqual(failure.tabID, tabID)
+                    await viewModel.flushSave(for: tabID)
+                    let blocker = try XCTUnwrap(lane.operationAdmissionFailureMessage)
+                    let submission = viewModel.submitUserTurn(text: "Do not dispatch while preparing", tabID: tabID)
+                    guard case let .blocked(message) = submission else {
+                        return XCTFail("A preparing lane must refuse submission before admitting a user row.")
+                    }
+                    XCTAssertEqual(message, blocker)
+                    let files = try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+                    XCTAssertFalse(files.contains { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
+                    XCTAssertEqual(saveCount, 0, "Neither generic save may enter the real saver before configuration.")
+                    XCTAssertTrue(lane.items.isEmpty)
+                    XCTAssertFalse(lane.runState.isActive)
+                    XCTAssertNil(lane.runID)
+                    XCTAssertNil(lane.provider)
+                    XCTAssertNil(lane.codexController)
+                    XCTAssertNil(lane.claudeController)
+                    XCTAssertNil(lane.acpController)
+                    XCTAssertNil(viewModel.captureSessionCreationRetry(for: lane))
+                    XCTAssertFalse(lane.restorationReadiness.isAuthoritative)
+                } catch {
+                    XCTFail("Preparing lane assertions failed: \(error)")
+                }
             }
-            await fulfillment(of: [firstSaveEntered], timeout: 3)
-            XCTAssertEqual(saveCount, 1)
-            staleSaveRelease?.resume()
-            await fulfillment(of: [completed], timeout: 5)
-            guard let outcome, case let .created(sessionID, tabID, bindingToken) = outcome else {
-                let lane = viewModel.sessions.values.first(where: {
-                    $0.createdByOverseerSessionID == creatorID
-                })
-                return XCTFail("lane did not establish a durable first-save proof: \(String(describing: outcome)); saves=\(saveCount), readiness=\(String(describing: lane?.restorationReadiness)), model=\(String(describing: lane?.selectedModelRaw)), expected=\(fixture.selection.modelRaw), dirty=\(String(describing: lane?.isDirty))")
+            defer { viewModel.test_afterOversightLaneProvision = nil }
+
+            let outcome = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: creatorID, sessionName: "Persisted lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(sessionID, tabID, bindingToken) = outcome else {
+                return XCTFail("Configured lane did not establish its durable first-save proof: \(outcome)")
             }
+            let fileURL = try XCTUnwrap(savedFileURL)
+            XCTAssertTrue(fileURL.path.hasPrefix(fixture.root.path + "/"))
             let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
             XCTAssertEqual(saved.id, sessionID)
             XCTAssertEqual(saved.createdByOverseerSessionID, creatorID)
+            XCTAssertEqual(saved.agentKind, fixture.selection.agentRaw)
             XCTAssertEqual(
                 CodexModelSpecifier(raw: saved.agentModel).baseModel,
                 CodexModelSpecifier(raw: fixture.selection.modelRaw).baseModel
             )
             XCTAssertEqual(saved.agentReasoningEffort, fixture.selection.reasoningEffortRaw)
-            XCTAssertGreaterThanOrEqual(saveCount, 2)
+            XCTAssertNil(saved.parentSessionID)
+            XCTAssertEqual(saveCount, 1, "Only the configured owner may perform the lane's first save.")
             let lane = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertTrue(lane === provisionedSession)
+            XCTAssertEqual(bindingToken, provisionedBindingToken)
             XCTAssertEqual(
                 lane.restorationReadiness,
                 .authoritative(bindingToken, .freshBindingDurablyCreated)
             )
+            XCTAssertTrue(lane.items.isEmpty)
             XCTAssertFalse(lane.runState.isActive)
             XCTAssertFalse(lane.isMCPOriginated)
+            XCTAssertNil(lane.runID)
+            XCTAssertNil(lane.provider)
+            XCTAssertNil(lane.codexController)
+            XCTAssertNil(lane.claudeController)
+            XCTAssertNil(lane.acpController)
         }
     }
 

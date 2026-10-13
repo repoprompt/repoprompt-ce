@@ -192,7 +192,12 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         guard !request.targetSessionIDs.isEmpty || request.operation.scopeGuardrailUse != nil else {
             return authorize(request, scope: scope, projector: projector)
         }
-        return projector.withSynchronousCensus { projector in
+        if request.operation.scopeGuardrailUse != nil {
+            return projector.withSynchronousCensus { projector in
+                authorize(request, scope: scope, projector: projector)
+            }
+        }
+        return projector.withSynchronousTargets(Set(request.targetSessionIDs)) { projector in
             authorize(request, scope: scope, projector: projector)
         }
     }
@@ -210,6 +215,12 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         let chain = scopes.scopeChain(from: scope.id)
         var memberships: [UUID: [DomainDelegationScopeMembershipProof]] = [:]
         for target in request.targetSessionIDs {
+            // Equal mirrors can supply a read proof, but no current canonical write owner has
+            // been established. Refuse before confirmation or effects rather than mutate one
+            // presentation and make the returned undo token immediately unusable.
+            if request.operation.mutatesTarget, projector.pointResolutionState(for: target) == .replicated {
+                return .denied(.membershipProofMissing, sessionID: target)
+            }
             memberships[target] = chain.compactMap { projector.membershipProof(for: target, in: $0.grant) }
         }
         var targetStates: [UUID: DomainDelegationScopeTargetState] = [:]
@@ -220,10 +231,10 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         if request.operation.scopeGuardrailUse != nil {
             for record in chain {
                 // In-flight creations (spawn, fork, worktree_create) count until they settle.
-                usage[record.id] = scopes.usageIncludingReservations(projector.usage(
-                    of: record.grant,
-                    spawnParentSessionID: request.targetSessionIDs.first
-                ))
+                guard let evidence = projector.usageEvidence(
+                    of: record.grant, spawnParentSessionID: request.targetSessionIDs.first
+                ) else { return .denied(.usageProofMissing, sessionID: nil) }
+                usage[record.id] = scopes.usageIncludingReservations(evidence)
             }
         }
         let confirmation = request.confirmationID.flatMap {

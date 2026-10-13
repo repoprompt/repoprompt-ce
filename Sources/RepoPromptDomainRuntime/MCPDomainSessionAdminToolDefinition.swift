@@ -52,10 +52,10 @@ package enum MCPDomainSessionAdminToolDefinition {
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
         - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
-        - `release_scope`: give up one of your scopes; revokes its nested scopes too.
+        - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
-        **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
+        **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?). `total_complete` describes the selected records/filter; `history_complete` describes the selected history coverage. Global endpoint/link/orphan coverage is separate. An incomplete zero never proves an empty workspace. Organization fields are omitted when `organization_complete` is false and unknown fields never match pin/group/archive filters.
         **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
@@ -114,8 +114,8 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "description": .string("[request_scope, attenuate] Proposed guardrails; the user may tighten them.")
                 ]),
                 "reason": .stringSchema("[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes."),
-                "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope."),
-                "request_id": .stringSchema("[scope_status] Request UUID returned by request_scope."),
+                "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope. release_scope accepts either scope_id or request_id, never both."),
+                "request_id": .stringSchema("[scope_status, release_scope] Your request UUID returned by request_scope. release_scope cancels only a pending request; use scope_id to release an already granted scope."),
                 "session_id": .stringSchema("[target ops] One target session UUID."),
                 "targets": .object([
                     "type": .string("array"),

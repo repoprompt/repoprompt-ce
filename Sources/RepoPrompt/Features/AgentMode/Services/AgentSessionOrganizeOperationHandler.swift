@@ -9,8 +9,8 @@ enum AgentSessionOrganizeFieldChange: Equatable {
     /// Pin rank only (reorders and rank materialization).
     case pinRank(before: Int?, after: Int?)
     case group(before: String?, beforeOrder: Int?, after: String?, afterOrder: Int?)
-    /// Group order value only (group reorders).
-    case groupOrder(before: Int?, after: Int?)
+    /// Group order value only, qualified by the group whose order changed.
+    case groupOrder(group: String, before: Int?, after: Int?)
 }
 
 struct AgentSessionOrganizeFieldRestore: Equatable {
@@ -406,11 +406,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             desired: order,
             entries: entries.map { ($0.group, $0.order) }
         )
-        var before: [UUID: Int?] = [:]
+        var before: [UUID: (group: String, order: Int?)] = [:]
         var writes: [UUID: Int?] = [:]
         for entry in entries {
             guard let value = values[entry.group] else { continue }
-            before[entry.sessionID] = entry.order
+            before[entry.sessionID] = (entry.group, entry.order)
             if entry.order != value { writes[entry.sessionID] = value }
         }
         guard affected.allSatisfy(context.isCurrent) else {
@@ -426,10 +426,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             DomainAgentSessionSidebarGroup.orderedGroups(after.map { ($0.group, $0.order) })
                 .filter(Set(order).contains).map(Value.string)
         )
-        return finish(context, payload: .fields(changed.sorted { $0.uuidString < $1.uuidString }.map { id in
-            AgentSessionOrganizeFieldRestore(
+        return finish(context, payload: .fields(changed.sorted { $0.uuidString < $1.uuidString }.compactMap { id in
+            guard let original = before[id] else { return nil }
+            return AgentSessionOrganizeFieldRestore(
                 sessionID: id,
-                change: .groupOrder(before: before[id] ?? nil, after: writes[id] ?? nil)
+                change: .groupOrder(group: original.group, before: original.order, after: writes[id] ?? nil)
             )
         }))
     }
@@ -577,9 +578,10 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             extra: ["undone_op": .string(entry.operation.adminOperationName)]
         )
         if case var .object(object) = value {
-            // Redeeming a token is not evidence that anything was restored. Keep the per-item
-            // reasons (e.g. changed_since), but never report an all-skipped batch as undone.
-            object["result"] = .string(context.items.contains { $0.status == .changed } ? "undone" : "not_undone")
+            // Token redemption is separate from the effects: some targets may have changed while
+            // others were refused (for example because the user edited them since the original).
+            let outcome = object["result"]?.stringValue
+            object["result"] = .string(outcome == "partial" ? "partially_undone" : (outcome == "applied" ? "undone" : "not_undone"))
             value = .object(object)
         }
         return value
@@ -606,7 +608,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             case let .pinned(_, _, after): state.isPinned == after
             case let .pinRank(_, after): state.isPinned && state.pinnedOrder == after
             case let .group(_, _, after, afterOrder): state.sidebarGroup == after && state.sidebarGroupOrder == afterOrder
-            case let .groupOrder(_, after): state.sidebarGroup != nil && state.sidebarGroupOrder == after
+            case let .groupOrder(group, _, after): state.sidebarGroup == group && state.sidebarGroupOrder == after
             }
             if matches { pending.append(restore) } else { outcomes[id] = (.skipped, "changed_since") }
         }
@@ -630,7 +632,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 if before, let beforeRank { ranksAfterPin[id] = beforeRank }
             case let .pinRank(before, _): pinRanks.updateValue(before, forKey: id)
             case let .group(before, beforeOrder, _, _): groups[id] = (before, beforeOrder)
-            case let .groupOrder(before, _): groupOrders.updateValue(before, forKey: id)
+            case let .groupOrder(_, before, _): groupOrders.updateValue(before, forKey: id)
             }
         }
         func isCurrent(_ id: UUID) -> Bool {

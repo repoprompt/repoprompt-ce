@@ -749,7 +749,14 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                 }
                 let text = try Self.onlyText(ToolOutputFormatter.formatHistory(args: ["op": .string(op)], value: value))
                 XCTAssertEqual(text.contains("Scan completeness"), incomplete, op)
-                if incomplete { XCTAssertTrue(text.contains("No matches does not establish"), op) }
+                if incomplete {
+                    XCTAssertTrue(text.contains("No matches does not establish"), op)
+                    XCTAssertFalse(text.contains("No matching sessions found"), op)
+                    XCTAssertFalse(text.contains("No matching turns found"), op)
+                    XCTAssertTrue(text.contains("⚠️"), op)
+                } else if op != "time" {
+                    XCTAssertTrue(text.contains("No matching"), op)
+                }
             }
         }
     }

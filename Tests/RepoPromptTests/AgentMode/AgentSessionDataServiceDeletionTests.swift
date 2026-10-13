@@ -161,6 +161,96 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path))
     }
 
+    @MainActor
+    func testTerminationRefusesDeletionWithoutDiscardingSaveBeforeAdmission() async throws {
+        let registry = AgentSessionDeletionRegistry.shared
+        registry.test_reset()
+        let fixture = try makeFixture()
+        addTeardownBlock {
+            await fixture.service.test_setBeforeSessionWriteHook(nil)
+            await fixture.service.test_setBeforeDeletionAdmissionHook(nil)
+            await MainActor.run { registry.test_reset() }
+            try? FileManager.default.removeItem(at: fixture.storageURL)
+        }
+        let sessionURL = fixture.agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: fixture.sessionID))
+        var session = AgentSession(
+            id: fixture.sessionID,
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Session preserved during termination",
+            itemCount: 0
+        )
+        try writeSession(session, to: sessionURL)
+        let saveFence = TestReleaseFence(name: "save before deletion admission")
+        let admissionFence = TestReleaseFence(name: "deletion before registry admission")
+        defer {
+            saveFence.release()
+            admissionFence.release()
+        }
+        await fixture.service.test_setBeforeSessionWriteHook { url in
+            guard url.standardizedFileURL == sessionURL.standardizedFileURL else { return }
+            await saveFence.enterAndWait()
+        }
+        await fixture.service.test_setBeforeDeletionAdmissionHook { url in
+            guard url.standardizedFileURL == sessionURL.standardizedFileURL else { return }
+            await admissionFence.enterAndWait()
+        }
+        session.name = "Save admitted before deletion"
+        let pendingSession = session
+        let saveTask = Task {
+            try await fixture.service.saveAgentSession(
+                pendingSession,
+                for: fixture.workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 0
+            )
+        }
+        addTeardownBlock {
+            saveFence.release()
+            admissionFence.release()
+            _ = await saveTask.result
+        }
+        guard await saveFence.waitUntilEntered() else { return }
+        let deletionTask = Task {
+            try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
+        }
+        addTeardownBlock {
+            saveFence.release()
+            admissionFence.release()
+            _ = await deletionTask.result
+        }
+        guard await admissionFence.waitUntilEntered() else { return }
+
+        XCTAssertTrue(registry.freezeNewDeletionAdmissionForTermination())
+        saveFence.release()
+        let savedBeforeAdmission = try await saveTask.value
+        XCTAssertEqual(savedBeforeAdmission.standardizedFileURL, sessionURL.standardizedFileURL)
+        let beforeAdmission = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: sessionURL))
+        XCTAssertEqual(beforeAdmission.name, pendingSession.name)
+
+        admissionFence.release()
+        do {
+            try await deletionTask.value
+            XCTFail("Termination must refuse deletion before the session file is removed")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "Unexpected deletion error: \(error)")
+        }
+
+        let afterRejection = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: sessionURL))
+        XCTAssertEqual(afterRejection.name, pendingSession.name)
+        XCTAssertNil(registry.state(forSessionID: fixture.sessionID))
+        session.name = "Saved after deletion was refused"
+        let savedURL = try await fixture.service.saveAgentSession(
+            session,
+            for: fixture.workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+        XCTAssertEqual(savedURL.standardizedFileURL, sessionURL.standardizedFileURL)
+        let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: sessionURL))
+        XCTAssertEqual(saved.name, session.name)
+    }
+
     private struct BatchDeleteFixture {
         let service: AgentSessionDataService
         let workspace: WorkspaceModel

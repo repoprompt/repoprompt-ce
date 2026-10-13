@@ -1541,7 +1541,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     private func loadConfigForSession(_ session: TabSession) {
         guard let manager = workspaceManager,
-              let tabState = manager.composeTab(with: session.tabID) else { return }
+              let workspaceID = manager.activeWorkspaceID,
+              let tabState = manager.modelRoutingTab(workspaceID: workspaceID, tabID: session.tabID) else { return }
 
         isRestoringState = true
 
@@ -2063,15 +2064,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func persistSessionConfig(_ session: TabSession, markWorkspaceDirty: Bool = true) {
         guard !isRestoringState,
               let manager = workspaceManager,
-              var tab = manager.composeTab(with: session.tabID) else { return }
+              let workspaceID = manager.activeWorkspaceID,
+              var tab = manager.modelRoutingTab(workspaceID: workspaceID, tabID: session.tabID) else { return }
 
-        // Persist only tab-specific Context Builder state
-        tab.contextBuilder = ContextBuilderTabConfig(
+        // Loading treats an absent/invalid follow-up as plan and prompt IDs as a set.
+        // Compare the same effective values so an unchanged save does not republish the tab.
+        let selectedPromptIDs = session.selectedContextBuilderPromptIDs.sorted { $0.uuidString < $1.uuidString }
+        let proposed = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
             followUpTypeRaw: session.selectedFollowUpType.rawValue,
-            selectedContextBuilderPromptIDs: Array(session.selectedContextBuilderPromptIDs)
+            selectedContextBuilderPromptIDs: selectedPromptIDs
         )
-        manager.updateComposeTab(tab, markDirty: markWorkspaceDirty)
+        var current = tab.contextBuilder
+        current.followUpTypeRaw = current.followUpTypeRaw.flatMap(ContextBuilderFollowUpType.init(rawValue:))?.rawValue
+            ?? ContextBuilderFollowUpType.plan.rawValue
+        current.selectedContextBuilderPromptIDs = Set(current.selectedContextBuilderPromptIDs).sorted { $0.uuidString < $1.uuidString }
+        guard current != proposed else { return }
+
+        tab.contextBuilder = proposed
+        manager.updateComposeTab(tab, workspaceID: workspaceID, markDirty: markWorkspaceDirty)
     }
 
     private func persistCurrentSession() {

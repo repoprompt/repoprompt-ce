@@ -23,11 +23,14 @@ extension AgentModeViewModel {
     }
 
     func mcpResidentTarget(sessionID: UUID, requiringLoadedState: Bool = false) throws -> MCPResidentTarget? {
-        guard let session = try authoritativeLiveSession(for: sessionID), Self.isMCPResidentAppOwned(session),
-              !requiringLoadedState || session.hasLoadedPersistedState
+        guard let session = try authoritativeLiveSession(for: sessionID), Self.isMCPResidentAppOwned(session)
         else {
             return nil
         }
+        if session.qualifiedRestorationReadiness.terminalFailure != nil || session.qualifiedRestorationReadiness.isCreating {
+            throw MCPError.invalidParams(session.restorationAdmissionFailureMessage ?? Self.mcpResidentTargetError)
+        }
+        if requiringLoadedState, !session.permitsBoundOperationAndSave { return nil }
         guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
               endpoint.sessionID == sessionID, !session.bindingTransitionInProgress,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
@@ -60,7 +63,7 @@ extension AgentModeViewModel {
             return false
         }
         return current === target.session && Self.isMCPResidentAppOwned(current)
-            && !current.bindingTransitionInProgress
+            && current.permitsBoundOperationAndSave
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target.endpoint.sessionID)
             && agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
@@ -77,7 +80,8 @@ extension AgentModeViewModel {
     func mcpPreflightResidentActivation(sessionID: UUID, admittedWindow: WindowState?) async throws -> MCPResidentTarget? {
         // An unloaded runtime has not established persisted origin yet. Explicit adoption may
         // hydrate it; the shared preparation/activation fences requalify before any control action.
-        guard let resolved = try mcpResidentTarget(sessionID: sessionID), resolved.session.hasLoadedPersistedState else { return nil }
+        guard let resolved = try mcpResidentTarget(sessionID: sessionID),
+              resolved.session.permitsBoundOperationAndSave else { return nil }
         let target = MCPResidentTarget(session: resolved.session, endpoint: resolved.endpoint, window: admittedWindow)
         let hasLinks = await agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
@@ -89,6 +93,9 @@ extension AgentModeViewModel {
     func mcpRequireResidentActivationFence(
         _ target: MCPResidentTarget, authoritativeHasLinks: Bool = false
     ) throws {
+        if let failure = target.session.restorationAdmissionFailureMessage {
+            throw MCPError.invalidParams(failure)
+        }
         guard mcpActivationTargetIsCurrent(target),
               agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
         else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
@@ -113,7 +120,10 @@ extension AgentModeViewModel {
 
     /// Pure in-memory projection. Never acquires control, hydrates, clears masks or scans transcripts.
     func mcpResidentSnapshot(_ target: MCPResidentTarget) throws -> AgentRunMCPSnapshot {
-        guard mcpResidentTargetIsCurrent(target), target.session.hasLoadedPersistedState else {
+        if let failure = target.session.restorationAdmissionFailureMessage {
+            throw MCPError.invalidParams(failure)
+        }
+        guard mcpResidentTargetIsCurrent(target), target.session.permitsBoundOperationAndSave else {
             throw MCPError.invalidParams("Live status is not ready for this session binding. Retry agent_run.poll.")
         }
         let session = target.session
@@ -182,6 +192,9 @@ extension AgentModeViewModel {
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
         try Task.checkCancellation()
+        if let failure = target.session.restorationAdmissionFailureMessage {
+            throw MCPError.invalidParams(failure)
+        }
         guard windowIsAvailable(), mcpResidentTargetIsCurrent(target) else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }

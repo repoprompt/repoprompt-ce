@@ -11,7 +11,7 @@ protocol AgentSessionLinkReleasing: AnyObject {
         live: [DomainAgentSessionLinkInventoryItem],
         persisted: [AgentSessionOversightIntent]
     )
-    func stopLink(_ item: DomainAgentSessionLinkInventoryItem) async -> AgentMonitorStopOutcome
+    func stopLink(_ item: DomainAgentSessionLinkInventoryItem, isStillAuthorized: @escaping @MainActor () -> Bool) async -> AgentMonitorStopOutcome
 }
 
 @MainActor
@@ -23,12 +23,13 @@ final class BridgeAgentSessionLinkReleaser: AgentSessionLinkReleasing {
         await AgentSessionLinkRuntimeBridge.shared.oversightInventory()
     }
 
-    func stopLink(_ item: DomainAgentSessionLinkInventoryItem) async -> AgentMonitorStopOutcome {
+    func stopLink(_ item: DomainAgentSessionLinkInventoryItem, isStillAuthorized: @escaping @MainActor () -> Bool) async -> AgentMonitorStopOutcome {
         await AgentSessionLinkRuntimeBridge.shared.stopMonitorLink(
             observerSessionID: item.observerSessionID,
             targetSessionID: item.targetSessionID,
             linkID: item.linkID,
-            generation: item.generation
+            generation: item.generation,
+            isStillAuthorized: isStillAuthorized
         )
     }
 }
@@ -81,7 +82,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
         let leases = Dictionary(batch.leases.map { ($0.targetSessionID, $0) }, uniquingKeysWith: { first, _ in first })
         func isCurrent(_ id: UUID) -> Bool {
-            leases[id].map(isLeaseCurrent) ?? false
+            !Task.isCancelled && (leases[id].map(isLeaseCurrent) ?? false) && isMember(id, batch.scope)
         }
         var items: [AgentSessionAdminItemResult] = []
         var released: Set<UUID> = []
@@ -102,6 +103,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
 
         for target in batch.admittedSessionIDs {
             var detail: [String: Value] = [:]
+            var targetChanged = false
             if retiring {
                 guard backend.state(of: target) != nil else {
                     items.append(.init(sessionID: target, status: .skipped, reason: "workspace_not_loaded"))
@@ -118,9 +120,29 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                         items.append(.init(sessionID: target, status: .skipped, reason: "requires_control"))
                         continue
                     }
-                    let stopped = await backend.stopRun(target)
-                    detail["stopped"] = .bool(stopped)
-                    if stopped { committed = true }
+                    let stop = await backend.stopRun(target, isStillAuthorized: {
+                        isCurrent(target) && holdsControl(scope)
+                    })
+                    detail["stopped"] = .bool(stop.stopped)
+                    detail["stop_requested"] = .bool(stop.initiatedCancellation)
+                    if stop.initiatedCancellation {
+                        committed = true
+                        targetChanged = true
+                    }
+                    // The Stop may have committed preparation but lost terminal publication.
+                    // Retain that receipt; control permission is not proof that a run settled.
+                    guard isCurrent(target) else {
+                        items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
+                        continue
+                    }
+                    guard backend.state(of: target) != nil else {
+                        items.append(.init(sessionID: target, status: .skipped, reason: "workspace_not_loaded", detail: detail))
+                        continue
+                    }
+                    guard backend.runState(of: target) == .idle else {
+                        items.append(.init(sessionID: target, status: .failed, reason: "stop_unconfirmed", detail: detail))
+                        continue
+                    }
                 }
             }
 
@@ -137,22 +159,30 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             var unlinked = 0
             var outsideScope = 0
             var failures: [String] = []
+            var refusedOnAuthority = false
             var refusedOnRunState = false
             for item in inventory.live where item.observerSessionID == target || item.targetSessionID == target {
                 guard !released.contains(item.linkID) else { continue }
+                // This reference remains unhandled. Check target authority before classifying its
+                // counterpart, so an interrupted traversal cannot masquerade as outsider filtering.
+                guard isCurrent(target) else {
+                    refusedOnAuthority = true
+                    break
+                }
                 let counterpart = item.observerSessionID == target ? item.targetSessionID : item.observerSessionID
                 guard isMember(counterpart, batch.scope) else {
                     outsideScope += 1
                     continue
                 }
-                guard isCurrent(target) else { break }
                 // Each unlink suspends; a retire target that starts running meanwhile is not unlinked
                 // further (nor archived) without `control`.
                 guard runStateAllows(target) else {
                     refusedOnRunState = true
                     break
                 }
-                switch await links.stopLink(item) {
+                switch await links.stopLink(item, isStillAuthorized: {
+                    isCurrent(target) && self.isMember(counterpart, batch.scope) && runStateAllows(target)
+                }) {
                 case .stopped:
                     unlinked += 1
                     released.insert(item.linkID)
@@ -168,11 +198,18 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             )
             let dormant = inventory.persisted.count(where: { $0.touches(sessionID: target) && !liveTouching.contains($0) })
             totalUnlinked += unlinked
-            if unlinked > 0 { committed = true }
+            if unlinked > 0 {
+                committed = true
+                targetChanged = true
+            }
             detail["unlinked"] = .int(unlinked)
             if outsideScope > 0 { detail["links_outside_scope"] = .int(outsideScope) }
             if dormant > 0 { detail["dormant_intents"] = .int(dormant) }
             if !failures.isEmpty { detail["unlink_failures"] = .array(failures.map(Value.string)) }
+            if refusedOnAuthority {
+                items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
+                continue
+            }
             if refusedOnRunState {
                 items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
                 continue
@@ -183,24 +220,53 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                     items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
                     continue
                 }
-                // Archiving stashes the tab and cancels any run. The run-state + control check runs
-                // inside the stash's commit-time context check, after the stash's own suspensions.
-                let refusals = AgentSessionRunStateRefusals()
-                let archived = await backend.archive([target], isAuthorized: { id in
-                    guard isCurrent(id) else {
-                        refusals.clear(id)
-                        return false
-                    }
-                    return refusals.admit(id, runStateAllows(id))
-                }).contains(target)
-                if !archived, refusals.refused.contains(target) {
+                guard runStateAllows(target) else {
                     items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
                     continue
                 }
-                detail["archived"] = .bool(archived)
-                if archived { committed = true }
-                let status: AgentSessionAdminItemResult.Status = archived ? .changed : (unlinked > 0 ? .changed : .failed)
-                items.append(.init(sessionID: target, status: status, reason: archived ? nil : "archive_rejected", detail: detail))
+                guard let beforeArchive = backend.state(of: target) else {
+                    items.append(.init(sessionID: target, status: .skipped, reason: "workspace_not_loaded", detail: detail))
+                    continue
+                }
+                // An archived target can still have links to release. Check its archive requirement
+                // only after those steps, without counting an existing stash as our own effect.
+                let refusals = AgentSessionRunStateRefusals()
+                let archiveChanged = if beforeArchive.isArchived {
+                    false
+                } else {
+                    await backend.archive([target], isAuthorized: { id in
+                        guard isCurrent(id) else {
+                            refusals.clear(id)
+                            return false
+                        }
+                        return refusals.admit(id, runStateAllows(id))
+                    }).contains(target)
+                }
+                detail["archive_changed"] = .bool(archiveChanged)
+                if archiveChanged {
+                    committed = true
+                    targetChanged = true
+                } else {
+                    // A failed transition may have suspended. Never reinterpret its refusal as an
+                    // already-satisfied target after the lease or run-state authority changed.
+                    guard isCurrent(target) else {
+                        items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
+                        continue
+                    }
+                    guard !refusals.refused.contains(target), runStateAllows(target) else {
+                        items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                        continue
+                    }
+                }
+                let currentState = backend.state(of: target)
+                if let currentState { detail["archived"] = .bool(currentState.isArchived) }
+                let archiveSatisfied = archiveChanged || currentState?.isArchived == true
+                detail["archive_result"] = .string(archiveChanged ? "changed" : (archiveSatisfied ? "already_archived" : "rejected"))
+                let reason = !archiveSatisfied ? "archive_rejected" : (failures.isEmpty ? nil : "unlink_failed")
+                let status: AgentSessionAdminItemResult.Status = reason == nil
+                    ? (targetChanged ? .changed : .unchanged)
+                    : .failed
+                items.append(.init(sessionID: target, status: status, reason: reason, detail: detail))
             } else {
                 let status: AgentSessionAdminItemResult.Status = failures.isEmpty
                     ? (unlinked > 0 ? .changed : .unchanged)

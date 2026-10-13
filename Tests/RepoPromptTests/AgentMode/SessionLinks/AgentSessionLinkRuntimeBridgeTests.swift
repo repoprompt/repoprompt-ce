@@ -3089,7 +3089,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             case "mcp-control": session.mcpControlContext = context(.pair)
             case "mcp-origin": session.isMCPOriginated = true
             case "binding-transition": session.beginPersistentBindingTransition()
-            case "deletion": deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: observer.sessionID)
+            case "deletion": deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: observer.sessionID)
             case "role-policy": session.mcpControlContext = context(.explore)
             case "binding-incarnation": session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID))
             default: session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: UUID()))
@@ -7962,7 +7962,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let lane = prepareCreatedLane(fixture)
         var deletion: AgentSessionDeletionRegistry.AttemptToken?
         fixture.host.beforeLaneCreationReturn = {
-            deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: lane.sessionID)
+            do {
+                deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: lane.sessionID)
+            } catch {
+                XCTFail("Deletion admission failed: \(error)")
+                return
+            }
         }
         let completed = expectation(description: "creation settles after deletion begins")
         var receipt: AgentSessionLaneCreateReceipt?
@@ -8621,10 +8626,15 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         fixture.host.laneProvenance[fixture.target.domainEndpoint] = fixture.observer.sessionID
         guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
         fixture.bridge.test_afterRetireRelationshipPrecheck = {
-            let deletion = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
-                sessionID: fixture.target.sessionID
-            )
-            await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
+            do {
+                let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+                    sessionID: fixture.target.sessionID
+                )
+                await AgentSessionDeletionRegistry.shared.didCommitDurableDeletion(deletion)
+            } catch {
+                XCTFail("Deletion admission failed: \(error)")
+                return
+            }
         }
         let completed = expectation(description: "retirement settles after committed deletion")
         var outcome: AgentSessionLaneRetireOutcome?

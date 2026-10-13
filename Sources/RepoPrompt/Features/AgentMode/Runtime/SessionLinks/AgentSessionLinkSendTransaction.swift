@@ -178,6 +178,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case endpointPostWindow = "endpoint_post_window"
     case endpointPostReadiness = "endpoint_post_readiness"
     case targetLoading = "target_loading"
+    case targetRestoreUnavailable = "target_restore_unavailable"
+    case targetCreationIncomplete = "target_creation_incomplete"
     case targetNotIdle = "target_not_idle"
     case linkRevoked = "link_revoked"
     case persistenceFailed = "persistence_failed"
@@ -213,6 +215,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         switch reason {
         case .endpointInvalidated: self = .endpointInvalidated
         case .targetLoading: self = .targetLoading
+        case .targetRestoreUnavailable: self = .targetRestoreUnavailable
+        case .targetCreationIncomplete: self = .targetCreationIncomplete
         case .targetNotIdle: self = .targetNotIdle
         }
     }
@@ -273,7 +277,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
              .endpointMissingWorkspace,
              .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
              .endpointPostTarget, .endpointPostWindow, .endpointPostReadiness,
-             .linkRevoked, .persistenceIndeterminate,
+             .linkRevoked, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
              .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped:
             false
         }
@@ -294,6 +298,10 @@ enum AgentSessionLinkSendFailure: String, Equatable {
             "The overseen session is no longer available at the exact endpoint this link was granted for."
         case .targetLoading:
             "The overseen session is still loading. Poll it and try again."
+        case .targetRestoreUnavailable:
+            AgentSessionLinkDeliveryReadiness.BlockReason.targetRestoreUnavailable.message
+        case .targetCreationIncomplete:
+            AgentSessionLinkDeliveryReadiness.BlockReason.targetCreationIncomplete.message
         case .targetNotIdle:
             AgentSessionLinkDeliveryReadiness.BlockReason.targetNotIdle.message
         case .linkRevoked:

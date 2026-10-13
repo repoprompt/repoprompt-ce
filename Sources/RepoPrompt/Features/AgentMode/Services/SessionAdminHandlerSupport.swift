@@ -16,8 +16,13 @@ struct SessionAdminHandlerContext {
 
     /// The write-time authority check for one target: the lease is current **and** the target is
     /// still a member of the whole scope chain (placement may have changed since the lease).
-    func isStillAuthorized(_ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord) -> Bool {
-        scopes.isCurrent(lease) && isMember(lease.targetSessionID, ofChainFrom: scope)
+    func isStillAuthorized(
+        _ lease: DomainDelegationScopeLease, scope: DomainDelegationScopeRecord,
+        requiresMutationOwner: Bool = true
+    ) -> Bool {
+        !Task.isCancelled && scopes.isCurrent(lease)
+            && (!requiresMutationOwner || projector.pointResolutionState(for: lease.targetSessionID) != .replicated)
+            && isMember(lease.targetSessionID, ofChainFrom: scope)
     }
 
     /// The caller's scope and every ancestor scope.

@@ -190,6 +190,7 @@ final class ACPIntegratedAgentModeRunner {
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
         stopFence: AgentRunStartStopFence? = nil
     ) async {
+        guard session.operationAdmissionFailureMessage == nil else { return }
         guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
@@ -614,6 +615,7 @@ final class ACPIntegratedAgentModeRunner {
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController
     ) async -> Bool {
+        guard session.operationAdmissionFailureMessage == nil else { return false }
         guard runRequest.agentKind == session.selectedAgent,
               runRequest.agentKind.acpProviderID != nil,
               session.runState == .running,

@@ -651,6 +651,312 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
     }
 
+    func testCancelRejectsUnprovenLiveTargetsBeforeHeartbeat() async throws {
+        enum InvalidTarget: CaseIterable {
+            case ambiguous, controlledObjectMismatch, unrelatedParent
+        }
+        for invalidTarget in InvalidTarget.allCases {
+            let window = try await makeCancelWindow()
+            let viewModel = window.agentModeViewModel
+            let callerID = UUID(), sessionID = UUID()
+            let session = try await makeControlledCancelSession(
+                in: window, sessionID: sessionID, parentSessionID: callerID
+            )
+            switch invalidTarget {
+            case .ambiguous:
+                let duplicate = AgentModeViewModel.TabSession(tabID: UUID())
+                duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: sessionID))
+                duplicate.hasLoadedPersistedState = true
+                duplicate.parentSessionID = UUID()
+                viewModel.test_installLiveSession(duplicate)
+            case .controlledObjectMismatch:
+                try rebindCancelSession(session, to: UUID(), in: window)
+                let actual = AgentModeViewModel.TabSession(tabID: UUID())
+                actual.installPersistentSessionBinding(.init(tabID: actual.tabID, sessionID: sessionID))
+                actual.hasLoadedPersistedState = true
+                actual.parentSessionID = callerID
+                viewModel.test_installLiveSession(actual)
+            case .unrelatedParent:
+                session.parentSessionID = UUID()
+            }
+            installCancelIndex(sessionID: sessionID, tabID: session.tabID, parentSessionID: callerID, in: viewModel)
+            let generation = session.stopState.cancellationGeneration
+            let runID = session.runID
+            var heartbeatEntered = false
+            var cancellationReached = false
+            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            let service = makeService(
+                window: window, resolveCaller: { _, _ in callerID },
+                beforeHeartbeatOperation: { heartbeatEntered = true }
+            )
+            try await requireCancelDenied(service, sessionID: sessionID, requiresScopeUnavailableMessage: true)
+            XCTAssertFalse(heartbeatEntered, "\(invalidTarget) must fail before the heartbeat boundary")
+            XCTAssertFalse(cancellationReached, "\(invalidTarget)")
+            XCTAssertEqual(session.stopState.cancellationGeneration, generation, "\(invalidTarget)")
+            XCTAssertEqual(session.runID, runID, "\(invalidTarget)")
+            XCTAssertEqual(session.runState, .running, "\(invalidTarget)")
+        }
+    }
+
+    func testCancelUsesExactChildProvenanceAndStopsUnchangedActiveOrPendingTarget() async throws {
+        for pending in [false, true] {
+            let window = try await makeCancelWindow()
+            let viewModel = window.agentModeViewModel
+            let callerID = UUID(), sessionID = UUID()
+            let session = try await makeControlledCancelSession(
+                in: window, sessionID: sessionID, parentSessionID: callerID, startPending: pending
+            )
+            // A stale index must neither grant nor override the exact loaded object's parent.
+            installCancelIndex(sessionID: sessionID, tabID: session.tabID, parentSessionID: UUID(), in: viewModel)
+            let originalContext = try XCTUnwrap(session.mcpControlContext)
+            let originalGeneration = session.stopState.cancellationGeneration
+            let originalExplicitStopGeneration = session.stopState.explicitStopGeneration
+            let originalOwnership = session.activeRunOwnership
+            let originalRunID = session.runID
+            var heartbeatEntered = false
+            var cancelledObjects: [ObjectIdentifier] = []
+            viewModel.test_setBeforeCancellationCommit { cancelledObjects.append(ObjectIdentifier($0)) }
+            let service = makeService(
+                window: window, resolveCaller: { _, _ in callerID },
+                beforeHeartbeatOperation: { heartbeatEntered = true }
+            )
+            let result = try await service.execute(args: [
+                "op": .string("cancel"), "session_id": .string(sessionID.uuidString)
+            ])
+            XCTAssertTrue(heartbeatEntered)
+            XCTAssertEqual(result.objectValue?["session_id"], .string(sessionID.uuidString))
+            let cancellation = try XCTUnwrap(result.objectValue?["cancellation"]?.objectValue)
+            XCTAssertEqual(cancellation["initiated"], .bool(!pending))
+            XCTAssertEqual(cancellation["stopped"], .bool(!pending))
+            XCTAssertEqual(cancellation["pending_start_withdrawn"], .bool(pending))
+            XCTAssertEqual(cancellation["run_id"], originalRunID.map { .string($0.uuidString) } ?? .null)
+            XCTAssertFalse(session.mcpFollowUpRunPending)
+            XCTAssertNotEqual(session.stopState.cancellationGeneration, originalGeneration)
+            XCTAssertNotEqual(session.stopState.explicitStopGeneration, originalExplicitStopGeneration)
+            XCTAssertEqual(session.mcpControlContext?.activationID, originalContext.activationID)
+            XCTAssertEqual(session.mcpControlContext?.registration, originalContext.registration)
+            if pending {
+                XCTAssertTrue(cancelledObjects.isEmpty, "Withdrawing a producer must not synthesize a cancelled run")
+                XCTAssertNil(session.lastTerminalCommitRevision)
+                XCTAssertEqual(session.activeRunOwnership, originalOwnership)
+                XCTAssertFalse(session.runState.isActive)
+                XCTAssertNotEqual(result.objectValue?["status"], .string("running"))
+            } else {
+                XCTAssertEqual(cancelledObjects, [ObjectIdentifier(session)])
+                XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .cancelled)
+                XCTAssertEqual(session.runState, .cancelled)
+            }
+        }
+    }
+
+    func testCancelRefusesActiveTargetDriftAcrossHeartbeat() async throws {
+        enum Drift: CaseIterable {
+            case successorRun, replacementObject, reboundObject, controlLost, controlReplaced, callerChanged
+        }
+        for drift in Drift.allCases {
+            let window = try await makeCancelWindow()
+            let viewModel = window.agentModeViewModel
+            let callerID = UUID(), sessionID = UUID()
+            let original = try await makeControlledCancelSession(
+                in: window, sessionID: sessionID, parentSessionID: callerID
+            )
+            var currentCallerID = callerID
+            var protectedSession = original
+            var protectedGeneration = original.stopState.cancellationGeneration
+            var protectedRunID = original.runID
+            var protectedContext = original.mcpControlContext
+            var heartbeatEntered = false
+            var cancellationReached = false
+            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            let service = makeService(
+                window: window, resolveCaller: { _, _ in currentCallerID },
+                beforeHeartbeatOperation: {
+                    heartbeatEntered = true
+                    switch drift {
+                    case .successorRun:
+                        original.installRunID(UUID())
+                        _ = original.beginRunAttempt(source: "public-cancel-successor")
+                    case .replacementObject:
+                        let replacement = AgentModeViewModel.TabSession(tabID: original.tabID)
+                        viewModel.test_installLiveSession(replacement)
+                        try self.rebindCancelSession(replacement, to: UUID(), in: window)
+                        replacement.hasLoadedPersistedState = true
+                        replacement.parentSessionID = callerID
+                        replacement.selectedAgent = .claudeCode
+                        _ = try await viewModel.mcpActivateControlContext(
+                            forTabID: replacement.tabID,
+                            sessionID: XCTUnwrap(replacement.activeAgentSessionID),
+                            originatingConnectionID: nil
+                        )
+                        replacement.installRunID(UUID())
+                        _ = replacement.beginRunAttempt(source: "public-cancel-replacement")
+                        replacement.runState = .running
+                        protectedSession = replacement
+                    case .reboundObject:
+                        try self.rebindCancelSession(original, to: UUID(), in: window)
+                    case .callerChanged:
+                        currentCallerID = UUID()
+                    case .controlLost:
+                        original.mcpControlContext = nil
+                    case .controlReplaced:
+                        _ = try await viewModel.mcpActivateControlContext(
+                            forTabID: original.tabID, sessionID: sessionID, originatingConnectionID: nil
+                        )
+                    }
+                    protectedGeneration = protectedSession.stopState.cancellationGeneration
+                    protectedRunID = protectedSession.runID
+                    protectedContext = protectedSession.mcpControlContext
+                }
+            )
+            try await requireCancelDenied(service, sessionID: sessionID)
+            XCTAssertTrue(heartbeatEntered, "\(drift) must exercise the post-await fence")
+            XCTAssertFalse(cancellationReached, "\(drift)")
+            XCTAssertEqual(protectedSession.stopState.cancellationGeneration, protectedGeneration, "\(drift)")
+            XCTAssertEqual(protectedSession.runID, protectedRunID, "\(drift)")
+            XCTAssertEqual(protectedSession.mcpControlContext, protectedContext, "\(drift)")
+            XCTAssertEqual(protectedSession.runState, .running, "\(drift)")
+            XCTAssertNil(protectedSession.lastTerminalCommitRevision, "\(drift)")
+        }
+    }
+
+    func testCancelRefusesSuccessorPendingProducerOrStartedRunAcrossHeartbeat() async throws {
+        enum Drift: CaseIterable {
+            case successorEpoch, pendingRevision, scheduledProducer, startedRun
+        }
+        for drift in Drift.allCases {
+            let window = try await makeCancelWindow()
+            let viewModel = window.agentModeViewModel
+            let callerID = UUID(), sessionID = UUID()
+            let session = try await makeControlledCancelSession(
+                in: window, sessionID: sessionID, parentSessionID: callerID, startPending: true
+            )
+            let originalTransition = try XCTUnwrap(session.mcpControlContext?.pendingEpochTransition?.token)
+            let originalPendingRevision = Date().addingTimeInterval(60)
+            session.mcpFollowUpRunPendingUpdatedAt = originalPendingRevision
+            if drift == .scheduledProducer {
+                session.scheduledACPFollowUp = .init(
+                    id: UUID(), instruction: "original pending task", stopFence: .init(session: session)
+                )
+            }
+            var protectedGeneration = session.stopState.cancellationGeneration
+            var protectedExplicitStopGeneration = session.stopState.explicitStopGeneration
+            var protectedContext = session.mcpControlContext
+            var protectedRunID = session.runID
+            var protectedPendingRevision = session.mcpFollowUpRunPendingUpdatedAt
+            var protectedProducerID = session.scheduledACPFollowUp?.id
+            var heartbeatEntered = false
+            var cancellationReached = false
+            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            let service = makeService(
+                window: window, resolveCaller: { _, _ in callerID },
+                beforeHeartbeatOperation: {
+                    heartbeatEntered = true
+                    switch drift {
+                    case .startedRun:
+                        viewModel.setMCPFollowUpRunPending(sessionID: sessionID, false)
+                        session.installRunID(UUID())
+                        _ = session.beginRunAttempt(source: "public-cancel-pending-started")
+                        session.runState = .running
+                    case .successorEpoch:
+                        let successor = try XCTUnwrap(viewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
+                        XCTAssertNotEqual(successor, originalTransition)
+                    case .pendingRevision:
+                        session.mcpFollowUpRunPendingUpdatedAt = originalPendingRevision.addingTimeInterval(1)
+                    case .scheduledProducer:
+                        session.scheduledACPFollowUp = .init(
+                            id: UUID(), instruction: "replacement pending task", stopFence: .init(session: session)
+                        )
+                    }
+                    protectedGeneration = session.stopState.cancellationGeneration
+                    protectedExplicitStopGeneration = session.stopState.explicitStopGeneration
+                    protectedContext = session.mcpControlContext
+                    protectedRunID = session.runID
+                    protectedPendingRevision = session.mcpFollowUpRunPendingUpdatedAt
+                    protectedProducerID = session.scheduledACPFollowUp?.id
+                }
+            )
+            try await requireCancelDenied(service, sessionID: sessionID)
+            XCTAssertTrue(heartbeatEntered, "\(drift)")
+            XCTAssertFalse(cancellationReached, "\(drift)")
+            XCTAssertEqual(session.stopState.cancellationGeneration, protectedGeneration, "\(drift)")
+            XCTAssertEqual(session.stopState.explicitStopGeneration, protectedExplicitStopGeneration, "\(drift)")
+            XCTAssertEqual(session.mcpControlContext, protectedContext, "\(drift)")
+            XCTAssertEqual(session.runID, protectedRunID, "\(drift)")
+            XCTAssertEqual(session.mcpFollowUpRunPendingUpdatedAt, protectedPendingRevision, "\(drift)")
+            XCTAssertEqual(session.scheduledACPFollowUp?.id, protectedProducerID, "\(drift)")
+            XCTAssertEqual(session.mcpFollowUpRunPending, drift != .startedRun, "\(drift)")
+            XCTAssertEqual(session.runState, drift == .startedRun ? .running : .idle, "\(drift)")
+            XCTAssertNil(session.lastTerminalCommitRevision, "\(drift)")
+        }
+    }
+
+    private func makeCancelWindow() async throws -> WindowState {
+        let window = try await makeWindow()
+        addTeardownBlock { @MainActor in
+            window.agentModeViewModel.test_setBeforeCancellationCommit(nil)
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+        }
+        return window
+    }
+
+    private func makeControlledCancelSession(
+        in window: WindowState, sessionID: UUID, parentSessionID: UUID, startPending: Bool = false
+    ) async throws -> AgentModeViewModel.TabSession {
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.hasLoadedPersistedState = true
+        session.parentSessionID = parentSessionID
+        session.selectedAgent = .claudeCode
+        session.runState = .idle
+        _ = try await window.agentModeViewModel.mcpActivateControlContext(
+            forTabID: session.tabID, sessionID: sessionID,
+            originatingConnectionID: nil, startPending: startPending
+        )
+        if startPending {
+            _ = try XCTUnwrap(window.agentModeViewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
+        } else {
+            session.installRunID(UUID())
+            _ = session.beginRunAttempt(source: "public-cancel-admission")
+            session.runState = .running
+        }
+        window.agentModeViewModel.publishMCPStateChange(for: session)
+        return session
+    }
+
+    private func rebindCancelSession(_ session: AgentModeViewModel.TabSession, to sessionID: UUID, in window: WindowState) throws {
+        var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: session.tabID))
+        tab.activeAgentSessionID = sessionID
+        window.workspaceManager.updateComposeTab(tab, markDirty: false)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
+    }
+
+    private func installCancelIndex(sessionID: UUID, tabID: UUID, parentSessionID: UUID, in viewModel: AgentModeViewModel) {
+        viewModel.upsertSessionIndex(
+            sessionID: sessionID, tabID: tabID, name: "Cancel provenance",
+            lastUserMessageAt: nil, savedAt: Date(timeIntervalSince1970: 1),
+            lastRunStateRaw: AgentSessionRunState.running.rawValue, itemCount: 0,
+            agentKindRaw: "claudeCode", agentModelRaw: nil, agentReasoningEffortRaw: nil,
+            autoEditEnabled: false, parentSessionID: parentSessionID
+        )
+    }
+
+    private func requireCancelDenied(
+        _ service: AgentRunMCPToolService, sessionID: UUID, requiresScopeUnavailableMessage: Bool = false
+    ) async throws {
+        do {
+            _ = try await service.execute(args: ["op": .string("cancel"), "session_id": .string(sessionID.uuidString)])
+            XCTFail("Expected invalidParams before cancellation")
+        } catch let error as MCPError {
+            guard case .invalidParams = error else { return XCTFail("Unexpected error: \(error)") }
+            if requiresScopeUnavailableMessage {
+                XCTAssertEqual(
+                    String(describing: error),
+                    String(describing: AgentSessionTargetOperationGuard.denialError(sessionID: sessionID))
+                )
+            }
+        }
+    }
+
     /// Release is latched even if timeout cleanup runs before the task reaches its gate.
     @MainActor
     private final class ResidentSteerGate {
@@ -741,7 +1047,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     private func makeService(
         window: WindowState, requestedTabID: UUID? = nil,
-        resolveCaller: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver = { _, _ in nil }
+        resolveCaller: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver = { _, _ in nil },
+        beforeHeartbeatOperation: (@MainActor () async throws -> Void)? = nil
     ) -> AgentRunMCPToolService {
         AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
@@ -756,7 +1063,10 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             resolveRequestedTabID: { _ in requestedTabID },
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: resolveCaller,
-            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            withHeartbeat: { _, _, _, _, operation in
+                try await beforeHeartbeatOperation?()
+                return try await operation()
+            },
             startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun should not be used by steer resume tests")
             }

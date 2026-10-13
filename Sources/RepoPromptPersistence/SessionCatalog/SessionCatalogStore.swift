@@ -85,6 +85,17 @@ package actor SessionCatalogStore {
         try connection.withLockUnchecked { try $0.saveReconciliation(progress, expectedGeneration: expectedGeneration) }
     }
 
+    package func beginReconciliation(restart: Bool = false) throws -> SessionCatalogReconciliation {
+        try connection.withLockUnchecked { try $0.beginReconciliation(restart: restart) }
+    }
+
+    package func applyReconciliationBatch(
+        _ batch: SessionCatalogReconciliationBatch,
+        expected: SessionCatalogReconciliation
+    ) throws -> SessionCatalogReconciliationReceipt {
+        try connection.withLockUnchecked { try $0.applyReconciliationBatch(batch, expected: expected) }
+    }
+
     package func readCounters() -> SessionCatalogReadCounters {
         reader.readCounters()
     }

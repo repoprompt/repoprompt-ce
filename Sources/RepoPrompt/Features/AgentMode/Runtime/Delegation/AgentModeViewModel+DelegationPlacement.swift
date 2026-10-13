@@ -28,9 +28,27 @@ enum DelegationPlacementWriteQueue {
     }
 }
 
+enum DelegationPlacementPersistenceError: LocalizedError {
+    case workspaceUnavailable
+    case ownerChanged
+    case superseded
+    case sessionFileMissing
+    case saveFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .workspaceUnavailable: "The placement's owning workspace is unavailable."
+        case .ownerChanged: "The session owner changed before placement persistence completed."
+        case .superseded: "A newer placement superseded this change before persistence completed."
+        case .sessionFileMissing: "The session file is missing; the placement was not persisted."
+        case let .saveFailed(message): message
+        }
+    }
+}
+
 /// A placement already applied in memory (the owner-validated index entry and the live tab), so
-/// membership checks see it at once. `pendingWrite` is its queued durable rewrite, `nil` when the
-/// live tab's ordinary save path persists it.
+/// membership checks see it at once. Production commits always carry the owning durable write;
+/// scheduling an ordinary debounced save is not a persistence acknowledgement.
 struct DelegationPlacementCommit {
     let pendingWrite: Task<Void, Error>?
 
@@ -102,8 +120,8 @@ extension AgentModeViewModel {
     /// target. A caller that re-validates placement and then commits in one synchronous region can
     /// therefore never race another placement change (two cross re-parents, two adopts at a limit).
     ///
-    /// Persistence follows: the ordinary save path for a live tab, or a queued placement-only rewrite
-    /// for a session with no live tab. Spawn provenance is never written here.
+    /// Persistence follows through the owning required-save path for a live tab, or a queued
+    /// placement-only rewrite for a session with no live tab. Spawn provenance is never written here.
     ///
     /// - Returns: `nil` when this window owns neither an index entry nor a live tab for the session.
     func commitDelegationPlacement(
@@ -114,6 +132,9 @@ extension AgentModeViewModel {
         let live = try authoritativeLiveSession(for: sessionID)
         let entry = ownerValidatedSessionIndex[sessionID]
         guard live != nil || entry != nil else { return nil }
+        guard let workspace = workspaceManager?.activeWorkspace else {
+            throw DelegationPlacementPersistenceError.workspaceUnavailable
+        }
         if var entry, entry.organizationalParentID != organizationalParentID || entry.delegationScopeID != delegationScopeID {
             entry.organizationalParentID = organizationalParentID
             entry.delegationScopeID = delegationScopeID
@@ -126,9 +147,28 @@ extension AgentModeViewModel {
                 session.isDirty = true
                 scheduleSave(for: session.tabID)
             }
-            return DelegationPlacementCommit(pendingWrite: nil)
+            let binding = session.persistentSessionBindingIdentity
+            let write = DelegationPlacementWriteQueue.schedule(sessionID) { [self, session] in
+                // The queue may start after another placement or a workspace switch. Flush only
+                // the exact owner that committed this change, never a successor on the same tab.
+                let requireCurrentPlacement = {
+                    guard self.workspaceManager?.activeWorkspaceID == workspace.id,
+                          self.sessions[session.tabID] === session,
+                          session.activeAgentSessionID == sessionID,
+                          session.persistentSessionBindingIdentity == binding
+                    else { throw DelegationPlacementPersistenceError.ownerChanged }
+                    guard session.organizationalParentID == organizationalParentID,
+                          session.delegationScopeID == delegationScopeID
+                    else { throw DelegationPlacementPersistenceError.superseded }
+                }
+                try requireCurrentPlacement()
+                if case let .failure(failure) = await flushSaveRequired(for: session.tabID, workspaceID: workspace.id) {
+                    throw DelegationPlacementPersistenceError.saveFailed(failure.message)
+                }
+                try requireCurrentPlacement()
+            }
+            return DelegationPlacementCommit(pendingWrite: write)
         }
-        guard let workspace = workspaceManager?.activeWorkspace else { return DelegationPlacementCommit(pendingWrite: nil) }
         let write = DelegationPlacementWriteQueue.schedule(sessionID) {
             try await AgentSessionDataService.shared.updateDelegationPlacement(
                 id: sessionID,
@@ -166,6 +206,38 @@ extension AgentModeViewModel {
             placement: delegationSpawnTargetPlacement(sessionID: sessionID),
             creatorSessionID: creatorSessionID
         )
+    }
+
+    /// Stages an auto-join stamp on the exact creating runtime, without publishing an incomplete
+    /// payload through the ordinary placement writer. The creator's configured first save owns
+    /// persistence; membership still sees the in-memory placement immediately.
+    func stageCreationDelegationPlacementIfUnplaced(
+        creationHandle: AgentSessionCreationHandle,
+        sessionID: UUID,
+        creatorSessionID: UUID,
+        delegationScopeID: UUID
+    ) throws -> Bool {
+        let session = creationHandle.session
+        try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
+        guard session.activeAgentSessionID == sessionID else {
+            throw DelegationPlacementPersistenceError.ownerChanged
+        }
+        let placement = DelegationSpawnTargetPlacement(
+            organizationalParentID: session.organizationalParentID,
+            parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID,
+            delegationScopeID: session.delegationScopeID
+        )
+        guard placement.admitsStamp(by: creatorSessionID) else { return false }
+        session.organizationalParentID = creatorSessionID
+        session.delegationScopeID = delegationScopeID
+        session.isDirty = true
+        if var entry = ownerValidatedSessionIndex[sessionID] {
+            entry.organizationalParentID = creatorSessionID
+            entry.delegationScopeID = delegationScopeID
+            sessionIndexStore.applyLocalUpsert(entry)
+        }
+        return true
     }
 
     /// Auto-join stamp for a session created (or taken) under `creatorSessionID`'s scope. Never

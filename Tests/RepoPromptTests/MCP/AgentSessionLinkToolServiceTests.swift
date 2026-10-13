@@ -2553,9 +2553,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
         var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
         fixture.bridge.test_afterManagedObservationAuthorityValidation = {
-            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
-                sessionID: fixture.target.sessionID
-            )
+            do {
+                deletionAttempt = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+                    sessionID: fixture.target.sessionID
+                )
+            } catch {
+                XCTFail("Deletion admission failed: \(error)")
+                return
+            }
         }
         defer {
             fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
@@ -2670,7 +2675,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
         let parked = await fixture.authority.snapshot().parkedWaiterCount
         XCTAssertEqual(parked, 1)
-        let deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+        let deletionAttempt = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(
             sessionID: fixture.target.sessionID
         )
         defer { AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt) }
@@ -2702,7 +2707,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
         fixture.bridge.test_afterManagedObservationAuthorityValidation = {
             guard deletionAttempt == nil else { return }
-            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: second.sessionID)
+            do {
+                deletionAttempt = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: second.sessionID)
+            } catch {
+                XCTFail("Deletion admission failed: \(error)")
+                return
+            }
         }
         defer {
             fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
@@ -2732,9 +2742,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
         fixture.bridge.test_afterManagedObservationAuthorityValidation = {
             guard deletionAttempt == nil else { return }
-            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
-                sessionID: fixture.target.sessionID
-            )
+            do {
+                deletionAttempt = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+                    sessionID: fixture.target.sessionID
+                )
+            } catch {
+                XCTFail("Deletion admission failed: \(error)")
+                return
+            }
         }
         defer {
             fixture.bridge.test_afterManagedObservationAuthorityValidation = nil

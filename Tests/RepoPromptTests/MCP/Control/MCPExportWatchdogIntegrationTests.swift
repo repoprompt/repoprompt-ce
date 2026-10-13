@@ -437,6 +437,329 @@ import XCTest
             }
         }
 
+        func testQueuedSessionAdminScopeRequestsUseExactPolicyAdmission() async throws {
+            for change in QueuedSessionAdminPolicyChange.scopeRequestCases {
+                try await assertQueuedSessionAdminPolicy(change, rename: false)
+            }
+        }
+
+        func testQueuedSessionAdminRenamePreservesPolicyAndScopeAuthority() async throws {
+            for change in [QueuedSessionAdminPolicyChange.unchanged, .restricted, .scopeRevoked, .policyChangedAfterProvider] {
+                try await assertQueuedSessionAdminPolicy(change, rename: true)
+            }
+        }
+
+        private enum QueuedSessionAdminPolicyChange: String {
+            case unchanged, rehydrated, restricted, explore, restrictionABA, seededPolicyChange, unrelated, removed, scopeRevoked, policyChangedAfterProvider
+
+            static let scopeRequestCases: [Self] = [
+                .unchanged, .rehydrated, .restricted, .explore, .restrictionABA, .seededPolicyChange, .unrelated, .removed
+            ]
+
+            var rejectsPolicy: Bool {
+                self == .restricted || self == .explore || self == .restrictionABA || self == .seededPolicyChange
+            }
+        }
+
+        @MainActor
+        private struct QueuedSessionAdminAgent {
+            let context: PersistentMCPTestContext
+            let endpoint: PersistentMCPTestEndpoint
+            let runID: UUID
+            let sessionID: UUID
+            let originalName: String
+        }
+
+        private func assertQueuedSessionAdminPolicy(
+            _ change: QueuedSessionAdminPolicyChange,
+            rename: Bool
+        ) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+                let gate = MCPQueuedPolicyAdmissionGate()
+                let entered = expectation(description: "\(change.rawValue) reached its exact policy-change boundary")
+                let removalStarted = change == .removed
+                    ? expectation(description: "Exact connection removal crossed its terminal fence") : nil
+                var agents: [QueuedSessionAdminAgent] = []
+                var pendingCall: Task<PersistentMCPTestRPCResponse, Error>?
+                var removalTask: Task<Void, Never>?
+                var failure: Error?
+
+                @MainActor
+                func cleanup() async throws {
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await gate.release()
+                    pendingCall?.cancel()
+                    if let pendingCall { _ = try? await pendingCall.value }
+                    await removalTask?.value
+                    for agent in agents {
+                        MCPLifecycleDiagnostics.shared.endCapture(connectionID: agent.endpoint.connectionID)
+                        for request in scopes.pendingRequests(forTab: agent.context.tabID, sessionID: agent.sessionID) {
+                            _ = scopes.withdrawRequest(id: request.id, requesterSessionID: agent.sessionID)
+                        }
+                        scopes.revokeAll(involving: agent.sessionID)
+                        await manager.clearClientConnectionPolicy(
+                            for: agent.endpoint.clientName, windowID: agent.context.window.windowID, runID: agent.runID
+                        )
+                        await Self.cleanupEndpoint(agent.endpoint, manager: manager)
+                        await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
+                    }
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+
+                do {
+                    let a = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextA)
+                    agents.append(a)
+                    let b = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextB)
+                    agents.append(b)
+                    XCTAssertTrue(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).isEmpty)
+                    XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
+                    var scopeID: UUID?
+                    if rename {
+                        // Cross the real service for the request, then the real card's explicit
+                        // presentation check for approval. The test never invents an authority lease.
+                        let requested = try await Self.toolResultObject(a.endpoint.callTool(
+                            name: MCPWindowToolName.sessionAdmin,
+                            arguments: Self.queuedScopeRequestArguments(a, key: "approval-\(UUID())")
+                        ))
+                        XCTAssertEqual(requested["result"] as? String, "pending_user_approval")
+                        let requestID = try XCTUnwrap((requested["request_id"] as? String).flatMap(UUID.init(uuidString:)))
+                        let grant = try scopes.approve(
+                            requestID: requestID, presentedWindowID: a.context.window.windowID,
+                            presentedTabID: a.context.tabID, presentedSessionID: a.sessionID,
+                            capabilities: [.observe, .organize]
+                        ).get()
+                        scopeID = grant.id
+                    }
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: a.endpoint.connectionID) { event in
+                        if event.phase == .removalStarted { removalStarted?.fulfill() }
+                    }
+                    if change == .policyChangedAfterProvider {
+                        await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                            guard connectionID == a.endpoint.connectionID, toolName == MCPWindowToolName.sessionAdmin else { return }
+                            await gate.hold { entered.fulfill() }
+                        }
+                    } else {
+                        await manager.debugSetAfterConnectionCallPermitAcquiredForTesting { connectionID in
+                            guard connectionID == a.endpoint.connectionID else { return }
+                            await gate.hold { entered.fulfill() }
+                        }
+                    }
+                    var arguments = Self.queuedScopeRequestArguments(a, key: "queued-\(UUID())")
+                    if rename {
+                        arguments = try [
+                            "op": "rename", "session_id": a.sessionID.uuidString,
+                            "scope_id": XCTUnwrap(scopeID).uuidString,
+                            "name": "Renamed by admitted policy", "idempotency_key": "rename-\(UUID())",
+                            "_rawJSON": true
+                        ]
+                    }
+                    let callArguments = arguments
+                    let call = Task {
+                        try await a.endpoint.callTool(name: MCPWindowToolName.sessionAdmin, arguments: callArguments)
+                    }
+                    pendingCall = call
+                    await fulfillment(of: [entered], timeout: 5)
+                    // Fail before changing policy if the intended queue boundary was not reached.
+                    let held = await gate.isHolding
+                    XCTAssertTrue(held, change.rawValue)
+                    guard held else { throw MCPQueuedPolicyFixtureError.admissionNotReached }
+                    XCTAssertEqual(
+                        MCPLifecycleDiagnostics.shared.snapshot(connectionID: a.endpoint.connectionID)
+                            .contains { $0.phase == .providerEntered },
+                        change == .policyChangedAfterProvider,
+                        change.rawValue
+                    )
+
+                    if change == .policyChangedAfterProvider {
+                        XCTAssertEqual(a.context.window.workspaceManager.activeWorkspace?.composeTabs.first {
+                            $0.id == a.context.tabID
+                        }?.name, "Renamed by admitted policy", "The receipt control changes policy only after the real effect")
+                    }
+                    switch change {
+                    case .unchanged:
+                        break
+                    case .rehydrated:
+                        let restored = await manager.rehydrateRunTabContextForConnectionIfPossible(a.endpoint.connectionID)
+                        XCTAssertTrue(restored, "The positive control must execute the real cached policy rehydration path")
+                    case .restricted, .restrictionABA, .policyChangedAfterProvider:
+                        await Self.renewQueuedSessionAdminPolicy(a, restricted: true)
+                        let withdrawn = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertTrue(try XCTUnwrap(withdrawn).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        if change == .restrictionABA {
+                            await Self.renewQueuedSessionAdminPolicy(a)
+                            let restored = await manager.debugRunPolicyState(for: a.runID)
+                            XCTAssertFalse(try XCTUnwrap(restored).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        }
+                    case .explore:
+                        await Self.renewQueuedSessionAdminPolicy(a, explore: true)
+                        let current = await manager.debugEffectivePolicyState(for: a.endpoint.connectionID)
+                        XCTAssertEqual(current.taskLabelKind, .explore)
+                    case .seededPolicyChange:
+                        let sampled = await manager.debugRunPolicyState(for: a.runID)
+                        let cached = try XCTUnwrap(sampled)
+                        // Existing seed owner defaults allowsAgentExternalControlTools to false.
+                        // This changes semantic run policy without reinstalling or advancing the
+                        // run routing generation; all visible routing and tool sets stay the same.
+                        await manager.debugSeedRunPolicyState(
+                            runID: a.runID, windowID: cached.windowID, workspaceID: cached.workspaceID,
+                            tabID: a.context.tabID, restrictedTools: cached.restrictedTools,
+                            additionalTools: cached.additionalTools, purpose: cached.purpose
+                        )
+                    case .unrelated:
+                        await Self.renewQueuedSessionAdminPolicy(b, restricted: true)
+                        let changedB = await manager.debugRunPolicyState(for: b.runID)
+                        let unchangedA = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertTrue(try XCTUnwrap(changedB).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        XCTAssertFalse(try XCTUnwrap(unchangedA).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                    case .removed:
+                        removalTask = Task { await manager.debugRemoveConnection(a.endpoint.connectionID) }
+                        try await fulfillment(of: [XCTUnwrap(removalStarted)], timeout: 5)
+                    case .scopeRevoked:
+                        try scopes.revoke(scopeID: XCTUnwrap(scopeID))
+                        XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
+                    }
+                    if change != .removed {
+                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        let current = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertEqual(try XCTUnwrap(current).purpose, .agentModeRun)
+                    }
+                    await gate.release()
+                    if change == .removed {
+                        // Removal closes the actual socket. It need not deliver a tool result.
+                        do {
+                            let response = try await call.value
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["code"] as? String, "tool_execution_connection_terminal")
+                        } catch PersistentMCPTestSocketClient.ClientError.closed {
+                            // Exact connection teardown is the expected alternative.
+                        }
+                    } else {
+                        let response = try await call.value
+                        if change.rejectsPolicy {
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["code"] as? String, "tool_execution_policy_changed", change.rawValue)
+                        } else if change == .scopeRevoked {
+                            // Revocation remains a domain denial even though MCP policy is unchanged.
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["result"] as? String, "denied", response.rawJSON)
+                            XCTAssertEqual(object["code"] as? String, "scope_revoked", response.rawJSON)
+                        } else {
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["result"] as? String, rename ? "applied" : "pending_user_approval", change.rawValue)
+                            if rename {
+                                XCTAssertEqual(object["changed_count"] as? Int, 1)
+                            } else {
+                                let requestID = try XCTUnwrap((object["request_id"] as? String).flatMap(UUID.init(uuidString:)))
+                                XCTAssertEqual(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).map(\.id), [requestID])
+                            }
+                        }
+                    }
+                    pendingCall = nil
+                    let enteredProvider = MCPLifecycleDiagnostics.shared.snapshot(connectionID: a.endpoint.connectionID)
+                        .filter { $0.phase == .providerEntered }
+                    XCTAssertEqual(enteredProvider.count, change.rejectsPolicy || change == .removed ? 0 : 1, change.rawValue)
+                    if rename {
+                        let tab = try XCTUnwrap(a.context.window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == a.context.tabID })
+                        XCTAssertEqual(tab.name, change == .unchanged || change == .policyChangedAfterProvider ? "Renamed by admitted policy" : a.originalName, change.rawValue)
+                        XCTAssertEqual(tab.activeAgentSessionID, a.sessionID)
+                    } else {
+                        XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID), "Discovery never approves a scope")
+                        if change.rejectsPolicy || change == .removed {
+                            XCTAssertTrue(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).isEmpty, change.rawValue)
+                        }
+                    }
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    if change != .removed {
+                        let read = try await a.endpoint.callTool(
+                            name: MCPWindowToolName.readFile, arguments: ["path": a.context.fileURL.path]
+                        )
+                        XCTAssertTrue(try Self.toolResultText(read).contains(a.context.sentinel), "Policy denial must preserve this connection's allowed reads")
+                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                    }
+                } catch {
+                    failure = error
+                }
+                do { try await cleanup() } catch {
+                    if failure == nil { failure = error }
+                }
+                if let failure { throw failure }
+            }
+        }
+
+        private static func queuedScopeRequestArguments(_ agent: QueuedSessionAdminAgent, key: String) -> [String: Any] {
+            [
+                "op": "request_scope", "kind": "workspace", "workspace": agent.context.workspaceID.uuidString,
+                "capabilities": ["observe", "organize"], "idempotency_key": key, "_rawJSON": true
+            ]
+        }
+
+        private static func renewQueuedSessionAdminPolicy(
+            _ agent: QueuedSessionAdminAgent, restricted: Bool = false, explore: Bool = false
+        ) async {
+            await ServerNetworkManager.shared.installClientConnectionPolicy(
+                for: agent.endpoint.clientName, windowID: agent.context.window.windowID,
+                restrictedTools: restricted ? [MCPWindowToolName.sessionAdmin] : [],
+                reason: "Queued session administration regression", ttl: 60,
+                tabID: agent.context.tabID, runID: agent.runID, additionalTools: [], purpose: .agentModeRun,
+                taskLabelKind: explore ? .explore : nil, allowsAgentExternalControlTools: true
+            )
+        }
+
+        private static func prepareQueuedSessionAdminAgent(
+            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
+        ) async throws -> QueuedSessionAdminAgent {
+            try await fixture.registerDomainWorkspace(context)
+            try await activateWorkspace(for: context)
+            let window = context.window
+            let vm = window.agentModeViewModel
+            var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tabPosition = try XCTUnwrap(workspace.composeTabs.firstIndex { $0.id == context.tabID })
+            let sessionID = UUID()
+            workspace.composeTabs[tabPosition].activeAgentSessionID = sessionID
+            let workspacePosition = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+            window.workspaceManager.workspaces[workspacePosition] = workspace
+            window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+            let name = workspace.composeTabs[tabPosition].name
+            let entry = AgentSessionIndexEntry(
+                id: sessionID, tabID: context.tabID, name: name, savedAt: Date(timeIntervalSince1970: 0),
+                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+            let session = vm.session(for: context.tabID)
+            session.selectedAgent = .claudeCode
+            session.hasLoadedPersistedState = true
+            session.oversight.autoWakeOnUpdates = false
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+            let runID = UUID()
+            session.installRunID(runID)
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            let clientName = "queued-policy-\(UUID())"
+            await fixture.networkManager.installClientConnectionPolicy(
+                for: clientName, windowID: window.windowID, restrictedTools: [],
+                reason: "Queued session administration fixture", ttl: 60,
+                tabID: context.tabID, runID: runID, additionalTools: [], purpose: .agentModeRun,
+                allowsAgentExternalControlTools: true
+            )
+            let endpoint = try await PersistentMCPTestEndpoint.make(
+                label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
+                requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
+            )
+            XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], endpoint.connectionID)
+            let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
+            XCTAssertEqual(resolved.sessionID, sessionID)
+            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name)
+        }
+
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
             for toolName in ["prompt", "workspace_context"] {
                 try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -3997,6 +4320,36 @@ import XCTest
         func completedCount() -> Int {
             completed
         }
+    }
+
+    /// The entered signal is emitted only after the release continuation exists.
+    /// This deliberately has no polling or sleeps; the caller owns its XCTest deadline.
+    private actor MCPQueuedPolicyAdmissionGate {
+        private var waiter: CheckedContinuation<Void, Never>?
+        private var released = false
+
+        var isHolding: Bool {
+            waiter != nil
+        }
+
+        func hold(onRegistered: @Sendable () -> Void) async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                waiter = continuation
+                onRegistered()
+            }
+        }
+
+        func release() {
+            released = true
+            let registered = waiter
+            waiter = nil
+            registered?.resume()
+        }
+    }
+
+    private enum MCPQueuedPolicyFixtureError: Error {
+        case admissionNotReached
     }
 
     actor MCPExecutionIgnoringCancellationGate {

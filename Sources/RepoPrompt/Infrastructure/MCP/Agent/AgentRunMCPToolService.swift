@@ -685,7 +685,10 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
-        await DelegationSpawnAdmission.stamp(spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM)
+        await DelegationSpawnAdmission.stamp(
+            spawnAdmission, newSessionID: targetSessionID, viewModel: agentModeVM,
+            creationHandle: target.creationHandle
+        )
         // The new member is visible to the projector now; the reservation is not held through the run.
         DelegationSpawnAdmission.finish(spawnAdmission)
         #if DEBUG
@@ -1280,48 +1283,209 @@ struct AgentRunMCPToolService {
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
+    /// A cancellation never retargets after suspension, even to a successor run of the same session.
+    private struct CancelTarget {
+        let window: WindowState
+        let workspaceID: UUID
+        let session: AgentModeViewModel.TabSession
+        let sessionID: UUID
+        let binding: AgentPersistentSessionBindingIdentity
+        let control: AgentModeViewModel.AgentMCPControlContext
+        let controlGeneration: UInt64
+        let ownership: AgentRunOwnership?
+        let runID: UUID?
+        let stopFence: AgentRunStartStopFence
+        let parentSessionID: UUID?
+        let pendingStart: Bool
+        let pendingUpdatedAt: Date?
+        let scheduledProducerID: UUID?
+    }
+
     private func executeCancel(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let metadata = await captureRequestMetadata()
+        guard let reference = normalizedString(args["session_id"]) else {
+            throw MCPError.invalidParams("session_id is required for agent_run control operations.")
+        }
         let sessionID = try await resolveControlSessionID(
-            args,
-            operation: .runCancel,
-            targetWindow: targetWindow,
-            agentModeVM: agentModeVM,
-            metadata: metadata
+            reference: reference, targetWindow: targetWindow, agentModeVM: agentModeVM
         )
-        let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let caller = await AgentSessionTargetOperationGuard.resolveCaller(
+            metadata: metadata, targetWindow: targetWindow,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+        // Resolve the actual controlled object before authorizing. Raw metadata cannot rescue an
+        // ambiguous binding or authorize a different object occupying the routed tab.
+        let resolvedSession: AgentModeViewModel.TabSession?
+        do { resolvedSession = try agentModeVM.authoritativeLiveSession(for: sessionID) } catch {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        guard let session = resolvedSession,
+              agentModeVM.mcpControlledSession(sessionID: sessionID) === session,
+              session.activeAgentSessionID == sessionID,
+              let binding = session.persistentSessionBindingIdentity,
+              let control = session.mcpControlContext,
+              let workspaceID = targetWindow.workspaceManager.activeWorkspaceID,
+              session.runState.isActive || session.mcpFollowUpRunPending
+        else { throw AgentSessionTargetOperationGuard.denialError(reference: reference) }
+        let pendingStart = !session.runState.isActive && session.mcpFollowUpRunPending
+        guard pendingStart ? session.activeRunOwnership == nil
+            : (session.activeRunOwnership != nil && session.runID != nil)
+        else { throw AgentSessionTargetOperationGuard.denialError(reference: reference) }
+        let target = CancelTarget(
+            window: targetWindow, workspaceID: workspaceID, session: session, sessionID: sessionID,
+            binding: binding, control: control, controlGeneration: session.mcpControlActivationGeneration,
+            ownership: session.activeRunOwnership, runID: session.runID,
+            stopFence: AgentRunStartStopFence(session: session), parentSessionID: session.parentSessionID,
+            pendingStart: pendingStart, pendingUpdatedAt: session.mcpFollowUpRunPendingUpdatedAt,
+            scheduledProducerID: session.scheduledACPFollowUp?.id
+        )
+        try requireCurrentCancelTarget(target, caller: caller)
+        let initialSnapshot = await currentSnapshot(
+            sessionID: sessionID, registration: control.registration, agentModeVM: agentModeVM
+        )
         if initialSnapshot.status == .expired {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         if initialSnapshot.status.isTerminal {
             throw MCPError.invalidParams("The run is not currently active (status: \(initialSnapshot.status.rawValue)) and cannot be cancelled.")
         }
-        guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID),
-              session.runState.isActive || session.mcpFollowUpRunPending
-        else {
-            throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
-        }
-        let cancelsStartupPendingRun = !session.runState.isActive && session.mcpFollowUpRunPending
-        let tabID = session.tabID
         let cancelResult = try await withHeartbeat(
-            metadata.connectionID,
-            toolName,
-            "cancelling",
-            "Cancelling the agent run..."
+            metadata.connectionID, toolName, "cancelling", "Cancelling the agent run..."
         ) {
-            if cancelsStartupPendingRun {
-                await agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, false)
-            }
-            await agentModeVM.cancelAgentRun(tabID: tabID, completion: .terminalPublished)
-            await Task.yield()
-            return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
+            try await cancelCapturedTarget(target, caller: caller, metadata: metadata)
         }
         if let object = cancelResult.objectValue {
-            return try decoratedRunValue(snapshot: snapshot(from: object))
+            var result = try decoratedRunValue(snapshot: snapshot(from: object)).objectValue ?? object
+            result["cancellation"] = object["cancellation"]
+            return .object(result)
         }
         return cancelResult
+    }
+
+    /// Reuses the existing direct-child policy against the admitted object's own immutable provenance.
+    /// This synchronous fence is also the run owner's final admission callback.
+    private func requireCurrentCancelTarget(
+        _ target: CancelTarget, caller: DomainAgentSessionCallerIdentity
+    ) throws {
+        try Task.checkCancellation()
+        let viewModel = target.window.agentModeViewModel
+        let session = target.session
+        let resolvedSession: AgentModeViewModel.TabSession?
+        do { resolvedSession = try viewModel.authoritativeLiveSession(for: target.sessionID) } catch {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
+        }
+        guard try requireTargetWindow() === target.window,
+              !target.window.isClosing, !WindowStatesManager.shared.isTerminating,
+              target.window.workspaceManager.activeWorkspaceID == target.workspaceID,
+              resolvedSession === session,
+              viewModel.mcpControlledSession(sessionID: target.sessionID) === session,
+              session.activeAgentSessionID == target.sessionID,
+              session.persistentSessionBindingIdentity == target.binding,
+              session.mcpControlContext == target.control,
+              session.mcpControlActivationGeneration == target.controlGeneration,
+              session.activeRunOwnership == target.ownership, session.runID == target.runID,
+              session.stopState.cancellationGeneration == target.stopFence.cancellationGeneration,
+              session.parentSessionID == target.parentSessionID,
+              !target.pendingStart || (
+                  session.mcpFollowUpRunPendingUpdatedAt == target.pendingUpdatedAt
+                      && session.scheduledACPFollowUp?.id == target.scheduledProducerID
+              ),
+              !session.terminalCommitInProgress,
+              target.pendingStart ? (!session.runState.isActive && session.mcpFollowUpRunPending) : session.runState.isActive
+        else { throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID) }
+        let provenance: DomainAgentSessionTargetProvenance = session.hasLoadedPersistedState
+            ? AgentSessionTargetOperationGuard.provenance(
+                for: target.sessionID, loadedParentSessionID: session.parentSessionID
+            )
+            : .unknown(targetSessionID: target.sessionID)
+        try AgentSessionTargetOperationGuard.require(
+            operation: .runCancel, caller: caller, provenance: provenance,
+            reference: target.sessionID.uuidString
+        )
+    }
+
+    private func cancelCapturedTarget(
+        _ target: CancelTarget, caller: DomainAgentSessionCallerIdentity, metadata: RequestMetadata
+    ) async throws -> Value {
+        let currentCaller = await AgentSessionTargetOperationGuard.resolveCaller(
+            metadata: metadata, targetWindow: target.window,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+        guard currentCaller == caller else {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
+        }
+        try requireCurrentCancelTarget(target, caller: caller)
+        let admission = AgentRunCancellationAdmission(
+            scope: target.pendingStart ? .pendingStart : .activeRun,
+            session: target.session, binding: target.binding,
+            expectedOwnership: target.ownership, expectedRunID: target.runID,
+            cancellationGeneration: target.stopFence.cancellationGeneration,
+            pendingStartFence: target.pendingStart ? target.stopFence : nil,
+            validateAndClaim: {
+                do {
+                    try requireCurrentCancelTarget(target, caller: caller)
+                    return true
+                } catch { return false }
+            }
+        )
+        let viewModel = target.window.agentModeViewModel
+        let admitted: Bool
+        var stopped = false
+        var outcomeSnapshot: AgentRunMCPSnapshot?
+        if target.pendingStart {
+            admitted = viewModel.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
+            if admitted { outcomeSnapshot = viewModel.mcpSnapshot(for: target.session) }
+        } else {
+            guard let ownership = target.ownership else {
+                throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
+            }
+            let recorder = AgentRunCancellationOutcomeRecorder(
+                expectedOwnership: ownership, expectedRunID: target.runID, expectedBinding: target.binding,
+                onAcceptedPrimaryPublication: { _ in
+                    stopped = true
+                    if target.session.mcpControlContext == target.control,
+                       !target.session.runState.isActive,
+                       target.session.runID == nil || target.session.runID == target.runID
+                    {
+                        outcomeSnapshot = viewModel.mcpSnapshot(
+                            for: target.session, canonicalTerminalState: .cancelled,
+                            canonicalProviderRunID: target.runID
+                        )
+                    }
+                }
+            )
+            admitted = await viewModel.cancelAgentRunForSessionLink(
+                session: target.session, admission: admission, outcomeRecorder: recorder,
+                completion: .terminalPublished
+            )
+        }
+        guard admitted else { throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID) }
+        // The effect is settled. Read no UUID-routed store or successor snapshot after this point.
+        // Natural completion can win the terminal race; only the matching original revision may
+        // describe that outcome. The receipt still distinguishes initiation from a stopped run.
+        if outcomeSnapshot == nil,
+           target.session.persistentSessionBindingIdentity == target.binding,
+           target.session.mcpControlContext == target.control,
+           !target.session.runState.isActive,
+           target.session.runID == nil || target.session.runID == target.runID,
+           let revision = target.session.lastTerminalCommitRevision,
+           revision.ownership == target.ownership, revision.expectedRunID == target.runID
+        {
+            outcomeSnapshot = viewModel.mcpSnapshot(
+                for: target.session, canonicalTerminalState: revision.terminalState,
+                canonicalProviderRunID: target.runID
+            )
+        }
+        var result = (outcomeSnapshot ?? Self.agentRunExpiredSnapshot(sessionID: target.sessionID)).asObject()
+        result["cancellation"] = .object([
+            "run_id": target.runID.map { .string($0.uuidString) } ?? .null,
+            "initiated": .bool(!target.pendingStart),
+            "stopped": .bool(stopped),
+            "pending_start_withdrawn": .bool(target.pendingStart)
+        ])
+        return .object(result)
     }
 
     private func executeSteer(args: [String: Value]) async throws -> Value {

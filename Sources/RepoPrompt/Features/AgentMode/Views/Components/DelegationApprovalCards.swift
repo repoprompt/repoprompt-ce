@@ -53,6 +53,7 @@ struct DelegationApprovalSlot: View {
                 ForEach(requests) { request in
                     DelegationScopeApprovalCard(
                         request: request,
+                        authorityUnavailableReason: runtime.authorityUnavailableReason,
                         onApprove: { capabilities, threshold in
                             guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
                             var guardrails = request.guardrails
@@ -123,13 +124,13 @@ struct DelegationActiveScopesSection: View {
 
     var body: some View {
         let scopes = runtime.allLiveScopes()
-        if !scopes.isEmpty || runtime.persistenceFailed {
+        if !scopes.isEmpty || runtime.persistenceStatusMessage != nil {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                 Text("Active delegations")
                     .font(.headline)
-                if runtime.persistenceFailed {
-                    Label("Delegation changes could not be saved; they apply until RepoPrompt quits.", systemImage: "exclamationmark.triangle")
+                if let message = runtime.persistenceStatusMessage {
+                    Label(message, systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -172,6 +173,7 @@ struct DelegationActiveScopesSection: View {
 /// One-time approval of a delegation scope requested by an Agent session.
 struct DelegationScopeApprovalCard: View {
     let request: DelegationScopeRequest
+    let authorityUnavailableReason: String?
     /// Approved capabilities (a subset of the request) and the user's bulk-card threshold.
     let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>
     let onDeny: () -> Void
@@ -183,10 +185,12 @@ struct DelegationScopeApprovalCard: View {
 
     init(
         request: DelegationScopeRequest,
+        authorityUnavailableReason: String? = nil,
         onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>,
         onDeny: @escaping () -> Void
     ) {
         self.request = request
+        self.authorityUnavailableReason = authorityUnavailableReason
         self.onApprove = onApprove
         self.onDeny = onDeny
         _selected = State(initialValue: request.capabilities)
@@ -249,7 +253,11 @@ struct DelegationScopeApprovalCard: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            if let approvalFailure {
+            if let authorityUnavailableReason {
+                Label(authorityUnavailableReason, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if let approvalFailure {
                 Label(approvalFailureMessage(approvalFailure), systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -267,7 +275,7 @@ struct DelegationScopeApprovalCard: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(selected.isEmpty)
+                .disabled(selected.isEmpty || authorityUnavailableReason != nil)
             }
         }
         .padding(12)

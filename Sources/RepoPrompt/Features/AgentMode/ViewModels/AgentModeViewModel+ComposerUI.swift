@@ -133,7 +133,8 @@ extension AgentModeViewModel {
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil
         }
-        guard !resolvedSession.isComposerSubmissionInFlight,
+        guard resolvedSession.restorationAdmissionFailureMessage == nil,
+              !resolvedSession.isComposerSubmissionInFlight,
               !resolvedSession.isPreparingInitialWorktree,
               !resolvedSession.isChangingExecutionLocation
         else { return nil }

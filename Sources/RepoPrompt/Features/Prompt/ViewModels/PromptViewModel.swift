@@ -2980,7 +2980,7 @@ class PromptViewModel: ObservableObject {
             name: currentName,
             base: manager.workspaces[index].composeTabs[activeIdx]
         )
-        manager.workspaces[index].composeTabs[activeIdx] = snapshot
+        _ = manager.updateStoredComposeTabSnapshot(snapshot, workspaceID: manager.workspaces[index].id)
     }
 
     /// Flush pending editor state and snapshot the active tab before transitioning away.
@@ -3064,7 +3064,8 @@ class PromptViewModel: ObservableObject {
     private func createComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
-        blankAgentSessionID: UUID? = nil
+        blankAgentSessionID: UUID? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ForegroundComposeTabCreationResult {
         guard
             let manager = workspaceManager,
@@ -3086,6 +3087,7 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
+        guard onCreated?(newTab) ?? true else { return .failed }
         manager.workspaces[index].composeTabs.append(newTab)
         await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
             manager.workspaces[index].activeComposeTabID = newTab.id
@@ -3114,9 +3116,21 @@ class PromptViewModel: ObservableObject {
 
     @discardableResult
     @MainActor
-    func createBlankComposeTab(createAgentSession: Bool = false) async -> ForegroundComposeTabCreationResult {
-        let blankAgentSessionID = createAgentSession ? UUID() : nil
-        return await createComposeTab(strategy: .blank, blankAgentSessionID: blankAgentSessionID)
+    func createBlankComposeTab(
+        createAgentSession: Bool = false,
+        onAgentSessionCreated: (@MainActor (ComposeTabState, AgentSessionCreationClaim) -> Bool)? = nil
+    ) async -> ForegroundComposeTabCreationResult {
+        let creation: AgentSessionCreationClaim?
+        if createAgentSession {
+            guard let workspaceID = workspaceManager?.activeWorkspaceID else { return .failed }
+            creation = AgentSessionCreationClaim(workspaceID: workspaceID)
+        } else {
+            creation = nil
+        }
+        return await createComposeTab(strategy: .blank, blankAgentSessionID: creation?.sessionID) { tab in
+            if let creation { return onAgentSessionCreated?(tab, creation) ?? false }
+            return true
+        }
     }
 
     /// Create a fork-duplicate tab in the background (without switching to it).
@@ -3124,8 +3138,16 @@ class PromptViewModel: ObservableObject {
     /// but clears agent and chat session bindings so the forked tab gets fresh sessions.
     /// - Parameter sourceTabID: The specific tab to duplicate. Avoids racing with active-tab changes.
     @MainActor
-    func createBackgroundForkComposeTab(sourceTabID: UUID, named name: String? = nil) async -> ComposeTabState? {
-        await createBackgroundComposeTab(strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name)
+    func createBackgroundForkComposeTab(
+        sourceTabID: UUID, named name: String? = nil,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
+    ) async -> ComposeTabState? {
+        await createBackgroundComposeTab(
+            strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name,
+            isMutationContextCurrent: isMutationContextCurrent,
+            onCreated: onCreated
+        )
     }
 
     /// Ensure a tab is active; if the tab does not exist, create a new one with the provided strategy.
@@ -3170,7 +3192,9 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func createBackgroundComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
-        name: String? = nil
+        name: String? = nil,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ComposeTabState? {
         guard
             let manager = workspaceManager,
@@ -3181,7 +3205,11 @@ class PromptViewModel: ObservableObject {
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
 
+        // Re-prove delegated authority inside the tab owner, after any preparation and directly
+        // before the first visible mutation. Ordinary human creation has no additional predicate.
+        guard isMutationContextCurrent?() ?? true else { return nil }
         // Append but do NOT change activeComposeTabID
+        guard onCreated?(newTab) ?? true else { return nil }
         manager.workspaces[index].composeTabs.append(newTab)
         // Keep existing active tab; just sync lists
         loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -3223,7 +3251,8 @@ class PromptViewModel: ObservableObject {
         name: String?,
         sessionID: UUID,
         expectedWorkspaceID: UUID,
-        lifecycleAuthority: AgentSessionLifecycleAuthority
+        lifecycleAuthority: AgentSessionLifecycleAuthority,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async throws -> DurableBackgroundComposeTabCreationResult {
         guard let manager = workspaceManager else {
             return .rejected(
@@ -3313,6 +3342,12 @@ class PromptViewModel: ObservableObject {
                 in: manager,
                 workspaceIndex: index
             )
+            guard onCreated?(newTab) ?? true else {
+                return .rejected(
+                    .init(outcome: .rejected(reason: "creation_preparation_changed"), commitEvidence: .none),
+                    .sessionIdentityChanged
+                )
+            }
             manager.workspaces[index].composeTabs.append(newTab)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
@@ -3885,22 +3920,19 @@ class PromptViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let manager = workspaceManager,
-              let workspace = manager.activeWorkspace,
-              let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-              let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == id }) else { return }
-        manager.workspaces[index].composeTabs[tabIndex].name = trimmed
-        manager.workspaces[index].composeTabs[tabIndex].lastModified = Date()
+              let workspace = manager.activeWorkspace else { return }
+        let changed = manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [id]) { _, tab in
+            tab.name = trimmed
+            tab.lastModified = Date()
+        }
+        guard changed.contains(id) else { return }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        if let current = manager.activeWorkspace { loadComposeTabsFromWorkspace(current) }
         NotificationCenter.default.post(
             name: .composeTabNameChanged,
             object: nil,
-            userInfo: [
-                "tabID": id,
-                "windowID": windowID,
-                "name": trimmed
-            ]
+            userInfo: ["tabID": id, "windowID": windowID, "name": trimmed]
         )
     }
 
@@ -4823,31 +4855,19 @@ class PromptViewModel: ObservableObject {
         for tabIDs: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) -> ComposeTabPinMutationReport {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-            isMutationContextCurrent?() ?? true
+        guard let manager = workspaceManager, let workspace = manager.activeWorkspace,
+              isMutationContextCurrent?() ?? true,
+              tabIDs.allSatisfy({ manager.modelRoutingTab(workspaceID: workspace.id, tabID: $0) != nil })
         else { return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: true) }
-        let currentTabIDs = Set(manager.workspaces[index].composeTabs.map(\.id))
-        guard tabIDs.isSubset(of: currentTabIDs) else {
-            return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: true)
-        }
-
-        var updatedTabIDs: Set<UUID> = []
-        for tabIndex in manager.workspaces[index].composeTabs.indices {
-            let tabID = manager.workspaces[index].composeTabs[tabIndex].id
-            guard tabIDs.contains(tabID), manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { continue }
-            manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
-            if !pinned {
-                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = nil
-            }
-            updatedTabIDs.insert(tabID)
+        let updatedTabIDs = manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: tabIDs) { _, tab in
+            guard tab.isPinned != pinned else { return }
+            tab.isPinned = pinned
+            if !pinned { tab.pinnedOrder = nil }
         }
         guard !updatedTabIDs.isEmpty else {
             return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: false)
         }
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        if let current = manager.activeWorkspace { loadComposeTabsFromWorkspace(current) }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return ComposeTabPinMutationReport(updatedTabIDs: updatedTabIDs, contextRejected: false)

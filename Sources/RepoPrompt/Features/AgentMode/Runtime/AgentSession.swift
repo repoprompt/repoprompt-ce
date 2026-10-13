@@ -264,6 +264,13 @@ struct AgentSession: Codable, Identifiable {
     var pendingHandoffCreatedAt: Date?
     var pendingHandoffSourceItemID: UUID?
     var pendingHandoffDefersProviderLockUntilSend: Bool
+    /// A non-nil marker blocks every provider send until the user closes this incomplete fork.
+    /// Kept in the session payload so saving, reopening, and restarting cannot silently choose the
+    /// primary checkout when inherited worktree preparation did not complete.
+    var pendingHandoffExecutionLocationFailure: String?
+
+    static let incompleteHandoffExecutionLocationMessage =
+        "This fork did not finish preparing its worktree. Close this partial chat and create a new fork from the source after its worktree is ready."
 
     /// Optional recovery data. A decoded attempt is never authority to resume provider work.
     var selfCompactState: AgentSelfCompactState?
@@ -317,6 +324,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
+        pendingHandoffExecutionLocationFailure: String? = nil,
         selfCompactState: AgentSelfCompactState? = nil,
         isMCPOriginated: Bool = false,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
@@ -366,6 +374,7 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
+        self.pendingHandoffExecutionLocationFailure = pendingHandoffExecutionLocationFailure
         self.selfCompactState = selfCompactState
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindings = worktreeBindings
@@ -417,6 +426,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
+        case pendingHandoffExecutionLocationFailure
         case selfCompactState
         case isMCPOriginated
         case worktreeBindings
@@ -489,6 +499,17 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
+        if container.contains(.pendingHandoffExecutionLocationFailure),
+           try !container.decodeNil(forKey: .pendingHandoffExecutionLocationFailure)
+        {
+            // Unknown/future marker shapes and malformed values are still evidence of incomplete
+            // execution preparation. Decode them as blocked, never as an ordinary unbound session.
+            let reason = try? container.decode(String.self, forKey: .pendingHandoffExecutionLocationFailure)
+            pendingHandoffExecutionLocationFailure = reason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? reason : Self.incompleteHandoffExecutionLocationMessage
+        } else {
+            pendingHandoffExecutionLocationFailure = nil
+        }
         if container.contains(.selfCompactState), try !(container.decodeNil(forKey: .selfCompactState)) {
             do {
                 var restored = try container.decode(AgentSelfCompactState.self, forKey: .selfCompactState)

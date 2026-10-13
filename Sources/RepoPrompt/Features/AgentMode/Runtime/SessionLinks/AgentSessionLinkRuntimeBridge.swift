@@ -1196,7 +1196,9 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
     /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
-    let delegationScopes = DelegationScopeRuntime()
+    let delegationScopes = DelegationScopeRuntime(
+        persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
+    )
     /// Durable worktree ownership for delegated worktree creation/release; installed at launch.
     let worktreeOwnership = WorktreeOwnershipStore()
     /// The single shared administration service behind `session_admin` and future UI dispatchers.
@@ -1208,7 +1210,13 @@ final class AgentSessionLinkRuntimeBridge {
     /// `sessionAdministration`, which keeps the single authority check. Registers the organizing ops
     /// and the structure/lifecycle/worktree ops.
     private(set) lazy var sessionAdministrationFrontDoor: AgentSessionAdministrationFrontDoor = {
-        let frontDoor = AgentSessionAdministrationFrontDoor.production(core: sessionAdministration, scopes: delegationScopes)
+        let frontDoor = AgentSessionAdministrationFrontDoor.production(
+            core: sessionAdministration,
+            scopes: delegationScopes,
+            workspaceLocations: HistoryWorkspaceLocationResolver(workspaceStore: {
+                AppDomainRuntimeComposition.shared.runtime.workspaceStore
+            })
+        )
         frontDoor.registerStructureHandlers(scopes: delegationScopes, worktreeOwnership: worktreeOwnership)
         return frontDoor
     }()
@@ -1476,6 +1484,14 @@ final class AgentSessionLinkRuntimeBridge {
         }
         AgentSessionLinkLocationInvalidationSink.refreshObservedTargets = { [weak self] workspaceID in
             self?.requestMonitorLocationRefreshForObservedTargets(inWorkspace: workspaceID)
+        }
+        // Session removal cannot race unopened/restoring/blocked scope persistence. Before the
+        // first attach the production registry is closed; this predicate follows the existing scope
+        // runtime rather than duplicating its readiness state. Explicit ephemeral test bridges own
+        // no saved authority and must not leave a dead weak predicate in the process-global fixture.
+        // Suppressed production still has a requiresStore owner and remains fenced.
+        if delegationScopes.persistenceMode == .requiresStore {
+            AgentSessionDeletionRegistry.shared.installScopePersistenceAdmission(for: delegationScopes)
         }
         // Awaited by the registry rather than spawned: the deleting caller must not proceed to
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
@@ -1908,6 +1924,14 @@ final class AgentSessionLinkRuntimeBridge {
     func freezeForTermination() {
         guard !isFrozenForTermination else { return }
         isFrozenForTermination = true
+        // The deletion registry owns reported per-session removals. Closing its admission and
+        // checking both disk attempts and commit callbacks in this same MainActor turn proves that
+        // no later reported removal can invalidate a clean scope seal. If anything is pending, leave the
+        // scope document open and require fresh approval next launch. Ephemeral fixtures have no
+        // scope document to seal and must not freeze the process-global deletion fixture.
+        let mayRestoreScopes = delegationScopes.availability == .ready
+            && AgentSessionDeletionRegistry.shared.freezeNewDeletionAdmissionForTermination()
+        delegationScopes.freezeForTermination(allowRestoration: mayRestoreScopes)
         // Presentation-only work is dropped rather than drained: a queued projection repaint has no
         // durable or agent-visible consequence, so nothing about quitting has to wait for it.
         pendingMonitorTargetEndpoints.removeAll()
@@ -2238,9 +2262,10 @@ final class AgentSessionLinkRuntimeBridge {
     private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
-        await invalidateSession(sessionID, reason: .sessionDeleted)
-        // No scope may keep acting for, or over a tree rooted at, a session that no longer exists.
+        // Revoke synchronously before the first suspension. The deletion registry retains its
+        // commit task through this callback, so an overlapping quit cannot seal stale scope intent.
         delegationScopes.revokeAll(involving: sessionID)
+        await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
         // actor turn as the write. A separate read would leave a hop where an intervening row could be
@@ -3770,7 +3795,8 @@ final class AgentSessionLinkRuntimeBridge {
         observerSessionID: UUID,
         targetSessionID: UUID,
         linkID: UUID,
-        generation: UInt64
+        generation: UInt64,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
         guard !isFrozenForTermination else {
             return .failed(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
@@ -3788,7 +3814,7 @@ final class AgentSessionLinkRuntimeBridge {
         }
         return await performStop(
             observerEndpoint: observerEndpoint, targetEndpoint: targetEndpoint,
-            expectedReference: reference, admitted: admitted
+            expectedReference: reference, admitted: admitted, isStillAuthorized: isStillAuthorized
         )
     }
 
@@ -3819,7 +3845,8 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         expectedReference: DomainAgentSessionLinkReference,
-        admitted: ReferenceBookkeeping?
+        admitted: ReferenceBookkeeping?,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
         let pair = AgentSessionOversightIntent(
             observerSessionID: observerEndpoint.sessionID,
@@ -3851,7 +3878,8 @@ final class AgentSessionLinkRuntimeBridge {
                ) == true
             {
                 return await performPairRetirement(
-                    pair: pair, reference: expectedReference, admittedClose: admitted
+                    pair: pair, reference: expectedReference, admittedClose: admitted,
+                    isStillAuthorized: isStillAuthorized
                 )
             }
             guard let grant else { return .alreadyStopped }
@@ -3859,7 +3887,9 @@ final class AgentSessionLinkRuntimeBridge {
                 return .failed(message: Self.staleRelationshipMessage)
             }
             if let admitted, bookkeepingByReference[expectedReference] != admitted { return .alreadyStopped }
-            return await performPairRetirement(pair: pair, reference: expectedReference)
+            return await performPairRetirement(
+                pair: pair, reference: expectedReference, isStillAuthorized: isStillAuthorized
+            )
         }
         #if DEBUG
             logPairLane(pair: pair, outcome: "retired")
@@ -3884,8 +3914,12 @@ final class AgentSessionLinkRuntimeBridge {
     private func performPairRetirement(
         pair: AgentSessionOversightIntent,
         reference: DomainAgentSessionLinkReference,
-        admittedClose: ReferenceBookkeeping? = nil
+        admittedClose: ReferenceBookkeeping? = nil,
+        isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async -> AgentMonitorStopOutcome {
+        guard isStillAuthorized?() ?? true else {
+            return .failed(message: "Delegated authority ended before the unlink.")
+        }
         if let admittedClose {
             guard launchCoordinator?.permitsCloseRetirement(
                 reference, pair: pair, token: admittedClose.token,
@@ -3940,6 +3974,9 @@ final class AgentSessionLinkRuntimeBridge {
             // mapping and must keep its durable row.
             await settleEstablishment(pair: pair, token: token)
             guard bookkeepingByReference[reference] == mapped, !isFrozenForTermination else { break }
+            guard isStillAuthorized?() ?? true else {
+                return .failed(message: "Delegated authority ended before the unlink.")
+            }
             compensationAttempts += 1
             receipt = await intentStore.remove(pair, ifCurrent: token, assertedAt: nil)
         }
@@ -7503,7 +7540,7 @@ final class AgentSessionLinkRuntimeBridge {
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
-            case .persistenceFailed, .persistenceIndeterminate:
+            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
