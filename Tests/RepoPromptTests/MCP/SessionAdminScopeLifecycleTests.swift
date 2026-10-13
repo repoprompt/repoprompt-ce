@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptVCS
 import XCTest
 
 /// App-side delegation scopes: durable store, runtime, the `session_admin` scope lifecycle over MCP,
@@ -1011,7 +1012,13 @@ final class SessionAdminStructureTests: XCTestCase {
         /// Runs inside a bind/unbind just before the write-time authority check (a revocation or a
         /// membership change landing mid-transition).
         var beforeWrite: (@MainActor () -> Void)?
+        var beforePreviewReturn: (@MainActor () async -> Void)?
+        var beforeCreateCommit: (@MainActor () async -> Void)?
+        var afterBindAdmission: (@MainActor (UUID, String) async throws -> Void)?
+        var failPersistenceAfterBind = false
+        var provenance: Provenance?
         var boundElsewhere: [String: Set<UUID>] = [:]
+        var retainedBindingsBySession: [UUID: Set<String>] = [:]
         private var waiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
 
         func becomeIdle(_ sessionID: UUID) {
@@ -1025,8 +1032,11 @@ final class SessionAdminStructureTests: XCTestCase {
             forSession sessionID: UUID,
             repoRoot _: String?,
             branch: String?,
-            baseRef _: String?
+            baseRef _: String?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
         ) async throws -> SessionAdminWorktreeInfo {
+            await beforeCreateCommit?()
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             created.append(sessionID)
             return SessionAdminWorktreeInfo(
                 worktreeID: "wt-\(created.count)", repositoryID: "repo", repoRootPath: "/repo",
@@ -1038,15 +1048,23 @@ final class SessionAdminStructureTests: XCTestCase {
             sessionID: UUID,
             worktree: String,
             repoRoot _: String?,
-            isStillAuthorized: @escaping @MainActor () -> Bool
+            isStillAuthorized: @escaping @MainActor () -> Bool,
+            admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
+            bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
         ) async throws -> SessionAdminWorktreeInfo {
             guard idle[sessionID] ?? true else { throw SessionAdminHostError.notIdle }
             beforeWrite?()
             guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            let worktreeID = worktree.hasPrefix("@id:") ? String(worktree.dropFirst(4)) : worktree
+            try admitBindings([worktreeID])
+            try await afterBindAdmission?(sessionID, worktreeID)
             bindCalls.append((sessionID, worktree))
-            bound[sessionID] = [Self.summary(worktree)]
+            bound[sessionID] = [Self.summary(worktreeID)]
+            updateProvenance(sessionID, worktrees: [worktreeID])
+            bindingsCommitted([worktreeID])
+            if failPersistenceAfterBind { throw SessionAdminHostError.invalid("test_persistence_failure") }
             return SessionAdminWorktreeInfo(
-                worktreeID: worktree, repositoryID: "repo", repoRootPath: "/repo", path: "/managed/\(worktree)",
+                worktreeID: worktreeID, repositoryID: "repo", repoRootPath: "/repo", path: "/managed/\(worktreeID)",
                 branch: nil, isPrunable: false
             )
         }
@@ -1062,7 +1080,17 @@ final class SessionAdminStructureTests: XCTestCase {
             unbindCalls.append(sessionID)
             let removed = (bound[sessionID] ?? []).filter { worktreeID == nil || $0.worktreeID == worktreeID }
             bound[sessionID] = (bound[sessionID] ?? []).filter { !removed.contains($0) }
+            updateProvenance(sessionID, worktrees: Set((bound[sessionID] ?? []).map(\.worktreeID)))
             return removed.map(\.worktreeID)
+        }
+
+        private func updateProvenance(_ sessionID: UUID, worktrees: Set<String>) {
+            guard let old = provenance?.sessions[sessionID] else { return }
+            provenance?.add(
+                sessionID, parent: old.parentSessionID, org: old.organizationalParentID,
+                workspace: old.workspaceID, scope: old.delegationScopeID,
+                laneCreator: old.createdByOverseerSessionID, live: old.isLive, state: old.runState, worktrees: worktrees
+            )
         }
 
         func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary] {
@@ -1080,6 +1108,11 @@ final class SessionAdminStructureTests: XCTestCase {
 
         func allBoundWorktrees() -> [String: Set<UUID>] {
             var result = boundElsewhere
+            for (sessionID, ids) in retainedBindingsBySession {
+                for id in ids {
+                    result[id, default: []].insert(sessionID)
+                }
+            }
             for (sessionID, summaries) in bound {
                 for summary in summaries {
                     result[summary.worktreeID, default: []].insert(sessionID)
@@ -1088,12 +1121,17 @@ final class SessionAdminStructureTests: XCTestCase {
             return result
         }
 
+        func retainedWorktreeIDsAfterReplacingBinding(sessionID: UUID) -> Set<String> {
+            retainedBindingsBySession[sessionID] ?? []
+        }
+
         func isWorktreePrunable(path _: String, repoRoot _: String?) async -> Bool {
             false
         }
 
         func previewMerge(sessionID _: UUID, repoRoot _: String?, mergeTarget _: String?) async throws -> Value {
-            .object(["operation_id": .string("op-1")])
+            await beforePreviewReturn?()
+            return .object(["operation_id": .string("op-1")])
         }
 
         func applyMerge(sessionID _: UUID, operationID: String) async throws -> Value {
@@ -1122,6 +1160,7 @@ final class SessionAdminStructureTests: XCTestCase {
 
         init() {
             structure = StructureHost(provenance: provenance)
+            worktrees.provenance = provenance
             var projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
             let ownership = ownership
             projector.ownedUnreleasedWorktreeIDs = { ownership.ownedUnreleasedWorktreeIDs(createdBy: $0) }
@@ -1634,6 +1673,213 @@ final class SessionAdminStructureTests: XCTestCase {
 
     // MARK: - Worktrees on behalf
 
+    @MainActor
+    private final class BindGate {
+        private var hold: CheckedContinuation<Void, Never>?
+        private var pausedWaiters: [CheckedContinuation<Void, Never>] = []
+        private var paused = false
+
+        func pause() async {
+            paused = true
+            for waiter in pausedWaiters {
+                waiter.resume()
+            }
+            pausedWaiters.removeAll()
+            await withCheckedContinuation { hold = $0 }
+        }
+
+        func waitUntilPaused() async {
+            if paused { return }
+            await withCheckedContinuation { pausedWaiters.append($0) }
+        }
+
+        func resume() {
+            hold?.resume()
+            hold = nil
+        }
+    }
+
+    func testWorktreeBindEnforcesLimitAndDeduplicatesSharedAndReplacedIdentities() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), a = UUID(), b = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(a, parent: caller, worktrees: ["old"])
+        fixture.provenance.add(b, parent: caller)
+        fixture.worktrees.bound[a] = [WorktreeHost.summary("old")]
+        try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+        let replacement = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [a], args: ["worktree": .string("new")])
+        XCTAssertEqual(items(replacement)[a.uuidString]?["result"], .string("bound"), "Replacing the only binding has no count growth")
+        let shared = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [b], args: ["worktree": .string("new")])
+        XCTAssertEqual(items(shared)[b.uuidString]?["result"], .string("bound"), "Shared worktree identities count once")
+        let denied = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [a], args: ["worktree": .string("third")])
+        XCTAssertEqual(items(denied)[a.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertEqual(fixture.worktrees.bound[a]?.map(\.worktreeID), ["new"], "The other member keeps new counted")
+
+        let zero = Fixture()
+        let overseer = UUID(), target = UUID()
+        zero.provenance.add(overseer, parent: nil)
+        zero.provenance.add(target, parent: overseer)
+        try zero.grant(overseer, guardrails: .init(maxWorktrees: 0))
+        let blocked = try await zero.value(.adminWorktreeBind, caller: overseer, targets: [target], args: ["worktree": .string("external")])
+        XCTAssertEqual(items(blocked)[target.uuidString]?["guardrail"], .string("max_worktrees"))
+        XCTAssertTrue(zero.worktrees.bindCalls.isEmpty)
+    }
+
+    func testWorktreeReplacementCountsTheSameSessionsBindingRetainedInAnotherWindow() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller, worktrees: ["old"])
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("old")]
+        fixture.worktrees.retainedBindingsBySession[target] = ["old"]
+        try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+
+        let denied = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [target], args: ["worktree": .string("new")])
+        XCTAssertEqual(items(denied)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty)
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["old"])
+    }
+
+    func testConcurrentBindsReserveDistinctIdentitiesAndShareTheSameIdentity() async throws {
+        for sameIdentity in [false, true] {
+            let fixture = Fixture()
+            let caller = UUID(), a = UUID(), b = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(a, parent: caller)
+            fixture.provenance.add(b, parent: caller)
+            let scope = try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+            let gate = BindGate()
+            fixture.worktrees.afterBindAdmission = { target, _ in if target == a { await gate.pause() } }
+            let first = Task { try await fixture.value(.adminWorktreeBind, caller: caller, targets: [a], args: ["worktree": .string("one")]) }
+            await gate.waitUntilPaused()
+            let second = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [b], args: ["worktree": .string(sameIdentity ? "one" : "two")])
+            XCTAssertEqual(items(second)[b.uuidString]?["result"], .string(sameIdentity ? "bound" : "not_applied"))
+            let creation = try await fixture.value(.adminWorktreeCreate, caller: caller, targets: [b])
+            XCTAssertEqual(creation["code"], .string("scope_guardrail_exceeded"), "Creation sees a pending bind without double-charging an already-published shared identity")
+            gate.resume()
+            _ = try await first.value
+            let usage = fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil)
+            XCTAssertEqual(usage.worktreeCount, 1)
+            XCTAssertEqual(fixture.runtime.usageIncludingReservations(usage).worktreeCount, 1, "All binding reservations settle")
+        }
+    }
+
+    func testCreateAndBindAtTheLimitTransfersReservationToOwnedIdentity() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        let scope = try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+        let reply = try await fixture.value(.adminWorktreeCreate, caller: caller, targets: [target], args: ["bind": .bool(true)])
+        XCTAssertEqual(reply["binding"]?.objectValue?["result"], .string("bound"))
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["wt-1"])
+        let usage = fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil)
+        XCTAssertEqual(usage.worktreeCount, 1)
+        XCTAssertEqual(fixture.runtime.usageIncludingReservations(usage).worktreeCount, 1)
+    }
+
+    func testDeferredBindChecksFreshUsageAndFailedPersistenceKeepsCommittedOwnership() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        let scope = try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+        fixture.worktrees.idle[target] = false
+        _ = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [target], args: ["worktree": .string("later"), "apply": .string("next_boundary")])
+        _ = try await fixture.value(.adminWorktreeCreate, caller: caller, targets: [target])
+        fixture.worktrees.becomeIdle(target)
+        await fixture.worktreeHandler.settleDeferredBinds()
+        guard case .failed? = fixture.worktreeHandler.deferredOutcomes[target] else { return XCTFail("Fresh owned usage must refuse the deferred binding") }
+        XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty)
+
+        fixture.ownership.markReleased([WorktreeHost.summary("wt-1")], bySessionID: caller, at: Date())
+        fixture.worktrees.failPersistenceAfterBind = true
+        let reply = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [target], args: ["worktree": .string("wt-1")])
+        XCTAssertEqual(items(reply)[target.uuidString]?["code"], .string("bind_failed"))
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["wt-1"])
+        XCTAssertNil(fixture.ownership.record(worktreeID: "wt-1")?.releasedAt, "Ownership reactivates with publication, even if its later disk flush fails")
+        let usage = fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil)
+        XCTAssertEqual(fixture.runtime.usageIncludingReservations(usage).worktreeCount, 1)
+    }
+
+    func testBindReactivationCannotExceedTheOriginalCreatorsScopeLimit() async throws {
+        let fixture = Fixture()
+        let original = UUID(), caller = UUID(), target = UUID()
+        fixture.provenance.add(original, parent: nil)
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        let originalScope = try fixture.grant(original, guardrails: .init(maxWorktrees: 0))
+        try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+        fixture.ownership.recordCreation(
+            .init(worktreeID: "released", repositoryID: "repo", repoRootPath: "/repo", path: "/managed/released", branch: nil, isPrunable: false),
+            createdBySessionID: original, delegationScopeID: originalScope.id, at: Date()
+        )
+        fixture.ownership.markReleased([WorktreeHost.summary("released")], bySessionID: original, at: Date())
+        let reply = try await fixture.value(.adminWorktreeBind, caller: caller, targets: [target], args: ["worktree": .string("released")])
+        XCTAssertEqual(items(reply)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "released")?.releasedAt)
+        XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty)
+    }
+
+    func testWorktreeCreationRechecksLeaseAndTargetMembershipAtTheFinalFence() async throws {
+        for revoke in [true, false] {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            let scope = try fixture.grant(caller, guardrails: .init(maxWorktrees: 1))
+            fixture.worktrees.beforeCreateCommit = {
+                await Task.yield()
+                if revoke { fixture.runtime.revoke(scopeID: scope.id) }
+                else { fixture.provenance.add(target, parent: nil) }
+            }
+            let reply = try await fixture.value(.adminWorktreeCreate, caller: caller, targets: [target])
+            XCTAssertEqual(items(reply)[target.uuidString]?["code"], .string("scope_revoked"))
+            XCTAssertTrue(fixture.worktrees.created.isEmpty)
+            XCTAssertTrue(fixture.ownership.records.isEmpty)
+            let usage = fixture.projector.usage(of: scope.grant, spawnParentSessionID: nil)
+            XCTAssertEqual(fixture.runtime.usageIncludingReservations(usage).worktreeCount, 0)
+        }
+    }
+
+    @MainActor
+    private final class CreationFence {
+        var preparatoryQueueFinished = false
+        var calls = 0
+        func deny() throws {
+            XCTAssertTrue(preparatoryQueueFinished)
+            calls += 1
+            throw SessionAdminHostError.authorityEnded
+        }
+    }
+
+    func testProductionGitCreationFenceRunsAfterPreparationAndDeniesBeforeGitAdd() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: "SessionAdminCreationFence")
+        defer { repository.cleanup() }
+        let source = try repository.makeRepository(named: "source", files: ["README.md": "fixture\n"])
+        let destination = repository.sandbox.appendingPathComponent("denied")
+        let service = GitService()
+        let fence = CreationFence()
+        await service.setWorktreeMutationLockAcquiredHandlerForTesting { _ in
+            await MainActor.run { fence.preparatoryQueueFinished = true }
+        }
+        do {
+            _ = try await service.createWorktreeWithResult(
+                request: .init(path: destination, branch: "denied-branch", cloneTrackedCheckout: false),
+                at: source, beforeCommit: { try await fence.deny() }
+            )
+            XCTFail("Authority lost during preparation must refuse the actual Git creation")
+        } catch {
+            XCTAssertEqual(error as? SessionAdminHostError, .authorityEnded)
+        }
+        XCTAssertEqual(fence.calls, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        let refs = try repository.runGit(["for-each-ref", "--format=%(refname)", "refs/heads/denied-branch"], at: source)
+        XCTAssertEqual(refs.trimmingCharacters(in: .whitespacesAndNewlines), "")
+        let worktrees = try repository.runGit(["worktree", "list", "--porcelain"], at: source)
+        XCTAssertFalse(worktrees.contains(destination.path))
+    }
+
     func testWorktreeCreateRecordsOwnershipAndCountsTowardMaxWorktrees() async throws {
         let fixture = Fixture()
         let overseer = UUID(), member = UUID()
@@ -1744,6 +1990,30 @@ final class SessionAdminStructureTests: XCTestCase {
             .adminMergeApply, caller: overseer, targets: [member], args: ["operation_id": .string("op-1")]
         )
         XCTAssertEqual(applied["result"], .string("reviewed"))
+    }
+
+    func testMergePreviewRechecksAuthorityAfterHostSuspension() async throws {
+        for revokeScope in [true, false] {
+            let fixture = Fixture()
+            let overseer = UUID(), member = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(member, parent: overseer)
+            let scope = try fixture.grant(overseer)
+            fixture.worktrees.beforePreviewReturn = {
+                await Task.yield()
+                if revokeScope {
+                    fixture.runtime.revoke(scopeID: scope.id)
+                } else {
+                    fixture.provenance.add(member, parent: nil)
+                }
+            }
+            do {
+                _ = try await fixture.value(.adminMergePreview, caller: overseer, targets: [member])
+                XCTFail("A preview must not disclose worktree details after its authority ends")
+            } catch is MCPError {} catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
     }
 
     // MARK: - Persistence
@@ -3946,13 +4216,26 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
             self.base = base
         }
 
-        func createWorktree(forSession sessionID: UUID, repoRoot: String?, branch: String?, baseRef: String?) async throws -> SessionAdminWorktreeInfo {
-            try await base.createWorktree(forSession: sessionID, repoRoot: repoRoot, branch: branch, baseRef: baseRef)
+        func createWorktree(
+            forSession sessionID: UUID, repoRoot: String?, branch: String?, baseRef: String?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async throws -> SessionAdminWorktreeInfo {
+            try await base.createWorktree(
+                forSession: sessionID, repoRoot: repoRoot, branch: branch, baseRef: baseRef,
+                isStillAuthorized: isStillAuthorized
+            )
         }
 
-        func bindWorktree(sessionID: UUID, worktree: String, repoRoot: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> SessionAdminWorktreeInfo {
+        func bindWorktree(
+            sessionID: UUID, worktree: String, repoRoot: String?, isStillAuthorized: @escaping @MainActor () -> Bool,
+            admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
+            bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
+        ) async throws -> SessionAdminWorktreeInfo {
             if failBinding { throw NSError(domain: "Test", code: 1, userInfo: [NSLocalizedDescriptionKey: "test_bind_failure"]) }
-            return try await base.bindWorktree(sessionID: sessionID, worktree: worktree, repoRoot: repoRoot, isStillAuthorized: isStillAuthorized)
+            return try await base.bindWorktree(
+                sessionID: sessionID, worktree: worktree, repoRoot: repoRoot, isStillAuthorized: isStillAuthorized,
+                admitBindings: admitBindings, bindingsCommitted: bindingsCommitted
+            )
         }
 
         func unbindWorktrees(sessionID: UUID, worktreeID: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> [String] {
@@ -3973,6 +4256,10 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
 
         func allBoundWorktrees() -> [String: Set<UUID>] {
             base.allBoundWorktrees()
+        }
+
+        func retainedWorktreeIDsAfterReplacingBinding(sessionID: UUID) -> Set<String> {
+            base.retainedWorktreeIDsAfterReplacingBinding(sessionID: sessionID)
         }
 
         func isWorktreePrunable(path: String, repoRoot: String?) async -> Bool {

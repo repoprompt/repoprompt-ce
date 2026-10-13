@@ -747,10 +747,13 @@ actor GitService {
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
     /// Receipt observation is additive and fail-open: creation remains successful when
     /// authority or witness evidence cannot be proven.
+    @TaskLocal private static var worktreeCreationCommitFence: (@Sendable () async throws -> Void)?
+
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
@@ -984,7 +987,9 @@ actor GitService {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
+                        try await runGit(args, at: repoURL)
+                    }
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
@@ -8081,6 +8086,12 @@ actor GitService {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        // Only delegated creation carries this callback. All repository resolution, mutation-lock,
+        // eligibility and process-lane waits have completed; rejection here leaves no Git worktree
+        // or branch. Once admitted, checkout and receipt completion retain ordinary semantics.
+        if args.prefix(2).elementsEqual(["worktree", "add"]) {
+            try await Self.worktreeCreationCommitFence?()
+        }
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {

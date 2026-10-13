@@ -61,6 +61,8 @@ struct DelegationScopeReservation: Hashable {
     let scopeIDs: [UUID]
     let sessions: Int
     let worktrees: Int
+    /// Binding reservations carry identities; concurrent binds of the same worktree count once.
+    var worktreeIDs: Set<String> = []
 }
 
 enum DelegationScopeRequestError: Error, Equatable {
@@ -210,9 +212,9 @@ final class DelegationScopeRuntime: ObservableObject {
     ///
     /// Taken synchronously right after a guardrail check (no suspension in between) and released when
     /// creation finishes or fails, so two concurrent creations can never both pass a limit of one.
-    func reserve(scopeIDs: [UUID], sessions: Int = 0, worktrees: Int = 0) -> DelegationScopeReservation {
+    func reserve(scopeIDs: [UUID], sessions: Int = 0, worktrees: Int = 0, worktreeIDs: Set<String> = []) -> DelegationScopeReservation {
         let reservation = DelegationScopeReservation(
-            id: makeUUID(), scopeIDs: Array(Set(scopeIDs)), sessions: sessions, worktrees: worktrees
+            id: makeUUID(), scopeIDs: Array(Set(scopeIDs)), sessions: sessions, worktrees: worktrees, worktreeIDs: worktreeIDs
         )
         reservations[reservation.id] = reservation
         return reservation
@@ -226,11 +228,14 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Projected usage plus in-flight reservations on the same scope.
     func usageIncludingReservations(_ usage: DomainDelegationScopeUsage) -> DomainDelegationScopeUsage {
         let held = reservations.values.filter { $0.scopeIDs.contains(usage.scopeID) }
+        let pendingIDs = held.reduce(into: Set<String>()) { $0.formUnion($1.worktreeIDs) }
         return DomainDelegationScopeUsage(
             scopeID: usage.scopeID,
             liveSessionCount: usage.liveSessionCount + held.reduce(0) { $0 + $1.sessions },
-            worktreeCount: usage.worktreeCount + held.reduce(0) { $0 + $1.worktrees },
-            spawnParentDepth: usage.spawnParentDepth
+            worktreeCount: usage.worktreeCount + held.reduce(0) { $0 + $1.worktrees }
+                + pendingIDs.subtracting(usage.countedWorktreeIDs).count,
+            spawnParentDepth: usage.spawnParentDepth,
+            countedWorktreeIDs: usage.countedWorktreeIDs.union(pendingIDs)
         )
     }
 

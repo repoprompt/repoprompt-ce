@@ -415,14 +415,17 @@ package struct DomainDelegationScopeUsage: Hashable, Sendable {
     package let scopeID: UUID
     package let liveSessionCount: Int
     package let worktreeCount: Int
+    /// Distinct identities already represented in `worktreeCount`, for in-flight binding deduplication.
+    package let countedWorktreeIDs: Set<String>
     /// For session-creating operations: the depth of the new session's organizational parent within
     /// this scope's tree (root = 0). `nil` when the scope is not a tree or the op creates no session.
     package let spawnParentDepth: Int?
 
-    package init(scopeID: UUID, liveSessionCount: Int, worktreeCount: Int, spawnParentDepth: Int? = nil) {
+    package init(scopeID: UUID, liveSessionCount: Int, worktreeCount: Int, spawnParentDepth: Int? = nil, countedWorktreeIDs: Set<String> = []) {
         self.scopeID = scopeID
         self.liveSessionCount = liveSessionCount
         self.worktreeCount = worktreeCount
+        self.countedWorktreeIDs = countedWorktreeIDs
         self.spawnParentDepth = spawnParentDepth
     }
 }

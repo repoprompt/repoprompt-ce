@@ -173,10 +173,22 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             scopeIDs: Array(evaluation.scopeIDs.union(context.scopeChain(of: batch.scope).map(\.id))), worktrees: 1
         )
         defer { context.scopes.release(reservation) }
-        let info = try await host.createWorktree(forSession: target, repoRoot: repoRoot, branch: branch, baseRef: baseRef)
+        let handlerContext = context
+        let info: SessionAdminWorktreeInfo
+        do {
+            info = try await host.createWorktree(
+                forSession: target, repoRoot: repoRoot, branch: branch, baseRef: baseRef,
+                isStillAuthorized: { handlerContext.isStillAuthorized(lease, scope: batch.scope) }
+            )
+        } catch SessionAdminHostError.authorityEnded {
+            return SessionAdminReply.batch(op: "worktree_create", items: [.revoked(target)])
+        }
         // Ownership is recorded even if authority lapsed during creation: the worktree exists, and
         // the record is what lets the user find and clean it up.
         ownership.recordCreation(info, createdBySessionID: caller, delegationScopeID: batch.scope.id, at: now())
+        // The ownership row now counts the same identity; the anonymous creation reservation must
+        // transfer before an optional bind checks usage, otherwise create+bind charges twice.
+        context.scopes.release(reservation)
         var reply: [String: Value] = [
             "result": .string("created"), "op": .string("worktree_create"),
             "session_id": .string(target.uuidString), "worktree": info.value,
@@ -238,15 +250,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         if mode == .nextBoundary, !host.isIdleForWorktreeTransition(sessionID: target) {
             return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
         }
-        let context = context
         do {
-            let info = try await host.bindWorktree(sessionID: target, worktree: worktree, repoRoot: repoRoot) {
-                context.isStillAuthorized(lease, scope: scope)
-            }
-            ownership.clearReleased(worktreeID: info.worktreeID)
+            let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot)
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
         } catch SessionAdminHostError.authorityEnded {
             return .revoked(target)
+        } catch let SessionAdminHostError.guardrailExceeded(limit, current) {
+            return SessionAdminItemResult(
+                sessionID: target, result: "not_applied", code: "scope_guardrail_exceeded",
+                fields: ["guardrail": .string("max_worktrees"), "limit": .int(limit), "current": .int(current)]
+            )
         } catch SessionAdminHostError.notIdle {
             if mode == .nextBoundary {
                 return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
@@ -261,6 +274,81 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 fields: ["detail": .string(error.localizedDescription)]
             )
         }
+    }
+
+    /// Resolving a selector and preparing roots may suspend. Admission runs only at the host's final
+    /// fence, using resolved worktree identities; the reservations cover its remaining publication
+    /// awaits and deduplicate both concurrent same-tree binds and already-counted ownership.
+    private func bindWithAdmission(
+        lease: DomainDelegationScopeLease,
+        scope: DomainDelegationScopeRecord,
+        worktree: String,
+        repoRoot: String?
+    ) async throws -> SessionAdminWorktreeInfo {
+        let context = context
+        var reservations: [DelegationScopeReservation] = []
+        defer { for reservation in reservations {
+            context.scopes.release(reservation)
+        } }
+        return try await host.bindWorktree(
+            sessionID: lease.targetSessionID, worktree: worktree, repoRoot: repoRoot,
+            isStillAuthorized: { context.isStillAuthorized(lease, scope: scope) },
+            admitBindings: { desiredIDs in
+                precondition(reservations.isEmpty, "A binding transition admits only once")
+                reservations = try self.reserveBinding(desiredIDs, target: lease.targetSessionID, scope: scope)
+            },
+            bindingsCommitted: { desiredIDs in
+                for worktreeID in desiredIDs {
+                    self.ownership.clearReleased(worktreeID: worktreeID)
+                }
+            }
+        )
+    }
+
+    private func reserveBinding(
+        _ desiredIDs: Set<String>, target: UUID, scope: DomainDelegationScopeRecord
+    ) throws -> [DelegationScopeReservation] {
+        let reactivated = desiredIDs.compactMap { ownership.record(worktreeID: $0) }
+            .filter { $0.releasedAt != nil && $0.createdBySessionID != nil }
+        var records = context.scopeChain(of: scope)
+            + DelegationSpawnAdmission.guardrailScopes(forCreator: target, scopes: context.scopes, projector: context.projector)
+        for creator in Set(reactivated.compactMap(\.createdBySessionID)) {
+            records += DelegationSpawnAdmission.guardrailScopes(forCreator: creator, scopes: context.scopes, projector: context.projector)
+        }
+        let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let bound = host.allBoundWorktrees()
+        let retainedTargetIDs = host.retainedWorktreeIDsAfterReplacingBinding(sessionID: target)
+        var admitted: [(UUID, Set<String>)] = []
+        for record in byID.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let members = Set(context.projector.members(of: record.grant))
+            let owned = ownership.ownedUnreleasedWorktreeIDs(createdBy: members)
+            let currentIDs = Set(bound.filter { !$0.value.isDisjoint(with: members) }.keys).union(owned)
+            let addedIDs = (members.contains(target) ? desiredIDs : [])
+                .union(reactivated.filter { $0.createdBySessionID.map(members.contains) ?? false }.map(\.worktreeID))
+            // Replace this target's selected-window contribution while retaining bindings in
+            // other windows, another member's bindings, and unreleased ownership rows.
+            let postIDs = Set(bound.filter { !$0.value.subtracting([target]).isDisjoint(with: members) }.keys)
+                .union(members.contains(target) ? retainedTargetIDs : [])
+                .union(owned).union(addedIDs)
+            let projected = context.projector.usage(of: record.grant, spawnParentSessionID: nil)
+            let anonymous = max(0, projected.worktreeCount - projected.countedWorktreeIDs.count)
+            let postUsage = context.scopes.usageIncludingReservations(DomainDelegationScopeUsage(
+                scopeID: record.id, liveSessionCount: projected.liveSessionCount,
+                worktreeCount: postIDs.count + anonymous, countedWorktreeIDs: postIDs
+            ))
+            if let limit = record.grant.guardrails.maxWorktrees, postUsage.worktreeCount > limit {
+                let current = context.scopes.usageIncludingReservations(DomainDelegationScopeUsage(
+                    scopeID: record.id, liveSessionCount: projected.liveSessionCount,
+                    worktreeCount: currentIDs.count + anonymous, countedWorktreeIDs: currentIDs
+                )).worktreeCount
+                throw SessionAdminHostError.guardrailExceeded(limit: limit, current: current)
+            }
+            admitted.append((record.id, addedIDs))
+        }
+        // Every check and all reservations are synchronous, so no competing bind can pass between
+        // the census and the reservation. Identity reservations remain held independently by each
+        // admitted bind, even if another bind of the same identity later fails.
+        return admitted.map { context.scopes.reserve(scopeIDs: [$0.0], worktreeIDs: $0.1) }
     }
 
     /// One pending bind per target; a newer request replaces an older one.
@@ -303,11 +391,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 return finishDeferredBind(pending, .revoked)
             }
             do {
-                let info = try await host.bindWorktree(
-                    sessionID: pending.sessionID, worktree: pending.worktree, repoRoot: pending.repoRoot,
-                    isStillAuthorized: isStillAuthorized
+                let info = try await bindWithAdmission(
+                    lease: lease, scope: scope, worktree: pending.worktree, repoRoot: pending.repoRoot
                 )
-                ownership.clearReleased(worktreeID: info.worktreeID)
                 return finishDeferredBind(pending, .applied(worktreeID: info.worktreeID))
             } catch SessionAdminHostError.authorityEnded {
                 return finishDeferredBind(pending, .revoked)
@@ -536,6 +622,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         let repoRoot = try SessionAdminArguments.string(batch.request.arguments, "repo_root", op: "merge_preview")
         let mergeTarget = try SessionAdminArguments.string(batch.request.arguments, "merge_target", op: "merge_preview")
         let preview = try await host.previewMerge(sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
+        try Task.checkCancellation()
+        guard context.isStillAuthorized(lease, scope: batch.scope) else {
+            throw SessionAdminMCPToolService.unavailableError
+        }
         return .object([
             "result": .string("previewed"), "op": .string("merge_preview"),
             "session_id": .string(lease.targetSessionID.uuidString), "merge": preview

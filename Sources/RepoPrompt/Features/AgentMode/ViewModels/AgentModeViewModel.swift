@@ -8277,7 +8277,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         invocation: WorktreeBindingMutationInvocationIdentity? = nil,
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
-        beforeCommit: (@MainActor () async throws -> Void)? = nil
+        beforeCommit: (@MainActor () async throws -> Void)? = nil,
+        afterCommit: (@MainActor () -> Void)? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
@@ -8454,6 +8455,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             _ = commitWorktreeBindings(desiredBindings, to: session)
             bindingsPublished = true
+            // Delegated ownership follows the actual in-memory publication even when its required
+            // disk flush later fails. No callback runs for a rejected provisional transition.
+            afterCommit?()
             if previousBindings != desiredBindings, case .externalManagement = intent {
                 guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
                     throw ExecutionLocationTransitionError.unavailable(
