@@ -10608,7 +10608,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 && workspaceManager.activeWorkspaceID == expectedWorkspaceID
                 && session.persistentSessionBindingIdentity == installedBinding
                 && session.bindingTransitionGeneration == installedTransitionGeneration
-                && freshCreation?.creationHandle.map { session.creationHandleIsCurrent($0) } == true
+                && freshCreation.creationHandle.map { session.creationHandleIsCurrent($0) } == true
                 && workspaceManager.workspaces.first(where: {
                     $0.id == expectedWorkspaceID
                 })?.composeTabs.contains(where: {
