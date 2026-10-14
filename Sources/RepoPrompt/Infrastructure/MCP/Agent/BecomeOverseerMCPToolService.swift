@@ -5,8 +5,8 @@ import RepoPromptDomainRuntime
 /// Bootstrap only: exact installed model route, memory-only eligibility, and no invented grant.
 @MainActor
 struct BecomeOverseerMCPToolService {
-    static let nextTurnResult = "Oversight enabled; the tools will be available on your next turn."
-    static let devinResult = "Oversight enabled; Devin may not discover the tools until a new provider session."
+    static let nextTurnResult = "Oversight enabled; the tools will be available on your next turn. Start with session_admin scope_status for the operation catalog, required capabilities, and your current grants. request_scope asks for user approval; it grants nothing until approved. Linking needs restructure + observe + control; scoped session creation needs spawn."
+    static let devinResult = "Oversight enabled; Devin may not discover the tools until a new provider session. Then call session_admin scope_status for the operation catalog and current grants; use request_scope for missing capabilities."
 
     /// Transport-owned proof adapted to the bridge's synchronous, network-independent commit fence.
     struct ActivationCommitFence {

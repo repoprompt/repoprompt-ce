@@ -115,6 +115,89 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testScopedCreatorCreatesLaneThroughResolvedDestination() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Scoped creator", selection: fixture.selection
+            )
+            guard case let .created(creatorID, tabID, _) = seed else { return XCTFail("Creator must save") }
+            let creator = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[tabID])
+            creator.createdByOverseerSessionID = nil
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            bridge.installIntentStore(AgentSessionOversightIntentStore(
+                fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+            ))
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+            XCTAssertNotNil(activated)
+            let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+            let request = try scopes.requestScope(
+                requesterSessionID: creatorID, requesterTabID: tabID,
+                kind: .tree(rootSessionID: creatorID), capabilities: [.spawn, .worktree],
+                guardrails: .init(), reason: nil, idempotencyKey: nil
+            ).get()
+            let grant = try scopes.approve(requestID: request.id).get()
+            defer { scopes.revoke(scopeID: grant.id) }
+            // An unrelated physical carrier with no indexed provenance makes the capacity census
+            // incomplete. With no capacity limits, it must not veto this known creator's spawn.
+            let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(ComposeTabState(name: "Unrelated unindexed tab", activeAgentSessionID: UUID()))
+            let destination = try XCTUnwrap(AgentSessionLaneMCPToolService.resolveDestination(
+                workspaceSelector: nil, callerWindow: fixture.window
+            ))
+            XCTAssertEqual(AgentSessionLaneMCPToolService.resolveDestination(
+                workspaceSelector: fixture.workspaceID.uuidString, callerWindow: fixture.window
+            ), destination)
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("scoped destination model availability") {
+                fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let lane = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "unlimited", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Scoped lane", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: nil, callerWindow: fixture.window).map { ($0.windowID, $0.workspaceID, $0.workspaceName) } }
+            )
+            XCTAssertEqual(lane.result, .created, "Scoped lane must save: \(lane)")
+            scopes.revoke(scopeID: grant.id)
+            let limitedRequest = try scopes.requestScope(
+                requesterSessionID: creatorID, requesterTabID: tabID,
+                kind: .tree(rootSessionID: creatorID), capabilities: [.spawn, .worktree],
+                guardrails: .init(maxLiveSessions: 50), reason: nil, idempotencyKey: nil
+            ).get()
+            let limited = try scopes.approve(requestID: limitedRequest.id).get()
+            defer { scopes.revoke(scopeID: limited.id) }
+            let count = fixture.window.workspaceManager.activeWorkspace?.composeTabs.count
+            let refused = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "limited", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Must not allocate", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: fixture.workspaceID.uuidString, callerWindow: fixture.window).map { ($0.windowID, $0.workspaceID, $0.workspaceName) } }
+            )
+            XCTAssertEqual(refused.reason, .scopeDenied, "A configured limit must still require complete placement evidence, not blame the destination")
+            XCTAssertTrue(refused.refusalDetail?.contains("placement_unresolved") == true)
+            var admin = SessionAdminMCPToolService(
+                captureRequestMetadata: { .init(connectionID: nil, clientName: "lane-regression", windowID: fixture.window.windowID) },
+                requireTargetWindow: { fixture.window }, resolveObserverEndpoint: { _, _ in endpoint },
+                scopes: { scopes }, administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor }
+            )
+            admin.isToolEnabled = { true }
+            let forkRefusal = try await admin.execute(args: [
+                "op": .string("fork"), "session_id": .string(creatorID.uuidString), "idempotency_key": .string("limited-fork")
+            ])
+            XCTAssertEqual(forkRefusal.objectValue?["code"]?.stringValue, "placement_unresolved", "A capacity-proof refusal must not claim that session_admin disappeared")
+            XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.count, count)
+        }
+    }
+
     func testFreshForegroundSessionPublishesToolbarEligibilityAfterConfiguredSave() async throws {
         try await withFixture(ephemeral: false) { fixture in
             let viewModel = fixture.window.agentModeViewModel

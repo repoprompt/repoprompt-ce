@@ -146,6 +146,8 @@ struct AgentSessionLinkPendingInteractionInspection: Equatable {
 struct AgentSessionLinkInteractionResponseRequest: Equatable {
     let interactionID: UUID
     let payload: AgentModeViewModel.MCPInteractionResponsePayload
+    /// Internal-only; no MCP argument enables this policy. Target validates the raw command.
+    var readOnlyAutoApproval = false
 }
 
 /// Host-level result of one respond attempt. Every case except `.submitted` applied nothing.

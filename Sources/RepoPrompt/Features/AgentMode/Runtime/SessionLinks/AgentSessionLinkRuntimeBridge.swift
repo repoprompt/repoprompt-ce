@@ -911,6 +911,10 @@ final class AgentSessionLinkRuntimeBridge {
         authority: AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
     )
 
+    /// Explicit UI-only opt-in, exact-incarnation scoped and intentionally not persisted.
+    private var readOnlyApprovalTokens: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+    private var readOnlyApprovalTasks: Set<DomainAgentSessionLinkEndpointIdentity> = []
+
     private var restorePerfRecorder: any WorkspaceRestorePerfRecording
 
     func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
@@ -4759,6 +4763,7 @@ final class AgentSessionLinkRuntimeBridge {
         ).values.flatMap(\.self) : []
         let currentCandidate = needsFreshCandidates
             ? host.agentSessionLinkCandidate(for: candidate.domainEndpoint, includeLocation: false) : nil
+        scheduleReadOnlyApprovals(observer: candidate.domainEndpoint, targetIDs: inputs.outbound.items.map(\.targetSessionID))
         let passiveNotices = reconcilePassiveNotices(
             for: candidate,
             samples: monitor.statusSamples,
@@ -4944,7 +4949,7 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
 
-        let props = AgentMonitorPillProps(
+        var props = AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
@@ -4982,6 +4987,7 @@ final class AgentSessionLinkRuntimeBridge {
                 isFrozenForTermination: isFrozenForTermination
             )
         )
+        props.readOnlyAutoApprovalEnabled = readOnlyApprovalTokens[endpoint] != nil
         return MonitorProjection(props: props, statusSamples: statusSamples)
     }
 
@@ -5686,7 +5692,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// withdrawn management, or endpoint replacement that lands mid-call applies nothing.
     func respondToInteraction(
         target: AuthorizedTarget,
-        request: AgentSessionLinkInteractionResponseRequest
+        request: AgentSessionLinkInteractionResponseRequest,
+        readOnlyApprovalToken: UUID? = nil
     ) async -> AgentSessionLinkInteractionDisposition {
         guard !isFrozenForTermination else { return .shuttingDown }
         guard let host else { return .denied }
@@ -5696,7 +5703,12 @@ final class AgentSessionLinkRuntimeBridge {
             request: request,
             authorize: { [weak self] in
                 guard let self else { return false }
-                return await managementLeaseIsStillAuthorized(lease)
+                guard await managementLeaseIsStillAuthorized(lease) else { return false }
+                if request.readOnlyAutoApproval {
+                    guard let readOnlyApprovalToken,
+                          readOnlyApprovalTokens[lease.observer] == readOnlyApprovalToken else { return false }
+                }
+                return true
             }
         )
         return .responded(outcome)
@@ -5726,6 +5738,48 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         return true
+    }
+
+    /// User consent only: this method has no MCP surface and changes no grant or wake setting.
+    @discardableResult
+    func setReadOnlyAutoApproval(_ enabled: Bool, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination,
+              host?.agentSessionLinkCandidate(for: observer, includeLocation: false) != nil else { return false }
+        if enabled {
+            if readOnlyApprovalTokens[observer] == nil { readOnlyApprovalTokens[observer] = UUID() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let links = await authority.links(forObserver: observer.sessionID)
+                scheduleReadOnlyApprovals(observer: observer, targetIDs: links.items.map(\.targetSessionID))
+            }
+        } else {
+            readOnlyApprovalTokens.removeValue(forKey: observer)
+        }
+        requestObserverLocalPolicyRepaint(for: observer)
+        return true
+    }
+
+    private func scheduleReadOnlyApprovals(observer: DomainAgentSessionLinkEndpointIdentity, targetIDs: [UUID]) {
+        guard let token = readOnlyApprovalTokens[observer], !readOnlyApprovalTasks.contains(observer) else { return }
+        readOnlyApprovalTasks.insert(observer)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { readOnlyApprovalTasks.remove(observer) }
+            for targetID in targetIDs {
+                guard readOnlyApprovalTokens[observer] == token, !isFrozenForTermination else { return }
+                guard case let .success(target) = await authorizeTarget(
+                    operation: .monitorRespond, observerEndpoint: observer, targetSessionID: targetID
+                ), readOnlyApprovalTokens[observer] == token,
+                let interaction = host?.agentSessionLinkPendingInteraction(for: target.candidate).interaction,
+                interaction.kind == .approval else { continue }
+                var request = AgentSessionLinkInteractionResponseRequest(
+                    interactionID: interaction.id,
+                    payload: .init(text: nil, skip: false, responseArgument: .scalar("accept"), amendment: nil, answersByQuestionID: [:])
+                )
+                request.readOnlyAutoApproval = true
+                _ = await respondToInteraction(target: target, request: request, readOnlyApprovalToken: token)
+            }
+        }
     }
 
     // MARK: Routine wake interval and Wake now routing
@@ -8209,6 +8263,10 @@ final class AgentSessionLinkRuntimeBridge {
             )
         } catch is AgentSessionLaneHostUnavailable {
             return .refused(.hostUnavailable)
+        } catch let failure as AgentSessionLaneSpawnAdmissionFailure {
+            var receipt = AgentSessionLaneCreateReceipt.refused(.scopeDenied)
+            receipt.refusalDetail = failure.detail
+            return receipt
         } catch { return .refused(.destinationUnavailable) }
         let sessionID: UUID
         let tabID: UUID

@@ -164,6 +164,20 @@ final class DelegationScopeRuntime: ObservableObject {
 
     private var authority = DomainDelegationScopeAuthority()
     private var store: DelegationScopeStore?
+    private struct DecisionDelivery {
+        let tabID: UUID
+        let stopFence: AgentRunStartStopFence
+        var messages: [String]
+        var observation: AnyCancellable?
+    }
+
+    private var decisions: [UUID: DecisionDelivery] = [:]
+    #if DEBUG
+        var test_scopeDecision: ((UUID, String) -> Void)?
+        /// Unit fixtures must explicitly opt into provider delivery; ordinary scope tests do not
+        /// accidentally start installed CLIs merely by approving their synthetic grant cards.
+        var test_suppressDecisionDelivery = AppLaunchConfiguration.isUnitTestProcess
+    #endif
     private var reservations: [UUID: DelegationScopeReservation] = [:]
     private var requestOrder: [UUID] = []
     private var requestIDByKey: [String: UUID] = [:]
@@ -545,7 +559,8 @@ final class DelegationScopeRuntime: ObservableObject {
         presentedTabID: UUID,
         presentedSessionID: UUID,
         capabilities: Set<DomainDelegationScopeCapability>? = nil,
-        guardrails: DomainDelegationScopeGuardrails? = nil
+        guardrails: DomainDelegationScopeGuardrails? = nil,
+        grantAllForSession: Bool = false
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard let request = requests[requestID], request.state == .pending,
               request.requesterTabID == presentedTabID,
@@ -553,7 +568,7 @@ final class DelegationScopeRuntime: ObservableObject {
               request.requesterWindowID == presentedWindowID,
               explicitPresentationWindow(tabID: presentedTabID, sessionID: presentedSessionID)?.windowID == presentedWindowID
         else { return .failure(.unknownScope) }
-        return approve(requestID: requestID, capabilities: capabilities, guardrails: guardrails)
+        return approve(requestID: requestID, capabilities: capabilities, guardrails: guardrails, grantAllForSession: grantAllForSession)
     }
 
     /// The physical, loaded presentation shared by scope and batch approval. Catalog copies in
@@ -583,12 +598,16 @@ final class DelegationScopeRuntime: ObservableObject {
     func approve(
         requestID: UUID,
         capabilities: Set<DomainDelegationScopeCapability>? = nil,
-        guardrails: DomainDelegationScopeGuardrails? = nil
+        guardrails: DomainDelegationScopeGuardrails? = nil,
+        grantAllForSession: Bool = false
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard canUseAuthority else { return .failure(.unknownScope) }
         guard var request = requests[requestID], request.state == .pending else { return .failure(.unknownScope) }
-        let approvedCapabilities = capabilities ?? request.capabilities
-        guard approvedCapabilities.isSubset(of: request.capabilities) else {
+        // Only the explicit user-facing Grant all action sets this flag. No MCP argument can.
+        let allCapabilities: Set<DomainDelegationScopeCapability> = request.kind == .allSessions
+            ? DomainDelegationScopeCapability.allSessionsPermitted : DomainDelegationScopeCapability.fullPreset
+        let approvedCapabilities = grantAllForSession ? allCapabilities : capabilities ?? request.capabilities
+        guard grantAllForSession || approvedCapabilities.isSubset(of: request.capabilities) else {
             return .failure(.approvalExceedsRequest)
         }
         let approvedAt = now()
@@ -599,6 +618,7 @@ final class DelegationScopeRuntime: ObservableObject {
         case let (requested?, nil): requested
         case let (nil, chosen): chosen
         }
+        if grantAllForSession { approvedGuardrails.expiresAt = nil }
         let grantRequest = DomainDelegationScopeGrantRequest(
             granteeSessionID: request.requesterSessionID,
             kind: request.kind,
@@ -611,9 +631,21 @@ final class DelegationScopeRuntime: ObservableObject {
             request.state = .granted(scopeID: record.id)
             requests[requestID] = request
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
+            enqueueDecision(
+                sessionID: request.requesterSessionID,
+                tabID: request.requesterTabID,
+                result: "granted",
+                identifier: record.id
+            )
         case let .failure(denial):
             request.state = .denied(reason: "Approval failed validation (\(denial.diagnosticLabel)).")
             requests[requestID] = request
+            enqueueDecision(
+                sessionID: request.requesterSessionID,
+                tabID: request.requesterTabID,
+                result: "denied",
+                identifier: request.id
+            )
         }
         return result
     }
@@ -622,6 +654,12 @@ final class DelegationScopeRuntime: ObservableObject {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .denied(reason: reason)
         requests[requestID] = request
+        enqueueDecision(
+            sessionID: request.requesterSessionID,
+            tabID: request.requesterTabID,
+            result: "denied",
+            identifier: request.id
+        )
     }
 
     /// The requester may withdraw its own undecided card. Retaining its identity makes retries
@@ -713,6 +751,79 @@ final class DelegationScopeRuntime: ObservableObject {
             revokedScopeIDs.removeFirst(revokedScopeIDs.count - Self.maxRevokedScopeIDs)
         }
         didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
+        for record in changed {
+            let tabID = requests.values.first { $0.state == .granted(scopeID: record.id) }?.requesterTabID
+            enqueueDecision(
+                sessionID: record.grant.granteeSessionID,
+                tabID: tabID,
+                result: "revoked",
+                identifier: record.id
+            )
+        }
+    }
+
+    /// This is an app-owned decision notification, not target attention or an oversight grant.
+    /// It never traverses the passive reducer, changes wake policy, or interrupts a running turn.
+    private func enqueueDecision(sessionID: UUID, tabID: UUID?, result: String, identifier: UUID) {
+        let text = "[RepoPrompt delegation decision: \(result); id=\(identifier.uuidString). Call session_admin scope_status to inspect current authority before continuing the user's existing work. This notice grants no authority or new task.]"
+        #if DEBUG
+            test_scopeDecision?(sessionID, text)
+            if test_suppressDecisionDelivery { return }
+        #endif
+        let candidates = windows().filter { !$0.isClosing }.flatMap { window in
+            window.agentModeViewModel.sessions.values.filter { $0.activeAgentSessionID == sessionID }.map(\.tabID)
+        }
+        guard let tabID = tabID ?? (candidates.count == 1 ? candidates[0] : nil),
+              let presentation = Self.loadedPresentation(forTab: tabID, in: windows()),
+              presentation.sessionID == sessionID,
+              let session = presentation.window.agentModeViewModel.sessions[tabID]
+        else { return }
+        if let pending = decisions[sessionID], !pending.stopFence.permitsQueuedDelivery(to: session) {
+            decisions.removeValue(forKey: sessionID)
+        }
+        if decisions[sessionID] == nil {
+            let observation = session.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self, weak session] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard session?.activeAgentSessionID == sessionID else {
+                        self.decisions.removeValue(forKey: sessionID)
+                        return
+                    }
+                    self.drainDecisions(sessionID: sessionID)
+                }
+            }
+            decisions[sessionID] = DecisionDelivery(tabID: tabID, stopFence: AgentRunStartStopFence(session: session), messages: [], observation: observation)
+        }
+        decisions[sessionID]?.messages.append(text)
+        // Approval must finish its authority mutation before a provider can observe the result.
+        Task { @MainActor [weak self] in self?.drainDecisions(sessionID: sessionID) }
+    }
+
+    private func drainDecisions(sessionID: UUID) {
+        guard canUseAuthority else {
+            decisions.removeValue(forKey: sessionID)
+            return
+        }
+        guard let pending = decisions[sessionID], !pending.messages.isEmpty,
+              let presentation = Self.loadedPresentation(forTab: pending.tabID, in: windows()),
+              !presentation.window.isClosing,
+              presentation.sessionID == sessionID,
+              let session = presentation.window.agentModeViewModel.sessions[pending.tabID],
+              pending.stopFence.permitsQueuedDelivery(to: session)
+        else {
+            decisions.removeValue(forKey: sessionID)
+            return
+        }
+        // Remove before submission: synchronous session publication cannot deliver it twice.
+        decisions[sessionID]?.messages = []
+        if presentation.window.agentModeViewModel.submitDelegationDecision(
+            pending.messages.joined(separator: "\n"), tabID: pending.tabID, expectedSessionID: sessionID,
+            stopFence: pending.stopFence
+        ) {
+            decisions.removeValue(forKey: sessionID)
+        } else {
+            decisions[sessionID]?.messages = pending.messages
+        }
     }
 
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {

@@ -1675,6 +1675,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let source = OpenWindowsDelegationProvenanceSource(windows: { [window] })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
         let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let unscopedCore = AgentSessionAdministrationCore(scopes: scopes, projector: projector)
+        XCTAssertEqual(DelegationSpawnAdmission.admit(
+            creatorSessionID: child, target: .newSession, scopes: scopes, administration: unscopedCore, projector: projector
+        ), .unscoped, "With no live delegation anywhere, scope provenance cannot revoke the creation surface's own authority")
         let pending = try scopes.requestScope(
             requesterSessionID: child, requesterTabID: nil, kind: .tree(rootSessionID: root),
             capabilities: [.observe, .spawn], guardrails: .init(maxLiveSessions: 10), reason: nil, idempotencyKey: nil

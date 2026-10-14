@@ -810,6 +810,23 @@ final class MCPServerViewModel: ObservableObject {
             }
         )
         toolService.perfRecorder = perfRecorder
+        toolService.forwardOversightSteer = { [self] args, metadata in
+            guard args["workflow"] == nil, args["workflow_id"] == nil,
+                  args["wait"] != .bool(true), args["timeout_seconds"] == nil
+            else {
+                throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Repeat with session_id and message only; workflows and message-and-wait are not supported on that surface. Nothing was delivered.")
+            }
+            guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
+                throw MCPError.invalidParams("Oversight steering is disabled. Enable agent_session_link in tool settings, then use its steer operation under a Manage link.")
+            }
+            var forwarded: [String: Value] = [
+                "op": .string("steer"),
+                "idempotency_key": args["idempotency_key"] ?? .string(UUID().uuidString)
+            ]
+            forwarded["session_id"] = args["session_id"]
+            forwarded["message"] = args["message"]
+            return try await makeAgentSessionLinkToolService(metadata: metadata).execute(args: forwarded)
+        }
         return toolService
     }
 
@@ -1120,9 +1137,16 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
+        makeAgentSessionLinkToolService()
+    }
+
+    private func makeAgentSessionLinkToolService(metadata: RequestMetadata? = nil) -> AgentSessionLinkMCPToolService {
         AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
-            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            captureRequestMetadata: { [self] in
+                if let metadata { return metadata }
+                return await captureRequestMetadata()
+            },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             // Exact run-installed/handover/pending-run routing only: the observing endpoint can never
             // be supplied, hinted, or explicitly bound by the caller.

@@ -51,7 +51,7 @@ package enum MCPDomainSessionAdminToolDefinition {
 
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
-        - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
+        - `scope_status`: call first, without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). If tools disappear, call `become_overseer`; discovery changes may require your next turn.
         - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
@@ -61,7 +61,7 @@ package enum MCPDomainSessionAdminToolDefinition {
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
 
         **Structure ops** (members only; membership never grows by moving sessions)
-        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). New links need observe + control; existing links are never upgraded. `unlink`: from `observer_session_id` (default you), both in scope.
+        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). `link` needs restructure; new links additionally need observe + control. Existing links are never upgraded. Omit scope_id when exactly one active scope holds the needed capabilities. `unlink`: from `observer_session_id` (default you), both in scope.
         - `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions and their subtrees under a member (user card; user-granted scopes only; never another scope's overseer). Refused with `placement_affects_other_scopes` if another scope's membership would change, `placement_unresolved` if a chain runs through an unloaded workspace.
         - `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.
         - `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.

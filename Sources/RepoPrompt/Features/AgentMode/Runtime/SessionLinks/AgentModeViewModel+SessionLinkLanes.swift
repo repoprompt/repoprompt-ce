@@ -73,7 +73,12 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("The destination workspace is not active.")
         }
         // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
-        let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        let spawnAdmission: DelegationSpawnAdmission.Admission?
+        do {
+            spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: creatorSessionID)
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneSpawnAdmissionFailure(detail: detail ?? "Scoped spawn admission was refused. Call session_admin scope_status to inspect authority and placement.")
+        }
         defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target: MCPSessionTarget
         do {

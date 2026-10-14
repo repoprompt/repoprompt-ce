@@ -67,6 +67,10 @@ enum DelegationSpawnAdmission {
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
     ) throws -> [DomainDelegationScopeRecord] {
+        let liveScopes = scopes.allLiveScopes()
+        // These creation surfaces already have their own caller authority. With no delegation
+        // anywhere, missing scope provenance cannot hide a limit or revoke that authority.
+        guard !liveScopes.isEmpty else { return [] }
         // Ambiguous ancestry can hide the scope that should count this spawn. It must never
         // become the absence of delegation and consequently an unscoped admission.
         guard projector.pointResolutionState(for: creator) != .replicated,
@@ -74,7 +78,7 @@ enum DelegationSpawnAdmission {
         else {
             throw error(for: .usageProofMissing)
         }
-        return scopes.allLiveScopes().filter { record in
+        return liveScopes.filter { record in
             switch record.grant.kind {
             case .allSessions:
                 false
@@ -121,6 +125,8 @@ enum DelegationSpawnAdmission {
         for record in records {
             var usage: [UUID: DomainDelegationScopeUsage] = [:]
             for scope in scopes.scopeChain(from: record.id) {
+                scopeIDs.insert(scope.id)
+                guard operation.requiresScopeUsage(for: scope.grant.guardrails) else { continue }
                 guard let evidence = projector.usageEvidence(of: scope.grant, spawnParentSessionID: creator) else {
                     return (.usageProofMissing, scopeIDs)
                 }
@@ -329,6 +335,10 @@ enum DelegationSpawnAdmission {
             )
         case let .capabilityMissing(capability):
             fields["capability"] = .string(capability.rawValue)
+            fields["detail"] = .string("Call session_admin request_scope with capabilities including \(capability.rawValue), then wait for the user's approval. Call scope_status for the operation catalog and current grants.")
+        case .usageProofMissing, .membershipProofMissing:
+            fields["reason"] = .string("placement_unresolved")
+            fields["detail"] = .string("Scope capacity or creator provenance cannot be proved from the loaded sessions. Load or resolve ambiguous session bindings, then retry. Call session_admin scope_status to inspect limits; another capability grant alone will not repair placement.")
         default:
             break
         }

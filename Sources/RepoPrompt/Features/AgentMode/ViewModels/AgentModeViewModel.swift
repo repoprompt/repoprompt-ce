@@ -18996,6 +18996,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
+    /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
+    func submitDelegationDecision(_ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence) -> Bool {
+        let deletion = AgentSessionDeletionRegistry.shared
+        guard !WindowStatesManager.shared.isTerminating,
+              !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
+              !deletion.isDeletionInProgress(sessionID: expectedSessionID) else { return false }
+        guard let session = sessions[tabID], session.activeAgentSessionID == expectedSessionID,
+              stopFence.permitsQueuedDelivery(to: session),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return false }
+        var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )
+        if session.runState == .waitingForUser, session.instructionContinuation != nil {
+            readiness.runStateIsActive = false
+            readiness.hasWaitingPrompt = false
+        }
+        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return false }
+        let submission = submitPreparedUserTurn(
+            tabID: tabID, session: session, trimmedText: text,
+            attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
+            managedTurn: AgentNoncomposerTurn(
+                endpoint: endpoint, providerText: text, sink: AgentSessionLinkManagedSteerSink()
+            ),
+            stopFence: AgentRunStartStopFence(session: session), isLocalComposerInput: false
+        )
+        if case .submitted = submission { return true }
+        return false
+    }
+
     /// Shares prepared submission and provider settlement without borrowing link authority.
     @discardableResult
     func submitNoncomposerSteer(

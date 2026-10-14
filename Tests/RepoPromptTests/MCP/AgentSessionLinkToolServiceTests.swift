@@ -2378,6 +2378,22 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(fixture.host.respondRequests.count, requestsBeforeStop)
     }
 
+    func testReadOnlyAutoApprovalIsDefaultOffAndRevocableAtFinalFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        XCTAssertTrue(fixture.host.respondRequests.isEmpty, "A Manage grant alone must never auto-answer")
+        fixture.host.beforeRespondAuthorize = {
+            XCTAssertTrue(fixture.bridge.setReadOnlyAutoApproval(false, observer: fixture.observer.domainEndpoint))
+        }
+        XCTAssertTrue(fixture.bridge.setReadOnlyAutoApproval(true, observer: fixture.observer.domainEndpoint))
+        try await AsyncTestWait.waitUntil("auto-approval final fence") {
+            await MainActor.run { !fixture.host.respondAuthorizations.isEmpty }
+        }
+        XCTAssertEqual(fixture.host.respondAuthorizations, [false], "Turning off must invalidate the in-flight opt-in token")
+        XCTAssertEqual(fixture.host.respondRequests.first?.readOnlyAutoApproval, true)
+    }
+
     func testRestrictedGrantKeepsPollButDeniesPromptBodyRespondAndSteer() async throws {
         let fixture = try await makeReadReleaseFixture(restricted: true)
         defer { fixture.tearDown() }

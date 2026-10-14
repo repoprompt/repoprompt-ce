@@ -1151,7 +1151,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static let becomeOverseerDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.becomeOverseer,
-        description: "Enable oversight tool discovery for this Agent Mode session, normally on the next turn. Grants no authority. To list or organize this workspace, then request a user-approved workspace scope with observe plus the needed mutation capabilities through session_admin request_scope, and use inventory after approval.",
+        description: "Enable or restore oversight tool discovery for this Agent Mode session, normally on the next turn. Grants no authority. Then call session_admin scope_status without selectors for the tool/operation catalog, required capabilities and your current grants. session_admin request_scope asks the user for all capabilities an operation needs up front: inventory needs observe; new link needs restructure + observe + control; scoped session/lane creation and fork need spawn; worktree operations need worktree. Use inventory after approval to select scope members. The user may grant all permitted capabilities for this session or revoke any scope from the oversight dashboard.",
         inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
         annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
     )

@@ -25,7 +25,7 @@ enum AgentSessionTargetOperationGuard {
     typealias ManageGrantResolver = (DomainAgentSessionLinkEndpointIdentity, UUID) async -> Bool
 
     static func denialError(reference: String) -> MCPError {
-        MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope.")
+        MCPError.invalidParams("Session '\(reference)' is not available to this caller's scope. For a directly linked lane, use agent_session_link poll/wait/read, or steer/respond/stop with its Manage capability. For scope administration, call session_admin scope_status to inspect grants and operation requirements; request_scope asks the user for missing capabilities. If oversight tools are absent, call become_overseer and retry next turn from the original requesting session.")
     }
 
     static func denialError(sessionID: UUID) -> MCPError {

@@ -36,6 +36,12 @@ enum AgentSessionLaneHostCreationOutcome {
 
 enum AgentSessionLaneHostUnavailable: Error { case unavailable }
 
+/// A destination was resolved, but scoped creation was refused before allocating any session.
+/// Keeping this separate prevents the bridge from misreporting authority as destination failure.
+struct AgentSessionLaneSpawnAdmissionFailure: Error {
+    let detail: String
+}
+
 struct AgentSessionLaneCreateReceipt: Equatable {
     enum Result: Equatable { case created, creationIncomplete, refused }
     enum Reason: String, Equatable {
@@ -43,6 +49,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
         case denied
         case persistenceUnavailable = "persistence_unavailable"
         case destinationUnavailable = "destination_unavailable"
+        case scopeDenied = "scope_denied"
         case hostUnavailable = "host_unavailable"
         case laneLimitReached = "lane_limit_reached"
         case admissionUnstable = "admission_unstable"
@@ -65,6 +72,7 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     let laneCount: Int
     var duplicate = false
     var firstTaskReason: String?
+    var refusalDetail: String?
     /// Original destination display name, preserved on replay; not a live location or selector.
     var workspaceName: String?
 

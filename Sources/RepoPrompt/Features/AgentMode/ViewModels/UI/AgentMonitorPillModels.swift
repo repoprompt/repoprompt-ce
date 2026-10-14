@@ -956,6 +956,8 @@ enum AgentMonitorAccessibilityLocationPhrase {
 /// Workspace/worktree labels here are **UI only**; they are never placed in agent-facing snapshots,
 /// inventories, or prompts.
 struct AgentMonitorPillProps: Equatable {
+    /// Explicit, revocable, process-local user policy; independent of management grants.
+    var readOnlyAutoApprovalEnabled = false
     struct Outbound: Equatable, Identifiable {
         let linkID: UUID
         let generation: UInt64

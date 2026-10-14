@@ -64,7 +64,17 @@ struct DelegationApprovalSlot: View {
                                 capabilities: capabilities, guardrails: guardrails
                             )
                         },
-                        onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") }
+                        onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") },
+                        onGrantAll: { threshold in
+                            guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
+                            var guardrails = request.guardrails
+                            guardrails.bulkConfirmationThreshold = threshold
+                            return runtime.approve(
+                                requestID: request.id, presentedWindowID: windowID,
+                                presentedTabID: tabID, presentedSessionID: presentedSessionID,
+                                guardrails: guardrails, grantAllForSession: true
+                            )
+                        }
                     )
                 }
                 ForEach(cards) { card in
@@ -177,6 +187,7 @@ struct DelegationScopeApprovalCard: View {
     /// Approved capabilities (a subset of the request) and the user's bulk-card threshold.
     let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>
     let onDeny: () -> Void
+    let onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)?
 
     @State private var selected: Set<DomainDelegationScopeCapability>
     /// Only the user may loosen the agent's (already clamped) threshold.
@@ -187,12 +198,14 @@ struct DelegationScopeApprovalCard: View {
         request: DelegationScopeRequest,
         authorityUnavailableReason: String? = nil,
         onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>,
-        onDeny: @escaping () -> Void
+        onDeny: @escaping () -> Void,
+        onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)? = nil
     ) {
         self.request = request
         self.authorityUnavailableReason = authorityUnavailableReason
         self.onApprove = onApprove
         self.onDeny = onDeny
+        self.onGrantAll = onGrantAll
         _selected = State(initialValue: request.capabilities)
         _threshold = State(initialValue: request.guardrails.bulkConfirmationThreshold)
     }
@@ -268,6 +281,17 @@ struct DelegationScopeApprovalCard: View {
                 Button("Deny", action: onDeny)
                     .buttonStyle(.bordered)
                 Spacer()
+                if let onGrantAll {
+                    Button("Grant all for this session") {
+                        switch onGrantAll(threshold) {
+                        case .success: approvalFailure = nil
+                        case let .failure(denial): approvalFailure = denial
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(authorityUnavailableReason != nil)
+                    .hoverTooltip("Grant every capability permitted for the scope shown above, without expiry. Existing capacity and bulk-change limits remain. Revoke any time in Active delegations. Human-only actions remain excluded.")
+                }
                 Button("Grant") {
                     switch onApprove(selected, threshold) {
                     case .success: approvalFailure = nil

@@ -69,7 +69,34 @@ enum AgentSessionLaneMCPToolService {
                     "lanes": .string("\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)")
                 ])
             }
-            return refusal(receipt.reason?.rawValue ?? "creation_incomplete")
+            let reason = receipt.reason ?? .admissionUnstable
+            let hint = switch reason {
+            case .destinationUnavailable:
+                "The selected workspace has no available active window, or its window/workspace changed before allocation. Open that workspace in a window, confirm its UUID with workspace tools, and retry. No lane was allocated."
+            case .scopeDenied:
+                "The destination was resolved, but scoped spawn admission was refused. Call session_admin scope_status to inspect spawn authority and limits. If placement is unresolved, load or repair the affected sessions before retrying; granting more capabilities does not repair provenance. No lane was allocated."
+            case .persistenceUnavailable, .saveFailed:
+                "Oversight storage is unavailable. Check the oversight dashboard's saving warning and retry after storage is available."
+            case .hostUnavailable, .shuttingDown:
+                "The app host is closing or unavailable. Retry from the requesting session after the app is ready."
+            case .roleUnavailable:
+                "Refresh agent_manage list_agents and retry with an available role or model_id. No lane was allocated."
+            case .idempotencyConflict:
+                "This idempotency_key belongs to different arguments. Use a new key for a different request."
+            case .ledgerFull:
+                "Too many lane creations are in flight or retained for this session. Wait for pending calls to settle before creating another lane."
+            case .denied:
+                "Call become_overseer, then retry next turn from the same session. Activation does not grant target authority."
+            case .addFailed:
+                "Lane linking failed. Inspect the returned session_id and link it with session_admin link after resolving the oversight dashboard warning; do not allocate a replacement blindly."
+            case .admissionUnstable:
+                "Concurrent lane or session changes prevented stable admission. Wait for those operations to settle and retry with the same key."
+            case .modelUnavailable, .laneLimitReached:
+                "Refresh the lane inventory and available models before retrying."
+            }
+            var fields: [String: Value] = ["result": .string(reason.rawValue), "hint": .string(hint)]
+            if let detail = receipt.refusalDetail { fields["detail"] = .string(detail) }
+            return .object(fields)
         }
         var fields: [String: Value] = [
             "result": .string(receipt.result == .created ? "created" : "creation_incomplete"),

@@ -240,6 +240,110 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         return try fixture.runtime.approve(requestID: request.id).get()
     }
 
+    func testReadOnlyApprovalAllowlistFailsClosedForShellAndMutationOptions() {
+        let allowed = [
+            "git --no-pager status --short", "git --no-pager log --no-ext-diff --no-textconv --oneline -n5",
+            "git --no-pager diff --no-ext-diff --no-textconv --stat HEAD~1",
+            "gh run view 123 --log-failed", "./conductor job list", "conductor job status abc",
+            "./conductor job wait --request-key validation --full-log", "grep -rn needle Sources"
+        ]
+        for command in allowed {
+            XCTAssertTrue(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)
+        }
+        let denied = [
+            "git status; rm -rf .", "git status && echo unsafe", "git diff > output", "grep $(touch x) Sources",
+            "grep `touch x` Sources", "grep needle Sources\ntouch x", "bash -c git status", "env git status",
+            "git -c alias.log=unsafe log", "git --no-pager diff --output=out", "git --no-pager log --ext-diff",
+            "git --no-pager reset --hard", "gh run view 123 --web", "gh run cancel 123",
+            "./conductor job cancel abc", "./conductor app relaunch", "grep 'quoted pattern' Sources"
+        ]
+        for command in denied {
+            XCTAssertFalse(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)
+        }
+        let refusal = AgentSessionLaneMCPToolService.render(.refused(.destinationUnavailable)).objectValue
+        XCTAssertEqual(refusal?["result"], .string("destination_unavailable"))
+        XCTAssertTrue(refusal?["hint"]?.stringValue?.contains("Open that workspace") == true)
+    }
+
+    func testGrantAllIsExplicitRevocableAndNotAvailableThroughMCPArguments() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        var decisions: [(UUID, String)] = []
+        fixture.runtime.test_scopeDecision = { decisions.append(($0, $1)) }
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.observe], guardrails: .init(maxLiveSessions: 4), expiresInSeconds: 60,
+            reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertTrue(decisions.isEmpty)
+        XCTAssertThrowsError(try fixture.runtime.approve(requestID: request.id, capabilities: [.spawn]).get())
+        let scope = try fixture.runtime.approve(requestID: request.id, grantAllForSession: true).get()
+        XCTAssertEqual(scope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertNil(scope.grant.guardrails.expiresAt)
+        XCTAssertEqual(scope.grant.guardrails.maxLiveSessions, 4)
+        XCTAssertEqual(decisions.count, 1)
+        XCTAssertEqual(decisions.first?.0, overseer)
+        XCTAssertTrue(decisions.first?.1.contains("granted") == true)
+        fixture.runtime.revoke(scopeID: scope.id)
+        XCTAssertFalse(fixture.runtime.hasLiveScope(grantedTo: overseer))
+        XCTAssertEqual(decisions.count, 2)
+        XCTAssertTrue(decisions.last?.1.contains("revoked") == true)
+        do {
+            _ = try await fixture.call(["op": .string("request_scope"), "grant_all": .bool(true)])
+            XCTFail("Grant all is a user action, never an agent argument")
+        } catch {}
+        let denied = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .allSessions,
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        fixture.runtime.deny(requestID: denied.id)
+        XCTAssertEqual(decisions.count, 3)
+        XCTAssertTrue(decisions.last?.1.contains("denied") == true)
+        let global = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .allSessions,
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertEqual(try fixture.runtime.approve(requestID: global.id, grantAllForSession: true).get().grant.capabilities, DomainDelegationScopeCapability.allSessionsPermitted)
+    }
+
+    func testScopeStatusDiscoversOperationsAndCurrentGrantsBeforeFailure() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let scope = try grantTree(fixture, grantee: overseer)
+        let value = try await fixture.call(["op": .string("scope_status")])
+        let catalog = try XCTUnwrap(value["operation_catalog"]?.arrayValue).compactMap(\.objectValue)
+        let link = try XCTUnwrap(catalog.first { $0["tool"] == .string("session_admin") && $0["op"] == .string("link") })
+        XCTAssertEqual(try Set(XCTUnwrap(link["scope_capabilities"]?.arrayValue).compactMap(\.stringValue)), ["observe", "control", "restructure"])
+        XCTAssertTrue(catalog.contains { $0["tool"] == .string("agent_session_link") && $0["op"] == .string("create_lane") })
+        XCTAssertTrue(catalog.contains { $0["tool"] == .string("agent_run") && $0["op"] == .string("start") })
+        let steer = try XCTUnwrap(catalog.first { $0["tool"] == .string("agent_run") && $0["op"] == .string("steer") })
+        XCTAssertEqual(steer["authority"], .string("direct_child_or_exact_manage_link"))
+        XCTAssertEqual(steer["managed_target_op"], .string("steer"))
+        XCTAssertNil(steer["scope_capabilities"], "A broad scope must not be advertised as raw child control authority")
+        XCTAssertEqual(value["scopes"]?.arrayValue?.first?.objectValue?["scope_id"], .string(scope.id.uuidString))
+    }
+
+    func testImplicitScopeSelectsUniqueCapableGrantAndRefusesAmbiguity() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), target = UUID()
+        fixture.source.add(overseer, parent: nil)
+        fixture.source.add(target, parent: overseer)
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try fixture.runtime.approve(requestID: request.id).get()
+        let capable = try grantTree(fixture, grantee: overseer)
+        let link = AgentSessionAdministrationRequest(operation: .adminLink, caller: .agentSession(overseer), targetSessionIDs: [target])
+        guard case let .authorized(batch) = fixture.core.authorize(link) else { return XCTFail("Unique capable grant must be selected") }
+        XCTAssertEqual(batch.scope.id, capable.id)
+        _ = try grantTree(fixture, grantee: overseer)
+        guard case let .scopeSelectionRequired(ids) = fixture.core.authorize(link) else { return XCTFail("Multiple capable grants must require selection") }
+        XCTAssertEqual(ids.count, 2)
+    }
+
     // MARK: - Store
 
     func testStoreRoundTripsActiveGrantsAndReloadsUnderAFreshRuntime() async throws {

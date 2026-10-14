@@ -30,7 +30,7 @@ struct SessionAdminMCPToolService {
 
     /// Identical for every unavailable caller, so the hidden tool reveals nothing when named.
     static let unavailableError = MCPError.invalidParams(
-        "session_admin is not available for this session. Use request_scope to ask for user-approved authority when the tool is available."
+        "session_admin is not available for this session on this exact route. Call become_overseer, then on your next turn call session_admin scope_status to discover operations and current grants. If already enabled, retry from the original requesting session; use request_scope for missing authority. A grant never substitutes for a current routed session."
     )
 
     static let inventoryGuidance = "For cleanup or organizing, request observe together with the needed mutation capabilities, then use inventory to select targets when available. A workspace scope covers only that workspace; history is not a scope inventory."
@@ -158,7 +158,7 @@ struct SessionAdminMCPToolService {
             value["result"] = .string(request.state.label)
             if request.state == .pending {
                 value["guidance"] = .string(
-                    "Nothing is granted yet. The user sees an approval card in this session. Continue other work and check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
+                    "Nothing is granted yet. The user sees an approval card in this session. Continue other work; RepoPrompt notifies this requesting session when the user decides (after its active turn settles). You can also check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
                 )
             }
             return Self.withScopeAvailability(value, runtime: scopes())
@@ -211,7 +211,9 @@ struct SessionAdminMCPToolService {
         return Self.withScopeAvailability([
             "result": .string("ok"),
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
-            "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) })
+            "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) }),
+            "operation_catalog": Self.operationCatalog(),
+            "guidance": .string("Capabilities describe authority, not tool discovery. Call become_overseer to restore oversight tools; catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
         ], runtime: runtime)
     }
 
@@ -359,14 +361,16 @@ struct SessionAdminMCPToolService {
         return try await render(
             administration().perform(request),
             confirmationID: request.confirmationID,
-            callerSessionID: endpoint.sessionID
+            callerSessionID: endpoint.sessionID,
+            requestedScopeID: request.scopeID
         )
     }
 
     private func render(
         _ outcome: AgentSessionAdministrationOutcome,
         confirmationID: UUID?,
-        callerSessionID: UUID
+        callerSessionID: UUID,
+        requestedScopeID: UUID? = nil
     ) throws -> Value {
         switch outcome {
         case let .completed(value):
@@ -396,6 +400,14 @@ struct SessionAdminMCPToolService {
                 scopes().confirmations.confirmation(id: $0, granteeSessionID: callerSessionID)
             }
             return Self.confirmationMismatchValue(card)
+        case .denied(.usageProofMissing, _):
+            if let requestedScopeID, scopes().record(id: requestedScopeID)?.grant.granteeSessionID != callerSessionID {
+                throw Self.unavailableError
+            }
+            return .object([
+                "result": .string("denied"), "code": .string("placement_unresolved"),
+                "detail": .string("Your scope's configured limits require complete session placement evidence. Load or resolve ambiguous session bindings, then retry the same operation. Use session_admin scope_status to inspect limits. A new capability grant alone will not repair missing provenance.")
+            ])
         case let .denied(denial, sessionID):
             return try Self.deniedValue(denial, sessionID: sessionID)
         }
@@ -436,9 +448,7 @@ struct SessionAdminMCPToolService {
         switch denial {
         case let .capabilityMissing(capability):
             value["capability"] = .string(capability.rawValue)
-            if capability == .observe {
-                value["detail"] = .string("This scope lacks observe. Request a new scope including observe; approval never adds it implicitly. \(inventoryGuidance)")
-            }
+            value["detail"] = .string("This scope lacks \(capability.rawValue). Request a new scope including \(capability.rawValue) by calling session_admin request_scope with all capabilities needed by the operation; wait for the user's approval. Call session_admin scope_status for the operation catalog and your current grants. \(inventoryGuidance)")
         case let .guardrailExceeded(guardrail, limit, current):
             value["guardrail"] = .string(guardrail.rawValue)
             value["limit"] = .int(limit)
@@ -453,6 +463,64 @@ struct SessionAdminMCPToolService {
         return .object(value)
     }
 
+    /// Discovery is derived from the same operation identities used by authorization. It grants
+    /// nothing; scope_status returns the caller's own grants beside this target-independent catalog.
+    static func operationCatalog() -> Value {
+        var rows: [Value] = MCPDomainSessionAdminToolDefinition.advertisedOperations.map { op in
+            let operation = DomainAgentSessionTargetOperation(rawValue: "session_admin.\(op)")
+            var required = operation?.requiredScopeCapabilities(for: .idle) ?? []
+            if op == "link" { required.formUnion([.observe, .control]) }
+            var row: [String: Value] = [
+                "tool": .string("session_admin"), "op": .string(op),
+                "scope_capabilities": capabilitiesValue(required)
+            ]
+            if op == "archive" || op == "retire" {
+                row["when_running_also_requires"] = capabilitiesValue([.control])
+            }
+            return .object(row)
+        }
+        for operation in DomainAgentSessionTargetOperation.allCases where operation.rawValue.hasPrefix("agent_session_link.") {
+            var row: [String: Value] = [
+                "tool": .string("agent_session_link"),
+                "op": .string(String(operation.rawValue.dropFirst("agent_session_link.".count)))
+            ]
+            if let capability = operation.requiredMonitorCapability {
+                row["link_capability"] = .string(capability.rawValue)
+            }
+            if operation == .monitorCreateLane {
+                row["scope_capabilities"] = capabilitiesValue([.spawn])
+                row["guidance"] = .string("Requires overseer activation or an outbound link; scoped creation uses spawn and scope guardrails. This creates and links a lane without starting a turn unless message is supplied.")
+            }
+            rows.append(.object(row))
+        }
+        for op in ["set_waiting_on", "request_attention"] {
+            rows.append(.object([
+                "tool": .string("agent_session_link"), "op": .string(op),
+                "guidance": .string(op == "set_waiting_on" ? "Self-scoped waiting context; grants no authority." : "Needs an exact inbound link to the observer. Attention is not approval, authority or a reverse send grant.")
+            ]))
+        }
+        rows.append(.object([
+            "tool": .string("agent_run"), "op": .string("start"),
+            "scope_capabilities": capabilitiesValue([.spawn]),
+            "guidance": .string("Creates a child session. Scoped creation checks provenance and guardrails, not just spawn. Use session_admin fork to copy a member, or agent_session_link create_lane for a top-level managed lane.")
+        ]))
+        for operation in DomainAgentSessionTargetOperation.allCases where operation.rawValue.hasPrefix("agent_run.") {
+            let op = String(operation.rawValue.dropFirst("agent_run.".count))
+            rows.append(.object([
+                "tool": .string("agent_run"), "op": .string(op),
+                "authority": .string(operation == .runSteer ? "direct_child_or_exact_manage_link" : "direct_child"),
+                "managed_target_tool": .string("agent_session_link"),
+                "managed_target_op": .string(operation == .runCancel ? "stop" : op),
+                "guidance": .string(
+                    operation == .runSteer
+                        ? "A managed target is forwarded to the exact-link steer transaction and requires Manage. A scope alone does not replace a link."
+                        : "Child-session surface, not a scope inventory or raw transcript grant. For unrelated managed lanes use the named agent_session_link operation under an exact link; poll/wait need Watch, respond/stop need Manage."
+                )
+            ]))
+        }
+        return .array(rows)
+    }
+
     static func scopeSelectionRequiredValue(_ scopeIDs: [UUID]) -> Value {
         var value: [String: Value] = [
             "result": .string(scopeIDs.isEmpty ? "no_live_scope" : "scope_id_required"),
@@ -460,6 +528,8 @@ struct SessionAdminMCPToolService {
         ]
         if scopeIDs.isEmpty {
             value["guidance"] = .string("Use request_scope to ask for user-approved authority. \(inventoryGuidance)")
+        } else {
+            value["guidance"] = .string("More than one scope could authorize this operation. Call session_admin scope_status, then repeat with the intended scope_id from scope_ids.")
         }
         return .object(value)
     }

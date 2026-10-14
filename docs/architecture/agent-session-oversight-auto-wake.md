@@ -447,8 +447,20 @@ Every newly created oversight link includes `.manage` on its exact, directional,
 This applies equally to an interactive Add, a restored saved pair, and an explicit re-add of a
 still-saved pair. The dashboard has no Manage toggle: the link itself is the user's delegation to
 observe, answer one-time prompts, and steer under the observer's own user's instructions. There is
-also no oversight Auto-approve control or listener; provider permission prompts remain manual unless
-the managed overseer explicitly responds to a particular eligible request.
+a separate, default-off **Auto-approve read-only commands** control. This is explicit user consent,
+not a consequence of a Manage grant: it applies only to eligible one-time command approvals on exact
+managed lanes and is immediately revocable in the dashboard. It is incarnation-local and is never
+persisted or restored. Turning it off changes a token checked at the final management fence; turning
+it on again cannot revive an old attempt. Questions, permissions bundles, hooks, edits, merges,
+session-wide approvals, and policy amendments remain manual. ACP raw-input JSON remains manual until
+there is an attested command projection; supported native command requests are checked at the target
+against a conservative command-shape allowlist, never against their redacted display text.
+
+The allowlist covers simple git status/log/diff (with `--no-pager`, and for log/diff also
+`--no-ext-diff --no-textconv`), `gh run view`, conductor job list/status/wait, and grep. Shell quoting,
+expansion, wrappers, operators, redirection, and unknown mutation options stay manual. This is not a
+shell sandbox: repository tools and configuration must be trusted. The listener is separate from the
+passive reducer and wake coordinator; presentation-only repaints never inspect or answer a prompt.
 
 The durable oversight document stores only observer → target UUID pairs. Older documents with a
 `delegations` key decode safely because unknown fields are ignored; those values are never applied,
@@ -1092,6 +1104,37 @@ expiry, cooldown, target-side cancellation, delivery-ack API, reciprocal-link de
 new tool, per-caller schema variants, target-side prompt supplement, inbound inventory operation,
 generic reverse-send channel, provider-adapter changes, or broad immutable-dispatch refactor. These are
 YAGNI non-goals, not missing pieces to infer from the attention operation.
+
+## Approval and discovery ergonomics
+
+`become_overseer` advertises the bootstrap path before failures are needed. Its result points to
+`session_admin scope_status` without selectors, which returns an operation catalog beside the caller's
+actual scope grants. Scope requirements derive from operation identities; new `link` additionally
+needs observe + control as well as restructure. Scope selection chooses a unique capability-sufficient
+live scope, never guesses from membership, and still runs ordinary chain, membership, and lease checks.
+`agent_run steer` on an unrelated target forwards to the exact-link steer transaction, rather than
+capturing the lane as a child; child/admin calls retain their existing behavior. Raw child poll/log
+surfaces are not widened by a link: refusals direct overseers to the sanitized link surfaces.
+
+The approval card offers **Grant all for this session** as a separate user action. It grants every
+capability permitted for the displayed scope kind, without expiry, retaining capacity and bulk-card
+limits. It does not widen membership, grant human-only actions, or enable read-only auto-approval.
+Ordinary Grant still cannot exceed the request. Active delegations display the actual capabilities
+and allow immediate revocation. No tool argument can invoke Grant all or enable auto-approval.
+
+Grant, denial, and revocation generate app-authored decision notices for the requesting session.
+These use noncomposer submission after the active turn settles, without reading/clearing the user's
+draft, attachments, workflow or interview state. The queue is bound to the presenting session and
+its Stop fence. It is not attention, a link grant, an interaction response, or passive Auto-wake;
+no notice bypasses readiness or Stop, and notices instruct the agent to re-read current scope status.
+
+Creation needs capacity evidence only for configured limits, including ancestor limits. #1363
+(`8b47b8ad1`) added unconditional complete-census checks before scoped spawn and fork: an unrelated
+unindexed physical tab could veto an unlimited scope, yielding `scope_denied` for start, uniform
+unavailability for fork, and a masked `destination_unavailable` for lane creation. Unlimited creation
+no longer demands unused capacity evidence; creator and membership ambiguity still fail closed,
+and configured limits still require a complete census. Lane receipts distinguish scoped admission
+from unavailable destinations and include recovery guidance. This changes no persistence policy.
 
 ## Catalog-convergence diagnostics
 
