@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import SwiftUI
 import XCTest
 
@@ -1107,4 +1109,397 @@ private struct SidebarLayoutProbe: View {
         (nil, false, "R2"),
         ("H-Previous", false, "R3")
     ]
+}
+
+/// #1373: a session switch, a global link-candidate notification, or an unrelated prompt publish
+/// must re-render only the rows whose rendered values changed — not every pinned row.
+///
+/// Pinned rows are exempt from the page cap, so a workspace with hundreds of pins renders hundreds
+/// of rows. These tests host the real sidebar with 500 pinned sessions and count actual
+/// `AgentSessionRow` body evaluations.
+@MainActor
+final class AgentSidebarRowInvalidationTests: XCTestCase {
+    private static let rowCount = 500
+
+    @MainActor
+    private struct Fixture {
+        let state: WindowState
+        let tabs: [ComposeTabState]
+        let host: NSHostingView<AgentModeSessionsSidebarView>
+        let window: NSWindow
+
+        var vm: AgentModeViewModel {
+            state.agentModeViewModel
+        }
+    }
+
+    private var renderedTitles: [String] = []
+    private var changedModelFields: Set<String> = []
+
+    override func setUp() async throws {
+        try await super.setUp()
+        renderedTitles = []
+        changedModelFields = []
+        AgentSidebarRowRenderProbe.onSessionRowBody = { [weak self] title in
+            self?.renderedTitles.append(title)
+        }
+        AgentSidebarRowRenderProbe.onActiveRowModelChange = { [weak self] old, new in
+            self?.changedModelFields.formUnion(Self.changedFields(old, new))
+        }
+    }
+
+    override func tearDown() async throws {
+        AgentSidebarRowRenderProbe.onSessionRowBody = nil
+        AgentSidebarRowRenderProbe.onActiveRowModelChange = nil
+        try await super.tearDown()
+    }
+
+    // MARK: - Real sidebar
+
+    func testSessionSwitchReRendersOnlyTheTwoRowsWhoseSelectionChanged() async throws {
+        let fixture = try await makeFixture()
+        XCTAssertGreaterThanOrEqual(
+            Set(renderedTitles).count, Self.rowCount,
+            "Sanity: the pin-exempt page must actually render every pinned row"
+        )
+        // Warm both tabs: a first visit may legitimately capture live editor state into the tab.
+        // The issue's acceptance target is a warm switch between already-visited sessions.
+        for tab in [fixture.tabs[1], fixture.tabs[0]] {
+            await fixture.state.promptManager.switchComposeTab(tab.id)
+            fixture.vm.test_setCurrentTabIDOverride(nil)
+            fixture.vm.syncSidebarUIState(refresh: true, reason: .explicit)
+            await render(fixture, currentTabID: tab.id)
+        }
+        try await settle(fixture)
+        let rowBuildsBefore = fixture.vm.test_sidebarSessionRowsBuildCount
+        let rowContentRevisionBefore = fixture.vm.ui.sessionSidebar.snapshot.rowContentRevision
+        let fingerprintBefore = fixture.vm.makeSessionSidebarContentFingerprint()
+        renderedTitles = []
+
+        await fixture.state.promptManager.switchComposeTab(fixture.tabs[1].id)
+        fixture.vm.test_setCurrentTabIDOverride(nil)
+        XCTAssertEqual(fixture.vm.currentTabID, fixture.tabs[1].id)
+        // The production sync path after a switch; the selected tab must not count as row content.
+        fixture.vm.syncSidebarUIState(refresh: true, reason: .explicit)
+        await render(fixture, currentTabID: fixture.tabs[1].id)
+
+        XCTAssertEqual(
+            Set(renderedTitles), [fixture.tabs[0].name, fixture.tabs[1].name],
+            "Only the previously and newly active rows may re-render; got \(Set(renderedTitles).count) rows, changed: \(changedModelFields.sorted())"
+        )
+        let fingerprintDelta = fixture.vm.makeSessionSidebarContentFingerprint()
+            .debugDeltaDiagnostics(from: fingerprintBefore).categories
+        XCTAssertEqual(
+            fixture.vm.ui.sessionSidebar.snapshot.rowContentRevision, rowContentRevisionBefore,
+            "A selection change is not row content and must not force a full row rebuild; changed: \(fingerprintDelta)"
+        )
+        XCTAssertEqual(fixture.vm.test_sidebarSessionRowsBuildCount, rowBuildsBefore)
+    }
+
+    func testUnchangedSessionLinkNotificationsReRenderNoRows() async throws {
+        let fixture = try await makeFixture()
+        renderedTitles = []
+        changedModelFields = []
+
+        NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
+        NotificationCenter.default.post(name: .agentSessionLinkOverseerProjectionDidChange, object: fixture.vm)
+        await render(fixture, currentTabID: fixture.tabs[0].id)
+
+        XCTAssertEqual(
+            Set(renderedTitles).count, 0,
+            "Notifications that change no rendered row facts must not re-render rows; changed: \(changedModelFields.sorted())"
+        )
+    }
+
+    func testBackgroundRunStateChangeReRendersOnlyThatRow() async throws {
+        let fixture = try await makeFixture()
+        let session = fixture.vm.session(for: fixture.tabs[5].id)
+        session.runState = .idle
+        fixture.vm.observeSidebarRunStateTransition(for: session)
+        await render(fixture, currentTabID: fixture.tabs[0].id)
+        renderedTitles = []
+
+        session.runState = .completed
+        fixture.vm.observeSidebarRunStateTransition(for: session)
+        await render(fixture, currentTabID: fixture.tabs[0].id)
+
+        XCTAssertEqual(Set(renderedTitles), [fixture.tabs[5].name], "Only the transitioned row may re-render")
+    }
+
+    func testOversightLinkChangeReRendersOnlyTheLinkedRows() async throws {
+        let fixture = try await makeFixture()
+        renderedTitles = []
+        let observerID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let targetID = try XCTUnwrap(fixture.tabs[1].activeAgentSessionID)
+
+        let outcome = await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+            observerSessionID: observerID, rawTargetSessionID: targetID.uuidString
+        )
+        guard case .added = outcome else { return XCTFail("Real bridge grant failed: \(outcome)") }
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        await render(fixture, currentTabID: fixture.tabs[0].id)
+
+        let linkedTitles: Set = [fixture.tabs[0].name, fixture.tabs[1].name]
+        XCTAssertFalse(renderedTitles.isEmpty, "A real link change must reach the linked rows")
+        XCTAssertTrue(
+            Set(renderedTitles).isSubset(of: linkedTitles),
+            "Only the observer and target rows may re-render; got \(Set(renderedTitles).subtracting(linkedTitles).count) others"
+        )
+    }
+
+    func testUnrelatedPromptPublishReRendersNoRows() async throws {
+        let fixture = try await makeFixture()
+        renderedTitles = []
+
+        fixture.state.promptManager.promptText = "unrelated draft text"
+        fixture.state.promptManager.instructionsHeight += 10
+        await render(fixture, currentTabID: fixture.tabs[0].id)
+
+        XCTAssertEqual(renderedTitles, [], "Prompt publishes the sidebar never reads must not re-render rows")
+    }
+
+    /// Clicks are not deliverable in CI XCTest (see `AgentSidebarRunningTapTests`), so this pins the
+    /// property a press depends on: the pressed row's native view survives a switch, a forced row
+    /// rebuild, and a link notification landing mid-press.
+    func testRowNativeViewsSurviveSidebarUpdatesDuringAPress() async throws {
+        let fixture = try await makeFixture()
+        let before = rowRegions(in: fixture.host)
+        XCTAssertEqual(before.count, Self.rowCount)
+
+        await fixture.state.promptManager.switchComposeTab(fixture.tabs[1].id)
+        fixture.vm.test_setCurrentTabIDOverride(nil)
+        fixture.vm.ui.sessionSidebar.refresh()
+        NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
+        await render(fixture, currentTabID: fixture.tabs[1].id)
+
+        let after = rowRegions(in: fixture.host)
+        XCTAssertEqual(
+            Set(before.map(ObjectIdentifier.init)), Set(after.map(ObjectIdentifier.init)),
+            "Every row, including a pressed one, must keep its native view across sidebar updates"
+        )
+    }
+
+    // MARK: - Control: the pre-fix row shape
+
+    /// Rows whose action closures capture values are incomparable, so every parent re-render
+    /// re-evaluates every row body. This is the shape the sidebar used before #1373 (its closures
+    /// captured the row session and list snapshot); the probe must detect it as O(N).
+    func testControlClosureCarryingRowsReRenderEveryRow() {
+        let titles = (0 ..< Self.rowCount).map { "Control \($0)" }
+        let host = NSHostingView(rootView: LegacyClosureRowList(titles: titles, activeIndex: 0))
+        host.frame = CGRect(x: 0, y: 0, width: 300, height: 700)
+        host.layoutSubtreeIfNeeded()
+        renderedTitles = []
+
+        host.rootView = LegacyClosureRowList(titles: titles, activeIndex: 1)
+        host.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(
+            Set(renderedTitles).count, Self.rowCount,
+            "Closure-carrying rows re-render every row for a two-row selection change"
+        )
+    }
+
+    // MARK: - Fixture
+
+    private static func changedFields(_ old: AgentSidebarActiveRowModel, _ new: AgentSidebarActiveRowModel) -> Set<String> {
+        var fields: Set<String> = []
+        if old.session != new.session { fields.insert("session") }
+        if old.workspaceID != new.workspaceID { fields.insert("workspaceID") }
+        if old.isActive != new.isActive { fields.insert("isActive") }
+        if old.runState != new.runState { fields.insert("runState") }
+        if old.attentionRunState != new.attentionRunState { fields.insert("attentionRunState") }
+        if old.oversight.role != new.oversight.role { fields.insert("oversight.role") }
+        if old.oversight.summary != new.oversight.summary { fields.insert("oversight.summary") }
+        if old.oversight.targetEndpoint != new.oversight.targetEndpoint { fields.insert("oversight.targetEndpoint") }
+        if old.oversight.creatorSessionID != new.oversight.creatorSessionID { fields.insert("oversight.creator") }
+        if old.oversight.copySessionIDTarget != new.oversight.copySessionIDTarget { fields.insert("oversight.copyTarget") }
+        if old.isSelected != new.isSelected { fields.insert("isSelected") }
+        if old.showsSelectionPresentation != new.showsSelectionPresentation { fields.insert("showsSelectionPresentation") }
+        if old.isInteractionEnabled != new.isInteractionEnabled { fields.insert("isInteractionEnabled") }
+        if old.commandProgressKind != new.commandProgressKind { fields.insert("commandProgressKind") }
+        return fields
+    }
+
+    private func render(_ fixture: Fixture, currentTabID: UUID) async {
+        // Session-link and snapshot publishers deliver on the next main-queue turn.
+        for _ in 0 ..< 3 {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        fixture.host.rootView = sidebar(for: fixture.state, tabID: currentTabID)
+        fixture.host.layoutSubtreeIfNeeded()
+        await Task.yield()
+        fixture.host.layoutSubtreeIfNeeded()
+    }
+
+    private func rowRegions(in view: NSView) -> [StableMenuContextView] {
+        (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { rowRegions(in: $0) }
+    }
+
+    private func makeFixture() async throws -> Fixture {
+        _ = NSApplication.shared
+        let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        addTeardownBlock {
+            await MainActor.run {
+                GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
+            }
+        }
+        let state = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID,
+                    codexControllerFactory: { _, _, _, _, _, _ in
+                        LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                    },
+                    claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
+                    acpProviderFactory: { _, _ in throw ProviderLaunchRefused.refused },
+                    acpControllerFactory: { _, _ in throw ProviderLaunchRefused.refused },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { false },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in
+                AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+            }
+        )
+        addTeardownBlock {
+            await state.tearDown()
+        }
+        await state.workspaceManager.awaitInitialized()
+        let tabs = (0 ..< Self.rowCount).map { index in
+            ComposeTabState(name: "Pinned \(index)", isPinned: true, activeAgentSessionID: UUID())
+        }
+        let workspace = WorkspaceModel(
+            name: "Pinned sidebar workload", repoPaths: [], ephemeralFlag: true,
+            composeTabs: tabs, activeComposeTabID: tabs[0].id
+        )
+        state.workspaceManager.workspaces = [workspace]
+        let switched = await state.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "sidebarRowInvalidationTest")
+        XCTAssertEqual(switched, .switched)
+        state.promptManager.loadComposeTabsFromWorkspace(workspace)
+        let vm = state.agentModeViewModel
+        await vm.handleWorkspaceSwitch(workspace)
+        vm.test_setCurrentTabIDOverride(tabs[0].id)
+        _ = await vm.ensureSessionReady(tabID: tabs[0].id)
+        for tab in tabs {
+            let session = vm.session(for: tab.id)
+            _ = vm.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session, updateWorkspaceMetadata: true)
+            session.hasLoadedPersistedState = true
+            // Each pinned row is an existing restored conversation, as in the hosted menu fixture.
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.items = [AgentChatItem(kind: .user, text: "Pinned fixture message")]
+        }
+        WindowStatesManager.shared.registerWindowState(state)
+        addTeardownBlock {
+            await MainActor.run {
+                WindowStatesManager.shared.unregisterWindowState(state)
+            }
+        }
+        await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+        vm.syncSidebarUIState(refresh: true, reason: .runState, sidebarTabs: tabs)
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        addTeardownBlock {
+            await MainActor.run {
+                window.close()
+            }
+        }
+        let host = NSHostingView(rootView: sidebar(for: state, tabID: tabs[0].id))
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        let fixture = Fixture(state: state, tabs: tabs, host: host, window: window)
+        // Settle startup publications before any measurement.
+        try await settle(fixture)
+        return fixture
+    }
+
+    /// Workspace activation hydrates every bound tab in the background. With hundreds of tabs that
+    /// outlives a few run-loop turns and legitimately re-binds endpoints, so measurements start only
+    /// once every row's exact endpoint and copy target are present and unchanged.
+    private func settle(_ fixture: Fixture) async throws {
+        func signature() -> [String] {
+            fixture.tabs.map { tab in
+                guard let sessionID = tab.activeAgentSessionID,
+                      let endpoint = fixture.vm.agentSidebarOversightTargetEndpoint(tabID: tab.id, expectedSessionID: sessionID),
+                      let copyTarget = fixture.vm.agentSessionCopyIDTarget(tabID: tab.id, sessionID: sessionID, tabName: tab.name)
+                else { return "pending" }
+                return "\(endpoint)|\(copyTarget)"
+            }
+        }
+        var previous: [String] = []
+        for _ in 0 ..< 300 {
+            await AgentSessionLinkRuntimeBridge.shared.test_settleProjections()
+            await render(fixture, currentTabID: fixture.vm.currentTabID ?? fixture.tabs[0].id)
+            let current = signature()
+            if current == previous, !current.contains("pending") { return }
+            previous = current
+        }
+        let probe = fixture.tabs[2]
+        let probeSessionID = probe.activeAgentSessionID ?? UUID()
+        let endpoint = fixture.vm.agentSidebarOversightTargetEndpoint(tabID: probe.id, expectedSessionID: probeSessionID)
+        let candidate = fixture.vm.agentSessionLinkCandidate(
+            tabID: probe.id, sessionID: probeSessionID, tabName: probe.name, isWindowClosing: false
+        )
+        let session = fixture.vm.session(for: probe.id)
+        XCTFail("""
+        Fixture never settled: \(previous.count { $0 == "pending" }) rows pending; \
+        probe endpoint=\(endpoint != nil) candidate=\(candidate != nil) \
+        failure=\(String(describing: candidate.flatMap(AgentSessionLinkEndpointEligibility.targetResolveFailure(for:)))) \
+        loaded=\(session.hasLoadedPersistedState) loadTask=\(session.persistedLoadTask != nil) \
+        transition=\(session.bindingTransitionInProgress) active=\(String(describing: session.activeAgentSessionID == probeSessionID))
+        """)
+    }
+
+    private func sidebar(for state: WindowState, tabID: UUID) -> AgentModeSessionsSidebarView {
+        AgentModeSessionsSidebarView(
+            rootsStore: AgentWorkspaceRootsSidebarStore(
+                rootProjections: { [] }, rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+                workspaceManager: state.workspaceManager, windowID: state.windowID
+            ),
+            agentModeVM: state.agentModeViewModel, sidebarUI: state.agentModeViewModel.ui.sessionSidebar,
+            promptManager: state.promptManager, apiSettingsVM: state.apiSettingsViewModel,
+            currentTabID: tabID, onManageWorkspaces: {}
+        )
+    }
+
+    private enum ProviderLaunchRefused: Error { case refused }
+}
+
+/// The pre-#1373 row shape: `AgentSessionRow` built inline with fresh action closures.
+private struct LegacyClosureRowList: View {
+    let titles: [String]
+    let activeIndex: Int
+
+    var body: some View {
+        VStack(spacing: 2) {
+            ForEach(titles.indices, id: \.self) { index in
+                let title = titles[index]
+                let activeIndex = activeIndex
+                AgentSessionRow(
+                    title: titles[index],
+                    isActive: index == activeIndex,
+                    isPinned: true,
+                    isMCPControlled: false,
+                    runState: .idle,
+                    threadDepth: 0,
+                    onSelectionGesture: { _ in index == activeIndex ? .ignored : .activate },
+                    onSelect: { _ = title },
+                    onTogglePin: { _ = title },
+                    onDelete: { _ = title },
+                    onRename: { _ = ($0, title) },
+                    sessionIDCopyAction: .systemClipboard(sessionID: nil)
+                )
+            }
+        }
+    }
 }

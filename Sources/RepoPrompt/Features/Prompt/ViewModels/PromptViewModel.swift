@@ -2975,11 +2975,17 @@ class PromptViewModel: ObservableObject {
             let activeIdx = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == activeID })
         else { return }
 
-        let currentName = manager.workspaces[index].composeTabs[activeIdx].name
+        let storedTab = manager.workspaces[index].composeTabs[activeIdx]
         let snapshot = manager.collectComposeTabSnapshot(
-            name: currentName,
-            base: manager.workspaces[index].composeTabs[activeIdx]
+            name: storedTab.name,
+            base: storedTab
         )
+        // `collectComposeTabSnapshot` always stamps a fresh `lastModified`. Leaving a tab without
+        // editing it is not a modification: a timestamp-only write re-dated the outgoing session's
+        // sidebar row and forced a full sidebar row rebuild on every switch (#1373).
+        var timestampNeutral = snapshot
+        timestampNeutral.lastModified = storedTab.lastModified
+        guard timestampNeutral != storedTab else { return }
         _ = manager.updateStoredComposeTabSnapshot(snapshot, workspaceID: manager.workspaces[index].id)
     }
 
