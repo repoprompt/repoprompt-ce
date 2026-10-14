@@ -46,10 +46,12 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         return try Fixture(
             viewModel: viewModel,
             session: session,
@@ -304,6 +306,8 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         successor.selectedAgent = .claudeCode
         successor.hasLoadedPersistedState = true
         successor.installPersistentSessionBinding(fixture.session.persistentSessionBindingIdentity)
+        successor.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(successor.permitsBoundOperationAndSave)
         fixture.viewModel.test_installLiveSession(successor)
         fixture.viewModel.syncStatusPillsUIState()
         let snapshot = fixture.viewModel.ui.statusPills.snapshot
@@ -803,10 +807,12 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Bootstrap presentation requires an existing restored binding.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         let fixture = try Fixture(
             viewModel: viewModel,
             session: session,

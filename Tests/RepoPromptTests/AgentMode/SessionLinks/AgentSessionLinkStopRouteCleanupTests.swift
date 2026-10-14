@@ -56,7 +56,13 @@ final class AgentSessionLinkStopRouteCleanupTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Stop targets an existing restored run, not an unfinished creation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID, sessionID: sessionID, tabName: "Stop route target", isWindowClosing: false
         ))

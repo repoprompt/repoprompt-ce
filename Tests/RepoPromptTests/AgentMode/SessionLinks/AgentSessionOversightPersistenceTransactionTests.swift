@@ -188,12 +188,17 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         displayName: String,
         sessionID: UUID = UUID()
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: sessionID)
+        let restorationToken = AgentSessionRestorationBindingToken(
+            bindingIdentity: binding,
+            bindingTransitionGeneration: 1
+        )
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: UUID(),
-            tabID: UUID(),
+            tabID: binding.tabID,
             sessionID: sessionID,
-            persistentBindingGeneration: UUID(),
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -204,7 +209,8 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: displayName,
             providerDisplayName: "Codex CLI",
-            locationLabel: "worktree/main"
+            locationLabel: "worktree/main",
+            restorationReadiness: .authoritative(restorationToken, .persistedPayloadApplied)
         )
     }
 
@@ -228,7 +234,8 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             roleAllowsOutboundMonitoring: allowed,
             displayName: candidate.displayName,
             providerDisplayName: candidate.providerDisplayName,
-            locationLabel: candidate.locationLabel
+            locationLabel: candidate.locationLabel,
+            restorationReadiness: candidate.restorationReadiness
         )
     }
 

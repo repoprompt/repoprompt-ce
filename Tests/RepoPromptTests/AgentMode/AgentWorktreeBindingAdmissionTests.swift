@@ -521,6 +521,12 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         viewModel.workspaceManager = manager
         viewModel.promptManager = prompt
         session.hasLoadedPersistedState = true
+        XCTAssertNotNil(session.restorationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "Durable worktree transitions require an already-restored session."
+        )
         session.worktreeBindings = [.init(
             id: "primary", repositoryID: identity.repository.repositoryID,
             repoKey: identity.repository.repoKey, logicalRootPath: logical.path,

@@ -582,10 +582,21 @@ import XCTest
             if canonical.activeComposeTabID == moved.id {
                 canonical.activeComposeTabID = canonical.composeTabs.first?.id
             }
-            let stashedSnapshot = try WorkspaceManagerViewModel.replacingWorkspaceProjectionForTesting(
+            // The refreshed identity must come from a committed authority revision. Replacing
+            // only snapshot bytes leaves a fictitious digest that the next durable save rejects.
+            let stashSave = try await DomainWorkspaceAuthorityClient(
+                store: fixture.runtime.workspaceStore,
+                windowID: fixture.window.windowID
+            ).saveFailClosed(
                 canonical,
-                in: canonicalSnapshot
+                fileURL: fixture.workspaceFileURL,
+                expectedWorkspaceRevision: canonicalSnapshot.revisions.workingRevision,
+                expectedContentDigest: canonicalSnapshot.document.contentDigest
             )
+            XCTAssertEqual(stashSave.saved?.disposition, .applied)
+            let stashedValue = await fixture.runtime.workspaceStore
+                .canonicalWorkspaceSnapshot(fixture.workspaceID)
+            let stashedSnapshot = try XCTUnwrap(stashedValue)
             let peerIndex = try XCTUnwrap(peer.workspaceManager.workspaces.firstIndex {
                 $0.id == fixture.workspaceID
             })
@@ -1132,6 +1143,84 @@ import XCTest
                 acceptedPairs: []
             )
             XCTAssertFalse(savedWorkspace.composeTabs.containsIdentity(rejectedPair))
+
+            // A rejected attempt may only detach its own rolled-back runtime. Exercise the
+            // same early boundary with a retained tab, rotated binding, and replacement owner.
+            enum SurvivingOwner: CaseIterable { case stashed, rebound, replacement }
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let viewModel = fixture.window.agentModeViewModel
+            for survivingOwner in SurvivingOwner.allCases {
+                var survivor: AgentTabSession?
+                var survivorSessionID: UUID?
+                var attempt: AgentProvisionalAdmissionIdentity?
+                prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting { identity, receipt in
+                    XCTAssertEqual(receipt.outcome.normalizedFailureCategory, .authorityRevisionConflict)
+                    guard let runtime = viewModel.session(for: identity.tabID, createIfNeeded: false),
+                          let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                          let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: {
+                              $0.id == identity.tabID
+                          })
+                    else { return XCTFail("Rejected creation must expose its captured runtime before rollback") }
+                    XCTAssertTrue(runtime.qualifiedRestorationReadiness.isCreating)
+                    attempt = identity
+                    let tab = manager.workspaces[workspaceIndex].composeTabs.remove(at: tabIndex)
+                    switch survivingOwner {
+                    case .stashed:
+                        manager.workspaces[workspaceIndex].stashedTabs.append(StashedTab(tab: tab))
+                        survivor = runtime
+                        survivorSessionID = identity.sessionID
+                    case .rebound:
+                        let successorID = UUID()
+                        _ = viewModel.test_installPersistentSessionBinding(sessionID: successorID, on: runtime)
+                        survivor = runtime
+                        survivorSessionID = successorID
+                    case .replacement:
+                        viewModel.test_removeSession(tabID: identity.tabID)
+                        let replacement = viewModel.session(for: identity.tabID)
+                        _ = viewModel.test_installPersistentSessionBinding(sessionID: identity.sessionID, on: replacement)
+                        survivor = replacement
+                        survivorSessionID = identity.sessionID
+                    }
+                    prompt.loadComposeTabsFromWorkspace(manager.workspaces[workspaceIndex])
+                }
+                defer {
+                    prompt.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil)
+                    if let attempt {
+                        viewModel.test_removeSession(tabID: attempt.tabID)
+                        if let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                            manager.workspaces[workspaceIndex].stashedTabs.removeAll { $0.tab.id == attempt.tabID }
+                            prompt.loadComposeTabsFromWorkspace(manager.workspaces[workspaceIndex])
+                        }
+                    }
+                }
+                do {
+                    _ = try await service.execute(args: [
+                        "op": .string("start"),
+                        "message": .string("reject while preserving \(survivingOwner)"),
+                        "detach": .bool(true),
+                        "timeout": .int(0)
+                    ])
+                    XCTFail("Typed rejection must still refuse provider dispatch for \(survivingOwner)")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("workspace binding was not durably accepted"))
+                }
+                let retained = try XCTUnwrap(survivor)
+                XCTAssertTrue(viewModel.session(for: retained.tabID, createIfNeeded: false) === retained)
+                XCTAssertEqual(retained.activeAgentSessionID, survivorSessionID)
+                XCTAssertNotNil(retained.operationAdmissionFailureMessage)
+                let attemptedProviderCount = await providerRecorder.count()
+                XCTAssertEqual(attemptedProviderCount, 0)
+                if survivingOwner == .stashed {
+                    XCTAssertTrue(manager.workspace(withID: workspaceID)?.stashedTabs.contains {
+                        $0.tab.id == retained.tabID && $0.tab.activeAgentSessionID == survivorSessionID
+                    } == true)
+                } else {
+                    XCTAssertFalse(manager.workspace(withID: workspaceID)?.composeTabs.contains {
+                        $0.id == retained.tabID
+                    } == true)
+                }
+            }
 
             fixture.window.workspaceManager.removeBeforeSaveListener(beforeSaveToken)
             fixture.window.workspaceManager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
@@ -1730,6 +1819,18 @@ import XCTest
                     let sessionID = try XCTUnwrap(target.sessionID)
                     let pair = AdmissionIdentityPair(tabID: target.tabID, sessionID: sessionID)
                     try await validateBeforeProviderDispatch?(pair)
+                    // Keep the production configured-first-save boundary even though provider
+                    // execution is recorded here. A peer may restore this accepted session.
+                    try await agentModeVM.mcpConfigureSession(
+                        tabID: target.tabID,
+                        agentRaw: agentRaw,
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: reasoningEffortRaw,
+                        creationHandle: target.creationHandle
+                    )
+                    let committed = await agentModeVM.commitConfiguredSessionCreation(target: target)
+                    _ = try XCTUnwrap(committed ? target.sessionID : nil, "Configured session must save before provider dispatch")
+                    XCTAssertNil(agentModeVM.session(for: target.tabID).operationAdmissionFailureMessage)
                     try await recorder.recordAndWait(
                         .init(
                             tabID: target.tabID,

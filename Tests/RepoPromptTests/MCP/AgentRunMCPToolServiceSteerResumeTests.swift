@@ -682,6 +682,18 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                 case .lateMembership:
                     guard setupAwaitCount == 2 else { return }
                     XCTAssertTrue(current.isMCPOriginated)
+                    let autoEdit = await viewModel.applyEditsApprovalStore.autoEditEnabled(
+                        for: viewModel.applyEditsScope(for: current.tabID)
+                    )
+                    XCTAssertTrue(autoEdit, "Activation must override the authoritative approval store")
+                    // The setter yields a snapshot; its return does not acknowledge UI subscription delivery.
+                    do {
+                        try await AsyncTestWait.waitUntil("approval-store activation override projected") {
+                            await MainActor.run { current.autoEditEnabled }
+                        }
+                    } catch {
+                        XCTFail("Activation override was not projected: \(error)")
+                    }
                     XCTAssertTrue(current.autoEditEnabled)
                     hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
                 case .successorEpoch:

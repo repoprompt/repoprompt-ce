@@ -586,7 +586,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = try makeSubmissionFixture()
         let vm = fixture.viewModel
         let session = fixture.session
-        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        _ = try installRestoredBinding(fixture)
         let text = "/computer-use inspect the screen"
         let claim = try claimLocalComposerTurn(text, session: session, viewModel: vm)
         XCTAssertNotEqual(claim.attempt.target.route, .createAgentSessionFromSourceTab)
@@ -609,7 +609,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = try makeSubmissionFixture()
         let vm = fixture.viewModel
         let session = fixture.session
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredBinding(fixture)
         let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
             tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
         ))
@@ -643,7 +643,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             let fixture = try makeSubmissionFixture()
             let vm = fixture.viewModel
             let session = fixture.session
-            let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+            let sessionID = try installRestoredBinding(fixture)
             let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
                 tabID: session.tabID, sessionID: sessionID, tabName: "Target", isWindowClosing: false
             ))
@@ -708,7 +708,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = try makeSubmissionFixture()
         let vm = fixture.viewModel
         let session = fixture.session
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredBinding(fixture)
         _ = try await vm.mcpActivateControlContext(
             forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
         )
@@ -726,6 +726,21 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(fixture.factory.controllers.isEmpty)
         XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [])
         XCTAssertTrue(session.items.isEmpty)
+    }
+
+    /// These control and delivery tests start with an existing restored app session, even when
+    /// its provider conversation is new. Fresh composer creation is exercised separately.
+    private func installRestoredBinding(_ fixture: Fixture) throws -> UUID {
+        let sessionID = UUID()
+        _ = try XCTUnwrap(fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: fixture.session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertFalse(fixture.session.permitsBoundOperationAndSave)
+        XCTAssertNotNil(fixture.session.operationAdmissionFailureMessage)
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(fixture.session.permitsBoundOperationAndSave)
+        XCTAssertNil(fixture.session.operationAdmissionFailureMessage)
+        return sessionID
     }
 
     private func makeSubmissionFixture() throws -> Fixture {
@@ -796,7 +811,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = try makeSubmissionFixture()
         let vm = fixture.viewModel
         let session = fixture.session
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredBinding(fixture)
         if locallyArmed {
             await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
             XCTAssertTrue(session.isCodexComputerUseArmed)
@@ -1065,7 +1080,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         for reason in ["user-off", "setting-off"] {
             let fixture = makeFixture([])
-            _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(fixture.session))
+            _ = try installRestoredBinding(fixture)
             let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, _ in
                 WedgeFakeCodexController(runID: runID, responses: [.success("computer-use-thread")])
             }
@@ -1194,7 +1209,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
         let session = fixture.session
-        let sessionID = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredBinding(fixture)
         let controller = WedgeFakeCodexController(
             runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session), responses: []
         )

@@ -724,7 +724,12 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This presentation test starts with restored content, not an unfinished first-save claim.
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
         // Capture the props an open popover would retain, before any link publication exists.
         let captured = viewModel.currentMonitorPillProps()
@@ -742,6 +747,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertFalse(try viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
             !originalAutoWake, for: XCTUnwrap(captured.endpoint)
         ))
+        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
+        // The current incarnation is still addressable: stale rejection is not a blanket refusal.
+        XCTAssertTrue(viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(originalAutoWake, for: rebound))
         XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
     }
 

@@ -504,6 +504,13 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             session.testInstallPersistentSessionBinding(sessionID: UUID())
         }
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        XCTAssertNotNil(session.operationAdmissionFailureMessage, "Installing the fixture binding does not restore it")
+        // The interrupt race begins with an already restored session that can accept steering.
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? true : nil,
+            "Steering must be admitted before waiting for the interrupt gate"
+        )
         session.runState = .running
         let runID = AgentModeProcessRunIdentity.ensureProcessRunID(for: session)
         let attempt = session.beginRunAttempt(source: "test.acp.steer.late-writer")

@@ -325,7 +325,10 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         let session = await viewModel.ensureSessionReady(tabID: tabID)
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-opus-5-5"
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer {
             viewModel.test_setCurrentTabIDOverride(nil)
@@ -335,6 +338,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         session.hasLoadedPersistedState = false
         session.selectedClaudeEffortRaw = nil
         session.isDirty = false
+        XCTAssertFalse(session.permitsBoundOperationAndSave, "An existing cold conversation has no restoration proof yet")
         var saves: [AgentSession] = []
         viewModel.test_setAgentSessionSaver { saved, _, _ in
             saves.append(saved)
@@ -355,7 +359,12 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         // Commit the authoritative payload before restoring the legacy effort, as hydration does.
         session.setItemsSilently([.user("Existing conversation")], reason: .persistedSessionHydration)
         session.providerSessionID = "existing-provider-session"
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "Only the applied conversation payload may permit the legacy-effort migration save."
+        )
         viewModel.restoreClaudeEffort(from: AgentSession(id: sessionID, name: "Legacy conversation"), to: session)
         await viewModel.flushSave(for: tabID)
         XCTAssertEqual(saves.count, 1)
@@ -381,6 +390,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             WindowStatesManager.shared.unregisterWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         }
+        await window.workspaceManager.awaitInitialized()
         let workspace = window.workspaceManager.createWorkspace(
             name: "Claude MCP effort pin",
             repoPaths: [root.path],
@@ -390,10 +400,29 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == activeWorkspace.id })
+        window.workspaceManager.workspaces[workspaceIndex].customStoragePath = root.appendingPathComponent("sessions", isDirectory: true)
+        let sessionID = UUID()
+        let persisted = AgentSession(
+            id: sessionID, workspaceID: activeWorkspace.id, composeTabID: tabID,
+            name: "Claude effort pin", agentKind: AgentProviderKind.claudeCode.rawValue,
+            agentModel: "claude-opus-5-5", isMCPOriginated: true
+        )
+        let savedFile = try await AgentSessionDataService.shared.saveAgentSession(
+            persisted, for: window.workspaceManager.workspaces[workspaceIndex]
+        )
         let viewModel = window.agentModeViewModel
+        let pending = viewModel.session(for: tabID)
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: pending, updateWorkspaceMetadata: true
+        ))
+        pending.hasLoadedPersistedState = false
         let session = await viewModel.ensureSessionReady(tabID: tabID)
-        session.isMCPOriginated = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "MCP configuration requires the existing conversation to be restored."
+        )
+        XCTAssertTrue(session.isMCPOriginated)
         viewModel.test_setCurrentTabIDOverride(UUID())
         defer {
             viewModel.test_setCurrentTabIDOverride(nil)
@@ -401,10 +430,11 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
                 session.saveDebounceTask?.cancel()
             }
         }
-        let savedFile = root.appendingPathComponent("effort-session.json")
-        viewModel.test_setAgentSessionSaver { saved, _, _ in
-            try JSONEncoder().encode(saved).write(to: savedFile, options: .atomic)
-            return savedFile
+        viewModel.test_setAgentSessionSaver { saved, workspace, count in
+            try await AgentSessionDataService.shared.saveAgentSession(
+                saved, for: workspace, preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: count
+            )
         }
 
         try await viewModel.mcpConfigureSession(
@@ -424,6 +454,12 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         viewModel.test_removeSession(tabID: tabID)
         let restored = viewModel.session(for: tabID)
         XCTAssertEqual(restored.persistedReasoningEffortRaw, "low")
+        let hydrated = await viewModel.ensureSessionReady(tabID: tabID)
+        XCTAssertTrue(hydrated === restored)
+        _ = try XCTUnwrap(
+            restored.permitsBoundOperationAndSave ? restored.currentRestorationBindingToken : nil,
+            "Reconfiguring the reopened conversation requires its saved payload."
+        )
         viewModel.restoreClaudeEffort(from: saved, to: restored)
         XCTAssertEqual(viewModel.claudeCoordinator.currentClaudeEffortLevel(for: restored), .low)
 
@@ -495,7 +531,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
     }
 
     @MainActor
-    private func fixture(_ controller: ClaudeNativeProcessSessionController) -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
+    private func fixture(_ controller: ClaudeNativeProcessSessionController) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1, workspacePathProvider: { _ in nil },
             claudeControllerFactory: { _, _, _, _ in controller }, autoEffortEnabledProvider: { true }
@@ -505,6 +541,11 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         session.selectedModelRaw = "claude-opus-5-5:high"
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The restored conversation must be ready before exercising native Auto fallback."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -529,7 +570,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                     return [:]
                 }, write: { writes.append($0) })
                 if afterClassification { await controller.test_setBeforeApplicationErrorReturn { await gate.pause() } }
-                let (coordinator, session, intent) = fixture(controller)
+                let (coordinator, session, intent) = try fixture(controller)
                 let send = Task {
                     await coordinator.sendClaudeNativeMessage(
                         session: session, text: "older ordinary turn", attachments: [], intent: intent,
@@ -574,7 +615,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             }
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = fixture(controller)
+        let (coordinator, session, intent) = try fixture(controller)
         let outcome = await coordinator.sendClaudeNativeMessage(
             session: session, text: "current ordinary turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
@@ -612,7 +653,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             applied.append(data)
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = fixture(controller)
+        let (coordinator, session, intent) = try fixture(controller)
         let ensured = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
         XCTAssertEqual(ensured, .ready)
         let picker = Task { await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.picker") }
@@ -667,7 +708,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             applied.append(data)
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = fixture(controller)
+        let (coordinator, session, intent) = try fixture(controller)
         let auto = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "Superseded Auto turn", attachments: [], intent: intent,
@@ -718,7 +759,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             applied.append(data)
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = fixture(controller)
+        let (coordinator, session, intent) = try fixture(controller)
         let auto = Task {
             await coordinator.sendClaudeNativeMessage(
                 session: session, text: "Superseded Auto turn", attachments: [], intent: intent,

@@ -39,7 +39,19 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
         locationLabel: String? = nil,
         isDeletionInProgress: Bool = false
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let readiness: AgentSessionRestorationReadiness
+        if let bindingID {
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: tabID, sessionID: sessionID, generation: bindingID
+                ),
+                bindingTransitionGeneration: transitionGeneration
+            )
+            readiness = hasLoadedPersistedState ? .authoritative(token, .persistedPayloadApplied) : .pending(token)
+        } else {
+            readiness = .unbound
+        }
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: workspaceID,
             tabID: tabID,
@@ -56,6 +68,7 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: providerDisplayName,
             locationLabel: locationLabel,
+            restorationReadiness: readiness,
             isDeletionInProgress: isDeletionInProgress
         )
     }
@@ -255,7 +268,9 @@ final class AgentSidebarOversightMenuModelsTests: XCTestCase {
             menu.observerOptions.map(\.menuLabel),
             ["beta (main): Able", "beta (main): Chat", "zeta (main): Zed"]
         )
-        guard case .linked = menu.observerOptions[1].relationship else {
+        guard menu.observerOptions.indices.contains(1),
+              case .linked = menu.observerOptions[1].relationship
+        else {
             return XCTFail("expected the remote option to stay linked after sorting")
         }
     }
@@ -2157,6 +2172,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
             sessionID: firstID, on: session, compareAndSetInWorkspaceID: workspaceID
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(session.permitsBoundOperationAndSave ? session : nil)
         session.items = [AgentChatItem(kind: .user, text: "First bound fixture message")]
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
         await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
@@ -2193,6 +2211,9 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         XCTAssertNotNil(fixture.vm.test_installPersistentSessionBinding(
             sessionID: replacementID, on: session, compareAndSetInWorkspaceID: workspaceID
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(session.permitsBoundOperationAndSave ? session : nil)
         AgentSessionLinkRuntimeBridge.shared.noteTopologyMayHaveChanged()
         await AgentSessionLinkRuntimeBridge.shared.test_settleMonitorProjectionRefresh()
         await settleHostedPublication(in: fixture)
@@ -2804,6 +2825,13 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             _ = vm.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session, updateWorkspaceMetadata: true)
             session.hasLoadedPersistedState = true
             if tab.activeAgentSessionID != nil {
+                XCTAssertNotNil(session.operationAdmissionFailureMessage)
+                // Hosted menu fixtures begin with an existing restored conversation.
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                _ = try XCTUnwrap(
+                    session.permitsBoundOperationAndSave ? session : nil,
+                    "Hosted menu participants must be restored before installing grants"
+                )
                 session.items = [AgentChatItem(kind: .user, text: "Hosted fixture message")]
             }
         }

@@ -1444,9 +1444,11 @@ extension AgentTranscriptRestorationLifecycleTests {
 @MainActor
 extension AgentTranscriptRestorationLifecycleTests {
     func testFreshlyCreatedBoundChatIsWelcome() async throws {
-        try await withSavedSelectedTab { fixture in
+        try await withSavedSelectedTab(bound: false) { fixture in
             let session = fixture.viewModel.session(for: fixture.tabID)
-            XCTAssertEqual(session.persistentSessionBindingIdentity?.sessionID, fixture.sessionID, "bound, not durable")
+            let allocated = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+            XCTAssertEqual(session.persistentSessionBindingIdentity?.sessionID, allocated, "bound, not durable")
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isCreating, "fresh creation remains unsaved")
 
             fixture.viewModel.markSessionAsFreshlyCreated(session)
 
@@ -1633,8 +1635,10 @@ extension AgentTranscriptRestorationLifecycleTests {
 extension AgentTranscriptRestorationLifecycleTests {
     /// §4.3 control: with persistence suppressed, a deliberately created fresh chat stays usable.
     func testSuppressedPersistenceFreshChatStaysWelcome() async throws {
-        try await withSavedSelectedTab(suppressPersistence: true) { fixture in
+        try await withSavedSelectedTab(bound: false, suppressPersistence: true) { fixture in
             let session = fixture.viewModel.session(for: fixture.tabID)
+            _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isCreating, "fresh creation remains unsaved")
             fixture.viewModel.markSessionAsFreshlyCreated(session)
 
             XCTAssertEqual(fixture.viewModel.ui.transcript.snapshot.panePresentation, .welcome)
@@ -2934,8 +2938,10 @@ extension AgentTranscriptRestorationLifecycleTests {
 extension AgentTranscriptRestorationLifecycleTests {
     /// §5.5: a deliberately created fresh selection settles the selected side immediately.
     func testSelectedSettlementForFreshChatIsSettledFresh() async throws {
-        try await withSavedSelectedTab { fixture in
+        try await withSavedSelectedTab(bound: false) { fixture in
             let session = fixture.viewModel.session(for: fixture.tabID)
+            _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isCreating, "fresh creation remains unsaved")
             fixture.viewModel.markSessionAsFreshlyCreated(session)
             XCTAssertEqual(fixture.viewModel.ui.transcript.snapshot.panePresentation, .welcome, "precondition")
 

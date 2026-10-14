@@ -612,7 +612,11 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
         func testRequiredSaveFailureSettlesIndeterminateWithBindingActuallyChanged() async throws {
             try await withProvider { fixture in
                 struct SaveFailure: Error {}
-                fixture.driver.window.agentModeViewModel.test_setAgentSessionSaver { _, _, _ in throw SaveFailure() }
+                var saveAttempted = false
+                fixture.driver.window.agentModeViewModel.test_setAgentSessionSaver { _, _, _ in
+                    saveAttempted = true
+                    throw SaveFailure()
+                }
                 let settlements = OSAllocatedUnfairLock<[DomainProtectedMutationSettlement]>(initialState: [])
                 do {
                     _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
@@ -624,6 +628,7 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                         return XCTFail("Expected genuine postcommit indeterminate, got \(error)")
                     }
                 }
+                XCTAssertTrue(saveAttempted, "The injected persistence failure must be reached after admission.")
                 XCTAssertEqual(fixture.session.worktreeBindings.first?.worktreeID, fixture.identity.worktreeID)
                 XCTAssertEqual(settlements.withLock { $0.last?.state }, .indeterminateAfterCommit)
                 let journal = try await fixture.driver.fixture.runtime.mutationJournal.snapshot()
@@ -792,6 +797,12 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 let sessionID = UUID()
                 vm.test_installLiveSession(session)
                 _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true)
+                XCTAssertNotNil(session.restorationAdmissionFailureMessage)
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                _ = try XCTUnwrap(
+                    session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+                    "Worktree provider operations require an already-restored session."
+                )
                 vm.test_setAgentSessionSaver { _, _, _ in git.sandbox.appendingPathComponent("session.json") }
                 let tools = await driver.window.mcpServer.windowMCPTools
                 let tool = try XCTUnwrap(tools.first { $0.name == "manage_worktree" })

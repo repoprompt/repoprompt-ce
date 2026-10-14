@@ -228,7 +228,16 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                         session.selectedAgent = .claudeCode
                         session.hasLoadedPersistedState = true
                         session.oversight.autoWakeOnUpdates = false
-                        _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+                        // This catalog workload starts with restored conversations, not unfinished creations.
+                        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+                        ))
+                        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+                        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                        _ = try XCTUnwrap(
+                            session.permitsBoundOperationAndSave ? session : nil,
+                            "Scale participants must be restored before installing monitor grants"
+                        )
                         sessions.append((window, session))
                     }
                 }

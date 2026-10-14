@@ -3332,10 +3332,13 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Accepted wake attribution belongs to an existing restored conversation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         #if DEBUG
             let expectedCatalogConnectionID = UUID(
                 uuidString: "00000000-0000-0000-0000-00000000CA7A"

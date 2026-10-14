@@ -163,7 +163,17 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             session.providerSessionID = "provider-conversation"
             session.codexConversationID = "codex-thread"
         }
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         let candidate = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
             tabID: tabID,
             sessionID: sessionID,
@@ -1017,7 +1027,17 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // This transaction starts from an existing restored session, not an unfinished allocation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must admit operations before exercising transaction gates"
+        )
         session.claudeController = controller
         let inventory = MonitorInventoryPublisher(viewModel: viewModel, observerSessionID: sessionID, tabID: tabID)
         return (viewModel, session, inventory, tabID)

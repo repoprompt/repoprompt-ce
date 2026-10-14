@@ -10482,6 +10482,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ))
 
         var capturedFreshSession: FreshSessionCreation?
+        defer {
+            // Tab admission can roll its projection back before it returns or throws. Retire
+            // only the matching unpublished runtime; a successor or retained recovery tab owns
+            // its own lifecycle and must survive this failed creation attempt.
+            if let creation = capturedFreshSession,
+               sessions[creation.session.tabID] === creation.session,
+               creation.session.creationHandleIsCurrent(creation),
+               let workspace = workspaceManager?.workspace(withID: creation.workspaceID),
+               !workspace.composeTabs.contains(where: { $0.id == creation.session.tabID }),
+               !workspace.stashedTabs.contains(where: { $0.tab.id == creation.session.tabID })
+            {
+                cancelPersistedLoad(for: creation.session)
+                creation.session.saveDebounceTask?.cancel()
+                creation.session.saveDebounceTask = nil
+                creation.session.cancelEphemeralRuntimeState()
+                sessions.removeValue(forKey: creation.session.tabID)
+                transcriptPresentationRecordsByTabID.removeValue(forKey: creation.session.tabID)
+                persistedLoadAttemptByTabID.removeValue(forKey: creation.session.tabID)
+                removePendingUIRefresh(for: creation.session.tabID)
+            }
+        }
         switch try await promptManager.createDurableBackgroundAgentSessionTab(
             name: name,
             sessionID: sessionID,

@@ -423,6 +423,9 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
     func testOnlyAVerifiedOwnContinuationNotePassesTheACPBackgroundCompactionHold() {
         let session = AgentTabSession(tabID: UUID())
         session.hasLoadedPersistedState = true
+        session.installPersistentSessionBinding(
+            AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        )
         session.beginACPBackgroundCompactionSettle(duration: 90)
         defer { session.endACPBackgroundCompactionSettle() }
         var attempt = AgentSelfCompactAttempt(
@@ -441,6 +444,12 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
 
         // Verified completion (vouched drop): this request's own note may start the next turn.
         attempt.acpCompletionUnverified = nil
+        XCTAssertEqual(
+            AgentSessionLinkDeliveryReadiness.evaluate(snapshot: noteSnapshot(for: attempt.id)),
+            .blocked(.targetLoading),
+            "Verified compaction never bypasses pending restoration"
+        )
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         let verified = noteSnapshot(for: attempt.id)
         XCTAssertFalse(verified.backgroundCompactionSettling)
         XCTAssertEqual(AgentSessionLinkDeliveryReadiness.evaluate(snapshot: verified), .ready)
