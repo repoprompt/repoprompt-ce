@@ -720,6 +720,61 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("Skipped workspaces"))
     }
 
+    func testSessionAdminInventoryPreviewPreservesCountsCoverageAndStructuredRows() throws {
+        let cases: [(label: String, total: Int, returned: Int, totalComplete: Bool, historyComplete: Bool, endpointsComplete: Bool, truncated: Bool)] = [
+            ("complete selected records with incomplete endpoints", 97, 97, true, true, false, false),
+            ("incomplete zero", 0, 0, false, false, false, false),
+            ("row limit with complete coverage", 97, 1, true, true, true, true)
+        ]
+        for scenario in cases {
+            let rows: [Value] = (0 ..< scenario.returned).map { index in
+                .object([
+                    "session_id": .string("session-\(index)"),
+                    "name": .string(String(repeating: "Long session title 日本語 ", count: 16)),
+                    "state": .string("unknown")
+                ])
+            }
+            let value: Value = .object([
+                "result": .string("ok"),
+                "total": .int(scenario.total),
+                "total_complete": .bool(scenario.totalComplete),
+                "history_complete": .bool(scenario.historyComplete),
+                "endpoints_complete": .bool(scenario.endpointsComplete),
+                "truncated": .bool(scenario.truncated),
+                "sessions": .array(rows)
+            ])
+            let args: [String: Value] = ["op": .string("inventory")]
+            let text = try Self.onlyText(ToolOutputFormatter.buildContentBlocks(
+                toolName: "session_admin", args: args, result: value, emitResources: false
+            ))
+            // The observed provider failure retained only this preview of a 97-row response.
+            let preview = String(decoding: text.utf8.prefix(2000), as: UTF8.self)
+            XCTAssertTrue(preview.contains("\(scenario.total) matching session identities"), scenario.label)
+            XCTAssertTrue(preview.contains("\(scenario.returned) rows returned"), scenario.label)
+            XCTAssertTrue(preview.contains("total_complete=\(scenario.totalComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("history_complete=\(scenario.historyComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("endpoints_complete=\(scenario.endpointsComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("Row-limit truncated=\(scenario.truncated)"), scenario.label)
+            XCTAssertTrue(preview.contains("not the number of visible rows"), scenario.label)
+            XCTAssertEqual(preview.contains("does not prove an empty workspace"), !scenario.totalComplete, scenario.label)
+            XCTAssertEqual(preview.contains("row limit omitted matches"), scenario.truncated, scenario.label)
+
+            let jsonFence = try XCTUnwrap(text.range(of: "```json\n"), scenario.label)
+            let jsonStart = jsonFence.upperBound
+            let jsonEnd = try XCTUnwrap(text.range(of: "\n```", options: .backwards), scenario.label).lowerBound
+            let decoded = try JSONDecoder().decode(Value.self, from: Data(text[jsonStart ..< jsonEnd].utf8))
+            XCTAssertEqual(decoded, value, "The summary must preserve every structured row and coverage flag: \(scenario.label)")
+            let summary = text[..<jsonFence.lowerBound]
+            XCTAssertLessThan(summary.utf8.count, 2000, scenario.label)
+
+            let raw = try Self.onlyText(ToolOutputFormatter.buildContentBlocks(
+                toolName: "session_admin", args: args.merging(["_rawJSON": .bool(true)]) { _, new in new },
+                result: value, emitResources: false
+            ))
+            XCTAssertEqual(try JSONDecoder().decode(Value.self, from: Data(raw.utf8)), value, scenario.label)
+        }
+    }
+
     func testIncompleteHistoryScansNeverImplyAnEmptyWorkspace() throws {
         for (scanTruncated, skipped) in [(true, [String]()), (false, ["stale index schema v2: 1"]), (false, [])] {
             let incomplete = scanTruncated || !skipped.isEmpty

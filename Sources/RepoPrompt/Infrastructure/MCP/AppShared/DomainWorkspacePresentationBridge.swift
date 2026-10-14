@@ -797,9 +797,12 @@ final class DomainWorkspacePresentationBridge {
             if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
                let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
                projectedAdoptionGenerations[workspaceID] == generation,
-               let cached = projectedModels[workspaceID]
+               projectedModels[workspaceID] != nil,
+               let current = manager.workspace(withID: workspaceID)
             {
-                nextModels[workspaceID] = cached
+                // The generation proves a shared canonical ancestor, not that the cached model
+                // contains edits made since its last projection. Preserve the current descendant.
+                nextModels[workspaceID] = current
             } else {
                 do {
                     nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)

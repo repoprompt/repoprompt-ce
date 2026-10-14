@@ -524,12 +524,27 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                         }
                     )
                     manager.workspaces.append(unrelated)
+                    // Fixture installation changes the active tab after workspace activation.
+                    // Complete the real Chat owner before measuring archive; joining workspace
+                    // saves alone does not join Oracle's queued active-tab initialization.
+                    let oracle = fixture.window.oracleViewModel
+                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                    let ensuredChatID = await oracle.ensureActiveSessionForCurrentTab(createIfMissing: true)
+                    let callerChatID = try XCTUnwrap(ensuredChatID)
                     await manager.debugDrainScheduledSaves()
+                    let callerChat = try XCTUnwrap(oracle.sessions.first { $0.id == callerChatID })
+                    XCTAssertEqual(callerChat.workspaceID, fixture.workspaceID)
+                    XCTAssertEqual(callerChat.composeTabID, fixture.callerTab.id)
+                    XCTAssertEqual(oracle.currentSessionID, callerChatID)
+                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                    let storedCaller = try XCTUnwrap(try fixture.workspace().composeTabs.first { $0.id == fixture.callerTab.id })
+                    XCTAssertEqual(storedCaller.activeChatSessionID, callerChatID)
                     let rebuilds = manager.test_sessionCarrierIndexRebuildCount
                     manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
                     let archived = try await fixture.call("archive", [:])
                     XCTAssertEqual(archived["changed_count"], .int(1))
                     XCTAssertEqual(try fixture.workspace().stashedTabs.map(\.tab.id), [fixture.targetTab.id])
+                    XCTAssertEqual(manager.activeChatSessionID(forTabID: fixture.callerTab.id), callerChatID)
                     XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
                     archiveVisits.append(manager.test_sessionCarrierIndexMaintenanceRowsVisited)
                     XCTAssertGreaterThan(archiveVisits.last ?? 0, 0, "Count actual index maintenance, not only an outer call")
@@ -540,6 +555,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     XCTAssertEqual(restored["changed_count"], .int(1))
                     XCTAssertTrue(try fixture.workspace().stashedTabs.isEmpty)
                     try fixture.assertTarget(name: "Target", pinned: false, group: nil)
+                    XCTAssertEqual(manager.activeChatSessionID(forTabID: fixture.callerTab.id), callerChatID)
                     XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
                     restoreVisits.append(manager.test_sessionCarrierIndexMaintenanceRowsVisited)
                     XCTAssertGreaterThan(restoreVisits.last ?? 0, 0)

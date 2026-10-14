@@ -4814,6 +4814,62 @@ import XCTest
             }
         }
 
+        func testUnrelatedCatalogProjectionPreservesCurrentLocalDescendantOfCachedDocument() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let initialSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(Fixture.aardvarkID)
+                let initial = try XCTUnwrap(initialSnapshot)
+                let original = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let target = try XCTUnwrap(original.composeTabs.first)
+                let generation = try XCTUnwrap(manager.adoptedFullDocumentGeneration(
+                    workspaceID: original.id, contentDigest: initial.document.contentDigest
+                ))
+                let restoredTitle = "Restored local title awaiting its save"
+                let changed = manager.updateComposeTabPresentation(workspaceID: original.id, tabIDs: [target.id]) { _, tab in
+                    tab.name = restoredTitle
+                }
+                XCTAssertEqual(changed, [target.id])
+                manager.markWorkspaceDirty(workspaceID: original.id)
+                let dirtyVersion = manager.debugStateVersionForWorkspace(original.id)
+                XCTAssertEqual(manager.adoptedFullDocumentGeneration(
+                    workspaceID: original.id, contentDigest: initial.document.contentDigest
+                ), generation, "a local descendant retains its adopted canonical ancestor")
+                var targetDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    if id == original.id { targetDecodes += 1 }
+                    return nil
+                }
+                defer { manager.setCatalogRecordDecodeFailureForTesting(nil) }
+
+                // A real new record forces a full catalog application while this target's
+                // canonical document is unchanged. No save or flush can mask the local rollback.
+                let unrelated = try await f.commitWorkspace(named: "Unrelated catalog member", window: window)
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                let after = try XCTUnwrap(manager.workspace(withID: original.id))
+                XCTAssertEqual(after.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertNotNil(manager.workspace(withID: unrelated.id))
+                XCTAssertEqual(manager.debugStateVersionForWorkspace(original.id), dirtyVersion)
+                XCTAssertEqual(targetDecodes, 0, "the same-lineage target must not be decoded again")
+                let unchangedSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(original.id)
+                let unchanged = try XCTUnwrap(unchangedSnapshot)
+                XCTAssertEqual(unchanged.revisions, initial.revisions)
+                XCTAssertEqual(unchanged.document.contentDigest, initial.document.contentDigest)
+
+                // The retained descendant must still be writable through the real owner.
+                _ = try await manager.saveWorkspaceToFileAsync(after)
+                let savedSnapshot = await f.runtime.workspaceStore.canonicalWorkspaceSnapshot(original.id)
+                let saved = try XCTUnwrap(savedSnapshot)
+                let canonical = try manager.decodeDomainWorkspaceCatalogRecord(saved)
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: saved.document.fileURL))
+                XCTAssertEqual(canonical.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertEqual(disk.composeTabs.first { $0.id == target.id }?.name, restoredTitle)
+                XCTAssertNil(saved.revisions.dirtyRevision)
+            }
+        }
+
         func testPointDefaultAdoptionPreventsCachedOverlayReturningOnUnrelatedCatalogChange() async throws {
             try await Fixture.run { f in
                 let window = f.makeWindow()

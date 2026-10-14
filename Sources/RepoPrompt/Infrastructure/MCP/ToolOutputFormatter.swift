@@ -948,6 +948,8 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "session_admin":
+            return SessionAdminToolOutputFormatter.format(args: args, value: result)
         case "history":
             return formatHistory(args: args, value: result)
         default:

@@ -2246,6 +2246,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             agentAdmissionRecoveryOwners.contains(identity)
         }
 
+        /// Pauses a real captured coalesced publication before its debounce and admission.
+        var workingPublicationDidCaptureForTesting: (@MainActor (UUID) async -> Void)?
+
         func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) async {
             publishWorkingDocumentToDomainAuthority(workspace)
             await debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspace.id)
@@ -7990,6 +7993,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
             do {
+                #if DEBUG
+                    await self?.workingPublicationDidCaptureForTesting?(workspaceID)
+                #endif
                 try await Task.sleep(for: .milliseconds(200))
                 guard let self,
                       domainWorkingCommitGeneration[workspaceID] == generation,
@@ -8108,8 +8114,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         operationIDs: [UUID],
         permitsLocalDescendants: Bool
     ) throws {
-        guard fullDocumentWriteBaseline(workspaceID: workspace.id) == baseline else {
-            requestFullDocumentAdoption(workspaceID: workspace.id)
+        let currentBaseline = fullDocumentWriteBaseline(workspaceID: workspace.id)
+        guard currentBaseline == baseline else {
+            // A newer qualified lineage makes this captured write stale, but needs no catalog
+            // adoption. Keep refusing the stale proposal without reloading every workspace.
+            if currentBaseline == nil { requestFullDocumentAdoption(workspaceID: workspace.id) }
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
         let digest = try DomainWorkspaceAuthorityClient.documentDigest(for: workspace)

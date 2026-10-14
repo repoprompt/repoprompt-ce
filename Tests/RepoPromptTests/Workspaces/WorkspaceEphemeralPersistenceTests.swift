@@ -1,3 +1,4 @@
+import Combine
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -1281,6 +1282,100 @@ import XCTest
             }
         }
 
+        func testStaleCapturedPublicationDoesNotRefreshCatalogAfterNewerFullAdoption() async throws {
+            let captured = expectation(description: "coalesced publisher captured its old full-document baseline")
+            let finished = expectation(description: "stale captured publication returned")
+            let captureGate = WorkspaceDeleteSuspensionGate()
+            let commands = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command else { return }
+                    _ = await commands.increment()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                await fixture.bridge.stopAndJoinForTesting()
+                let initialIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                manager.workspaces[initialIndex].composeTabs[0].promptText = "Pending coalesced local edit"
+                manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                let old = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let oldBaseline = manager.debugDomainAuthorityBaseline(for: old.id)
+                var refreshRequests: [Bool] = []
+                manager.installDomainCatalogRefresh(request: { refreshRequests.append($0) }, cancel: {})
+                manager.workingPublicationDidCaptureForTesting = { id in
+                    guard id == old.id else { return }
+                    captured.fulfill()
+                    await captureGate.wait()
+                }
+                defer {
+                    manager.workingPublicationDidCaptureForTesting = nil
+                    manager.installDomainCatalogRefresh(request: { _ in }, cancel: {})
+                }
+                let publication = Task {
+                    defer { finished.fulfill() }
+                    await manager.debugPublishWorkingDocumentToDomainAuthority(old)
+                }
+                do {
+                    try await self.awaitSaveCheckpoint(captured)
+                    let restored = try await self.restoreArchivedTabRemotely(in: fixture)
+                    XCTAssertGreaterThan(restored.revisions.workingRevision, try XCTUnwrap(oldBaseline.revisions).workingRevision)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let decoded = try catalog.workspaces.map { try manager.decodeDomainWorkspaceCatalogRecord($0) }
+                    let receipt = manager.applyDomainWorkspaceCatalog(
+                        catalog, projection: .full(decoded), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    ).receipt
+                    XCTAssertEqual(try XCTUnwrap(receipt).kind, .full)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).revisions, restored.revisions)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).digest, restored.document.contentDigest)
+                    XCTAssertTrue(manager.hasAdoptedFullDocumentBaseline(workspaceID: old.id, contentDigest: restored.document.contentDigest))
+                    let adopted = try XCTUnwrap(manager.workspace(withID: old.id))
+                    XCTAssertNotEqual(adopted.composeTabs[0].promptText, old.composeTabs[0].promptText)
+                    XCTAssertTrue(adopted.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                    XCTAssertFalse(adopted.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+                    XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
+
+                    // The captured publisher must reach its provenance refusal after the real
+                    // full projection, without sending an authority command or requesting a scan.
+                    manager.workingPublicationDidCaptureForTesting = nil
+                    await captureGate.open()
+                    try await self.awaitSaveCheckpoint(finished)
+                    await publication.value
+                    let refusedCommandCount = await commands.value
+                    XCTAssertEqual(refusedCommandCount, 0)
+                    XCTAssertEqual(refreshRequests, [])
+                    XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
+                    XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "working_commit")
+                    XCTAssertEqual(manager.workspace(withID: old.id), adopted)
+                    try await self.assertCanonicalAndDiskRemain(restored, in: fixture)
+
+                    // Keep the bridge stopped: the existing newer witness itself must authorize
+                    // the next current-model save, with no intervening adoption or reload.
+                    let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == old.id })
+                    manager.workspaces[index].composeTabs[0].promptText = "Legitimate edit after stale publication refusal"
+                    manager.markWorkspaceDirty(workspaceID: old.id)
+                    let current = manager.workspaces[index]
+                    let url = try await manager.saveWorkspaceToFileAsync(current)
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(old.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    let savedCommandCount = await commands.value
+                    XCTAssertEqual(savedCommandCount, 1)
+                    XCTAssertEqual(refreshRequests, [])
+                    XCTAssertEqual(url, saved.document.fileURL)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, current.composeTabs[0].promptText)
+                    XCTAssertTrue(canonical.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                    XCTAssertFalse(canonical.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                } catch {
+                    manager.workingPublicationDidCaptureForTesting = nil
+                    await captureGate.open()
+                    await publication.value
+                    throw error
+                }
+            }
+        }
+
         func testRejectedPublicationCannotAuthorizeASecondStalePublication() async throws {
             try await assertRejectedPublicationCannotAuthorizeStaleWrite(useOrdinarySave: false)
         }
@@ -1295,6 +1390,9 @@ import XCTest
                 let old = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
                 let baseline = manager.debugDomainAuthorityBaseline(for: old.id)
                 await fixture.bridge.stopAndJoinForTesting()
+                var refreshRequests: [Bool] = []
+                manager.installDomainCatalogRefresh(request: { refreshRequests.append($0) }, cancel: {})
+                defer { manager.installDomainCatalogRefresh(request: { _ in }, cancel: {}) }
                 let restored = try await self.restoreArchivedTabRemotely(in: fixture)
                 XCTAssertGreaterThan(restored.revisions.workingRevision, try XCTUnwrap(baseline.revisions).workingRevision)
 
@@ -1306,6 +1404,7 @@ import XCTest
                 XCTAssertEqual(manager.workspace(withID: old.id), old)
                 XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).revisions, restored.revisions)
                 XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).digest, restored.document.contentDigest)
+                XCTAssertEqual(refreshRequests, [])
                 try await self.assertCanonicalAndDiskRemain(restored, in: fixture)
 
                 if useOrdinarySave {
@@ -1318,6 +1417,7 @@ import XCTest
                     XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
                 }
                 XCTAssertEqual(manager.workspace(withID: old.id), old)
+                XCTAssertEqual(refreshRequests, [false], "Unadopted conflict metadata still needs one full-adoption request")
                 try await self.assertCanonicalAndDiskRemain(restored, in: fixture)
                 try await self.assertFullProjectionReauthorizesLocalSave(in: fixture)
             }
@@ -1455,6 +1555,25 @@ import XCTest
                     let stash = try XCTUnwrap(restored.stashedTabs.first { $0.tab.id == fixture.restoredTab.id })
                     restored.stashedTabs.removeAll { $0.id == stash.id }
                     restored.composeTabs.append(stash.tab)
+                    // Working and saved events can produce full then metadata receipts. Keep
+                    // the actual target adoption evidence before the latest checkpoint advances.
+                    let observation = fixture.bridge.projectionObservationStateForTesting
+                    var fullProjectionEvidence: [(revision: UInt64, digest: String)] = []
+                    let projectionToken = fixture.bridge.projectionObservationPublisherForTesting.sink { event in
+                        guard case let .applied(checkpoint) = event,
+                              checkpoint.runID == observation.runID,
+                              checkpoint.generation > observation.generation,
+                              checkpoint.catalogReceipt?.kind == .full,
+                              let projected = manager.workspace(withID: observed.id),
+                              projected.composeTabs.map(\.id) == restored.composeTabs.map(\.id),
+                              !projected.stashedTabs.contains(where: { $0.tab.id == fixture.restoredTab.id })
+                        else { return }
+                        let baseline = manager.debugDomainAuthorityBaseline(for: observed.id)
+                        if let revision = baseline.revisions?.workingRevision, let digest = baseline.digest {
+                            fullProjectionEvidence.append((revision, digest))
+                        }
+                    }
+                    defer { projectionToken.cancel() }
                     let author = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -758)
                     let remote = try await author.saveFailClosed(
                         restored, fileURL: baseline.document.fileURL,
@@ -1467,9 +1586,12 @@ import XCTest
                     let accepted = try XCTUnwrap(restoredSnapshot)
                     let catalog = await fixture.runtime.workspaceStore.snapshot()
                     let checkpoint = await fixture.observer.waitForProjection(
-                        afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                        afterGeneration: observation.generation, through: catalog.publicationSequence, requireCatalogApplication: true
                     )
-                    XCTAssertEqual(try XCTUnwrap(checkpoint).catalogReceipt?.kind, .full)
+                    _ = try XCTUnwrap(checkpoint)
+                    XCTAssertTrue(fullProjectionEvidence.contains {
+                        $0.revision == accepted.revisions.workingRevision && $0.digest == accepted.document.contentDigest
+                    }, "The restored target must have been adopted by an accepted full projection")
                     XCTAssertEqual(manager.workspace(withID: observed.id)?.composeTabs.map(\.id), restored.composeTabs.map(\.id))
                     XCTAssertEqual(
                         manager.debugStateVersionForWorkspace(observed.id),
