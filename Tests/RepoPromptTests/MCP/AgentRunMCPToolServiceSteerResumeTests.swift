@@ -934,9 +934,25 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             let window = try await makeCancelWindow()
             let viewModel = window.agentModeViewModel
             let callerID = UUID(), sessionID = UUID()
+            var observedPendingActivation = false
+            viewModel.test_afterMCPControlSetupAwait = { current in
+                observedPendingActivation = true
+                XCTAssertTrue(current.mcpFollowUpRunPending, "Pending start must precede observable control setup")
+                guard let snapshot = viewModel.mcpSnapshot(for: current), let context = current.mcpControlContext else {
+                    return XCTFail("Control setup must expose its pending snapshot")
+                }
+                XCTAssertEqual(snapshot.status, .running)
+                // Join the same publication an observer can enqueue during setup, so a terminal
+                // snapshot cannot escape this regression through favorable task scheduling.
+                await AgentRunSessionStore.signalSnapshot(
+                    snapshot, cursor: .init(registration: context.registration, epoch: context.currentEpoch)
+                )
+            }
             let session = try await makeControlledCancelSession(
                 in: window, sessionID: sessionID, parentSessionID: callerID, startPending: true
             )
+            viewModel.test_afterMCPControlSetupAwait = nil
+            XCTAssertTrue(observedPendingActivation)
             let originalTransition = try XCTUnwrap(session.mcpControlContext?.pendingEpochTransition?.token)
             let originalPendingRevision = Date().addingTimeInterval(60)
             session.mcpFollowUpRunPendingUpdatedAt = originalPendingRevision

@@ -1481,7 +1481,12 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let entries = [carrierEntry(first, tabID: firstTab.id), carrierEntry(second, tabID: secondTab.id)]
         let owner = await carrierWindow(workspace: workspace, entries: entries)
         let peer = await carrierWindow(workspace: otherWorkspace, entries: [])
-        peer.workspaceManager.workspaces.append(workspace)
+        let ownerChatIDValue = await owner.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
+        let ownerChatID = try XCTUnwrap(ownerChatIDValue)
+        let ownerForegroundChat = try XCTUnwrap(owner.oracleViewModel.sessions.first { $0.id == ownerChatID })
+        let settledOwnerWorkspace = try XCTUnwrap(owner.workspaceManager.activeWorkspace)
+        XCTAssertEqual(settledOwnerWorkspace.composeTabs.first { $0.id == keepAlive.id }?.activeChatSessionID, ownerChatID)
+        peer.workspaceManager.workspaces.append(settledOwnerWorkspace)
         installIdleCarrier(first, tabID: firstTab.id, on: owner)
         installIdleCarrier(second, tabID: secondTab.id, on: owner)
         let windows = [owner, peer]
@@ -1508,8 +1513,14 @@ final class DelegationMembershipCensusTests: XCTestCase {
                 peer.workspaceManager.workspaces = [otherWorkspace, current]
                 peer.workspaceManager.activeWorkspace = current
                 peer.promptManager.loadComposeTabsFromWorkspace(current)
+                // Replicate the unsaved foreground chat as well as its tab pointer, so the peer's
+                // independent Oracle initialization cannot replace it with a different blank chat.
+                peer.oracleViewModel.prepareChatSessionCatalog(for: current)
+                peer.oracleViewModel.sessions = [ownerForegroundChat]
+                let peerChatID = await peer.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
+                XCTAssertEqual(peerChatID, ownerChatID)
+                XCTAssertEqual(peer.workspaceManager.activeWorkspace, current)
                 self.installCarrierIndex(owner.agentModeViewModel.sessionIndex, workspace: current, on: peer)
-                await Task.yield()
             }
             return .proceed
         }

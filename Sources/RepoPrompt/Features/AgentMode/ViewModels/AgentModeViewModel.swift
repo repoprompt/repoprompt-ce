@@ -11230,6 +11230,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let priorMCPOriginated = session.isMCPOriginated
         let priorPermissionProfile = session.permissionProfile
         var didOverrideAutoEdit = false
+        // Observers can publish as soon as control is installed. Establish pending status before
+        // setup suspends, so an idle session cannot publish a sticky terminal snapshot for this start.
+        session.mcpFollowUpRunPending = startPending
         session.mcpControlContext = activatedContext
         // Publication transfers ownership from the app-owned admission to this exact control context.
         activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
@@ -11297,7 +11300,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await releaseFailedInstalledActivation()
             throw error
         }
-        session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
         if markSessionAsMCPOriginated {
             // Mark session as MCP-originated so cleanup can scope to MCP sessions only.
