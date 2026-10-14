@@ -115,6 +115,66 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testFreshForegroundSessionPublishesToolbarEligibilityAfterConfiguredSave() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let host = WindowStatesManager.shared
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(
+                authority: authority, host: host, toolAdvertisementInvalidator: { _ in }
+            )
+            let retirements = AdvertisementRecorder()
+            let previousRetirementSink = installLocalRetirementSink(retirements)
+            defer {
+                viewModel.test_afterFreshForegroundSessionCreation = nil
+                AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetirementSink
+            }
+            var preparingSnapshot: AgentMonitorPillProps?
+            viewModel.test_afterFreshForegroundSessionCreation = { handle in
+                XCTAssertTrue(handle.session.qualifiedRestorationReadiness.isCreating)
+                XCTAssertEqual(viewModel.currentTabID, handle.session.tabID)
+                // Model the foreground publication while the new tab's first save is pending.
+                // No explicit UI refresh is allowed after persistence acknowledges readiness.
+                viewModel.applySessionToBindings(handle.session)
+                preparingSnapshot = viewModel.ui.statusPills.snapshot.monitor
+            }
+
+            let createdTabID = await viewModel.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(createdTabID)
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            let preparing = try XCTUnwrap(preparingSnapshot)
+            XCTAssertNil(preparing.overseerBootstrapState)
+            XCTAssertNotNil(preparing.canAddReason)
+            guard case .authoritative(_, .freshBindingDurablyCreated) = session.qualifiedRestorationReadiness else {
+                return XCTFail("The foreground session must earn readiness from its configured first save")
+            }
+            // Capture before another suspension can incidentally repaint the toolbar.
+            let rendered = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(rendered, viewModel.currentMonitorPillProps(), "The toolbar cannot retain the pre-save loading snapshot")
+            let endpoint = try XCTUnwrap(rendered.endpoint)
+            let expected = try XCTUnwrap(rendered.overseerBootstrapState)
+            XCTAssertNil(expected.activation)
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let payload = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            XCTAssertEqual(payload?.id, sessionID)
+            XCTAssertEqual(payload?.toLiveItems(), [])
+            let enabled = await bridge.enableOverseerFromToolbar(
+                endpoint: endpoint, expected: expected, isEnabled: { true }
+            )
+            XCTAssertTrue(enabled)
+            XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
+            XCTAssertFalse(viewModel.ui.statusPills.snapshot.monitor.isOverseer)
+            XCTAssertNil(session.oversight.pendingAutoWake)
+            XCTAssertNil(session.runID)
+            XCTAssertTrue(session.items.isEmpty)
+            let links = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(links.items.isEmpty, "Toolbar consent must not manufacture oversight grants")
+        }
+    }
+
     func testToolbarActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
         try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: true)
     }

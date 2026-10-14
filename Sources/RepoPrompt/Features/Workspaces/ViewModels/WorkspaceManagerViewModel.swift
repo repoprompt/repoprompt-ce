@@ -1423,11 +1423,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Selection changes no physical carrier. Preserve the caller's existing optional-ID policy.
     /// As with carrier publication, true acknowledges admission rather than a durable postcondition.
     @discardableResult
-    func updateActiveComposeTabSelection(workspaceID: UUID, activeComposeTabID: UUID?) -> Bool {
+    func updateActiveComposeTabSelection(
+        workspaceID: UUID, activeComposeTabID: UUID?, dateModified: Date? = nil
+    ) -> Bool {
         guard let index = uniqueWorkspaceIndexForCarrierPublication(workspaceID) else { return false }
-        if workspaces[index].activeComposeTabID == activeComposeTabID { return true }
+        if workspaces[index].activeComposeTabID == activeComposeTabID,
+           dateModified == nil || workspaces[index].dateModified == dateModified { return true }
         var replacement = workspaces[index]
         replacement.activeComposeTabID = activeComposeTabID
+        if let dateModified { replacement.dateModified = dateModified }
         composeTabPresentationPublication = (workspaceID, [])
         workspaces[index] = replacement
         return true
@@ -9948,14 +9952,16 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     private func markWorkspaceDirtyIfTabStillActive(tabID: UUID) -> Bool {
-        guard
-            let active = activeWorkspace,
-            active.activeComposeTabID == tabID,
-            let index = workspaces.firstIndex(where: { $0.id == active.id })
+        guard let active = activeWorkspace,
+              active.activeComposeTabID == tabID,
+              updateActiveComposeTabSelection(
+                  workspaceID: active.id, activeComposeTabID: tabID, dateModified: Date()
+              ),
+              activeWorkspaceID == active.id,
+              composeTabCarrierWorkspace(workspaceID: active.id)?.workspace.activeComposeTabID == tabID
         else { return false }
 
-        workspaces[index].dateModified = Date()
-        markWorkspaceDirty()
+        markWorkspaceDirty(workspaceID: active.id)
         return true
     }
 
@@ -10790,6 +10796,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspace.dateModified = Date()
     }
 
+    private func workspaceCaptureMirrorsMatch(
+        _ workspace: WorkspaceModel,
+        promptText: String,
+        promptIDs: [UUID]
+    ) -> Bool {
+        workspace.currentPromptText == promptText
+            && workspace.selectedMetaPromptIDs == promptIDs
+            && workspace.copyPresetId == promptViewModel.selectedCopyPresetID
+            && workspace.copyCustomizations == promptViewModel.workingCopyCustomizations
+            && workspace.chatPresetId == promptViewModel.selectedChatPresetID
+    }
+
     @discardableResult
     private func captureActiveTabSnapshotForWorkspaceIndex(_ index: Int, source: WorkspaceSaveSource = .pollAndSaveState) -> ComposeTabState? {
         guard workspaces.indices.contains(index) else { return nil }
@@ -10814,6 +10832,18 @@ class WorkspaceManagerViewModel: ObservableObject {
                 activeTabID: activeTabID
             )
             snapshot.selection = saveSelection.selection
+            let storedTab = workspace.composeTabs[tabIndex]
+            // Expansion is collected from a Set. Preserve the stored order when membership did
+            // not change, so a timer capture cannot turn incidental ordering into a new document.
+            if Set(snapshot.expandedFolders) == Set(storedTab.expandedFolders) {
+                snapshot.expandedFolders = storedTab.expandedFolders
+            }
+            // The caller still owns dirty-state persistence and interrupted-save convergence.
+            // This guard only avoids publishing a capture that adds timestamps without content.
+            let tabChanged = Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: storedTab, touchModified: false)
+            guard tabChanged || !workspaceCaptureMirrorsMatch(workspace, promptText: snapshot.promptText, promptIDs: snapshot.selectedMetaPromptIDs)
+            else { return nil }
+            if !tabChanged { snapshot.lastModified = storedTab.lastModified }
             workspace.composeTabs[tabIndex] = snapshot
             updateWorkspaceState(
                 &workspace,
@@ -10844,6 +10874,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             return snapshot
         } else {
             let legacy = collectWorkspaceState()
+            guard !workspaceCaptureMirrorsMatch(workspace, promptText: legacy.promptText, promptIDs: legacy.promptIDs) else { return nil }
             updateWorkspaceState(&workspace, with: legacy)
             composeTabPresentationPublication = (workspace.id, [])
             workspaces[index] = workspace
@@ -17072,13 +17103,17 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Capture snapshot with a fresh index (workspace could be deleted during the await above).
         guard let snapIdx = workspaceIndex(for: wsID) else { return }
-        let snapshot = captureActiveTabSnapshotForWorkspaceIndex(snapIdx)
-        guard let capturedWorkspace = self.workspace(withID: wsID) else { return }
+        captureActiveTabSnapshotForWorkspaceIndex(snapIdx)
+        guard let capturedWorkspace = currentWorkspaceForRefresh() else { return }
         let saveFileURL = workspaceFileURL(for: capturedWorkspace)
 
-        // Suspend snapshot commits during refresh to prevent $selectedFiles subscriber
-        // from overwriting the captured selection when dropSelections clears it.
-        if let tabID = snapshot?.id {
+        // An unchanged capture does not publish a snapshot, but refresh must still protect
+        // the exact active tab from temporary selection clears while roots reload. Only
+        // release a suspension acquired here; another owner may already hold the tab.
+        if let tabID = capturedWorkspace.activeComposeTabID,
+           capturedWorkspace.composeTabs.contains(where: { $0.id == tabID }),
+           !isSnapshotCommitSuspended(forTabID: tabID)
+        {
             setSnapshotsSuspended(true, forTabID: tabID)
             suspendedTabID = tabID
         }

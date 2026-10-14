@@ -1,6 +1,7 @@
 import Combine
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
@@ -83,6 +84,165 @@ import XCTest
             manager.activeWorkspace = second
             XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: second.id, sessionID: sessionID), [laterTab, sharedTab])
             XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
+        }
+
+        func testDirectTabSwitchPreservesDraftAndPersistsSelectionWithoutUnrelatedCarrierRebuilds() async throws {
+            for unrelatedCount in [0, 4000] {
+                var source = ComposeTabState(name: "Source", activeAgentSessionID: UUID())
+                source.promptText = "Previously saved source draft"
+                var target = ComposeTabState(name: "Target", activeAgentSessionID: UUID())
+                target.promptText = "Target draft"
+                let seed = WorkspaceModel(
+                    dateModified: .distantPast, name: "Direct switch \(unrelatedCount)", repoPaths: [],
+                    composeTabs: [source, target], activeComposeTabID: source.id
+                )
+                try writeWorkspace(seed)
+                try writeLegacyIndex([seed])
+                let manager = makeManager(windowID: -17840 - unrelatedCount)
+                await manager.awaitInitialized()
+                let workspace = try XCTUnwrap(manager.workspace(withID: seed.id))
+                let unrelated = WorkspaceModel(
+                    name: "Unrelated retained carriers", repoPaths: [], ephemeralFlag: true,
+                    composeTabs: (0 ..< unrelatedCount).map {
+                        ComposeTabState(name: "Unrelated \($0)", activeAgentSessionID: UUID())
+                    }
+                )
+                manager.workspaces.append(unrelated)
+                manager.activeWorkspace = workspace
+                let prompt = manager.promptViewModel
+                prompt.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                prompt.promptText = "Unsaved source draft"
+                let dirtyVersion = manager.debugStateVersionForWorkspace(seed.id)
+                let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+                manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
+
+                // Exercise the real direct selection and heavy-apply completion. This manager-only
+                // fixture intentionally excludes Oracle's separate first-Chat-session creation.
+                await prompt.switchComposeTab(target.id)
+                let switched = try XCTUnwrap(manager.workspace(withID: seed.id))
+                XCTAssertEqual(manager.activeWorkspaceID, seed.id)
+                XCTAssertEqual(switched.activeComposeTabID, target.id)
+                XCTAssertEqual(prompt.activeComposeTabID, target.id)
+                XCTAssertEqual(prompt.promptText, target.promptText)
+                XCTAssertEqual(switched.composeTabs.first { $0.id == source.id }?.promptText, "Unsaved source draft")
+                XCTAssertGreaterThan(switched.dateModified, workspace.dateModified)
+                XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(seed.id), dirtyVersion)
+                XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
+                XCTAssertEqual(manager.test_sessionCarrierIndexMaintenanceRowsVisited, 0)
+                XCTAssertEqual(manager.workspace(withID: unrelated.id), unrelated)
+
+                // Join only the save already scheduled by switch completion; do not issue a
+                // compensating poll/save. The file is the direct switch's actual durable result.
+                await manager.debugDrainScheduledSaves()
+                // The scheduled save enqueues physical I/O. Join that existing write without
+                // submitting another workspace payload or triggering another UI capture.
+                await manager.workspaceDiskWriter.flush(url: workspaceFileURL(for: seed))
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: workspaceFileURL(for: seed)))
+                XCTAssertEqual(disk.activeComposeTabID, target.id)
+                XCTAssertEqual(disk.composeTabs.first { $0.id == source.id }?.promptText, "Unsaved source draft")
+                XCTAssertEqual(disk.composeTabs.first { $0.id == target.id }?.promptText, target.promptText)
+                XCTAssertGreaterThan(disk.dateModified, workspace.dateModified)
+                XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
+                XCTAssertEqual(manager.test_sessionCarrierIndexMaintenanceRowsVisited, 0)
+                manager.prepareForWindowClose()
+            }
+        }
+
+        func testDirectTabSwitchDoesNotApplyItsTargetAfterSynchronousWorkspaceSelectionChange() async {
+            let source = ComposeTabState(name: "Source")
+            var target = ComposeTabState(name: "Target")
+            target.promptText = "Target must not reach the newly selected workspace"
+            let workspace = WorkspaceModel(
+                name: "Original owner", repoPaths: [], ephemeralFlag: true,
+                composeTabs: [source, target], activeComposeTabID: source.id
+            )
+            var replacementTab = ComposeTabState(name: "New owner")
+            replacementTab.promptText = "New owner draft"
+            let replacement = WorkspaceModel(
+                name: "Reentrant owner", repoPaths: [], ephemeralFlag: true,
+                composeTabs: [replacementTab], activeComposeTabID: replacementTab.id
+            )
+            let manager = makeManager(windowID: -17839)
+            await manager.awaitInitialized()
+            manager.workspaces = [workspace, replacement]
+            manager.activeWorkspace = workspace
+            let prompt = manager.promptViewModel
+            prompt.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+            var interrupted = false
+            let subscription = manager.$workspaces.sink { models in
+                guard !interrupted,
+                      models.first(where: { $0.id == workspace.id })?.activeComposeTabID == target.id
+                else { return }
+                interrupted = true
+                manager.activeWorkspace = replacement
+                prompt.loadComposeTabsFromWorkspace(replacement, syncPromptText: true)
+            }
+            defer { subscription.cancel() }
+            await prompt.switchComposeTab(target.id)
+            XCTAssertTrue(interrupted)
+            XCTAssertEqual(manager.activeWorkspaceID, replacement.id)
+            XCTAssertEqual(prompt.activeComposeTabID, replacementTab.id)
+            XCTAssertEqual(prompt.promptText, replacementTab.promptText)
+            XCTAssertFalse(prompt.isSwitchingComposeTab)
+            XCTAssertEqual(manager.workspace(withID: replacement.id), replacement)
+        }
+
+        func testRefusedDirectTabSwitchPreservesAnOlderApplyAndDoesNotSelectARemovedTarget() async throws {
+            for reselectFirst in [false, true] {
+                let source = ComposeTabState(name: "Source")
+                let first = ComposeTabState(name: "First target")
+                let removed = ComposeTabState(name: "Removed second target")
+                let workspace = WorkspaceModel(
+                    name: "Interrupted switch owner", repoPaths: [], ephemeralFlag: true,
+                    composeTabs: [source, first, removed], activeComposeTabID: source.id
+                )
+                let manager = makeManager(windowID: reselectFirst ? -17837 : -17838)
+                await manager.awaitInitialized()
+                manager.workspaces = [workspace]
+                manager.activeWorkspace = workspace
+                let prompt = manager.promptViewModel
+                prompt.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                let entered = expectation(description: "older switch reached its actual fast-apply boundary")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setComposeTabFastStateDidApplyHandlerForTesting { tabID in
+                    guard tabID == first.id else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                }
+                let removedID = reselectFirst ? first.id : removed.id
+                let olderSwitch = Task { await prompt.switchComposeTab(first.id) }
+                do {
+                    try await awaitSaveCheckpoint(entered)
+                    XCTAssertTrue(prompt.isSwitchingComposeTab)
+                    let token = NotificationCenter.default.addObserver(forName: .willSwitchComposeTab, object: nil, queue: nil) { notification in
+                        MainActor.assumeIsolated {
+                            guard notification.userInfo?["windowID"] as? Int == prompt.windowID,
+                                  let current = manager.composeTabCarrierWorkspace(workspaceID: workspace.id)
+                            else { return }
+                            _ = manager.replaceComposeTabCarriers(
+                                workspaceID: workspace.id,
+                                composeTabs: current.workspace.composeTabs.filter { $0.id != removedID },
+                                stashedTabs: current.workspace.stashedTabs
+                            )
+                        }
+                    }
+                    defer { NotificationCenter.default.removeObserver(token) }
+                    await prompt.switchComposeTab(removedID)
+                    XCTAssertFalse(try XCTUnwrap(manager.workspace(withID: workspace.id)).composeTabs.contains { $0.id == removedID })
+                    XCTAssertEqual(manager.workspace(withID: workspace.id)?.activeComposeTabID, first.id)
+                    XCTAssertEqual(prompt.activeComposeTabID, first.id)
+                    XCTAssertTrue(prompt.isSwitchingComposeTab, "the older switch still owns an in-flight apply")
+                    manager.setComposeTabFastStateDidApplyHandlerForTesting(nil)
+                    await gate.open()
+                    await olderSwitch.value
+                    XCTAssertFalse(prompt.isSwitchingComposeTab)
+                } catch {
+                    manager.setComposeTabFastStateDidApplyHandlerForTesting(nil)
+                    await gate.open()
+                    await olderSwitch.value
+                    throw error
+                }
+            }
         }
 
         func testLibraryRecencyIgnoresBackgroundSavesAndGroupsTemporaryWork() throws {
@@ -965,6 +1125,215 @@ import XCTest
                     }
                 }
             }
+        }
+
+        func testUnchangedPollCapturePreservesExpansionOrderTimestampsAndCanonicalRevision() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let folders = ["First", "Second"].map { name in
+                    let path = self.storageRoot.appendingPathComponent(name, isDirectory: true).path
+                    return FolderViewModel(
+                        folder: Folder(name: name, path: path, modificationDate: .distantPast),
+                        rootPath: path,
+                        isExpanded: true
+                    )
+                }
+                folders.forEach { manager.fileManager.addRootFolder($0) }
+                _ = try await self.establishActiveCaptureBaseline(fixture)
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let liveOrder = manager.fileManager.snapshotExpandedFolderFullPaths()
+                XCTAssertEqual(liveOrder.count, 2)
+                manager.workspaces[index].composeTabs[0].expandedFolders = Array(liveOrder.reversed())
+                manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                let reorderSave = await manager.pollAndSaveStateWithOutcomeAsync()
+                XCTAssertTrue(reorderSave.acceptedForLifecycleAdmission, "\(reorderSave)")
+                let baseline = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                XCTAssertNotEqual(baseline.composeTabs[0].expandedFolders, liveOrder)
+                let beforeValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
+                let before = try XCTUnwrap(beforeValue)
+                XCTAssertNil(before.revisions.dirtyRevision)
+                manager.resetWorkspaceSaveDiagnosticsForTesting()
+                var captureEmissions = 0
+                let observation = manager.composeTabSnapshotPublisher().sink { _ in captureEmissions += 1 }
+                defer { observation.cancel() }
+
+                // An equal observer emission can dirty the version without changing content.
+                // Exercise the admitted timer path, not only its already-clean early return.
+                manager.markWorkspaceDirty(workspaceID: baseline.id)
+                await manager.debugPerformPollTimerSave()
+                await manager.debugPerformPollTimerSave()
+
+                XCTAssertEqual(manager.workspace(withID: baseline.id), baseline)
+                XCTAssertEqual(captureEmissions, 0, "A no-op capture must not invalidate tab consumers")
+                XCTAssertEqual(manager.workspaceSaveDiagnosticsForTesting(workspaceID: baseline.id).capturePublicationCount, 0)
+                XCTAssertEqual(manager.debugLastSavedVersionForWorkspace(baseline.id), manager.debugStateVersionForWorkspace(baseline.id))
+                XCTAssertFalse(manager.debugHasUnsavedWorkingPublication(baseline.id))
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+
+                // Membership changes remain real content, even though ordering-only changes do not.
+                folders[0].isExpanded = false
+                let changed = await manager.pollAndSaveStateWithOutcomeAsync()
+                XCTAssertTrue(changed.acceptedForLifecycleAdmission, "\(changed)")
+                let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
+                let after = try XCTUnwrap(afterValue)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+                XCTAssertEqual(Set(canonical.composeTabs[0].expandedFolders), Set([folders[1].standardizedFullPath]))
+                XCTAssertGreaterThan(canonical.composeTabs[0].lastModified, baseline.composeTabs[0].lastModified)
+                XCTAssertGreaterThan(canonical.dateModified, baseline.dateModified)
+                XCTAssertGreaterThan(after.revisions.workingRevision, before.revisions.workingRevision)
+                XCTAssertNil(after.revisions.dirtyRevision)
+                XCTAssertEqual(manager.workspaceSaveDiagnosticsForTesting(workspaceID: baseline.id).capturePublicationCount, 1)
+                try await self.assertCanonicalAndDiskRemain(after, in: fixture)
+            }
+        }
+
+        func testUnchangedCaptureStillPersistsAnEarlierStoredMetadataEdit() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let baseline = try await self.establishActiveCaptureBaseline(fixture)
+                let beforeValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
+                let before = try XCTUnwrap(beforeValue)
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == baseline.id })
+                manager.workspaces[index].composeTabs[0].isPinned = true
+                manager.markWorkspaceDirty(workspaceID: baseline.id)
+                manager.resetWorkspaceSaveDiagnosticsForTesting()
+
+                let result = await manager.pollAndSaveStateWithOutcomeAsync()
+
+                XCTAssertTrue(result.acceptedForLifecycleAdmission, "\(result)")
+                let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
+                let after = try XCTUnwrap(afterValue)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+                XCTAssertTrue(canonical.composeTabs[0].isPinned)
+                XCTAssertEqual(canonical.composeTabs[0].lastModified, baseline.composeTabs[0].lastModified)
+                XCTAssertEqual(canonical.dateModified, baseline.dateModified)
+                XCTAssertGreaterThan(after.revisions.workingRevision, before.revisions.workingRevision)
+                XCTAssertNil(after.revisions.dirtyRevision)
+                XCTAssertEqual(manager.workspaceSaveDiagnosticsForTesting(workspaceID: baseline.id).capturePublicationCount, 0)
+                try await self.assertCanonicalAndDiskRemain(after, in: fixture)
+            }
+        }
+
+        func testSaveCaptureIncludesBeforeSaveEditsBeforeDecidingItIsUnchanged() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let baseline = try await self.establishActiveCaptureBaseline(fixture)
+                var callbackCount = 0
+                let listener = manager.addBeforeSaveListener { workspace in
+                    XCTAssertEqual(workspace.id, baseline.id)
+                    callbackCount += 1
+                    manager.promptViewModel.promptText = "Pending editor text flushed by its owner"
+                }
+                defer { manager.removeBeforeSaveListener(listener) }
+                manager.markWorkspaceDirty(workspaceID: baseline.id)
+                manager.resetWorkspaceSaveDiagnosticsForTesting()
+
+                let result = await manager.pollAndSaveStateWithOutcomeAsync()
+
+                XCTAssertTrue(result.acceptedForLifecycleAdmission, "\(result)")
+                XCTAssertEqual(callbackCount, 1)
+                let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
+                let after = try XCTUnwrap(afterValue)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+                XCTAssertEqual(canonical.composeTabs[0].promptText, "Pending editor text flushed by its owner")
+                XCTAssertEqual(canonical.currentPromptText, canonical.composeTabs[0].promptText)
+                XCTAssertGreaterThan(canonical.composeTabs[0].lastModified, baseline.composeTabs[0].lastModified)
+                XCTAssertGreaterThan(canonical.dateModified, baseline.dateModified)
+                XCTAssertNil(after.revisions.dirtyRevision)
+                XCTAssertEqual(manager.workspaceSaveDiagnosticsForTesting(workspaceID: baseline.id).capturePublicationCount, 1)
+                try await self.assertCanonicalAndDiskRemain(after, in: fixture)
+            }
+        }
+
+        func testUnchangedRefreshProtectsSelectionAndReleasesOnlyItsOwnSnapshotSuspension() async throws {
+            for preexistingSuspension in [false, true] {
+                try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A"]) { fixture in
+                    let manager = try XCTUnwrap(fixture.manager)
+                    let workspace = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    manager.promptViewModel.loadComposeTabsFromWorkspace(workspace)
+                    let selectedPath = fixture.rootPaths[0] + "/README.md"
+                    try await fixture.selectFixtureFiles([selectedPath])
+                    let baseline = try XCTUnwrap(manager.workspace(withID: workspace.id))
+                    let tabID = try XCTUnwrap(baseline.activeComposeTabID)
+                    let savedSelection = try XCTUnwrap(manager.composeTabSnapshot(for: tabID)).selection
+                    XCTAssertEqual(savedSelection.selectedPaths, [selectedPath])
+                    XCTAssertEqual(fixture.files.snapshotSelection(), savedSelection)
+                    manager.resetWorkspaceSaveDiagnosticsForTesting()
+                    if preexistingSuspension {
+                        manager.setSnapshotsSuspended(true, forTabID: tabID)
+                    }
+                    defer {
+                        manager.rootReconciliationGateForTesting = nil
+                        manager.setSnapshotsSuspended(false, forTabID: tabID)
+                    }
+
+                    let entered = XCTestExpectation(description: "refresh held after unchanged capture")
+                    let gate = fixture.makeGate()
+                    var held = false
+                    manager.rootReconciliationGateForTesting = { event in
+                        guard event.ticket.workspaceID == workspace.id,
+                              event.phase == .beforeCompletion, !held else { return }
+                        held = true
+                        entered.fulfill()
+                        await gate.wait()
+                    }
+                    let refresh = fixture.startOwnedTask {
+                        await manager.refreshWorkspace(soft: true, for: baseline)
+                    }
+                    try await fixture.awaitGateEvent(entered)
+                    XCTAssertTrue(manager.isRefreshing)
+                    XCTAssertEqual(manager.workspaceSaveDiagnosticsForTesting(workspaceID: workspace.id).capturePublicationCount, 0)
+
+                    // Exercise the real snapshot publisher with refresh's temporary empty UI state.
+                    let selectedFile = try XCTUnwrap(fixture.files.selectedFiles.first { $0.fullPath == selectedPath })
+                    fixture.files.setFileToggled(selectedFile, isToggled: false)
+                    XCTAssertTrue(fixture.files.snapshotSelection().selectedPaths.isEmpty)
+                    manager.publishActiveComposeTabSnapshot()
+                    XCTAssertEqual(manager.composeTabSnapshot(for: tabID)?.selection, savedSelection)
+
+                    if preexistingSuspension {
+                        // Exit before nested restore owners run: this refresh must not release a
+                        // suspension that the original owner installed before refresh began.
+                        refresh.cancel()
+                    }
+                    gate.release()
+                    try await fixture.perform("refresh releases its snapshot ownership") { await refresh.value }
+                    XCTAssertFalse(manager.isRefreshing)
+                    try await fixture.settle()
+                    let after = try await fixture.capturePassive()
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.canonical.document.documentBytes)
+                    XCTAssertEqual(after.model.composeTabs.first { $0.id == tabID }?.selection, savedSelection)
+                    XCTAssertEqual(canonical.composeTabs.first { $0.id == tabID }?.selection, savedSelection)
+                    XCTAssertEqual(after.disk.composeTabs.first { $0.id == tabID }?.selection, savedSelection)
+
+                    if !preexistingSuspension {
+                        XCTAssertEqual(after.selection, savedSelection, "Completed refresh restores the selected file")
+                        let restoredFile = try XCTUnwrap(fixture.files.selectedFiles.first { $0.fullPath == selectedPath })
+                        fixture.files.setFileToggled(restoredFile, isToggled: false)
+                    }
+                    XCTAssertTrue(fixture.files.snapshotSelection().selectedPaths.isEmpty)
+                    manager.publishActiveComposeTabSnapshot()
+                    if preexistingSuspension {
+                        XCTAssertEqual(manager.composeTabSnapshot(for: tabID)?.selection, savedSelection)
+                        manager.setSnapshotsSuspended(false, forTabID: tabID)
+                        manager.publishActiveComposeTabSnapshot()
+                    }
+                    XCTAssertEqual(manager.composeTabSnapshot(for: tabID)?.selection.selectedPaths, [])
+                }
+            }
+        }
+
+        private func establishActiveCaptureBaseline(_ fixture: ProjectionSaveFixture) async throws -> WorkspaceModel {
+            await fixture.bridge.stopAndJoinForTesting()
+            let manager = fixture.manager
+            let workspace = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+            manager.activeWorkspace = workspace
+            manager.promptViewModel.loadComposeTabsFromWorkspace(workspace)
+            manager.markWorkspaceDirty(workspaceID: workspace.id)
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync()
+            XCTAssertTrue(outcome.acceptedForLifecycleAdmission, "\(outcome)")
+            XCTAssertFalse(manager.debugHasUnsavedWorkingPublication(workspace.id))
+            return try XCTUnwrap(manager.workspace(withID: workspace.id))
         }
 
         func testCurrentModelSaveRecapturesRestoredProjectionWithoutDirtyVersionChange() async throws {

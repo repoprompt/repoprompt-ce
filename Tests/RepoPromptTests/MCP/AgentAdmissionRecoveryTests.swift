@@ -292,6 +292,9 @@ import XCTest
             let workspaceID = fixture.workspaceA.id
             let lastSavedBefore = fixture.manager.debugLastSavedVersionForWorkspace(workspaceID)
 
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let wedged = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
 
@@ -313,6 +316,9 @@ import XCTest
             let workspaceID = fixture.workspaceA.id
             let stateVersion = fixture.manager.debugStateVersionForWorkspace(workspaceID)
 
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             fixture.manager.pollAndSaveState(source: .pollAndSaveState)
             let cancelled = await fixture.manager.debugCancelScheduledSaves(workspaceID: workspaceID)
             XCTAssertEqual(cancelled, 1, "The capture must have scheduled exactly one save to cancel.")
@@ -341,6 +347,9 @@ import XCTest
                 await gate.markStartedAndWaitForRelease()
             }
 
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             fixture.manager.pollAndSaveState(source: .pollAndSaveState)
             await gate.waitUntilStarted()
             let cancelled = await fixture.manager.debugCancelScheduledSaves(workspaceID: workspaceID, join: false)
@@ -366,6 +375,9 @@ import XCTest
         func testOwnedConvergenceConflictReportsOwningCategoryAndNeverClobbers() async throws {
             let fixture = try await establishCleanActiveWorkspaceBaseline()
             let workspaceID = fixture.workspaceA.id
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let wedged = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
             let foreignClient = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -886)
@@ -417,6 +429,9 @@ import XCTest
         func testCancelledConvergenceReportsCancelledCategoryAndLaterAdmissionConverges() async throws {
             let fixture = try await establishCleanActiveWorkspaceBaseline()
             let workspaceID = fixture.workspaceA.id
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let wedged = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
             let store = fixture.client.store
@@ -490,6 +505,9 @@ import XCTest
         func testOwnPublicationSupersededByForeignWriteNeverClobbersOnPollOrAdmission() async throws {
             let fixture = try await establishCleanActiveWorkspaceBaseline()
             let workspaceID = fixture.workspaceA.id
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let owned = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
             let foreignClient = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -887)
@@ -532,6 +550,7 @@ import XCTest
             let peerClient = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -885)
             let (peer, peerPrompt) = makeManager(client: peerClient, windowID: -885)
             await peer.awaitInitialized()
+            try await adoptFullCanonicalCatalog(client: peerClient, manager: peer)
             let peerWorkspace = try XCTUnwrap(peer.workspace(withID: workspaceID))
             peer.activeWorkspace = peerWorkspace
             peerPrompt.loadComposeTabsFromWorkspace(peerWorkspace)
@@ -541,17 +560,16 @@ import XCTest
 
             // The peer publishes first, then this window publishes over it: the peer has its own
             // unsaved publication, but canonical dirty state is exactly this window's.
+            try prepareCaptureOnlyUIChange(manager: peer, prompt: peerPrompt, workspaceID: workspaceID)
             await peer.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let peerCommitSnapshot = await fixture.client.canonicalWorkspaceSnapshot(workspaceID)
             let peerCommit = try XCTUnwrap(peerCommitSnapshot)
             XCTAssertEqual(peer.debugOwnWorkingCommitRevision(workspaceID), peerCommit.revisions.workingRevision)
-            // Stand in for the presentation bridge's metadata projection of the peer commit.
-            fixture.manager.applyDomainAuthorityBaseline(
-                workspaceID: workspaceID,
-                revisions: peerCommit.revisions,
-                digest: peerCommit.document.contentDigest,
-                health: peerCommit.health,
-                catalogRevision: 0
+            // Install the peer's actual document before publishing a local descendant. Metadata
+            // alone cannot establish ownership of bytes that this window has never adopted.
+            try await adoptFullCanonicalCatalog(client: fixture.client, manager: fixture.manager)
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
             )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let wedged = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
@@ -589,6 +607,9 @@ import XCTest
         func testCrossRuntimeForeignWriteMakesPinnedConvergenceFailClosed() async throws {
             let fixture = try await establishCleanActiveWorkspaceBaseline()
             let workspaceID = fixture.workspaceA.id
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             _ = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
             let competitor = try await makeCompetingClient(fixture)
@@ -636,6 +657,9 @@ import XCTest
         func testRestartedPresentationCannotClaimReconstructedDirtyState() async throws {
             let fixture = try await establishCleanActiveWorkspaceBaseline()
             let workspaceID = fixture.workspaceA.id
+            try prepareCaptureOnlyUIChange(
+                manager: fixture.manager, prompt: fixture.prompt, workspaceID: workspaceID
+            )
             await fixture.manager.debugCaptureActiveWorkspaceWithoutSave(workspaceID)
             let wedged = try await assertOwnedInterruptedWedge(fixture, workspaceID: workspaceID)
 
@@ -4090,6 +4114,43 @@ import XCTest
             return fixture
         }
 
+        /// A real UI configuration edit that is persisted only by capture, without a dirty-version
+        /// debounce. This preserves the interrupted-save case where the local version looks saved.
+        private func prepareCaptureOnlyUIChange(
+            manager: WorkspaceManagerViewModel,
+            prompt: PromptViewModel,
+            workspaceID: UUID,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws {
+            let before = try XCTUnwrap(manager.workspace(withID: workspaceID), file: file, line: line)
+            let stateVersion = manager.debugStateVersionForWorkspace(workspaceID)
+            XCTAssertEqual(manager.activeWorkspace?.id, workspaceID, file: file, line: line)
+            XCTAssertEqual(prompt.activeComposeTabID, before.activeComposeTabID, file: file, line: line)
+            prompt.selectedChatPresetID = before.chatPresetId == ChatPreset.BuiltIn.chat.id
+                ? ChatPreset.BuiltIn.manual.id : ChatPreset.BuiltIn.chat.id
+            XCTAssertNotEqual(prompt.selectedChatPresetID, before.chatPresetId, file: file, line: line)
+            XCTAssertEqual(manager.workspace(withID: workspaceID), before, file: file, line: line)
+            XCTAssertEqual(manager.debugStateVersionForWorkspace(workspaceID), stateVersion, file: file, line: line)
+        }
+
+        /// Use the same full-document adoption boundary as the production presentation bridge.
+        /// A metadata-only baseline cannot authorize a whole-document working publication.
+        private func adoptFullCanonicalCatalog(
+            client: DomainWorkspaceAuthorityClient,
+            manager: WorkspaceManagerViewModel
+        ) async throws {
+            let catalog = await client.snapshot()
+            let decoded = try catalog.workspaces.map { try manager.decodeDomainWorkspaceCatalogRecord($0) }
+            let receipt = try XCTUnwrap(manager.applyDomainWorkspaceCatalog(
+                catalog,
+                projection: .full(decoded),
+                preferredActiveWorkspaceID: manager.activeWorkspaceID,
+                rootMapPolicy: .snapshotMetadata
+            ).receipt)
+            XCTAssertEqual(receipt.kind, .full)
+        }
+
         /// #1089 wedge owned by `manager`: canonical is dirty with no live save at exactly the
         /// revision this window committed, while its local state version alone looks saved.
         @discardableResult
@@ -4103,6 +4164,12 @@ import XCTest
             let manager = manager ?? fixture.manager
             let admission = await fixture.client.agentAdmissionSnapshot(workspaceID)
             let wedged = try XCTUnwrap(admission.snapshot, file: file, line: line)
+            let captured = try manager.decodeDomainWorkspaceCatalogRecord(wedged)
+            XCTAssertEqual(
+                captured.chatPresetId, manager.promptViewModel.selectedChatPresetID,
+                "The interrupted publication contains the real capture-only UI edit.",
+                file: file, line: line
+            )
             XCTAssertNotNil(wedged.revisions.dirtyRevision, file: file, line: line)
             XCTAssertEqual(admission.diagnostic.admissionState, .dirtyWithoutLiveSave, file: file, line: line)
             XCTAssertEqual(admission.diagnostic.pendingSaveCount, 0, file: file, line: line)

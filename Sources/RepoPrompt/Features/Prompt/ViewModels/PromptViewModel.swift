@@ -3893,13 +3893,32 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
+        let switchingWasInProgress = isSwitchingComposeTab
+        var startedApply = false
+        defer {
+            // Restore only after the wrapper's cleanup, including a refused reselect of the
+            // older apply's same tab. The refusal path has not started another asynchronous apply.
+            if !startedApply { isSwitchingComposeTab = switchingWasInProgress }
+        }
         await withComposeTabSwitching(targetTabID: id) {
             await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
-                manager.workspaces[index].activeComposeTabID = id
+                guard manager.activeWorkspaceID == workspace.id,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.composeTabs.contains(where: { $0.id == id }) == true,
+                      manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: id),
+                      manager.activeWorkspaceID == workspace.id,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.activeComposeTabID == id
+                else { return }
                 activeComposeTabID = id
-
-                loadComposeTabsFromWorkspace(manager.workspaces[index])
-                guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+                guard manager.activeWorkspaceID == workspace.id,
+                      let selected = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
+                      selected.workspace.activeComposeTabID == id
+                else { return }
+                loadComposeTabsFromWorkspace(selected.workspace)
+                guard manager.activeWorkspaceID == workspace.id, activeComposeTabID == id,
+                      let current = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
+                      current.workspace.activeComposeTabID == id,
+                      let target = current.workspace.composeTabs.first(where: { $0.id == id })
+                else { return }
 
                 activeTabApplyTask?.cancel()
                 let applyGeneration = UUID()
@@ -3912,6 +3931,7 @@ class PromptViewModel: ObservableObject {
                 activeTabApplyTask = task
                 activeTabApplyTaskTabID = id
                 activeTabApplyTaskGeneration = applyGeneration
+                startedApply = true
                 await task.value
                 if activeTabApplyTaskGeneration == applyGeneration {
                     activeTabApplyTask = nil

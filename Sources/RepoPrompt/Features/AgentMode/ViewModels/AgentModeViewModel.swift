@@ -17442,6 +17442,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 else {
                     return .deferred("The prepared session configuration changed while its initial payload was saving.")
                 }
+                // A new zero-link session has no oversight observation to repaint its loading
+                // snapshot. Publish the earned readiness at its configured-save boundary.
+                if sessions[tabID] === session, currentTabID == tabID {
+                    syncStatusPillsUIStateIfMonitorStale()
+                }
             }
             session.isDirty = false
             session.lastUserMessageAt = lastUserMessageAt
