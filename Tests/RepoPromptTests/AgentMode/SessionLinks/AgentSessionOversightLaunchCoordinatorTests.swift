@@ -471,7 +471,11 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let snapshot = await fixture.authority.snapshot()
         XCTAssertEqual(snapshot.activeLinkCount, 0)
         XCTAssertEqual(snapshot.pendingReservationCount, 0)
-        // The refusal itself proves nothing; the reclassification that follows proves the duplicate.
+        // The refusal itself proves nothing and does not immediately re-run.
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        // The next readiness event reclassifies first and proves the duplicate.
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
     }
 
@@ -1195,6 +1199,10 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         await fixture.bridge.bootstrapIntentStore(fixture.store)
         await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(
+            fixture.bridge.test_launchRefusedEstablishmentCount(for: pair), 1,
+            "A refusal never retries back-to-back; it waits for the next readiness event."
+        )
         for _ in 0 ..< AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts + 2 {
             fixture.host.candidates = [observer, target]
             fixture.bridge.noteCandidateReadinessChanged()
@@ -1211,6 +1219,18 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
         let token = await fixture.store.token(for: pair)
         XCTAssertNotNil(token, "Budget exhaustion must preserve the intent for the next launch.")
+
+        // A new target incarnation is new evidence: the exhausted entry is not locked out for the
+        // rest of the launch, and restores once establishment succeeds.
+        fixture.host.beforeUUIDCensus = nil
+        let reopened = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, reopened]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: reopened)]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let recovered = await isRestored(fixture)
+        XCTAssertTrue(recovered, "A changed endpoint earns a fresh retry budget.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
     }
 
     func testSupersessionDuringEstablishmentKeepsIntentWithoutGranting() async throws {

@@ -195,8 +195,12 @@ final class AgentSessionOversightLaunchCoordinator {
         /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it or a
         /// refused establishment spends one of its bounded per-launch retries.
         var didStartReservation = false
-        /// Refused establishments this launch. Bounds automatic retries; never a deletion trigger.
+        /// Refused establishments against `lastRefusedProof`. Bounds automatic retries of one exact
+        /// endpoint pair state; never a deletion trigger.
         var refusedEstablishmentCount = 0
+        /// The proof the last refusal was classified against. A different proof (a new incarnation or
+        /// readiness) is new evidence and earns a fresh retry budget.
+        var lastRefusedProof: AgentSessionOversightRestorationProof?
         /// Sessions this launch has actually seen described or live at least once.
         ///
         /// A session that was observed and then disappeared is a *positive* fact about this process,
@@ -968,6 +972,14 @@ final class AgentSessionOversightLaunchCoordinator {
         proof: AgentSessionOversightRestorationProof
     ) async {
         guard let delegate, var entry = entries[pair] else { return }
+        // A refusal budget is spent per exact endpoint state. Changed endpoints are new evidence, so a
+        // pair is never locked out for the rest of the launch by refusals of an earlier incarnation.
+        if entry.didStartReservation, entry.refusedEstablishmentCount >= Self.maxAutomaticEstablishmentAttempts,
+           let lastRefusedProof = entry.lastRefusedProof, lastRefusedProof != proof
+        {
+            entry.didStartReservation = false
+            entry.refusedEstablishmentCount = 0
+        }
         // At-most-once is enforced by launch-entry state, not by the bridge's task table: a joined
         // task would satisfy the table while still counting as a second automatic reservation.
         guard !entry.didStartReservation else { return }
@@ -1014,19 +1026,24 @@ final class AgentSessionOversightLaunchCoordinator {
                 entries[pair] = settled
                 return
             }
+            if settled.lastRefusedProof != proof {
+                settled.lastRefusedProof = proof
+                settled.refusedEstablishmentCount = 0
+            }
             settled.refusedEstablishmentCount += 1
             if settled.refusedEstablishmentCount < Self.maxAutomaticEstablishmentAttempts {
-                // Rearm one bounded retry. The next pass reclassifies against current facts first,
-                // so a permanent cause retires with its real reason and a transient one waits for
-                // the readiness event that settles it.
+                // Rearm one bounded retry. No immediate re-pass: the retry runs on the next
+                // readiness or topology event, so a transient refusal cannot burn the budget
+                // back-to-back. That pass reclassifies first, so a permanent cause retires with its
+                // real reason and a transient one waits for the event that settles it.
                 settled.didStartReservation = false
             }
-            // Otherwise the per-launch budget is spent: the intent stays durable for the next launch.
+            // Otherwise this endpoint state's budget is spent; a changed endpoint earns a fresh one, and
+            // the intent stays durable for the next launch either way.
             entries[pair] = settled
             #if DEBUG
                 logReconcile(pair: pair, outcome: "refused")
             #endif
-            markDirty()
         }
     }
 
