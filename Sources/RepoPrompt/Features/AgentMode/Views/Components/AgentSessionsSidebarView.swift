@@ -584,13 +584,15 @@ struct AgentModeSessionsListView: View, Equatable {
             renderedIdentities: Set(renderedProgressRowIdentities),
             workspaceID: snapshot.workspaceID
         )
+        // Bind before resolving any facts: an unbound owner resolves `.none`, and a first render
+        // recorded with `.none` facts would stay stale behind row equality and the notification filter.
+        let _ = rowActions.bind(agentModeVM: agentModeVM, promptManager: promptManager)
         let renderedRowSessions = renderedActiveRows.filter { !$0.hidesRow }.map(\.session)
         let oversightFactsByTabID = Dictionary(
             renderedRowSessions.map { ($0.tabID, rowActions.oversightFacts(for: $0)) },
             uniquingKeysWith: { first, _ in first }
         )
         // Non-observed bookkeeping: rows skipped by equality read the current order from here.
-        let _ = rowActions.bind(agentModeVM: agentModeVM, promptManager: promptManager)
         let _ = rowActions.recordRender(
             sessions: renderedRowSessions,
             renderedSelectionOrder: snapshot.renderedSelectionOrder,

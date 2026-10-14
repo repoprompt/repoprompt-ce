@@ -1247,6 +1247,38 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         )
     }
 
+    /// A freshly mounted list must resolve oversight facts on its very first render. Resolving them
+    /// before the action owner is bound produced `.none`, which equality and the notification
+    /// filter then kept: no role marks, creator labels, or Copy Session ID until an unrelated change.
+    func testFreshlyMountedSidebarShowsOversightFactsOnFirstRender() async throws {
+        let fixture = try await makeFixture()
+        let observerID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
+        let targetID = try XCTUnwrap(fixture.tabs[1].activeAgentSessionID)
+        let outcome = await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+            observerSessionID: observerID, rawTargetSessionID: targetID.uuidString
+        )
+        guard case .added = outcome else { return XCTFail("Real bridge grant failed: \(outcome)") }
+        try await settle(fixture)
+
+        var firstModels: [UUID: AgentSidebarActiveRowModel] = [:]
+        AgentSidebarRowRenderProbe.onActiveRowBody = { model in
+            if firstModels[model.session.tabID] == nil { firstModels[model.session.tabID] = model }
+        }
+        defer { AgentSidebarRowRenderProbe.onActiveRowBody = nil }
+        let freshHost = NSHostingView(rootView: sidebar(for: fixture.state, tabID: fixture.tabs[0].id))
+        freshHost.frame = fixture.host.frame
+        freshHost.layoutSubtreeIfNeeded()
+
+        let target = try XCTUnwrap(firstModels[fixture.tabs[1].id], "The target row must render on first mount")
+        XCTAssertTrue(target.oversight.role.hasMark, "The overseen row must show its role mark on first render")
+        XCTAssertNotNil(target.oversight.targetEndpoint)
+        XCTAssertEqual(firstModels.count, Self.rowCount)
+        XCTAssertTrue(
+            firstModels.values.allSatisfy { $0.oversight.copySessionIDTarget != nil },
+            "Every bound top-level row must offer Copy Session ID on first render"
+        )
+    }
+
     func testUnrelatedPromptPublishReRendersNoRows() async throws {
         let fixture = try await makeFixture()
         renderedTitles = []

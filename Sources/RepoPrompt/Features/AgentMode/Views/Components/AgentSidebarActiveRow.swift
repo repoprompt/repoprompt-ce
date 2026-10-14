@@ -41,6 +41,8 @@ struct AgentSidebarActiveRowModel: Equatable {
     @MainActor
     enum AgentSidebarRowRenderProbe {
         static var onSessionRowBody: ((String) -> Void)?
+        /// Reports the model each active row body renders.
+        static var onActiveRowBody: ((AgentSidebarActiveRowModel) -> Void)?
         /// Reports unequal row models so tests can name the field that invalidated a row.
         static var onActiveRowModelChange: ((AgentSidebarActiveRowModel, AgentSidebarActiveRowModel) -> Void)?
     }
@@ -197,6 +199,9 @@ struct AgentSidebarActiveRow: View, Equatable {
     }
 
     var body: some View {
+        #if DEBUG
+            let _ = AgentSidebarRowRenderProbe.onActiveRowBody?(model)
+        #endif
         let model = model
         let actions = actions
         let session = model.session
