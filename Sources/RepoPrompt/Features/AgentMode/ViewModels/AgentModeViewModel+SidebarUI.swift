@@ -556,7 +556,11 @@ extension AgentModeViewModel {
                     transcriptTurnsIsEmpty: session.transcript.turns.isEmpty,
                     runState: session.runState,
                     lastActivityAt: session.lastActivityAt,
-                    lastUserMessageAt: session.lastUserMessageAt
+                    lastUserMessageAt: session.lastUserMessageAt,
+                    worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
+                    worktreeMergeAttention: AgentWorktreeMergeBlockerSelector.sidebarAttention(
+                        in: session.worktreeMergeOperations
+                    )
                 )
             }
         return AgentSessionSidebarContentFingerprint(

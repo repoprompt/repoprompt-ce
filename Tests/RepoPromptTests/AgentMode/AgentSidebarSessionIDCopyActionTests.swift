@@ -26,6 +26,29 @@ final class AgentSidebarSessionIDCopyActionTests: XCTestCase {
         XCTAssertEqual(writtenValues, [sessionID.uuidString])
     }
 
+    /// A row skipped by equality can hold an old capture; click-time revalidation must fail closed.
+    func testStaleCapturedSessionIDFailsClosedWithZeroWrites() throws {
+        let sessionID = try XCTUnwrap(UUID(uuidString: "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9"))
+        var writtenValues: [String] = []
+        var checkedIDs: [UUID] = []
+        var isCurrent = false
+        let action = AgentSidebarSessionIDCopyAction(
+            sessionID: sessionID,
+            isCurrent: { checkedIDs.append($0)
+                return isCurrent
+            },
+            clipboardWriter: { writtenValues.append($0) }
+        )
+
+        action.perform()
+        XCTAssertEqual(writtenValues, [], "A stale capture must perform zero clipboard writes")
+        XCTAssertEqual(checkedIDs, [sessionID])
+
+        isCurrent = true
+        action.perform()
+        XCTAssertEqual(writtenValues, [sessionID.uuidString])
+    }
+
     func testNilSessionIDIsDisabledAndPerformsNoWrite() {
         var writtenValues = ["sentinel"]
         let action = AgentSidebarSessionIDCopyAction(

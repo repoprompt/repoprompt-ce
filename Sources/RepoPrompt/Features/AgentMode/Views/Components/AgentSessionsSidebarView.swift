@@ -403,6 +403,10 @@ struct AgentModeSessionsListView: View, Equatable {
     @State private var showingBulkDeleteConfirmation = false
     @State private var sessionLinkProjectionRevision: UInt64 = 0
     @State private var rowActions = AgentSidebarActiveRowActions()
+    /// Anchor for Today/Yesterday headers. The list is skipped by equality on quiet updates, so a
+    /// wall-clock read in `body` would keep yesterday's headers across a quiet midnight; the
+    /// calendar day-change notification refreshes this state and re-renders the headers.
+    @State private var dateSectionNow = AgentSidebarDayClock.now()
 
     init(
         agentModeVM: AgentModeViewModel,
@@ -565,8 +569,12 @@ struct AgentModeSessionsListView: View, Equatable {
             for: snapshot.pagedSessions,
             collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
             searchText: sidebarUI.snapshot.searchText,
+            now: dateSectionNow,
             perfRecorder: perfRecorder
         )
+        #if DEBUG
+            let _ = AgentSidebarRowRenderProbe.onActiveRowsRendered?(renderedActiveRows)
+        #endif
         let selectionState = sidebarUI.selectionState
         let showsSelectionPresentation = selectionState.showsSelectionPresentation
         let isInteractionEnabled = !selectionState.isMutationInFlight
@@ -784,6 +792,7 @@ struct AgentModeSessionsListView: View, Equatable {
                                     renderedOrder: snapshot.renderedSelectionOrder,
                                     agentModeVM: agentModeVM,
                                     creatorDisplayNames: agentModeVM.sidebarCreatorDisplayNames,
+                                    dateSectionNow: dateSectionNow,
                                     promptManager: promptManager
                                 )
                             }
@@ -818,6 +827,9 @@ struct AgentModeSessionsListView: View, Equatable {
         }
         .onReceive(NotificationCenter.default.publisher(for: .agentSessionLinkCandidatesDidChange).receive(on: DispatchQueue.main)) { _ in
             reconcileSessionLinkProjection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged).receive(on: DispatchQueue.main)) { _ in
+            dateSectionNow = AgentSidebarDayClock.now()
         }
         .onReceive(promptManager.$sidebarWorkspaceSnapshot.removeDuplicates()) { next in
             guard next != workspaceSnapshot else { return }
@@ -1169,6 +1181,12 @@ struct AgentSidebarRenderedArchivedRow: Identifiable {
     }
 }
 
+/// Clock for sidebar date headers. Tests substitute it to cross midnight deterministically.
+@MainActor
+enum AgentSidebarDayClock {
+    static var now: () -> Date = { Date() }
+}
+
 /// One `ForEach`, keyed by each row's own id. The active list, the archived
 /// list, and the click tests all use this view. A date-section or thread-group
 /// `ForEach` around these rows changes identity during a press and cancels the tap.
@@ -1411,6 +1429,8 @@ struct ArchivedSessionsList: View {
     let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
     let creatorDisplayNames: [UUID: String]
+    /// Day anchor for Today/Yesterday buckets; owned by the list and refreshed at midnight.
+    let dateSectionNow: Date
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -1448,6 +1468,7 @@ struct ArchivedSessionsList: View {
     var body: some View {
         let sections = AgentSidebarDateSectionBuilder.archivedSections(
             for: tabs,
+            now: dateSectionNow,
             dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) },
             perfRecorder: perfRecorder
         )

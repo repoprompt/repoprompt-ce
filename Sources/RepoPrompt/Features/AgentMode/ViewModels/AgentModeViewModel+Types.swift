@@ -351,6 +351,10 @@ extension AgentModeViewModel {
         let runState: AgentSessionRunState
         let lastActivityAt: Date
         let lastUserMessageAt: Date?
+        /// The row builder prefers live bindings and merge operations over the index entry, so a
+        /// live change must refresh rows even when no index entry exists to carry it.
+        var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = []
+        var worktreeMergeAttention: AgentWorktreeMergeAttention?
     }
 
     /// Fingerprint of every VM-level input that affects the rendered session sidebar.

@@ -13,8 +13,21 @@ struct AgentSidebarRowOversightFacts: Equatable {
     var creatorSessionID: UUID?
     var creatorDisplayName: String?
     var copySessionIDTarget: AgentSessionCopyIDTarget?
+    /// Live preconditions of identity-only oversight preparation. Non-nil only while the row still
+    /// lacks an exact endpoint; a change re-runs the preparation task once those settle.
+    var preparationKey: AgentSidebarOversightPreparationKey?
 
     static let none = AgentSidebarRowOversightFacts()
+}
+
+/// Inputs `prepareSidebarOversightSession` gates on that a row would otherwise never observe.
+struct AgentSidebarOversightPreparationKey: Hashable {
+    let sessionID: UUID
+    let hasLiveSession: Bool
+    let hasLoadedPersistedState: Bool
+    let isLoading: Bool
+    let bindingTransitionInProgress: Bool
+    let isDirty: Bool
 }
 
 /// Every value an active sidebar row renders. Equality is the row's whole render identity:
@@ -43,6 +56,8 @@ struct AgentSidebarActiveRowModel: Equatable {
         static var onSessionRowBody: ((String) -> Void)?
         /// Reports the model each active row body renders.
         static var onActiveRowBody: ((AgentSidebarActiveRowModel) -> Void)?
+        /// Reports the active rows (with their headers) each list body renders.
+        static var onActiveRowsRendered: (([AgentSidebarRenderedActiveRow]) -> Void)?
         /// Reports unequal row models so tests can name the field that invalidated a row.
         static var onActiveRowModelChange: ((AgentSidebarActiveRowModel, AgentSidebarActiveRowModel) -> Void)?
     }
@@ -93,7 +108,9 @@ final class AgentSidebarActiveRowActions {
             // window-wide counts (available observers) that change for every row whenever any one
             // session's eligibility changes, so unmarked rows must not depend on it.
             summary: role.hasMark
-                ? agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: sessionID)
+                ? Self.renderedSummary(
+                    agentModeVM.agentSidebarOversightSummary(tabID: session.tabID, expectedSessionID: sessionID)
+                )
                 : nil,
             targetEndpoint: agentModeVM.agentSidebarOversightTargetEndpoint(
                 tabID: session.tabID,
@@ -105,8 +122,48 @@ final class AgentSidebarActiveRowActions {
                 tabID: session.tabID,
                 sessionID: sessionID,
                 tabName: session.title
-            )
+            ),
+            preparationKey: Self.preparationKey(agentModeVM: agentModeVM, tabID: session.tabID, sessionID: sessionID)
         )
+    }
+
+    private static func preparationKey(
+        agentModeVM: AgentModeViewModel,
+        tabID: UUID,
+        sessionID: UUID
+    ) -> AgentSidebarOversightPreparationKey? {
+        guard agentModeVM.agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: sessionID) == nil
+        else { return nil }
+        let live = agentModeVM.sessions[tabID]
+        return AgentSidebarOversightPreparationKey(
+            sessionID: sessionID,
+            hasLiveSession: live != nil,
+            hasLoadedPersistedState: live?.hasLoadedPersistedState ?? false,
+            isLoading: live?.persistedLoadTask != nil,
+            bindingTransitionInProgress: live?.bindingTransitionInProgress ?? false,
+            isDirty: live?.isDirty ?? false
+        )
+    }
+
+    /// Click-time check for the verbatim Copy Session ID fallback: the row's tab must still resolve
+    /// to the captured session in the active workspace.
+    func isCurrentRowSessionID(_ sessionID: UUID, tabID: UUID, workspaceID: UUID?) -> Bool {
+        guard let agentModeVM, let promptManager, let workspaceID,
+              agentModeVM.workspaceManager?.activeWorkspaceID == workspaceID,
+              let snapshot = promptManager.sidebarWorkspaceSnapshot, snapshot.workspaceID == workspaceID
+        else { return false }
+        return agentModeVM.agentChatsSidebarSessions(for: snapshot.composeTabs)
+            .first { $0.tabID == tabID }?.sessionID == sessionID
+    }
+
+    /// Recorded facts mirror what a closed row renders. `observerIneligibleReason` is overlaid from
+    /// the process-wide persistence presentation, whose updates post no sidebar invalidation, and
+    /// the row never renders it: menus re-resolve the reason when they open. Keeping it out stops
+    /// recorded facts drifting from the live projection between notifications.
+    nonisolated static func renderedSummary(_ summary: AgentSidebarOversightSummary?) -> AgentSidebarOversightSummary? {
+        guard var summary else { return nil }
+        summary.observerIneligibleReason = nil
+        return summary
     }
 
     /// Whether a session-link notification changed anything a rendered row shows. Global
@@ -178,6 +235,11 @@ final class AgentSidebarActiveRowActions {
             tabID: model.session.tabID, sessionID: sessionID, workspaceID: workspaceID
         )
     }
+}
+
+private struct AgentSidebarPreparationTaskID: Hashable {
+    let sessionID: UUID?
+    let key: AgentSidebarOversightPreparationKey?
 }
 
 /// One active sidebar row whose render identity is its value model.
@@ -345,8 +407,14 @@ struct AgentSidebarActiveRow: View, Equatable {
                     )
                 }
             },
-            sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
+            sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID) { sessionID in
+                actions.isCurrentRowSessionID(sessionID, tabID: session.tabID, workspaceID: model.workspaceID)
+            }
         )
-        .task(id: session.sessionID) { actions.prepareOversight(model) }
+        // Re-keyed on the preparation preconditions, not just the ID: hydration settling later must
+        // retry preparation even when the session ID never changes.
+        .task(id: AgentSidebarPreparationTaskID(sessionID: session.sessionID, key: model.oversight.preparationKey)) {
+            actions.prepareOversight(model)
+        }
     }
 }
