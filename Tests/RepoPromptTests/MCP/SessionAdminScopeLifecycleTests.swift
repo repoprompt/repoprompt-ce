@@ -248,19 +248,16 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         await runtime.bootstrap(store: store)
         let overseer = UUID()
         let granted = try grantScope(runtime, to: overseer)
-        await runtime.flushPersistence()
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
+        XCTAssertEqual(try scopeDocument().scopes.map(\.id), [granted.id], "A grant is durable before approve returns")
         XCTAssertTrue(runtime.authorize(authorizationRequest(granted)).isAuthorized)
         XCTAssertTrue(runtime.isCurrent(lease(granted)))
 
         runtime.freezeForTermination(allowRestoration: true)
         let sealed = await runtime.settleForTermination()
         XCTAssertTrue(sealed)
-        XCTAssertTrue(try scopeDocument().cleanShutdown)
         XCTAssertFalse(runtime.hasLiveScopeForCatalog(grantedTo: overseer))
         XCTAssertFalse(runtime.authorize(authorizationRequest(granted)).isAuthorized)
-        XCTAssertFalse(runtime.isCurrent(lease(granted)))
-        await store.closeWithoutSealingForTesting()
+        store.closeWithoutSealingForTesting()
 
         let nextStore = makeStore(mode: .dormant)
         let reloaded = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
@@ -268,45 +265,67 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let live = reloaded.liveScopes(grantedTo: overseer)
         XCTAssertEqual(live.map(\.id), [granted.id])
         XCTAssertEqual(live.first?.grant, granted.grant)
-        XCTAssertFalse(try scopeDocument().cleanShutdown, "Even unchanged restored grants require a real opening write")
 
         reloaded.revoke(scopeID: granted.id)
-        reloaded.freezeForTermination(allowRestoration: true)
-        let revokedSealed = await reloaded.settleForTermination()
-        XCTAssertTrue(revokedSealed)
-        await reloaded.flushPersistence()
-        XCTAssertTrue(try scopeDocument().scopes.isEmpty)
-        await nextStore.closeWithoutSealingForTesting()
+        XCTAssertTrue(try scopeDocument().scopes.isEmpty, "A revocation is durable before revoke returns")
+        nextStore.closeWithoutSealingForTesting()
         let lastStore = makeStore()
         let again = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
         await again.bootstrap(store: lastStore)
         XCTAssertFalse(again.hasLiveScope(grantedTo: overseer))
-        await lastStore.closeWithoutSealingForTesting()
+        lastStore.closeWithoutSealingForTesting()
+    }
+
+    /// Kill mid-session (no terminate hook): every grant and every revocation made so far survives.
+    func testKillWithoutTerminationRestoresGrantsAndKeepsRevocations() async throws {
+        let store = makeStore()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
+        let kept = try grantScope(runtime, to: UUID())
+        let revoked = try grantScope(runtime, to: UUID())
+        let released = try grantScope(runtime, to: UUID())
+        runtime.revoke(scopeID: revoked.id)
+        _ = runtime.release(scopeID: released.id, caller: .agentSession(released.grant.granteeSessionID))
+        // No freeze, no settle: the process dies here.
+        store.closeWithoutSealingForTesting()
+
+        for _ in 0 ..< 2 {
+            let nextStore = makeStore()
+            let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+            await restarted.bootstrap(store: nextStore)
+            XCTAssertTrue(restarted.canUseAuthority)
+            XCTAssertEqual(restarted.liveScopes(grantedTo: kept.grant.granteeSessionID).map(\.id), [kept.id])
+            XCTAssertFalse(restarted.hasLiveScope(grantedTo: revoked.grant.granteeSessionID))
+            XCTAssertFalse(restarted.hasLiveScope(grantedTo: released.grant.granteeSessionID))
+            XCTAssertEqual(try scopeDocument().scopes.map(\.id), [kept.id], "Relaunch never rewrites grants away")
+            try XCTAssertEqual(Set(scopeDocument().revokedScopeIDs ?? []), [revoked.id, released.id])
+            // Killed again, before any change: the next launch still restores everything.
+            nextStore.closeWithoutSealingForTesting()
+        }
     }
 
     func testStorePreservesFutureSchemaQuarantinesMalformedAndSuppressesIO() async throws {
         let futureBytes = Data(#"{"version": 99, "scopes": []}"#.utf8)
         try futureBytes.write(to: scopeFile)
         let future = makeStore()
-        let futureLoad = await future.loadForLaunch()
+        let futureLoad = future.loadForLaunch()
         XCTAssertEqual(futureLoad, .blocked(.unsupportedFutureSchema(onDiskVersion: 99, supportedVersion: 2)))
-        let futureWrite = await future.replace(with: [])
+        let futureWrite = future.replace(with: [])
         XCTAssertEqual(futureWrite, .blocked)
         XCTAssertEqual(try Data(contentsOf: scopeFile), futureBytes)
-        await future.closeWithoutSealingForTesting()
+        future.closeWithoutSealingForTesting()
 
         let malformedBytes = Data("not json".utf8)
         try malformedBytes.write(to: scopeFile)
         let malformed = makeStore()
-        let malformedLoad = await malformed.loadForLaunch()
+        let malformedLoad = malformed.loadForLaunch()
         XCTAssertEqual(malformedLoad, .ready(source: .quarantined, grants: [], revokedScopeIDs: []))
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
         XCTAssertTrue(try scopeDocument().scopes.isEmpty)
         let backupDirectory = temporaryDirectory.appendingPathComponent("Backups")
         let backups = try FileManager.default.contentsOfDirectory(at: backupDirectory, includingPropertiesForKeys: nil)
         XCTAssertEqual(backups.count, 1)
         XCTAssertEqual(try Data(contentsOf: XCTUnwrap(backups.first)), malformedBytes)
-        await malformed.closeWithoutSealingForTesting()
+        malformed.closeWithoutSealingForTesting()
 
         let untouched = temporaryDirectory.appendingPathComponent("suppressed-does-not-exist")
         let suppressed = makeStore(mode: .suppressed, directory: untouched)
@@ -315,49 +334,37 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(runtime.availability, .ephemeral)
         _ = try grantScope(runtime, to: UUID())
         await runtime.flushPersistence()
-        let suppressedWrite = await suppressed.replace(with: [])
+        let suppressedWrite = suppressed.replace(with: [])
         XCTAssertEqual(suppressedWrite, .blocked)
         XCTAssertFalse(FileManager.default.fileExists(atPath: untouched.path), "No directory, document, backup, or lock I/O")
     }
 
-    func testFailedRevokeAndFailedSealCannotRestoreTheOldGrant() async throws {
+    func testFailedRevokeWriteStillAppliesAndTheNextWriteRecordsIt() async throws {
         let gate = DelegationScopeFileWriteGate()
         let store = makeStore(writer: { try gate.write($0, to: $1) })
         let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
         await runtime.bootstrap(store: store)
         let overseer = UUID()
         let granted = try grantScope(runtime, to: overseer)
-        await runtime.flushPersistence()
-        let oldBytes = try Data(contentsOf: scopeFile)
         gate.setFailing(true)
         runtime.revoke(scopeID: granted.id)
-        await runtime.flushPersistence()
         XCTAssertEqual(runtime.lastPersistenceOutcome, .writeFailed)
-        XCTAssertFalse(runtime.authorize(authorizationRequest(granted)).isAuthorized)
-        runtime.freezeForTermination(allowRestoration: true)
-        let sealed = await runtime.settleForTermination()
-        XCTAssertFalse(sealed)
-        XCTAssertEqual(try Data(contentsOf: scopeFile), oldBytes, "The stale grant really remains on disk")
-        XCTAssertEqual(try scopeDocument().scopes.map(\.id), [granted.id])
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
+        XCTAssertTrue(runtime.persistenceFailed)
+        XCTAssertFalse(runtime.authorize(authorizationRequest(granted)).isAuthorized, "Revocation is immediate in memory")
+        XCTAssertEqual(try scopeDocument().scopes.map(\.id), [granted.id], "The failed write left the old bytes")
+
+        // Storage recovers: the next write of any kind carries the revocation.
         gate.setFailing(false)
-        let lateWrite = await store.replace(with: [])
-        XCTAssertEqual(lateWrite, .blocked, "A failed seal is still terminal")
-        let repeatedSeal = await store.finishLaunch(with: [])
-        XCTAssertEqual(repeatedSeal, .writeFailed)
-        XCTAssertEqual(try Data(contentsOf: scopeFile), oldBytes)
-        await store.closeWithoutSealingForTesting()
+        _ = try grantScope(runtime, to: UUID())
+        XCTAssertFalse(try scopeDocument().scopes.map(\.id).contains(granted.id))
+        XCTAssertTrue(try scopeDocument().revokedScopeIDs?.contains(granted.id) == true)
+        store.closeWithoutSealingForTesting()
 
         let nextStore = makeStore()
         let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
         await restarted.bootstrap(store: nextStore)
-        XCTAssertTrue(restarted.canUseAuthority, "Fresh approvals may proceed after a new opening fence succeeds")
-        XCTAssertNotNil(restarted.recoveryNotice)
-        XCTAssertFalse(restarted.hasLiveScopeForCatalog(grantedTo: overseer))
-        XCTAssertFalse(restarted.authorize(authorizationRequest(granted)).isAuthorized)
-        XCTAssertFalse(restarted.isCurrent(lease(granted)))
-        XCTAssertTrue(try scopeDocument().scopes.isEmpty)
-        await nextStore.closeWithoutSealingForTesting()
+        XCTAssertFalse(restarted.hasLiveScope(grantedTo: overseer))
+        nextStore.closeWithoutSealingForTesting()
     }
 
     func testOpeningFailureBlocksRestorationApprovalAndMCPStatusForExistingAndNewStores() async throws {
@@ -396,7 +403,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             XCTAssertEqual(status["authority_available"], .bool(false))
             XCTAssertNotNil(status["authority_status_detail"]?.stringValue)
             XCTAssertEqual(try? Data(contentsOf: scopeFile), before, "Failed opening preserves the trusted bytes or missing file")
-            await store.closeWithoutSealingForTesting()
+            store.closeWithoutSealingForTesting()
         }
     }
 
@@ -427,7 +434,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: saved.fileURL), saved.bytes)
         XCTAssertEqual(try Data(contentsOf: scopeFile), cleanBytes)
         XCTAssertNil(registry.state(forSessionID: overseer), "Refusal must precede even the local deletion tombstone")
-        await failedStore.closeWithoutSealingForTesting()
+        failedStore.closeWithoutSealingForTesting()
 
         let restartedStore = makeStore()
         let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
@@ -435,7 +442,6 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         await restarted.bootstrap(store: restartedStore)
         XCTAssertTrue(restarted.hasLiveScope(grantedTo: overseer))
         XCTAssertEqual(try Data(contentsOf: saved.fileURL), saved.bytes, "The restored grant still names an existing payload")
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
         var committed: [UUID] = []
         registry.commitObserver = { id in
             committed.append(id)
@@ -454,10 +460,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertTrue(try scopeDocument().cleanShutdown)
         XCTAssertTrue(try scopeDocument().scopes.isEmpty)
         XCTAssertTrue(try scopeDocument().revokedScopeIDs?.contains(record.id) == true)
-        await restartedStore.closeWithoutSealingForTesting()
+        restartedStore.closeWithoutSealingForTesting()
     }
 
-    func testHumanDeletionBeforeAndDuringOpeningIsRefusedThenCommitRevokesTheRestoredGrant() async throws {
+    func testHumanDeletionBeforeOpeningIsRefusedThenCommitRevokesTheRestoredGrant() async throws {
         let registry = AgentSessionDeletionRegistry.shared
         let previousObserver = registry.commitObserver
         let previousChangeObserver = registry.changeObserver
@@ -472,12 +478,9 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let overseer = UUID()
         let saved = try makeSavedSession(overseer)
         let record = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: overseer)
-        let cleanBytes = try JSONEncoder().encode(DelegationScopeDocument(scopes: [record.grant], cleanShutdown: true))
+        let cleanBytes = try JSONEncoder().encode(DelegationScopeDocument(scopes: [record.grant]))
         try cleanBytes.write(to: scopeFile, options: .atomic)
-        let gate = DelegationScopeFileWriteGate()
-        gate.holdNextWrite()
-        defer { gate.resume() }
-        let store = makeStore(writer: { try gate.write($0, to: $1) })
+        let store = makeStore()
         let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
         registry.installScopePersistenceAdmission(for: runtime)
         var committed: [UUID] = []
@@ -486,30 +489,20 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             runtime.revokeAll(involving: id)
         }
         await assertScopePersistenceRefusesDeletion(of: overseer, service: saved.service, workspace: saved.workspace)
-        let bootstrap = Task { await runtime.bootstrap(store: store) }
-        addTeardownBlock {
-            gate.resume()
-            await bootstrap.value
-            await store.closeWithoutSealingForTesting()
-        }
-        await fulfillment(of: [gate.entered], timeout: 3)
-        XCTAssertEqual(runtime.availability, .awaitingStore)
-        await assertScopePersistenceRefusesDeletion(of: overseer, service: saved.service, workspace: saved.workspace)
         XCTAssertTrue(committed.isEmpty, "No callback may be lost before restored authority exists")
         XCTAssertNil(registry.state(forSessionID: overseer))
         XCTAssertEqual(try Data(contentsOf: saved.fileURL), saved.bytes)
         XCTAssertEqual(try Data(contentsOf: scopeFile), cleanBytes)
-        gate.resume()
-        await bootstrap.value
+        await runtime.bootstrap(store: store)
         XCTAssertTrue(runtime.hasLiveScope(grantedTo: overseer))
         XCTAssertNil(runtime.durableDeletionUnavailableReason)
         try await saved.service.deleteAgentSession(id: overseer, for: saved.workspace)
         XCTAssertEqual(committed, [overseer])
         XCTAssertFalse(FileManager.default.fileExists(atPath: saved.fileURL.path))
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: overseer))
-        await runtime.flushPersistence()
         XCTAssertTrue(try scopeDocument().scopes.isEmpty)
         XCTAssertTrue(try scopeDocument().revokedScopeIDs?.contains(record.id) == true)
+        store.closeWithoutSealingForTesting()
     }
 
     func testDeletionAdmissionRequiresAnOwnerAndDistinguishesFixtureEphemeralFromSuppression() async throws {
@@ -571,46 +564,47 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertNil(registry.state(forSessionID: savedID))
         XCTAssertEqual(try Data(contentsOf: saved.fileURL), saved.bytes)
         XCTAssertEqual(try Data(contentsOf: scopeFile), before)
-        await contending.closeWithoutSealingForTesting()
-        await first.closeWithoutSealingForTesting()
+        contending.closeWithoutSealingForTesting()
+        first.closeWithoutSealingForTesting()
     }
 
-    func testStoreOwnershipAndTerminalSealRejectOldQueuedSnapshots() async throws {
+    func testStoreOwnershipAndTerminalSealRejectOldQueuedSnapshots() throws {
         let seed = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
         let first = makeStore()
-        _ = await first.loadForLaunch()
-        _ = await first.replace(with: [seed.grant])
+        _ = first.loadForLaunch()
+        _ = first.replace(with: [seed.grant])
         let before = try Data(contentsOf: scopeFile)
         let contending = makeStore()
-        let contention = await contending.loadForLaunch()
+        let contention = contending.loadForLaunch()
         XCTAssertEqual(contention, .blocked(.ownershipUnavailable))
         XCTAssertEqual(try Data(contentsOf: scopeFile), before)
-        let sealed = await first.finishLaunch(with: [], revokedScopeIDs: [seed.id])
+        let sealed = first.finishLaunch(with: [], revokedScopeIDs: [seed.id])
         XCTAssertEqual(sealed, .applied)
         let sealedBytes = try Data(contentsOf: scopeFile)
-        let stale = await first.replace(with: [seed.grant])
+        let stale = first.replace(with: [seed.grant])
         XCTAssertEqual(stale, .blocked)
-        let repeated = await first.finishLaunch(with: [seed.grant])
+        let repeated = first.finishLaunch(with: [seed.grant])
         XCTAssertEqual(repeated, sealed, "Finalization is terminal and never accepts a second snapshot")
         XCTAssertEqual(try Data(contentsOf: scopeFile), sealedBytes)
         let stillContending = makeStore()
-        let stillBlocked = await stillContending.loadForLaunch()
+        let stillBlocked = stillContending.loadForLaunch()
         XCTAssertEqual(stillBlocked, .blocked(.ownershipUnavailable), "Successful sealing retains path ownership until exit")
-        await first.closeWithoutSealingForTesting()
-        await contending.closeWithoutSealingForTesting()
-        await stillContending.closeWithoutSealingForTesting()
+        first.closeWithoutSealingForTesting()
+        contending.closeWithoutSealingForTesting()
+        stillContending.closeWithoutSealingForTesting()
         let next = makeStore()
-        let restored = await next.loadForLaunch()
+        let restored = next.loadForLaunch()
         XCTAssertEqual(restored, .ready(source: .loaded, grants: [], revokedScopeIDs: [seed.id]))
-        await next.closeWithoutSealingForTesting()
+        next.closeWithoutSealingForTesting()
     }
 
-    func testLegacyAndOpenDocumentsRequireReapprovalAndInvalidLaunchStateIsPreserved() async throws {
+    /// v1 documents migrate their grants, and the legacy launch-state field never gates restoration.
+    func testLegacyDocumentsMigrateAndLaunchStateFieldIsIgnored() async throws {
         let record = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
         for legacy in [true, false] {
             for hasTombstone in [false, true] {
                 var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(DelegationScopeDocument(
-                    scopes: [record.grant], revokedScopeIDs: hasTombstone ? [record.id] : nil
+                    scopes: [record.grant], revokedScopeIDs: hasTombstone ? [record.id] : nil, cleanShutdown: false
                 ))) as? [String: Any])
                 if legacy {
                     object["version"] = 1
@@ -618,104 +612,62 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
                 }
                 try JSONSerialization.data(withJSONObject: object).write(to: scopeFile)
                 let store = makeStore()
-                let loaded = await store.loadForLaunch()
+                let loaded = store.loadForLaunch()
                 XCTAssertEqual(loaded, .ready(
-                    source: legacy ? .legacyRequiresApproval : .uncleanRequiresApproval,
-                    grants: [], revokedScopeIDs: hasTombstone ? [record.id] : []
+                    source: legacy ? .migrated : .loaded,
+                    grants: [record.grant], revokedScopeIDs: hasTombstone ? [record.id] : []
                 ))
                 XCTAssertEqual(try scopeDocument().version, 2)
-                XCTAssertTrue(try scopeDocument().scopes.isEmpty)
-                await store.closeWithoutSealingForTesting()
+                XCTAssertEqual(try scopeDocument().scopes, [record.grant], "Loading never rewrites grants away")
+                store.closeWithoutSealingForTesting()
+
+                let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+                let nextStore = makeStore()
+                await runtime.bootstrap(store: nextStore)
+                XCTAssertEqual(runtime.hasLiveScope(grantedTo: record.grant.granteeSessionID), !hasTombstone)
+                nextStore.closeWithoutSealingForTesting()
             }
         }
         for field in [nil, NSNull(), "clean", 1] as [Any?] {
             var object: [String: Any] = ["version": 2, "scopes": []]
             object["clean_shutdown"] = field
-            let bytes = try JSONSerialization.data(withJSONObject: object)
-            try bytes.write(to: scopeFile)
+            try JSONSerialization.data(withJSONObject: object).write(to: scopeFile)
             let store = makeStore()
-            let loaded = await store.loadForLaunch()
-            XCTAssertEqual(loaded, .blocked(.invalidLaunchState))
-            XCTAssertEqual(try Data(contentsOf: scopeFile), bytes)
-            await store.closeWithoutSealingForTesting()
+            XCTAssertEqual(store.loadForLaunch(), .ready(source: .loaded, grants: [], revokedScopeIDs: []))
+            store.closeWithoutSealingForTesting()
         }
     }
 
-    func testFreezeDuringOpeningNeverInstallsAuthority() async throws {
-        let record = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
-        try JSONEncoder().encode(DelegationScopeDocument(scopes: [record.grant], cleanShutdown: true)).write(to: scopeFile)
-        let gate = DelegationScopeFileWriteGate()
-        gate.holdNextWrite()
-        let store = makeStore(writer: { try gate.write($0, to: $1) })
-        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
-        let bootstrap = Task { await runtime.bootstrap(store: store) }
-        await fulfillment(of: [gate.entered], timeout: 3)
-        runtime.freezeForTermination(allowRestoration: true)
-        gate.resume()
-        await bootstrap.value
-        XCTAssertEqual(runtime.availability, .terminating)
-        XCTAssertFalse(runtime.hasLiveScopeForCatalog(grantedTo: record.grant.granteeSessionID))
-        XCTAssertFalse(runtime.authorize(authorizationRequest(record)).isAuthorized)
-        let settled = await runtime.settleForTermination()
-        XCTAssertTrue(settled, "No activated snapshot exists to seal")
-        XCTAssertFalse(try scopeDocument().cleanShutdown, "Unused candidates stay unsealed")
-        await store.closeWithoutSealingForTesting()
+    /// A corrupt or unverifiable row drops alone; its siblings and tombstones still load.
+    func testCorruptEntryDropsOnlyItself() throws {
+        let ephemeral = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let first = try grantScope(ephemeral, to: UUID())
+        let second = try grantScope(ephemeral, to: UUID())
+        let tombstone = UUID()
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(DelegationScopeDocument(
+            scopes: [first.grant, second.grant], revokedScopeIDs: [tombstone]
+        ))) as? [String: Any])
+        var scopes = try XCTUnwrap(object["scopes"] as? [Any])
+        scopes.insert(["id": "not-a-uuid", "kind": ["type": "unknown"]], at: 1)
+        scopes.append(42)
+        object["scopes"] = scopes
+        object["revoked_scope_ids"] = [tombstone.uuidString, "garbage"]
+        try JSONSerialization.data(withJSONObject: object).write(to: scopeFile)
+
+        let store = makeStore()
+        guard case let .ready(source, grants, revoked) = store.loadForLaunch() else {
+            return XCTFail("A document with one corrupt row must still load")
+        }
+        XCTAssertEqual(source, .loaded)
+        XCTAssertEqual(Set(grants.map(\.id)), [first.id, second.id])
+        XCTAssertEqual(revoked, [tombstone])
+        try XCTAssertEqual(Set(scopeDocument().scopes.map(\.id)), [first.id, second.id])
+        store.closeWithoutSealingForTesting()
     }
 
-    func testFinalSnapshotWinsAnOlderHeldWriteAndFreezesNewAdmission() async throws {
-        let gate = DelegationScopeFileWriteGate()
-        let store = makeStore(writer: { try gate.write($0, to: $1) })
-        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
-        await runtime.bootstrap(store: store)
-        await runtime.flushPersistence()
-        gate.holdNextWrite()
-        let record = try grantScope(runtime, to: UUID())
-        await fulfillment(of: [gate.entered], timeout: 3)
-        runtime.revoke(scopeID: record.id)
-        let pending = try runtime.requestScope(
-            requesterSessionID: UUID(), requesterTabID: nil, kind: .allSessions,
-            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
-        ).get()
-        runtime.freezeForTermination(allowRestoration: true)
-        XCTAssertEqual(runtime.approve(requestID: pending.id).map(\.id), .failure(.unknownScope))
-        XCTAssertEqual(runtime.requests[pending.id]?.state, .pending)
-        XCTAssertFalse(runtime.authorize(authorizationRequest(record)).isAuthorized)
-        XCTAssertEqual(runtime.release(scopeID: record.id, caller: .agentSession(record.grant.granteeSessionID)).map(\.count), .failure(.unknownScope))
-        gate.resume()
-        let sealed = await runtime.settleForTermination()
-        XCTAssertTrue(sealed)
-        await runtime.flushPersistence()
-        XCTAssertTrue(try scopeDocument().cleanShutdown)
-        XCTAssertTrue(try scopeDocument().scopes.isEmpty)
-        XCTAssertEqual(try scopeDocument().revokedScopeIDs, [record.id])
-        await store.closeWithoutSealingForTesting()
-    }
-
-    func testFinalizationTimeoutKeepsAuthorityFrozenAndLateWriteUsesTheSameSnapshot() async throws {
-        let gate = DelegationScopeFileWriteGate()
-        let store = makeStore(writer: { try gate.write($0, to: $1) })
-        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
-        await runtime.bootstrap(store: store)
-        let record = try grantScope(runtime, to: UUID())
-        await runtime.flushPersistence()
-        gate.holdNextWrite()
-        runtime.freezeForTermination(allowRestoration: true)
-        let settlement = Task { await runtime.settleForTermination(timeout: 0) }
-        await fulfillment(of: [gate.entered], timeout: 3)
-        let completedBeforeWrite = await settlement.value
-        XCTAssertFalse(completedBeforeWrite)
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
-        XCTAssertFalse(runtime.authorize(authorizationRequest(record)).isAuthorized)
-        XCTAssertTrue(runtime.revoke(scopeID: record.id).isEmpty, "Frozen authority cannot alter the final snapshot after timeout")
-        gate.resume()
-        let late = await runtime.settleForTermination()
-        XCTAssertTrue(late)
-        XCTAssertTrue(try scopeDocument().cleanShutdown)
-        XCTAssertEqual(try scopeDocument().scopes, [record.grant])
-        await store.closeWithoutSealingForTesting()
-    }
-
-    func testPendingDeletionCommitVetoesCleanScopeSealAndClosesFurtherDeletionAdmission() async throws {
+    /// A deletion that commits while quitting is still recorded, so the next launch cannot restore
+    /// authority for the deleted session; the rest of the scope document is untouched.
+    func testDeletionCommittedDuringQuitIsStillRecordedAndClosesFurtherDeletionAdmission() async throws {
         let registry = AgentSessionDeletionRegistry.shared
         let previousObserver = registry.commitObserver
         let previousChangeObserver = registry.changeObserver
@@ -731,11 +683,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         await runtime.bootstrap(store: store)
         let overseer = UUID()
         let record = try grantScope(runtime, to: overseer)
-        await runtime.flushPersistence()
+        let bystander = try grantScope(runtime, to: UUID())
         let commitFence = TestReleaseFence(name: "deletion callback before scope revocation")
         defer { commitFence.release() }
         registry.commitObserver = { sessionID in
-            // The disk phase has committed, but scope revocation has not reached its boundary yet.
             await commitFence.enterAndWait()
             runtime.revokeAll(involving: sessionID)
         }
@@ -746,25 +697,22 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             await callback.value
         }
         guard await commitFence.waitUntilEntered(timeout: 3) else { return }
-        XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: overseer))
-        XCTAssertFalse(registry.isDeletionInProgress(sessionID: overseer), "Only the commit callback remains pending")
         let mayRestore = registry.freezeNewDeletionAdmissionForTermination()
-        XCTAssertFalse(mayRestore, "Disk completion alone is not lifecycle quiescence")
         runtime.freezeForTermination(allowRestoration: mayRestore)
         XCTAssertThrowsError(try registry.beginDurableDeletion(sessionID: UUID()))
         commitFence.release()
         await callback.value
+        XCTAssertEqual(try scopeDocument().scopes.map(\.id), [bystander.id])
+        XCTAssertTrue(try scopeDocument().revokedScopeIDs?.contains(record.id) == true)
         let settled = await runtime.settleForTermination()
-        XCTAssertFalse(settled, "A veto is permanent even if the callback later finishes")
-        XCTAssertFalse(try scopeDocument().cleanShutdown)
-        XCTAssertEqual(try scopeDocument().scopes.map(\.id), [record.id], "The stale row remains, but can never be restored")
-        await store.closeWithoutSealingForTesting()
+        XCTAssertTrue(settled)
+        store.closeWithoutSealingForTesting()
         let nextStore = makeStore()
         let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
         await restarted.bootstrap(store: nextStore)
         XCTAssertFalse(restarted.hasLiveScope(grantedTo: overseer))
-        XCTAssertNotNil(restarted.recoveryNotice)
-        await nextStore.closeWithoutSealingForTesting()
+        XCTAssertTrue(restarted.hasLiveScope(grantedTo: bystander.grant.granteeSessionID))
+        nextStore.closeWithoutSealingForTesting()
     }
 
     // MARK: - undo strict keys
@@ -1337,7 +1285,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         await runtime.flushPersistence()
         XCTAssertTrue(try scopeDocument().scopes.isEmpty)
         XCTAssertEqual(try scopeDocument().revokedScopeIDs, [record.id])
-        await store.closeWithoutSealingForTesting()
+        store.closeWithoutSealingForTesting()
 
         // Domain reactivation remains the only decision owner. A clean file with a stale row next
         // to its tombstone never brings the grant back.
@@ -1349,7 +1297,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertFalse(relaunched.hasLiveScope(grantedTo: overseer))
         await relaunched.flushPersistence()
         XCTAssertTrue(try scopeDocument().scopes.isEmpty)
-        await nextStore.closeWithoutSealingForTesting()
+        nextStore.closeWithoutSealingForTesting()
     }
 
     func testAgentProposedGuardrailsAreClampedAndApprovalCannotWidenTheRequest() throws {

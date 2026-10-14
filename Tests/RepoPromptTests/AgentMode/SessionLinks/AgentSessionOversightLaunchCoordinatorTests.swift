@@ -471,7 +471,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let snapshot = await fixture.authority.snapshot()
         XCTAssertEqual(snapshot.activeLinkCount, 0)
         XCTAssertEqual(snapshot.pendingReservationCount, 0)
-        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.activationFailed))
+        // The refusal itself proves nothing; the reclassification that follows proves the duplicate.
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
     }
 
     func testBothExactHydrationProofsAreFreshAfterReservation() async throws {
@@ -939,7 +940,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.missing))
     }
 
@@ -962,7 +963,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored)
@@ -1009,7 +1010,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.hydrationFailed))
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored)
@@ -1146,14 +1147,70 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.bootstrapIntentStore(fixture.store)
         await fixture.bridge.test_settleLaunchReconciliation()
 
-        let restored = await isRestored(fixture)
+        var restored = await isRestored(fixture)
         XCTAssertFalse(restored, "An unproven incarnation must never be reauthorized.")
-        XCTAssertEqual(
-            fixture.bridge.test_launchEntryState(for: pair),
-            .terminal(.activationFailed)
-        )
+        // Restart survival: a target that rehydrates in place is routine at launch. The refusal
+        // grants nothing, but it must not erase the user's saved relationship.
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "A refused automatic restore must keep the durable intent.")
+
+        // Once the target is authoritative again, the bounded retry restores the link.
+        fixture.host.beforeUUIDCensus = nil
+        fixture.host.candidates = [observer, target]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        restored = await isRestored(fixture)
+        XCTAssertTrue(restored, "The saved link must restore after the transient refusal settles.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        fixture.bridge.freezeForTermination()
+    }
+
+    /// A launch entry that keeps getting refused stops retrying after its per-launch budget, but the
+    /// intent stays durable for the next launch instead of being deleted.
+    func testRepeatedlyRefusedRestoreExhaustsBudgetAndKeepsIntent() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        let rehydrating = withReadiness(
+            target,
+            .pending(
+                AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: target.tabID,
+                        sessionID: target.sessionID
+                    ),
+                    bindingTransitionGeneration: 1
+                )
+            )
+        )
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        fixture.host.candidates = [observer, target]
+        // Every establishment observes drift, then the endpoint reports ready again.
+        fixture.host.beforeUUIDCensus = {
+            fixture.host.candidates = [observer, rehydrating]
+        }
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        for _ in 0 ..< AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts + 2 {
+            fixture.host.candidates = [observer, target]
+            fixture.bridge.noteCandidateReadinessChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+        }
+
+        let restored = await isRestored(fixture)
+        XCTAssertFalse(restored)
+        XCTAssertEqual(
+            fixture.bridge.test_launchRefusedEstablishmentCount(for: pair),
+            AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts,
+            "Retries are bounded per launch."
+        )
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNotNil(token, "Budget exhaustion must preserve the intent for the next launch.")
     }
 
     func testSupersessionDuringEstablishmentKeepsIntentWithoutGranting() async throws {
@@ -1185,7 +1242,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let token = await fixture.store.token(for: pair)
             XCTAssertFalse(restored)
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
-            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
+            // The refusal spent one bounded retry and rearmed the entry for the next readiness event.
+            XCTAssertEqual(fixture.bridge.test_launchRefusedEstablishmentCount(for: pair), 1)
+            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
             XCTAssertNotNil(token)
         }
     }
@@ -1210,7 +1269,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.hydrationFailed))
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
     }
@@ -1248,7 +1307,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             .terminal(.ambiguousDuplicate)
         )
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(
             fixture.bridge.test_launchReservationStartCount(),
             1,
@@ -1293,7 +1352,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "An endpoint observed and then torn down is a fact, not the uncertainty of an abandoned restore."
         )
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
     }
 
     // MARK: - Launch policy

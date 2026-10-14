@@ -404,24 +404,31 @@ and follows the same preserve-first rules:
 - Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
   `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
   `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
-- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`) holding only the
-  **active** grants: scope ID, grantee session, kind, capabilities, guardrails (including the
-  per-scope bulk confirmation threshold), origin (user or attenuated parent), and grant time.
-  Revoked and expired scopes are removed. `revoked_scope_ids` is a bounded (1,024, oldest dropped)
-  tombstone list: a tombstoned grant, or a child of one, is never reactivated even if a stale copy of
-  the file still lists it. Generations, leases, pending `request_scope` cards, and batch
-  confirmations are process-local and never written.
-- Writes are serialized write-through, retried once on failure, and surfaced in the "Active
-  delegations" list when they fail. `applicationWillTerminate` performs a bounded synchronous
-  flush so a revocation made just before quitting is durable.
-- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
-  Grants past their expiry, tombstoned grants, and attenuated grants whose parent is missing,
-  inactive, or no longer satisfies the attenuation invariants (tree rooted at the grantee,
-  capabilities a subset, guardrails no looser) are not reactivated, so a reload can never undo a
-  cascade or widen a child.
-- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
+- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`, and a legacy
+  `clean_shutdown` field) holding only the **active** grants: scope ID, grantee session, kind,
+  capabilities, guardrails (including the per-scope bulk confirmation threshold), origin (user or
+  attenuated parent), and grant time. Revoked and expired scopes are removed from `scopes`.
+  `revoked_scope_ids` is a bounded (1,024, oldest dropped) tombstone list: a tombstoned grant, or a
+  child of one, is never reactivated even if a stale copy of the file still lists it. Generations,
+  leases, pending `request_scope` cards, and batch confirmations are process-local and never written.
+- **Crash-safe by construction.** Every grant, revocation, release, and expiry is written
+  synchronously and durably (temp file, `F_FULLFSYNC`, `rename`, directory fsync —
+  `DurableAtomicFileWriter`) inside the mutating call, before it returns. Nothing is sealed at quit and
+  correctness never depends on a graceful termination; the quit-time write is a final no-op-or-write.
+  A failed write leaves the revocation in effect in memory, is surfaced in "Active delegations", and is
+  carried by the next successful write. `clean_shutdown` is ignored on load and always written `true`
+  so older builds that still gate on it keep the grants.
+- Launch: the file is read once and every grant is reactivated under a **fresh generation**, however
+  the previous launch ended. v1 documents migrate their grants to v2. Grants past their expiry,
+  tombstoned grants, and attenuated grants whose parent is missing, inactive, or no longer satisfies
+  the attenuation invariants (tree rooted at the grantee, capabilities a subset, guardrails no looser)
+  are not reactivated, so a reload can never undo a cascade or widen a child. The opening write
+  rewrites exactly the loaded rows, never an empty list in place of loaded grants.
+- Recovery: an undecodable row (or tombstone) is dropped alone and its siblings still load; a future
+  `version` is preserved and blocks writes; a wholly malformed file is moved intact to
   `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
-  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+  and row counts are preserved and block writes. A deletion that commits while quitting still records
+  its revocation.
 
 ### Organizational placement and delegated worktree ownership
 

@@ -1872,6 +1872,10 @@ final class AgentSessionLinkRuntimeBridge {
             launchCoordinator?.reservationStartCount ?? 0
         }
 
+        func test_launchRefusedEstablishmentCount(for pair: AgentSessionOversightIntent) -> Int {
+            launchCoordinator?.refusedEstablishmentCount(for: pair) ?? 0
+        }
+
         /// Test seam: runs the eager observer-eligibility audit synchronously.
         ///
         /// `noteCandidateReadinessChanged()` fires it from a detached task because its callers are

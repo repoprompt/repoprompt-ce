@@ -200,6 +200,23 @@ Hydration need is derived from current readiness on existing reconciliation even
 loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
 persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
 
+Launch restoration never deletes saved intent because an establishment was refused. A refusal grants
+nothing, but at launch it is routinely transient (an endpoint still hydrating or rebinding, a
+superseded hydration proof, a closing or retiring endpoint). The entry returns to waiting with a small
+per-launch retry budget (`AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts`);
+the next pass reclassifies first, so only a fact `classify` proves (deleted, missing under a fully
+observed topology, duplicate, ineligible, terminal hydration) removes the durable row. An exhausted
+budget leaves the intent dormant for the next launch.
+
+**No data loss across restart or crash.** Oversight intent (`agentSessionOversightLinks.json`),
+delegation scopes (`delegationScopes.json`), and delegated worktree ownership are written atomically
+and durably at the moment of change (`DurableAtomicFileWriter`), so launch simply loads what is on
+disk; nothing depends on a graceful quit. Launch restoration may end an entry for this launch for any
+reason, but it removes the saved row only for a committed session deletion
+(`AgentSessionOversightLaunchTerminalReason.removesDurableIntent`); every other reason keeps the intent
+dormant for the next launch. Explicit user or agent actions (Unlink, revoke, release) still remove
+state, recording tombstones where the store has them.
+
 ## Route authority is independent of tool discovery
 
 A provider input never waits for a returned tool catalog. For native Claude/Codex runs with exact
