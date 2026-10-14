@@ -128,7 +128,15 @@ extension AgentModeViewModel {
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
-        let resolvedSession = session ?? self.session(for: tabID)
+        let resolvedSession: TabSession
+        if let heldSession = session ?? sessions[tabID] {
+            resolvedSession = heldSession
+        } else {
+            // Saved-session activation owns materialization. Repainting a composer during
+            // recovery must not recreate a detached runtime from its still-visible carrier.
+            guard explicitActiveSessionID(for: tabID) == nil else { return nil }
+            resolvedSession = self.session(for: tabID)
+        }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil

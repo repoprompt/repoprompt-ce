@@ -60,7 +60,7 @@ protocol AgentSessionAdministrationUndoing: AnyObject {
 /// `rename`, `set_pin`, `reorder_pins`, `set_group`, `reorder_groups`, `archive`, `unarchive`.
 ///
 /// Every effect is derived from `request.arguments`. Each mutation re-checks its target's scope lease
-/// immediately before it runs; nothing suspends between that check and the synchronous mutation.
+/// immediately before it runs. Archive and unarchive also recheck at their asynchronous boundaries.
 @MainActor
 final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOperationHandler,
     AgentSessionAdministrationTargetDeriving, AgentSessionAdministrationUndoing
@@ -181,7 +181,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         case .adminArchive:
             return await finish(context, payload: archive(context))
         case .adminUnarchive:
-            return finish(context, payload: unarchive(context))
+            return await finish(context, payload: unarchive(context))
         default:
             throw AgentSessionAdminArguments.invalid("\(batch.request.operation.adminOperationName) is not an organize op.")
         }
@@ -491,11 +491,34 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         }
     }
 
-    private func unarchive(_ context: Context) -> AgentSessionOrganizeUndoPayload? {
+    private func unarchive(_ context: Context) async -> AgentSessionOrganizeUndoPayload? {
         let states = currentOnly(context, eligibleStates(context, archived: true) { _ in false })
-        let changed = states.isEmpty ? [] : backend.unarchive(states.map(\.sessionID))
-        record(context, attempted: states, changed: changed)
-        return .archive(states.map(\.sessionID).filter(changed.contains))
+        let ids = states.map(\.sessionID)
+        let outcome = await backend.unarchive(ids, isAuthorized: context.isCurrent)
+        recordUnarchive(context, attempted: ids, outcome: outcome)
+        return .archive(ids.filter(outcome.restored.contains))
+    }
+
+    private func recordUnarchive(_ context: Context, attempted: [UUID], outcome: AgentSessionUnarchiveOutcome) {
+        for id in attempted {
+            if outcome.restored.contains(id) {
+                context.add(id, .changed)
+            } else if let failure = outcome.failures[id] {
+                context.items.append(AgentSessionAdminItemResult(
+                    sessionID: id, status: .failed, reason: failure.reason,
+                    detail: [
+                        "local_changes": .bool(failure.localChanges),
+                        "persistence_confirmed": .bool(failure.persistenceConfirmed)
+                    ]
+                ))
+                if failure.localChanges { context.extra["local_changes"] = .bool(true) }
+                if failure.persistenceConfirmed {
+                    context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
+                }
+            } else {
+                context.add(id, .skipped, "not_restorable")
+            }
+        }
     }
 
     // MARK: - Finish and undo
@@ -550,9 +573,11 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             undoFields(restores, context: context)
         case let .unarchive(ids):
             let current = ids.filter(context.isCurrent)
-            let changed = backend.unarchive(current)
-            for id in ids {
-                context.add(id, changed.contains(id) ? .changed : .skipped, changed.contains(id) ? nil : "not_restorable")
+            let outcome = await backend.unarchive(current, isAuthorized: context.isCurrent)
+            recordUnarchive(context, attempted: ids, outcome: outcome)
+            if outcome.restored.isEmpty, !outcome.failures.values.contains(where: \.localChanges) {
+                // A refusal before any effect must not consume the original undo token.
+                restoreUndo(entry)
             }
         case let .archive(ids):
             // Re-authorized as `archive`, so not-idle targets without `control` were never admitted;
@@ -571,11 +596,13 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 context.add(id, .skipped, "not_archivable")
             }
         }
+        var extra = context.extra
+        extra["undone_op"] = .string(entry.operation.adminOperationName)
         var value = AgentSessionAdminRendering.mutationValue(
             operation: entry.operation,
             items: context.items,
             itemsRequiringControl: batch.itemsRequiringControl,
-            extra: ["undone_op": .string(entry.operation.adminOperationName)]
+            extra: extra
         )
         if case var .object(object) = value {
             // Token redemption is separate from the effects: some targets may have changed while

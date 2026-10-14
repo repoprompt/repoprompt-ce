@@ -475,8 +475,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
     func testCopySessionIDRejectsCaptureOnceAnotherConversationIsDisplayed() async throws {
         try await withFixture { fixture in
             fixture.sessionA.selectedAgent = .claudeCode
-            fixture.sessionA.hasLoadedPersistedState = true
-            _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(fixture.sessionA))
+            XCTAssertTrue(fixture.sessionA.permitsBoundOperationAndSave)
             await awaitWindowTitleResolution(fixture.window)
             let capture = try XCTUnwrap(
                 fixture.window.agentChatTitleClusterMenuSnapshot()?.copySessionIDTarget,
@@ -695,6 +694,15 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             let sessionBID = UUID()
             let tabA = ComposeTabState(id: tabAID, name: "Alpha", activeAgentSessionID: sessionAID)
             let tabB = ComposeTabState(id: tabBID, name: "Beta", activeAgentSessionID: sessionBID)
+            // These titlebar actions target restored conversations. A carrier UUID alone cannot
+            // authorize Copy Session ID or the required flush before closing its tab.
+            for (tab, sessionID) in [(tabA, sessionAID), (tabB, sessionBID)] {
+                var payload = AgentSession(
+                    id: sessionID, workspaceID: workspace.id, name: tab.name, autoEditEnabled: false
+                )
+                payload.composeTabID = tab.id
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+            }
             let workspaceIndex = try XCTUnwrap(
                 window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id })
             )
@@ -706,8 +714,13 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             )
 
             let viewModel = window.agentModeViewModel
-            let sessionA = viewModel.session(for: tabAID)
-            _ = viewModel.session(for: tabBID)
+            let sessionA = await viewModel.ensureSessionReady(tabID: tabAID)
+            let sessionB = await viewModel.ensureSessionReady(tabID: tabBID)
+            for (session, sessionID) in [(sessionA, sessionAID), (sessionB, sessionBID)] {
+                XCTAssertEqual(session.activeAgentSessionID, sessionID)
+                XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertNil(session.operationAdmissionFailureMessage)
+            }
             viewModel.setAgentModeActive(true)
             viewModel.test_setCurrentTabIDOverride(tabAID)
             window.setAgentTitlebarAccessoryVisible(true, onNewSession: {})
@@ -1202,22 +1215,31 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         let overseen = window.workspaceManager.createWorkspace(
             name: "Overseer \(UUID().uuidString.prefix(6))", repoPaths: [root.path], ephemeral: true
         )
-        let observerTab = ComposeTabState(id: UUID(), name: "Observer")
-        let targetTab = ComposeTabState(id: UUID(), name: "Target")
+        let observerSessionID = UUID()
+        let targetSessionID = UUID()
+        let observerTab = ComposeTabState(id: UUID(), name: "Observer", activeAgentSessionID: observerSessionID)
+        let targetTab = ComposeTabState(id: UUID(), name: "Target", activeAgentSessionID: targetSessionID)
+        // Real link authority requires restored endpoints. Save both payloads before publishing
+        // their carriers so workspace activation cannot observe either as a missing session.
+        for (tab, sessionID) in [(observerTab, observerSessionID), (targetTab, targetSessionID)] {
+            var payload = AgentSession(
+                id: sessionID, workspaceID: overseen.id, name: tab.name,
+                agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
+            )
+            payload.composeTabID = tab.id
+            _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: overseen)
+        }
         let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == overseen.id })
         window.workspaceManager.workspaces[index].composeTabs = [observerTab, targetTab]
         window.workspaceManager.workspaces[index].activeComposeTabID = observerTab.id
         _ = await window.workspaceManager.switchWorkspace(to: overseen, saveState: false, reason: "titleRole")
         XCTAssertEqual(window.promptManager.activeComposeTabID, observerTab.id)
-        var sessionIDs: [UUID] = []
-        for tabID in [observerTab.id, targetTab.id] {
-            let session = viewModel.session(for: tabID)
-            session.selectedAgent = .claudeCode
-            session.hasLoadedPersistedState = true
-            try sessionIDs.append(XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session)))
+        for (tab, sessionID) in [(observerTab, observerSessionID), (targetTab, targetSessionID)] {
+            let session = await viewModel.ensureSessionReady(tabID: tab.id)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+            XCTAssertNil(session.operationAdmissionFailureMessage)
         }
-        let observerSessionID = sessionIDs[0]
-        let targetSessionID = sessionIDs[1]
         let revokeAll: @MainActor () async -> Void = {
             for item in await authority.links(forObserver: observerSessionID).items {
                 await bridge.revokeLink(linkID: item.linkID, generation: item.generation)

@@ -48,6 +48,11 @@ struct DomainWorkspaceAuthorityClient {
     let store: DomainWorkspaceStore
     let windowID: Int
 
+    /// The exact digest used by document submission, shared with presentation write receipts.
+    static func documentDigest(for workspace: WorkspaceModel) throws -> String {
+        try DomainContentDigest.sha256(DomainWorkspaceModelEncoder.encode(workspace))
+    }
+
     #if DEBUG
         /// Per-client suspension only: the real envelope and authority execution remain unchanged.
         var commandWillExecuteForTesting: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)?
@@ -141,6 +146,24 @@ struct DomainWorkspaceAuthorityClient {
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
+            origin: .appPresentation(windowID: windowID),
+            command: .replaceWorkingDocument(document)
+        ))
+    }
+
+    /// Submits the captured document against its adopted revision without replaying its bytes
+    /// over an interleaved durable writer.
+    func replaceWorkingFailClosed(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        expectedWorkspaceRevision: UInt64,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
+            conflictRecoveryPolicy: .failClosed,
             origin: .appPresentation(windowID: windowID),
             command: .replaceWorkingDocument(document)
         ))
@@ -321,6 +344,9 @@ final class DomainWorkspacePresentationBridge {
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
     private var projectedModels: [UUID: WorkspaceModel] = [:]
+    /// Cached models can contain local edits beyond their canonical digest. A point adoption can
+    /// discard those edits without reconciling the catalog, so each row keeps its owner generation.
+    private var projectedAdoptionGenerations: [UUID: UInt64] = [:]
     /// Manager reconciliation generation the caches above were committed against; nil until this
     /// run's first accepted full reconciliation. A mismatch (manager-owned reload or cleanup) forces
     /// a complete decode/reconcile before the caches are trusted again.
@@ -356,6 +382,7 @@ final class DomainWorkspacePresentationBridge {
         acceptedReconciliationGeneration = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
+        projectedAdoptionGenerations.removeAll(keepingCapacity: false)
         #if DEBUG
             projectionCheckpoint = nil
             catalogProjectionCheckpoint = nil
@@ -657,10 +684,9 @@ final class DomainWorkspacePresentationBridge {
         }
     }
 
-    /// The originating window already applied its command outcome (revisions + digest) via
-    /// `applyDomainAuthorityOutcome`, so echoing its own commit back through a full catalog
-    /// snapshot plus a MainActor document decode would only amplify every capture by W windows.
-    /// Bookkeeping is refreshed from a single-workspace snapshot instead.
+    /// A proven own document submission or already-adopted document may refresh bookkeeping from
+    /// one record. Window identity alone cannot prove that a later canonical document belongs to
+    /// this event: another command may have committed before the point read resumes.
     private func suppressSelfEcho(for event: DomainWorkspaceEvent, runID: UUID?) async -> Bool {
         let ownerRunID = runID ?? subscriptionRunID
         let suppressibleKinds: Set<DomainWorkspaceEventKind> = [
@@ -675,8 +701,7 @@ final class DomainWorkspacePresentationBridge {
               workspaceManager?.admitsDomainSelfEcho(baselineGeneration: baselineGeneration) == true
         else { return false }
         guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
-              workspace.health.acceptsMutations,
-              let model = workspaceManager?.workspace(withID: workspaceID)
+              workspace.health.acceptsMutations
         else { return false }
         if let runID, !isCurrentRun(runID) { return false }
         // Only an accepted one-record baseline may advance caches; otherwise take the full path.
@@ -687,18 +712,23 @@ final class DomainWorkspacePresentationBridge {
             health: workspace.health,
             catalogRevision: event.catalogRevision,
             publicationSequence: event.sequence,
-            baselineGeneration: baselineGeneration
+            baselineGeneration: baselineGeneration,
+            operationID: event.operationID,
+            eventRevisions: event.revisions
         ) == true else { return false }
         guard subscriptionRunID == ownerRunID, !Task.isCancelled,
-              workspaceManager?.isPreparingForWindowClose == false
+              let manager = workspaceManager, !manager.isPreparingForWindowClose,
+              let generation = manager.adoptedFullDocumentGeneration(
+                  workspaceID: workspaceID, contentDigest: workspace.document.contentDigest
+              ),
+              let model = manager.workspace(withID: workspaceID)
         else { return false }
-        // A same-window commit can be accepted just before a newer local edit is captured. Keep the
-        // local model in both the manager and bridge cache: advancing the baseline below lets the
-        // newer edit commit from the accepted revision, and explicit failed-save reconciliation
-        // remains responsible for authoritative replacement when a two-phase cleanup save does not
-        // complete. The outcome does not depend on re-encoding the model to compare digests.
+        // Manager acceptance proves this canonical document belongs to the local edit lineage.
+        // Preserve a newer local edit without treating an unrelated newer canonical snapshot as
+        // its write baseline. Cached overlays remain subject to the same per-record witness.
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
+        projectedAdoptionGenerations[workspaceID] = generation
         lastPublicationSequence = event.sequence
         didApplyProjection(runID: runID, publicationSequence: event.sequence, application: .selfEchoBaseline)
         return true
@@ -733,7 +763,14 @@ final class DomainWorkspacePresentationBridge {
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
-        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests {
+        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests,
+           records.allSatisfy({ record in
+               guard let generation = manager.adoptedFullDocumentGeneration(
+                   workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
+               ) else { return false }
+               return projectedAdoptionGenerations[record.document.workspaceID] == generation
+           })
+        {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
                 projection: .metadata(baselineGeneration: baselineGeneration),
@@ -758,6 +795,8 @@ final class DomainWorkspacePresentationBridge {
         for record in records {
             let workspaceID = record.document.workspaceID
             if cacheIsTrusted, projectedDigests[workspaceID] == record.document.contentDigest,
+               let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
+               projectedAdoptionGenerations[workspaceID] == generation,
                let cached = projectedModels[workspaceID]
             {
                 nextModels[workspaceID] = cached
@@ -788,7 +827,22 @@ final class DomainWorkspacePresentationBridge {
         )
         guard case let .accepted(receipt) = result else { return result.rejection }
         guard isCurrentRun(runID) else { return nil }
-        projectedModels = nextModels
+        // Accepted chooser publication can synchronously adopt another model for the same digest.
+        // Read each model and its witness together after those callbacks; never stamp an older
+        // pre-application overlay with a newly observed owner generation.
+        var acceptedModels: [UUID: WorkspaceModel] = [:]
+        var acceptedGenerations: [UUID: UInt64] = [:]
+        for record in records {
+            let workspaceID = record.document.workspaceID
+            guard nextModels[workspaceID] != nil,
+                  let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
+                  let model = manager.workspace(withID: workspaceID)
+            else { continue }
+            acceptedModels[workspaceID] = model
+            acceptedGenerations[workspaceID] = generation
+        }
+        projectedModels = acceptedModels
+        projectedAdoptionGenerations = acceptedGenerations
         commitAccepted(receipt, digests: nextDigests, runID: runID)
         return nil
     }

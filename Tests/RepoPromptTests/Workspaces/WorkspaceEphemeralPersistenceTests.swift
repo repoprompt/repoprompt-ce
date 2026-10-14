@@ -845,6 +845,801 @@ import XCTest
             XCTAssertFalse(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: staleRename).path))
         }
 
+        func testAwaitedAndScheduledSavesShareOwnerOrderingAndCancellationOnlyWithdrawsTheWaiter() async throws {
+            for (label, publicFirst, cancelWaitingPublic) in [
+                ("scheduled then awaited", false, false),
+                ("awaited then scheduled", true, false),
+                ("cancel awaited behind scheduled", false, true)
+            ] {
+                let commandEntered = expectation(description: "\(label): predecessor reached real authority command")
+                let successorRegistered = expectation(description: "\(label): successor registered behind predecessor")
+                let cancelledWaiterFinished = cancelWaitingPublic
+                    ? expectation(description: "\(label): cancelled waiter completed while predecessor remains held")
+                    : nil
+                let commandGate = WorkspaceDeleteSuspensionGate()
+                let commands = WorkspaceOrderedSaveCommands()
+                try await withProjectionSaveFixture(configureClient: { client in
+                    client.commandWillExecuteForTesting = { envelope in
+                        guard case let .replaceWorkingDocument(document) = envelope.command else { return }
+                        let submitted = try? JSONDecoder().decode(WorkspaceModel.self, from: document.documentBytes)
+                        let pinned = submitted?.composeTabs.first?.isPinned
+                        XCTAssertNotNil(pinned)
+                        let position = await commands.record(pinned ?? false)
+                        if position == 1 {
+                            commandEntered.fulfill()
+                            await commandGate.wait()
+                            XCTAssertFalse(Task.isCancelled, "Cancelling an acknowledgement must not cancel its predecessor")
+                        }
+                    }
+                }) { fixture in
+                    let manager = fixture.manager
+                    await fixture.bridge.stopAndJoinForTesting()
+                    manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                    manager.workspaces[index].composeTabs[0].isPinned = true
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    var firstPublic: Task<WorkspacePersistenceOutcome, Never>?
+                    var secondPublic: Task<WorkspacePersistenceOutcome, Never>?
+                    if publicFirst {
+                        firstPublic = Task { await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: fixture.workspace.id) }
+                    } else {
+                        // This public entry schedules an owning save without also arming
+                        // poll capture's separate coalesced working-document publisher.
+                        manager.updatePromptText("Scheduled predecessor")
+                    }
+                    do {
+                        try await self.awaitSaveCheckpoint(commandEntered)
+                        let beforeValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                        let before = try XCTUnwrap(beforeValue)
+                        let beforeModel = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
+                        XCTAssertFalse(beforeModel.composeTabs[0].isPinned, "The command gate precedes the real first write")
+
+                        manager.workspaces[index].composeTabs[0].isPinned = false
+                        manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                        var predecessorsAtAdmission: Int?
+                        manager.ownSaveDidRegisterHandlerForTesting = { workspaceID, predecessorCount in
+                            guard workspaceID == fixture.workspace.id else { return }
+                            predecessorsAtAdmission = predecessorCount
+                            successorRegistered.fulfill()
+                        }
+                        if publicFirst {
+                            manager.updatePromptText("Scheduled successor")
+                        } else {
+                            secondPublic = Task {
+                                defer { cancelledWaiterFinished?.fulfill() }
+                                return await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: fixture.workspace.id)
+                            }
+                        }
+                        try await self.awaitSaveCheckpoint(successorRegistered)
+                        manager.ownSaveDidRegisterHandlerForTesting = nil
+                        XCTAssertEqual(predecessorsAtAdmission, 1, "The actual successor admission must join the held owning save")
+                        let heldCommands = await commands.pinnedValues
+                        XCTAssertEqual(heldCommands, [true], "No successor authority command may bypass its predecessor")
+                        let stillHeldValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                        let stillHeld = try XCTUnwrap(stillHeldValue)
+                        XCTAssertEqual(stillHeld.revisions, before.revisions)
+                        XCTAssertEqual(stillHeld.document.contentDigest, before.document.contentDigest)
+
+                        if cancelWaitingPublic {
+                            let waiter = try XCTUnwrap(secondPublic)
+                            waiter.cancel()
+                            try await self.awaitSaveCheckpoint(XCTUnwrap(cancelledWaiterFinished))
+                            let cancelled = await waiter.value
+                            XCTAssertFalse(cancelled.acceptedForLifecycleAdmission)
+                            let commandsAfterCancellation = await commands.pinnedValues
+                            XCTAssertEqual(commandsAfterCancellation, [true])
+                        }
+                        await commandGate.open()
+                        if let firstPublic {
+                            let first = await firstPublic.value
+                            XCTAssertTrue(first.acceptedForLifecycleAdmission, "\(label): \(first)")
+                        }
+                        if let secondPublic, !cancelWaitingPublic {
+                            let second = await secondPublic.value
+                            XCTAssertTrue(second.acceptedForLifecycleAdmission, "\(label): \(second)")
+                        }
+                        // This joins the scheduled half of the test, not a compensating save.
+                        await manager.debugDrainScheduledSaves()
+                        let finalValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                        let final = try XCTUnwrap(finalValue)
+                        let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                        let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: final.document.fileURL))
+                        XCTAssertNil(final.revisions.dirtyRevision)
+                        XCTAssertEqual(canonical.composeTabs[0].isPinned, cancelWaitingPublic)
+                        XCTAssertEqual(disk.composeTabs[0].isPinned, cancelWaitingPublic)
+                        XCTAssertFalse(
+                            try XCTUnwrap(manager.workspace(withID: fixture.workspace.id)).composeTabs[0].isPinned,
+                            "Cancellation keeps the unsaved local successor; it cannot roll back the user's edit"
+                        )
+                        let completedCommands = await commands.pinnedValues
+                        XCTAssertEqual(completedCommands, cancelWaitingPublic ? [true] : [true, false])
+                        try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+                    } catch {
+                        manager.ownSaveDidRegisterHandlerForTesting = nil
+                        await commandGate.open()
+                        if let firstPublic { _ = await firstPublic.value }
+                        if let secondPublic { _ = await secondPublic.value }
+                        await manager.debugDrainScheduledSaves()
+                        throw error
+                    }
+                }
+            }
+        }
+
+        func testCurrentModelSaveRecapturesRestoredProjectionWithoutDirtyVersionChange() async throws {
+            try await assertSaveAfterRestoredProjection(explicitProposal: false)
+        }
+
+        func testOwnWholeModelReceiptsAuthorizeLaterEditsWithoutProjection() async throws {
+            try await withProjectionSaveFixture { fixture in
+                await fixture.bridge.stopAndJoinForTesting()
+                let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                let manager = fixture.manager
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let initial = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                var previousRevision = try XCTUnwrap(initial).revisions.workingRevision
+                for (step, prompt) in ["Working one", "Saved two", "Working three", "Saved four"].enumerated() {
+                    manager.workspaces[index].composeTabs[0].promptText = prompt
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    let local = manager.workspaces[index]
+                    if step.isMultiple(of: 2) {
+                        await manager.debugPublishWorkingDocumentToDomainAuthority(local)
+                    } else {
+                        _ = try await manager.saveWorkspaceToFileAsync(local)
+                    }
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let current = try XCTUnwrap(snapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes)
+                    XCTAssertGreaterThan(current.revisions.workingRevision, previousRevision)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, prompt)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).digest, current.document.contentDigest)
+                    if !step.isMultiple(of: 2) {
+                        XCTAssertNil(current.revisions.dirtyRevision)
+                        try await self.assertCanonicalAndDiskRemain(current, in: fixture)
+                    }
+                    previousRevision = current.revisions.workingRevision
+                }
+                XCTAssertEqual(
+                    fixture.bridge.projectionObservationStateForTesting.generation,
+                    generation,
+                    "Own write receipts must advance lineage without a presentation projection"
+                )
+            }
+        }
+
+        func testSaveJoinsCancelledOwnPublisherAndPersistsItsNewerLocalDescendant() async throws {
+            let authorityCommitted = expectation(description: "predecessor committed before its response")
+            let publisherCancelled = expectation(description: "ordinary save cancels and joins its predecessor")
+            let responseGate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                let store = client.store
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command else { return }
+                    guard await counter.increment() == 1 else { return }
+                    let outcome = await store.execute(envelope)
+                    XCTAssertEqual(outcome.disposition, .applied)
+                    await withTaskCancellationHandler {
+                        authorityCommitted.fulfill()
+                        await responseGate.wait()
+                        XCTAssertTrue(Task.isCancelled, "The save must cancel its still-held predecessor")
+                        let replay = await store.execute(envelope)
+                        XCTAssertEqual(replay.disposition, .deduplicated)
+                    } onCancel: {
+                        publisherCancelled.fulfill()
+                    }
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                await fixture.bridge.stopAndJoinForTesting()
+                let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                let baseline = manager.debugDomainAuthorityBaseline(for: fixture.workspace.id)
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                manager.workspaces[index].composeTabs[0].promptText = "Committed predecessor B"
+                manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                let submitted = manager.workspaces[index]
+                let publication = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(submitted) }
+                var successorSave: Task<URL, Error>?
+                do {
+                    try await self.awaitSaveCheckpoint(authorityCommitted)
+                    let committedValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let committed = try XCTUnwrap(committedValue)
+                    let canonicalB = try JSONDecoder().decode(WorkspaceModel.self, from: committed.document.documentBytes)
+                    XCTAssertEqual(canonicalB.composeTabs[0].promptText, submitted.composeTabs[0].promptText)
+                    XCTAssertNotNil(committed.revisions.dirtyRevision)
+                    XCTAssertGreaterThan(committed.revisions.workingRevision, try XCTUnwrap(baseline.revisions).workingRevision)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).revisions, baseline.revisions)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).digest, baseline.digest)
+
+                    manager.workspaces[index].composeTabs[0].promptText = "Newer local descendant C"
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    let newer = manager.workspaces[index]
+                    manager.resetWorkspaceSaveDiagnosticsForTesting()
+                    let save = Task { try await manager.saveWorkspaceToFileAsync(newer) }
+                    successorSave = save
+                    try await self.awaitSaveCheckpoint(publisherCancelled)
+                    XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: fixture.workspace.id).digest, baseline.digest)
+                    await responseGate.open()
+                    let url = try await save.value
+                    await publication.value
+
+                    let savedValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let saved = try XCTUnwrap(savedValue)
+                    let canonicalC = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(url, saved.document.fileURL)
+                    XCTAssertEqual(canonicalC.composeTabs[0].promptText, newer.composeTabs[0].promptText)
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), newer)
+                    XCTAssertGreaterThan(saved.revisions.workingRevision, committed.revisions.workingRevision)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(
+                        manager.workspaceSaveDiagnosticsForTesting(workspaceID: fixture.workspace.id).attemptCount,
+                        1,
+                        "Joining the predecessor needs one recaptured serialization attempt"
+                    )
+                    XCTAssertFalse(fixture.bridge.hasActiveSubscriptionForTesting)
+                    XCTAssertEqual(fixture.bridge.projectionObservationStateForTesting.generation, generation)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                } catch {
+                    await responseGate.open()
+                    await publication.value
+                    if let successorSave { _ = await successorSave.result }
+                    throw error
+                }
+            }
+        }
+
+        func testEarlyOwnWorkingEventPreservesNewerLocalEditBeforeCommandResponse() async throws {
+            let commandEntered = expectation(description: "own command held before authority execution")
+            let authorityCommitted = expectation(description: "own event published before command response")
+            let executeGate = WorkspaceDeleteSuspensionGate()
+            let responseGate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                let store = client.store
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command else { return }
+                    guard await counter.increment() == 1 else { return }
+                    commandEntered.fulfill()
+                    await executeGate.wait()
+                    // Execute the exact real envelope once; the client's later execution must
+                    // deduplicate this operation rather than manufacturing a receipt or event.
+                    let outcome = await store.execute(envelope)
+                    XCTAssertEqual(outcome.disposition, .applied)
+                    authorityCommitted.fulfill()
+                    await responseGate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                manager.workspaces[index].composeTabs[0].promptText = "Submitted working edit"
+                manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                let submitted = manager.workspaces[index]
+                let publication = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(submitted) }
+                do {
+                    try await self.awaitSaveCheckpoint(commandEntered)
+                    manager.workspaces[index].composeTabs[0].promptText = "Newer local edit before response"
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    let newer = manager.workspaces[index]
+                    let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                    await executeGate.open()
+                    try await self.awaitSaveCheckpoint(authorityCommitted)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: generation, through: catalog.publicationSequence
+                    )
+                    XCTAssertEqual(try XCTUnwrap(checkpoint).application, .selfEchoBaseline)
+                    XCTAssertEqual(
+                        manager.workspace(withID: fixture.workspace.id),
+                        newer,
+                        "An early own event must not overwrite a newer local edit"
+                    )
+                    let committed = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == fixture.workspace.id })
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: committed.document.documentBytes)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, submitted.composeTabs[0].promptText)
+                    XCTAssertNotNil(committed.revisions.dirtyRevision)
+                    await responseGate.open()
+                    await publication.value
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), newer)
+                    _ = try await manager.saveWorkspaceToFileAsync(newer)
+                    let final = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let saved = try XCTUnwrap(final)
+                    let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: saved.document.fileURL))
+                    XCTAssertEqual(disk.composeTabs[0].promptText, newer.composeTabs[0].promptText)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                } catch {
+                    await executeGate.open()
+                    await responseGate.open()
+                    await publication.value
+                    throw error
+                }
+            }
+        }
+
+        func testSameBaselineFullProjectionInvalidatesPendingWholeModelReceipt() async throws {
+            let commandEntered = expectation(description: "own publication held before same-baseline projection")
+            let executeGate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command else { return }
+                    guard await counter.increment() == 1 else { return }
+                    commandEntered.fulfill()
+                    await executeGate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                await fixture.bridge.stopAndJoinForTesting()
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let baseline = manager.workspaces[index]
+                let diskBefore = try Data(contentsOf: manager.workspaceFileURL(for: baseline))
+                manager.workspaces[index].composeTabs[0].promptText = "Pending whole-model edit"
+                manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                let submitted = manager.workspaces[index]
+                let version = manager.debugStateVersionForWorkspace(fixture.workspace.id)
+                let publication = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(submitted) }
+                do {
+                    try await self.awaitSaveCheckpoint(commandEntered)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let decoded = try catalog.workspaces.map {
+                        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                            documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL
+                        )
+                    }
+                    let receipt = manager.applyDomainWorkspaceCatalog(
+                        catalog, projection: .full(decoded), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    ).receipt
+                    XCTAssertEqual(try XCTUnwrap(receipt).kind, .full)
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), baseline)
+                    XCTAssertEqual(
+                        manager.debugStateVersionForWorkspace(fixture.workspace.id),
+                        version,
+                        "Full adoption can replace bytes without changing the local dirty counter"
+                    )
+                    await executeGate.open()
+                    await publication.value
+                    let committedValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let committed = try XCTUnwrap(committedValue)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: committed.document.documentBytes)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, submitted.composeTabs[0].promptText)
+                    XCTAssertNotNil(committed.revisions.dirtyRevision)
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), baseline)
+
+                    do {
+                        _ = try await manager.saveWorkspaceToFileAsync(baseline)
+                        XCTFail("A late receipt from the replaced adoption generation must not authorize the baseline model")
+                    } catch {}
+                    let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let after = try XCTUnwrap(afterValue)
+                    XCTAssertEqual(after.document.documentBytes, committed.document.documentBytes)
+                    XCTAssertEqual(after.revisions, committed.revisions)
+                    XCTAssertEqual(after.contexts, committed.contexts)
+                    XCTAssertEqual(try Data(contentsOf: committed.document.fileURL), diskBefore)
+                } catch {
+                    await executeGate.open()
+                    await publication.value
+                    throw error
+                }
+            }
+        }
+
+        private func awaitSaveCheckpoint(_ expectation: XCTestExpectation) async throws {
+            let reached = await XCTWaiter.fulfillment(of: [expectation], timeout: 5)
+            XCTAssertEqual(reached, .completed)
+            guard reached == .completed else { throw SaveInterleavingFailure.checkpointTimedOut }
+        }
+
+        func testExplicitProposalReceiptCannotAuthorizeUnrepresentedLocalDescendant() async throws {
+            let commandEntered = expectation(description: "explicit proposal held before authority execution")
+            let executeGate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command else { return }
+                    guard await counter.increment() == 1 else { return }
+                    commandEntered.fulfill()
+                    await executeGate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                await fixture.bridge.stopAndJoinForTesting()
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let baseline = manager.workspaces[index]
+                var proposal = baseline
+                // Keep the file path unchanged so rejection must come from model provenance,
+                // rather than a workspace rename independently changing its destination.
+                proposal.composeTabs[0].name = "Explicit tab rename"
+                let directSave = Task { try await manager.saveWorkspaceToFileAsync(proposal) }
+                do {
+                    try await self.awaitSaveCheckpoint(commandEntered)
+                    manager.workspaces[index].composeTabs[0].promptText = "Unrelated local draft after submission"
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    let retained = manager.workspaces[index]
+                    await executeGate.open()
+                    let url = try await directSave.value
+                    let savedValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                    let saved = try XCTUnwrap(savedValue)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(url, saved.document.fileURL)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(canonical.composeTabs[0].name, proposal.composeTabs[0].name)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, baseline.composeTabs[0].promptText)
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), retained)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+
+                    do {
+                        _ = try await manager.saveWorkspaceToFileAsync(retained)
+                        XCTFail("The unrepresented explicit proposal must not authorize its retained local predecessor")
+                    } catch {}
+                    XCTAssertEqual(manager.workspace(withID: fixture.workspace.id), retained)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                } catch {
+                    await executeGate.open()
+                    _ = await directSave.result
+                    throw error
+                }
+            }
+        }
+
+        func testRejectedPublicationCannotAuthorizeASecondStalePublication() async throws {
+            try await assertRejectedPublicationCannotAuthorizeStaleWrite(useOrdinarySave: false)
+        }
+
+        func testRejectedPublicationCannotAuthorizeAnOrdinaryStaleSave() async throws {
+            try await assertRejectedPublicationCannotAuthorizeStaleWrite(useOrdinarySave: true)
+        }
+
+        private func assertRejectedPublicationCannotAuthorizeStaleWrite(useOrdinarySave: Bool) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let old = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let baseline = manager.debugDomainAuthorityBaseline(for: old.id)
+                await fixture.bridge.stopAndJoinForTesting()
+                let restored = try await self.restoreArchivedTabRemotely(in: fixture)
+                XCTAssertGreaterThan(restored.revisions.workingRevision, try XCTUnwrap(baseline.revisions).workingRevision)
+
+                // The real first publication conflicts. Its outcome advances observed authority
+                // metadata while the stopped presentation bridge leaves the local bytes old.
+                await manager.debugPublishWorkingDocumentToDomainAuthority(old)
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "working_commit")
+                XCTAssertEqual(manager.workspace(withID: old.id), old)
+                XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).revisions, restored.revisions)
+                XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).digest, restored.document.contentDigest)
+                try await self.assertCanonicalAndDiskRemain(restored, in: fixture)
+
+                if useOrdinarySave {
+                    do {
+                        _ = try await manager.saveWorkspaceToFileAsync(old)
+                        XCTFail("Conflict metadata must not authorize saving the unprojected old model")
+                    } catch {}
+                } else {
+                    await manager.debugPublishWorkingDocumentToDomainAuthority(old)
+                    XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
+                }
+                XCTAssertEqual(manager.workspace(withID: old.id), old)
+                try await self.assertCanonicalAndDiskRemain(restored, in: fixture)
+                try await self.assertFullProjectionReauthorizesLocalSave(in: fixture)
+            }
+        }
+
+        func testRootOnlySuccessCannotAuthorizeSavingUnprojectedSessionState() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let old = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                await fixture.bridge.stopAndJoinForTesting()
+                let restored = try await self.restoreArchivedTabRemotely(in: fixture)
+                let root = self.storageRoot.appendingPathComponent("root-only-edit", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+                // A root edit owns only roots; its actual success must retain canonical session
+                // state without claiming that the old local session fields have been projected.
+                try await manager.addFolder(root, to: old)
+                let rootSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(old.id)
+                let rooted = try XCTUnwrap(rootSnapshot)
+                let rootedModel = try JSONDecoder().decode(WorkspaceModel.self, from: rooted.document.documentBytes)
+                let local = try XCTUnwrap(manager.workspace(withID: old.id))
+                XCTAssertGreaterThan(rooted.revisions.workingRevision, restored.revisions.workingRevision)
+                XCTAssertEqual(rootedModel.repoPaths, [root.path])
+                XCTAssertEqual(local.repoPaths, rootedModel.repoPaths)
+                XCTAssertTrue(rootedModel.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                XCTAssertFalse(rootedModel.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+                XCTAssertFalse(local.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                XCTAssertTrue(local.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+                XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).revisions, rooted.revisions)
+                XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: old.id).digest, rooted.document.contentDigest)
+                try await self.assertCanonicalAndDiskRemain(rooted, in: fixture)
+
+                do {
+                    _ = try await manager.saveWorkspaceToFileAsync(local)
+                    XCTFail("A root-only receipt must not authorize overwriting unprojected session fields")
+                } catch {}
+                XCTAssertEqual(manager.workspace(withID: old.id), local)
+                try await self.assertCanonicalAndDiskRemain(rooted, in: fixture)
+                try await self.assertFullProjectionReauthorizesLocalSave(in: fixture)
+            }
+        }
+
+        private func restoreArchivedTabRemotely(in fixture: ProjectionSaveFixture) async throws -> DomainWorkspaceSnapshot {
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+            let before = try XCTUnwrap(snapshot)
+            var restored = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
+            let stash = try XCTUnwrap(restored.stashedTabs.first { $0.tab.id == fixture.restoredTab.id })
+            restored.stashedTabs.removeAll { $0.id == stash.id }
+            restored.composeTabs.append(stash.tab)
+            let author = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -758)
+            let result = try await author.saveFailClosed(
+                restored, fileURL: before.document.fileURL,
+                expectedWorkspaceRevision: before.revisions.workingRevision,
+                expectedContentDigest: before.document.contentDigest
+            )
+            XCTAssertEqual(result.working?.disposition, .applied)
+            XCTAssertEqual(result.saved?.disposition, .applied)
+            let after = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+            return try XCTUnwrap(after)
+        }
+
+        private func assertCanonicalAndDiskRemain(
+            _ expected: DomainWorkspaceSnapshot,
+            in fixture: ProjectionSaveFixture
+        ) async throws {
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+            let actual = try XCTUnwrap(snapshot)
+            XCTAssertEqual(actual.document.documentBytes, expected.document.documentBytes)
+            XCTAssertEqual(actual.revisions, expected.revisions)
+            XCTAssertEqual(actual.contexts, expected.contexts)
+            let disk = try Data(contentsOf: expected.document.fileURL)
+            XCTAssertEqual(DomainContentDigest.sha256(disk), expected.document.contentDigest)
+        }
+
+        private func assertFullProjectionReauthorizesLocalSave(in fixture: ProjectionSaveFixture) async throws {
+            let generation = fixture.bridge.projectionObservationStateForTesting.generation
+            let catalog = await fixture.runtime.workspaceStore.snapshot()
+            fixture.bridge.start()
+            let checkpoint = await fixture.observer.waitForProjection(
+                afterGeneration: generation, through: catalog.publicationSequence, requireCatalogApplication: true
+            )
+            XCTAssertEqual(try XCTUnwrap(checkpoint).catalogReceipt?.kind, .full)
+            let index = try XCTUnwrap(fixture.manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+            XCTAssertTrue(fixture.manager.workspaces[index].composeTabs.contains { $0.id == fixture.restoredTab.id })
+            XCTAssertFalse(fixture.manager.workspaces[index].stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+            fixture.manager.workspaces[index].composeTabs[0].promptText = "Local edit after real full projection"
+            fixture.manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+            let local = fixture.manager.workspaces[index]
+            let url = try await fixture.manager.saveWorkspaceToFileAsync(local)
+            let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+            let after = try XCTUnwrap(snapshot)
+            XCTAssertEqual(url, after.document.fileURL)
+            XCTAssertNil(after.revisions.dirtyRevision)
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+            XCTAssertEqual(canonical.composeTabs[0].promptText, local.composeTabs[0].promptText)
+            XCTAssertTrue(canonical.composeTabs.contains { $0.id == fixture.restoredTab.id })
+            XCTAssertFalse(canonical.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+            try await assertCanonicalAndDiskRemain(after, in: fixture)
+        }
+
+        func testExplicitProposalFailsWhenRestoredProjectionSupersedesItsCapture() async throws {
+            try await assertSaveAfterRestoredProjection(explicitProposal: true)
+        }
+
+        func testCurrentModelSaveRejectsStaleLocalOverlayAfterAuthorityAdvance() async throws {
+            try await assertSaveAfterRestoredProjection(explicitProposal: false, retainStaleLocalOverlay: true)
+        }
+
+        private func assertSaveAfterRestoredProjection(
+            explicitProposal: Bool,
+            retainStaleLocalOverlay: Bool = false
+        ) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let observed = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                var proposal = observed
+                if explicitProposal { proposal.composeTabs[0].name = "Uncommitted explicit rename" }
+                let version = manager.debugStateVersionForWorkspace(observed.id)
+                let snapshotCaptured = self.expectation(description: "old archived save captured authority")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting { id in
+                    guard id == observed.id else { return }
+                    snapshotCaptured.fulfill()
+                    await gate.wait()
+                }
+                let save = Task { try await manager.saveWorkspaceToFileAsync(proposal) }
+                do {
+                    let reached = await XCTWaiter.fulfillment(of: [snapshotCaptured], timeout: 5)
+                    XCTAssertEqual(reached, .completed)
+                    guard reached == .completed else { throw SaveInterleavingFailure.checkpointTimedOut }
+
+                    let before = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(observed.id)
+                    let baseline = try XCTUnwrap(before)
+                    var restored = try JSONDecoder().decode(WorkspaceModel.self, from: baseline.document.documentBytes)
+                    let stash = try XCTUnwrap(restored.stashedTabs.first { $0.tab.id == fixture.restoredTab.id })
+                    restored.stashedTabs.removeAll { $0.id == stash.id }
+                    restored.composeTabs.append(stash.tab)
+                    let author = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -758)
+                    let remote = try await author.saveFailClosed(
+                        restored, fileURL: baseline.document.fileURL,
+                        expectedWorkspaceRevision: baseline.revisions.workingRevision,
+                        expectedContentDigest: baseline.document.contentDigest
+                    )
+                    XCTAssertEqual(remote.working?.disposition, .applied)
+                    XCTAssertEqual(remote.saved?.disposition, .applied)
+                    let restoredSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(observed.id)
+                    let accepted = try XCTUnwrap(restoredSnapshot)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    XCTAssertEqual(try XCTUnwrap(checkpoint).catalogReceipt?.kind, .full)
+                    XCTAssertEqual(manager.workspace(withID: observed.id)?.composeTabs.map(\.id), restored.composeTabs.map(\.id))
+                    XCTAssertEqual(
+                        manager.debugStateVersionForWorkspace(observed.id),
+                        version,
+                        "A canonical projection changes bytes without bumping local dirty tracking"
+                    )
+
+                    var retainedOverlay: WorkspaceModel?
+                    if retainStaleLocalOverlay {
+                        XCTAssertNotEqual(accepted.revisions.workingRevision, baseline.revisions.workingRevision)
+                        XCTAssertNotEqual(accepted.document.contentDigest, baseline.document.contentDigest)
+                        // Model an unrelated local edit retaining the old archived carrier after
+                        // the real projection has advanced the manager's authority baseline.
+                        var overlay = observed
+                        overlay.composeTabs[0].promptText = "Unrelated local draft"
+                        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == observed.id })
+                        manager.workspaces[index] = overlay
+                        manager.markWorkspaceDirty(workspaceID: observed.id)
+                        retainedOverlay = overlay
+                        XCTAssertNotEqual(overlay, observed)
+                    }
+
+                    manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
+                    await gate.open()
+                    let result = await save.result
+                    if explicitProposal || retainStaleLocalOverlay {
+                        if case .success = result { XCTFail("A stale proposal or local overlay must not report a successful save") }
+                    } else {
+                        XCTAssertEqual(try result.get(), baseline.document.fileURL)
+                    }
+
+                    // No compensating save or flush: these are the bytes left by the returned save.
+                    let afterSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(observed.id)
+                    let after = try XCTUnwrap(afterSnapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+                    let diskBytes = try Data(contentsOf: baseline.document.fileURL)
+                    let disk = try JSONDecoder().decode(WorkspaceModel.self, from: diskBytes)
+                    var restoredModels = [canonical, disk]
+                    if let retainedOverlay {
+                        XCTAssertEqual(
+                            manager.workspace(withID: observed.id),
+                            retainedOverlay,
+                            "Refusing the stale save must preserve the unrelated local edit"
+                        )
+                    } else {
+                        try restoredModels.append(XCTUnwrap(manager.workspace(withID: observed.id)))
+                    }
+                    for workspace in restoredModels {
+                        XCTAssertTrue(workspace.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                        XCTAssertFalse(workspace.stashedTabs.contains { $0.tab.id == fixture.restoredTab.id })
+                        XCTAssertEqual(workspace.composeTabs.first?.name, observed.composeTabs.first?.name)
+                        XCTAssertEqual(workspace.composeTabs.first?.promptText, observed.composeTabs.first?.promptText)
+                    }
+                    XCTAssertEqual(after.revisions, accepted.revisions, "The old save must not create a new removal revision")
+                    XCTAssertEqual(after.contexts, accepted.contexts, "The restored context must not acquire a new tombstone")
+                    XCTAssertEqual(DomainContentDigest.sha256(diskBytes), after.document.contentDigest)
+                } catch {
+                    manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
+                    await gate.open()
+                    _ = await save.result
+                    throw error
+                }
+            }
+        }
+
+        func testPreparationDriftRecapturesOnceAndPersistsTheLatestModel() async throws {
+            try await assertPreparationDrift(changeCount: 1)
+        }
+
+        func testRepeatedPreparationDriftExhaustsWithoutWritingEitherStaleModel() async throws {
+            try await assertPreparationDrift(changeCount: 2)
+        }
+
+        private func assertPreparationDrift(changeCount: Int) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let beforeSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(beforeSnapshot)
+                let counter = WorkspaceSavePreparationCounter()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id else { return }
+                    let attempt = await counter.increment()
+                    guard attempt <= changeCount else { return }
+                    await MainActor.run {
+                        guard let index = manager.workspaces.firstIndex(where: { $0.id == id }) else { return }
+                        manager.workspaces[index].composeTabs[0].promptText = "Local edit \(attempt)"
+                        manager.markWorkspaceDirty(workspaceID: id)
+                    }
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                let result: Result<URL, Error>
+                do { result = try await .success(manager.saveWorkspaceToFileAsync(initial)) }
+                catch { result = .failure(error) }
+                let preparationCount = await counter.value
+                XCTAssertEqual(preparationCount, 2, "Only one complete recapture is allowed")
+                let afterSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let after = try XCTUnwrap(afterSnapshot)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+                let diskBytes = try Data(contentsOf: before.document.fileURL)
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: diskBytes)
+                if changeCount == 1 {
+                    XCTAssertEqual(try result.get(), before.document.fileURL)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, "Local edit 1")
+                    XCTAssertEqual(disk.composeTabs[0].promptText, "Local edit 1")
+                    XCTAssertNil(after.revisions.dirtyRevision)
+                } else {
+                    if case .success = result { XCTFail("Repeated drift must exhaust instead of writing a stale payload") }
+                    XCTAssertEqual(after.revisions, before.revisions)
+                    XCTAssertEqual(after.document.contentDigest, before.document.contentDigest)
+                    XCTAssertEqual(canonical.composeTabs[0].promptText, initial.composeTabs[0].promptText)
+                    XCTAssertEqual(disk.composeTabs[0].promptText, initial.composeTabs[0].promptText)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.composeTabs[0].promptText, "Local edit 2")
+                }
+                XCTAssertEqual(DomainContentDigest.sha256(diskBytes), after.document.contentDigest)
+            }
+        }
+
+        private struct ProjectionSaveFixture {
+            let runtime: MCPDomainRuntime
+            let manager: WorkspaceManagerViewModel
+            let bridge: DomainWorkspacePresentationBridge
+            let observer: DomainWorkspaceProjectionObserver
+            let workspace: WorkspaceModel
+            let restoredTab: ComposeTabState
+        }
+
+        private enum SaveInterleavingFailure: Error {
+            case checkpointTimedOut
+        }
+
+        private func withProjectionSaveFixture(
+            configureClient: (@MainActor (inout DomainWorkspaceAuthorityClient) -> Void)? = nil,
+            _ body: @MainActor (ProjectionSaveFixture) async throws -> Void
+        ) async throws {
+            let fallback = ComposeTabState(name: "Current tab")
+            let restoredTab = ComposeTabState(name: "Archived session", activeAgentSessionID: UUID())
+            var workspace = WorkspaceModel(
+                name: "Projection save target", repoPaths: [],
+                composeTabs: [fallback], activeComposeTabID: fallback.id
+            )
+            workspace.stashedTabs = [StashedTab(tab: restoredTab)]
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-projection-save")
+            var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -759)
+            configureClient?(&client)
+            let manager = makeManager(windowID: -759, domainWorkspaceAuthorityClient: client)
+            let bridge = DomainWorkspacePresentationBridge(workspaceManager: manager, client: client)
+            let observer = DomainWorkspaceProjectionObserver(bridge: bridge)
+            do {
+                await manager.awaitInitialized()
+                bridge.start()
+                let catalog = await runtime.workspaceStore.snapshot()
+                let initial = await observer.waitForProjection(
+                    afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                )
+                _ = try XCTUnwrap(initial)
+                try await body(.init(runtime: runtime, manager: manager, bridge: bridge, observer: observer, workspace: workspace, restoredTab: restoredTab))
+                await bridge.stopAndJoinForTesting()
+                manager.prepareForWindowClose()
+                _ = await runtime.shutdown()
+            } catch {
+                await bridge.stopAndJoinForTesting()
+                manager.prepareForWindowClose()
+                _ = await runtime.shutdown()
+                throw error
+            }
+        }
+
         func testActivationLeaseBlocksDeletionClaimUntilSwitchCompletes() async throws {
             let workspace = leakedFixtureWorkspace()
             try writeWorkspace(workspace)
@@ -1213,6 +2008,24 @@ import XCTest
             let pending = waiters
             waiters.removeAll()
             pending.forEach { $0.resume() }
+        }
+    }
+
+    private actor WorkspaceOrderedSaveCommands {
+        private(set) var pinnedValues: [Bool] = []
+
+        func record(_ pinned: Bool) -> Int {
+            pinnedValues.append(pinned)
+            return pinnedValues.count
+        }
+    }
+
+    private actor WorkspaceSavePreparationCounter {
+        private(set) var value = 0
+
+        func increment() -> Int {
+            value += 1
+            return value
         }
     }
 #endif

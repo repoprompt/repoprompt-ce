@@ -186,7 +186,8 @@ extension AgentModeViewModel {
         guard let tabID,
               CodexGoalSupport.isEnabled
         else { return nil }
-        let session = session(for: tabID, createIfNeeded: false)
+        // Presentation reads must not recreate a runtime while its saved carrier is retiring.
+        let session = sessions[tabID]
         let targetAgent = session?.selectedAgent ?? (tabID == currentTabID ? selectedAgent : nil)
         guard targetAgent == .codexExec else { return nil }
         let draftText = draftTextOverride ?? session?.draftText ?? tabDraftText[tabID] ?? ""

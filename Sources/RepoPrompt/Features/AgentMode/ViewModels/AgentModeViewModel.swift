@@ -3929,7 +3929,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func agentSessionLifecycleProtectionClaims(
         in workspaces: [WorkspaceModel]
     ) -> [AgentSessionLifecycleAuthority.ProtectionClaim] {
-        workspaces.flatMap { workspace in
+        let ownedWorkspaceID = workspaceManager?.activeWorkspaceID
+        return workspaces.flatMap { workspace in
             workspace.composeTabs.compactMap { tab in
                 let sessionID = tab.activeAgentSessionID
                 let liveSession = sessionID.flatMap { expectedSessionID in
@@ -3938,7 +3939,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         : nil
                 }
                 let isLive = liveSession != nil
-                guard isLive || tab.isPinned else { return nil }
+                // Every window mirrors the catalog, but a cold pin in an inactive workspace
+                // is not this window's local intent. Protecting that cached row would undo an
+                // authorized unpin or archive from the window that actually owns its presentation.
+                guard isLive || (workspace.id == ownedWorkspaceID && tab.isPinned) else { return nil }
                 return AgentSessionLifecycleAuthority.ProtectionClaim(
                     identity: AgentSessionLifecycleAuthority.Identity(
                         workspaceID: workspace.id,

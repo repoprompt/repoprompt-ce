@@ -182,7 +182,7 @@ import XCTest
                 contextID: nil,
                 operationID: UUID(),
                 origin: .appPresentation(windowID: -781),
-                revisions: nil,
+                revisions: canonicalBeforeLocalSave.revisions,
                 timestamp: Date(),
                 diagnostic: nil
             ))

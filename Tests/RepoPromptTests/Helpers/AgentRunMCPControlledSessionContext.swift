@@ -37,29 +37,44 @@ final class AgentRunMCPControlledSessionContext {
         WindowStatesManager.shared.registerWindowState(window)
         do {
             await window.workspaceManager.awaitInitialized()
-            let workspace = window.workspaceManager.createWorkspace(
+            let sessionID = UUID()
+            let tabID = UUID()
+            var workspace = WorkspaceModel(
                 name: "\(workspaceNamePrefix) \(UUID().uuidString.prefix(8))",
-                repoPaths: [FileManager.default.currentDirectoryPath],
-                ephemeral: true
+                repoPaths: [FileManager.default.currentDirectoryPath]
             )
+            workspace.isEphemeral = true
+            workspace.composeTabs = [
+                ComposeTabState(id: tabID, name: "Controlled approval session", activeAgentSessionID: sessionID)
+            ]
+            workspace.activeComposeTabID = tabID
+            let payload = AgentSession(
+                id: sessionID, workspaceID: workspace.id, composeTabID: tabID,
+                name: "Controlled approval session", agentKind: AgentProviderKind.claudeCode.rawValue
+            )
+            // Restore the intended binding from disk; rebinding a loaded fresh tab resets readiness.
+            _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+            window.workspaceManager.workspaces.append(workspace)
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
                 reason: workspaceSwitchReason
             )
-            guard let activeWorkspace = window.workspaceManager.activeWorkspace else {
+            guard let activeWorkspace = window.workspaceManager.activeWorkspace,
+                  activeWorkspace.id == workspace.id
+            else {
                 throw MCPError.internalError("Expected active ephemeral workspace")
             }
             window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
 
-            let sessionID = UUID()
-            guard let tabID = activeWorkspace.activeComposeTabID else {
-                throw MCPError.internalError("Expected active compose tab")
+            let viewModel = window.agentModeViewModel
+            let session = await viewModel.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+            guard session.activeAgentSessionID == sessionID,
+                  session.qualifiedRestorationReadiness.isAuthoritative,
+                  viewModel.ownerValidatedSessionIndex[sessionID]?.tabID == tabID
+            else {
+                throw MCPError.internalError("Expected the persisted approval session to restore with its owner-valid binding")
             }
-            let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
-            _ = window.agentModeViewModel.test_installPersistentSessionBinding(
-                sessionID: sessionID, on: session, compareAndSetInWorkspaceID: activeWorkspace.id
-            )
             try await window.agentModeViewModel.mcpActivateControlContext(
                 forTabID: session.tabID,
                 sessionID: sessionID,

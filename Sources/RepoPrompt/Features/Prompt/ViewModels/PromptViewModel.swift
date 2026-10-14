@@ -4347,15 +4347,16 @@ class PromptViewModel: ObservableObject {
         {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
+        var stashedTabs = manager.workspaces[index].stashedTabs
         if reason == .stash {
             let refreshedTabs = manager.workspaces[index].composeTabs
             for tabID in tabsBeingClosed {
                 guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
                 let stashedTab = StashedTab(tab: refreshedTab)
-                if let existingIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
-                    manager.workspaces[index].stashedTabs[existingIndex] = stashedTab
+                if let existingIndex = stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
+                    stashedTabs[existingIndex] = stashedTab
                 } else {
-                    manager.workspaces[index].stashedTabs.append(stashedTab)
+                    stashedTabs.append(stashedTab)
                 }
             }
             tabs = refreshedTabs
@@ -4373,16 +4374,37 @@ class PromptViewModel: ObservableObject {
             }
             return report
         }
+        let previousActiveID = manager.workspaces[index].activeComposeTabID
+        // Publish the active/stashed transition once through the workspace owner. The retained
+        // catalog can be large; unrelated carrier positions are unchanged by this local edit.
+        guard manager.replaceComposeTabCarriers(
+            workspaceID: workspace.id, composeTabs: tabs, stashedTabs: stashedTabs
+        ) else {
+            return rejection(.mutationContextChanged, message: "The workspace changed before tab removal.")
+        }
         report.removedComposeTabIDs.formUnion(tabsBeingClosed)
-
         dirtyTabIDs.subtract(resolvedIDs)
 
-        let previousActiveID = manager.workspaces[index].activeComposeTabID
-        manager.workspaces[index].composeTabs = tabs
-
+        func currentRemovalOwner() -> (index: Int, workspace: WorkspaceModel)? {
+            guard manager.activeWorkspaceID == workspace.id else { return nil }
+            return manager.composeTabCarrierWorkspace(workspaceID: workspace.id)
+        }
+        func supersededContinuation() -> ComposeTabMutationReport {
+            // The removal publication already happened. Preserve that receipt while refusing
+            // to apply selection or editor state through a replacement owner.
+            report.cleanupIssues.append(contentsOf: tabsBeingClosed.map {
+                ComposeTabPostRemovalIssue(tabID: $0, reason: reason, message: "The workspace changed after tab removal.")
+            })
+            return report
+        }
+        guard let published = currentRemovalOwner(),
+              published.workspace.composeTabs == tabs, published.workspace.stashedTabs == stashedTabs,
+              published.workspace.activeComposeTabID == previousActiveID
+        else { return supersededContinuation() }
         if tabs.isEmpty {
-            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: published.index)
+            guard let current = currentRemovalOwner() else { return supersededContinuation() }
+            loadComposeTabsFromWorkspace(current.workspace)
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
                 for tabID in tabsBeingClosed {
@@ -4428,18 +4450,26 @@ class PromptViewModel: ObservableObject {
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
             await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
-                manager.workspaces[index].activeComposeTabID = newActiveID
+                guard manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: newActiveID),
+                      currentRemovalOwner()?.workspace.activeComposeTabID == newActiveID,
+                      manager.modelRoutingTab(workspaceID: workspace.id, tabID: newActiveID) == tab
+                else { return }
                 activeComposeTabID = newActiveID
                 await withComposeTabSwitching(targetTabID: newActiveID) {
+                    guard currentRemovalOwner()?.workspace.activeComposeTabID == newActiveID,
+                          manager.modelRoutingTab(workspaceID: workspace.id, tabID: newActiveID) == tab
+                    else { return }
                     await manager.applyComposeTabState(tab)
                 }
             }
-        } else {
-            manager.workspaces[index].activeComposeTabID = newActiveID
+        } else if manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: newActiveID),
+                  let selected = currentRemovalOwner(), selected.workspace.activeComposeTabID == newActiveID
+        {
             activeComposeTabID = newActiveID
         }
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        guard let current = currentRemovalOwner() else { return supersededContinuation() }
+        loadComposeTabsFromWorkspace(current.workspace)
         onProjectionRemovalCommitted?(tabsBeingClosed)
         #if DEBUG
             for tabID in tabsBeingClosed {
@@ -4512,8 +4542,15 @@ class PromptViewModel: ObservableObject {
             workspaceIndex: workspaceIndex,
             manager: manager
         ) else { return nil }
-        manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
+        let workspace = manager.workspaces[workspaceIndex]
+        guard manager.replaceComposeTabCarriers(
+            workspaceID: workspace.id, composeTabs: [blankTab], stashedTabs: workspace.stashedTabs
+        ), manager.activeWorkspaceID == workspace.id,
+        manager.modelRoutingTab(workspaceID: workspace.id, tabID: blankTab.id) == blankTab,
+        manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: blankTab.id),
+        manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.activeComposeTabID == blankTab.id,
+        manager.modelRoutingTab(workspaceID: workspace.id, tabID: blankTab.id) == blankTab
+        else { return nil }
         dirtyTabIDs.remove(blankTab.id)
         return blankTab
     }
@@ -4525,14 +4562,23 @@ class PromptViewModel: ObservableObject {
         workspaceIndex: Int,
         applyLiveContext: Bool = true
     ) async -> ComposeTabState? {
+        let workspaceID = manager.workspaces[workspaceIndex].id
         guard let blankTab = appendStoredReplacementBlankComposeTabIfNeeded(
             manager: manager,
             workspaceIndex: workspaceIndex
         ) else { return nil }
         guard applyLiveContext else { return blankTab }
         await withComposeTabActivationSnapshotSuspended(targetTabID: blankTab.id, manager: manager) {
+            guard manager.activeWorkspaceID == workspaceID,
+                  manager.composeTabCarrierWorkspace(workspaceID: workspaceID)?.workspace.activeComposeTabID == blankTab.id,
+                  manager.modelRoutingTab(workspaceID: workspaceID, tabID: blankTab.id) == blankTab
+            else { return }
             activeComposeTabID = blankTab.id
             await withComposeTabSwitching(targetTabID: blankTab.id) {
+                guard manager.activeWorkspaceID == workspaceID,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspaceID)?.workspace.activeComposeTabID == blankTab.id,
+                      manager.modelRoutingTab(workspaceID: workspaceID, tabID: blankTab.id) == blankTab
+                else { return }
                 await manager.applyComposeTabState(blankTab)
             }
         }

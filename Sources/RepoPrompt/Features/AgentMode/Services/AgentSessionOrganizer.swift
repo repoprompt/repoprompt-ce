@@ -37,6 +37,18 @@ struct AgentSessionArchiveOutcome {
     var requiresControl: Set<UUID> = []
 }
 
+/// Unarchive completion separates the local projection from acknowledged owner persistence.
+struct AgentSessionUnarchiveOutcome {
+    struct Failure {
+        let reason: String
+        var localChanges = false
+        var persistenceConfirmed = false
+    }
+
+    var restored: Set<UUID> = []
+    var failures: [UUID: Failure] = [:]
+}
+
 /// Records which targets a commit-time check last refused on run state. A stash evaluates its check
 /// more than once (before and after its preflight suspension); the last evaluation decides.
 @MainActor
@@ -92,8 +104,11 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     /// suspensions and immediately before it commits; a session it refuses is not archived. Returns
     /// the sessions that were archived.
     func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> Set<UUID>
-    /// Restores archived sessions to the sidebar without switching the user's current tab.
-    func unarchive(_ sessionIDs: [UUID]) -> Set<UUID>
+    /// Restores without switching tabs. Completion waits for owner persistence and exact carrier
+    /// readback; authority is checked before mutation and again after each owning save.
+    func unarchive(
+        _ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool
+    ) async -> AgentSessionUnarchiveOutcome
     /// Cancels one proven live runtime owner, checking authority immediately before the claim.
     /// `stopped` requires an accepted cancelled terminal publication for that exact run and binding.
     func stopRun(
@@ -380,22 +395,30 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         return .idle
     }
 
-    func unarchive(_ sessionIDs: [UUID]) -> Set<UUID> {
-        var restored: Set<UUID> = []
+    func unarchive(
+        _ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool
+    ) async -> AgentSessionUnarchiveOutcome {
+        var outcome = AgentSessionUnarchiveOutcome()
         var byWindow: [Int: (WindowState, [(UUID, Location)])] = [:]
-        let locations = locations(for: Set(sessionIDs), windows: liveWindows(), writableOnly: true)
-        for sessionID in sessionIDs {
-            guard let location = locations[sessionID]?.location, location.stashedTabID != nil else { continue }
+        let initial = locations(for: Set(sessionIDs), windows: liveWindows(), writableOnly: true)
+        var seen: Set<UUID> = []
+        for sessionID in sessionIDs where seen.insert(sessionID).inserted {
+            guard let location = initial[sessionID]?.location, location.stashedTabID != nil else { continue }
             byWindow[location.window.windowID, default: (location.window, [])].1.append((sessionID, location))
         }
-        for (window, entries) in byWindow.values {
+        for windowID in byWindow.keys.sorted() {
+            guard let (window, entries) = byWindow[windowID] else { continue }
             let manager = window.workspaceManager
             let workspaceID = entries[0].1.workspaceID
             guard window.promptManager.flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
             else { continue }
+            // Flush callbacks and the preceding window's save can change a same-workspace carrier.
+            // Reuse the indexed resolver for this region, never the pre-await locations as authority.
+            let current = locations(for: Set(entries.map(\.0)), windows: liveWindows(), writableOnly: true)
             guard manager.activeWorkspaceID == workspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
             else { continue }
+            let ephemeral = manager.workspaces[index].isEphemeral
             let stashes = manager.workspaces[index].stashedTabs
             var stashIndexByID: [UUID: Int] = [:]
             for stashIndex in stashes.indices where stashIndexByID[stashes[stashIndex].id] == nil {
@@ -404,25 +427,96 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             var tabs = manager.workspaces[index].composeTabs
             var activeTabIDs = Set(tabs.map(\.id))
             var removedIndexes: Set<Int> = []
-            for (sessionID, location) in entries {
-                guard let stashID = location.stashedTabID, let stashIndex = stashIndexByID[stashID],
-                      !removedIndexes.contains(stashIndex) else { continue }
+            var changed: [(UUID, Location)] = []
+            for (sessionID, original) in entries {
+                guard !Task.isCancelled, isAuthorized(sessionID) else {
+                    outcome.failures[sessionID] = .init(reason: "scope_no_longer_current")
+                    continue
+                }
+                guard let location = current[sessionID]?.location,
+                      location.window === window, location.workspaceID == workspaceID,
+                      location.tabID == original.tabID, location.stashedTabID == original.stashedTabID,
+                      let stashID = location.stashedTabID, let stashIndex = stashIndexByID[stashID],
+                      !removedIndexes.contains(stashIndex)
+                else {
+                    outcome.failures[sessionID] = .init(reason: "target_changed")
+                    continue
+                }
                 var tab = stashes[stashIndex].tab
                 guard activeTabIDs.insert(tab.id).inserted else { continue }
                 tab.lastModified = Date()
                 removedIndexes.insert(stashIndex)
                 tabs.append(tab)
-                restored.insert(sessionID)
+                changed.append((sessionID, location))
             }
-            guard !removedIndexes.isEmpty else { continue }
-            manager.workspaces[index].stashedTabs = stashes.indices.filter { !removedIndexes.contains($0) }.map { stashes[$0] }
-            manager.workspaces[index].composeTabs = tabs
-            manager.workspaces[index].dateModified = Date()
-            window.promptManager.loadComposeTabsFromWorkspace(manager.workspaces[index])
+            guard !changed.isEmpty else { continue }
+            guard manager.replaceComposeTabCarriers(
+                workspaceID: workspaceID,
+                composeTabs: tabs,
+                stashedTabs: stashes.indices.filter { !removedIndexes.contains($0) }.map { stashes[$0] },
+                dateModified: Date()
+            ) else {
+                for (id, _) in changed {
+                    outcome.failures[id] = .init(reason: "target_changed")
+                }
+                continue
+            }
+            // Synchronous publication subscribers may replace or reorder the catalog. An
+            // admitted publication is still a local effect, even if its owner has changed.
+            guard manager.activeWorkspaceID == workspaceID,
+                  let published = manager.composeTabCarrierWorkspace(workspaceID: workspaceID)
+            else {
+                for (id, _) in changed {
+                    outcome.failures[id] = .init(reason: "target_changed", localChanges: true)
+                }
+                continue
+            }
+            window.promptManager.loadComposeTabsFromWorkspace(published.workspace)
             manager.markWorkspaceDirty()
-            manager.pollAndSaveState()
+            let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID)
+            guard persistence.acceptedForLifecycleAdmission, persistence.workspaceID == workspaceID else {
+                for (id, _) in changed {
+                    outcome.failures[id] = .init(reason: "persistence_rejected", localChanges: true)
+                }
+                continue
+            }
+            // A queued save can win first and make this save unnecessary. Check the existing
+            // persistence owner's exact workspace, rather than equating .notRequired with durability.
+            let durable = ephemeral ? nil : await manager.durableWorkspaceForMutationReadback(workspaceID: workspaceID)
+            let readback = locations(for: Set(changed.map(\.0)), windows: liveWindows(), writableOnly: true)
+            // Decode/read one workspace once; do not rescan its tab arrays for every requested ID.
+            let durableTabs = Dictionary(grouping: durable?.composeTabs ?? [], by: \.id)
+            let durableBindings = Dictionary(grouping: (durable?.composeTabs ?? []).filter { $0.activeAgentSessionID != nil }, by: \.activeAgentSessionID)
+            let durableStashedTabs = Set((durable?.stashedTabs ?? []).map(\.tab.id))
+            let durableStashedSessions = Set((durable?.stashedTabs ?? []).compactMap(\.tab.activeAgentSessionID))
+            for (id, original) in changed {
+                let carriers = durableTabs[original.tabID] ?? []
+                let persisted = durable?.id == workspaceID && carriers.count == 1
+                    && (
+                        carriers[0].activeAgentSessionID == id
+                            || (carriers[0].activeAgentSessionID == nil && original.tab.activeAgentSessionID == nil)
+                    )
+                    && !durableStashedTabs.contains(original.tabID) && !durableStashedSessions.contains(id)
+                    && !(durableBindings[id] ?? []).contains { $0.id != original.tabID }
+                guard ephemeral || persisted else {
+                    outcome.failures[id] = .init(reason: "persistence_unconfirmed", localChanges: true)
+                    continue
+                }
+                guard let location = readback[id]?.location,
+                      location.window === window, location.workspaceID == workspaceID,
+                      location.tabID == original.tabID, location.stashedTabID == nil
+                else {
+                    outcome.failures[id] = .init(reason: "target_changed", localChanges: true, persistenceConfirmed: persisted)
+                    continue
+                }
+                guard !Task.isCancelled, isAuthorized(id) else {
+                    outcome.failures[id] = .init(reason: "scope_no_longer_current", localChanges: true, persistenceConfirmed: persisted)
+                    continue
+                }
+                outcome.restored.insert(id)
+            }
         }
-        return restored
+        return outcome
     }
 
     func stopRun(
