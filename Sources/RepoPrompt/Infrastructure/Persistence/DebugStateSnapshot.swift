@@ -121,6 +121,13 @@ struct DebugStateSnapshot {
         )
     }
 
+    static func physicalPath(_ url: URL) throws -> String {
+        var parent = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let result = url.deletingLastPathComponent().path.withCString { rpce_catalog_resolve_directory($0, &parent) }
+        guard result == 0 else { throw Failure.unsafeFile }
+        return String(cString: parent) + "/" + url.lastPathComponent
+    }
+
     /// Online backup of a rollback-journal source. READONLY never recovers or
     /// checkpoints the live source. Refuse WAL rather than write its SHM read marks.
     static func copyDatabase(from source: URL, to destination: URL) throws {
@@ -139,12 +146,6 @@ struct DebugStateSnapshot {
         // has already rejected application-state aliases; resolve OS parents only.
         try requireDirectory(source.deletingLastPathComponent())
         try requireDirectory(destination.deletingLastPathComponent())
-        func physicalPath(_ url: URL) throws -> String {
-            var parent = [CChar](repeating: 0, count: Int(PATH_MAX))
-            let result = url.deletingLastPathComponent().path.withCString { rpce_catalog_resolve_directory($0, &parent) }
-            guard result == 0 else { throw Failure.unsafeFile }
-            return String(cString: parent) + "/" + url.lastPathComponent
-        }
         let inputPath = try physicalPath(source)
         let outputPath = try physicalPath(destination)
         var code = sqlite3_open_v2(inputPath, &input, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW, nil)

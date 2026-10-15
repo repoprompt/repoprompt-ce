@@ -69,7 +69,7 @@ enum DebugStateBootstrap {
         var lastError: Error = DebugStateSnapshot.Failure.sourceChanged
         for _ in 0 ..< 3 {
             do {
-                var builder = Builder(locations: locations, releasePreferences: releasePreferences)
+                var builder = Builder(locations: locations, releasePreferences: releasePreferences, previousPreferences: previousPreferences)
                 if !cleanSlate, let url = preferenceSourceURL, fm.fileExists(atPath: url.path) {
                     let bytes = try builder.plan.read(url)
                     guard let preferences = try PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any] else {
@@ -93,13 +93,17 @@ enum DebugStateBootstrap {
         throw lastError
     }
 
-    private struct Builder {
+    struct Builder {
         let locations: AppProfileLocations
         var releasePreferences: [String: Any]
+        var previousPreferences: [String: Any] = [:]
+        var sourceOverride: AppProfileLocations?
+        var retainedIdentities: DebugStateSnapshot.ContinuityIdentities?
+        var retainedWorkspaceIDs = Set<String>()
         var plan = DebugStateSnapshot.Plan()
         var mappings: [(URL, URL)] = []
         var source: AppProfileLocations {
-            AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: locations.homeDirectory)
+            sourceOverride ?? AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: locations.homeDirectory)
         }
 
         mutating func build() throws -> DebugStateSnapshot.Plan {
@@ -128,6 +132,7 @@ enum DebugStateBootstrap {
             if fm.fileExists(atPath: database.path) {
                 try plan.add(database, as: "ProductionContinuity/continuity.sqlite", database: true)
             }
+            try preserveDebugContinuity()
             plan.generated["debugSeedSources.json"] = try json([
                 "version": 1,
                 "profile": locations.preferencesDomain,
@@ -211,6 +216,7 @@ enum DebugStateBootstrap {
             var unavailable: [String] = []
             var seededIndex: [[String: Any]] = []
             for (id, url) in files.sorted(by: { $0.key < $1.key }) {
+                if retainedIdentities != nil { try locations.validateCustomWorkspaceDirectory(url.deletingLastPathComponent()) }
                 var working: Data?
                 if let encoded = journals[id]?["workingDocument"] as? String {
                     guard let data = Data(base64Encoded: encoded) else { throw DebugStateSnapshot.Failure.unsafeFile }
@@ -229,6 +235,13 @@ enum DebugStateBootstrap {
                       let uuid = UUID(uuidString: id), let name = workspace["name"] as? String
                 else {
                     throw DebugStateSnapshot.Failure.unsafeFile
+                }
+                if let retainedIdentities {
+                    let tabs = workspace["composeTabs"] as? [[String: Any]] ?? []
+                    guard retainedIdentities.workspaces.contains(id) || tabs.contains(where: {
+                        ($0["activeAgentSessionID"] as? String).map { retainedIdentities.sessions.contains($0) } ?? false
+                    }) else { continue }
+                    retainedWorkspaceIDs.insert(id)
                 }
                 // Decode against this binary before any publish or normalization.
                 _ = try DomainWorkspaceDocument.decode(documentBytes: working ?? bytes, fileURL: url)
@@ -268,7 +281,7 @@ enum DebugStateBootstrap {
                     // A rebuildable projection; copied records would retain stale
                     // file size/mtime and runtime summaries after handle detachment.
                     continue
-                } else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
+                } else if retainedIdentities == nil, name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
                     guard var session = try object(url) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
                     for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
                         session.removeValue(forKey: key)

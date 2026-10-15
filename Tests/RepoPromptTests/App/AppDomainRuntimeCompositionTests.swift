@@ -328,6 +328,46 @@ final class DebugStateBootstrapTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: unknown), Data("preserve".utf8))
     }
 
+    func testNormalRefreshPreservesDebugApprovalsAndEndpointWorkspaceWhileRefreshingOtherState() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspaceID = UUID(), sessionID = UUID(), tabID = UUID()
+        let directory = "Workspace-Fixture-" + workspaceID.uuidString
+        let prior = f.debug.workspaceRoot.appendingPathComponent(directory)
+        let production = f.release.workspaceRoot.appendingPathComponent(directory)
+        for root in [prior, production] {
+            try f.writeJSON([["id": workspaceID.uuidString, "name": "Fixture"]], root.deletingLastPathComponent().appendingPathComponent("workspacesIndex.json"))
+            try f.writeJSON([
+                "id": workspaceID.uuidString, "name": "Fixture",
+                "composeTabs": root == prior ? [["id": tabID.uuidString, "activeAgentSessionID": sessionID.uuidString]] : []
+            ], root.appendingPathComponent("workspace.json"))
+        }
+        let backing = prior.appendingPathComponent("AgentSessions/AgentSession-" + sessionID.uuidString + ".json")
+        try f.writeJSON(["id": sessionID.uuidString, "providerSessionID": "debug-owned-thread", "items": [["text": "debug-only history"]]], backing)
+        try f.write(Data([7, 8, 9]), prior.appendingPathComponent("AgentSessions/attachments/image.bin"))
+        let database = f.debug.applicationSupportRoot.appendingPathComponent("Overseer/continuity.sqlite")
+        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &db), SQLITE_OK)
+        defer { sqlite3_close_v2(db) }
+        XCTAssertEqual(sqlite3_exec(db, "PRAGMA user_version=1; CREATE TABLE profile_state(singleton INTEGER, profile TEXT); INSERT INTO profile_state VALUES(1,'repoprompt-ce-debug-overseer-v1'); CREATE TABLE continuity_rows(owner_id TEXT,anchor_id TEXT,workspace_id TEXT,terminal INTEGER); INSERT INTO continuity_rows VALUES('\(sessionID.uuidString)',NULL,NULL,0);", nil, nil, nil), SQLITE_OK)
+        let sourceBytes = try Data(contentsOf: production.appendingPathComponent("workspace.json"))
+        for size in [15, 17] {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: ["fontSize": size])
+            XCTAssertEqual(try f.object(backing)["providerSessionID"] as? String, "debug-owned-thread")
+            XCTAssertEqual(try f.object(prior.appendingPathComponent("workspace.json"))["composeTabs"] as? [[String: String]], [["id": tabID.uuidString, "activeAgentSessionID": sessionID.uuidString]])
+            XCTAssertEqual(try DebugStateSnapshot.continuityIdentities(database).sessions, [sessionID.uuidString])
+            XCTAssertEqual(try Data(contentsOf: prior.appendingPathComponent("AgentSessions/attachments/image.bin")), Data([7, 8, 9]))
+            let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")), format: nil) as? [String: Int]
+            XCTAssertEqual(preferences?["fontSize"], size)
+        }
+        XCTAssertEqual(try Data(contentsOf: production.appendingPathComponent("workspace.json")), sourceBytes)
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: database.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backing.path))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).contains { UUID(uuidString: $0) != nil })
+    }
+
     func testSQLiteBackupIsReadOnlyAndWrongProfileContinuityIsNotActivated() throws {
         let f = Fixture()
         defer { f.cleanup() }

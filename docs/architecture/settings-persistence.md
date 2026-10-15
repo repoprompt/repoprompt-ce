@@ -210,7 +210,16 @@ Release paths and formats are unchanged. Each normal debug **app process launch*
 prepares a new independent working snapshot of production state before app stores
 open. `--debug-clean-slate` skips the production seed for that launch only; it is
 not a preference, and the next normal launch seeds production again. This is
-state initialization, not a compiler/cache cold build. Existing provider homes,
+state initialization, not a compiler/cache cold build. Ordinary refresh retains
+this debug profile's transactional oversight DB and legacy continuity records.
+Workspaces containing saved debug endpoints (or named by a saved workspace scope)
+retain their intact debug-owned tabs/conversations, rather than replacing their
+identities with the production baseline. Their debug windows are retained too;
+settings and unrelated workspaces still refresh. Runtime restoration remains
+responsible for profile/identity validation: retaining bytes does not mint authority.
+Missing original endpoints stay recorded, not fabricated or silently revoked.
+`--debug-clean-slate` intentionally archives rather than carries this debug control
+continuity; it is a genuinely clean launch, not an ordinary restart. Existing provider homes,
 authentication, Keychain items and harmless runtime caches remain shared; the
 bootstrap never copies credentials or requires a new login.
 
