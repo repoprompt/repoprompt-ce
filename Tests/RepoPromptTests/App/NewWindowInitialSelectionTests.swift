@@ -7,6 +7,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import SwiftUI
 import XCTest
 
@@ -5612,7 +5613,9 @@ import XCTest
 
         private init(sandbox: URL, seeds: [WorkspaceModel], unavailableSeedIDs: Set<UUID>) {
             base = sandbox.appendingPathComponent("new-window-selection-\(UUID().uuidString)", isDirectory: true)
-            storage = base.appendingPathComponent("Workspaces", isDirectory: true)
+            storage = AppProfileLocations.current.customWorkspaceDirectory(
+                selectedDirectory: base.appendingPathComponent("Workspaces", isDirectory: true)
+            )
             self.seeds = seeds
             self.unavailableSeedIDs = unavailableSeedIDs
         }

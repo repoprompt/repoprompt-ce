@@ -183,14 +183,123 @@ of saving provisional defaults.
 
 Close older CE versions before upgrading or using this shared settings location. Older
 released binaries and arbitrary external editors do not honor this cooperative protocol;
-the sidecar does not make them safe concurrent writers. Current debug and release builds
-use the same protocol and file identity. No lifetime app lock or new settings namespace is
-required for the supported cooperative-current-writer contract.
+the sidecar does not make them safe concurrent writers. Current writers within one build
+flavor use this cooperative protocol. Debug and release now select separate application
+state roots as described below; no lifetime app lock is introduced.
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
+
+## Debug session-state boundary
+
+Debug and release builds must not normalize, overwrite, lock, or delete the same
+application-owned session metadata. `MCPFilesystemIdentity.current` selects the
+compiled build flavor; `applicationStateDirectoryName` selects mutable state.
+
+| State | Release | Debug |
+| --- | --- | --- |
+| Workspaces, conversations, Agent Mode sessions, catalog/journals, window continuity | `~/Library/Application Support/RepoPrompt CE` | `~/Library/Application Support/RepoPrompt CE Debug` |
+| Settings, presets, custom workflows, and persisted slice selections (`Partitions`) | Same release root | Same debug root |
+| Saved prompts, including context-builder prompts | `~/Library/Application Support/com.pvncher.repoprompt` | Debug root, `SavedPrompts` |
+| Oversight intents, scope continuity, worktree ownership | Same release root | Same debug root |
+| One-click recovery archive in Downloads | `RepoPrompt-Backup` | `RepoPrompt-Debug-Backup` |
+
+Release paths and formats are unchanged. Each normal debug **app process launch**
+prepares a new independent working snapshot of production state before app stores
+open. `--debug-clean-slate` skips the production seed for that launch only; it is
+not a preference, and the next normal launch seeds production again. This is
+state initialization, not a compiler/cache cold build. Ordinary refresh retains
+this debug profile's transactional oversight DB and legacy continuity records.
+Workspaces containing saved debug endpoints (or named by a saved workspace scope)
+retain their intact debug-owned tabs/conversations, rather than replacing their
+identities with the production baseline. Their debug windows are retained too;
+settings and unrelated workspaces still refresh. Runtime restoration remains
+responsible for profile/identity validation: retaining bytes does not mint authority.
+Missing original endpoints stay recorded, not fabricated or silently revoked.
+`--debug-clean-slate` intentionally archives rather than carries this debug control
+continuity; it is a genuinely clean launch, not an ordinary restart. Existing provider homes,
+authentication, Keychain items and harmless runtime caches remain shared; the
+bootstrap never copies credentials or requires a new login.
+
+The seed follows the current workspace catalog/index, copies workspace documents
+and conversation backing files, and materializes pending workspace journal bytes
+into the destination. Custom metadata sources are copied into the debug root;
+repository paths remain repository paths. Settings, presets, prompts, workflows,
+window state, slice selections and Oracle conversation artifacts are included.
+Rebuildable session indexes, locks/PIDs/runtime claims, Git data, workspace folders outside the live catalog and source recovery/backup trees are not restored as active state. Source
+history/recovery files remain at their original locations; an omitted unavailable
+workspace cannot be reconstructed from an absent source document.
+
+Source files and directory membership must remain stable across the capture, with
+three bounded attempts. Database snapshots use SQLite's backup API, never an
+uncoordinated live database-file copy, source migration or checkpoint. The current
+rollback-journal continuity store is supported. WAL sources currently fail closed
+rather than risk a write to production SHM read marks; they are not silently
+omitted or opened with the unsafe `immutable` promise.
+
+Copied provider conversation/cleanup handles are detached so a debug continuation
+cannot append to or delete its production provider conversation. Local transcript
+history is retained for the ordinary history-replay/new-conversation path. Saved
+production grants/continuity are preserved separately in `ProductionContinuity`,
+not promoted into debug authority. Automatic wakes and active merge/compact claims
+are not revived. No provider mode is disabled.
+
+Preparation and validation happen in staging. A same-volume atomic directory swap
+publishes the complete profile; a failed preparation leaves prior debug and source
+bytes intact. Prior debug-only work and its preferences are recoverable under
+`RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
+snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
+deleted. Normal startup is silent. Failure presents an actionable debug-only error
+and exits instead of opening a partial mixture. `debugSeed.json` and the redacted
+startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
+preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
+CLI requests do not re-seed a running app. Explicit standalone headless profiles
+remain independent and do not run the app launch bootstrap.
+
+Custom debug storage selections and explicit headless profiles use a build-flavor-namespaced child directory. Runtime profile IDs and release directory semantics remain unchanged. Known
+release roots (including configured custom storage), canonical aliases, symlinked
+metadata descendants are rejected before metadata writes,
+lock creation, or destructive cleanup. Nearest-existing-ancestor canonicalization
+also covers symlink parents with an absent final child. These checks protect
+against accidental cross-profile writes, not a malicious same-user process
+racing filesystem changes. Repository edits and user-selected exports are not
+application-metadata writes and do not acquire this restriction.
+
+The app and standalone headless runtime share this location policy. Debug CLI
+policy administration targets debug runtime policy, not release policy.
+
+This is **not** blanket filesystem isolation. Existing flavor-specific MCP
+socket/config names, wrappers/install destinations, provider homes/authentication,
+Keychain behavior, telemetry/device identity, tooling, and harmless shared caches
+or runtime downloads retain their existing behavior. Oversight transaction and
+permission semantics are owned by their separate repair track.
+
+### Acceptance evidence
+
+Use conductor for focused profile tests, relevant persistence/app suites, lint,
+product compilation and packaging. Packaged Agent Mode validation must use an
+explicitly approved app lifecycle action, coexist with release, and attribute
+writes to the debug process. Helper/unit tests alone do not establish live
+no-production-write behavior. Do not claim that acceptance until observed.
+
+#### Two-app same-workspace regression
+
+With release and the approved packaged debug build running together, exercise
+the same repository/workspace reference that previously resolved to one shared
+persisted document. Record each PID/executable and effective metadata path. A
+debug request to use the release document as writable metadata must be rejected
+before lock creation, normalization, or cleanup; the usable debug workspace must
+resolve to separate metadata. Exercise repeated selection switches and restore,
+then compare release workspace bytes, catalog/index, window state, settings,
+presets, prompts and oversight metadata against the baseline, attributing debug
+writes to the debug process. Repository access remains shared and usable.
+
+Do not disable saves, suppress CAS checks, copy production grants, or dismiss a
+conflict without writer attribution. Do not copy private live history into public
+fixtures/artifacts. This requires fresh lifecycle approval and coordination with
+other tracks, not an unapproved stress sequence against production.
 
 ## Model Router settings
 

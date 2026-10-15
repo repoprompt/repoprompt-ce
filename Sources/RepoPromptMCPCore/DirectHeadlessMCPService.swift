@@ -4,6 +4,7 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 package actor DirectHeadlessMCPService {
     struct PreparedRuntime {
@@ -135,6 +136,7 @@ package actor DirectHeadlessMCPService {
             environment: environment,
             currentDirectory: currentDirectory
         )
+        let profile = AppProfileLocations(identity: .current, profileName: locations.profileIdentifier)
         for directory in [
             locations.storageDirectory,
             locations.workspaceStorageDirectory,
@@ -156,7 +158,9 @@ package actor DirectHeadlessMCPService {
             workspaceStorageDirectory: locations.workspaceStorageDirectory,
             eventDirectory: locations.eventDirectory,
             temporaryDirectory: locations.temporaryDirectory,
-            hostDrainTimeout: .seconds(5)
+            hostDrainTimeout: .seconds(5),
+            metadataPathPolicy: profile.identity.buildFlavor == .debug
+                ? AppMetadataPathPolicy(locations: profile, roots: [locations.storageDirectory, locations.workspaceStorageDirectory]) : nil
         ), resolveChildLaunchPlan: { toolName, arguments, securityContext in
             try await childLaunchCoordinator.resolvePlan(
                 toolName: toolName,

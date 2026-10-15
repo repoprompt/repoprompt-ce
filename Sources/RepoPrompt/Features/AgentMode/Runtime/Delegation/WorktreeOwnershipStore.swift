@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 /// Who created a worktree under delegation, and whether it has been released for human cleanup.
 ///
@@ -91,7 +92,7 @@ final class WorktreeOwnershipStore {
     func bootstrapProduction(mode: AgentSessionOversightPersistenceMode) async {
         guard mode.performsProductionFileIO,
               let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-              .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+              .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
         else { return }
         await bootstrap(
             fileURL: base.appendingPathComponent(Self.filename),

@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
@@ -1948,7 +1949,7 @@ import XCTest
             let workspace = WorkspaceModel(
                 name: "Admission",
                 repoPaths: [],
-                customStoragePath: root,
+                customStoragePath: AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: root),
                 composeTabs: [tab],
                 activeComposeTabID: tab.id
             )

@@ -6,6 +6,7 @@ import RepoPromptFileSystem
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import Sparkle
 import SwiftUI
 
@@ -71,6 +72,9 @@ struct RepoPromptSwiftUIApp: App {
             #endif
             return handler
         }
+        // Do not initialize the settings-backed property before the state boundary
+        // check (stored-property default initializers run before this init body).
+        _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -137,7 +141,7 @@ struct RepoPromptSwiftUIApp: App {
     }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
-    @StateObject private var fontScale = FontScaleManager.shared
+    @StateObject private var fontScale: FontScaleManager
 
     // MARK: - Body
 
@@ -204,8 +208,24 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
+    private static func checkDebugStateBoundary() {
+        do {
+            try DebugStateBootstrap.runIfNeeded()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Debug state snapshot could not be prepared"
+            alert.informativeText = "\(error.localizedDescription)\nProduction and prior debug state were preserved. Retry when release is idle, or launch with --debug-clean-slate for an isolated empty profile."
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            exit(EXIT_FAILURE)
+        }
+    }
+
     public static func main() {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        // Before defaults migration, provider launch snapshots, property wrappers,
+        // or any settings/session singleton can observe or normalize this profile.
+        Self.checkDebugStateBoundary()
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()

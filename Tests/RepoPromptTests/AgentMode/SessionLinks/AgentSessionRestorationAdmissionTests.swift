@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -937,9 +938,10 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
     }
 
     private func makeRoot() throws -> URL {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("RestorationAdmission-\(UUID())")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RestorationAdmission-\(UUID())")
+        let root = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: directory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return root
     }
 
