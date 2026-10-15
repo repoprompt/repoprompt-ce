@@ -346,6 +346,9 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
             authorization: .init(sourceScopeID: scope.id) { fixture.bridge.delegationScopes.record(id: scope.id)?.isActive == true }
         )
         XCTAssertNil(scoped.failureMessage)
+        // Real window close first captures ownership of the preserved intent, then invalidates
+        // endpoints. Raw invalidation without that capture intentionally removes the saved row.
+        fixture.bridge.noteOversightWindowClosing(windowID: fixture.target.windowID)
         await fixture.bridge.invalidateWindow(fixture.target.windowID, reason: .windowClosed)
         let reopened = makeCandidate(windowID: 3, displayName: "Reopened", sessionID: fixture.target.sessionID)
         fixture.host.candidates = [fixture.observer, reopened]
