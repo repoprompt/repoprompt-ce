@@ -1473,6 +1473,7 @@ final class AgentSessionLinkRuntimeBridge {
         var test_afterLaneCreationClaim: (@MainActor () async -> Void)?
         /// Parks bootstrap after route success, before its terminal no-link authority sample.
         var test_afterBootstrapRouteValidation: (@MainActor () async -> Void)?
+        var test_beforeIntentBootstrap: (@MainActor () -> Void)?
         /// Signals a linked-basis creation waiting for an exact bootstrap establishment to settle.
         var test_beforeLaneCreationBootstrapSettlement: (@MainActor () -> Void)?
         /// Emulates scheduling delay before the independent-grant actor hop and before its returned
@@ -1770,8 +1771,17 @@ final class AgentSessionLinkRuntimeBridge {
     /// Deliberately independent of window-session restore. The manifest is loaded even when
     /// auto-restore is off — dormant intent must survive, not be silently discarded because the user
     /// turned window restoration off for one launch.
+    /// Restore consent continuity before any derived intent can attempt establishment.
+    func bootstrapContinuity(scopeStore: DelegationScopeStore, intentStore: AgentSessionOversightIntentStore) async {
+        await delegationScopes.bootstrap(store: scopeStore)
+        await bootstrapIntentStore(intentStore)
+    }
+
     func bootstrapIntentStore(_ store: AgentSessionOversightIntentStore) async {
         guard !isFrozenForTermination else { return }
+        #if DEBUG
+            test_beforeIntentBootstrap?()
+        #endif
         _ = await ensureScopedLinkConsent()
         guard !isFrozenForTermination else { return }
         intentStore = store
@@ -8850,10 +8860,21 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
             {
                 return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
             }
+            // Coordinator dictionary keys identify the pair, not its mutable consent provenance.
+            // Re-read the current row inside its lane; never establish from a first-seen stale key.
+            var currentPair = pair
+            var currentToken = token
+            if let intentStore {
+                guard let saved = await intentStore.token(for: pair), saved == token else {
+                    return EstablishmentResult(outcome: .rejected(message: Self.retiredMessage))
+                }
+                currentPair = saved.pair
+                currentToken = saved
+            }
             // Still inside the pair lane, so a concurrent Add or Stop cannot interleave with restore.
             return await establish(
-                pair: pair,
-                token: token,
+                pair: currentPair,
+                token: currentToken,
                 assertedAt: generation,
                 proof: proof
             )

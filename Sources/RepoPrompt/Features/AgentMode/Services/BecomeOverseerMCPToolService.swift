@@ -90,7 +90,7 @@ struct BecomeOverseerMCPToolService {
                 isEnabled: isEnabled,
                 revalidateRoute: { await resolveObserverEndpoint(metadata) == endpoint },
                 commitIfCurrent: fence.commitIfCurrent,
-                continuingTargetedRequest: targetID != nil
+                continuingTargetedRequest: true
             )
         } onCancel: {
             invalidate()

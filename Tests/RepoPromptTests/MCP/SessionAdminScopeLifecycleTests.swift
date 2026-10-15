@@ -45,6 +45,51 @@ private final class ScopeBlockedWriter: @unchecked Sendable {
 /// and the shared administration core's single authority check and batch cards.
 @MainActor
 final class SessionAdminScopeLifecycleTests: XCTestCase {
+    func testTargetedRequestReusesOnlyPendingAndContinuesFreshGrantedDeniedAndCancelledRequests() async throws {
+        for terminal in ["granted", "denied", "cancelled"] {
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            let caller = UUID(), target = UUID()
+            @MainActor func request() throws -> DelegationScopeRequest {
+                try runtime.requestScope(
+                    requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                    capabilities: [.observe, .control, .restructure], guardrails: .init(),
+                    reason: "same task", idempotencyKey: "same-key", reusePendingOnly: true
+                ).get()
+            }
+            let original = try request()
+            XCTAssertEqual(try request().id, original.id, "Only a pending card is deduplicated")
+            var scopeID: UUID?
+            switch terminal {
+            case "granted": scopeID = try runtime.approve(requestID: original.id).get().id
+            case "denied": runtime.deny(requestID: original.id)
+            default: _ = runtime.withdrawRequest(id: original.id, requesterSessionID: caller)
+            }
+            let next = try request()
+            XCTAssertNotEqual(next.id, original.id, terminal)
+            XCTAssertEqual(next.state, .pending)
+            var continuedScopeID: UUID?
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: next.id) { continuedScopeID = $0.id })
+            let reusedConsent = runtime.continueOverseeWithExistingConsent(requestID: next.id)
+            XCTAssertEqual(reusedConsent, terminal == "granted")
+            if let scopeID {
+                try await AsyncTestWait.waitUntil("fresh task reuses real live consent") { continuedScopeID == scopeID }
+            } else { XCTAssertNil(continuedScopeID) }
+        }
+    }
+
+    func testOverseeRefusalNoticesContainOnlyCodesAndCardReasonIsBounded() {
+        let privateDetail = "target_unloaded_unpreparable: SECRET /Users/private/project workspace title"
+        let outcome = AgentSessionAdministrationOutcome.completed(.object(["items": .array([.object([
+            "result": .string("not_applied"), "detail": .string(privateDetail)
+        ])])]))
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeLinkRefusalCode(outcome), "target_unloaded_unpreparable")
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeDeliveryRefusalCode(.workflowUnavailable(reference: privateDetail)), "workflow_unavailable")
+        XCTAssertEqual(DelegationScopeApprovalCard.displayReason("short"), "short")
+        let text = DelegationScopeApprovalCard.displayReason(String(repeating: "x", count: 32768))
+        XCTAssertLessThan(text.count, 1100)
+        XCTAssertTrue(text.hasSuffix("… (truncated)"))
+    }
+
     private var temporaryDirectory: URL!
 
     override func setUp() async throws {
@@ -6452,6 +6497,146 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let shutdown = await runtime.shutdown()
             XCTAssertEqual(shutdown.finalLifecycle, .stopped)
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    func testHistoricalAndStashedTargetsAreRefusedBeforeAnyCardWithoutChangingVisibleBinding() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let current = UUID(), historical = UUID(), stashed = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: current, parentID: nil, stashedID: stashed)
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+            fixture.indexEntries[historical] = AgentSessionIndexEntry(
+                id: historical, tabID: tab.id, name: "Historical", savedAt: .distantPast,
+                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            try fixture.installCarriers()
+            let vm = fixture.window.agentModeViewModel
+            let requester = vm.session(for: tab.id)
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: current, on: requester, updateWorkspaceMetadata: true))
+            requester.hasLoadedPersistedState = true
+            requester.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
+            let selected = fixture.window.promptManager.activeComposeTabID
+            let runtimeCount = vm.sessions.count
+            for (id, reason) in [(historical, "target_history_not_current"), (stashed, "target_stashed")] {
+                let result = AgentSessionLinkRuntimeBridge.shared.requestTargetedOversight(
+                    observer: endpoint, targetSessionID: id, message: nil, idempotencyKey: "preflight-\(id)"
+                )
+                XCTAssertEqual(result.objectValue?["result"], .string("target_not_preparable"))
+                XCTAssertEqual(result.objectValue?["subreason"], .string(reason))
+                XCTAssertNotNil(result.objectValue?["next_call"])
+            }
+            XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.delegationScopes.pendingRequests(forTab: tab.id, sessionID: current).isEmpty)
+            XCTAssertEqual(vm.sessions.count, runtimeCount)
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selected)
+            XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.first?.activeAgentSessionID, current)
+        }
+    }
+
+    func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
+            addTeardownBlock { @MainActor in await targetFixture.cleanup()
+                await observerFixture.cleanup()
+            }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let vm = observerFixture.window.agentModeViewModel
+            let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
+            let session = vm.session(for: tab.id)
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
+            let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            var notices: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in notices.append(text) }
+            addTeardownBlock { @MainActor in bridge.delegationScopes.test_scopeDecision = nil }
+            let response = bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "say hi", idempotencyKey: UUID().uuidString)
+            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card") }
+            _ = try bridge.delegationScopes.approve(requestID: id, capabilities: [.observe]).get()
+            try await AsyncTestWait.waitUntil("precise reduced-consent notice") { notices.contains { $0.contains("missing_capabilities=control,restructure") } }
+            XCTAssertFalse(notices.contains { $0.contains("task_delivered") || $0.contains("caller_changed_or_scope_revoked") })
+        }
+    }
+
+    func testIdleDecisionIndeterminateSaveIsFlaggedAndPersistedOnlyRetriesStartWithoutAnotherRow() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for indeterminate in [true, false] {
+                let controller = MonitorFakeNativeController()
+                var starts = 0
+                let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in fatalError("Unexpected Codex") },
+                        claudeControllerFactory: { _, _, _, _ in starts += 1
+                            return controller
+                        },
+                        mcpServerEnabler: { true }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    return vm // Real pending-policy installer and lease; no catalog-witness stub.
+                }
+                let requesterID = UUID()
+                let fixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: factory)
+                var cleaned = false
+                addTeardownBlock { @MainActor in if !cleaned { await fixture.cleanup() } }
+                try fixture.installCarriers()
+                let vm = fixture.window.agentModeViewModel
+                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+                let session = vm.session(for: tab.id)
+                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: requesterID, on: session, updateWorkspaceMetadata: true))
+                session.hasLoadedPersistedState = true
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.selectedAgent = .claudeCode
+                fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                try await AsyncTestWait.waitUntil("notification provider available") { fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
+                _ = try await fixture.window.workspaceManager.saveWorkspaceToFileAsync(XCTUnwrap(fixture.window.workspaceManager.activeWorkspace))
+                var writes = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    writes += 1
+                    if indeterminate { throw CocoaError(.fileWriteOutOfSpace) }
+                    if writes == 1 { session.mcpFollowUpRunPending = true } // Drift after row save, before start.
+                    return fixture.directory.appendingPathComponent("notice.json")
+                }
+                let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [fixture.window] }, notifyCatalogChanged: { _ in })
+                runtime.test_suppressDecisionDelivery = false
+                let request = try runtime.requestScope(
+                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: UUID()),
+                    capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                _ = try runtime.approve(requestID: request.id).get()
+                if indeterminate {
+                    try await AsyncTestWait.waitUntil("uncertain save flagged, never requeued") {
+                        session.items.contains { $0.kind == .error && $0.text.contains("save is unconfirmed") } && runtime.test_pendingDecisionCount == 0
+                    }
+                    XCTAssertGreaterThanOrEqual(writes, 2, "Both write and compensating removal failed")
+                    XCTAssertEqual(starts, 0)
+                    session.objectWillChange.send()
+                    XCTAssertEqual(runtime.test_pendingDecisionCount, 0)
+                    XCTAssertEqual(AgentModeViewModel.delegationDecisionOutcome(.blocked(.persistenceIndeterminate)), .indeterminate)
+                } else {
+                    try await AsyncTestWait.waitUntil("saved row remains owned for start-only retry") { runtime.test_pendingDecisionStartCount == 1 }
+                    let rows = session.items.filter { $0.kind == .user }
+                    XCTAssertEqual(rows.count, 1)
+                    XCTAssertEqual(starts, 0)
+                    session.mcpFollowUpRunPending = false
+                    try await AsyncTestWait.waitUntil("saved notice starts without another approval or append", timeout: 15) { await controller.sentCount == 1 }
+                    XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.id), rows.map(\.id))
+                    XCTAssertEqual(starts, 1)
+                }
+                runtime.freezeForTermination()
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.directory.appendingPathComponent("notice.json") }
+                await fixture.cleanup()
+                cleaned = true
+            }
         }
     }
 

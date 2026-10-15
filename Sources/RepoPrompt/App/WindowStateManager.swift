@@ -681,8 +681,7 @@ class WindowStatesManager: ObservableObject {
         // Delegation scopes share the oversight persistence mode: suppressed launches touch no file.
         let scopeStore = DelegationScopeStore.production(mode: mode)
         Task { @MainActor in
-            await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
-            await AgentSessionLinkRuntimeBridge.shared.delegationScopes.bootstrap(store: scopeStore)
+            await AgentSessionLinkRuntimeBridge.shared.bootstrapContinuity(scopeStore: scopeStore, intentStore: store)
             await AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.bootstrapProduction(mode: mode)
         }
     }

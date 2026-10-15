@@ -65,6 +65,13 @@ struct DelegationScopeReservation: Hashable {
     var worktreeIDs: Set<String> = []
 }
 
+enum DelegationDecisionDeliveryOutcome: Equatable {
+    case submitted
+    case retry
+    case persisted(AgentSessionLinkSendDelivery)
+    case indeterminate
+}
+
 enum DelegationScopeRequestError: Error, Equatable {
     case invalid(DomainDelegationScopeDenial)
     case idempotencyConflict
@@ -152,6 +159,8 @@ final class DelegationScopeRuntime: ObservableObject {
         var messages: [String]
         var observation: AnyCancellable?
         var isDelivering = false
+        var pendingStart: (text: String, delivery: AgentSessionLinkSendDelivery)?
+        var retryScheduled = false
     }
 
     private var decisions: [UUID: DecisionDelivery] = [:]
@@ -162,6 +171,14 @@ final class DelegationScopeRuntime: ObservableObject {
     private var overseeContinuationTasks: [UUID: (scopeID: UUID, task: Task<Void, Never>)] = [:]
     #if DEBUG
         var test_scopeDecision: ((UUID, String) -> Void)?
+        var test_pendingDecisionCount: Int {
+            decisions.count
+        }
+
+        var test_pendingDecisionStartCount: Int {
+            decisions.values.count { $0.pendingStart != nil }
+        }
+
         /// Unit fixtures must explicitly opt into provider delivery; ordinary scope tests do not
         /// accidentally start installed CLIs merely by approving their synthetic grant cards.
         var test_suppressDecisionDelivery = AppLaunchConfiguration.isUnitTestProcess
@@ -546,7 +563,8 @@ final class DelegationScopeRuntime: ObservableObject {
         reason: String?,
         idempotencyKey: String?,
         requesterTitle: String? = nil,
-        workspaceName: String? = nil
+        workspaceName: String? = nil,
+        reusePendingOnly: Bool = false
     ) -> Result<DelegationScopeRequest, DelegationScopeRequestError> {
         guard availability != .terminating else { return .failure(.invalid(.unknownScope)) }
         var guardrails = requestedGuardrails
@@ -571,7 +589,9 @@ final class DelegationScopeRuntime: ObservableObject {
             return .failure(.invalid(denial))
         }
         let key = idempotencyKey.map { "\(requesterSessionID.uuidString)|\($0)" }
-        if let key, let existingID = requestIDByKey[key], let existing = requests[existingID] {
+        if let key, let existingID = requestIDByKey[key], let existing = requests[existingID],
+           !reusePendingOnly || existing.state == .pending
+        {
             return existing.matches(
                 kind: kind,
                 capabilities: capabilities,
@@ -926,7 +946,7 @@ final class DelegationScopeRuntime: ObservableObject {
         }
         // Publications during the save/start await must not drop the in-flight batch or start it twice.
         if decisions[sessionID]?.isDelivering == true { return }
-        guard let pending = decisions[sessionID], !pending.messages.isEmpty,
+        guard let pending = decisions[sessionID], !pending.messages.isEmpty || pending.pendingStart != nil,
               let presentation = Self.loadedPresentation(forTab: pending.tabID, in: windows()),
               !presentation.window.isClosing,
               presentation.sessionID == sessionID,
@@ -936,21 +956,38 @@ final class DelegationScopeRuntime: ObservableObject {
             decisions.removeValue(forKey: sessionID)
             return
         }
-        decisions[sessionID]?.messages = []
+        if pending.pendingStart == nil { decisions[sessionID]?.messages = [] }
         decisions[sessionID]?.isDelivering = true
+        let text = pending.pendingStart?.text ?? pending.messages.joined(separator: "\n")
         Task { @MainActor [weak self] in
-            let accepted = await presentation.window.agentModeViewModel.submitDelegationDecision(
-                pending.messages.joined(separator: "\n"), tabID: pending.tabID, expectedSessionID: sessionID,
-                stopFence: pending.stopFence
+            let outcome = await presentation.window.agentModeViewModel.submitDelegationDecision(
+                text, tabID: pending.tabID, expectedSessionID: sessionID,
+                stopFence: pending.stopFence, resuming: pending.pendingStart?.delivery
             )
             guard let self, var current = decisions[sessionID], current.stopFence == pending.stopFence else { return }
             current.isDelivering = false
-            if !accepted { current.messages = pending.messages + current.messages }
-            if current.messages.isEmpty {
+            switch outcome {
+            case .submitted, .indeterminate: current.pendingStart = nil
+            case .retry:
+                if pending.pendingStart == nil { current.messages = pending.messages + current.messages }
+            case let .persisted(delivery): current.pendingStart = (text, delivery)
+            }
+            if current.messages.isEmpty, current.pendingStart == nil {
                 decisions.removeValue(forKey: sessionID)
             } else {
                 decisions[sessionID] = current
-                if accepted { drainDecisions(sessionID: sessionID) }
+                if outcome == .submitted || outcome == .indeterminate { drainDecisions(sessionID: sessionID) }
+                else if current.pendingStart != nil, !current.retryScheduled {
+                    // Retry only a saved row's start, never append/save the notice again. The same
+                    // binding, Stop and readiness checks still gate every attempt.
+                    decisions[sessionID]?.retryScheduled = true
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .seconds(1))
+                        guard let self, decisions[sessionID]?.stopFence == pending.stopFence else { return }
+                        decisions[sessionID]?.retryScheduled = false
+                        drainDecisions(sessionID: sessionID)
+                    }
+                }
             }
         }
     }
@@ -1046,7 +1083,8 @@ final class DelegationScopeRuntime: ObservableObject {
             guard let index = requestOrder.firstIndex(where: { requests[$0]?.state != .pending }) else { return }
             let id = requestOrder.remove(at: index)
             if let removed = requests.removeValue(forKey: id), let key = removed.idempotencyKey {
-                requestIDByKey.removeValue(forKey: "\(removed.requesterSessionID.uuidString)|\(key)")
+                let scopedKey = "\(removed.requesterSessionID.uuidString)|\(key)"
+                if requestIDByKey[scopedKey] == id { requestIDByKey.removeValue(forKey: scopedKey) }
             }
         }
     }

@@ -252,7 +252,7 @@ struct DelegationScopeApprovalCard: View {
                     Text("Agent's stated reason (unverified)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Text(reason)
+                    Text(Self.displayReason(reason))
                         .font(.callout)
                         .textSelection(.enabled)
                 }
@@ -351,6 +351,10 @@ struct DelegationScopeApprovalCard: View {
         default:
             "This scope could not be approved. Review its capabilities and limits, then request a new scope."
         }
+    }
+
+    static func displayReason(_ reason: String) -> String {
+        reason.count > 1024 ? String(reason.prefix(1024)) + "… (truncated)" : reason
     }
 
     private var kindDescription: String {

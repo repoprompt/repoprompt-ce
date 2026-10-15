@@ -2272,7 +2272,7 @@
         "additionalProperties" : false,
         "properties" : {
           "idempotency_key" : {
-            "description" : "Optional stable request key. Replays never replace a pending task or send it twice.",
+            "description" : "Optional key deduplicating pending requests only. A decided request starts a fresh task, reusing live exact-target consent when available.",
             "type" : "string"
           },
           "message" : {

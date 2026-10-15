@@ -1157,7 +1157,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             "properties": .object([
                 "session_id": .object(["type": .string("string"), "description": .string("Exact target session UUID. Requests one target-scoped approval and automatic continuation, even when other oversight tools are not yet in this provider turn's catalog.")]),
                 "message": .object(["type": .string("string"), "description": .string("Optional task to deliver after the one approval and link. Requires session_id; 1–32768 bytes.")]),
-                "idempotency_key": .object(["type": .string("string"), "description": .string("Optional stable request key. Replays never replace a pending task or send it twice.")])
+                "idempotency_key": .object(["type": .string("string"), "description": .string("Optional key deduplicating pending requests only. A decided request starts a fresh task, reusing live exact-target consent when available.")])
             ])
         ]),
         annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)

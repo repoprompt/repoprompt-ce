@@ -52,6 +52,23 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         await bridge().delegationActiveLink(observerSessionID: observer, targetSessionID: target)?.capabilities
     }
 
+    /// Admission-only metadata check: refuse unsupported saved placements before asking for consent.
+    /// Never switches a workspace, rebinds a visible tab, hydrates sessions or starts a provider.
+    static func savedTargetPreparationRefusal(target: UUID, windows: [WindowState]) -> String? {
+        let deletion = AgentSessionDeletionRegistry.shared
+        if deletion.isPermanentlyDeleted(sessionID: target) || deletion.isDeletionInProgress(sessionID: target) { return "target_missing" }
+        let saved = AgentSessionCarrierResolver.capture(windows: windows.filter { !$0.isClosing }, sessionIDs: [target])
+        if saved.ambiguousSessionIDs.contains(target) || saved.replicatedSessionIDs.contains(target) { return "target_ambiguous" }
+        guard let location = saved.uniqueLocations[target] else {
+            if saved.metadata[target]?.isEmpty == false { return "target_history_not_current" }
+            return saved.claimedWorkspaceIDs[target]?.isEmpty == false ? "target_workspace_not_active" : "target_not_in_loaded_workspace"
+        }
+        if location.stashedTabID != nil { return "target_stashed" }
+        if location.window.workspaceManager.activeWorkspaceID != location.workspaceID { return "target_workspace_not_active" }
+        if let current = location.tab.activeAgentSessionID, current != target { return "target_history_not_current" }
+        return nil
+    }
+
     func addLink(
         observer: UUID,
         target: UUID,

@@ -19046,14 +19046,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
     /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
-    func submitDelegationDecision(_ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence) async -> Bool {
+    func submitDelegationDecision(
+        _ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence,
+        resuming persisted: AgentSessionLinkSendDelivery? = nil
+    ) async -> DelegationDecisionDeliveryOutcome {
         let deletion = AgentSessionDeletionRegistry.shared
         guard !WindowStatesManager.shared.isTerminating,
               !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
-              !deletion.isDeletionInProgress(sessionID: expectedSessionID) else { return false }
+              !deletion.isDeletionInProgress(sessionID: expectedSessionID) else { return .retry }
         guard let session = sessions[tabID], session.activeAgentSessionID == expectedSessionID,
               stopFence.permitsQueuedDelivery(to: session),
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return false }
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return .retry }
         var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
@@ -19061,24 +19064,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             readiness.runStateIsActive = false
             readiness.hasWaitingPrompt = false
         }
-        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return false }
+        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return .retry }
+        if persisted != nil, session.runState.isActive { return .retry }
+        if let persisted, !session.items.contains(where: { $0.id == persisted.targetItemID && $0.kind == .user && $0.text == text }) {
+            return .indeterminate // Never recreate an accepted row whose identity can no longer be proved.
+        }
         // An app-authored decision resumes an idle requester; it is not an active managed steer.
         // The steer path deliberately withdraws idle input, so use the existing claimed, durable
         // noncomposer start instead. No draft, workflow, provider permission or link is borrowed.
         if !session.runState.isActive {
             guard let target = makeComposerSubmitTarget(tabID: tabID, session: session),
                   target.route == .existingAgentSession, target.expectedSourceAgentSessionID == expectedSessionID
-            else { return false }
+            else { return .retry }
             let attempt = AgentComposerSubmitAttempt(
                 id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
             )
-            guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return false }
-            let outcome = await persistAndStartNoncomposerTurn(
-                session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
-                claim: claim, displayText: text, providerMessage: text, workflow: nil,
-                attribution: nil, stopFence: stopFence
-            ) {
+            guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return .retry }
+            let isCurrent: @MainActor () -> Bool = {
                 !WindowStatesManager.shared.isTerminating
+                    && WindowStatesManager.shared.allWindows.contains { $0.windowID == endpoint.windowID && !$0.isClosing && $0.agentModeViewModel === self }
                     && self.sessions[tabID] === session && stopFence.permitsStart(of: session)
                     && self.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
                     && self.composerSubmitClaimIsCurrent(claim)
@@ -19088,8 +19092,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true
                     )) == nil
             }
-            if case .delivered = outcome { return true } // A saved row must never be appended twice.
-            return false
+            let outcome: AgentSessionLinkSendTransactionOutcome = if let persisted {
+                await startPersistedNoncomposerTurn(
+                    session: session, tabID: tabID, claim: claim, savedItemID: persisted.targetItemID,
+                    acceptedAt: persisted.acceptedAt, providerMessage: text, stopFence: stopFence,
+                    dispatchIsCurrent: isCurrent
+                )
+            } else {
+                await persistAndStartNoncomposerTurn(
+                    session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
+                    claim: claim, displayText: text, providerMessage: text, workflow: nil,
+                    attribution: nil, stopFence: stopFence, dispatchIsCurrent: isCurrent
+                )
+            }
+            let result = Self.delegationDecisionOutcome(outcome)
+            if case .indeterminate = result {
+                session.appendItem(.error("The approval notice's save is unconfirmed. It may already be on disk; it will not be duplicated or claimed delivered. Check this session before retrying.", sequenceIndex: session.nextSequenceIndex))
+            }
+            return result
         }
         let submission = submitPreparedUserTurn(
             tabID: tabID, session: session, trimmedText: text,
@@ -19099,8 +19119,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ),
             stopFence: AgentRunStartStopFence(session: session), isLocalComposerInput: false
         )
-        if case .submitted = submission { return true }
-        return false
+        if case .submitted = submission { return .submitted }
+        return .retry
+    }
+
+    static func delegationDecisionOutcome(_ outcome: AgentSessionLinkSendTransactionOutcome) -> DelegationDecisionDeliveryOutcome {
+        switch outcome {
+        case .blocked(.persistenceIndeterminate): .indeterminate
+        case .blocked: .retry
+        case let .delivered(delivery) where delivery.deliveryState == .persisted: .persisted(delivery)
+        case .delivered: .submitted
+        }
     }
 
     /// Shares prepared submission and provider settlement without borrowing link authority.

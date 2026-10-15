@@ -312,6 +312,55 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
 
     // MARK: - Tests
 
+    func testContinuityBootsConsentFirstAndReopenReadsCurrentScopeProvenance() async throws {
+        let fixture = makeFixture()
+        let scopeStore = DelegationScopeStore(
+            fileURL: directory.appendingPathComponent(DelegationScopeStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled
+        )
+        let seed = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let request = try seed.requestScope(
+            requesterSessionID: fixture.observer.sessionID, requesterTabID: nil,
+            kind: .session(targetSessionID: fixture.target.sessionID), capabilities: [.observe, .control, .restructure],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        let scope = try seed.approve(requestID: request.id).get()
+        XCTAssertEqual(scopeStore.record(operationID: UUID(), grants: [scope.grant], revoked: []), .applied)
+        _ = await fixture.store.loadForLaunch()
+        _ = await fixture.store.insert(fixture.pair) // Coordinator will keep this first-seen unscoped key.
+        await fixture.store.serializationBarrier()
+        var observedIntentBootstrap = false
+        fixture.bridge.test_beforeIntentBootstrap = {
+            observedIntentBootstrap = true
+            XCTAssertTrue(fixture.bridge.delegationScopes.record(id: scope.id)?.isActive == true, "Consent must be restored before intents start")
+        }
+        await fixture.bridge.bootstrapContinuity(scopeStore: scopeStore, intentStore: fixture.store)
+        XCTAssertTrue(observedIntentBootstrap)
+        guard case .added = await add(fixture), let first = await liveReference(fixture) else { return XCTFail("Initial plain link") }
+        _ = await stop(fixture, linkID: first.linkID, generation: first.generation)
+        let scoped = await fixture.bridge.addDelegatedMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint, targetEndpoint: fixture.target.domainEndpoint,
+            authorization: .init(sourceScopeID: scope.id) { fixture.bridge.delegationScopes.record(id: scope.id)?.isActive == true }
+        )
+        XCTAssertNil(scoped.failureMessage)
+        await fixture.bridge.invalidateWindow(fixture.target.windowID, reason: .windowClosed)
+        let reopened = makeCandidate(windowID: 3, displayName: "Reopened", sessionID: fixture.target.sessionID)
+        fixture.host.candidates = [fixture.observer, reopened]
+        let currentToken = await fixture.store.token(for: fixture.pair)
+        let token = try XCTUnwrap(currentToken)
+        let generation = await fixture.store.assertionGeneration(for: fixture.pair)
+        let result = await fixture.bridge.launchCoordinatorEstablish(
+            pair: fixture.pair, token: token, assertedAt: generation, proof: nil
+        )
+        XCTAssertNil(result.outcome.failureMessage)
+        let restored = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        XCTAssertEqual(restored.items.first?.sourceScopeID, scope.id, "Never reserve from the coordinator's stale nil-provenance key")
+        _ = fixture.bridge.delegationScopes.revoke(scopeID: scope.id)
+        let afterRevoke = await fixture.authority.links(forObserver: fixture.observer.sessionID)
+        XCTAssertTrue(afterRevoke.items.isEmpty, "Reopened link must not outlive the exact consent")
+        await fixture.store.serializationBarrier()
+    }
+
     func testAddPersistsIntentAndStopRemovesItBeforeTheGrantIsRevoked() async throws {
         let fixture = makeFixture()
 
