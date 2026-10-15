@@ -107,6 +107,10 @@ private struct WorkspaceFileCachedLoadResult {
 final class WorkspaceFileDecodeCache: @unchecked Sendable {
     static let shared = WorkspaceFileDecodeCache()
 
+    /// Serialize immutable codec preparation across windows under the existing cache owner,
+    /// rather than introduce another process singleton or initialize the app/runtime for a codec.
+    let documentPreparation = WorkspaceDocumentPreparation()
+
     private let lock = NSLock()
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]
     private var scheduledNormalizationSaveKeys: Set<WorkspaceFileDecodeCacheKey> = []
@@ -8005,11 +8009,18 @@ class WorkspaceManagerViewModel: ObservableObject {
                       domainWorkingCommitGeneration[workspaceID] == generation,
                       self.workspace(withID: workspaceID)?.isEphemeral == false
                 else { return }
-                try registerPendingFullDocumentWrite(workspace, baseline: writeBaseline, operationIDs: [operationID], permitsLocalDescendants: permitsLocalDescendants)
+                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
+                try Task.checkCancellation()
+                guard domainWorkingCommitGeneration[workspaceID] == generation,
+                      self.workspace(withID: workspaceID)?.isEphemeral == false
+                else { return }
+                try registerPendingFullDocumentWrite(
+                    workspace, baseline: writeBaseline, operationIDs: [operationID],
+                    permitsLocalDescendants: permitsLocalDescendants, preparedDigest: document.contentDigest
+                )
                 defer { pendingFullDocumentWrites.removeValue(forKey: operationID) }
                 let outcome = try await domainWorkspaceAuthorityClient.replaceWorkingFailClosed(
-                    workspace,
-                    fileURL: fileURL,
+                    document,
                     expectedWorkspaceRevision: expectedWorkspaceRevision,
                     operationID: operationID
                 )
@@ -8116,7 +8127,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ workspace: WorkspaceModel,
         baseline: FullDocumentWriteBaseline,
         operationIDs: [UUID],
-        permitsLocalDescendants: Bool
+        permitsLocalDescendants: Bool,
+        preparedDigest: String? = nil
     ) throws {
         let currentBaseline = fullDocumentWriteBaseline(workspaceID: workspace.id)
         guard currentBaseline == baseline else {
@@ -8125,7 +8137,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             if currentBaseline == nil { requestFullDocumentAdoption(workspaceID: workspace.id) }
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
-        let digest = try DomainWorkspaceAuthorityClient.documentDigest(for: workspace)
+        let digest = try preparedDigest ?? DomainWorkspaceAuthorityClient.documentDigest(for: workspace)
         let pending = PendingFullDocumentWrite(
             workspaceID: workspace.id, baseline: baseline,
             resultingRevision: baseline.workingRevision &+ (digest == baseline.contentDigest ? 0 : 1),
@@ -9038,9 +9050,18 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Shared identity-checked record decode for catalog projection and scoped restore classification.
     func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
+        try checkDomainWorkspaceCatalogRecordDecoding(record)
+        return try Self.decodeDomainWorkspaceCatalogRecordBytes(record)
+    }
+
+    /// Fault injection stays on the manager's actor; immutable bytes are decoded separately.
+    func checkDomainWorkspaceCatalogRecordDecoding(_ record: DomainWorkspaceSnapshot) throws {
         #if DEBUG
             if let error = catalogRecordDecodeFailureForTesting?(record.document.workspaceID) { throw error }
         #endif
+    }
+
+    nonisolated static func decodeDomainWorkspaceCatalogRecordBytes(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
         let model = try Self.decodeDomainWorkspaceProjection(
             documentBytes: record.document.documentBytes,
             fileURL: record.document.fileURL
@@ -9051,6 +9072,30 @@ class WorkspaceManagerViewModel: ObservableObject {
             ])
         }
         return model
+    }
+
+    /// Captured before CPU preparation suspends. Even an equal-value setter or a point adoption
+    /// can invalidate local-edit provenance without advancing the catalog publication floor.
+    struct CatalogPreparationWitness: Equatable {
+        let publicationSerial: UInt64
+        let reconciliationGeneration: UInt64
+        let adoptionGenerations: [UUID: UInt64]
+        let stateVersions: [UUID: Int]
+        let revisions: [UUID: DomainRevisionState]
+        let digests: [UUID: String]
+        let health: [UUID: DomainAuthorityHealth]
+    }
+
+    var catalogPreparationWitness: CatalogPreparationWitness {
+        CatalogPreparationWitness(
+            publicationSerial: workspacePublicationSerial,
+            reconciliationGeneration: domainCatalogReconciliationGeneration,
+            adoptionGenerations: fullDocumentAdoptionGenerations,
+            stateVersions: stateVersionByWorkspaceID,
+            revisions: domainWorkspaceRevisionsByID,
+            digests: domainWorkspaceDigestsByID,
+            health: domainWorkspaceHealthByID
+        )
     }
 
     #if DEBUG
@@ -16344,6 +16389,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
 
+        // Encode/hash once off main. The existing post-preparation capture, lifecycle and own-save
+        // fences below also cover this suspension; no prepared bytes authorize a later stale write.
+        let preparedDocument = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspaceToSave, fileURL: targetURL)
         #if DEBUG
             await workspaceSavePreparationDidFinishHandlerForTesting?(
                 workspace.id,
@@ -16399,11 +16447,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaceToSave,
                 baseline: writeBaseline,
                 operationIDs: pendingOperationIDs,
-                permitsLocalDescendants: workspaceToSave == capture.localWorkspace
+                permitsLocalDescendants: workspaceToSave == capture.localWorkspace,
+                preparedDigest: preparedDocument.contentDigest
             )
             let phasedOutcome = try await domainWorkspaceAuthorityClient.saveFailClosed(
-                workspaceToSave,
-                fileURL: targetURL,
+                preparedDocument,
                 expectedWorkspaceRevision: exactExpectedWorkspaceRevision,
                 expectedContentDigest: exactExpectedContentDigest,
                 operationIDs: operationIDs
@@ -16488,11 +16536,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceToSave,
                     baseline: writeBaseline,
                     operationIDs: pendingOperationIDs,
-                    permitsLocalDescendants: workspaceToSave == capture.localWorkspace
+                    permitsLocalDescendants: workspaceToSave == capture.localWorkspace,
+                    preparedDigest: preparedDocument.contentDigest
                 )
                 let phased = try await domainWorkspaceAuthorityClient.saveFailClosed(
-                    workspaceToSave,
-                    fileURL: targetURL,
+                    preparedDocument,
                     expectedWorkspaceRevision: writeBaseline.workingRevision,
                     expectedContentDigest: writeBaseline.contentDigest,
                     operationIDs: operationIDs
@@ -16534,7 +16582,7 @@ class WorkspaceManagerViewModel: ObservableObject {
            fullDocumentAdoptionGenerations[workspaceToSave.id, default: 0] == capture.adoptionGeneration,
            let revisions = outcome.workspace?.revisions ?? outcome.after,
            let digest = outcome.workspace?.document.contentDigest ?? outcome.resultingDigest,
-           digest == (try? DomainWorkspaceAuthorityClient.documentDigest(for: workspaceToSave))
+           digest == preparedDocument.contentDigest
         {
             // Explicit creation owns the first full document. No existing record's CAS is borrowed.
             adoptFullDocumentBaseline(workspaceID: workspaceToSave.id, revisions: revisions, digest: digest, fileURL: targetURL)

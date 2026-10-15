@@ -88,7 +88,7 @@ struct DomainWorkspaceAuthorityClient {
         _ workspace: WorkspaceModel,
         fileURL: URL
     ) async throws -> DomainWorkspaceSnapshot {
-        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL))
+        try await store.registerReadDocument(Self.document(for: workspace, fileURL: fileURL))
     }
 
     func create(
@@ -97,7 +97,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
             expectedCatalogRevision: expectedCatalogRevision,
@@ -124,7 +124,7 @@ struct DomainWorkspaceAuthorityClient {
         canonicalRootPath: String,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: 0,
@@ -142,7 +142,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
@@ -159,7 +159,16 @@ struct DomainWorkspaceAuthorityClient {
         expectedWorkspaceRevision: UInt64,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
+        return try await replaceWorkingFailClosed(document, expectedWorkspaceRevision: expectedWorkspaceRevision, operationID: operationID)
+    }
+
+    func replaceWorkingFailClosed(
+        _ document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        try Task.checkCancellation()
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
@@ -194,7 +203,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String?,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspacePhasedSaveOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try Self.document(for: workspace, fileURL: fileURL)
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -247,7 +256,22 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
-        let document = try document(for: workspace, fileURL: fileURL)
+        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
+        return try await saveFailClosed(
+            document,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
+            expectedContentDigest: expectedContentDigest,
+            operationIDs: operationIDs
+        )
+    }
+
+    func saveFailClosed(
+        _ document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        expectedContentDigest: String,
+        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
+    ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
+        try Task.checkCancellation()
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -274,7 +298,7 @@ struct DomainWorkspaceAuthorityClient {
             expectedWorkspaceRevision: saveRevision,
             conflictRecoveryPolicy: .failClosed,
             origin: .appPresentation(windowID: windowID),
-            command: .saveWorkspaceDocument(workspaceID: workspace.id)
+            command: .saveWorkspaceDocument(workspaceID: document.workspaceID)
         ))
         return DomainWorkspaceFailClosedSaveOutcome(
             working: workingOutcome,
@@ -302,7 +326,7 @@ struct DomainWorkspaceAuthorityClient {
         return await store.snapshot()
     }
 
-    private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
+    static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
         let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
@@ -457,6 +481,8 @@ final class DomainWorkspacePresentationBridge {
     #if DEBUG
         /// Captured by each refresh before scheduling; never substitutes the authority result.
         var afterCatalogReloadForTesting: (@MainActor () async -> Void)?
+        /// Holds the real preparation/apply boundary, never substitutes decoded models.
+        var catalogPreparationDidFinishForTesting: (@MainActor (_ wasOnMainThread: Bool) async -> Void)?
 
         private var initialDefaultCreateOverride: (outcome: DomainCommandOutcome, observeCandidate: (WorkspaceModel) -> Void)?
 
@@ -665,12 +691,12 @@ final class DomainWorkspacePresentationBridge {
             else { return false }
             return workspaceManager?.coversDomainCatalog(snapshot) == false
         }
-        var rejection = project(snapshot, attempt: attempt, runID: runID)
+        var rejection = await project(snapshot, attempt: attempt, runID: runID)
         var resolved = snapshot
         if isUncoveredFreshnessRejection(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
             let refetched = await client.snapshot()
             guard isCurrentRun(runID) else { return }
-            rejection = project(refetched, attempt: refetchAttempt, runID: runID)
+            rejection = await project(refetched, attempt: refetchAttempt, runID: runID)
             resolved = refetched
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
             if isUncoveredFreshnessRejection(rejection, refetched) {
@@ -741,7 +767,7 @@ final class DomainWorkspacePresentationBridge {
         _ snapshot: DomainWorkspaceCatalogSnapshot,
         attempt: DomainCatalogAttempt,
         runID: UUID
-    ) -> DomainCatalogRejection? {
+    ) async -> DomainCatalogRejection? {
         guard isCurrentRun(runID), let manager = workspaceManager else { return nil }
         if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
         guard snapshot.isBootstrapped else {
@@ -788,9 +814,11 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
-        // Decode failures degrade only their authoritative member. Keep all-record digests below:
-        // missing model keys force the next snapshot to retry even an unchanged failed document.
-        var nextModels: [UUID: WorkspaceModel] = [:]
+        // Capture provenance, not manager references, before yielding for CPU work. Cached local
+        // descendants are re-read only after that witness and the authority floors are revalidated.
+        let preparationWitness = manager.catalogPreparationWitness
+        var reusableIDs: Set<UUID> = []
+        var recordsToDecode: [DomainWorkspaceSnapshot] = []
         var failedIDs: Set<UUID> = []
         for record in records {
             let workspaceID = record.document.workspaceID
@@ -798,18 +826,41 @@ final class DomainWorkspacePresentationBridge {
                let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
                projectedAdoptionGenerations[workspaceID] == generation,
                projectedModels[workspaceID] != nil,
-               let current = manager.workspace(withID: workspaceID)
+               manager.workspace(withID: workspaceID) != nil
             {
-                // The generation proves a shared canonical ancestor, not that the cached model
-                // contains edits made since its last projection. Preserve the current descendant.
-                nextModels[workspaceID] = current
+                reusableIDs.insert(workspaceID)
             } else {
                 do {
-                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)
+                    try manager.checkDomainWorkspaceCatalogRecordDecoding(record)
+                    recordsToDecode.append(record)
                 } catch {
                     failedIDs.insert(workspaceID)
                 }
             }
+        }
+        var nextModels: [UUID: WorkspaceModel] = [:]
+        if !recordsToDecode.isEmpty {
+            do {
+                let prepared = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode(recordsToDecode)
+                #if DEBUG
+                    await catalogPreparationDidFinishForTesting?(prepared.wasOnMainThread)
+                #endif
+                guard isCurrentRun(runID) else { return .cancelled }
+                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
+                guard manager.catalogPreparationWitness == preparationWitness else {
+                    #if DEBUG
+                        AgentModePerfDiagnostics.increment("workspace.prepare.projectionDiscarded")
+                    #endif
+                    return .superseded
+                }
+                nextModels = prepared.models
+                failedIDs.formUnion(prepared.failedIDs)
+            } catch {
+                return .cancelled
+            }
+        }
+        for workspaceID in reusableIDs {
+            nextModels[workspaceID] = manager.workspace(withID: workspaceID)
         }
         // Presentation-only availability, never a write to authoritative membership. The existing
         // incomplete-catalog warning carries the failed IDs and keeps valid rows usable. The manager
