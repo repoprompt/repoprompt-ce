@@ -16,6 +16,8 @@ struct BecomeOverseerMCPToolService {
 
     let captureRequestMetadata: () async -> MCPRequestMetadata
     let resolveObserverEndpoint: (MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity?
+    /// Refusal text only: the routed endpoint without the availability check. Never admits activation.
+    var resolveRoutedEndpointForRefusal: (MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { _ in nil }
     var isEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) }
     var bridge: AgentSessionLinkRuntimeBridge = .shared
     var prepareActivationCommit: (
@@ -76,11 +78,11 @@ struct BecomeOverseerMCPToolService {
         let invocation = MCPInvocationContextBridge.current
         let metadata = await captureRequestMetadata()
         guard let endpoint = await resolveObserverEndpoint(metadata) else {
-            throw MCPError.invalidParams("Tool 'become_overseer' is not available for this session.")
+            throw await unavailable(metadata: metadata, endpoint: nil)
         }
         guard targetID != endpoint.sessionID else { throw MCPError.invalidParams("become_overseer cannot oversee itself.") }
         guard let fence = await prepareActivationCommit(invocation, endpoint) else {
-            throw MCPError.invalidParams("Tool 'become_overseer' is not available for this session.")
+            throw await unavailable(metadata: metadata, endpoint: endpoint)
         }
         let invalidate = fence.invalidate
         defer { invalidate() }
@@ -95,12 +97,31 @@ struct BecomeOverseerMCPToolService {
         } onCancel: {
             invalidate()
         }
-        guard let provider else { throw MCPError.invalidParams("Tool 'become_overseer' is not available for this session.") }
+        guard let provider else { throw await unavailable(metadata: metadata, endpoint: endpoint) }
         if let targetID {
             let key = suppliedKey
                 ?? "oversee:\(targetID.uuidString):\(AgentSessionLinkMessageDigest.steerDigest(message: message ?? ""))"
             return await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: targetID, message: message, idempotencyKey: key)
         }
         return .string(provider == .devin ? Self.devinResult : Self.nextTurnResult)
+    }
+
+    /// Every refusal names its cause and the next step; a generic "not available" leaves the agent
+    /// (and the user) unable to act on it.
+    private func unavailable(
+        metadata: MCPRequestMetadata,
+        endpoint: DomainAgentSessionLinkEndpointIdentity?
+    ) async -> MCPError {
+        var routed = endpoint
+        if routed == nil, isEnabled() { routed = await resolveRoutedEndpointForRefusal(metadata) }
+        let reason: String = if !isEnabled() {
+            "Session oversight is switched off: agent_session_link is disabled in this window's Tools settings. Ask the user to enable it, then retry."
+        } else if let routed {
+            bridge.overseerBootstrapRefusal(for: routed)?.reason
+                ?? "This session's route or state changed while activating. Retry become_overseer once."
+        } else {
+            "This call isn't routed to an installed Agent Mode run in this window. Retry once; if it still fails, ask the user to send the request again from the Agent Mode session itself."
+        }
+        return MCPError.invalidParams("become_overseer can't activate this session. \(reason) Nothing was requested or delivered.")
     }
 }

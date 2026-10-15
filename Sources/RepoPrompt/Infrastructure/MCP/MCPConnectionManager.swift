@@ -3239,13 +3239,18 @@ actor ServerNetworkManager {
         let hasActiveOutboundLink: Bool
         /// Catalog reachability only; every scope operation re-authorizes at execution.
         var isSessionAdminEligible = false
+        /// Activation admission: the session is eligible to activate right now.
         let canBecomeOverseer: Bool
+        /// Catalog listing and early call admission. Wider than `canBecomeOverseer`: a session
+        /// that is only transiently ineligible keeps the tool so a call returns an actionable
+        /// reason instead of the agent silently lacking the tool. Never admits activation.
+        var canListBecomeOverseer = false
         let hasActivatedOverseer: Bool
 
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
-            if canBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
+            if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
         }
@@ -3334,6 +3339,12 @@ actor ServerNetworkManager {
             return nil
         }
         let eligible = runState.taskLabelKind != .explore && bootstrapState != nil
+        let transientlyIneligible: Bool = if runState.taskLabelKind != .explore, bootstrapState == nil {
+            await AgentSessionLinkRuntimeBridge.shared
+                .overseerBootstrapRefusal(for: routeToken.observerEndpoint)?.isPermanent == false
+        } else {
+            false
+        }
         let activated = eligible && bootstrapState?.activation != nil
         var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
@@ -3346,6 +3357,7 @@ actor ServerNetworkManager {
         )
         // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
         // authority. Keep durable scope eligibility independent of activation retirement.
+        snapshot.canListBecomeOverseer = isEnabledState && oversightEnabled && (eligible || transientlyIneligible)
         snapshot.isSessionAdminEligible = holdsLiveScope
             || runState.allowsAgentExternalControlTools
             || hasActiveOutboundLink
@@ -3463,7 +3475,7 @@ actor ServerNetworkManager {
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
             hasExactAgentSessionLinkGrant: snapshot.hasAnyActiveLink,
-            canBecomeOverseer: snapshot.canBecomeOverseer,
+            canBecomeOverseer: snapshot.canListBecomeOverseer,
             hasActivatedOverseer: snapshot.hasActivatedOverseer
         )
         let catalog = await domainHost.advertisedCatalog(.init(
@@ -11642,7 +11654,7 @@ actor ServerNetworkManager {
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                 hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
-                canBecomeOverseer: sessionLinkGrantSnapshot?.canBecomeOverseer == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
                 hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             let advertisement = await domainHost.advertisedCatalog(
@@ -13241,7 +13253,7 @@ actor ServerNetworkManager {
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                 hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
-                canBecomeOverseer: sessionLinkGrantSnapshot?.canBecomeOverseer == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
                 hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             // The domain host owns canonical filtering; this app shell retains only
@@ -13754,7 +13766,7 @@ actor ServerNetworkManager {
                     taskLabelKind: effectivePolicy.taskLabelKind,
                     allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools,
                     hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
-                    canBecomeOverseer: liveSessionLinkGrant?.canBecomeOverseer == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
                     hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 do {
@@ -13861,7 +13873,7 @@ actor ServerNetworkManager {
                     taskLabelKind: policy.taskLabelKind,
                     allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                     hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
-                    canBecomeOverseer: liveSessionLinkGrant?.canBecomeOverseer == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
                     hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(

@@ -877,6 +877,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint)
     }
 
+    func agentSessionLinkBootstrapRefusal(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionOverseerBootstrapRefusal? {
+        guard !isTerminating else { return .terminating }
+        guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return .notLoaded }
+        return window.agentModeViewModel.agentSessionLinkBootstrapRefusal(for: endpoint)
+    }
+
     func agentSessionLinkActivateOverseer(
         for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
     ) -> Bool {

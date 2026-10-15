@@ -39,6 +39,13 @@ extension AgentSessionLinkEndpointHost {
         nil
     }
 
+    func agentSessionLinkBootstrapRefusal(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionOverseerBootstrapRefusal? {
+        guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
+        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: false)
+    }
+
     func agentSessionLinkActivateOverseer(
         for _: DomainAgentSessionLinkEndpointIdentity, expected _: AgentSessionOverseerBootstrapState
     ) -> Bool {
@@ -184,6 +191,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 
     /// Exact session-incarnation opt-in; default hosts fail closed. Neither method creates grants.
     func agentSessionLinkBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState?
+    /// nil when bootstrap would admit the endpoint now; otherwise a classified, actionable refusal.
+    func agentSessionLinkBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal?
     func agentSessionLinkActivateOverseer(
         for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
     ) -> Bool
@@ -7989,6 +7998,13 @@ final class AgentSessionLinkRuntimeBridge {
     func overseerBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         guard !isFrozenForTermination else { return nil }
         return host?.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    /// Catalog listing and refusal text only; never admits activation.
+    func overseerBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal? {
+        guard !isFrozenForTermination else { return .terminating }
+        guard let host else { return .notLoaded }
+        return host.agentSessionLinkBootstrapRefusal(for: endpoint)
     }
 
     /// Direct user consent from the dashboard, not an Agent/MCP invocation. Capture the displayed

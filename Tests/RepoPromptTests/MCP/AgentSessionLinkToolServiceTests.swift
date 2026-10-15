@@ -1086,7 +1086,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 release?.resume()
                 switch await caller.result {
                 case .success: XCTFail("revoked proof must deny \(withdrawal)")
-                case let .failure(error): XCTAssertTrue("\(error)".contains("not available for this session"))
+                case let .failure(error):
+                    // Denial names a cause and next step instead of a generic "not available".
+                    XCTAssertTrue("\(error)".contains("can't activate this session"), "\(error)")
+                    XCTAssertTrue("\(error)".contains("Retry become_overseer once"), "\(error)")
+                    XCTAssertTrue("\(error)".contains("Nothing was requested or delivered"), "\(error)")
                 }
                 XCTAssertNil(fixture.host.activations[endpoint], withdrawal)
                 XCTAssertEqual(publications, 0, "no full advertisement for \(withdrawal)")
@@ -1162,7 +1166,70 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let activation = await fixture.bridge.becomeOverseer(endpoint: candidate.domainEndpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
             XCTAssertNil(activation, exclusion)
             XCTAssertNil(fixture.host.activations[candidate.domainEndpoint], exclusion)
+            // Only sessions that can never oversee hide the bootstrap tool; transient states keep it
+            // listed so a call can explain itself instead of the agent silently lacking the tool.
+            let refusal = await fixture.bridge.overseerBootstrapRefusal(for: candidate.domainEndpoint)
+            let unwrapped = try XCTUnwrap(refusal, exclusion)
+            XCTAssertEqual(unwrapped.isPermanent, !["loading", "rebinding"].contains(exclusion), exclusion)
+            XCTAssertFalse(unwrapped.reason.isEmpty, exclusion)
         }
+        fixture.host.candidates = [original, fixture.target]
+        fixture.host.laneCreatorByEndpoint = [:]
+        let eligibleRefusal = await fixture.bridge.overseerBootstrapRefusal(for: original.domainEndpoint)
+        XCTAssertNil(eligibleRefusal, "an eligible session has no refusal")
+    }
+
+    func testBecomeOverseerRefusalNamesTransientCauseAndNextStepInsteadOfGenericUnavailable() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let referenceValue = await fixture.linkReference()
+        let reference = try XCTUnwrap(referenceValue)
+        _ = await fixture.bridge.stopMonitorLink(observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID, linkID: reference.linkID, generation: reference.generation)
+        let original = fixture.observer
+        let token = try XCTUnwrap(original.restorationReadiness.bindingToken)
+        let loading = AgentSessionLinkEndpointCandidate(
+            windowID: original.windowID, workspaceID: original.workspaceID, tabID: original.tabID, sessionID: original.sessionID,
+            persistentBindingGeneration: original.persistentBindingGeneration, bindingTransitionGeneration: original.bindingTransitionGeneration,
+            isTopLevel: true, hasLoadedPersistedState: false, bindingTransitionInProgress: false, isClosing: false,
+            isMCPControlled: false, isMCPOriginated: false, roleAllowsOutboundMonitoring: true,
+            displayName: original.displayName, providerDisplayName: original.providerDisplayName, locationLabel: original.locationLabel,
+            restorationReadiness: .pending(token)
+        )
+        fixture.host.candidates = [loading, fixture.target]
+        var enabled = true
+        let service = BecomeOverseerMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "bootstrap-refusal", windowID: fixture.window.windowID) },
+            resolveObserverEndpoint: { _ in nil },
+            resolveRoutedEndpointForRefusal: { _ in loading.domainEndpoint },
+            isEnabled: { enabled }, bridge: fixture.bridge,
+            prepareActivationCommit: { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+        )
+        func refusalMessage() async -> String? {
+            do {
+                _ = try await service.execute(args: [:])
+                XCTFail("ineligible session must not activate")
+                return nil
+            } catch let error as MCPError {
+                guard case let .invalidParams(message) = error else { XCTFail("\(error)")
+                    return nil
+                }
+                return message
+            } catch { XCTFail("\(error)")
+                return nil
+            }
+        }
+        let transientMessage = await refusalMessage()
+        let transient = try XCTUnwrap(transientMessage)
+        XCTAssertFalse(transient.contains("is not available for this session"), transient)
+        XCTAssertTrue(transient.contains("Load this thread"), transient)
+        XCTAssertTrue(transient.contains("retry become_overseer"), transient)
+        XCTAssertTrue(transient.contains("Nothing was requested or delivered"), transient)
+
+        enabled = false
+        let disabledMessage = await refusalMessage()
+        let disabled = try XCTUnwrap(disabledMessage)
+        XCTAssertTrue(disabled.contains("agent_session_link is disabled"), disabled)
+        XCTAssertNil(fixture.host.activations[loading.domainEndpoint])
     }
 
     func testBootstrapRejectsLinkArrivingDuringRouteRevalidation() async throws {
@@ -3400,6 +3467,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                   laneCreatorByEndpoint[endpoint] == nil,
                   AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring) == nil else { return nil }
             return .init(sessionIdentity: ObjectIdentifier(fenceSession), provider: bootstrapProvider, activation: activations[endpoint])
+        }
+
+        func agentSessionLinkBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal? {
+            guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
+            return .classify(
+                candidate: candidates.first(where: { $0.domainEndpoint == endpoint }),
+                isOverseerLane: laneCreatorByEndpoint[endpoint] != nil
+            )
         }
 
         func agentSessionLinkActivateOverseer(for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState) -> Bool {

@@ -1128,6 +1128,15 @@ final class MCPServerViewModel: ObservableObject {
                 ), await ServerNetworkManager.shared.isBecomeOverseerAvailable(connectionID: connectionID, endpoint: endpoint)
                 else { return nil }
                 return endpoint
+            },
+            resolveRoutedEndpointForRefusal: { [self] metadata in
+                guard let invocation = try? service.captureInvocationContext(
+                    toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
+                ) else { return nil }
+                return await resolveAgentSessionLinkModelObserverEndpoint(
+                    metadata: metadata,
+                    modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
+                )
             }
         )
     }
