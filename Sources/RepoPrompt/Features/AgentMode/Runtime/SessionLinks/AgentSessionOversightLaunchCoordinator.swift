@@ -86,10 +86,18 @@ enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
     case bindingDrift = "binding_drift"
     /// A committed deletion tombstone covers one of the endpoints.
     case deleted
-    /// The shared establishment path refused for a non-shutdown reason.
+    /// Retained for diagnostics compatibility. Launch restoration no longer ends an entry with this
+    /// reason: a refused establishment is never proof the saved pair is gone (see `establish`).
     case activationFailed = "activation_failed"
     /// Lifecycle revoked the restored grant; only exact captured window-close ownership may requeue.
     case lifecycleRevoked = "lifecycle_revoked"
+
+    /// Whether ending the launch entry may also remove the saved row. Only a committed deletion is a
+    /// proven-permanent fact; every other reason ends the entry for this launch and keeps the intent
+    /// dormant for the next one (no data loss on transient or environmental conditions).
+    var removesDurableIntent: Bool {
+        self == .deleted
+    }
 }
 
 // MARK: - Delegate
@@ -184,8 +192,15 @@ final class AgentSessionOversightLaunchCoordinator {
         let pair: AgentSessionOversightIntent
         var token: AgentSessionOversightIntentToken?
         var state: EntryState = .waiting
-        /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it.
+        /// Once true, no automatic retry is allowed unless exact window-close ownership rearms it or a
+        /// refused establishment spends one of its bounded per-launch retries.
         var didStartReservation = false
+        /// Refused establishments against `lastRefusedProof`. Bounds automatic retries of one exact
+        /// endpoint pair state; never a deletion trigger.
+        var refusedEstablishmentCount = 0
+        /// The proof the last refusal was classified against. A different proof (a new incarnation or
+        /// readiness) is new evidence and earns a fresh retry budget.
+        var lastRefusedProof: AgentSessionOversightRestorationProof?
         /// Sessions this launch has actually seen described or live at least once.
         ///
         /// A session that was observed and then disappeared is a *positive* fact about this process,
@@ -601,6 +616,12 @@ final class AgentSessionOversightLaunchCoordinator {
         entries.values.count { $0.didStartReservation }
     }
 
+    #if DEBUG
+        func refusedEstablishmentCount(for pair: AgentSessionOversightIntent) -> Int {
+            entries[pair]?.refusedEstablishmentCount ?? 0
+        }
+    #endif
+
     // MARK: Pass
 
     /// One reconciliation pass over the launch-loaded and close-captured worklist.
@@ -951,6 +972,14 @@ final class AgentSessionOversightLaunchCoordinator {
         proof: AgentSessionOversightRestorationProof
     ) async {
         guard let delegate, var entry = entries[pair] else { return }
+        // A refusal budget is spent per exact endpoint state. Changed endpoints are new evidence, so a
+        // pair is never locked out for the rest of the launch by refusals of an earlier incarnation.
+        if entry.didStartReservation, entry.refusedEstablishmentCount >= Self.maxAutomaticEstablishmentAttempts,
+           let lastRefusedProof = entry.lastRefusedProof, lastRefusedProof != proof
+        {
+            entry.didStartReservation = false
+            entry.refusedEstablishmentCount = 0
+        }
         // At-most-once is enforced by launch-entry state, not by the bridge's task table: a joined
         // task would satisfy the table while still counting as a second automatic reservation.
         guard !entry.didStartReservation else { return }
@@ -985,71 +1014,42 @@ final class AgentSessionOversightLaunchCoordinator {
                 }
             #endif
         case .failed, .rejected:
-            // A shutdown-shaped refusal preserves the intent for the next launch; anything else is a
-            // real refusal and the saved request is removed.
-            guard !isFrozen else {
-                settled.state = .waiting
-                entries[pair] = settled
-                return
-            }
-            // A hydration outcome can supersede the classified proof inside the shared path's
-            // authority hops. That refusal grants nothing, but is not proof the saved pair is gone.
-            if case .failed(.rebinding) = outcome,
-               let host = delegate.launchCoordinatorHost,
-               transientHydrationDrift(
-                   from: proof,
-                   candidates: host.agentSessionLinkCandidates(
-                       forSessionIDs: [proof.observerEndpoint.sessionID, proof.targetEndpoint.sessionID],
-                       includeLocation: true
-                   ).values.flatMap(\.self)
-               )
-            {
-                // The launch reservation budget is spent; retain intent for the next launch.
-                settled.state = .waiting
-                entries[pair] = settled
-                return
-            }
+            // A refused establishment grants nothing, and it is never proof that the saved pair is
+            // gone: at launch the shared path routinely refuses transiently (an endpoint still
+            // hydrating or rebinding, a superseded hydration proof, a closing or retiring endpoint,
+            // a transient observer eligibility input). Deleting here erased user-created links on
+            // ordinary restarts. Only `classify` may end the saved relationship, and only on a proven
+            // fact (deleted, missing under a fully observed topology, duplicate, ineligible, terminal
+            // hydration).
             settled.state = .waiting
+            guard !isFrozen else {
+                entries[pair] = settled
+                return
+            }
+            if settled.lastRefusedProof != proof {
+                settled.lastRefusedProof = proof
+                settled.refusedEstablishmentCount = 0
+            }
+            settled.refusedEstablishmentCount += 1
+            if settled.refusedEstablishmentCount < Self.maxAutomaticEstablishmentAttempts {
+                // Rearm one bounded retry. No immediate re-pass: the retry runs on the next
+                // readiness or topology event, so a transient refusal cannot burn the budget
+                // back-to-back. That pass reclassifies first, so a permanent cause retires with its
+                // real reason and a transient one waits for the event that settles it.
+                settled.didStartReservation = false
+            }
+            // Otherwise this endpoint state's budget is spent; a changed endpoint earns a fresh one, and
+            // the intent stays durable for the next launch either way.
             entries[pair] = settled
-            await retire(pair: pair, reason: .activationFailed)
+            #if DEBUG
+                logReconcile(pair: pair, outcome: "refused")
+            #endif
         }
     }
 
-    private func transientHydrationDrift(
-        from proof: AgentSessionOversightRestorationProof,
-        candidates: [AgentSessionLinkEndpointCandidate]
-    ) -> Bool {
-        let observers = candidates.filter { $0.sessionID == proof.observerEndpoint.sessionID }
-        let targets = candidates.filter { $0.sessionID == proof.targetEndpoint.sessionID }
-        guard observers.count == 1, targets.count == 1,
-              let observer = observers.first, let target = targets.first,
-              observer.domainEndpoint == proof.observerEndpoint,
-              target.domainEndpoint == proof.targetEndpoint,
-              observer.isTopLevel, !observer.isClosing,
-              observer.roleAllowsOutboundMonitoring,
-              !observer.isMCPControlled, !observer.isMCPOriginated,
-              target.isTopLevel, !target.isClosing
-        else {
-            return false
-        }
-        func isTransient(
-            _ current: AgentSessionRestorationReadiness,
-            insteadOf expected: AgentSessionRestorationReadiness
-        ) -> Bool {
-            guard case let .terminal(token, failure) = current,
-                  token == expected.bindingToken
-            else { return false }
-            return switch failure {
-            case .loadFailed, .sourceRevisionSuperseded: true
-            case .missingPayload: false
-            }
-        }
-        let observerTransient = isTransient(observer.restorationReadiness, insteadOf: proof.observerReadiness)
-        let targetTransient = isTransient(target.restorationReadiness, insteadOf: proof.targetReadiness)
-        return (observerTransient || observer.restorationReadiness == proof.observerReadiness)
-            && (targetTransient || target.restorationReadiness == proof.targetReadiness)
-            && (observerTransient || targetTransient)
-    }
+    /// Automatic establishment attempts per launch entry. Bounded so a persistently refusing path
+    /// cannot spin; exhaustion preserves intent rather than deleting it.
+    static let maxAutomaticEstablishmentAttempts = 3
 
     /// Terminalizes one entry and removes exactly its own durable token.
     private func retire(
@@ -1060,7 +1060,7 @@ final class AgentSessionOversightLaunchCoordinator {
         else {
             return
         }
-        guard let token = entry.token else {
+        guard let token = entry.token, reason.removesDurableIntent else {
             entry.parkedReference = nil
             entry.closedReferences.removeAll()
             entry.state = .terminal(reason)

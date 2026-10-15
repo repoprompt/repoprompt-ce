@@ -351,14 +351,21 @@ extension AgentModeViewModel {
         let runState: AgentSessionRunState
         let lastActivityAt: Date
         let lastUserMessageAt: Date?
+        /// The row builder prefers live bindings and merge operations over the index entry, so a
+        /// live change must refresh rows even when no index entry exists to carry it.
+        var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = []
+        var worktreeMergeAttention: AgentWorktreeMergeAttention?
     }
 
     /// Fingerprint of every VM-level input that affects the rendered session sidebar.
     /// `syncSidebarUIState(refresh:reason:)` gates forced revisions on changes to
     /// this fingerprint, ensuring duplicate refresh requests during steady provider
     /// output do not bump `AgentSessionSidebarUIStore.revision`.
+    ///
+    /// The selected tab is deliberately absent: no built row depends on it (the list receives it as a
+    /// view input and the projection cache keys on it). Including it forced a full O(sessions) row
+    /// rebuild on every session switch (#1373).
     struct AgentSessionSidebarContentFingerprint: Equatable {
-        let currentTabID: UUID?
         let sessionListCacheReady: Bool
         let tabsWithActiveAgentRun: Set<UUID>
         let mcpControlledTabIDs: Set<UUID>

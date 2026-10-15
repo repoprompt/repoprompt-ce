@@ -471,7 +471,12 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let snapshot = await fixture.authority.snapshot()
         XCTAssertEqual(snapshot.activeLinkCount, 0)
         XCTAssertEqual(snapshot.pendingReservationCount, 0)
-        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.activationFailed))
+        // The refusal itself proves nothing and does not immediately re-run.
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        // The next readiness event reclassifies first and proves the duplicate.
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
     }
 
     func testBothExactHydrationProofsAreFreshAfterReservation() async throws {
@@ -939,7 +944,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.missing))
     }
 
@@ -962,7 +967,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.ambiguousDuplicate))
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored)
@@ -1009,7 +1014,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.hydrationFailed))
         let restored = await isRestored(fixture)
         XCTAssertFalse(restored)
@@ -1146,14 +1151,86 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.bootstrapIntentStore(fixture.store)
         await fixture.bridge.test_settleLaunchReconciliation()
 
-        let restored = await isRestored(fixture)
+        var restored = await isRestored(fixture)
         XCTAssertFalse(restored, "An unproven incarnation must never be reauthorized.")
-        XCTAssertEqual(
-            fixture.bridge.test_launchEntryState(for: pair),
-            .terminal(.activationFailed)
-        )
+        // Restart survival: a target that rehydrates in place is routine at launch. The refusal
+        // grants nothing, but it must not erase the user's saved relationship.
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "A refused automatic restore must keep the durable intent.")
+
+        // Once the target is authoritative again, the bounded retry restores the link.
+        fixture.host.beforeUUIDCensus = nil
+        fixture.host.candidates = [observer, target]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        restored = await isRestored(fixture)
+        XCTAssertTrue(restored, "The saved link must restore after the transient refusal settles.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        fixture.bridge.freezeForTermination()
+    }
+
+    /// A launch entry that keeps getting refused stops retrying after its per-launch budget, but the
+    /// intent stays durable for the next launch instead of being deleted.
+    func testRepeatedlyRefusedRestoreExhaustsBudgetAndKeepsIntent() async throws {
+        try seedSavedPair()
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        let rehydrating = withReadiness(
+            target,
+            .pending(
+                AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: target.tabID,
+                        sessionID: target.sessionID
+                    ),
+                    bindingTransitionGeneration: 1
+                )
+            )
+        )
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        fixture.host.candidates = [observer, target]
+        // Every establishment observes drift, then the endpoint reports ready again.
+        fixture.host.beforeUUIDCensus = {
+            fixture.host.candidates = [observer, rehydrating]
+        }
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(
+            fixture.bridge.test_launchRefusedEstablishmentCount(for: pair), 1,
+            "A refusal never retries back-to-back; it waits for the next readiness event."
+        )
+        for _ in 0 ..< AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts + 2 {
+            fixture.host.candidates = [observer, target]
+            fixture.bridge.noteCandidateReadinessChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+        }
+
+        let restored = await isRestored(fixture)
+        XCTAssertFalse(restored)
+        XCTAssertEqual(
+            fixture.bridge.test_launchRefusedEstablishmentCount(for: pair),
+            AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts,
+            "Retries are bounded per launch."
+        )
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNotNil(token, "Budget exhaustion must preserve the intent for the next launch.")
+
+        // A new target incarnation is new evidence: the exhausted entry is not locked out for the
+        // rest of the launch, and restores once establishment succeeds.
+        fixture.host.beforeUUIDCensus = nil
+        let reopened = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, reopened]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: reopened)]
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let recovered = await isRestored(fixture)
+        XCTAssertTrue(recovered, "A changed endpoint earns a fresh retry budget.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
     }
 
     func testSupersessionDuringEstablishmentKeepsIntentWithoutGranting() async throws {
@@ -1185,7 +1262,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let token = await fixture.store.token(for: pair)
             XCTAssertFalse(restored)
             XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
-            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 1)
+            // The refusal spent one bounded retry and rearmed the entry for the next readiness event.
+            XCTAssertEqual(fixture.bridge.test_launchRefusedEstablishmentCount(for: pair), 1)
+            XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
             XCTAssertNotNil(token)
         }
     }
@@ -1210,7 +1289,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.hydrationFailed))
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
     }
@@ -1248,7 +1327,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             .terminal(.ambiguousDuplicate)
         )
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
         XCTAssertEqual(
             fixture.bridge.test_launchReservationStartCount(),
             1,
@@ -1293,7 +1372,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             "An endpoint observed and then torn down is a fact, not the uncertainty of an abandoned restore."
         )
         let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token)
+        XCTAssertNotNil(token, "Launch retirement keeps the intent dormant; only a committed deletion removes it.")
     }
 
     // MARK: - Launch policy
@@ -1320,13 +1399,17 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         )
     }
 
-    // MARK: - Cleanup failure
+    // MARK: - Dormant rows (no data loss)
 
-    func testACleanupWriteFailureSuppressesTheEntryAndSurfacesRetrySaving() async throws {
+    // Failed launch cleanup and Retry saving remain covered for committed deletions by
+    // `testParkedDeletionCannotRestoreAndFailedCleanupRemainsRetryable`. Every other launch-terminal
+    // reason keeps the saved row, so it owes no cleanup at all.
+
+    func testAMissingTargetKeepsTheRowAndOwesNoCleanup() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
-        // Only the observer is present, under a topology that proves absence: the entry is terminal
-        // and owes a durable removal, which the gate then refuses.
+        // Only the observer is present, under a topology that proves absence: the entry ends for this
+        // launch, but the saved relationship is kept dormant even while writes fail.
         let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
         fixture.host.candidates = [observer]
         fixture.host.descriptors = [descriptor(for: observer)]
@@ -1337,47 +1420,19 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let token = await fixture.store.token(for: pair)
-        XCTAssertNotNil(token, "A failed cleanup preserves the row; it must not be silently dropped.")
-        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
-        XCTAssertEqual(
-            fixture.bridge.currentPersistencePresentation.warnings.map(\.id),
-            [AgentSessionOversightWarningID.cleanupFailed]
-        )
-
-        // Retry saving is one of the few permitted retry triggers.
+        XCTAssertNotNil(token, "A missing endpoint is not proof of deletion; the row stays dormant.")
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .terminal(.missing))
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
         fixture.gate.failsNextWrites = false
         await fixture.bridge.retryPendingIntentCleanup()
-
         let afterRetry = await fixture.store.token(for: pair)
-        XCTAssertNil(afterRetry)
-        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        XCTAssertNotNil(afterRetry, "Retry saving has nothing to remove")
     }
 
-    /// **Retry saving** racing an explicit Add of the same pair.
-    ///
-    /// Both are durable mutations of one pair, so both take its retirement lane and the outcome is
-    /// an invariant rather than a coin flip: whichever runs first, the user ends up with a live grant
-    /// backed by a durable row. Outside the lane, a cleanup already suspended on the store actor
-    /// would commit its expected-token removal *after* the Add reused that very token, deleting the
-    /// intent the user just recreated.
-    func testRetrySavingRacingAnExplicitAddLeavesTheReassertedPairGrantedAndDurable() async throws {
-        try seedSavedPair()
-        let fixture = makeFixture()
-        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
-        fixture.host.candidates = [observer]
-        fixture.host.descriptors = [descriptor(for: observer)]
-        await fixture.bridge.bootstrapIntentStore(fixture.store)
-        fixture.gate.failsNextWrites = true
-        fixture.bridge.noteCandidateReadinessChanged()
-        await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
-
-        // The target comes back and the user explicitly re-adds the pair, while the failed cleanup
-        // is retried at the same moment.
-        fixture.gate.failsNextWrites = false
-        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
-        fixture.host.candidates = [observer, target]
-        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+    /// The target comes back and the user explicitly re-adds the pair while Retry saving runs: the
+    /// user ends up with a live grant backed by the durable row.
+    func testExplicitAddOverADormantRowLeavesThePairGrantedAndDurable() async throws {
+        let (fixture, _, _) = try await seedDormantRowWithTargetBack()
 
         async let retry: Void = fixture.bridge.retryPendingIntentCleanup()
         let outcome = await fixture.bridge.addMonitorLink(
@@ -1390,15 +1445,15 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             return XCTFail("Expected the explicit Add to succeed, got \(outcome)")
         }
         let token = await fixture.store.token(for: pair)
-        XCTAssertNotNil(token, "A stale cleanup must never delete what the user just recreated.")
+        XCTAssertNotNil(token, "Nothing may delete what the user just recreated.")
         let restored = await isRestored(fixture)
         XCTAssertTrue(restored, "The grant and the durable row must agree.")
     }
 
-    /// Finding 12 follow-through: a delegated Add that reasserts a row still owing a cleanup, and whose
-    /// scope authority ends after the insert, must not retire that cleanup. Retry still removes the row.
-    func testRevokedDelegatedReassertionKeepsTheOwedCleanupOnTheNewAssertion() async throws {
-        let (fixture, observer, target) = try await seedPendingCleanupWithTargetBack()
+    /// A delegated Add whose scope authority ends after the insert fails, but never removes a row
+    /// that predates it.
+    func testRevokedDelegatedAddOverADormantRowKeepsTheRow() async throws {
+        let (fixture, observer, target) = try await seedDormantRowWithTargetBack()
         var authorized = true
         let pair = pair
         fixture.bridge.test_afterReservationBeforeActivation = { pendingPair in
@@ -1413,19 +1468,14 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         )
 
         XCTAssertNotNil(outcome.failureMessage, "a revoked delegated Add must not report success: \(outcome)")
-        XCTAssertTrue(
-            fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry,
-            "the user's failed Stop cleanup is still owed"
-        )
-        await fixture.bridge.retryPendingIntentCleanup()
-        let token = await fixture.store.token(for: pair)
-        XCTAssertNil(token, "Retry saving removes the row despite the delegated reassertion's generation bump")
         XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        let token = await fixture.store.token(for: pair)
+        XCTAssertNotNil(token, "A pre-existing row is never compensated away")
     }
 
-    /// Control: with live authority the same delegated reassertion establishes and retires the cleanup.
-    func testLiveDelegatedReassertionRetiresTheOwedCleanup() async throws {
-        let (fixture, observer, target) = try await seedPendingCleanupWithTargetBack()
+    /// Control: with live authority the same delegated Add establishes over the dormant row.
+    func testLiveDelegatedAddOverADormantRowEstablishes() async throws {
+        let (fixture, observer, target) = try await seedDormantRowWithTargetBack()
 
         let outcome = await fixture.bridge.addDelegatedMonitorLink(
             observerEndpoint: observer.domainEndpoint,
@@ -1435,15 +1485,15 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
 
         guard case .added = outcome else { return XCTFail("Expected the delegated Add to succeed, got \(outcome)") }
         XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
-        await fixture.bridge.retryPendingIntentCleanup()
         let token = await fixture.store.token(for: pair)
-        XCTAssertNotNil(token, "a retired cleanup never deletes the reasserted row")
+        XCTAssertNotNil(token)
         let restored = await isRestored(fixture)
         XCTAssertTrue(restored)
     }
 
-    /// A saved pair whose automatic cleanup failed to write, with the target back and writes working.
-    private func seedPendingCleanupWithTargetBack() async throws -> (
+    /// A saved pair whose launch entry ended because the target was missing, with the target back and
+    /// writes working. The row is still on disk and nothing is owed.
+    private func seedDormantRowWithTargetBack() async throws -> (
         Fixture, AgentSessionLinkEndpointCandidate, AgentSessionLinkEndpointCandidate
     ) {
         try seedSavedPair()
@@ -1455,7 +1505,9 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         fixture.gate.failsNextWrites = true
         fixture.bridge.noteCandidateReadinessChanged()
         await fixture.bridge.test_settleLaunchReconciliation()
-        XCTAssertTrue(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        XCTAssertFalse(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry)
+        let dormant = await fixture.store.token(for: pair)
+        XCTAssertNotNil(dormant)
         fixture.gate.failsNextWrites = false
         let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
         fixture.host.candidates = [observer, target]

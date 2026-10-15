@@ -79,7 +79,7 @@ final class WorktreeOwnershipStore {
     init(
         writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
+            try DurableAtomicFileWriter.write(data, to: url)
         }
     ) {
         self.writer = writer

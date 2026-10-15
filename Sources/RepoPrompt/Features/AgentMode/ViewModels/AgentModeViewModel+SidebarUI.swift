@@ -556,11 +556,14 @@ extension AgentModeViewModel {
                     transcriptTurnsIsEmpty: session.transcript.turns.isEmpty,
                     runState: session.runState,
                     lastActivityAt: session.lastActivityAt,
-                    lastUserMessageAt: session.lastUserMessageAt
+                    lastUserMessageAt: session.lastUserMessageAt,
+                    worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
+                    worktreeMergeAttention: AgentWorktreeMergeBlockerSelector.sidebarAttention(
+                        in: session.worktreeMergeOperations
+                    )
                 )
             }
         return AgentSessionSidebarContentFingerprint(
-            currentTabID: currentTabID,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             tabsWithActiveAgentRun: tabsWithActiveAgentRun,
             mcpControlledTabIDs: mcpControlledTabIDs,
@@ -610,7 +613,6 @@ extension AgentModeViewModel {
             guard previous != self else { return Self.makeDebugDelta(categories: ["none"]) }
 
             var categories = Set<String>()
-            if previous.currentTabID != currentTabID { categories.insert("currentTabID") }
             if previous.sessionListCacheReady != sessionListCacheReady { categories.insert("sessionListCacheReady") }
             if previous.tabsWithActiveAgentRun != tabsWithActiveAgentRun { categories.insert("tabsWithActiveAgentRun") }
             if previous.mcpControlledTabIDs != mcpControlledTabIDs { categories.insert("mcpControlledTabIDs") }
@@ -767,7 +769,7 @@ extension AgentModeViewModel {
 
         private static func orderedCategories(from categories: Set<String>) -> [String] {
             let preferredOrder = [
-                "currentTabID", "sessionListCacheReady", "tabsWithActiveAgentRun", "mcpControlledTabIDs",
+                "sessionListCacheReady", "tabsWithActiveAgentRun", "mcpControlledTabIDs",
                 "tabMetadata.count", "tabMetadata.order", "tabMetadata.name", "tabMetadata.activeAgentSessionID",
                 "tabMetadata.isPinned", "tabMetadata.lastModified", "session.count", "session.activeAgentSessionID",
                 "session.parentSessionID", "session.hasLoadedPersistedState", "session.itemsIsEmpty",

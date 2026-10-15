@@ -963,6 +963,9 @@ struct AgentSessionRow: View {
     }
 
     var body: some View {
+        #if DEBUG
+            let _ = AgentSidebarRowRenderProbe.onSessionRowBody?(title)
+        #endif
         let sidebarOversightSummary = resolveSidebarOversightSummary?()
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {

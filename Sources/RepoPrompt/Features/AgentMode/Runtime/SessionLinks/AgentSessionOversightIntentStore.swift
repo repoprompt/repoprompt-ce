@@ -277,7 +277,7 @@ actor AgentSessionOversightIntentStore {
         mode: AgentSessionOversightPersistenceMode,
         fileManager: FileManager = .default,
         writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
-            try data.write(to: url, options: .atomic)
+            try DurableAtomicFileWriter.write(data, to: url)
         },
         now: @escaping @Sendable () -> Date = Date.init,
         makeUUID: @escaping @Sendable () -> UUID = UUID.init,
