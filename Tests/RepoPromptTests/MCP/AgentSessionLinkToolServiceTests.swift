@@ -1302,7 +1302,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: .enabled
         ))
-        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let workspace = await installLaneWorkspace(in: fixture.window)
         let args: [String: Value] = [
             "op": .string("create_lane"),
             "idempotency_key": .string("service-replay-1"),
@@ -1372,7 +1372,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let workspace = await installLaneWorkspace(in: fixture.window)
         let byName = AgentSessionLaneMCPToolService.resolveDestination(
             workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
         )
@@ -3717,6 +3717,16 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             locationLabel: "worktree/main",
             restorationReadiness: .authoritative(token, .persistedPayloadApplied)
         )
+    }
+
+    /// Lane routing tests need a known active destination, not whichever startup
+    /// selection wins scheduling in an otherwise inert tool-service fixture.
+    private func installLaneWorkspace(in window: WindowState) async -> WorkspaceModel {
+        await window.workspaceManager.awaitInitialized()
+        let workspace = WorkspaceModel(name: "Lane destination fixture", repoPaths: [])
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        return workspace
     }
 
     /// One granted oversight link over a real authority, plus a tool service wired to it.
