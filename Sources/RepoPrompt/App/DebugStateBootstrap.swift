@@ -107,7 +107,7 @@ enum DebugStateBootstrap {
             mappings = [(root, locations.applicationSupportRoot), (source.savedPromptsRoot, locations.savedPromptsRoot)]
             // Only app-owned mutable state, never provider homes/auth, caches,
             // install resources, runtime downloads, IPC claims or process locks.
-            for name in ["Settings", "Presets", "Partitions", "Workflows", "History"] {
+            for name in ["Settings", "Presets", "Partitions", "Workflows"] {
                 try addTree(root.appendingPathComponent(name), relative: name)
             }
             for name in ["SavedPrompts.json", "ContextBuilderPrompts.json"] {
