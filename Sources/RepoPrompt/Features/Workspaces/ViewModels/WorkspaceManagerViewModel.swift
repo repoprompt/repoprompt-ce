@@ -2026,10 +2026,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         selectionMirrorContextRevision &+= 1
     }
 
-    private func bumpStateVersion(for id: UUID?) {
+    private func bumpStateVersion(for id: UUID?, source: StaticString = #function) {
         guard let id else { return }
         stateVersionByWorkspaceID[id, default: 0] &+= 1 // wraparound-safe
+        #if DEBUG
+            lastStateVersionWriterForTesting[id] = String(describing: source)
+        #endif
     }
+
+    #if DEBUG
+        private var lastStateVersionWriterForTesting: [UUID: String] = [:]
+        private var workspaceSaveConflictHandlerForTesting: (([String: String]) -> Void)?
+
+        func setWorkspaceSaveConflictHandlerForTesting(_ handler: (([String: String]) -> Void)?) {
+            workspaceSaveConflictHandlerForTesting = handler
+        }
+    #endif
 
     // MARK: - Domain read-registration cache (M3 scoped reads)
 
@@ -2468,6 +2480,17 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func markWorkspaceDirty(workspaceID: UUID) {
         bumpStateVersion(for: workspaceID)
+    }
+
+    /// Deferred UI publications can arrive after a save has already captured them, or repeat
+    /// an unchanged selection during root reconciliation. They must not invalidate prepared
+    /// bytes unless there is still an actual persistent tab change to capture.
+    func markWorkspaceDirtyIfActiveTabSnapshotChanged() {
+        let (name, base) = activeComposeTabContext()
+        guard let base else { return }
+        let snapshot = collectComposeTabSnapshot(name: name, base: base)
+        guard Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: base, touchModified: false) else { return }
+        bumpStateVersion(for: activeWorkspaceID)
     }
 
     /// Quick lookup cache replaced with index-based lookup
@@ -15943,6 +15966,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         remainingRetryCount: Int = 1,
         ownSaveFence: OwnSaveFence? = nil
     ) async -> Result<Int, WorkspacePersistenceFailure> {
+        // Nonvisual runtimes own session payloads, never the borrowed UI document.
+        guard !isSessionRuntimeProjection else {
+            return .failure(WorkspacePersistenceFailure(category: .workspaceChanged))
+        }
         guard !Task.isCancelled,
               isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID)
         else {
@@ -16223,6 +16250,29 @@ class WorkspaceManagerViewModel: ObservableObject {
         ownSaveFence: OwnSaveFence?
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
+        #if DEBUG
+            // Value-only conflict evidence: no document, path, prompt or selection contents.
+            workspaceSaveConflictHandlerForTesting?([
+                "workspace": String(proposal.id.uuidString.prefix(8)),
+                "writerManager": String(instanceID.uuidString.prefix(8)),
+                "writerWindow": domainWorkspaceAuthorityClient.map { String($0.windowID) } ?? "none",
+                "source": source.description,
+                "runtimeProjection": String(isSessionRuntimeProjection),
+                "stateWriter": lastStateVersionWriterForTesting[proposal.id] ?? "none",
+                "capturedState": String(capture.stateVersion),
+                "currentState": String(stateVersionByWorkspaceID[proposal.id, default: 0]),
+                "modelEqual": String(workspace(withID: proposal.id) == capture.localWorkspace),
+                "capturedWorking": capture.revisions.map { String($0.workingRevision) } ?? "none",
+                "currentWorking": domainWorkspaceRevisionsByID[proposal.id].map { String($0.workingRevision) } ?? "none",
+                "capturedSaved": capture.revisions.map { String($0.savedRevision) } ?? "none",
+                "currentSaved": domainWorkspaceRevisionsByID[proposal.id].map { String($0.savedRevision) } ?? "none",
+                "capturedAdoption": String(capture.adoptionGeneration),
+                "currentAdoption": String(fullDocumentAdoptionGenerations[proposal.id, default: 0]),
+                "capturedRoot": String(capture.rootEditGeneration),
+                "currentRoot": String(rootEditGenerationByWorkspaceID[proposal.id, default: 0]),
+                "remainingRetries": String(remainingRetryCount)
+            ])
+        #endif
         guard let current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
         guard !current.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: proposal.id) else {

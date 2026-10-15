@@ -2801,11 +2801,11 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var sentMessages: [String] = []
     private var lastSentTurnID: UUID?
 
-    func completeLastTurn(text: String? = nil) {
+    func completeLastTurn(text: String? = nil, status: NativeAgentRuntimeTurnStatus = .completed) {
         guard let lastSentTurnID else { return }
         _ = events // Buffer an immediate reply even if the real runner has not subscribed yet.
         if let text { continuation?.yield(.stream(.init(type: "content", text: text))) }
-        continuation?.yield(.turnCompleted(turnID: lastSentTurnID, status: .completed))
+        continuation?.yield(.turnCompleted(turnID: lastSentTurnID, status: status))
         self.lastSentTurnID = nil
     }
 

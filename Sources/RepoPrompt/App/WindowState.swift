@@ -556,6 +556,7 @@ class WindowState: ObservableObject {
         if !manager.isTerminating, preservingOversightIntent {
             AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
         }
+        if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
         failUnstartedCommandsForWindowClose()
 
@@ -717,7 +718,8 @@ class WindowState: ObservableObject {
         borrowing source: WindowState,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) -> WindowState {
-        WindowState(
+        source.apiSettingsViewModel.retainForManagedRuntime()
+        return WindowState(
             contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
             codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
             keyManager: source.keyManager,
@@ -728,18 +730,23 @@ class WindowState: ObservableObject {
 
     let isPreparedSessionOwner: Bool
     private let compositionDomainRuntime: MCPDomainRuntime?
+    private var didReleaseManagedSettings = false
 
     /// Retire the private route and its provider/session work, not the app-wide MCP listener or
     /// borrowed API settings. This owner has no window settings or placement document to persist.
     @discardableResult
     func tearDownPreparedSessionOwner() async -> Bool {
         guard isPreparedSessionOwner else { return false }
-        beginClose(preservingOversightIntent: false)
+        beginClose()
         let saved = await agentModeViewModel.finishPreparedOversightRuntime()
         await mcpServer.unregisterDomainRoutingWindow()
         mcpServer.stopServiceObservation()
         await promptManager.gitViewModel.shutdownForWindowClose()
         aiQueriesService.cancelQuery()
+        if !didReleaseManagedSettings {
+            didReleaseManagedSettings = true
+            apiSettingsViewModel.releaseManagedRuntime()
+        }
         return saved
     }
 

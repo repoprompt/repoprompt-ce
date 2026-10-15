@@ -684,7 +684,13 @@ final class DelegationScopeRuntime: ObservableObject {
         request: DelegationScopeRequest, record: DomainDelegationScopeRecord,
         continuation: @escaping @MainActor (DomainDelegationScopeRecord) async -> Void
     ) {
+        #if DEBUG
+            test_activeOverseeContinuationCount += 1
+        #endif
         let task = Task { @MainActor [weak self] in
+            #if DEBUG
+                defer { self?.test_activeOverseeContinuationCount -= 1 }
+            #endif
             await continuation(record)
             guard let self else { return }
             overseeContinuationTasks[request.id]?.completedAt = now()
@@ -694,7 +700,16 @@ final class DelegationScopeRuntime: ObservableObject {
         )
     }
 
+    #if DEBUG
+        private(set) var test_activeOverseeContinuationCount = 0
+    #endif
+
     func notifyOverseeContinuation(sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false) {
+        // A refused link did not dispatch anything. Do not absorb a corrected retry as though
+        // it were a successful recently completed assignment.
+        if result.contains("; link_refused:") || result.contains("; link_failed:") {
+            overseeContinuationTasks.removeValue(forKey: requestID)
+        }
         enqueueDecision(sessionID: sessionID, tabID: tabID, result: result, identifier: requestID, automaticContinuation: continuing)
     }
 

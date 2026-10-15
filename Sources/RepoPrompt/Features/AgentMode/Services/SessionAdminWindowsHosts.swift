@@ -37,7 +37,7 @@ struct SavedOversightSessionLocation {
     let entry: AgentSessionIndexEntry
 
     var isCurrent: Bool {
-        guard let window, !window.isClosing,
+        guard let window,
               let current = window.workspaceManager.workspace(withID: workspace.id) else { return false }
         if window.workspaceManager.activeWorkspaceID == workspace.id,
            let latest = window.agentModeViewModel.ownerValidatedSessionIndex[entry.id],
@@ -47,16 +47,13 @@ struct SavedOversightSessionLocation {
            || latest.delegationScopeID != entry.delegationScopeID { return false }
         let tabs = current.composeTabs.filter { $0.id == tab.id }
         let stashes = current.stashedTabs.filter { $0.tab.id == tab.id }
-        if let stashedTabID {
-            return tabs.isEmpty && stashes.count == 1 && stashes[0].id == stashedTabID
-                && stashes[0].tab.activeAgentSessionID == tab.activeAgentSessionID
-        }
-        return stashes.isEmpty && tabs.count == 1 && tabs[0].activeAgentSessionID == tab.activeAgentSessionID
+        // The target's carrier and provenance matter, not the other chat currently displayed
+        // in it. Stashing/unstashing is UI placement, not withdrawal of managed-task consent.
+        return tabs.count + stashes.count == 1
     }
 
     func agreesOnCarrierAndProvenance(with other: Self) -> Bool {
-        window === other.window && workspace.id == other.workspace.id && tab.id == other.tab.id
-            && stashedTabID == other.stashedTabID && tab.activeAgentSessionID == other.tab.activeAgentSessionID
+        workspace.id == other.workspace.id && tab.id == other.tab.id
             && entry.parentSessionID == other.entry.parentSessionID
             && entry.createdByOverseerSessionID == other.entry.createdByOverseerSessionID
             && entry.organizationalParentID == other.entry.organizationalParentID
@@ -158,8 +155,12 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: sourceScopeID, isCurrent: isStillAuthorized)
         )
         switch outcome {
-        case .added: return .linked
-        case .alreadyLinked: return .alreadyLinked
+        case .added, .alreadyLinked:
+            if manager.hasPreparedRuntime(target) {
+                manager.preparedOversightConsentPairs[target, default: []].update(with: .init(observerSessionID: observer, targetSessionID: target, sourceScopeID: sourceScopeID))
+            }
+            if case .added = outcome { return .linked }
+            return .alreadyLinked
         case .failed, .rejected:
             let message = outcome.failureMessage ?? "The link could not be created."
             // `.revoked` promises nothing was left behind; a compensation that could not be written

@@ -1046,6 +1046,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             TabSession
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
+    weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     private var hasPreparedForWindowClose = false
     private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
@@ -5673,7 +5674,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         freshCreation: AgentSessionCreationClaim? = nil
     ) -> AgentPersistentSessionBindingIdentity? {
         if let sessionID, workspaceManager?.isSessionRuntimeProjection != true,
-           WindowStatesManager.shared.preparedOversightWindows[sessionID] != nil { return nil }
+           preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true { return nil }
         if session.activeAgentSessionID == sessionID {
             return session.persistentSessionBindingIdentity
         }
@@ -6141,8 +6142,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requiresHydration: Bool = false
     ) async throws -> AgentPersistentSessionBindingIdentity {
         if workspaceManager?.isSessionRuntimeProjection != true,
-           await !(WindowStatesManager.shared.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID))
+           let owners = preparedSessionRuntimes,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
         {
+            if let workspace = workspaceManager?.activeWorkspace {
+                let tabID = targetSession.tabID
+                let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+                owners.queuePreparedRuntimeVisit(requestedSessionID) { [weak self, weak targetSession] in
+                    guard let self, let targetSession, !self.hasPreparedForWindowClose,
+                          sessions[tabID] === targetSession,
+                          workspaceManager?.activeWorkspaceID == workspace.id,
+                          workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: requestedSessionID, workspace: workspace)
+                }
+            }
             throw PersistentBindingMutationError.blockedByOwnership
         }
         if targetSession.activeAgentSessionID == requestedSessionID,
@@ -7373,23 +7386,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
     func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
-        let owners = WindowStatesManager.shared
+        let owners = preparedSessionRuntimes
         let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
-            ? visibleSessionID.flatMap { owners.preparedOversightWindows[$0] == nil ? nil : $0 } : nil
-        if let preparedVisitID, !owners.preparedOversightUIVisits.insert(preparedVisitID).inserted { return session(for: tabID) }
+            ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return session(for: tabID) }
         defer {
             if let preparedVisitID {
-                owners.preparedOversightUIVisits.remove(preparedVisitID)
-                owners.notifyAgentSessionLinkTopologyChanged()
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
             }
         }
         if workspaceManager?.isSessionRuntimeProjection != true,
            let id = workspaceManager?.activeAgentSessionID(forTabID: tabID),
-           await !(WindowStatesManager.shared.releasePreparedOversightOwnerForVisit(sessionID: id))
+           let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: id, preparingReplacement: false))
         {
-            // The background runtime still owns an accepted run. The ordinary synchronous binding
-            // fence below keeps this UI placeholder unbound rather than installing a second writer.
+            // Keep one writer while the run settles; the user's visit is resumed by the
+            // owner's existing run-state observation, without a second click or polling timer.
+            let workspaceID = workspaceManager?.activeWorkspaceID
+            owners.queuePreparedRuntimeVisit(id) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspaceID,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == id else { return }
+                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders)
+            }
             return session(for: tabID)
         }
         let session = session(for: tabID)
@@ -7423,17 +7443,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel
     ) async -> AgentRouteSessionActivationResult {
-        let owners = WindowStatesManager.shared
+        let owners = preparedSessionRuntimes
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
-            ? sessionID.flatMap { owners.preparedOversightWindows[$0] == nil ? nil : $0 } : nil
-        if let preparedVisitID, !owners.preparedOversightUIVisits.insert(preparedVisitID).inserted { return .blockedByActiveDifferentSession }
+            ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return .blockedByActiveDifferentSession }
         defer {
             if let preparedVisitID {
-                owners.preparedOversightUIVisits.remove(preparedVisitID)
-                owners.notifyAgentSessionLinkTopologyChanged()
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
             }
         }
-        if let preparedVisitID, await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID)) {
+        if let preparedVisitID, let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID, preparingReplacement: false))
+        {
+            let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+            owners.queuePreparedRuntimeVisit(preparedVisitID) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspace.id,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace)
+            }
             return .blockedByActiveDifferentSession
         }
         guard let sessionID else {
@@ -10702,7 +10730,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 reason: reason.rawValue
             ))
             throw MCPError.internalError(
-                "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory)). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
+                "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory), category=\(receipt.outcome.normalizedFailureCategory?.rawValue ?? "none")). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
             )
         }
     }

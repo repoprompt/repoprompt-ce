@@ -184,19 +184,41 @@ extension AgentSessionLinkRuntimeBridge {
         guard case let .success(watching) = await authorizeTarget(
             operation: .monitorWait, observerEndpoint: observer, targetSessionID: targetSessionID
         ), consentIsCurrent() else { return }
+        #if DEBUG
+            test_activeOverseeWatches += 1
+            defer { test_activeOverseeWatches -= 1 }
+        #endif
         var cursor = before?.waitCursor
-        let deadline = Date().addingTimeInterval(60)
-        while consentIsCurrent(), Date() < deadline {
+        var deadline = overseeWatchNow().addingTimeInterval(60)
+        while consentIsCurrent() {
+            if overseeWatchNow() >= deadline {
+                notify("task_still_pending; automatic watch remains active; no user input is needed", continuing: true)
+                deadline = overseeWatchNow().addingTimeInterval(60)
+            }
             let update = await wait(
                 requests: [.init(lease: watching.lease, cursor: cursor)], until: .change,
-                timeoutSeconds: max(0.01, deadline.timeIntervalSinceNow)
+                timeoutSeconds: max(0.01, deadline.timeIntervalSince(overseeWatchNow()))
             )
             guard consentIsCurrent() else { return }
             if let state = update.targets.first {
                 cursor = state.waitCursor
+                if state.snapshot.lastActivityAt > (before?.snapshot.lastActivityAt ?? .distantPast) {
+                    switch state.snapshot.board.runOutcome {
+                    case .failed:
+                        notify("target_failed_with_new_activity; inspect agent_session_link poll/read for the task failure")
+                        return
+                    case .cancelled:
+                        notify("target_cancelled_with_new_activity; inspect agent_session_link poll/read for the task outcome")
+                        return
+                    case .completed:
+                        notify("target_idle_with_new_activity; inspect agent_session_link poll/read for the requested result")
+                        return
+                    default: break
+                    }
+                }
                 if state.snapshot.hasPendingInteraction {
-                    notify("target_waiting_for_approval; inspect agent_session_link poll/read now; no permission was auto-granted")
-                    return
+                    notify("target_waiting_for_approval; inspect agent_session_link poll/read now; no permission was auto-granted", continuing: true)
+                    continue
                 }
                 if state.snapshot.idleForSend, state.snapshot.lastActivityAt > (before?.snapshot.lastActivityAt ?? .distantPast) {
                     notify("target_idle_with_new_activity; inspect agent_session_link poll/read for the requested result")
@@ -204,10 +226,15 @@ extension AgentSessionLinkRuntimeBridge {
                 }
             }
             if case .changed = update.outcome { continue }
-            let status = update.outcome == .timedOut ? "timed_out" : "requires_poll"
-            notify("watch_status=\(status); inspect agent_session_link poll/wait and continue the assigned work")
+            if update.outcome == .timedOut {
+                // Sixty seconds bounds one wait, not ownership of the assigned task. Keep the
+                // app-owned continuation subscribed until a result/interaction or consent ends.
+                notify("task_still_pending; automatic watch remains active; no user input is needed", continuing: true)
+                deadline = overseeWatchNow().addingTimeInterval(60)
+                continue
+            }
+            notify("watch_status=requires_poll; inspect agent_session_link poll/wait and continue the assigned work")
             return
         }
-        if consentIsCurrent() { notify("task_still_pending; inspect agent_session_link poll/wait and continue the assigned work") }
     }
 }

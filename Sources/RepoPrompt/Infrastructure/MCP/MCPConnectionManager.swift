@@ -5283,6 +5283,13 @@ actor ServerNetworkManager {
     /// Use this at true end-of-scope boundaries (session deletion, tab/window close),
     /// not for normal observer lifecycle teardown.
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
+        // Retiring a route also retires its unconsumed/reserved bootstrap intent.
+        // Do this before the first actor hop: a late peer must not reinstall a terminal run.
+        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
+        for key in Array(pendingPoliciesByClient.keys) {
+            pendingPoliciesByClient[key]?.removeAll { $0.runID == runID }
+            if pendingPoliciesByClient[key]?.isEmpty == true { pendingPoliciesByClient.removeValue(forKey: key) }
+        }
         await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
@@ -12188,9 +12195,14 @@ actor ServerNetworkManager {
         requireRunRouting: Bool = true,
         expectedLifecycleGeneration: UInt64? = nil
     ) async -> PendingPolicyApplicationOutcome {
-        if let reservedEntry = oldestReservedPendingPolicyEntry(for: clientName),
-           canConsumePendingPolicy(reservedEntry.policy, clientName: clientName, clientPid: clientPid)
-        {
+        let initialSessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let initialRunID = runIDByConnectionID[connectionID]
+            ?? preferredLiveRunAffinity(for: clientName, sessionKey: initialSessionKey)?.runID
+        if let reservedEntry = oldestPendingPolicyEntry(for: clientName, where: {
+            $0.reservationConnectionID != nil
+                && (initialRunID == nil || $0.runID == initialRunID)
+                && canConsumePendingPolicy($0, clientName: clientName, clientPid: clientPid)
+        }) {
             mcpPolicyLog(
                 "pending policy route installation already reserved client=\(clientName) connection=\(connectionID) reservedConnection=\(reservedEntry.policy.reservationConnectionID?.uuidString ?? "nil") runID=\(reservedEntry.policy.runID?.uuidString ?? "nil")"
             )
@@ -12309,16 +12321,44 @@ actor ServerNetworkManager {
             #endif
         }
 
-        let hasPIDGatedPolicy = hasPIDGatedPendingPolicy(for: clientName)
-        let matchedQueueEntry = if hasPIDGatedPolicy {
-            oldestPIDGatedPendingPolicyEntry(for: clientName, matching: clientPid ?? -1)
-        } else {
-            oldestPendingPolicyEntry(for: clientName) { policy in
-                policy.reservationConnectionID == nil
-                    && canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
-            }
+        // A PID proves ancestry, not which run a shared provider process is serving.
+        // Prefer the exact connection/token binding before selecting a pending policy;
+        // never assign an unbound peer to an arbitrary run by FIFO.
+        let boundRunID = await runIDForConnection(connectionID)
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+        if let boundRunID, let liveAffinity, boundRunID != liveAffinity.runID {
+            return .rejected(runID: boundRunID, reason: "session_token_bound_to_other_run")
         }
+        let exactRunID = boundRunID ?? liveAffinity?.runID
+        let hasPIDGatedPolicy = hasPIDGatedPendingPolicy(for: clientName)
+        let eligible: (ClientConnectionPolicy) -> Bool = { policy in
+            policy.reservationConnectionID == nil
+                && (!hasPIDGatedPolicy || policy.requiresExpectedAgentPID)
+                && self.canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
+                && (exactRunID == nil || policy.runID == exactRunID)
+        }
+        if exactRunID == nil,
+           let first = oldestPendingPolicyEntry(for: clientName, where: eligible),
+           first.policy.purpose == .agentModeRun, let firstRunID = first.policy.runID,
+           oldestPendingPolicyEntry(for: clientName, where: {
+               eligible($0) && $0.runID != nil && $0.runID != firstRunID
+           }) != nil || admittedPolicyRunIDs.contains(where: { otherRunID in
+               otherRunID != firstRunID
+                   && runPolicyStateByRunID[otherRunID]?.purpose == .agentModeRun
+                   && clientPid.map {
+                       isExpectedAgentDescendant(clientName: clientName, clientPid: $0, runID: otherRunID) == true
+                   } == true
+           })
+        {
+            return .rejected(runID: nil, reason: "ambiguous_run_policy")
+        }
+        let matchedQueueEntry = oldestPendingPolicyEntry(for: clientName, where: eligible)
         guard let matchedQueueEntry else {
+            if liveAffinity != nil {
+                await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
+                return .fallback
+            }
             #if DEBUG
                 debugPolicyDiagnostic("pendingPolicyMiss", connectionID: connectionID, extra: [
                     "clientName": clientName,
@@ -12343,8 +12383,6 @@ actor ServerNetworkManager {
             await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
             return .fallback
         }
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
         var queue = pendingPoliciesByClient[matchedQueueEntry.key] ?? []
         mcpRoutingLog("Applying FIFO policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connectionID=\(connectionID) queueLength=\(queue.count) policyWindow=\(matchedQueueEntry.policy.windowID)")
         let policy: ClientConnectionPolicy

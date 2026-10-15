@@ -355,6 +355,36 @@ import XCTest
             XCTAssertEqual(Set([firstPair, secondPair]).count, 2)
         }
 
+        func testUnchangedCodemapPublicationDoesNotExhaustAdmissionSavePreparation() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let files = fixture.window.workspaceFilesViewModel
+            XCTAssertTrue(files.autoCodemapFiles.isEmpty)
+            var preparations = 0
+            fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor _, _, _ in
+                preparations += 1
+                // The root/selection reconciler can republish an unchanged empty list
+                // while off-main document preparation is suspended. Exercise the real
+                // Combine subscriber and drain its scheduled dirty-state callback.
+                files.setAutoCodemapFilesForTesting([])
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            defer { fixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            _ = try await makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                "op": .string("start"), "message": .string("unchanged selection must not veto admission"),
+                "detach": .bool(true), "timeout": .int(0)
+            ])
+            let count = await recorder.count()
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(preparations, 1, "No real workspace mutation occurred; the two-attempt retry budget must remain unused")
+        }
+
         func testCanonicalAdmissionRefreshReResolvesWorkspaceAfterReorder() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup { await fixture.cleanup() }
@@ -2296,6 +2326,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState(domainRuntime: runtime)
+            window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             do {
@@ -2374,6 +2407,9 @@ import XCTest
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let peer = WindowState(domainRuntime: runtime)
+            peer.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(peer)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             peerWindows.append(peer)

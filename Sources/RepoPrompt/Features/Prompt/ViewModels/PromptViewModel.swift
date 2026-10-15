@@ -2504,7 +2504,7 @@ class PromptViewModel: ObservableObject {
                 isDirty = true
                 // ⬇️ Only mark prompt-text dirty (light recalculation)
                 tokenCountingViewModel.markPromptDirty()
-                workspaceManager?.markWorkspaceDirty()
+                workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
@@ -2516,7 +2516,7 @@ class PromptViewModel: ObservableObject {
                 self?.isDirty = true
                 // ⬇️ Heavy changes (selection impacts baseline)
                 self?.tokenCountingViewModel.markDirty()
-                self?.workspaceManager?.markWorkspaceDirty()
+                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesSelectionVersion()
             }
@@ -2525,7 +2525,7 @@ class PromptViewModel: ObservableObject {
         fileManager.selectionClearedPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                self?.workspaceManager?.markWorkspaceDirty()
+                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 self?.updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
@@ -2534,7 +2534,7 @@ class PromptViewModel: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.workspaceManager?.markWorkspaceDirty()
+                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesAutoCodemapVersion()
             }
@@ -2544,7 +2544,7 @@ class PromptViewModel: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.workspaceManager?.markWorkspaceDirty()
+                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesAutoCodemapVersion()
             }
@@ -2604,7 +2604,7 @@ class PromptViewModel: ObservableObject {
                 self?.isDirty = true
                 // ⬇️ Only git diff tokens change (light recalculation)
                 self?.tokenCountingViewModel.markGitDiffDirty()
-                self?.workspaceManager?.markWorkspaceDirty()
+                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
                 self?.updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
@@ -5162,8 +5162,9 @@ class PromptViewModel: ObservableObject {
             dirtyTabIDs.insert(activeID)
             manager.markWorkspaceDirty()
         } else if !isDirty, wasDirty {
+            // Clearing a presentation-only dirty badge changes no workspace bytes.
+            // Bumping the save version here can exhaust an unrelated in-flight save.
             dirtyTabIDs.remove(activeID)
-            manager.markWorkspaceDirty()
         }
     }
 

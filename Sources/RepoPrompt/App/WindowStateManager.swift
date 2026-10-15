@@ -587,6 +587,9 @@ class WindowStatesManager: ObservableObject {
     var preparedOversightCleanupDirty = false
     var preparedOversightCarrierSubscriptions: [UUID: AnyCancellable] = [:]
     var retiringPreparedOversightWindows: [UUID: WindowState] = [:]
+    var preparedOversightConsentPairs: [UUID: Set<AgentSessionOversightIntent>] = [:]
+    var preparedOversightRunObservations: [UUID: AgentSessionLinkObservationToken] = [:]
+    var preparedOversightPendingVisits: [UUID: @MainActor () async -> Void] = [:]
     var sessionRuntimeWindows: [WindowState] {
         guard !preparedOversightWindows.isEmpty else { return allWindows }
         return allWindows + preparedOversightWindows.compactMap { id, owner in
@@ -1462,6 +1465,10 @@ class WindowStatesManager: ObservableObject {
             preparedOversightOwnerLocations.removeAll()
             preparedOversightLocations.removeAll()
             preparedOversightCarrierSubscriptions.removeAll()
+            preparedOversightConsentPairs.removeAll()
+            preparedOversightRunObservations.values.forEach { $0.invalidate() }
+            preparedOversightRunObservations.removeAll()
+            preparedOversightPendingVisits.removeAll()
             preparedOversightPreparationInFlight.removeAll()
             preparedOversightHandoffs.removeAll()
             preparedOversightCleanupTask?.cancel()

@@ -4,6 +4,7 @@ import Foundation
 /// request-local evidence, never a cache or authority retained across an await or mutation.
 @MainActor
 enum AgentSessionCarrierResolver {
+    weak static var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     struct Observation {
         let window: WindowState
         let workspaceID: UUID
@@ -298,45 +299,8 @@ enum AgentSessionCarrierResolver {
                 snapshot.replicatedSessionIDs.insert(row.sessionID)
             }
         }
-        let manager = WindowStatesManager.shared
-        for (id, location) in manager.preparedOversightLocations {
-            guard requestedIDs?.contains(id) != false, location.isCurrent,
-                  let source = location.window, windows.contains(where: { $0 === source }),
-                  !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id),
-                  !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: id) else { continue }
-            if let metadata = snapshot.metadata[id], metadata.contains(where: {
-                $0.workspaceID != location.workspace.id || $0.entry.tabID != location.entry.tabID
-            }) {
-                snapshot.ambiguousSessionIDs.insert(id)
-                continue
-            }
-            snapshot.sessionIDs.insert(id)
-            snapshot.claimedWorkspaceIDs[id, default: []].insert(location.workspace.id)
-            if snapshot.metadata[id]?.isEmpty != false {
-                snapshot.metadata[id] = [MetadataObservation(window: source, workspaceID: location.workspace.id, entry: location.entry)]
-            }
-            guard !snapshot.ambiguousSessionIDs.contains(id), !snapshot.replicatedSessionIDs.contains(id),
-                  let owner = manager.preparedOversightWindows[id], !owner.isClosing,
-                  let witness = manager.preparedOversightOwnerLocations[id], witness.isCurrent,
-                  witness.agreesOnCarrierAndProvenance(with: location), !manager.preparedOversightHandoffs.contains(id),
-                  let runtime = owner.agentModeViewModel.sessions[location.tab.id], runtime.activeAgentSessionID == id,
-                  runtime.permitsBoundOperationAndSave,
-                  let tabs = owner.workspaceManager.activeWorkspace?.composeTabs, tabs.count == 1,
-                  let tab = tabs.first else { continue }
-            let row = Observation(
-                window: owner, workspaceID: location.workspace.id, workspaceName: location.workspace.name,
-                sessionID: id, tab: tab, stashedTabID: nil, entry: location.entry, hasCurrentMetadataOwner: true
-            )
-            // A visited runtime must first take over through the handoff seam, never coexist as
-            // another writer. Do not erase a conflicting live/physical claim here.
-            if let existing = snapshot.uniqueLocations[id], existing.window !== source {
-                snapshot.ambiguousSessionIDs.insert(id)
-                continue
-            }
-            snapshot.rows.removeAll { $0.sessionID == id }
-            snapshot.rows.append(row)
-            snapshot.uniqueLocations[id] = row
-        }
-        return snapshot
+        return preparedSessionRuntimes?.addingPreparedRuntimeCarriers(
+            to: snapshot, sessionIDs: requestedIDs, windowIDs: Set(windows.map(\.windowID))
+        ) ?? snapshot
     }
 }

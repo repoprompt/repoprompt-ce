@@ -47,10 +47,15 @@ and reconnects remain authoritative at the unchanged provider-start availability
 A projection is not a second physical carrier claim;
 the real saved identity, provenance, ambiguity, deletion, binding and consent fences still apply.
 
-The live link retains that runtime. Retirement, revocation, deletion and carrier changes release it
-through lifecycle events, without polling timers. An idle user visit settles its payload before
-handing off to the normal visible binding; an active writer cannot be duplicated by a UI rebind.
-Saved intents restore through the same targeted preparation before missing-target classification.
+Authority and UI ownership have separate lifetimes. Revocation and deletion cancel and retire the
+runtime. Switching another chat, unstashing or closing the source window does not cancel a managed
+run or discard a live-consent link. A closing window transfers the exact witness to the already-bound
+private owner. Its live API-settings subscriptions are process-leased until the final managed owner
+settles; window close cannot tear down that shared source prematurely. An idle user visit settles
+its payload before handing off to the visible binding. A visit during a run queues that handoff and
+hydrates automatically when the run settles, without a second click or a duplicate writer.
+Scoped exact-target saved intents restore through targeted preparation before missing-target
+classification; ordinary unscoped links do not eagerly construct background window compositions.
 The reconciliation pass holds temporary ownership through establishment's actor hops and releases
 it on every exit, so cleanup cannot retire the prepared runtime before the link commits.
 Quit withdraws nonvisual routes and joins teardown under a two-second total budget; an unsettled
@@ -58,9 +63,11 @@ write or provider teardown is never described as completed or durable. No unrela
 hydrated. Missing, ambiguous, changed or unreadable saved state has a precise reason code rather
 than instructions for the agent to select a target.
 
-The target provider starts only for an actually requested message. A bounded, event-driven
-watch hands reply/approval/pending status back to the requester, whose next run has the current
-tools and must continue watching unfinished work. No target text is embedded in an app-authored
+The target provider starts only for an actually requested message. Each event-driven watch wait is
+bounded to 60 seconds, but the app-owned continuation rearms while the assigned task is unfinished.
+It delivers one terminal result and stops on completed, failed or cancelled status, revocation,
+deletion or shutdown. Pending status and genuine approvals resume the requester without abandoning
+the final result. Cancellation releases the pending wait; no polling timer survives teardown. No target text is embedded in an app-authored
 authority notice, and pending security approvals are never inferred from a managed task.
 
 Exact-target links persist their source scope ID with their ordinary intent. The scope owner
@@ -1231,6 +1238,19 @@ unavailability for fork, and a masked `destination_unavailable` for lane creatio
 no longer demands unused capacity evidence; creator and membership ambiguity still fail closed,
 and configured limits still require a complete census. Lane receipts distinguish scoped admission
 from unavailable destinations and include recovery guidance. This changes no persistence policy.
+
+## Exact run attribution, including shared provider processes
+
+A peer PID proves ancestry, not session identity. Pending Agent Mode policies must first match
+an existing connection/run binding or its live capability-token affinity. An unbound peer matching
+multiple run policies is refused as `ambiguous_run_policy`; neither policy is consumed. A known
+reconnecting token selects its own run even when another run's policy is older. One connection
+has one current run mapping, not a caller-selectable run on each tool call.
+
+Catalog and tool dispatch then fence the exact run, connection object/lifecycle, routing generation,
+window, workspace, tab and session endpoint. Activation refresh sends `tools/list_changed` to the
+matching mapped connection; a reconnect obtains its catalog on its own connection. PID equality,
+agent arguments and another run's returned catalog are never route proof.
 
 ## Catalog-convergence diagnostics
 

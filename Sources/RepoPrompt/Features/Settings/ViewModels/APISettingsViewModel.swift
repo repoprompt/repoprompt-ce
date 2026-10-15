@@ -1132,8 +1132,26 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
+    // A non-visual managed runtime leases this same live settings owner. Closing the source
+    // window withdraws only its UI lease; subscriptions stay process-owned until the last
+    // managed runtime settles. No availability snapshot or replacement settings loader is used.
+    private(set) var managedRuntimeLeaseCount = 0
+    private var windowCloseRequested = false
+
+    func retainForManagedRuntime() {
+        precondition(!hasPreparedForWindowClose)
+        managedRuntimeLeaseCount += 1
+    }
+
+    func releaseManagedRuntime() {
+        guard managedRuntimeLeaseCount > 0 else { return }
+        managedRuntimeLeaseCount -= 1
+        if managedRuntimeLeaseCount == 0, windowCloseRequested { prepareForWindowClose() }
+    }
+
     func prepareForWindowClose() {
-        guard !hasPreparedForWindowClose else { return }
+        windowCloseRequested = true
+        guard managedRuntimeLeaseCount == 0, !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil

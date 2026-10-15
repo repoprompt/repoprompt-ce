@@ -17,6 +17,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// Endpoint host with a full window topology: descriptors, discovery levels, and a restore
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
+        var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
         var candidates: [AgentSessionLinkEndpointCandidate] = [] {
             didSet {
                 byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
@@ -371,6 +372,46 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     private func replaceTopology(_ fixture: Fixture, with candidates: [AgentSessionLinkEndpointCandidate]) {
         fixture.host.candidates = candidates
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
+    }
+
+    func testUnscopedLaunchIntentDoesNotConstructBackgroundRuntime() async throws {
+        final class Registry: PreparedAgentSessionRuntimeRegistry {
+            var preparations = 0
+            func addingPreparedRuntimeCarriers(to snapshot: AgentSessionCarrierResolver.Snapshot, sessionIDs: Set<UUID>?, windowIDs: Set<Int>) -> AgentSessionCarrierResolver.Snapshot {
+                snapshot
+            }
+
+            func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
+                false
+            }
+
+            func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
+                true
+            }
+
+            func finishPreparedRuntimeVisit(_ sessionID: UUID) {}
+            func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool {
+                true
+            }
+
+            func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {}
+            func beginPreparedOversightPreparation(_ id: UUID) {}
+            func endPreparedOversightPreparation(_ id: UUID) {}
+            func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool {
+                preparations += 1
+                return false
+            }
+        }
+        try seedSavedPair()
+        let fixture = makeFixture()
+        let registry = Registry()
+        fixture.host.preparedSessionRuntimes = registry
+        fixture.host.candidates = [makeReadyCandidate(windowID: 1, sessionID: observerSessionID)]
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        let uncertain = await fixture.bridge.launchCoordinatorPrepareSavedTargets([pair])
+        fixture.bridge.launchCoordinatorFinishSavedTargetPreparation()
+        XCTAssertTrue(uncertain.isEmpty)
+        XCTAssertEqual(registry.preparations, 0, "Ordinary unscoped links restore lazily, not as full background compositions")
     }
 
     func testSavedPreparationOwnershipSpansEstablishmentAndIsReleasedOnEarlyExit() async {
