@@ -67,7 +67,7 @@ import XCTest
                     ComposeTabState(name: "Session \(index)", lastModified: date, promptText: String(repeating: "immutable preparation ", count: 48))
                 }
                 workspace.activeComposeTabID = workspace.composeTabs[1100].id
-                let document = try await WorkspaceDocumentPreparation.shared.document(for: workspace, fileURL: record.document.fileURL)
+                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: record.document.fileURL)
                 let reference = try DomainWorkspaceAuthorityClient.document(for: workspace, fileURL: record.document.fileURL)
                 XCTAssertEqual(document.documentBytes, reference.documentBytes)
                 XCTAssertEqual(document.contentDigest, reference.contentDigest)
