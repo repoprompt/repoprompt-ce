@@ -139,6 +139,19 @@ final class DelegationScopeRuntime: ObservableObject {
     static let maxRetainedRequests = 256
 
     @Published private(set) var requests: [UUID: DelegationScopeRequest] = [:]
+    /// Requester sessions the user approved with "Grant all for this session". Later requests from
+    /// these sessions are approved without another card until the user stops it, revokes one of the
+    /// session's scopes, the session is deleted, or the app quits. Only the user-facing Grant all
+    /// action adds to this set; no MCP argument can.
+    @Published private(set) var sessionWideApprovals: Set<UUID> = []
+    /// Global user setting (Settings › Agent Permissions), off by default. When on, every agent
+    /// delegation request is approved as requested without a card. Deliberately not exposed through
+    /// MCP `app_settings`, so an agent cannot enable it.
+    static let autoApproveAllRequestsKey = "agentMode.delegation.autoApproveAllRequests"
+    var isGlobalAutoApproveEnabled: @MainActor () -> Bool = {
+        UserDefaults.standard.bool(forKey: DelegationScopeRuntime.autoApproveAllRequestsKey)
+    }
+
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
     /// Separate continuity result. Grants save asynchronously; terminal decisions attempt a
@@ -713,6 +726,25 @@ final class DelegationScopeRuntime: ObservableObject {
         enqueueDecision(sessionID: sessionID, tabID: tabID, result: result, identifier: requestID, automaticContinuation: continuing)
     }
 
+    /// Approves a just-recorded pending request from the user's standing consent: "Grant all for
+    /// this session" for its requester, or the global auto-approve setting. Goes through the same
+    /// `approve` path as the card, so the grant, requester notice and oversee continuation are
+    /// identical. Returns false (card shown as usual) when no standing consent applies.
+    @discardableResult
+    func approveWithStandingConsent(requestID: UUID) -> Bool {
+        guard let request = requests[requestID], request.state == .pending else { return false }
+        let sessionWide = sessionWideApprovals.contains(request.requesterSessionID)
+        guard sessionWide || isGlobalAutoApproveEnabled() else { return false }
+        if case .success = approve(requestID: requestID, grantAllForSession: sessionWide) { return true }
+        return false
+    }
+
+    /// User action from Active delegations: stop approving this session's requests automatically.
+    /// Existing grants stay until revoked individually.
+    func endSessionWideApproval(sessionID: UUID) {
+        sessionWideApprovals.remove(sessionID)
+    }
+
     /// Re-read the app-owned binding at the synchronous grant boundary. A stale rendered card,
     /// a rebound tab, or a duplicate tab in another physical window can never approve a grant.
     @discardableResult
@@ -793,6 +825,7 @@ final class DelegationScopeRuntime: ObservableObject {
         case let .success(record):
             request.state = .granted(scopeID: record.id)
             requests[requestID] = request
+            if grantAllForSession { sessionWideApprovals.insert(request.requesterSessionID) }
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
             let continuation = overseeContinuations.removeValue(forKey: requestID)
             if let continuation {
@@ -851,6 +884,11 @@ final class DelegationScopeRuntime: ObservableObject {
     func revoke(scopeID: UUID) -> [DomainDelegationScopeRecord] {
         guard canUseAuthority else { return [] }
         let changed = authority.revoke(scopeID: scopeID)
+        // Revoking any of a session's grants also withdraws its standing "Grant all" approval;
+        // otherwise its next request would silently re-grant what the user just took away.
+        for record in changed {
+            sessionWideApprovals.remove(record.grant.granteeSessionID)
+        }
         recordRevocations(changed)
         return changed
     }
@@ -859,6 +897,7 @@ final class DelegationScopeRuntime: ObservableObject {
     @discardableResult
     func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
         deletedSessionIDs.insert(sessionID)
+        sessionWideApprovals.remove(sessionID)
         if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID) }
         guard canUseAuthority else { return [] }
         let changed = authority.revokeAll(involving: sessionID)

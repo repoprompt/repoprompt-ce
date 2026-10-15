@@ -42,6 +42,7 @@ struct AgentPermissionsSettingsView: View {
     var onNavigate: ((SettingsTab) -> Void)?
 
     @State private var scope: AgentPermissionSettingsScope = .directAgents
+    @AppStorage(DelegationScopeRuntime.autoApproveAllRequestsKey) private var autoApproveDelegationRequests = false
 
     init(
         apiSettingsVM: APISettingsViewModel,
@@ -100,6 +101,7 @@ struct AgentPermissionsSettingsView: View {
                 AgentPermissionSecureStorageDegradedBanner(diagnostics: diagnosticsVM)
                 scopePicker
                 scopeContent
+                delegationApprovalSection
                 relatedSection
                 Spacer(minLength: 0)
             }
@@ -185,6 +187,28 @@ struct AgentPermissionsSettingsView: View {
                 availability: availability,
                 onNavigate: onNavigate
             )
+        }
+    }
+
+    // MARK: - Delegation approvals
+
+    /// Global standing consent for agent oversight requests. Off by default; user-only (not exposed
+    /// through MCP app_settings). When on, Active delegations shows it and every grant stays revocable.
+    private var delegationApprovalSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Session Oversight Approvals")
+                .font(.headline)
+            Toggle(isOn: $autoApproveDelegationRequests) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Approve agent delegation requests automatically")
+                    Text("Agents that ask to observe, organize, control, or restructure your sessions get what they asked for without an approval card. Grants still appear in Active delegations, where you can revoke them. Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("agent-permissions-auto-approve-delegation")
         }
     }
 

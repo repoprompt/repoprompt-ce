@@ -369,6 +369,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let spentGeneration = session.codexControllerGeneration
                 window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
                 XCTAssertEqual(session.codexControllerGeneration, spentGeneration)
+                // Production retirement clears the old run's provider PID when its transport
+                // terminates (CodexAppServerClient.finishTransportTermination). This no-op controller
+                // has no process, and both runs share the XCTest PID, so mirror that clear; otherwise
+                // the retired run still looks like a live ancestor and the next bootstrap is
+                // correctly refused as ambiguous_run_policy.
+                await manager.clearExpectedAgentPID(getpid(), for: clientName, runID: runID)
                 // The next ordinary installed run re-lists the full surface; no synthetic turn.
                 let nextRunID = UUID()
                 let nextConnectionID = UUID()

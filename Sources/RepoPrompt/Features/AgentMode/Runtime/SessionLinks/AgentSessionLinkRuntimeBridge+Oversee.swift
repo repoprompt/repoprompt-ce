@@ -48,7 +48,10 @@ extension AgentSessionLinkRuntimeBridge {
                 scopeID: scope.id, requestID: request.id
             )
         }
-        let reused = scopes.continueOverseeWithExistingConsent(requestID: request.id)
+        // Standing user consent ("Grant all for this session" or the global setting) approves
+        // through the same path as the card, after the continuation is installed.
+        let autoApproved = scopes.approveWithStandingConsent(requestID: request.id)
+        let reused = autoApproved || scopes.continueOverseeWithExistingConsent(requestID: request.id)
         let currentState = scopes.request(id: request.id, requesterSessionID: observer.sessionID)?.state ?? request.state
         let result = currentState == .pending ? "approval_requested" : (reused ? "continuing_approved_request" : "request_replayed")
         let state = switch currentState {

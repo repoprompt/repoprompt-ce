@@ -131,14 +131,41 @@ struct DelegationApprovalSlot: View {
 /// oversight monitor popover; renders nothing when no scope is live.
 struct DelegationActiveScopesSection: View {
     @ObservedObject var runtime: DelegationScopeRuntime
+    @AppStorage(DelegationScopeRuntime.autoApproveAllRequestsKey) private var globalAutoApprove = false
 
     var body: some View {
         let scopes = runtime.allLiveScopes()
-        if !scopes.isEmpty || runtime.persistenceStatusMessage != nil || !runtime.continuityRecoveryOffers.isEmpty {
+        let standing = runtime.sessionWideApprovals.sorted { $0.uuidString < $1.uuidString }
+        if !scopes.isEmpty || !standing.isEmpty || globalAutoApprove || runtime.persistenceStatusMessage != nil
+            || !runtime.continuityRecoveryOffers.isEmpty
+        {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                 Text("Active delegations")
                     .font(.headline)
+                if globalAutoApprove {
+                    Label(
+                        "Approving every agent delegation request automatically (Settings › Agent Permissions).",
+                        systemImage: "checkmark.shield"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+                ForEach(standing, id: \.self) { sessionID in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(DelegationDisplayNames.sessionTitle(sessionID) ?? "Session \(sessionID.uuidString.prefix(8))")
+                                .lineLimit(1)
+                            Text("Grant all for this session: new requests are approved without a card")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Stop auto-approving") { runtime.endSessionWideApproval(sessionID: sessionID) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
                 if let message = runtime.persistenceStatusMessage {
                     Label(message, systemImage: "exclamationmark.triangle")
                         .font(.caption)
@@ -312,7 +339,7 @@ struct DelegationScopeApprovalCard: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(authorityUnavailableReason != nil)
-                    .hoverTooltip("Grant every capability permitted for the scope shown above, without expiry. Existing capacity and bulk-change limits remain. Revoke any time in Active delegations. Human-only actions remain excluded.")
+                    .hoverTooltip("Grant every capability permitted for the scope shown above, without expiry, and approve this session's later requests without asking again until the app quits. Existing capacity and bulk-change limits remain. Stop auto-approving or revoke any time in Active delegations. Human-only actions remain excluded.")
                 }
                 Button("Grant") {
                     switch onApprove(selected, threshold) {

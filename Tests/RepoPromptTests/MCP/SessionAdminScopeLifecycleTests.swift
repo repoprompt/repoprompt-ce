@@ -391,6 +391,64 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(try fixture.runtime.approve(requestID: global.id, grantAllForSession: true).get().grant.capabilities, DomainDelegationScopeCapability.allSessionsPermitted)
     }
 
+    func testGrantAllForSessionAndGlobalSettingApproveLaterRequestsWithoutAnotherCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        var globalEnabled = false
+        fixture.runtime.isGlobalAutoApproveEnabled = { globalEnabled }
+        func requestID(_ value: [String: Value]) throws -> UUID {
+            try XCTUnwrap(value["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        }
+
+        // No standing consent: the request waits for a card.
+        let first = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(first["result"], .string("pending_user_approval"))
+        let firstScope = try fixture.runtime.approve(requestID: requestID(first), grantAllForSession: true).get()
+        XCTAssertEqual(fixture.runtime.sessionWideApprovals, [overseer])
+
+        // Grant all covers this session's later requests of any kind: granted at once, no card.
+        let second = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("all_sessions"), "capabilities": .array([.string("observe")])
+        ])
+        XCTAssertEqual(second["result"], .string("granted"))
+        XCTAssertEqual(try fixture.runtime.requests[requestID(second)]?.state.label, "granted")
+        XCTAssertEqual(fixture.runtime.allLiveScopes().count, 2)
+
+        // Another session gets no free pass from this session's Grant all.
+        let other = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: other)
+        let otherRequest = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(otherRequest["result"], .string("pending_user_approval"))
+        try fixture.runtime.deny(requestID: requestID(otherRequest))
+
+        // Revoking one of the session's grants withdraws its standing approval.
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        fixture.runtime.revoke(scopeID: firstScope.id)
+        XCTAssertTrue(fixture.runtime.sessionWideApprovals.isEmpty)
+        let third = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(third["result"], .string("pending_user_approval"))
+        try fixture.runtime.deny(requestID: requestID(third))
+
+        // The global setting approves every requester exactly as requested, without widening.
+        globalEnabled = true
+        fixture.endpoint = fixture.makeEndpoint(session: other)
+        let global = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(global["result"], .string("granted"))
+        let globalScope = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.granteeSessionID == other })
+        XCTAssertEqual(globalScope.grant.capabilities, [.observe])
+        XCTAssertFalse(fixture.runtime.sessionWideApprovals.contains(other), "the global setting is not Grant all")
+
+        // Stopping a standing approval from Active delegations brings the card back.
+        globalEnabled = false
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let again = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        _ = try fixture.runtime.approve(requestID: requestID(again), grantAllForSession: true).get()
+        fixture.runtime.endSessionWideApproval(sessionID: overseer)
+        let afterStop = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(afterStop["result"], .string("pending_user_approval"))
+    }
+
     func testScopeStatusDiscoversOperationsAndCurrentGrantsBeforeFailure() async throws {
         let fixture = Fixture()
         let overseer = UUID()

@@ -162,9 +162,18 @@ struct SessionAdminMCPToolService {
             requesterTitle: DelegationDisplayNames.sessionTitle(endpoint.sessionID),
             workspaceName: workspaceName
         ) {
-        case let .success(request):
+        case let .success(recorded):
+            let runtime = scopes()
+            // Standing user consent approves through the card's own path; no card is shown.
+            let autoApproved = recorded.state == .pending && runtime.approveWithStandingConsent(requestID: recorded.id)
+            let request = runtime.request(id: recorded.id, requesterSessionID: endpoint.sessionID) ?? recorded
             var value = Self.requestValue(request)
             value["result"] = .string(request.state.label)
+            if autoApproved {
+                value["guidance"] = .string(
+                    "Granted immediately by the user's standing approval for this session; no card was shown. The grant is live now."
+                )
+            }
             if request.state == .pending {
                 value["guidance"] = .string(
                     "Nothing is granted yet. The user sees an approval card in this session. Continue other work; RepoPrompt notifies this requesting session when the user decides (after its active turn settles). You can also check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
