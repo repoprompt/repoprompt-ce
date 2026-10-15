@@ -60,44 +60,7 @@ struct RepoPromptFileLogHandler: LogHandler {
 }
 
 struct RepoPromptSwiftUIApp: App {
-    private static func checkDebugStateBoundary() {
-        let locations = AppProfileLocations.current
-        guard locations.identity.buildFlavor == .debug else { return }
-        do {
-            try locations.validateWritableRoot(locations.applicationSupportRoot)
-            try locations.validateWritableRoot(locations.savedPromptsRoot)
-            for filename in [DelegationScopeStore.filename, DelegationScopeStore.filename + ".lock", AgentSessionOversightIntentStore.filename, WorktreeOwnershipStore.filename, "Backups"] {
-                try locations.validateMetadataFile(locations.applicationSupportRoot.appendingPathComponent(filename))
-            }
-            if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
-                _ = try locations.customWorkspaceRoot(selectedDirectory: URL(fileURLWithPath: path, isDirectory: true))
-            }
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Debug state overlaps an unsafe storage location"
-            alert.informativeText = "\(error.localizedDescription)\nRelease data has not been moved or changed. Choose a separate debug storage location before reopening this build."
-            alert.addButton(withTitle: "Quit")
-            alert.runModal()
-            exit(EXIT_FAILURE)
-        }
-        // The previous directory mixed release and debug history. Do not guess
-        // ownership, move it, or copy its permission grants into this profile.
-        let release = AppProfileLocations(identity: .repoPromptCE(.release))
-        if !FileManager.default.fileExists(atPath: locations.applicationSupportRoot.path),
-           FileManager.default.fileExists(atPath: release.applicationSupportRoot.path)
-           || FileManager.default.fileExists(atPath: release.savedPromptsRoot.path)
-        {
-            let alert = NSAlert()
-            alert.messageText = "Debug sessions now use separate storage"
-            alert.informativeText = "This build keeps sessions, workspaces, settings, presets, and saved prompts in \(locations.applicationSupportRoot.path). Existing release and earlier debug data remains unchanged in its original location; nothing has been moved or deleted. Provider sign-in is unchanged."
-            alert.addButton(withTitle: "Continue")
-            alert.runModal()
-        }
-    }
-
     init() {
-        // Before session/settings singletons can normalize or write metadata.
-        Self.checkDebugStateBoundary()
         let appInitSpan = StartupPhaseLog.begin(.appInit)
         defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
@@ -245,8 +208,24 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
+    private static func checkDebugStateBoundary() {
+        do {
+            try DebugStateBootstrap.runIfNeeded()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Debug state snapshot could not be prepared"
+            alert.informativeText = "\(error.localizedDescription)\nProduction and prior debug state were preserved. Retry when release is idle, or launch with --debug-clean-slate for an isolated empty profile."
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            exit(EXIT_FAILURE)
+        }
+    }
+
     public static func main() {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        // Before defaults migration, provider launch snapshots, property wrappers,
+        // or any settings/session singleton can observe or normalize this profile.
+        Self.checkDebugStateBoundary()
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()

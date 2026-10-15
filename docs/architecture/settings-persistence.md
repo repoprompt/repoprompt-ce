@@ -206,13 +206,48 @@ compiled build flavor; `applicationStateDirectoryName` selects mutable state.
 | Oversight intents, scope continuity, worktree ownership | Same release root | Same debug root |
 | One-click recovery archive in Downloads | `RepoPrompt-Backup` | `RepoPrompt-Debug-Backup` |
 
-Release paths and formats are unchanged. The previous shared directory contains
-indistinguishable release/earlier-debug history: startup explains the new debug
-location rather than silently presenting a migration as successful. No source
-files are moved, deleted, or automatically copied. In particular, permission
-grants and credentials are not migrated. Existing provider authentication is
-unchanged. Explicit import/export remains a user action; imported absolute
-metadata references do not authorize writes to release storage.
+Release paths and formats are unchanged. Each normal debug **app process launch**
+prepares a new independent working snapshot of production state before app stores
+open. `--debug-clean-slate` skips the production seed for that launch only; it is
+not a preference, and the next normal launch seeds production again. This is
+state initialization, not a compiler/cache cold build. Existing provider homes,
+authentication, Keychain items and harmless runtime caches remain shared; the
+bootstrap never copies credentials or requires a new login.
+
+The seed follows the current workspace catalog/index, copies workspace documents
+and conversation backing files, and materializes pending workspace journal bytes
+into the destination. Custom metadata sources are copied into the debug root;
+repository paths remain repository paths. Settings, presets, prompts, workflows,
+window state, slice selections and Oracle conversation artifacts are included.
+Rebuildable session indexes, locks/PIDs/runtime claims, Git data, workspace folders outside the live catalog and source recovery/backup trees are not restored as active state. Source
+history/recovery files remain at their original locations; an omitted unavailable
+workspace cannot be reconstructed from an absent source document.
+
+Source files and directory membership must remain stable across the capture, with
+three bounded attempts. Database snapshots use SQLite's backup API, never an
+uncoordinated live database-file copy, source migration or checkpoint. The current
+rollback-journal continuity store is supported. WAL sources currently fail closed
+rather than risk a write to production SHM read marks; they are not silently
+omitted or opened with the unsafe `immutable` promise.
+
+Copied provider conversation/cleanup handles are detached so a debug continuation
+cannot append to or delete its production provider conversation. Local transcript
+history is retained for the ordinary history-replay/new-conversation path. Saved
+production grants/continuity are preserved separately in `ProductionContinuity`,
+not promoted into debug authority. Automatic wakes and active merge/compact claims
+are not revived. No provider mode is disabled.
+
+Preparation and validation happen in staging. A same-volume atomic directory swap
+publishes the complete profile; a failed preparation leaves prior debug and source
+bytes intact. Prior debug-only work and its preferences are recoverable under
+`RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
+snapshots are retained; unrelated files and unrecognized crash leftovers are not
+deleted. Normal startup is silent. Failure presents an actionable debug-only error
+and exits instead of opening a partial mixture. `debugSeed.json` and the redacted
+startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
+preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
+CLI requests do not re-seed a running app. Explicit standalone headless profiles
+remain independent and do not run the app launch bootstrap.
 
 Custom debug storage selections and explicit headless profiles use a build-flavor-namespaced child directory. Runtime profile IDs and release directory semantics remain unchanged. Known
 release roots (including configured custom storage), canonical aliases, symlinked

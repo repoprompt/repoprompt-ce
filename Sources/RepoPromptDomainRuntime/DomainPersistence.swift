@@ -374,17 +374,21 @@ package struct DomainPersistenceCoordinator {
         configuration.workspaceStorageDirectory
     }
 
-    private var runtimeRoot: URL {
-        let safe = configuration.profileIdentifier
+    /// Stable persistence format path, shared with read-only profile snapshotting.
+    package static func runtimeDirectoryName(profileIdentifier: String) -> String {
+        let safe = profileIdentifier
             .unicodeScalars
             .map { CharacterSet.alphanumerics.contains($0) ? String($0) : "_" }
             .joined()
             .prefix(48)
-        let digest = DomainContentDigest.sha256(Data(configuration.profileIdentifier.utf8)).prefix(12)
-        return configuration.storageDirectory
-            .appendingPathComponent("DomainRuntime", isDirectory: true)
-            .appendingPathComponent("v1", isDirectory: true)
-            .appendingPathComponent("\(safe)-\(digest)", isDirectory: true)
+        let digest = DomainContentDigest.sha256(Data(profileIdentifier.utf8)).prefix(12)
+        return "DomainRuntime/v1/\(safe)-\(digest)"
+    }
+
+    private var runtimeRoot: URL {
+        configuration.storageDirectory.appendingPathComponent(
+            Self.runtimeDirectoryName(profileIdentifier: configuration.profileIdentifier), isDirectory: true
+        )
     }
 
     package var oracleStorageRoot: URL {
