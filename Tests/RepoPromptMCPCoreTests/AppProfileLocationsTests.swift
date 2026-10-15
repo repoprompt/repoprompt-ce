@@ -103,7 +103,7 @@ final class AppProfileLocationsTests: XCTestCase {
                 homeDirectory: locations.homeDirectory, temporaryDirectory: directory.appendingPathComponent("tmp"),
                 customWorkspaceStoragePath: nil, identity: .repoPromptCE(.release)
             )
-            XCTAssertEqual(release.storageDirectory, parent)
+            XCTAssertEqual(release.storageDirectory.path, parent.path)
             XCTAssertEqual(release.profileIdentifier, "default")
         }
     }
