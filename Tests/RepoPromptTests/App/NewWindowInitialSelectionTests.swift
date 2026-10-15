@@ -19,6 +19,265 @@ import XCTest
     final class NewWindowInitialSelectionTests: XCTestCase {
         private typealias Fixture = NewWindowInitialSelectionFixture
 
+        // MARK: Off-main catalog preparation and its new suspension boundary
+
+        func testCoveringManagerReconciliationDuringPreparationCreditsBridgeWithoutReadoptingModels() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("initial preparation ready before manager reconciliation")
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                let receipt = try XCTUnwrap(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let tab = try XCTUnwrap(workspace.composeTabs.first)
+                let title = "Local descendant of the covering reconciliation"
+                manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
+                    value.name = title
+                }
+                manager.markWorkspaceDirty(workspaceID: workspace.id)
+                let adoptions = catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }
+                gate.release()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(receipt.kind, .full)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .metadata)
+                XCTAssertEqual(catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }, adoptions, "the bridge must not replace already-qualified document lineages")
+                XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+            }
+        }
+
+        func testPointAdoptedDescendantSurvivesFirstBridgeCatalogPreparation() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    catalog, projection: .full(f.decoded(catalog)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let tab = try XCTUnwrap(workspace.composeTabs.first)
+                let title = "Point-adopted descendant before first bridge projection"
+                manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tab.id]) { _, value in
+                    value.name = title
+                }
+                manager.markWorkspaceDirty(workspaceID: workspace.id)
+                let adoptions = catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                XCTAssertEqual(manager.workspace(withID: workspace.id)?.composeTabs.first?.name, title)
+                XCTAssertEqual(catalog.workspaces.map {
+                    manager.adoptedFullDocumentGeneration(workspaceID: $0.document.workspaceID, contentDigest: $0.document.contentDigest)
+                }, adoptions)
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+            }
+        }
+
+        func testCancelledRepairFenceDuringPreparationForcesUnchangedRecordDecode() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("partial decode plan ready before independent repair fence")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { _ in
+                    preparations += 1
+                    if preparations == 1 {
+                        entered.fire()
+                        await gate.wait()
+                    }
+                }
+                let added = try await f.commitWorkspace(named: "Repair fence race", window: window, awaitProjection: false)
+                try await f.wait(entered)
+                var fencedDecodes = 0
+                manager.setCatalogRecordDecodeFailureForTesting { id in
+                    guard id == Fixture.aardvarkID else { return nil }
+                    fencedDecodes += 1
+                    return NSError(domain: "PreparationFenceRegression", code: 1)
+                }
+                // This real repair raises its independent fence before observing cancellation.
+                // It accepts no catalog and changes no model, dirty counter or publication floor.
+                let repair = Task { @MainActor in
+                    await manager.reconcileDuplicateCleanupAuthorityAfterFailedSaveForTesting()
+                }
+                repair.cancel()
+                let reconciled = await repair.value
+                XCTAssertFalse(reconciled)
+                XCTAssertTrue(manager.requiresFullCatalogReconciliation)
+                let readsBeforeRelease = fencedDecodes
+                gate.release()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertGreaterThan(fencedDecodes, readsBeforeRelease, "the pre-fence reuse plan must not certify an unchanged cached member")
+                XCTAssertGreaterThan(preparations, 1)
+                XCTAssertNotNil(manager.workspaceChooserPresentation.failure)
+                XCTAssertNotNil(manager.workspace(withID: added.id))
+            }
+        }
+
+        func testPointAuthorityOutcomeInvalidatesPreparationWithoutPublishingModels() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                await manager.awaitInitialized()
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12060)
+                let initial = await client.snapshot()
+                XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(
+                    initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil,
+                    rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                var changed = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                changed.currentPromptText = "A peer's canonical working edit"
+                let outcome = try await client.replaceWorkingFailClosed(
+                    changed, fileURL: record.document.fileURL,
+                    expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(outcome.disposition, .applied)
+                let latest = await client.snapshot()
+                let canonical = try XCTUnwrap(latest.workspaces.first { $0.document.workspaceID == changed.id })
+                let witness = manager.catalogPreparationWitness
+                let models = manager.workspaces
+                let reconciliation = manager.domainCatalogReconciliationGeneration
+                manager.applyDomainAuthorityBaseline(
+                    workspaceID: changed.id, revisions: canonical.revisions,
+                    digest: canonical.document.contentDigest, health: canonical.health,
+                    catalogRevision: latest.catalogRevision
+                )
+                XCTAssertEqual(manager.workspaces, models, "a point outcome has not adopted the peer's full document")
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, reconciliation)
+                XCTAssertEqual(manager.catalogPreparationWitness.publicationSerial, witness.publicationSerial)
+                XCTAssertNil(manager.qualifiedDomainWorkspaceDescendant(canonical), "point revision knowledge must never certify an unadopted document")
+                XCTAssertNotEqual(manager.catalogPreparationWitness, witness, "revision/digest knowledge invalidates suspended preparation independently")
+            }
+        }
+
+        func testLargePreparedDocumentPreservesBytesCASAndDurableSelectedTab() async throws {
+            try await Fixture.run { f in
+                let client = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -12061)
+                let initial = await client.snapshot()
+                let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                var workspace = try XCTUnwrap(f.decoded(initial).first { $0.id == Fixture.aardvarkID })
+                let date = Date(timeIntervalSince1970: 1_234_567_890)
+                workspace.composeTabs = (0 ..< 1603).map { index in
+                    ComposeTabState(name: "Session \(index)", lastModified: date, promptText: String(repeating: "immutable preparation ", count: 48))
+                }
+                workspace.activeComposeTabID = workspace.composeTabs[1100].id
+                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: record.document.fileURL)
+                let reference = try DomainWorkspaceAuthorityClient.document(for: workspace, fileURL: record.document.fileURL)
+                XCTAssertEqual(document.documentBytes, reference.documentBytes)
+                XCTAssertEqual(document.contentDigest, reference.contentDigest)
+                let saved = try await client.saveFailClosed(
+                    document, expectedWorkspaceRevision: record.revisions.workingRevision,
+                    expectedContentDigest: record.document.contentDigest
+                )
+                XCTAssertEqual(saved.working?.disposition, .applied)
+                XCTAssertEqual(saved.saved?.disposition, .applied)
+                let durable = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: Data(contentsOf: record.document.fileURL), fileURL: record.document.fileURL
+                )
+                XCTAssertEqual(durable.composeTabs, workspace.composeTabs)
+                XCTAssertEqual(durable.activeComposeTabID, workspace.activeComposeTabID)
+                let stale = try await client.replaceWorkingFailClosed(
+                    reference, expectedWorkspaceRevision: record.revisions.workingRevision
+                )
+                XCTAssertEqual(stale.disposition, .conflict, "prepared bytes must not bypass the original CAS baseline")
+                XCTAssertEqual(try Data(contentsOf: record.document.fileURL), document.documentBytes)
+            }
+        }
+
+        func testCatalogPreparationRunsOffMainAndKeepsInitialAuthorityMembership() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread, "the real catalog decoder must not run on main")
+                    preparations += 1
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                let accepted = try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
+                XCTAssertGreaterThan(preparations, 0)
+                XCTAssertTrue(Fixture.standardIDs.isSubset(of: Set(manager.workspaces.map(\.id))))
+            }
+        }
+
+        func testLocalEditDuringCatalogPreparationIsNotRolledBackByPreparedOverlay() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let original = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let tab = try XCTUnwrap(original.composeTabs.first)
+                let gate = f.makeGate()
+                let entered = Signal("real decode completed before main-actor application")
+                var preparations = 0
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread)
+                    preparations += 1
+                    if preparations == 1 {
+                        entered.fire()
+                        await gate.wait()
+                    }
+                }
+                let added = try await f.commitWorkspace(named: "Preparation race", window: window, awaitProjection: false)
+                try await f.wait(entered)
+                let title = "Local edit while CPU preparation was suspended"
+                XCTAssertEqual(manager.updateComposeTabPresentation(workspaceID: original.id, tabIDs: [tab.id]) { _, value in
+                    value.name = title
+                }, [tab.id])
+                manager.markWorkspaceDirty(workspaceID: original.id)
+                gate.release()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertGreaterThanOrEqual(preparations, 2, "the stale preparation must use the existing bounded refetch")
+                XCTAssertEqual(manager.workspace(withID: original.id)?.composeTabs.first?.name, title)
+                XCTAssertNotNil(manager.workspace(withID: added.id))
+                XCTAssertNil(manager.workspaceChooserPresentation.failure)
+            }
+        }
+
+        func testStoppedCatalogPreparationCannotPublishOrCreditItsOldRun() async throws {
+            try await Fixture.run { f in
+                let (window, manager, chooser, events) = await f.makeWindowWithHeldInitialProjection()
+                let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let gate = f.makeGate()
+                let entered = Signal("initial projection prepared but not applied")
+                bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
+                    XCTAssertFalse(wasOnMainThread)
+                    entered.fire()
+                    await gate.wait()
+                }
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.wait(entered)
+                let emissions = chooser.emitted.count
+                bridge.stop()
+                gate.release()
+                await bridge.stopAndJoinForTesting()
+                XCTAssertEqual(chooser.emitted.count, emissions)
+                XCTAssertEqual(manager.workspaceChooserPresentation, .loading)
+                XCTAssertTrue(events.catalogCheckpoints.isEmpty)
+                XCTAssertNil(bridge.projectionObservationStateForTesting.checkpoint)
+            }
+        }
+
         // MARK: 1. Decisive production-composition regression
 
         func testUntouchedWindowNeverPublishesMainWhileInitialDefaultIsGated() async throws {
@@ -5957,6 +6216,7 @@ import XCTest
             }
             for window in windows {
                 window.domainWorkspacePresentationBridgeForTesting?.afterCatalogReloadForTesting = nil
+                window.domainWorkspacePresentationBridgeForTesting?.catalogPreparationDidFinishForTesting = nil
             }
             if let runtimeStartTask {
                 do { try await runtimeStartTask.value } catch { XCTFail("Fixture runtime start failed: \(error)") }
