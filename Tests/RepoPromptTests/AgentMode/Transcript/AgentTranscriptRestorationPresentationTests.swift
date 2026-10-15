@@ -3714,3 +3714,68 @@ extension AgentSidebarRestoreStabilityTests {
         }
     }
 }
+
+/// Gate the real scheduled cleanup without involving a provider process or a wall-clock delay.
+@MainActor
+private final class RestorationCleanupDrainDelegate: WorkspaceSwitchSessionProviderDelegate {
+    let gate = PrepareGate()
+    private(set) var didFinishTeardown = false
+
+    func teardownMCPControlForDiscardedSession(
+        _ session: AgentTabSession,
+        cleanupSessionStore: Bool,
+        publishChanges: Bool,
+        deactivateLiveControlContext: Bool
+    ) async {
+        try? await gate.hold()
+        didFinishTeardown = true
+    }
+
+    func cleanupMCPRunRoutingForDiscardedSession(
+        boundSessionID: UUID?,
+        liveSession: AgentTabSession,
+        explicitRunID: UUID?,
+        reason: String
+    ) async {}
+}
+
+extension AgentTranscriptRestorationLifecycleTests {
+    func testCleanupDrainExpiredDeadlineReportsTimeoutAndStillDrainsAfterRelease() async throws {
+        try await withRealObserverSavedTab { fixture in
+            let provider = fixture.viewModel.workspaceSwitchProvider
+            let originalDelegate = provider.delegate
+            let delegate = RestorationCleanupDrainDelegate()
+            provider.delegate = delegate
+            defer { provider.delegate = originalDelegate }
+            let session = AgentTabSession(tabID: UUID())
+            provider.scheduleBackgroundCleanup(targets: [WorkspaceSwitchSessionCleanupTarget(
+                tabID: session.tabID,
+                session: session,
+                boundSessionID: nil,
+                runIDs: [],
+                provider: nil,
+                acpController: nil,
+                detachedClaude: nil,
+                detachedCodex: nil
+            )], reason: "restoration_drain_regression")
+            await delegate.gate.waitUntilEntered()
+
+            // No suspension is needed to recognize an already-expired budget. Releasing
+            // on the next actor turn also bounds the old timer-race implementation: it
+            // incorrectly accepts cleanup completed *after* expiry (or throws cancellation).
+            let release = Task { await delegate.gate.open() }
+            do {
+                try await provider.test_drainBackgroundCleanup(timeoutNanoseconds: 0)
+                XCTFail("An unfinished cleanup with an expired budget must report timeout")
+            } catch let error as AgentModeWorkspaceSwitchCleanupDrainTimeoutError {
+                XCTAssertEqual(error.timeoutNanoseconds, 0)
+            } catch {
+                XCTFail("Expected cleanup timeout, not \(error)")
+            }
+            XCTAssertFalse(delegate.didFinishTeardown, "Expiry must return without joining the still-pending cleanup")
+            await release.value
+            try await provider.test_drainBackgroundCleanup(timeoutNanoseconds: 5_000_000_000)
+            XCTAssertTrue(provider.test_backgroundCleanupDrainTasks.isEmpty, "Timeout must not cancel or lose the cleanup")
+        }
+    }
+}
