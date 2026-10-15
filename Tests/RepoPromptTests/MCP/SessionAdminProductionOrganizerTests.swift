@@ -496,6 +496,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                         }
                         XCTAssertEqual(try fixture.workspace().composeTabs.first { $0.id == independent.id }, independent)
                         await manager.debugDrainScheduledSaves()
+                        // Scheduled saves finish at enqueue; the actual writer may still be
+                        // coalescing that payload. Join durability before reading real bytes.
+                        await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
                         let final = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
                         XCTAssertEqual(final.composeTabs.first { $0.id == fixture.targetTab.id }?.name, "Target")
                         XCTAssertEqual(final.composeTabs.first { $0.id == independent.id }, independent)
