@@ -55,6 +55,24 @@ final class AppProfileLocationsTests: XCTestCase {
         }
     }
 
+    func testMetadataTargetMayShareAnAncestorButCannotMutateProductionOrItsAncestor() throws {
+        try withFixture { directory, locations in
+            let release = locations.releaseStateRoots[0]
+            try FileManager.default.createDirectory(at: release, withIntermediateDirectories: true)
+            let sentinel = release.appendingPathComponent("sentinel.json")
+            let bytes = Data("production unchanged".utf8)
+            try bytes.write(to: sentinel)
+            let sibling = directory.appendingPathComponent("unrelated-metadata", isDirectory: true)
+            XCTAssertNoThrow(try locations.validateMetadataFile(sibling))
+            XCTAssertNoThrow(try locations.validateMetadataURL(sibling.appendingPathComponent("settings.json"), within: directory))
+            XCTAssertThrowsError(try locations.validateMetadataFile(sentinel))
+            XCTAssertThrowsError(try locations.validateMetadataFile(directory))
+            XCTAssertThrowsError(try locations.validateWritableRoot(directory))
+            XCTAssertEqual(try Data(contentsOf: sentinel), bytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sibling.path))
+        }
+    }
+
     func testHeadlessRootUsesIdentityAndRefusesProductionOverride() throws {
         try withFixture { directory, locations in
             let headless = try DirectHeadlessRuntimeLocationResolver.resolve(

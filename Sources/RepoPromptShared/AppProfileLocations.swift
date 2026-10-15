@@ -62,19 +62,23 @@ public struct AppProfileLocations: Sendable {
     public func validateWritableRoot(_ url: URL, additionalReleaseRoots: [URL] = []) throws {
         guard identity.buildFlavor == .debug else { return }
         guard url.isFileURL, url.path.hasPrefix("/"), url.path != "/" else { throw ProfileLocationError.invalidRoot(url.path) }
-        let canonical = try Self.canonicalURL(url)
+        try validateDirectory(url)
+        try validateProtectedPath(url, additionalReleaseRoots: additionalReleaseRoots, rejectAncestors: true)
+    }
+
+    private func validateDirectory(_ url: URL) throws {
         var status = stat()
         if lstat(url.path, &status) == 0 {
             guard status.st_mode & S_IFMT == S_IFDIR else { throw ProfileLocationError.notDirectory(url.path) }
         } else if errno != ENOENT { throw ProfileLocationError.unavailable(url.path) }
-        if identity.buildFlavor == .debug {
-            for source in releaseStateRoots + additionalReleaseRoots {
-                let protected = try Self.canonicalURL(source)
-                // Reject ancestors too: a recursive cleanup of the selected root must
-                // never include production state. Compare path components, not prefixes.
-                if Self.contains(canonical, protected) || Self.contains(protected, canonical) {
-                    throw ProfileLocationError.releaseAlias(url.path)
-                }
+    }
+
+    private func validateProtectedPath(_ url: URL, additionalReleaseRoots: [URL], rejectAncestors: Bool) throws {
+        let canonical = try Self.canonicalURL(url)
+        for source in releaseStateRoots + additionalReleaseRoots {
+            let protected = try Self.canonicalURL(source)
+            if Self.contains(protected, canonical) || (rejectAncestors && Self.contains(canonical, protected)) {
+                throw ProfileLocationError.releaseAlias(url.path)
             }
         }
     }
@@ -83,7 +87,13 @@ public struct AppProfileLocations: Sendable {
     /// imported or persisted absolute references. This is accidental-write protection,
     /// not an OS security boundary against a malicious same-user process.
     public func validateMetadataURL(_ url: URL, within root: URL) throws {
-        try validateWritableRoot(root, additionalReleaseRoots: protectedCustomRoots)
+        guard identity.buildFlavor == .debug else { return }
+        guard root.isFileURL, root.path.hasPrefix("/") else { throw ProfileLocationError.invalidRoot(root.path) }
+        try validateDirectory(root)
+        // The containment parent is not itself the mutation target. A safe sibling
+        // file/directory can share an ancestor with production (for example temp HOME).
+        try validateProtectedPath(root, additionalReleaseRoots: protectedCustomRoots, rejectAncestors: false)
+        try validateProtectedPath(url, additionalReleaseRoots: protectedCustomRoots, rejectAncestors: true)
         let target = url.standardizedFileURL
         let canonicalRoot = try Self.canonicalURL(root)
         guard Self.contains(root.standardizedFileURL, target), try Self.contains(canonicalRoot, Self.canonicalURL(target)) else {
