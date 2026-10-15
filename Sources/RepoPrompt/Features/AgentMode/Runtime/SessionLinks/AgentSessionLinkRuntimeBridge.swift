@@ -1210,9 +1210,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Delegation-scope state (an authority *input* to oversight; it owns none of the four owners'
     /// responsibilities). Like `intentStore`, its durable store is installed by app composition.
-    let delegationScopes = DelegationScopeRuntime(
-        persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
-    )
+    let delegationScopes: DelegationScopeRuntime
     private var scopedLinkConsentInstalled = false
 
     func ensureScopedLinkConsent() async -> Bool {
@@ -1508,8 +1506,12 @@ final class AgentSessionLinkRuntimeBridge {
             await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID)
         },
         now: @escaping @Sendable () -> Date = { Date() },
-        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+        delegationScopes: DelegationScopeRuntime? = nil
     ) {
+        self.delegationScopes = delegationScopes ?? DelegationScopeRuntime(
+            persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
+        )
         self.restorePerfRecorder = restorePerfRecorder
         self.authority = authority
         self.host = host

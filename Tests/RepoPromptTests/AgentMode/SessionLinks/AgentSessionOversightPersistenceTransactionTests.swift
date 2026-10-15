@@ -238,7 +238,7 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         )
     }
 
-    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled) -> Fixture {
+    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled, scopes: DelegationScopeRuntime? = nil) -> Fixture {
         let authority = DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -267,7 +267,8 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
                 await MainActor.run {
                     host?.onToolAdvertisementInvalidation?(sessionID)
                 }
-            }
+            },
+            delegationScopes: scopes
         )
         bridge.installIntentStore(store)
         return Fixture(
@@ -313,7 +314,9 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
     // MARK: - Tests
 
     func testContinuityBootsConsentFirstAndReopenReadsCurrentScopeProvenance() async throws {
-        let fixture = makeFixture()
+        // Opt into the real production restore mode; the default unit-test owner is ephemeral.
+        let scopes = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        let fixture = makeFixture(scopes: scopes)
         let scopeStore = DelegationScopeStore(
             fileURL: directory.appendingPathComponent(DelegationScopeStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled

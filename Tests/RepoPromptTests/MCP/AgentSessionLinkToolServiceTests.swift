@@ -1105,9 +1105,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertFalse(noInventedLink)
         let noInventory = await fixture.authority.links(forObserver: endpoint.sessionID)
         XCTAssertTrue(noInventory.items.isEmpty)
-        do { _ = try await service.execute(args: [:])
-            XCTFail("bootstrap disappears once activated")
-        } catch {}
+        // The bootstrap remains advertised after activation; repeating it must return helpful
+        // guidance rather than the old, misleading "not available" error. It still grants nothing.
+        let repeated = try await service.execute(args: [:])
+        XCTAssertEqual(repeated, .string(BecomeOverseerMCPToolService.nextTurnResult))
+        let stillNoInventedLink = await fixture.authority.hasActiveLink(endpoint: endpoint)
+        XCTAssertFalse(stillNoInventedLink)
         // The only alternate success text is an honest limitation, not an ACP refresh promise.
         fixture.host.activations.removeAll()
         fixture.host.bootstrapProvider = .devin
