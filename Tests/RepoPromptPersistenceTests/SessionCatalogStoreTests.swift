@@ -1,8 +1,156 @@
+import Darwin
 import Foundation
 @testable import RepoPromptPersistence
 import XCTest
 
 final class SessionCatalogStoreTests: XCTestCase {
+    func testOverseerRowTransactionsReceiptsAndPermanentTerminalIdentities() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Overseer-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("private/state.sqlite")
+        let first = OverseerContinuityStore(databaseURL: url, profile: "test")
+        let second = OverseerContinuityStore(databaseURL: url, profile: "test")
+        XCTAssertEqual(try first.engineSettings(), ["journal_mode": "delete", "synchronous": "3", "fullfsync": "1", "foreign_keys": "1"])
+        let parent = OverseerContinuityRow(kind: .scope, id: "parent", payload: Data("parent".utf8))
+        let child = OverseerContinuityRow(kind: .scope, id: "child", parentID: "parent", payload: Data("child".utf8))
+        let unrelated = OverseerContinuityRow(kind: .scope, id: "other", payload: Data("other".utf8))
+        let operation = UUID()
+        let receipt = try first.commit(operationID: operation, origin: "user-owner", mutations: [.grant(parent)])
+        XCTAssertEqual(try second.receipt(operationID: operation), receipt)
+        XCTAssertTrue(try second.commit(operationID: operation, origin: "user-owner", mutations: [.grant(parent)]).replayed)
+        XCTAssertThrowsError(try first.commit(operationID: operation, origin: "user-owner", mutations: [.grant(unrelated)]))
+        _ = try second.commit(operationID: UUID(), origin: "other-owner", mutations: [.grant(unrelated), .grant(child)])
+        XCTAssertEqual(try first.rows(kind: .scope).count, 3, "An old owner must not replace another owner's rows")
+        let revoked = try first.commit(operationID: UUID(), origin: "user-owner", mutations: [.revokeScope("parent")])
+        XCTAssertEqual(Set(revoked.affectedIDs), ["parent", "child"])
+        XCTAssertThrowsError(try second.commit(operationID: UUID(), origin: "stale-import", mutations: [.grant(parent)]))
+        XCTAssertThrowsError(try second.commit(operationID: UUID(), origin: "late-child", mutations: [.grant(.init(kind: .scope, id: "late", parentID: "parent", payload: Data()))]))
+        let tombstones = (0 ..< 1050).map { OverseerContinuityMutation.revokeScope("old-\($0)") }
+        _ = try first.commit(operationID: UUID(), origin: "terminal-history", mutations: tombstones)
+        XCTAssertEqual(try second.rows(kind: .scope).filter(\.terminal).count, 1052)
+        XCTAssertEqual(try second.rows(kind: .scope).filter { !$0.terminal }.map(\.id), ["other"])
+    }
+
+    func testOverseerConcurrentFirstOpenSerializesSchemaAndIndependentRows() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerConcurrent-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("private/state.sqlite")
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0 ..< 12 {
+                group.addTask {
+                    let store = OverseerContinuityStore(databaseURL: url, profile: "test")
+                    _ = try store.commit(operationID: UUID(), origin: "parallel-owner", mutations: [.grant(.init(kind: .scope, id: "row-\(index)", payload: Data()))])
+                }
+            }
+            try await group.waitForAll()
+        }
+        let store = OverseerContinuityStore(databaseURL: url, profile: "test")
+        XCTAssertEqual(try store.rows(kind: .scope).count, 12)
+        XCTAssertEqual(try store.engineSettings()["journal_mode"], "delete")
+        for error in [OverseerContinuityError.terminalIdentity, .revisionConflict, .operationConflict] {
+            XCTAssertTrue(error.isPermanentTransitionFailure)
+        }
+        XCTAssertFalse(OverseerContinuityError.writerBusy.isPermanentTransitionFailure)
+    }
+
+    func testOverseerBusyFailureIsRetryableAndHasNoFalseReceipt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerBusy-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("private/state.sqlite")
+        let store = OverseerContinuityStore(databaseURL: url, profile: "test")
+        _ = try store.engineSettings()
+        let child = Process(), ready = Pipe(), release = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('BEGIN IMMEDIATE'); print('locked',flush=True); sys.stdin.readline(); c.rollback()", url.path]
+        child.standardOutput = ready
+        child.standardInput = release
+        try child.run()
+        defer { if child.isRunning { child.terminate()
+            child.waitUntilExit()
+        } }
+        XCTAssertEqual(String(data: ready.fileHandleForReading.availableData, encoding: .utf8), "locked\n")
+        let operation = UUID(), mutation = OverseerContinuityMutation.grant(.init(kind: .scope, id: "live", payload: Data()))
+        XCTAssertThrowsError(try store.commit(operationID: operation, origin: "user", mutations: [mutation]))
+        XCTAssertNil(try store.receipt(operationID: operation), "No committed receipt may be invented on busy failure")
+        release.fileHandleForWriting.write(Data("release\n".utf8))
+        child.waitUntilExit()
+        let receipt = try store.commit(operationID: operation, origin: "user", mutations: [mutation])
+        XCTAssertEqual(try store.receipt(operationID: operation), receipt)
+        XCTAssertEqual(try store.rows(kind: .scope).map(\.id), ["live"])
+    }
+
+    func testOverseerMigrationRetainsBytesRejectedRowsAndDestinationWins() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerImport-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = OverseerContinuityStore(databaseURL: root.appendingPathComponent("private/state.sqlite"), profile: "test")
+        let bytes = Data("original mixed source including an undecodable row".utf8)
+        let source = OverseerLegacySource(id: "source", path: "/read-only/source.json", digest: OverseerContinuityStore.digest(bytes), bytes: bytes, reason: "user_review_required")
+        let grant = OverseerContinuityRow(kind: .scope, id: "already-revoked", payload: Data("old permission".utf8))
+        try store.archive(source, rows: [.init(ordinal: 0, raw: bytes, mutation: .grant(grant), outcome: "review"), .init(ordinal: 1, raw: Data("invalid".utf8), mutation: nil, outcome: "rejected_unknown_capability")])
+        _ = try store.commit(operationID: UUID(), origin: "user", mutations: [.revokeScope(grant.id)])
+        let receipt = try store.activateLegacy(sourceID: source.id, operationID: UUID(), origin: "explicit-recovery")
+        XCTAssertTrue(receipt.affectedIDs.isEmpty)
+        XCTAssertEqual(try store.legacySources(), [source])
+        XCTAssertTrue(try store.rows(kind: .scope).first?.terminal == true)
+        XCTAssertThrowsError(try OverseerContinuityStore(databaseURL: store.databaseURL, profile: "another-profile").rows(kind: .scope))
+    }
+
+    func testOverseerDeletedAnchorsFenceLateImportsAndFutureDatabaseRemainsUntouched() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerDeletion-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("private/state.sqlite")
+        let store = OverseerContinuityStore(databaseURL: url, profile: "test")
+        _ = try store.commit(operationID: UUID(), origin: "user-deletion", mutations: [.deletedSession("gone")])
+        XCTAssertThrowsError(try store.commit(operationID: UUID(), origin: "late-import", mutations: [
+            .grant(.init(kind: .scope, id: "unknown-saved-grant", ownerID: "gone", payload: Data()))
+        ]))
+        XCTAssertThrowsError(try store.commit(operationID: UUID(), origin: "late-link", mutations: [
+            .put(.init(kind: .link, id: "pair", ownerID: "gone", anchorID: "target", payload: Data()), expectedRevision: nil)
+        ]))
+        do { let db = try SessionCatalogDatabase(url: url)
+            try db.execute("PRAGMA user_version=999")
+        }
+        let before = try Data(contentsOf: url)
+        XCTAssertThrowsError(try store.engineSettings())
+        XCTAssertEqual(try Data(contentsOf: url), before, "An unknown database must never be reset, migrated or rewritten")
+    }
+
+    func testOverseerRollbackJournalRecoversAfterAnotherProcessDiesMidTransaction() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OverseerCrash-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("private/state.sqlite")
+        let store = OverseerContinuityStore(databaseURL: url, profile: "test")
+        let operation = UUID()
+        _ = try store.commit(operationID: operation, origin: "user", mutations: [.grant(.init(kind: .scope, id: "kept", payload: Data()))])
+        let child = Process(), ready = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-c", """
+        import sqlite3,sys,time
+        c=sqlite3.connect(sys.argv[1])
+        c.execute('PRAGMA cache_size=10')
+        c.execute('BEGIN IMMEDIATE')
+        c.execute("UPDATE continuity_rows SET terminal=1 WHERE id='kept'")
+        for i in range(128):
+            c.execute("INSERT INTO continuity_rows(kind,id,capabilities,payload,terminal,revision) VALUES ('worktree',?,'[]',zeroblob(65536),0,99)", ('uncommitted-'+str(i),))
+        print('spilled',flush=True)
+        time.sleep(60)
+        """, url.path]
+        child.standardOutput = ready
+        try child.run()
+        defer { if child.isRunning { child.terminate()
+            child.waitUntilExit()
+        } }
+        XCTAssertEqual(String(data: ready.fileHandleForReading.availableData, encoding: .utf8), "spilled\n")
+        // SIGKILL is deliberately confined to this test-owned child and temporary SQLite file.
+        XCTAssertEqual(kill(child.processIdentifier, SIGKILL), 0)
+        child.waitUntilExit()
+        XCTAssertFalse(try XCTUnwrap(store.rows(kind: .scope).first).terminal, "The interrupted revoke was never committed")
+        XCTAssertTrue(try store.rows(kind: .worktree).isEmpty, "Cache-spilled uncommitted rows must roll back")
+        XCTAssertNotNil(try store.receipt(operationID: operation), "Earlier committed continuity survives without a clean exit")
+        _ = try store.commit(operationID: UUID(), origin: "user", mutations: [.revokeScope("kept")])
+        XCTAssertTrue(try XCTUnwrap(OverseerContinuityStore(databaseURL: url, profile: "test").rows(kind: .scope).first).terminal)
+    }
+
     private func fixture() throws -> (URL, URL, SessionCatalogStore) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SessionCatalogTests-\(UUID().uuidString)", isDirectory: true)
         let databaseURL = root.appendingPathComponent("catalog.sqlite")

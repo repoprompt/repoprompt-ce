@@ -199,9 +199,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             set { lock.withLock { shouldFail = newValue } }
         }
 
-        func write(_ data: Data, to url: URL) throws {
+        func check() throws {
             if failsNextWrites { throw CocoaError(.fileWriteOutOfSpace) }
-            try data.write(to: url, options: .atomic)
         }
     }
 
@@ -333,7 +332,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: mode,
-            writer: { data, url in try gate.write(data, to: url) }
+            beforeCommit: { try gate.check() }
         )
         let bridge = AgentSessionLinkRuntimeBridge(
             authority: authority,
@@ -641,7 +640,13 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     func testParkedDeletionCannotRestoreAndFailedCleanupRemainsRetryable() async throws {
+        let base = try XCTUnwrap(directory)
+        defer { directory = base }
         for failsWrite in [false, true] {
+            // Each variant is a separate profile. Reusing a terminal pair would correctly refuse
+            // resurrection from the stale legacy seed and would not test cleanup failure.
+            directory = base.appendingPathComponent("case-\(failsWrite)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             AgentSessionDeletionRegistry.shared.test_reset()
             let (fixture, observer, _) = try await makeRestoredFixture()
             fixture.bridge.attach(host: fixture.host)
@@ -657,8 +662,11 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.test_settleLaunchReconciliation()
             let restored = await isRestored(fixture)
             XCTAssertFalse(restored)
-            XCTAssertEqual(fixture.bridge.currentPersistencePresentation.hasPendingCleanupRetry, failsWrite)
+            await fixture.store.serializationBarrier()
+            let saving = await fixture.store.saveState
+            XCTAssertEqual(saving, failsWrite ? "failed" : "saved")
             fixture.gate.failsNextWrites = false
+            await fixture.store.retrySaving()
             await fixture.bridge.retryPendingIntentCleanup()
             let token = await fixture.store.token(for: pair)
             XCTAssertNil(token)

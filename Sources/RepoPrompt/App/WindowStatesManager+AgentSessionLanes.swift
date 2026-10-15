@@ -143,7 +143,7 @@ extension WindowStatesManager {
               window.workspaceManager.activeWorkspaceID == workspaceID,
               window.workspaceManager.activeWorkspace?.id == workspaceID
         else {
-            throw MCPError.invalidParams("The lane destination is unavailable.")
+            throw AgentSessionLaneDestinationFailure.destinationChanged
         }
         let outcome = try await window.agentModeViewModel.mcpCreateOversightLane(
             creatorSessionID: creatorSessionID,

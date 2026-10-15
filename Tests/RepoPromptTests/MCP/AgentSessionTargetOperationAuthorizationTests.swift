@@ -1655,7 +1655,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: creator, target: .newSession,
             scopes: fixture.scopes, administration: fixture.core, projector: projector
-        ), .denied(.usageProofMissing), "A missing safe placement is not evidence that this creator is unscoped")
+        ), .creatorPlacementUnresolved(projector.pointResolutionState(for: creator) == .replicated ? "creator_replicated" : "creator_ancestry_conflict"), "A missing safe placement is not evidence that this creator is unscoped")
         let after = fixture.scopes.usageIncludingReservations(emptyUsage)
         XCTAssertEqual(after.liveSessionCount, before.liveSessionCount)
         XCTAssertEqual(after.worktreeCount, before.worktreeCount)
@@ -1691,7 +1691,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let emptyUsage = DomainDelegationScopeUsage(scopeID: scope.id, liveSessionCount: 0, worktreeCount: 0)
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: child, target: .newSession, scopes: scopes, administration: core, projector: projector
-        ), .denied(.usageProofMissing))
+        ), .creatorPlacementUnresolved("creator_ancestry_conflict"))
+        let diagnostic = String(describing: DelegationSpawnAdmission.error(for: .usageProofMissing, subreason: "creator_ancestry_conflict"))
+        XCTAssertTrue(diagnostic.contains("creator_ancestry_conflict"))
+        XCTAssertTrue(diagnostic.contains("scope_status"))
         XCTAssertEqual(scopes.usageIncludingReservations(emptyUsage), emptyUsage)
 
         // An actually unloaded root retains the existing ancestry contract; it is distinct from a

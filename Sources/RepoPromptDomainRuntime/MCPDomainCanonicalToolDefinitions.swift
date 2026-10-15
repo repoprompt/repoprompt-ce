@@ -2236,9 +2236,18 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     /// Description-only projection; preserve the frozen model-selection and earlier migration shapes.
     private enum AgentSessionLinkOverseerActivationGuidance {
-        static let description = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
+        static let previousDescription = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
             of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
             with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
+        )
+
+        static func isPrevious(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == previousDescription && definition.inputSchema == AgentSessionLinkModelSelectionMigration.inputSchema
+        }
+
+        static let description = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
+            of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
+            with: "- `create_lane`: direct link or overseer opt-in; make your managed lane; unique `idempotency_key`. Its first message assigns the lane's job, without asking the user to repeat it. No unrelated authority is inherited: approvals, sandbox/permission changes, destructive or out-of-workspace actions still need their own user approval."
         )
 
         static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
@@ -2246,7 +2255,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
 
         static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
-            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition))
+            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition) || isPrevious(definition))
             return MCPDomainToolDefinition(
                 name: definition.name, description: description, inputSchema: definition.inputSchema,
                 annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
@@ -2463,7 +2472,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
-        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) {
+        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
         }
         precondition(!agentSessionLinkModelSelectionIsPartial(definition), "Partial agent_session_link model selection contract")
@@ -2474,6 +2483,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
         !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
+            && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
                 definition.description.contains("set_model")

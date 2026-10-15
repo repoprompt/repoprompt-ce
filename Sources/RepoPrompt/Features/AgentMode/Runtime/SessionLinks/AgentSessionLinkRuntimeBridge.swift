@@ -1081,11 +1081,10 @@ final class AgentSessionLinkRuntimeBridge {
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     }
 
-    private enum IntentPersistenceAdmission {
+    private enum IntentContinuityLookup {
         /// No durable layer is installed in this process.
         case noDurableLayer
         case available(AgentSessionOversightIntentStore)
-        case refused(String)
     }
 
     /// What one fresh establishment attempt produced.
@@ -1385,6 +1384,7 @@ final class AgentSessionLinkRuntimeBridge {
     private var pendingMonitorObserverEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     private var monitorProjectionRefreshTask: Task<Void, Never>?
     private var bindingChangeCancellable: AnyCancellable?
+    private var continuityChangeCancellable: AnyCancellable?
 
     #if DEBUG
         var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
@@ -1491,6 +1491,30 @@ final class AgentSessionLinkRuntimeBridge {
         self.host = host
         self.toolAdvertisementInvalidator = toolAdvertisementInvalidator
         self.now = now
+        continuityChangeCancellable = NotificationCenter.default.publisher(for: .agentOverseerContinuityDidChange)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.refreshContinuityDiagnostics() }
+            }
+    }
+
+    /// Continuity notifications repaint diagnostics only; they can neither grant nor revoke live
+    /// authority, re-establish a link, deliver a message, or admit a wake.
+    private func refreshContinuityDiagnostics() async {
+        guard let intentStore, !isFrozenForTermination else { return }
+        let state = await intentStore.saveState
+        let detail = await intentStore.diagnostic
+        if state == "saved" {
+            persistencePresentation.availability = await intentStore.persistenceMode == .enabled ? .ready : .dormant
+            persistencePresentation.dismissWarnings(ids: ["oversight.continuity.save"])
+            if let detail { persistencePresentation.appendWarning(id: "oversight.continuity.recovery", message: detail) }
+        } else if state == "pending" {
+            persistencePresentation.availability = .saving
+        } else if state == "not_persisted" {
+            persistencePresentation.availability = .suppressed
+        } else {
+            persistencePresentation.availability = .blocked(detail ?? "Live links apply now; continuity saving is \(state), not durable or shared.")
+        }
+        publishPersistencePresentation()
     }
 
     // MARK: - Attachment
@@ -1889,20 +1913,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
     #endif
 
-    /// Classifies whether persistence currently admits a mutation.
-    ///
-    /// `loadForLaunch()` is idempotent and reports the settled classification, so Add and Stop both
-    /// observe exactly what the launch load decided rather than re-reading the file.
-    private func intentPersistenceAdmission() async -> IntentPersistenceAdmission {
+    /// Live admission never opens or awaits the continuity database. Bootstrap/background save
+    /// notifications own diagnostics; a stalled file cannot delay a real user-approved task.
+    private func intentContinuityLookup() -> IntentContinuityLookup {
         guard let intentStore else { return .noDurableLayer }
-        switch await intentStore.loadForLaunch() {
-        case .ready:
-            return .available(intentStore)
-        case .suppressed:
-            return .refused(AgentSessionOversightPersistenceCopy.suppressedLaunch)
-        case let .blocked(reason):
-            return .refused(AgentSessionOversightPersistenceCopy.message(for: reason))
-        }
+        return .available(intentStore)
     }
 
     /// Whether this establishment's durable token is still the current one for its pair.
@@ -2006,7 +2021,7 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// The deadline is total and the losing branch is never awaited: a transaction stuck behind a
     /// hung filesystem must not hold up quit. Anything unsettled is logged as a count and abandoned;
-    /// the write-through store means every *reported* Add or Stop is already durable.
+    /// live action results and continuity-save acknowledgement are reported separately.
     func settleIntentTransactions(
         deadlineSeconds: TimeInterval = AgentSessionLinkRuntimeBridge.defaultIntentSettlementSeconds
     ) async {
@@ -2031,8 +2046,8 @@ final class AgentSessionLinkRuntimeBridge {
             reachedDeadline = !cleanupSettled
         }
         if !reachedDeadline {
-            // Write-through, so this is a linearization point rather than a flush: it only confirms
-            // that every operation registered before it crossed the store actor.
+            // Await the current outbox attempt. A failed save remains observable and is not
+            // represented as durable; do not hold quit open for an unbounded retry loop.
             let barrierSettled = await withinDeadline(deadline) { [weak self] in
                 await self?.intentStore?.serializationBarrier()
             }
@@ -2080,8 +2095,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// Runs one shutdown phase, abandoning it when the total deadline elapses first.
     ///
     /// The losing branch is never awaited and never structurally joined: a phase stuck behind a hung
-    /// filesystem must not hold up quit, and the write-through store means everything already
-    /// reported to the user is already durable.
+    /// filesystem must not hold up quit. Only acknowledged row commits are durable; a successful
+    /// live decision by itself is not a continuity-save acknowledgement.
     ///
     /// - Returns: `false` when the deadline elapsed before the phase completed.
     private func withinDeadline(
@@ -2812,16 +2827,11 @@ final class AgentSessionLinkRuntimeBridge {
         let transaction = registerTransaction()
         defer { finishTransaction(transaction) }
 
-        let store: AgentSessionOversightIntentStore?
-        switch await intentPersistenceAdmission() {
+        let store: AgentSessionOversightIntentStore? = switch intentContinuityLookup() {
         case .noDurableLayer:
-            store = nil
+            nil
         case let .available(value):
-            store = value
-        case let .refused(message):
-            // Persistence failure blocks the action outright: a session-only link that silently
-            // disappears on the next launch is worse than a refusal the user can act on.
-            return .rejected(message: message)
+            value
         }
 
         // Token B may not reserve until token A's removal and establishment have settled, and the
@@ -2881,6 +2891,12 @@ final class AgentSessionLinkRuntimeBridge {
                 )
             }
             let receipt = await store.insert(pair)
+            if !receipt.isDurable {
+                persistencePresentation.availability = receipt.saveState == "pending" ? .saving
+                    : receipt.saveState == "not_persisted" ? .suppressed
+                    : .blocked(receipt.saveError ?? "Live link applied; continuity saving failed. It is not durable or shared.")
+                publishPersistencePresentation()
+            }
             switch receipt.outcome {
             case .applied, .unchanged:
                 // Idempotent: an existing pair reuses its token rather than superseding it, so an
@@ -6855,6 +6871,10 @@ final class AgentSessionLinkRuntimeBridge {
             return .rejected(.denied)
         }
 
+        // Managed task assignment includes idle sends and create_lane's first task, not just
+        // steer. Sample exact management authority and require it again at the final dispatch fence.
+        let managedTargets = await authority.managedObservationTargetsIfValid(leases: [target.lease])
+        let requiresManagement = delivery == .managedSteer || managedTargets?.contains(target.candidate.sessionID) == true
         let disposition = await authority.beginSend(
             lease: target.lease,
             idempotencyKey: idempotencyKey,
@@ -6920,7 +6940,7 @@ final class AgentSessionLinkRuntimeBridge {
             observerDisplayName: observer.resolvedDisplayName,
             message: message,
             workflow: workflow,
-            framing: delivery == .managedSteer ? .management : .coordination
+            framing: requiresManagement ? .management : .coordination
         )
         request.startStopFence = startStopFence
         // Keep the host that supplied this exact candidate through the send transaction. The
@@ -6932,7 +6952,6 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         let authority = authority
-        let requiresManagement = delivery == .managedSteer
         let commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome = {
             // A queued drain's cancellation cutoff, taken synchronously on the bridge's main
             // actor immediately before the authority hop. Refusing here is indistinguishable
@@ -8078,7 +8097,7 @@ final class AgentSessionLinkRuntimeBridge {
     func createLane(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
+        resolveDestination: @escaping @MainActor () -> AgentSessionLaneDestinationResolution
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination else { return .refused(.shuttingDown) }
         let key = LaneCreationKey(endpoint: observerEndpoint, idempotencyKey: request.idempotencyKey)
@@ -8151,18 +8170,22 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         callerBasis: LaneCreationCallerBasis,
         request: AgentSessionLaneCreateRequest,
-        resolveDestination: @escaping @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)?
+        resolveDestination: @escaping @MainActor () -> AgentSessionLaneDestinationResolution
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         guard let host, await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis)
         else { return .refused(.denied) }
-        guard case .available = await intentPersistenceAdmission() else {
-            return .refused(.persistenceUnavailable)
-        }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
-        guard let destination = resolveDestination()
-        else { return .refused(.destinationUnavailable) }
+        let destination: AgentSessionLaneDestination
+        switch resolveDestination() {
+        case let .available(value): destination = value
+        case let .unavailable(failure):
+            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            receipt.destinationFailure = failure
+            receipt.refusalStage = "destination_resolution"
+            return receipt
+        }
         let selection: AgentSessionLanePolicy.RoleSelection
         do {
             if let modelID = request.modelID {
@@ -8270,8 +8293,21 @@ final class AgentSessionLinkRuntimeBridge {
         } catch let failure as AgentSessionLaneSpawnAdmissionFailure {
             var receipt = AgentSessionLaneCreateReceipt.refused(.scopeDenied)
             receipt.refusalDetail = failure.detail
+            receipt.admissionSubreason = failure.subreason
+            receipt.refusalStage = "scope_admission"
             return receipt
-        } catch { return .refused(.destinationUnavailable) }
+        } catch let failure as AgentSessionLaneDestinationFailure {
+            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            receipt.destinationFailure = failure
+            receipt.refusalStage = "host_allocation"
+            return receipt
+        } catch {
+            var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+            let type = String(describing: Swift.type(of: error)).filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." }
+            receipt.destinationFailure = .hostError(String(type.prefix(120)))
+            receipt.refusalStage = "host_allocation"
+            return receipt
+        }
         let sessionID: UUID
         let tabID: UUID
         let bindingToken: AgentSessionRestorationBindingToken?

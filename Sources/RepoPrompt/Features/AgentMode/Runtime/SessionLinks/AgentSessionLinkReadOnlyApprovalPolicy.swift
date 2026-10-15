@@ -2,7 +2,9 @@ import Foundation
 
 /// Conservative command-shape allowlist, not a shell parser. Quoting, expansion, pipelines,
 /// redirects, wrappers, environment assignments and unknown options always stay manual.
-/// Git's external diff/textconv/pager hooks must be explicitly disabled by the command itself.
+/// Git's external diff/textconv/pager and fsmonitor hooks must be disabled by the command itself.
+/// This is read-only command approval, not a filesystem sandbox: grep path access remains governed
+/// by the lane's existing provider sandbox. It does not grant a new sandbox or permission mode.
 enum AgentSessionLinkReadOnlyApprovalPolicy {
     static func allows(_ approval: AgentApprovalRequest) -> Bool {
         guard approval.kind == .commandExecution, let command = approval.command else { return false }
@@ -24,13 +26,16 @@ enum AgentSessionLinkReadOnlyApprovalPolicy {
         guard !command.isEmpty, command.utf8.count <= 8192,
               command.unicodeScalars.allSatisfy(allowed.contains) else { return false }
         let words = command.split(separator: " ").map(String.init)
-        guard let executable = words.first else { return false }
+        guard let executable = words.first, !words.contains(where: { $0.hasPrefix("~") }) else { return false }
         var args = Array(words.dropFirst())
         switch executable {
         case "git":
             guard args.first == "--no-pager" else { return false }
             args.removeFirst()
-            guard let op = args.first, ["log", "status", "diff"].contains(op) else { return false }
+            let disablesHooks = args.starts(with: ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"])
+            if disablesHooks { args.removeFirst(4) }
+            guard let op = args.first, ["log", "status", "diff"].contains(op),
+                  op == "log" || disablesHooks else { return false }
             args.removeFirst()
             if op != "status" {
                 guard args.contains("--no-ext-diff"), args.contains("--no-textconv") else { return false }

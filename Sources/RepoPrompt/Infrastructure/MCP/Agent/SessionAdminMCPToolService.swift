@@ -65,20 +65,22 @@ struct SessionAdminMCPToolService {
 
         let endpoint = try await resolveCaller()
         let caller = DomainAgentSessionCallerIdentity.agentSession(endpoint.sessionID)
-        switch op {
+        let value: Value = switch op {
         case "request_scope":
-            return try requestScope(args: args, endpoint: endpoint)
+            try requestScope(args: args, endpoint: endpoint)
         case "scope_status":
-            return try scopeStatus(args: args, callerSessionID: endpoint.sessionID)
+            try scopeStatus(args: args, callerSessionID: endpoint.sessionID)
         case "release_scope":
-            return try releaseScope(args: args, caller: caller)
+            try releaseScope(args: args, caller: caller)
         case "confirmation_status":
-            return try confirmationStatus(args: args, callerSessionID: endpoint.sessionID)
+            try confirmationStatus(args: args, callerSessionID: endpoint.sessionID)
         case "undo":
-            return try await undo(args: args, caller: caller)
+            try await undo(args: args, caller: caller)
         default:
-            return try await administer(op: op, args: args, caller: caller, endpoint: endpoint)
+            try await administer(op: op, args: args, caller: caller, endpoint: endpoint)
         }
+        guard case let .object(fields) = value else { return value }
+        return Self.withScopeAvailability(fields, runtime: scopes())
     }
 
     // MARK: - Caller
@@ -270,8 +272,14 @@ struct SessionAdminMCPToolService {
     ) -> Value {
         var value = value
         value["authority_available"] = .bool(runtime.canUseAuthority)
+        value["continuity_save_state"] = .string(runtime.continuityState)
+        value["continuity_durable"] = .bool(runtime.continuityState == "saved")
+        if !runtime.unsettledScopeIDs.isEmpty {
+            value["unsettled_scope_ids"] = .array(runtime.unsettledScopeIDs.map { .string($0.uuidString) })
+        }
+        if let operationID = runtime.lastContinuityOperationID { value["continuity_operation_id"] = .string(operationID.uuidString) }
         if let message = runtime.persistenceStatusMessage {
-            value["authority_status_detail"] = .string(message)
+            value["continuity_detail"] = .string(message)
         }
         return .object(value)
     }

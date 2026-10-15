@@ -571,10 +571,9 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             self.seconds = seconds
         }
 
-        func write(_ data: Data, to url: URL) throws {
+        func check() throws {
             began.signal()
             Thread.sleep(forTimeInterval: seconds)
-            try data.write(to: url, options: .atomic)
         }
 
         /// Resolves once the store actor is genuinely blocked, so the assertion below is about the
@@ -600,7 +599,7 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
             mode: .enabled,
-            writer: { data, url in try blocker.write(data, to: url) }
+            beforeCommit: { try blocker.check() }
         )
         let fixture = makeFixture()
         fixture.bridge.installIntentStore(store)
@@ -623,5 +622,6 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
             "Quitting must never await a stuck store operation, in any shutdown phase."
         )
         _ = await occupier.value
+        await store.serializationBarrier() // Finish the detached fixture write before removing its temp store.
     }
 }

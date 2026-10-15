@@ -97,44 +97,30 @@ final class DelegationScopeRuntime: ObservableObject {
     @Published private(set) var availability: Availability
 
     var canUseAuthority: Bool {
-        availability == .ready || availability == .ephemeral
+        availability != .terminating // Continuity availability is never a veto on a real live decision.
     }
 
     var authorityUnavailableReason: String? {
         switch availability {
-        case .ready, .ephemeral: nil
-        case .awaitingStore: "Delegation approval is unavailable while saved authority is being opened."
-        case let .blocked(message): message
+        case .ready, .ephemeral, .awaitingStore, .blocked: nil
         case .terminating: "Delegation authority is closed because RepoPrompt is quitting."
         }
     }
 
-    /// A physical session removal may invalidate saved grant anchors. Production must hold an
-    /// acknowledged open scope document before deletion can begin, even when no scope is currently
-    /// live. Explicit ephemeral fixtures have no durable authority to invalidate; a suppressed
-    /// production launch is different because it has deliberately left the shared file untouched.
+    /// Session deletion is a live user decision, not contingent on continuity storage.
     var durableDeletionUnavailableReason: String? {
-        switch availability {
-        case .ready:
-            nil
-        case .ephemeral:
-            persistenceMode == .ephemeral ? nil
-                : "This launch suppresses delegation persistence. Restart RepoPrompt normally before deleting saved sessions."
-        case .awaitingStore:
-            "Saved delegation authority has not opened safely yet. Wait for startup to finish before deleting saved sessions."
-        case let .blocked(message):
-            message
-        case .terminating:
-            "RepoPrompt is quitting."
-        }
+        availability == .terminating ? "RepoPrompt is quitting." : nil
     }
 
     var persistenceStatusMessage: String? {
-        if let authorityUnavailableReason { return authorityUnavailableReason }
-        if persistenceFailed {
-            return "Delegation changes could not be saved. Revocations still apply in this launch."
+        if pendingSaves.contains(where: { !$0.revoked.isEmpty || !$0.deletedSessions.isEmpty }) {
+            return "Continuity is unsettled: revoked/deleted authority is denied in this process, but its transaction is not acknowledged. If the app exits before saving succeeds, the next launch can recover only the last committed state, which may still contain those grants. Keep the app open and retry saving. \(store?.diagnostic ?? "")"
         }
-        return nil
+        if let rejected = rejectedOperations.values.sorted().first { return rejected }
+        if case let .blocked(message) = availability { return store?.diagnostic ?? message }
+        if persistenceFailed { return store?.diagnostic ?? "Continuity save failed. Live approvals and revocations still apply in this process; saving will retry." }
+        if !pendingSaves.isEmpty || availability == .awaitingStore { return "Live decisions apply now. Continuity saving is pending; these changes are not yet durable or shared with another process." }
+        return store?.diagnostic
     }
 
     static let maxPendingRequestsPerSession = 4
@@ -142,21 +128,18 @@ final class DelegationScopeRuntime: ObservableObject {
     static let minimumExpirySeconds = 60
     /// Agent-proposed lifetimes are capped at 30 days.
     static let maximumExpirySeconds = 30 * 24 * 60 * 60
-    /// Revocation tombstones kept in memory and on disk.
-    static let maxRevokedScopeIDs = DelegationScopeDocument.maxRevokedScopeIDs
     /// Bounded retention of decided requests so `scope_status` can still report them.
     static let maxRetainedRequests = 256
 
     @Published private(set) var requests: [UUID: DelegationScopeRequest] = [:]
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
-    /// Last durable write outcome, published so the delegations list can surface a failure. Every
-    /// change is written durably before the mutating call returns; a revocation also applies
-    /// immediately in memory even when its write fails.
+    /// Separate continuity result. Grants save asynchronously; terminal decisions attempt a
+    /// synchronous transaction before returning, without undoing the live denial on failure.
     @Published private(set) var lastPersistenceOutcome: DelegationScopeWriteOutcome?
 
     var persistenceFailed: Bool {
-        lastPersistenceOutcome == .writeFailed || lastPersistenceOutcome == .blocked
+        lastPersistenceOutcome == .writeFailed || lastPersistenceOutcome == .blocked || lastPersistenceOutcome == .rejected || !rejectedOperations.isEmpty
     }
 
     let confirmations: BatchConfirmationCoordinator
@@ -181,9 +164,39 @@ final class DelegationScopeRuntime: ObservableObject {
     private var requestOrder: [UUID] = []
     private var requestIDByKey: [String: UUID] = [:]
     let persistenceMode: PersistenceMode
-    private var frozenSnapshot: (grants: [DomainDelegationScopeGrant], revoked: [UUID])?
+    private struct PendingSave {
+        let id: UUID
+        let grants: [DomainDelegationScopeGrant]
+        let revoked: [UUID]
+        var deletedSessions: [UUID] = []
+    }
+
+    private var pendingSaves: [PendingSave] = []
+    private var rejectedOperations: [UUID: String] = [:]
+    private var queuedGrantIDs: Set<UUID> = []
+    private var saveTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var retryDelay: UInt64 = 1
+    @Published private(set) var lastContinuityOperationID: UUID?
+    @Published private(set) var continuityRecoveryOffers: [DelegationScopeRecoveryOffer] = []
+    @Published private(set) var continuityRecoveryMessage: String?
+    private var reviewedRecoverySources: Set<String> = []
+
+    var unsettledScopeIDs: [UUID] {
+        Array(Set(pendingSaves.flatMap(\.revoked))).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    var continuityState: String {
+        if persistenceFailed || { if case .blocked = availability { return true }
+            return false
+        }() { return "failed" }
+        if !pendingSaves.isEmpty || availability == .awaitingStore { return "pending" }
+        return persistenceMode == .ephemeral || availability == .ephemeral ? "not_persisted" : "saved"
+    }
+
     /// Revoked/released scope IDs, newest last. Persisted as tombstones honored by `reactivate`.
     private var revokedScopeIDs: [UUID] = []
+    private var deletedSessionIDs: Set<UUID> = []
     private let windows: @MainActor () -> [WindowState]
     private let now: () -> Date
     private let makeUUID: () -> UUID
@@ -212,42 +225,97 @@ final class DelegationScopeRuntime: ObservableObject {
 
     // MARK: - Launch
 
-    /// The store must acknowledge the open-launch fence before any persisted authority is installed.
+    /// Restore validated continuity, independently of current user-backed live decisions.
     func bootstrap(store: DelegationScopeStore) async {
-        guard persistenceMode == .requiresStore, self.store == nil,
-              availability == .awaitingStore else { return }
+        guard persistenceMode == .requiresStore, self.store == nil, availability != .terminating else { return }
         self.store = store
-        // Loads whatever is on disk, however the previous launch ended: every change was durable
-        // when it happened, so there is no unsealed state to distrust.
-        let loaded = store.loadForLaunch()
-        guard availability == .awaitingStore else { return }
+        await recoverContinuity()
+    }
+
+    /// Recovery can install compatible saved continuity, but never replaces a newer live decision.
+    private func recoverContinuity() async {
+        guard let store, availability != .terminating else { return }
+        let loaded = await Task.detached { store.loadForLaunch() }.value
+        let recoveryNow = now()
+        let offers = await Task.detached { store.recoveryOffers(now: recoveryNow) }.value
+        continuityRecoveryOffers = offers.filter { !reviewedRecoverySources.contains($0.id) }
+        guard availability != .terminating else { return }
         switch loaded {
         case let .ready(_, grants, revoked):
-            revokedScopeIDs = revoked
-            let installed = authority.reactivate(grants, revokedScopeIDs: Set(revoked), now: now())
+            revokedScopeIDs = Array(Set(revokedScopeIDs).union(revoked))
+            queuedGrantIDs.formUnion(grants.map(\.id))
+            let compatible = grants.filter { grant in
+                guard !deletedSessionIDs.contains(grant.granteeSessionID) else { return false }
+                if case let .tree(root) = grant.kind { return !deletedSessionIDs.contains(root) }
+                return true
+            }
+            let installed = authority.reactivate(compatible, revokedScopeIDs: Set(revokedScopeIDs), now: now())
             availability = .ready
+            if pendingSaves.isEmpty { lastPersistenceOutcome = .unchanged }
             didChange(grantees: Set(installed.map(\.grant.granteeSessionID)), invalidated: [])
         case let .blocked(reason):
             availability = .blocked(reason.message)
             lastPersistenceOutcome = .blocked
+            scheduleContinuityRetry()
         case .suppressed:
             // Explicit launch policy, never a fallback from failed production I/O.
             availability = .ephemeral
         }
+        startSaving()
     }
 
-    /// Writes are synchronous and durable; retained for callers that sequence on persistence.
-    func flushPersistence() async {}
+    /// Wait for the current save attempt, not an unbounded retry loop. Failure stays visible.
+    func flushPersistence() async {
+        startSaving()
+        await saveTask?.value
+    }
 
-    /// Closes authority for quit. Nothing needs sealing: every change is already on disk, so this
-    /// only stops further mutation. `allowRestoration` is retained for call-site compatibility and
-    /// no longer affects what the next launch restores.
+    func retryContinuityNow() async {
+        retryTask?.cancel()
+        retryTask = nil
+        if availability != .ready, availability != .ephemeral { await recoverContinuity() }
+        startSaving()
+        await saveTask?.value
+    }
+
+    /// UI-only explicit approval of displayed mixed-source root grant descriptions. This does
+    /// not activate arbitrary legacy IDs, revive revocations, or convert attenuated grants to roots.
+    /// No MCP operation or target-supplied message can invoke this user-decision path.
+    func approveContinuityRecovery(sourceID: String) {
+        guard canUseAuthority, let offer = continuityRecoveryOffers.first(where: { $0.id == sourceID }),
+              reviewedRecoverySources.insert(sourceID).inserted else { return }
+        continuityRecoveryOffers.removeAll { $0.id == sourceID }
+        var count = 0
+        for original in offer.grants {
+            guard !deletedSessionIDs.contains(original.granteeSessionID) else { continue }
+            if case let .tree(root) = original.kind, deletedSessionIDs.contains(root) { continue }
+            do {
+                let request = try requestScope(
+                    requesterSessionID: original.granteeSessionID,
+                    requesterTabID: nil,
+                    kind: original.kind,
+                    capabilities: original.capabilities,
+                    guardrails: original.guardrails,
+                    reason: "User explicitly approved a new grant from a preserved continuity description.",
+                    idempotencyKey: nil
+                ).get()
+                _ = try approve(requestID: request.id, guardrails: original.guardrails).get()
+                count += 1
+            } catch {
+                continuityRecoveryMessage = "Recovery description was preserved but could not be approved: \(error). Request a new explicit scope with valid capabilities/limits."
+                return
+            }
+        }
+        continuityRecoveryMessage = "Approved \(count) new live grants. Original source and other rows remain preserved; continuity saving is \(continuityState)."
+    }
+
+    /// Closes live authority for quit. No shutdown seal controls restoration; pending saves remain
+    /// separately observable. `allowRestoration` is retained only for call-site compatibility.
     func freezeForTermination(allowRestoration _: Bool = true) {
         guard availability != .terminating else { return }
         let active = authority.activeGrants
-        if availability == .ready {
-            frozenSnapshot = (active, revokedScopeIDs)
-        }
+        retryTask?.cancel()
+        retryTask = nil
         availability = .terminating
         revision &+= 1
         for grant in active {
@@ -255,13 +323,39 @@ final class DelegationScopeRuntime: ObservableObject {
         }
     }
 
-    /// One final synchronous write of the frozen snapshot. Correctness never depends on it.
-    func settleForTermination(timeout _: TimeInterval = 2) async -> Bool {
+    /// A snapshot of settlement, not a finalization seal. Late deletion callbacks still enqueue
+    /// transactions. A blocked writer is never structurally joined past this absolute deadline.
+    func settleForTermination(timeout: TimeInterval = 2) async -> Bool {
         if availability != .terminating { freezeForTermination() }
-        guard let store, let frozenSnapshot else { return true }
-        let outcome = store.finishLaunch(with: frozenSnapshot.grants, revokedScopeIDs: frozenSnapshot.revoked)
-        lastPersistenceOutcome = outcome
-        return outcome == .applied || outcome == .unchanged
+        guard let attempt = saveTask else { return pendingSaves.isEmpty && !persistenceFailed }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(max(0, timeout)))
+        var timer: Task<Void, Never>?
+        let settled = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let gate = TerminationSettlementGate(continuation)
+            timer = Task { @MainActor in
+                do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+                gate.finish(false)
+            }
+            Task { @MainActor [weak self] in
+                await attempt.value
+                gate.finish(self?.pendingSaves.isEmpty == true && self?.persistenceFailed == false)
+            }
+        }
+        timer?.cancel()
+        return settled
+    }
+
+    private final class TerminationSettlementGate {
+        private var continuation: CheckedContinuation<Bool, Never>?
+        init(_ continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+
+        func finish(_ settled: Bool) {
+            guard let continuation else { return }
+            self.continuation = nil
+            continuation.resume(returning: settled)
+        }
     }
 
     // MARK: - Queries
@@ -635,10 +729,12 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Revokes every scope granted to, or rooted at, a durably deleted session.
     @discardableResult
     func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        deletedSessionIDs.insert(sessionID)
         if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID) }
         guard canUseAuthority else { return [] }
         let changed = authority.revokeAll(involving: sessionID)
         recordRevocations(changed)
+        persist(invalidated: [], deletedSessions: [sessionID])
         return changed
     }
 
@@ -696,24 +792,15 @@ final class DelegationScopeRuntime: ObservableObject {
     /// A committed deletion is a proven-permanent fact, so it is recorded even while quitting: the
     /// next launch must not restore authority granted to, or rooted at, a deleted session.
     private func revokeAllWhileTerminating(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
-        guard frozenSnapshot != nil, let store else { return [] }
         let changed = authority.revokeAll(involving: sessionID)
-        guard !changed.isEmpty else { return [] }
         revokedScopeIDs.append(contentsOf: changed.map(\.id))
-        if revokedScopeIDs.count > Self.maxRevokedScopeIDs {
-            revokedScopeIDs.removeFirst(revokedScopeIDs.count - Self.maxRevokedScopeIDs)
-        }
-        frozenSnapshot = (authority.activeGrants, revokedScopeIDs)
-        lastPersistenceOutcome = store.replace(with: authority.activeGrants, revokedScopeIDs: revokedScopeIDs)
+        persist(invalidated: changed.map(\.id), deletedSessions: [sessionID])
         return changed
     }
 
     private func recordRevocations(_ changed: [DomainDelegationScopeRecord]) {
         guard !changed.isEmpty else { return }
         revokedScopeIDs.append(contentsOf: changed.map(\.id))
-        if revokedScopeIDs.count > Self.maxRevokedScopeIDs {
-            revokedScopeIDs.removeFirst(revokedScopeIDs.count - Self.maxRevokedScopeIDs)
-        }
         didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
         for record in changed {
             let tabID = requests.values.first { $0.state == .granted(scopeID: record.id) }?.requesterTabID
@@ -795,27 +882,81 @@ final class DelegationScopeRuntime: ObservableObject {
         for scopeID in invalidated {
             confirmations.invalidate(scopeID: scopeID)
         }
-        persist()
+        persist(invalidated: invalidated)
         for sessionID in grantees.sorted(by: { $0.uuidString < $1.uuidString }) {
             notifyCatalogChanged(sessionID)
         }
     }
 
-    /// Synchronous durable write-through of the authority's active grants and tombstones.
-    ///
-    /// Runs inside the mutating call (grant, revoke, release, expiry), so a change is on disk before
-    /// it is acknowledged and a crash can never resurrect a revoked grant. Each write carries the
-    /// *current* state, so any later change rewrites a previously failed one. A failed write is
-    /// retried once immediately; the outcome is retained for diagnostics.
-    private func persist() {
-        guard availability == .ready, let store else { return }
-        let grants = authority.activeGrants
-        let revoked = revokedScopeIDs
-        var outcome = store.replace(with: grants, revokedScopeIDs: revoked)
-        if outcome == .writeFailed {
-            outcome = store.replace(with: grants, revokedScopeIDs: revoked)
+    /// Immutable row deltas from a live decision, never a replacement snapshot.
+    private func persist(invalidated: [UUID], deletedSessions: [UUID] = []) {
+        guard persistenceMode == .requiresStore, availability != .ephemeral else { return }
+        let grants = authority.activeGrants.filter { !queuedGrantIDs.contains($0.id) }
+        guard !grants.isEmpty || !invalidated.isEmpty || !deletedSessions.isEmpty else { return }
+        // A live revoke supersedes an unsaved create, but never erases its permanent terminal fact.
+        pendingSaves.removeAll { pending in
+            pending.revoked.isEmpty && pending.deletedSessions.isEmpty && !pending.grants.isEmpty
+                && pending.grants.allSatisfy { invalidated.contains($0.id) }
         }
-        lastPersistenceOutcome = outcome
+        queuedGrantIDs.formUnion(grants.map(\.id))
+        // A revoke must not sit behind a failed/poisoned grant. Fence live authority first (the
+        // domain already did), then attempt its own terminal transaction before acknowledging
+        // durability. If the entire write fails, only this process knows the deny; report that
+        // limitation honestly and retain the exact operation for retry.
+        if !invalidated.isEmpty || !deletedSessions.isEmpty {
+            let terminal = PendingSave(id: makeUUID(), grants: [], revoked: invalidated, deletedSessions: deletedSessions)
+            let outcome = store?.record(operationID: terminal.id, grants: [], revoked: terminal.revoked, deletedSessions: terminal.deletedSessions) ?? .pending
+            lastPersistenceOutcome = outcome
+            if outcome == .applied || outcome == .unchanged {
+                lastContinuityOperationID = terminal.id
+            } else {
+                pendingSaves.insert(terminal, at: 0)
+            }
+        }
+        // Independent grant rows cannot poison each other's save, nor roll back a revoke.
+        for grant in grants {
+            pendingSaves.append(PendingSave(id: makeUUID(), grants: [grant], revoked: []))
+        }
+        if !grants.isEmpty, !persistenceFailed { lastPersistenceOutcome = .pending }
+        startSaving()
+    }
+
+    private func startSaving() {
+        guard saveTask == nil, let store, !pendingSaves.isEmpty else { return }
+        saveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let pending = pendingSaves.first {
+                let outcome = await Task.detached {
+                    store.record(operationID: pending.id, grants: pending.grants, revoked: pending.revoked, deletedSessions: pending.deletedSessions)
+                }.value
+                guard let index = pendingSaves.firstIndex(where: { $0.id == pending.id }) else { continue }
+                lastPersistenceOutcome = outcome
+                if outcome == .rejected {
+                    rejectedOperations[pending.id] = "Scope continuity operation \(pending.id) was rejected and is not durable. \(store.diagnostic ?? "Inspect the saved identity before a fresh user decision.") Other saves continue."
+                    pendingSaves.remove(at: index)
+                    continue
+                }
+                guard outcome == .applied || outcome == .unchanged else { break }
+                pendingSaves.remove(at: index)
+                lastContinuityOperationID = pending.id
+                retryDelay = 1
+            }
+            saveTask = nil
+            if !pendingSaves.isEmpty { scheduleContinuityRetry() }
+        }
+    }
+
+    private func scheduleContinuityRetry() {
+        guard retryTask == nil, availability != .terminating else { return }
+        let delay = retryDelay
+        retryDelay = min(30, retryDelay * 2)
+        retryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: delay * 1_000_000_000) } catch { return }
+            guard let self else { return }
+            retryTask = nil
+            if availability != .ready { await recoverContinuity() }
+            startSaving()
+        }
     }
 
     private func trimRequestRetention() {

@@ -3,56 +3,66 @@ import MCP
 
 /// Flat, bounded lane receipts. Allocation refusals never disclose a session ID.
 enum AgentSessionLaneMCPToolService {
-    struct Destination: Equatable {
-        let windowID: Int
-        let workspaceID: UUID
-        let workspaceName: String
+    typealias Destination = AgentSessionLaneDestination
+
+    @MainActor
+    static func resolveDestination(workspaceSelector: String?, callerWindow: WindowState) -> Destination? {
+        resolveDestination(
+            workspaceSelector: workspaceSelector,
+            callerWindowID: callerWindow.windowID,
+            callerWorkspaceID: callerWindow.workspaceManager.activeWorkspaceID
+        ).destination
     }
 
     @MainActor
-    static func resolveDestination(
-        workspaceSelector: String?,
-        callerWindow: WindowState
-    ) -> Destination? {
+    static func resolveDestination(workspaceSelector: String?, callerWindowID: Int, callerWorkspaceID: UUID?) -> AgentSessionLaneDestinationResolution {
         let candidates = WindowStatesManager.shared.allWindows.compactMap { window -> Destination? in
-            guard !window.isClosing, let workspace = window.workspaceManager.activeWorkspace else {
-                return nil
-            }
-            return Destination(
-                windowID: window.windowID,
-                workspaceID: workspace.id,
-                workspaceName: workspace.name
-            )
+            guard !window.isClosing, let workspace = window.workspaceManager.activeWorkspace else { return nil }
+            return Destination(windowID: window.windowID, workspaceID: workspace.id, workspaceName: workspace.name)
         }
-        return selectDestination(
+        return selectDestinationResult(
             candidates: candidates,
             workspaceSelector: workspaceSelector,
-            callerWindowID: callerWindow.windowID
+            callerWindowID: callerWindowID,
+            callerWorkspaceID: callerWorkspaceID
         )
     }
 
-    static func selectDestination(
-        candidates: [Destination],
-        workspaceSelector: String?,
-        callerWindowID: Int
-    ) -> Destination? {
-        let matches = candidates.filter { candidate in
-            guard let workspaceSelector else { return candidate.windowID == callerWindowID }
-            if let id = UUID(uuidString: workspaceSelector) { return candidate.workspaceID == id }
-            return AgentSessionLaneCreateRequest.canonicalSelector(candidate.workspaceName)
-                == AgentSessionLaneCreateRequest.canonicalSelector(workspaceSelector)
-        }
-        if workspaceSelector != nil, Set(matches.map(\.workspaceID)).count != 1 { return nil }
-        return matches.min { lhs, rhs in
-            let lhsIsCaller = lhs.windowID == callerWindowID
-            let rhsIsCaller = rhs.windowID == callerWindowID
-            if lhsIsCaller != rhsIsCaller { return lhsIsCaller }
-            return lhs.windowID < rhs.windowID
-        }
+    static func selectDestination(candidates: [Destination], workspaceSelector: String?, callerWindowID: Int) -> Destination? {
+        selectDestinationResult(
+            candidates: candidates,
+            workspaceSelector: workspaceSelector,
+            callerWindowID: callerWindowID,
+            callerWorkspaceID: nil
+        ).destination
     }
 
-    static func refusal(_ reason: String) -> Value {
-        .object(["result": .string(reason)])
+    static func selectDestinationResult(candidates: [Destination], workspaceSelector: String?, callerWindowID: Int, callerWorkspaceID: UUID?) -> AgentSessionLaneDestinationResolution {
+        let matches: [Destination]
+        if let workspaceSelector {
+            matches = candidates.filter { candidate in
+                if let id = UUID(uuidString: workspaceSelector) { return candidate.workspaceID == id }
+                return AgentSessionLaneCreateRequest.canonicalSelector(candidate.workspaceName)
+                    == AgentSessionLaneCreateRequest.canonicalSelector(workspaceSelector)
+            }
+            guard !matches.isEmpty else { return .unavailable(.selectorMatchedNone) }
+        } else {
+            let current = candidates.filter {
+                $0.windowID == callerWindowID && (callerWorkspaceID == nil || $0.workspaceID == callerWorkspaceID)
+            }
+            matches = current.isEmpty ? candidates : current
+            guard !matches.isEmpty else { return .unavailable(.callerWindowHasNoWorkspace) }
+        }
+        guard Set(matches.map(\.workspaceID)).count == 1 else { return .unavailable(.selectorAmbiguous) }
+        let selected = matches.min { lhs, rhs in
+            if (lhs.windowID == callerWindowID) != (rhs.windowID == callerWindowID) { return lhs.windowID == callerWindowID }
+            return lhs.windowID < rhs.windowID
+        }!
+        return .available(selected)
+    }
+
+    static func refusal(_ reason: AgentSessionLaneCreateReceipt.Reason) -> Value {
+        render(.refused(reason))
     }
 
     static func render(_ receipt: AgentSessionLaneCreateReceipt) -> Value {
@@ -60,19 +70,23 @@ enum AgentSessionLaneMCPToolService {
             if receipt.reason == .modelUnavailable {
                 return .object([
                     "result": .string("model_unavailable"),
+                    "subreason": .string("model_unavailable"),
+                    "next_call": .object(["tool": .string("agent_manage"), "arguments": .object(["op": .string("list_agents")])]),
                     "hint": .string("Refresh agent_manage.list_agents in the destination window and retry with an exact available model_id, or omit model_id to use role defaults. No lane was allocated.")
                 ])
             }
             if receipt.reason == .laneLimitReached {
                 return .object([
                     "result": .string(AgentSessionLaneCreateReceipt.Reason.laneLimitReached.rawValue),
+                    "subreason": .string("lane_limit_reached"),
+                    "next_call": .object(["tool": .string("agent_session_link"), "arguments": .object(["op": .string("list")])]),
                     "lanes": .string("\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)")
                 ])
             }
             let reason = receipt.reason ?? .admissionUnstable
             let hint = switch reason {
             case .destinationUnavailable:
-                "The selected workspace has no available active window, or its window/workspace changed before allocation. Open that workspace in a window, confirm its UUID with workspace tools, and retry. No lane was allocated."
+                "No unambiguous active destination was available, or it changed before allocation. Call manage_workspaces with action=list, open the intended workspace in a window, then retry create_lane with its UUID in workspace if more than one destination remains. No lane was allocated."
             case .scopeDenied:
                 "The destination was resolved, but scoped spawn admission was refused. Call session_admin scope_status to inspect spawn authority and limits. If placement is unresolved, load or repair the affected sessions before retrying; granting more capabilities does not repair provenance. No lane was allocated."
             case .persistenceUnavailable, .saveFailed:
@@ -96,6 +110,11 @@ enum AgentSessionLaneMCPToolService {
             }
             var fields: [String: Value] = ["result": .string(reason.rawValue), "hint": .string(hint)]
             if let detail = receipt.refusalDetail { fields["detail"] = .string(detail) }
+            fields["subreason"] = .string(reason == .destinationUnavailable ? (receipt.destinationFailure ?? .destinationChanged).subreason : receipt.admissionSubreason ?? reason.rawValue)
+            if let stage = receipt.refusalStage { fields["stage"] = .string(stage) }
+            fields["next_call"] = reason == .destinationUnavailable
+                ? .object(["tool": .string("manage_workspaces"), "arguments": .object(["action": .string("list")])])
+                : .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
             return .object(fields)
         }
         var fields: [String: Value] = [

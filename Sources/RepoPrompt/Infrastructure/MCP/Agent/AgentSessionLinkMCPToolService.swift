@@ -586,7 +586,7 @@ struct AgentSessionLinkMCPToolService {
             idempotencyKey: args["idempotency_key"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         ) {
             if refusal == .denied { throw Self.unavailableError }
-            return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
+            return AgentSessionLaneMCPToolService.refusal(refusal)
         }
         let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
         guard args["role"] == nil || args["model_id"] == nil else {
@@ -637,7 +637,6 @@ struct AgentSessionLinkMCPToolService {
         } else {
             workspaceSelector = nil
         }
-        let callerWindow = try requireTargetWindow()
         let receipt = await bridge.createLane(
             observerEndpoint: observerEndpoint,
             request: AgentSessionLaneCreateRequest(
@@ -651,8 +650,10 @@ struct AgentSessionLinkMCPToolService {
             ),
             resolveDestination: {
                 AgentSessionLaneMCPToolService.resolveDestination(
-                    workspaceSelector: workspaceSelector, callerWindow: callerWindow
-                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID, workspaceName: $0.workspaceName) }
+                    workspaceSelector: workspaceSelector,
+                    callerWindowID: observerEndpoint.windowID,
+                    callerWorkspaceID: observerEndpoint.workspaceID
+                )
             }
         )
         if receipt.reason == .denied { throw Self.unavailableError }
@@ -1711,7 +1712,7 @@ struct AgentSessionLinkMCPToolService {
 
     /// Denial for a caller that holds no oversight authority at all.
     static let unavailableError = MCPError.invalidParams(
-        "agent_session_link is not available for this session."
+        "agent_session_link is not available for this session on this exact route. From a supported Agent Mode session, call become_overseer, then next turn call session_admin scope_status to discover operations and required grants. Activation alone grants no target authority."
     )
 
     static func outboundOperationUnavailableError(_ operation: String) -> MCPError {

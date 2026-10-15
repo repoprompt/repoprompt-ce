@@ -29,7 +29,7 @@ final class AgentSessionOversightPersistencePresentationTests: XCTestCase {
 
     // MARK: - Add blocker composition
 
-    func testAPersistenceBlockerDisablesAddOnAnOtherwiseEligibleSession() {
+    func testAContinuityFailureWarnsWithoutDisablingAnEligibleLiveSession() {
         let props = AgentModeViewModel.monitorPillProps(
             sessionID: UUID(),
             published: nil,
@@ -40,13 +40,14 @@ final class AgentSessionOversightPersistencePresentationTests: XCTestCase {
             )
         )
 
-        XCTAssertFalse(props.canAdd)
-        XCTAssertEqual(props.canAddReason, AgentSessionOversightPersistenceCopy.futureSchema)
+        XCTAssertTrue(props.canAdd)
+        XCTAssertNil(props.canAddReason)
+        XCTAssertNotNil(props.persistence.noticeMessage)
     }
 
     /// Persistence wins over eligibility: telling a user to load a thread when the real problem is a
     /// preserved manifest sends them to fix the wrong thing.
-    func testThePersistenceBlockerTakesPrecedenceOverTheLiveEligibilityReason() {
+    func testLiveEligibilityStillAppliesWhenContinuityIsSuppressed() {
         let props = AgentModeViewModel.monitorPillProps(
             sessionID: UUID(),
             published: nil,
@@ -55,7 +56,7 @@ final class AgentSessionOversightPersistencePresentationTests: XCTestCase {
             persistence: AgentSessionOversightPersistencePresentation(availability: .suppressed)
         )
 
-        XCTAssertEqual(props.canAddReason, AgentSessionOversightPersistenceCopy.suppressedLaunch)
+        XCTAssertEqual(props.canAddReason, "Load this thread before adding sessions to oversee.")
     }
 
     func testEligibilityStillDisablesAddWhenPersistenceIsReady() {
@@ -99,7 +100,7 @@ final class AgentSessionOversightPersistencePresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(props.persistence.availability, .loading)
-        XCTAssertEqual(props.canAddReason, AgentSessionOversightPersistenceCopy.loading)
+        XCTAssertEqual(props.canAddReason, AgentMonitorPillProps.empty.canAddReason)
     }
 
     // MARK: - Warnings

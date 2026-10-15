@@ -134,7 +134,7 @@ struct DelegationActiveScopesSection: View {
 
     var body: some View {
         let scopes = runtime.allLiveScopes()
-        if !scopes.isEmpty || runtime.persistenceStatusMessage != nil {
+        if !scopes.isEmpty || runtime.persistenceStatusMessage != nil || !runtime.continuityRecoveryOffers.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                 Text("Active delegations")
@@ -143,6 +143,27 @@ struct DelegationActiveScopesSection: View {
                     Label(message, systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
+                    Button("Retry saving continuity") { Task { await runtime.retryContinuityNow() } }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                if let message = runtime.continuityRecoveryMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(runtime.continuityRecoveryOffers) { offer in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Preserved mixed-source delegations — not active authority")
+                            .font(.caption).bold()
+                        ForEach(offer.grants, id: \.id) { grant in
+                            Text("Session \(grant.granteeSessionID.uuidString): \(String(describing: grant.kind)); \(grant.capabilities.map(\.rawValue).sorted().joined(separator: ", ")); limits \(String(describing: grant.guardrails))")
+                                .font(.caption2).textSelection(.enabled)
+                        }
+                        Text("The original source is untouched. This approves new root grants with the displayed membership, capabilities and limits, not old IDs or unrelated authority. \(offer.retainedOtherRows) other rows remain preserved for separate recovery.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Button("Approve new live grants from these descriptions") {
+                            runtime.approveContinuityRecovery(sourceID: offer.id)
+                        }.buttonStyle(.bordered).controlSize(.small)
+                    }
                 }
                 ForEach(scopes, id: \.id) { scope in
                     HStack(alignment: .top, spacing: 8) {

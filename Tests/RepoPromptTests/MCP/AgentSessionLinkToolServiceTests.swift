@@ -1186,7 +1186,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             }
             let request = AgentSessionLaneCreateRequest(idempotencyKey: "cancelled-first-task", role: "pair", modelID: nil, sessionName: "First task", workspaceSelector: nil, message: "Work under this explicit test instruction.", workflowReference: nil)
             let caller = Task { @MainActor in
-                await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { (fixture.window.windowID, UUID(), "Destination") })
+                await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: UUID(), workspaceName: "Destination")) })
             }
             await fulfillment(of: [entered], timeout: 2)
             caller.cancel()
@@ -1195,7 +1195,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             XCTAssertEqual(first.result, .created)
             XCTAssertEqual(first.firstTask, .delivered)
             XCTAssertEqual(fixture.host.firstTaskRequests.count, 1)
-            let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { nil })
+            let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .unavailable(.callerWindowHasNoWorkspace) })
             XCTAssertTrue(replay.duplicate)
             XCTAssertEqual(replay.sessionID, first.sessionID)
             XCTAssertEqual(fixture.host.firstTaskRequests.count, 1)
@@ -1206,11 +1206,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testActivatedFirstLaneUsesNormalCreationAcrossWorkspaceAndReplayWithoutUnrelatedAuthority() async throws {
         try await withActivatedLaneFixture { fixture in
             let request = AgentSessionLaneCreateRequest(idempotencyKey: "activated-first", role: "pair", modelID: nil, sessionName: "First lane", workspaceSelector: nil, message: nil, workflowReference: nil)
-            let destination = (windowID: fixture.window.windowID + 100, workspaceID: UUID(), workspaceName: "Other workspace")
-            let first = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { destination })
+            let destination = AgentSessionLaneDestination(windowID: fixture.window.windowID + 100, workspaceID: UUID(), workspaceName: "Other workspace")
+            let first = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .available(destination) })
             XCTAssertEqual(first.result, .created)
             XCTAssertTrue(first.linked)
-            let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { destination })
+            let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .available(destination) })
             XCTAssertTrue(replay.duplicate)
             XCTAssertEqual(replay.sessionID, first.sessionID)
             XCTAssertEqual(fixture.host.laneCreationCount, 1)
@@ -1243,7 +1243,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 default: XCTFail("uncovered fence")
                 }
                 let request = AgentSessionLaneCreateRequest(idempotencyKey: fence, role: "pair", modelID: nil, sessionName: nil, workspaceSelector: nil, message: nil, workflowReference: nil)
-                let receipt = await fixture.bridge.createLane(observerEndpoint: endpoint, request: request, resolveDestination: { (fixture.window.windowID, UUID(), "Destination") })
+                let receipt = await fixture.bridge.createLane(observerEndpoint: endpoint, request: request, resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: UUID(), workspaceName: "Destination")) })
                 XCTAssertFalse(receipt.linked, fence)
                 XCTAssertNotEqual(receipt.result, .created, fence)
                 let inventory = await fixture.authority.links(forObserver: endpoint.sessionID)
@@ -1263,10 +1263,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                     }
                 }
                 let request = AgentSessionLaneCreateRequest(idempotencyKey: failure, role: "pair", modelID: nil, sessionName: nil, workspaceSelector: nil, message: nil, workflowReference: nil)
-                let receipt = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { (fixture.window.windowID, UUID(), "Destination") })
+                let receipt = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: UUID(), workspaceName: "Destination")) })
                 XCTAssertEqual(receipt.result, .creationIncomplete)
                 XCTAssertFalse(receipt.linked)
-                let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { nil })
+                let replay = await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: request, resolveDestination: { .unavailable(.callerWindowHasNoWorkspace) })
                 XCTAssertTrue(replay.duplicate)
                 XCTAssertEqual(replay.sessionID, receipt.sessionID)
                 XCTAssertEqual(fixture.host.laneCreationCount, 1)
@@ -1414,6 +1414,58 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 windowID: 10, workspaceID: UUID(), workspaceName: uuidShapedName.uuidString
             )], workspaceSelector: uuidShapedName.uuidString, callerWindowID: 10
         ))
+    }
+
+    func testCreateLaneUsesResolvedCallerOnceAndReportsHostAndSelectorFailures() async throws {
+        try await withActivatedLaneFixture { fixture in
+            var windowReads = 0
+            let service = AgentSessionLinkMCPToolService(
+                toolName: fixture.service.toolName, captureRequestMetadata: fixture.service.captureRequestMetadata,
+                requireTargetWindow: {
+                    windowReads += 1
+                    guard windowReads == 1 else { throw MCPError.internalError("stale second routing lookup") }
+                    return fixture.window
+                },
+                resolveObserverEndpoint: fixture.service.resolveObserverEndpoint,
+                withHeartbeat: fixture.service.withHeartbeat, bridge: fixture.bridge
+            )
+            let result = try await Self.executeObject(service, args: ["op": .string("create_lane"), "idempotency_key": .string("routed-once")])
+            XCTAssertEqual(result["result"], .string("created"))
+            XCTAssertEqual(windowReads, 1)
+            let noMatch = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("wrong-selector"), "workspace": .string(UUID().uuidString)])
+            XCTAssertEqual(noMatch["subreason"], .string("selector_matched_none"))
+            XCTAssertEqual(noMatch["stage"], .string("destination_resolution"))
+            fixture.host.laneCreationError = MCPError.internalError("PRIVATE_HOST_DETAIL")
+            let hostError = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("host-error")])
+            XCTAssertEqual(hostError["result"], .string("destination_unavailable"))
+            XCTAssertEqual(hostError["subreason"], .string("host_error:MCPError"))
+            XCTAssertEqual(hostError["stage"], .string("host_allocation"))
+            XCTAssertFalse(String(describing: hostError).contains("PRIVATE_HOST_DETAIL"))
+            fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.destinationChanged
+            let changed = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("changed")])
+            XCTAssertEqual(changed["subreason"], .string("destination_changed"))
+        }
+    }
+
+    func testLaneDestinationFallsBackOnlyToOneUnambiguousWorkspaceAndExplainsRefusal() throws {
+        let destination = AgentSessionLaneMCPToolService.Destination(windowID: 4, workspaceID: UUID(), workspaceName: "Current")
+        let other = AgentSessionLaneMCPToolService.Destination(windowID: 8, workspaceID: UUID(), workspaceName: "Other")
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(candidates: [destination], workspaceSelector: nil, callerWindowID: 99), destination)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(candidates: [destination, other], workspaceSelector: nil, callerWindowID: 4), destination)
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(candidates: [destination, other], workspaceSelector: nil, callerWindowID: 99))
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(candidates: [], workspaceSelector: nil, callerWindowID: 99))
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(candidates: [destination, other], workspaceSelector: destination.workspaceID.uuidString, callerWindowID: 99), destination)
+        let routed = AgentSessionLaneMCPToolService.selectDestinationResult(candidates: [destination, other], workspaceSelector: nil, callerWindowID: 4, callerWorkspaceID: other.workspaceID)
+        XCTAssertNil(routed.destination, "A stale window-only match must not override the routed workspace")
+        if case let .unavailable(failure) = routed { XCTAssertEqual(failure, .selectorAmbiguous) } else { XCTFail("Ambiguous route accepted") }
+        let duplicate = AgentSessionLaneDestination(windowID: 9, workspaceID: destination.workspaceID, workspaceName: destination.workspaceName)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestinationResult(candidates: [destination, duplicate], workspaceSelector: nil, callerWindowID: 99, callerWorkspaceID: nil).destination, destination)
+        var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+        receipt.destinationFailure = .callerWindowHasNoWorkspace
+        let rendered = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
+        XCTAssertEqual(rendered["result"], .string("destination_unavailable"))
+        XCTAssertEqual(rendered["subreason"], .string("caller_window_has_no_workspace"))
+        XCTAssertEqual(rendered["next_call"], .object(["tool": .string("manage_workspaces"), "arguments": .object(["action": .string("list")])]))
     }
 
     func testLaneWorkspaceDigestUsesExactlyDestinationNameEquivalence() {
@@ -3335,6 +3387,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
         private(set) var laneCreationCount = 0
+        var laneCreationError: (any Error)?
         private(set) var lastLaneSelection: AgentSessionLanePolicy.RoleSelection?
 
         func agentSessionLinkModelAvailability(windowID _: Int) -> AgentModelCatalog.AvailabilityContext {
@@ -3348,6 +3401,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             sessionName: String?,
             selection: AgentSessionLanePolicy.RoleSelection
         ) async throws -> AgentSessionLaneHostCreationOutcome {
+            if let laneCreationError { throw laneCreationError }
             laneCreationCount += 1
             lastLaneSelection = selection
             var lane = AgentSessionLinkEndpointCandidate(

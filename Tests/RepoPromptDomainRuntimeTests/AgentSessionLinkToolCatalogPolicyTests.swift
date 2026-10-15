@@ -25,12 +25,22 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let beforeActivationGuidance = MCPDomainToolDefinition(
             name: current.name,
             description: current.description.replacingOccurrences(
-                of: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`.",
+                of: "- `create_lane`: direct link or overseer opt-in; make your managed lane; unique `idempotency_key`. Its first message assigns the lane's job, without asking the user to repeat it. No unrelated authority is inherited: approvals, sandbox/permission changes, destructive or out-of-workspace actions still need their own user approval.",
                 with: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`."
             ),
             inputSchema: current.inputSchema, annotations: current.annotations,
             isEnabledByDefault: current.isEnabledByDefault
         )
+        let previousAssignmentGuidance = MCPDomainToolDefinition(
+            name: current.name,
+            description: beforeActivationGuidance.description.replacingOccurrences(
+                of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
+                with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
+            ), inputSchema: current.inputSchema, annotations: current.annotations, isEnabledByDefault: current.isEnabledByDefault
+        )
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previousAssignmentGuidance), current)
+        XCTAssertTrue(current.description.contains("first message assigns the lane's job"))
+        XCTAssertTrue(current.description.contains("No unrelated authority is inherited"))
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(beforeActivationGuidance), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous), current)
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(current), current)
@@ -41,7 +51,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         }
         // The independent wait note occurs in both definitions; exclude it only from the frozen anchor.
         XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count, 10304, "Frozen c43f1bf6 full-entry baseline")
-        XCTAssertLessThanOrEqual(try size(current) - size(previous), 160)
+        XCTAssertLessThanOrEqual(try size(current) - size(previous), 480)
         let properties = try XCTUnwrap(current.inputSchema.objectValue?["properties"]?.objectValue)
         XCTAssertEqual(properties["model_id"], .object(["type": .string("string")]))
         XCTAssertTrue(current.inputSchema.objectValue?["description"]?.stringValue?.contains("role|model_id?") == true)
@@ -1130,7 +1140,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertTrue(definition.description.contains("tool discovery"))
         XCTAssertTrue(definition.description.contains("next turn"))
         XCTAssertTrue(definition.description.contains("Grants no authority"))
-        XCTAssertTrue(definition.description.contains("user-approved workspace scope with observe"))
+        XCTAssertTrue(definition.description.contains("session_admin scope_status"))
+        XCTAssertTrue(definition.description.contains("session_admin request_scope asks the user"))
+        XCTAssertTrue(definition.description.contains("restructure + observe + control"))
+        XCTAssertTrue(definition.description.contains("creation and fork need spawn"))
         XCTAssertFalse(definition.description.contains("in any workspace"))
         XCTAssertEqual(definition.inputSchema.objectValue?["properties"], .object([:]))
         XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: bootstrap))

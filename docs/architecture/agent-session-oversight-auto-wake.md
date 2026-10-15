@@ -183,8 +183,20 @@ the user's card.
   and provider-context invalidation after that fence, before it publishes.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
-Scope intent persistence is described in
-[`settings-persistence.md`](settings-persistence.md#delegation-scope-intent).
+Scope/link/worktree continuity is described in
+[`settings-persistence.md`](settings-persistence.md#delegation-scope-intent). Persistence records user
+authority; it is not a master permission gate. The running decision owner validates explicit user
+approval, exact caller/target routing, membership, and revocation. A failed store open or save must
+not refuse a currently approved task. UI/tool save diagnostics and row-transaction receipts report
+continuity separately; local-only decisions are never represented as durable or shared.
+
+Managed task assignment is distinct from inheriting authority. An app-verified managed link's task
+(including `create_lane`'s first message) is the lane's job, not a request for the user to repeat the
+assignment. The bridge uses management framing for that first send and rechecks the management
+lease at submission. The lane still obeys its own user's direct instructions and existing workspace
+and permission boundaries. It does not inherit the overseer's unrelated approvals: permission or
+sandbox changes, destructive actions, and out-of-workspace work need their own user approval.
+Arbitrary cross-session text and agent tool arguments cannot stand in for that approval.
 
 ## Same-process window reopen
 
@@ -204,18 +216,20 @@ Launch restoration never deletes saved intent because an establishment was refus
 nothing, but at launch it is routinely transient (an endpoint still hydrating or rebinding, a
 superseded hydration proof, a closing or retiring endpoint). The entry returns to waiting with a small
 per-launch retry budget (`AgentSessionOversightLaunchCoordinator.maxAutomaticEstablishmentAttempts`);
-the next pass reclassifies first, so only a fact `classify` proves (deleted, missing under a fully
-observed topology, duplicate, ineligible, terminal hydration) removes the durable row. An exhausted
-budget leaves the intent dormant for the next launch.
+the next pass reclassifies first. Only committed deletion removes the durable row; other terminal
+classifications end this launch's attempt without erasing continuity. An exhausted budget likewise
+leaves the intent dormant for the next launch.
 
-**No data loss across restart or crash.** Oversight intent (`agentSessionOversightLinks.json`),
-delegation scopes (`delegationScopes.json`), and delegated worktree ownership are written atomically
-and durably at the moment of change (`DurableAtomicFileWriter`), so launch simply loads what is on
-disk; nothing depends on a graceful quit. Launch restoration may end an entry for this launch for any
-reason, but it removes the saved row only for a committed session deletion
-(`AgentSessionOversightLaunchTerminalReason.removesDurableIntent`); every other reason keeps the intent
-dormant for the next launch. Explicit user or agent actions (Unlink, revoke, release) still remove
-state, recording tombstones where the store has them.
+**Committed continuity survives restart or crash.** Scope, link-intent, and worktree transitions
+write affected SQLite rows and receipts atomically; no clean-shutdown marker or final snapshot is
+required. Live decisions and save acknowledgements are separate: pending/failed writes are not
+promised to survive process death. Revocation immediately denies live use and attempts a terminal
+transaction before returning; a wholly failed write is reported as unsettled, not as durable.
+Only affected entries need recovery; unrelated valid committed grants restore normally. See
+[`settings-persistence.md`](settings-persistence.md#delegation-scope-intent) for the exact failed-write
+limit. Launch restoration removes saved intent only for committed deletion
+(`AgentSessionOversightLaunchTerminalReason.removesDurableIntent`); every other reason keeps it
+dormant for the next launch. Explicit Unlink/revoke/release still records its own transition.
 
 ## Route authority is independent of tool discovery
 
@@ -474,9 +488,13 @@ there is an attested command projection; supported native command requests are c
 against a conservative command-shape allowlist, never against their redacted display text.
 
 The allowlist covers simple git status/log/diff (with `--no-pager`, and for log/diff also
-`--no-ext-diff --no-textconv`), `gh run view`, conductor job list/status/wait, and grep. Shell quoting,
-expansion, wrappers, operators, redirection, and unknown mutation options stay manual. This is not a
-shell sandbox: repository tools and configuration must be trusted. The listener is separate from the
+`--no-ext-diff --no-textconv`), `gh run view`, conductor job list/status/wait, and grep. Status/diff
+additionally require `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the operation: disabling
+external diff/textconv alone does not disable fsmonitor. Other config overrides stay manual.
+Shell quoting, expansion, wrappers, operators, redirection, and unknown mutation options stay manual.
+This is not a filesystem sandbox: grep's literal relative/absolute path arguments retain the lane's
+existing provider sandbox access. The option never grants a broader sandbox or permission mode;
+workspace confinement is not claimed by this command-shape check. The listener is separate from the
 passive reducer and wake coordinator; presentation-only repaints never inspect or answer a prompt.
 
 The durable oversight document stores only observer → target UUID pairs. Older documents with a

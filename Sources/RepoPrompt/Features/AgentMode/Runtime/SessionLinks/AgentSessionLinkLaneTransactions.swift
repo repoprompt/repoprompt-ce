@@ -36,10 +36,49 @@ enum AgentSessionLaneHostCreationOutcome {
 
 enum AgentSessionLaneHostUnavailable: Error { case unavailable }
 
+struct AgentSessionLaneDestination: Equatable {
+    let windowID: Int
+    let workspaceID: UUID
+    let workspaceName: String
+}
+
+enum AgentSessionLaneDestinationFailure: Error, Equatable {
+    case callerWindowHasNoWorkspace, selectorMatchedNone, selectorAmbiguous, destinationChanged
+    case hostError(String)
+
+    var subreason: String {
+        switch self {
+        case .callerWindowHasNoWorkspace: "caller_window_has_no_workspace"
+        case .selectorMatchedNone: "selector_matched_none"
+        case .selectorAmbiguous: "selector_ambiguous"
+        case .destinationChanged: "destination_changed"
+        case let .hostError(type): "host_error:\(type)"
+        }
+    }
+}
+
+enum AgentSessionLaneDestinationResolution {
+    case available(AgentSessionLaneDestination)
+    case unavailable(AgentSessionLaneDestinationFailure)
+
+    var destination: AgentSessionLaneDestination? {
+        if case let .available(value) = self { return value }
+        return nil
+    }
+}
+
 /// A destination was resolved, but scoped creation was refused before allocating any session.
 /// Keeping this separate prevents the bridge from misreporting authority as destination failure.
 struct AgentSessionLaneSpawnAdmissionFailure: Error {
     let detail: String
+
+    /// Only the structured error emitted by our admission owner is decoded here, never target text.
+    var subreason: String {
+        guard let start = detail.firstIndex(of: "{"),
+              let fields = try? JSONSerialization.jsonObject(with: Data(detail[start...].utf8)) as? [String: Any]
+        else { return "scope_denied" }
+        return fields["subreason"] as? String ?? fields["code"] as? String ?? "scope_denied"
+    }
 }
 
 struct AgentSessionLaneCreateReceipt: Equatable {
@@ -73,6 +112,9 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     var duplicate = false
     var firstTaskReason: String?
     var refusalDetail: String?
+    var admissionSubreason: String?
+    var destinationFailure: AgentSessionLaneDestinationFailure?
+    var refusalStage: String?
     /// Original destination display name, preserved on replay; not a live location or selector.
     var workspaceName: String?
 

@@ -123,7 +123,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     // MARK: - Perform
 
     func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
-        switch batch.request.operation {
+        let value: Value = switch batch.request.operation {
         case .adminWorktreeCreate: try await create(batch)
         case .adminWorktreeBind: try await bind(batch)
         case .adminWorktreeUnbind: try await unbind(batch, release: false)
@@ -133,6 +133,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         case .adminMergeApply: try await mergeApply(batch)
         default: throw SessionAdminMCPToolService.notImplemented(batch.request.operation.rawValue)
         }
+        guard case var .object(reply) = value else { return value }
+        reply["ownership_continuity_save_state"] = .string(ownership.saveState)
+        if let detail = ownership.persistenceDiagnostic { reply["ownership_continuity_detail"] = .string(detail) }
+        return .object(reply)
     }
 
     // MARK: - Create

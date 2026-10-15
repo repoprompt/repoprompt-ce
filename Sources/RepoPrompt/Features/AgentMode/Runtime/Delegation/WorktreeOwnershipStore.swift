@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPersistence
 
 /// Who created a worktree under delegation, and whether it has been released for human cleanup.
 ///
@@ -40,160 +41,130 @@ struct WorktreeOwnershipDocument: Codable, Equatable {
     let worktrees: [WorktreeOwnershipRecord]
 }
 
-private struct WorktreeOwnershipDocumentHeader: Decodable {
-    let version: Int
-}
-
-/// App-wide durable worktree ownership, beside `delegationScopes.json`:
-/// `~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json`.
-///
-/// Main-actor in-memory state with serialized write-through. Loading follows the delegation-scope
-/// store's rules: a missing file starts empty, a malformed supported-version file is quarantined into
-/// `Backups/`, and a future schema is preserved and blocks writes. Until app composition installs a
-/// file (`bootstrap`), and for suppressed launches, state is kept in memory only.
+/// Live delegation provenance with asynchronous per-row, revision-checked continuity saving.
+/// Legacy ownership sources are read-only. Saving can fail without invalidating current provenance;
+/// no whole-file replacement, clean-shutdown marker, or arbitrary release-history pruning exists.
 @MainActor
 final class WorktreeOwnershipStore {
     static let filename = "delegationWorktreeOwnership.json"
-    /// Rows this store ever writes. Kept well below `maxDecodedRecords`, so a file this store wrote can
-    /// never trip the decode guard and be quarantined.
-    static let maxRecords = 4096
-    /// Released (stale-marked) rows kept for cleanup visibility; the oldest are pruned first.
-    static let maxReleasedRecords = 1024
-    static let maxDecodedRecords = 8192
-    static let maxFileByteCount = 4 * 1024 * 1024
-
-    enum LoadState: Equatable {
-        case unloaded
-        case ready
-        case blocked(String)
-    }
-
+    enum LoadState: Equatable { case unloaded, ready, blocked(String) }
     private(set) var records: [String: WorktreeOwnershipRecord] = [:]
-    /// In-memory stores are `.ready` immediately; a file-backed store is `.unloaded` until loaded.
     private(set) var loadState: LoadState = .ready
-    private var fileURL: URL?
-    private var backupsDirectoryURL: URL?
-    private let writer: @Sendable (Data, URL) throws -> Void
-    private var persistChain: Task<Void, Never>?
-
-    init(
-        writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try DurableAtomicFileWriter.write(data, to: url)
-        }
-    ) {
-        self.writer = writer
+    private(set) var saveState = "not_persisted"
+    private(set) var persistenceDiagnostic: String?
+    private var repository: OverseerContinuityRepository?
+    private let beforeCommit: @Sendable () throws -> Void
+    private var savedRevisions: [String: Int64] = [:]
+    private struct Pending {
+        let id: UUID
+        var row: WorktreeOwnershipRecord
+        var mutation: OverseerContinuityMutation?
+        var needsBaseline = false
     }
 
-    // MARK: - Load
+    private var pending: [Pending] = []
+    private var rejectedOperations: [UUID: String] = [:]
+    private var recoveryWarning: String?
+    private var persistChain: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var retryDelay: UInt64 = 1
+    init(beforeCommit: @escaping @Sendable () throws -> Void = {}) {
+        self.beforeCommit = beforeCommit
+    }
 
-    /// Production location, beside `delegationScopes.json`. Suppressed launches stay in memory.
     func bootstrapProduction(mode: AgentSessionOversightPersistenceMode) async {
-        guard mode.performsProductionFileIO,
-              let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-              .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        else { return }
+        guard mode.performsProductionFileIO else { return }
+        let locations = OverseerContinuityRepository.production()
         await bootstrap(
-            fileURL: base.appendingPathComponent(Self.filename),
-            backupsDirectoryURL: base.appendingPathComponent(DelegationScopeStore.backupsDirectoryName, isDirectory: true)
+            fileURL: locations.legacyDirectory.appendingPathComponent(Self.filename),
+            backupsDirectoryURL: nil,
+            databaseURL: locations.databaseURL,
+            profile: locations.profile,
+            legacyPolicy: locations.legacyFactsPolicy
         )
     }
 
-    /// Installs the durable file once and loads it. Rows recorded before the load win.
-    func bootstrap(fileURL: URL, backupsDirectoryURL: URL?) async {
-        guard self.fileURL == nil else { return }
-        self.fileURL = fileURL
-        self.backupsDirectoryURL = backupsDirectoryURL
+    func bootstrap(
+        fileURL: URL,
+        backupsDirectoryURL _: URL?,
+        databaseURL: URL? = nil,
+        profile: String = "temporary-overseer",
+        legacyPolicy: OverseerLegacyPolicy = .sameProfile
+    ) async {
+        guard repository == nil else { return }
+        repository = OverseerContinuityRepository(
+            databaseURL: databaseURL ?? fileURL.deletingLastPathComponent().appendingPathComponent("Overseer/continuity.sqlite"),
+            profile: profile,
+            legacyURL: fileURL,
+            kind: .worktree,
+            mode: .enabled,
+            legacyPolicy: legacyPolicy
+        )
+        await recover()
+    }
+
+    private func recover() async {
+        guard let repository else { return }
         loadState = .unloaded
-        let backups = backupsDirectoryURL
-        let result = await Task.detached { Self.read(fileURL: fileURL, backupsDirectoryURL: backups) }.value
-        switch result {
-        case let .loaded(rows):
-            let preLoad = records
-            records = Dictionary(rows.map { ($0.worktreeID, $0) }, uniquingKeysWith: { first, _ in first })
-            for (worktreeID, pending) in preLoad {
-                guard var stored = records[worktreeID] else {
-                    records[worktreeID] = pending
-                    continue
+        do {
+            let loaded = try await Task.detached { try repository.load() }.value
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            var invalidIDs: [String] = []
+            let validated = loaded.compactMap { saved -> (OverseerContinuityRow, WorktreeOwnershipRecord)? in
+                do {
+                    let row = try decoder.decode(WorktreeOwnershipRecord.self, from: saved.payload)
+                    guard row.worktreeID == saved.id, row.createdBySessionID?.uuidString == saved.ownerID else { throw OverseerContinuityError.invalidRecord }
+                    return (saved, row)
+                } catch {
+                    invalidIDs.append(saved.id)
+                    return nil
                 }
-                if pending.createdBySessionID != nil {
-                    // A creation recorded this launch describes the current worktree.
-                    stored = pending
-                } else {
-                    // A pre-load release mark is merged onto the durable ownership row, never lost.
-                    stored.releasedAt = pending.releasedAt ?? stored.releasedAt
-                    stored.releasedBySessionID = pending.releasedBySessionID ?? stored.releasedBySessionID
+            }
+            recoveryWarning = invalidIDs.isEmpty ? nil : "Invalid ownership entries remain preserved for recovery: \(invalidIDs.joined(separator: ", ")). Other valid ownership rows restore normally."
+            for (saved, row) in validated {
+                savedRevisions[row.worktreeID] = max(savedRevisions[row.worktreeID] ?? 0, saved.revision)
+                // Existing current-process creation/release decisions always win over continuity.
+                if records[row.worktreeID] == nil { records[row.worktreeID] = row }
+                else if let live = records[row.worktreeID], live.createdBySessionID == nil, live.releasedAt != nil {
+                    // A pre-load release knew the binding, not its creator. Preserve saved creator
+                    // provenance while keeping the newer live release decision and current path.
+                    var merged = row
+                    merged.path = live.path
+                    merged.releasedAt = live.releasedAt
+                    merged.releasedBySessionID = live.releasedBySessionID
+                    records[row.worktreeID] = merged
+                    for index in pending.indices where pending[index].row.worktreeID == row.worktreeID && pending[index].row.createdBySessionID == nil {
+                        pending[index].row = merged
+                    }
                 }
-                records[worktreeID] = stored
             }
             loadState = .ready
-            if !preLoad.isEmpty { trimAndPersist() }
-        case let .blocked(reason):
-            loadState = .blocked(reason)
-        }
-    }
-
-    private enum ReadResult {
-        case loaded([WorktreeOwnershipRecord])
-        case blocked(String)
-    }
-
-    private nonisolated static func read(fileURL: URL, backupsDirectoryURL: URL?) -> ReadResult {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: fileURL.path) else { return .loaded([]) }
-        guard let data = try? Data(contentsOf: fileURL) else { return .blocked("unreadable") }
-        guard data.count <= maxFileByteCount else { return .blocked("file_too_large") }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        if let header = try? decoder.decode(WorktreeOwnershipDocumentHeader.self, from: data),
-           header.version > WorktreeOwnershipDocument.currentVersion
-        {
-            return .blocked("unsupported_future_schema")
-        }
-        if let document = try? decoder.decode(WorktreeOwnershipDocument.self, from: data),
-           document.worktrees.count <= maxDecodedRecords
-        {
-            return .loaded(document.worktrees)
-        }
-        // Malformed supported-version file: move it aside and start empty, or stay blocked.
-        guard let backupsDirectoryURL else { return .blocked("unreadable") }
-        try? fileManager.createDirectory(at: backupsDirectoryURL, withIntermediateDirectories: true)
-        let destination = backupsDirectoryURL.appendingPathComponent(
-            "delegationWorktreeOwnership.corrupt.\(UUID().uuidString).json"
-        )
-        do {
-            try fileManager.moveItem(at: fileURL, to: destination)
-            return .loaded([])
+            persistenceDiagnostic = rejectedOperations.values.sorted().first ?? recoveryWarning ?? repository.diagnostic
+            if pending.isEmpty { saveState = rejectedOperations.isEmpty ? "saved" : "failed" }
+            persist()
         } catch {
-            return .blocked("unreadable")
+            loadState = .blocked("Continuity open failed: \(error)")
+            saveState = "failed"
+            persistenceDiagnostic = "Worktree ownership saving is unavailable; current live provenance remains local and unsaved. Saving will retry: \(error)"
+            scheduleRetry()
         }
     }
-
-    // MARK: - Queries
 
     func record(worktreeID: String) -> WorktreeOwnershipRecord? {
         records[worktreeID]
     }
 
     func records(createdBy sessionIDs: Set<UUID>) -> [WorktreeOwnershipRecord] {
-        records.values
-            .filter { $0.createdBySessionID.map(sessionIDs.contains) ?? false }
-            .sorted { $0.createdAt < $1.createdAt }
+        records.values.filter { $0.createdBySessionID.map(sessionIDs.contains) ?? false }.sorted { $0.createdAt < $1.createdAt }
     }
 
     func ownedUnreleasedWorktreeIDs(createdBy sessionIDs: Set<UUID>) -> Set<String> {
         Set(records(createdBy: sessionIDs).filter { $0.releasedAt == nil }.map(\.worktreeID))
     }
 
-    // MARK: - Mutation
-
-    func recordCreation(
-        _ info: SessionAdminWorktreeInfo,
-        createdBySessionID: UUID,
-        delegationScopeID: UUID,
-        at date: Date
-    ) {
-        records[info.worktreeID] = WorktreeOwnershipRecord(
+    func recordCreation(_ info: SessionAdminWorktreeInfo, createdBySessionID: UUID, delegationScopeID: UUID, at date: Date) {
+        let row = WorktreeOwnershipRecord(
             worktreeID: info.worktreeID,
             repositoryID: info.repositoryID,
             path: info.path,
@@ -203,17 +174,10 @@ final class WorktreeOwnershipStore {
             delegationScopeID: delegationScopeID,
             createdAt: date
         )
-        trimAndPersist()
+        record(row)
     }
 
-    /// Marks worktrees stale for human cleanup. Worktrees this store never saw are recorded with no
-    /// creator so the stale mark still survives relaunch.
-    func markReleased(
-        _ worktrees: [AgentSessionWorktreeBindingSummary],
-        bySessionID releasedBy: UUID,
-        at date: Date
-    ) {
-        guard !worktrees.isEmpty else { return }
+    func markReleased(_ worktrees: [AgentSessionWorktreeBindingSummary], bySessionID releasedBy: UUID, at date: Date) {
         for summary in worktrees {
             var row = records[summary.worktreeID] ?? WorktreeOwnershipRecord(
                 worktreeID: summary.worktreeID,
@@ -225,62 +189,97 @@ final class WorktreeOwnershipStore {
             )
             row.releasedAt = row.releasedAt ?? date
             row.releasedBySessionID = row.releasedBySessionID ?? releasedBy
-            records[summary.worktreeID] = row
+            record(row)
         }
-        trimAndPersist()
     }
 
-    /// Waits for queued writes; tests and shutdown use this as a linearization point.
-    func flushPersistence() async {
-        await persistChain?.value
-    }
-
-    /// A worktree bound again is in use: its stale mark is cleared (a row that existed only for the
-    /// mark is dropped).
     func clearReleased(worktreeID: String) {
         guard var row = records[worktreeID], row.releasedAt != nil else { return }
-        if row.createdBySessionID == nil {
-            records.removeValue(forKey: worktreeID)
-        } else {
-            row.releasedAt = nil
-            row.releasedBySessionID = nil
-            records[worktreeID] = row
-        }
-        persist()
+        row.releasedAt = nil
+        row.releasedBySessionID = nil
+        record(row) // Keep history/identity; never arbitrarily prune terminal ownership records.
     }
 
-    private func trimAndPersist() {
-        // Oldest released rows go first, then (only past the hard cap) the oldest owned rows: losing
-        // a very old ownership row only makes `maxWorktrees` less strict for that worktree.
-        let released = records.values.filter { $0.releasedAt != nil }
-            .sorted { ($0.releasedAt ?? $0.createdAt) < ($1.releasedAt ?? $1.createdAt) }
-        for row in released.prefix(max(0, released.count - Self.maxReleasedRecords)) {
-            records.removeValue(forKey: row.worktreeID)
-        }
-        if records.count > Self.maxRecords {
-            let oldest = records.values.sorted { $0.createdAt < $1.createdAt }
-            for row in oldest.prefix(records.count - Self.maxRecords) {
-                records.removeValue(forKey: row.worktreeID)
-            }
-        }
+    private func record(_ row: WorktreeOwnershipRecord) {
+        records[row.worktreeID] = row
+        pending.append(.init(id: UUID(), row: row))
+        saveState = repository == nil ? "not_persisted" : "pending"
         persist()
     }
 
     private func persist() {
-        guard let fileURL, loadState == .ready else { return }
-        let document = WorktreeOwnershipDocument(
-            version: WorktreeOwnershipDocument.currentVersion,
-            worktrees: records.values.sorted { $0.worktreeID < $1.worktreeID }
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(document) else { return }
-        let writer = writer
-        let previous = persistChain
-        persistChain = Task {
-            await previous?.value
-            await Task.detached { try? writer(data, fileURL) }.value
+        guard persistChain == nil, loadState != .unloaded, let repository, !pending.isEmpty else { return }
+        persistChain = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !pending.isEmpty {
+                do {
+                    if pending[0].needsBaseline, loadState == .ready {
+                        let operation = pending[0].id, database = repository.database
+                        let prior = try await Task.detached { try database.receipt(operationID: operation) }.value
+                        if prior == nil { pending[0].mutation = nil }
+                        pending[0].needsBaseline = false
+                    }
+                    let mutation: OverseerContinuityMutation
+                    if let captured = pending[0].mutation { mutation = captured }
+                    else {
+                        let row = pending[0].row
+                        let encoder = JSONEncoder()
+                        encoder.outputFormatting = [.sortedKeys]
+                        encoder.dateEncodingStrategy = .iso8601
+                        mutation = try .put(.init(
+                            kind: .worktree,
+                            id: row.worktreeID,
+                            ownerID: row.createdBySessionID?.uuidString,
+                            payload: encoder.encode(row),
+                            terminal: row.releasedAt != nil
+                        ), expectedRevision: savedRevisions[row.worktreeID])
+                        pending[0].mutation = mutation
+                        pending[0].needsBaseline = loadState != .ready
+                    }
+                    let operation = pending[0].id, hook = beforeCommit
+                    let receipt = try await Task.detached {
+                        try hook()
+                        return try repository.commit(operationID: operation, mutations: [mutation], origin: "live-worktree-owner")
+                    }.value
+                    savedRevisions[pending[0].row.worktreeID] = receipt.revision
+                    pending.removeFirst()
+                    saveState = rejectedOperations.isEmpty ? (pending.isEmpty ? "saved" : "pending") : "failed"
+                    persistenceDiagnostic = rejectedOperations.values.sorted().first ?? recoveryWarning
+                    retryDelay = 1
+                } catch {
+                    if (error as? OverseerContinuityError)?.isPermanentTransitionFailure == true {
+                        let rejected = pending.removeFirst()
+                        let detail = "Worktree continuity operation \(rejected.id) was rejected and is not durable: \(error). Inspect the conflicting saved identity before a fresh decision; other saves continue."
+                        rejectedOperations[rejected.id] = detail
+                        saveState = "failed"
+                        persistenceDiagnostic = detail
+                        continue
+                    }
+                    saveState = "failed"
+                    persistenceDiagnostic = "Worktree ownership continuity is not saved or shared; current live provenance remains. Saving will retry: \(error)"
+                    scheduleRetry()
+                    break
+                }
+            }
+            persistChain = nil
         }
+    }
+
+    private func scheduleRetry() {
+        guard retryTask == nil else { return }
+        let delay = retryDelay
+        retryDelay = min(30, delay * 2)
+        retryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: delay * 1_000_000_000) } catch { return }
+            guard let self else { return }
+            retryTask = nil
+            if case .blocked = loadState { await recover() }
+            persist()
+        }
+    }
+
+    func flushPersistence() async {
+        persist()
+        await persistChain?.value
     }
 }
