@@ -6371,7 +6371,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             self.directory = directory
         }
 
-        static func make(activeID: UUID, parentID: UUID?, stashedID: UUID? = nil) async throws -> LoadedWindowFixture {
+        static func make(
+            activeID: UUID, parentID: UUID?, stashedID: UUID? = nil,
+            agentFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
+        ) async throws -> LoadedWindowFixture {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-loaded-\(UUID())")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             // WindowState() is the legacy/no-runtime composition in these headless tests.
@@ -6385,7 +6388,13 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
             ))
             try await runtime.start()
-            let window = WindowState(domainRuntime: runtime)
+            let window = if let agentFactory {
+                WindowState(
+                    agentModeViewModelFactory: agentFactory,
+                    contextBuilderProviderFactory: { _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
+                    domainRuntime: runtime
+                )
+            } else { WindowState(domainRuntime: runtime) }
             let fixture = LoadedWindowFixture(window: window, runtime: runtime, directory: directory)
             WindowStatesManager.shared.registerWindowState(window)
             do {
@@ -6443,6 +6452,174 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let shutdown = await runtime.shutdown()
             XCTAssertEqual(shutdown.finalLifecycle, .stopped)
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    func testExactTargetApprovalContinuesColdSavedLinkAndManagedTaskWithoutUserTurn() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let requesterID = UUID(uuidString: "EBDD3C4A-E6DE-4D9F-8FA3-5456B640BBE6")!
+            let targetID = UUID(uuidString: "7028330D-041A-432C-A6F6-F1C976FAD1AD")!
+            let controller = MonitorFakeNativeController()
+            var providerStarts = 0
+            let observerController = MonitorFakeNativeController()
+            @MainActor func providerFactory(_ controller: MonitorFakeNativeController, onStart: @escaping @MainActor () -> Void) -> WindowStateCompositionFactory.AgentModeViewModelFactory {
+                { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in fatalError("This fixture must never launch Codex") },
+                        claudeControllerFactory: { _, _, _, _ in onStart()
+                            return controller
+                        },
+                        // Keep real pending-policy arming: native PID leases must not see a no-op installer.
+                        mcpServerEnabler: { true }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    // This disposable provider has no MCP process to register a tools/list reply.
+                    // Supply only its transport/catalog witness; real scope/link authority stays live.
+                    let connectionID = UUID()
+                    vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { [weak vm] runID, _, tabID in
+                        guard let vm, let endpoint = vm.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
+                        let token = AgentSessionLinkRunCatalogRouteToken(
+                            runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
+                            routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
+                        )
+                        vm.agentSessionLinkPublishRunCatalogProjection(.init(
+                            runID: runID, routeToken: token, projectionRevision: 1,
+                            hasAgentSessionLink: true, hasAnyActiveLink: true
+                        ), to: endpoint)
+                        return token
+                    }
+                    vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { [weak vm] token, tabID in
+                        // The synchronous fence receives the tab ID, not the run ID.
+                        vm?.sessions[tabID]?.runID == token.runID
+                            && vm?.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
+                    }
+                    return vm
+                }
+            }
+            let observerFixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: providerFactory(observerController, onStart: {}))
+            let targetFixture = try await LoadedWindowFixture.make(activeID: targetID, parentID: nil, agentFactory: providerFactory(controller, onStart: { providerStarts += 1 }))
+            addTeardownBlock { @MainActor in
+                await targetFixture.cleanup()
+                await observerFixture.cleanup()
+                WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let observerVM = observerFixture.window.agentModeViewModel
+            let observerTab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let observer = observerVM.session(for: observerTab.id)
+            observer.selectedAgent = .claudeCode
+            _ = try XCTUnwrap(observerVM.test_installPersistentSessionBinding(sessionID: requesterID, on: observer, updateWorkspaceMetadata: true))
+            observer.hasLoadedPersistedState = true
+            observer.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerVM, tabID: observerTab.id)
+            let targetVM = targetFixture.window.agentModeViewModel
+            targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            observerFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("in-memory Claude availability", timeout: 5) {
+                targetFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                    && observerFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+            let workspaceIndex = try XCTUnwrap(targetFixture.window.workspaceManager.workspaces.firstIndex { $0.id == targetFixture.carriers?.id })
+            targetFixture.window.workspaceManager.workspaces[workspaceIndex].customStoragePath = targetFixture.directory.appendingPathComponent("sessions")
+            let workspace = targetFixture.window.workspaceManager.workspaces[workspaceIndex]
+            // Unlike the read-only inventory fixtures, this test dispatches a real write. Publish
+            // both carriers through the workspace owner so a save cannot reload their older disk tabs.
+            _ = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(workspace)
+            _ = try await observerFixture.window.workspaceManager.saveWorkspaceToFileAsync(
+                XCTUnwrap(observerFixture.window.workspaceManager.activeWorkspace)
+            )
+            if let prior = targetVM.sessions[targetTab.id] {
+                prior.saveDebounceTask?.cancel()
+                prior.persistedLoadTask?.cancel()
+                await prior.persistedLoadTask?.value
+            }
+            let savedURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: "Never visited idle target",
+                agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
+            ), for: workspace)
+            addTeardownBlock { try? FileManager.default.removeItem(at: savedURL) }
+            // Workspace activation can materialize the selected row. Remove only this disposable
+            // runtime to reproduce the never-visited saved carrier, not a fake live endpoint.
+            targetVM.test_removeSession(tabID: targetTab.id)
+            let selectedBefore = targetFixture.window.promptManager.activeComposeTabID
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            var decisions: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in decisions.append(text) }
+            let wasSuppressed = bridge.delegationScopes.test_suppressDecisionDelivery
+            bridge.delegationScopes.test_suppressDecisionDelivery = false
+            addTeardownBlock { @MainActor in
+                bridge.delegationScopes.test_scopeDecision = nil
+                bridge.delegationScopes.test_suppressDecisionDelivery = wasSuppressed
+            }
+            var service = BecomeOverseerMCPToolService(
+                captureRequestMetadata: { .init(connectionID: UUID(), clientName: "exact-target-flow", windowID: endpoint.windowID) },
+                resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: bridge
+            )
+            // The transport route proof is independently covered by the installed-routing tests;
+            // all activation, approval, preparation, link and delivery effects below are production.
+            service.prepareActivationCommit = { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+            let args: [String: Value] = ["session_id": .string(targetID.uuidString), "message": .string("say hi"), "idempotency_key": .string("T30-one-request")]
+            let requested = try await service.execute(args: args)
+            guard case let .object(result) = requested, case let .string(rawID) = result["request_id"], let requestID = UUID(uuidString: rawID) else { return XCTFail("\(requested)") }
+            let request = try XCTUnwrap(bridge.delegationScopes.request(id: requestID, requesterSessionID: requesterID))
+            XCTAssertEqual(request.kind, .session(targetSessionID: targetID))
+            XCTAssertEqual(request.capabilities, [.observe, .control, .restructure])
+            XCTAssertEqual(providerStarts, 0)
+            XCTAssertNil(targetVM.sessions[targetTab.id], "No provider or hydration before consent")
+            _ = try await service.execute(args: args)
+            XCTAssertEqual(bridge.delegationScopes.pendingRequests(forTab: endpoint.tabID, sessionID: requesterID).count, 1, "one card, no blind retry")
+            let granted = try bridge.delegationScopes.approve(
+                requestID: requestID, presentedWindowID: endpoint.windowID,
+                presentedTabID: endpoint.tabID, presentedSessionID: requesterID
+            ).get()
+            try await AsyncTestWait.waitUntil("one approval automatically prepares, links and dispatches", timeout: 15) {
+                decisions.contains { $0.contains("task_delivered") || $0.contains("refused") || $0.contains("failed") || $0.contains("not_dispatched") }
+            }
+            guard decisions.contains(where: { $0.contains("task_delivered") }) else { return XCTFail("\(decisions)") }
+            do {
+                try await AsyncTestWait.waitUntil("assigned task reaches the provider", timeout: 15) { await controller.sentCount == 1 }
+            } catch {
+                return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(String(describing: targetVM.sessions[targetTab.id]?.runState)), items=\(String(describing: targetVM.sessions[targetTab.id]?.items.map(\.text))), decisions=\(decisions)")
+            }
+            XCTAssertEqual(providerStarts, 1, "The provider starts for the assigned task, never merely to link")
+            XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
+            let messages = await controller.sentMessages
+            XCTAssertEqual(messages.count, 1)
+            XCTAssertTrue(messages.first?.contains("say hi") == true)
+            let link = await bridge.delegationActiveLink(observerSessionID: requesterID, targetSessionID: targetID)
+            XCTAssertEqual(link?.sourceScopeID, granted.id)
+            XCTAssertTrue(targetVM.sessions[targetTab.id]?.permitsBoundOperationAndSave == true)
+            XCTAssertFalse(decisions.contains { $0.contains("target_idle_with_new_activity") }, "Dispatch alone is not a reply")
+            await controller.completeLastTurn(text: "Hi!")
+            // The fake has no MCP peer: the real native bootstrap lease's 10-second routing
+            // deadline settles before its buffered provider events are consumed.
+            try await AsyncTestWait.waitUntil("target completion resumes requester automatically", timeout: 25) {
+                decisions.contains { $0.contains("target_idle_with_new_activity") }
+            }
+            XCTAssertTrue(targetVM.sessions[targetTab.id]?.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") } == true)
+            do {
+                try await AsyncTestWait.waitUntil("approval and result actually reach the requester provider without user input", timeout: 30) {
+                    await observerController.completeLastTurn()
+                    return await observerController.sentMessages.contains { $0.contains("target_idle_with_new_activity") }
+                }
+            } catch {
+                let resumed = await observerController.sentMessages
+                let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
+                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
+            }
+            let resumed = await observerController.sentMessages
+            XCTAssertTrue(resumed.contains { $0.contains("RepoPrompt delegation decision") })
+            _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+            let denied = await bridge.authorizeTarget(operation: .monitorSteer, observerEndpoint: endpoint, targetSessionID: targetID)
+            guard case .failure = denied else { return XCTFail("Exact-target revocation must deny immediately") }
+            bridge.delegationScopes.test_scopeDecision = nil
+            await bridge.test_settleProjections()
         }
     }
 

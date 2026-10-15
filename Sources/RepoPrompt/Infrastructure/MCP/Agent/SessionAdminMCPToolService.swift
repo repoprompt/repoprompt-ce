@@ -30,7 +30,7 @@ struct SessionAdminMCPToolService {
 
     /// Identical for every unavailable caller, so the hidden tool reveals nothing when named.
     static let unavailableError = MCPError.invalidParams(
-        "session_admin is not available for this session on this exact route. Call become_overseer, then on your next turn call session_admin scope_status to discover operations and current grants. If already enabled, retry from the original requesting session; use request_scope for missing authority. A grant never substitutes for a current routed session."
+        "session_admin is not available for this session on this exact route. For one target, call become_overseer with session_id and optional message now: one exact-target approval automatically continues preparation, link and dispatch. session_admin scope_status discovers operations and grants when available. If already enabled, retry from the original requesting session; use request_scope for missing authority. A grant never substitutes for a current routed session."
     )
 
     static let inventoryGuidance = "For cleanup or organizing, request observe together with the needed mutation capabilities, then use inventory to select targets when available. A workspace scope covers only that workspace; history is not a scope inventory."
@@ -104,6 +104,13 @@ struct SessionAdminMCPToolService {
     private func requestScope(args: [String: Value], endpoint: Endpoint) throws -> Value {
         let kind: DomainDelegationScopeKind
         switch AgentMCPToolHelpers.normalizedString(args["kind"])?.lowercased() ?? "tree" {
+        case "session":
+            guard args["workspace"] == nil, let raw = args["session_id"]?.stringValue,
+                  let target = UUID(uuidString: raw), target != endpoint.sessionID
+            else {
+                throw MCPError.invalidParams("session_admin request_scope kind=session needs one other session_id and no workspace selector.")
+            }
+            kind = .session(targetSessionID: target)
         case "tree":
             guard args["workspace"] == nil else {
                 throw MCPError.invalidParams("session_admin request_scope workspace applies only to kind=workspace.")
@@ -130,7 +137,7 @@ struct SessionAdminMCPToolService {
             }
             kind = .allSessions
         default:
-            throw MCPError.invalidParams("session_admin request_scope kind must be tree, workspace, or all_sessions.")
+            throw MCPError.invalidParams("session_admin request_scope kind must be session, tree, workspace, or all_sessions.")
         }
 
         let capabilities = try Self.parseCapabilities(args["capabilities"], kind: kind)
@@ -215,7 +222,7 @@ struct SessionAdminMCPToolService {
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
             "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) }),
             "operation_catalog": Self.operationCatalog(),
-            "guidance": .string("Capabilities describe authority, not tool discovery. Call become_overseer to restore oversight tools; catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
+            "guidance": .string("Capabilities describe authority, not tool discovery. For a one-target task, become_overseer with session_id and optional message requests exactly the needed capabilities and continues automatically after approval, without waiting for catalog refresh. Other catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
         ], runtime: runtime)
     }
 
@@ -570,6 +577,8 @@ struct SessionAdminMCPToolService {
             "guardrails": guardrailsValue(record.grant.guardrails)
         ]
         switch record.grant.kind {
+        case let .session(target):
+            value["target_session_id"] = .string(target.uuidString)
         case let .tree(rootSessionID):
             value["root_session_id"] = .string(rootSessionID.uuidString)
         case let .workspace(workspaceID):
@@ -641,6 +650,7 @@ struct SessionAdminMCPToolService {
         kind: DomainDelegationScopeKind
     ) throws -> Set<DomainDelegationScopeCapability> {
         guard let value else {
+            if case .session = kind { return [.observe, .control, .restructure] }
             if case .allSessions = kind { return DomainDelegationScopeCapability.organizeEverythingPreset }
             return DomainDelegationScopeCapability.manageTreePreset
         }

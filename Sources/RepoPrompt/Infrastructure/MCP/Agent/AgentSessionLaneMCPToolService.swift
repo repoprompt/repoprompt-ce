@@ -100,7 +100,7 @@ enum AgentSessionLaneMCPToolService {
             case .ledgerFull:
                 "Too many lane creations are in flight or retained for this session. Wait for pending calls to settle before creating another lane."
             case .denied:
-                "Call become_overseer, then retry next turn from the same session. Activation does not grant target authority."
+                "Call become_overseer from this exact routed session, then retry the operation when discovery is refreshed. No filler user turn is needed: for an existing target, become_overseer with session_id and optional message requests consent and automatically links/dispatches. Activation alone grants no target authority."
             case .addFailed:
                 "Lane linking failed. Inspect the returned session_id and link it with session_admin link after resolving the oversight dashboard warning; do not allocate a replacement blindly."
             case .admissionUnstable:

@@ -359,6 +359,10 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     ) -> DomainDelegationScopeMembershipProof? {
         let targetSessionID = target.sessionID
         switch scope.kind {
+        case let .session(managedTarget):
+            guard targetSessionID == managedTarget || targetSessionID == scope.granteeSessionID,
+                  pointResolutionState(for: targetSessionID) != .replicated else { return nil }
+            return DomainDelegationScopeMembershipProof(scopeID: scope.id, targetSessionID: targetSessionID, basis: .exactSession)
         case let .tree(rootSessionID):
             let rootState = pointResolutionState(for: rootSessionID)
             guard rootState != .ambiguous, rootState != .unproven,
@@ -394,6 +398,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
 
     private func contains(_ record: DelegationSessionProvenance, in scope: DomainDelegationScopeGrant, census: CensusSource) -> Bool {
         switch scope.kind {
+        case let .session(target): record.sessionID == target || record.sessionID == scope.granteeSessionID
         case .allSessions: true
         case let .workspace(id): record.workspaceID == id
         case let .tree(root):

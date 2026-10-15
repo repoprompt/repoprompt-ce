@@ -151,9 +151,15 @@ final class DelegationScopeRuntime: ObservableObject {
         let stopFence: AgentRunStartStopFence
         var messages: [String]
         var observation: AnyCancellable?
+        var isDelivering = false
     }
 
     private var decisions: [UUID: DecisionDelivery] = [:]
+    let linkConsent = DomainDelegationScopeLinkConsent()
+    var liveScopesDidChange: (@MainActor () -> Void)?
+    var scopesDidInvalidate: (@MainActor (Set<UUID>) -> Void)?
+    private var overseeContinuations: [UUID: @MainActor (DomainDelegationScopeRecord) async -> Void] = [:]
+    private var overseeContinuationTasks: [UUID: (scopeID: UUID, task: Task<Void, Never>)] = [:]
     #if DEBUG
         var test_scopeDecision: ((UUID, String) -> Void)?
         /// Unit fixtures must explicitly opt into provider delivery; ordinary scope tests do not
@@ -246,6 +252,7 @@ final class DelegationScopeRuntime: ObservableObject {
             queuedGrantIDs.formUnion(grants.map(\.id))
             let compatible = grants.filter { grant in
                 guard !deletedSessionIDs.contains(grant.granteeSessionID) else { return false }
+                if case let .session(target) = grant.kind { return !deletedSessionIDs.contains(target) }
                 if case let .tree(root) = grant.kind { return !deletedSessionIDs.contains(root) }
                 return true
             }
@@ -288,6 +295,7 @@ final class DelegationScopeRuntime: ObservableObject {
         var count = 0
         for original in offer.grants {
             guard !deletedSessionIDs.contains(original.granteeSessionID) else { continue }
+            if case let .session(target) = original.kind, deletedSessionIDs.contains(target) { continue }
             if case let .tree(root) = original.kind, deletedSessionIDs.contains(root) { continue }
             do {
                 let request = try requestScope(
@@ -317,6 +325,12 @@ final class DelegationScopeRuntime: ObservableObject {
         retryTask?.cancel()
         retryTask = nil
         availability = .terminating
+        linkConsent.replace([])
+        overseeContinuations.removeAll()
+        for running in overseeContinuationTasks.values {
+            running.task.cancel()
+        }
+        overseeContinuationTasks.removeAll()
         revision &+= 1
         for grant in active {
             confirmations.invalidate(scopeID: grant.id)
@@ -458,6 +472,7 @@ final class DelegationScopeRuntime: ObservableObject {
         var anchors: Set<UUID> = []
         for record in allLiveScopes() {
             anchors.insert(record.grant.granteeSessionID)
+            if case let .session(target) = record.grant.kind { anchors.insert(target) }
             if case let .tree(root) = record.grant.kind { anchors.insert(root) }
         }
         return anchors
@@ -495,6 +510,7 @@ final class DelegationScopeRuntime: ObservableObject {
                   request.requesterSessionID != currentSessionID
             else { continue }
             request.state = .cancelled(reason: "The tab's session changed before approval.")
+            overseeContinuations.removeValue(forKey: id)
             requests[id] = request
         }
     }
@@ -592,6 +608,39 @@ final class DelegationScopeRuntime: ObservableObject {
         return .success(request)
     }
 
+    /// Registers the already-requested exact-target task, not approval. Only the user's real
+    /// approval transition below may start it. Repeating a tool call cannot replace its payload.
+    func installOverseeContinuation(
+        requestID: UUID, continuation: @escaping @MainActor (DomainDelegationScopeRecord) async -> Void
+    ) -> Bool {
+        guard requests[requestID]?.state == .pending, overseeContinuations[requestID] == nil else { return false }
+        overseeContinuations[requestID] = continuation
+        return true
+    }
+
+    /// Reuse only this owner's live, exact-target user decision. A tool argument or saved link alone
+    /// cannot mark a new request approved. This also avoids another card after a normal restart.
+    func continueOverseeWithExistingConsent(requestID: UUID) -> Bool {
+        guard var request = requests[requestID], request.state == .pending,
+              case let .session(target) = request.kind,
+              let record = liveScopes(grantedTo: request.requesterSessionID).first(where: {
+                  $0.grant.kind == request.kind && $0.grant.capabilities.isSuperset(of: request.capabilities)
+              }), linkConsent.permits(scopeID: record.id, observer: request.requesterSessionID, target: target, at: now()),
+              let continuation = overseeContinuations.removeValue(forKey: requestID) else { return false }
+        request.state = .granted(scopeID: record.id)
+        requests[requestID] = request
+        let task = Task { @MainActor [weak self] in
+            await continuation(record)
+            self?.overseeContinuationTasks.removeValue(forKey: requestID)
+        }
+        overseeContinuationTasks[requestID] = (record.id, task)
+        return true
+    }
+
+    func notifyOverseeContinuation(sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false) {
+        enqueueDecision(sessionID: sessionID, tabID: tabID, result: result, identifier: requestID, automaticContinuation: continuing)
+    }
+
     /// Re-read the app-owned binding at the synchronous grant boundary. A stale rendered card,
     /// a rebound tab, or a duplicate tab in another physical window can never approve a grant.
     @discardableResult
@@ -673,13 +722,23 @@ final class DelegationScopeRuntime: ObservableObject {
             request.state = .granted(scopeID: record.id)
             requests[requestID] = request
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
+            let continuation = overseeContinuations.removeValue(forKey: requestID)
+            if let continuation {
+                let task = Task { @MainActor [weak self] in
+                    await continuation(record)
+                    self?.overseeContinuationTasks.removeValue(forKey: requestID)
+                }
+                overseeContinuationTasks[requestID] = (record.id, task)
+            }
             enqueueDecision(
                 sessionID: request.requesterSessionID,
                 tabID: request.requesterTabID,
                 result: "granted",
-                identifier: record.id
+                identifier: record.id,
+                automaticContinuation: continuation != nil
             )
         case let .failure(denial):
+            overseeContinuations.removeValue(forKey: requestID)
             request.state = .denied(reason: "Approval failed validation (\(denial.diagnosticLabel)).")
             requests[requestID] = request
             enqueueDecision(
@@ -695,6 +754,7 @@ final class DelegationScopeRuntime: ObservableObject {
     func deny(requestID: UUID, reason: String? = nil) {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .denied(reason: reason)
+        overseeContinuations.removeValue(forKey: requestID)
         requests[requestID] = request
         enqueueDecision(
             sessionID: request.requesterSessionID,
@@ -710,6 +770,7 @@ final class DelegationScopeRuntime: ObservableObject {
         guard var request = requests[id], request.requesterSessionID == requesterSessionID else { return nil }
         if request.state == .pending {
             request.state = .cancelled(reason: "Withdrawn by the requesting session.")
+            overseeContinuations.removeValue(forKey: id)
             requests[id] = request
         }
         return request
@@ -801,6 +862,11 @@ final class DelegationScopeRuntime: ObservableObject {
     private func recordRevocations(_ changed: [DomainDelegationScopeRecord]) {
         guard !changed.isEmpty else { return }
         revokedScopeIDs.append(contentsOf: changed.map(\.id))
+        let invalidated = Set(changed.map(\.id))
+        for (id, running) in overseeContinuationTasks where invalidated.contains(running.scopeID) {
+            running.task.cancel()
+            overseeContinuationTasks.removeValue(forKey: id)
+        }
         didChange(grantees: Set(changed.map(\.grant.granteeSessionID)), invalidated: changed.map(\.id))
         for record in changed {
             let tabID = requests.values.first { $0.state == .granted(scopeID: record.id) }?.requesterTabID
@@ -815,8 +881,11 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// This is an app-owned decision notification, not target attention or an oversight grant.
     /// It never traverses the passive reducer, changes wake policy, or interrupts a running turn.
-    private func enqueueDecision(sessionID: UUID, tabID: UUID?, result: String, identifier: UUID) {
-        let text = "[RepoPrompt delegation decision: \(result); id=\(identifier.uuidString). Call session_admin scope_status to inspect current authority before continuing the user's existing work. This notice grants no authority or new task.]"
+    private func enqueueDecision(sessionID: UUID, tabID: UUID?, result: String, identifier: UUID, automaticContinuation: Bool = false) {
+        let guidance = automaticContinuation
+            ? "The app is automatically continuing the approved exact-target oversight request. Do not duplicate its link/message or ask the user for a filler turn; its result will resume you."
+            : "Call session_admin scope_status to inspect current authority before continuing the user's existing work."
+        let text = "[RepoPrompt delegation decision: \(result); id=\(identifier.uuidString). \(guidance) This notice grants no authority or new task.]"
         #if DEBUG
             test_scopeDecision?(sessionID, text)
             if test_suppressDecisionDelivery { return }
@@ -855,6 +924,8 @@ final class DelegationScopeRuntime: ObservableObject {
             decisions.removeValue(forKey: sessionID)
             return
         }
+        // Publications during the save/start await must not drop the in-flight batch or start it twice.
+        if decisions[sessionID]?.isDelivering == true { return }
         guard let pending = decisions[sessionID], !pending.messages.isEmpty,
               let presentation = Self.loadedPresentation(forTab: pending.tabID, in: windows()),
               !presentation.window.isClosing,
@@ -865,19 +936,29 @@ final class DelegationScopeRuntime: ObservableObject {
             decisions.removeValue(forKey: sessionID)
             return
         }
-        // Remove before submission: synchronous session publication cannot deliver it twice.
         decisions[sessionID]?.messages = []
-        if presentation.window.agentModeViewModel.submitDelegationDecision(
-            pending.messages.joined(separator: "\n"), tabID: pending.tabID, expectedSessionID: sessionID,
-            stopFence: pending.stopFence
-        ) {
-            decisions.removeValue(forKey: sessionID)
-        } else {
-            decisions[sessionID]?.messages = pending.messages
+        decisions[sessionID]?.isDelivering = true
+        Task { @MainActor [weak self] in
+            let accepted = await presentation.window.agentModeViewModel.submitDelegationDecision(
+                pending.messages.joined(separator: "\n"), tabID: pending.tabID, expectedSessionID: sessionID,
+                stopFence: pending.stopFence
+            )
+            guard let self, var current = decisions[sessionID], current.stopFence == pending.stopFence else { return }
+            current.isDelivering = false
+            if !accepted { current.messages = pending.messages + current.messages }
+            if current.messages.isEmpty {
+                decisions.removeValue(forKey: sessionID)
+            } else {
+                decisions[sessionID] = current
+                if accepted { drainDecisions(sessionID: sessionID) }
+            }
         }
     }
 
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {
+        linkConsent.replace(authority.liveRecords(now: now()).map(\.grant))
+        if !invalidated.isEmpty { scopesDidInvalidate?(Set(invalidated)) }
+        liveScopesDidChange?()
         revision &+= 1
         for scopeID in invalidated {
             confirmations.invalidate(scopeID: scopeID)

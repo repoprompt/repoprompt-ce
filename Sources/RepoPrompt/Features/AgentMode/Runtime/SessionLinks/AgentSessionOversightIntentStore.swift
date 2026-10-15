@@ -2,7 +2,8 @@ import Foundation
 import RepoPromptInstrumentation
 import RepoPromptPersistence
 
-// Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
+// Durable oversight intents: directed relationships and, for derived exact-target links, the
+// user-consent scope they depend on. This reference can restrict restoration, never invent authority.
 //
 // Owns the Codable document, the persistence mode, the runtime token that fences one load/mutate
 // attempt, and the load/mutation contracts. `AgentSessionOversightLaunchCoordinator` replays these
@@ -24,6 +25,23 @@ import RepoPromptPersistence
 struct AgentSessionOversightIntent: Codable, Hashable {
     let observerSessionID: UUID
     let targetSessionID: UUID
+    let sourceScopeID: UUID?
+
+    init(observerSessionID: UUID, targetSessionID: UUID, sourceScopeID: UUID? = nil) {
+        self.observerSessionID = observerSessionID
+        self.targetSessionID = targetSessionID
+        self.sourceScopeID = sourceScopeID
+    }
+
+    /// The relationship is the row key. Consent provenance is immutable payload, not another pair.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.observerSessionID == rhs.observerSessionID && lhs.targetSessionID == rhs.targetSessionID
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(observerSessionID)
+        hasher.combine(targetSessionID)
+    }
 
     /// A session can never oversee itself, so such a row is invalid by construction rather than
     /// merely unsatisfiable. Filtered on load and refused on insert.
@@ -350,20 +368,22 @@ actor AgentSessionOversightIntentStore {
         guard !pair.isSelfPair else { return receipt(.blocked, before: storeRevision, transitions: []) }
         let before = storeRevision
         let old = tokenByPair[pair]
+        let sourceChanged = old.map { $0.pair.sourceScopeID != pair.sourceScopeID } ?? false
         storeRevision &+= 1
-        let token = old ?? mint(pair)
+        let token = sourceChanged ? mint(pair) : old ?? mint(pair)
+        if sourceChanged { tokenByPair.removeValue(forKey: pair) }
         tokenByPair[pair] = token
         localDecisions.insert(pair)
         assertions[pair, default: 0] &+= 1
         let transitions = [AgentSessionOversightIntentTokenTransition(pair: pair, before: old, after: token)]
         // A same-token reassertion changes only the process-local assertion fence. It must not
         // rewrite a saved row or generate save notifications on every reconciliation pass.
-        let operation = old == nil ? UUID() : nil
+        let operation = old == nil || sourceChanged ? UUID() : nil
         if let operation {
             pending.append(.init(id: operation, transitions: transitions))
             startSaving()
         }
-        var value = receipt(old == nil ? .applied : .unchanged, before: before, transitions: transitions)
+        var value = receipt(operation != nil ? .applied : .unchanged, before: before, transitions: transitions)
         value.assertionGeneration = assertions[pair]
         value.operationID = operation
         return value

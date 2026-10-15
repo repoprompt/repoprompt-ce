@@ -1750,14 +1750,16 @@ final class AgentSidebarOversightStableMenuTests: XCTestCase {
         XCTAssertEqual(chooseTargetCount, 1)
     }
 
-    func testPersistenceOverlayRetainsDisabledOutboundChoicesAndAccessibilityCount() throws {
+    func testPersistenceDiagnosticRetainsLifecycleDisabledChoicesAndAccessibilityCount() throws {
         let offered = [peer("Session B", seed: 1), peer("Session C", seed: 2)]
         let presentation = AgentSessionOversightPersistencePresentation(availability: .blocked("Persistence blocked"))
-        let blocker = try XCTUnwrap(presentation.addBlockerMessage)
+        XCTAssertNil(presentation.addBlockerMessage, "Continuity is not live authority")
+        XCTAssertTrue(presentation.noticeMessage?.contains("Persistence blocked") == true)
+        let blocker = "Lifecycle reason"
         let published = AgentMonitorPillProps(
             sessionID: nil, outbound: [], inbound: [], recentNotices: [], canAddReason: nil
         )
-        // Menus are lazy now: apply the same persistence-first reason supplied by the shared pill.
+        // The diagnostic must not replace the real lifecycle reason supplied by the shared pill.
         let reason = published.withPersistence(presentation, eligibilityReason: "Lifecycle reason").canAddReason
         let overlaid = props(targetOptions: offered).withObserverIneligibleReason(reason)
         XCTAssertEqual(overlaid.observerIneligibleReason, blocker)

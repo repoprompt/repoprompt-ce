@@ -614,13 +614,14 @@ class WindowState: ObservableObject {
     #if DEBUG
         convenience init(
             agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
-            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
+            domainRuntime: MCPDomainRuntime? = nil
         ) {
             self.init(
                 contextBuilderProviderFactory: contextBuilderProviderFactory,
                 loadStoredAPISettingsDataOnInit: false,
                 codexModelPollingService: .shared,
-                domainRuntimeOverride: nil,
+                domainRuntimeOverride: domainRuntime,
                 agentModeViewModelFactory: agentModeViewModelFactory
             )
         }

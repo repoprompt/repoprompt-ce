@@ -254,6 +254,8 @@ struct AgentSessionScopeVisibility {
     func isVisible(_ record: DomainAgentSessionInventoryRecord, in snapshot: DomainAgentSessionInventorySnapshot) -> Bool {
         chain.allSatisfy { scope in
             switch scope.grant.kind {
+            case let .session(target):
+                record.sessionID == target || record.sessionID == scope.grant.granteeSessionID
             case .allSessions:
                 true
             case let .workspace(workspaceID):

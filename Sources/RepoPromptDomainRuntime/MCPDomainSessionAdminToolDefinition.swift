@@ -45,13 +45,13 @@ package enum MCPDomainSessionAdminToolDefinition {
         description: """
         Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.
 
-        A scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
+        A scope is user-approved authority over a set of sessions: `session` (the grantee and one exact `session_id`, never descendants), `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
         For cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
 
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
-        - `scope_status`: call first, without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). If tools disappear, call `become_overseer`; discovery changes may require your next turn.
+        - `scope_status`: call first, without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). For a one-target request, `become_overseer` with `session_id` and optional `message` requests one exact-target approval and automatically prepares, links and dispatches; it does not require a filler user turn or a mid-turn catalog refresh.
         - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
@@ -80,8 +80,8 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "kind": .object([
                     "type": .string("string"),
-                    "enum": .array([.string("tree"), .string("workspace"), .string("all_sessions")]),
-                    "description": .string("[request_scope] Scope kind; default tree rooted at this session.")
+                    "enum": .array([.string("session"), .string("tree"), .string("workspace"), .string("all_sessions")]),
+                    "description": .string("[request_scope] Scope kind; session needs the exact session_id and defaults to observe + control + restructure. Default tree is rooted at this session.")
                 ]),
                 "workspace": .object([
                     "type": .string("string"),

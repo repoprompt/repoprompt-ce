@@ -147,6 +147,8 @@ final class OverseerContinuityRepository: @unchecked Sendable {
         let anchor: String?
         let workspace: String?
         switch grant.kind {
+        case let .session(target): anchor = target.uuidString
+            workspace = nil
         case let .tree(root): anchor = root.uuidString
             workspace = nil
         case let .workspace(id): anchor = nil

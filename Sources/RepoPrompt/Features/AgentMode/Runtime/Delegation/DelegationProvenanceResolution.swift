@@ -34,6 +34,8 @@ struct DelegationProvenanceSnapshot {
 
     func hasCompletePlacement(for scope: DomainDelegationScopeGrant) -> Bool {
         switch scope.kind {
+        case let .session(target):
+            placementConflicts[target] == nil && placementConflicts[scope.granteeSessionID] == nil
         case let .workspace(workspaceID):
             !placementConflicts.values.contains { $0.isEmpty || $0.contains(workspaceID) }
         case .tree, .allSessions:

@@ -79,7 +79,7 @@ enum DelegationSpawnAdmission {
         }
         return liveScopes.filter { record in
             switch record.grant.kind {
-            case .allSessions:
+            case .session, .allSessions:
                 false
             case .workspace:
                 isDelegated(creator, under: record, projector: projector)

@@ -5557,6 +5557,54 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// An explicitly authorized, targeted load for oversight. Unlike sidebar presentation, this
+    /// may materialize just this saved session, but never selects a tab or reconnects a provider.
+    func prepareSavedOversightSession(
+        tabID: UUID, sessionID: UUID, workspaceID: UUID,
+        isStillAuthorized: @MainActor () -> Bool
+    ) async -> Bool {
+        guard !Task.isCancelled, isStillAuthorized(), let workspaceManager,
+              workspaceManager.activeWorkspaceID == workspaceID,
+              let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+              tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return false }
+        if tab.activeAgentSessionID == nil {
+            guard let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == tabID,
+                  preferredActiveSidebarEntry(for: tabID, tabName: tab.name, workspaceID: workspaceID)?.id == sessionID,
+                  sessions[tabID].map({
+                      $0.activeAgentSessionID == nil && !$0.isDirty && $0.items.isEmpty
+                          && !$0.runState.isActive && !$0.bindingTransitionInProgress
+                          && !bindingHasSynchronousOwnership($0)
+                  }) ?? true,
+                  isStillAuthorized(),
+                  workspaceManager.compareAndSetActiveAgentSessionID(
+                      expected: nil, replacement: sessionID, forTabID: tabID, inWorkspaceID: workspaceID
+                  )
+            else { return false }
+        }
+        let session = session(for: tabID)
+        if session.activeAgentSessionID == nil {
+            guard !session.isDirty, session.items.isEmpty, !session.runState.isActive,
+                  !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session),
+                  isStillAuthorized(), installPersistentSessionBinding(
+                      sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+                  ) != nil
+            else { return false }
+            // The previous unbound/empty payload was not a load of this saved identity.
+            session.hasLoadedPersistedState = false
+        }
+        guard session.activeAgentSessionID == sessionID else { return false }
+        _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+        return !Task.isCancelled && isStillAuthorized() && sessions[tabID] === session
+            && workspaceManager.activeWorkspaceID == workspaceID
+            && workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == sessionID
+            && session.activeAgentSessionID == sessionID && session.permitsBoundOperationAndSave
+            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+    }
+
     private enum PersistentSessionBindingMutationTarget {
         case runtimeOnly
         case compareAndSet(workspaceID: UUID)
@@ -18998,7 +19046,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
     /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
-    func submitDelegationDecision(_ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence) -> Bool {
+    func submitDelegationDecision(_ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence) async -> Bool {
         let deletion = AgentSessionDeletionRegistry.shared
         guard !WindowStatesManager.shared.isTerminating,
               !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
@@ -19014,6 +19062,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             readiness.hasWaitingPrompt = false
         }
         guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return false }
+        // An app-authored decision resumes an idle requester; it is not an active managed steer.
+        // The steer path deliberately withdraws idle input, so use the existing claimed, durable
+        // noncomposer start instead. No draft, workflow, provider permission or link is borrowed.
+        if !session.runState.isActive {
+            guard let target = makeComposerSubmitTarget(tabID: tabID, session: session),
+                  target.route == .existingAgentSession, target.expectedSourceAgentSessionID == expectedSessionID
+            else { return false }
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+            )
+            guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return false }
+            let outcome = await persistAndStartNoncomposerTurn(
+                session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
+                claim: claim, displayText: text, providerMessage: text, workflow: nil,
+                attribution: nil, stopFence: stopFence
+            ) {
+                !WindowStatesManager.shared.isTerminating
+                    && self.sessions[tabID] === session && stopFence.permitsStart(of: session)
+                    && self.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
+                    && self.composerSubmitClaimIsCurrent(claim)
+                    && !deletion.isPermanentlyDeleted(sessionID: expectedSessionID)
+                    && !deletion.isDeletionInProgress(sessionID: expectedSessionID)
+                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                        session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true
+                    )) == nil
+            }
+            if case .delivered = outcome { return true } // A saved row must never be appended twice.
+            return false
+        }
         let submission = submitPreparedUserTurn(
             tabID: tabID, session: session, trimmedText: text,
             attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,

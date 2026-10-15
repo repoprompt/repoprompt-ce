@@ -71,6 +71,27 @@ package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashabl
     }
 }
 
+/// Read-only, process-local input to link authorization. The app's decision owner publishes its
+/// live grants synchronously; storage is never consulted here. Missing/expired consent fails closed.
+package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var grants: [UUID: DomainDelegationScopeGrant] = [:]
+
+    package init() {}
+
+    package func replace(_ grants: [DomainDelegationScopeGrant]) {
+        lock.withLock { self.grants = Dictionary(uniqueKeysWithValues: grants.map { ($0.id, $0) }) }
+    }
+
+    package func permits(scopeID: UUID, observer: UUID, target: UUID, at date: Date) -> Bool {
+        guard let grant = lock.withLock({ grants[scopeID] }), grant.granteeSessionID == observer,
+              case let .session(approvedTarget) = grant.kind, approvedTarget == target,
+              grant.capabilities.isSuperset(of: [.observe, .control, .restructure]),
+              grant.guardrails.expiresAt.map({ $0 > date }) ?? true else { return false }
+        return true
+    }
+}
+
 // MARK: - Target state
 
 /// App-presented run state of one target, for operations whose requirement depends on it.
@@ -88,6 +109,8 @@ package enum DomainDelegationScopeTargetState: String, Hashable, Sendable {
 /// What a scope covers. Membership is never taken from tool arguments; the app presents a
 /// `DomainDelegationScopeMembershipProof` computed from persisted provenance.
 package enum DomainDelegationScopeKind: Hashable, Sendable {
+    /// The grantee plus exactly one managed target; never its descendants or other workspace sessions.
+    case session(targetSessionID: UUID)
     /// The root plus every session whose organizational parent chain reaches it.
     case tree(rootSessionID: UUID)
     /// Every session in one workspace.
@@ -97,6 +120,7 @@ package enum DomainDelegationScopeKind: Hashable, Sendable {
 
     package var label: String {
         switch self {
+        case .session: "session"
         case .tree: "tree"
         case .workspace: "workspace"
         case .allSessions: "all_sessions"
@@ -108,12 +132,15 @@ extension DomainDelegationScopeKind: Codable {
     private enum CodingKeys: String, CodingKey {
         case type
         case rootSessionID = "root_session_id"
+        case targetSessionID = "target_session_id"
         case workspaceID = "workspace_id"
     }
 
     package init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(String.self, forKey: .type) {
+        case "session":
+            self = try .session(targetSessionID: container.decode(UUID.self, forKey: .targetSessionID))
         case "tree":
             self = try .tree(rootSessionID: container.decode(UUID.self, forKey: .rootSessionID))
         case "workspace":
@@ -133,6 +160,8 @@ extension DomainDelegationScopeKind: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(label, forKey: .type)
         switch self {
+        case let .session(targetSessionID):
+            try container.encode(targetSessionID, forKey: .targetSessionID)
         case let .tree(rootSessionID):
             try container.encode(rootSessionID, forKey: .rootSessionID)
         case let .workspace(workspaceID):
@@ -385,6 +414,8 @@ package struct DomainDelegationScopeRecord: Hashable, Sendable {
 /// constructed from tool arguments.
 package struct DomainDelegationScopeMembershipProof: Hashable, Sendable {
     package enum Basis: Hashable, Sendable {
+        /// A uniquely resolved app-owned identity in an exact-target grant.
+        case exactSession
         /// Organizational chain from the target (first) up to the tree root (last), inclusive.
         case treePath([UUID])
         /// The workspace the target currently belongs to.

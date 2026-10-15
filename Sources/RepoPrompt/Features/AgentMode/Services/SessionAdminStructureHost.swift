@@ -58,6 +58,11 @@ protocol SessionAdminStructureHost: AnyObject {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome
+    /// Exact-target approvals retain their consent dependency across runtime and restoration.
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     /// Stops the active link through the bridge's ordinary Stop. `isStillAuthorized` is evaluated
     /// synchronously after the link lookup and right before the Stop.
     func stopLink(
@@ -80,6 +85,16 @@ protocol SessionAdminStructureHost: AnyObject {
     func fork(
         sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> UUID
+}
+
+extension SessionAdminStructureHost {
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        guard sourceScopeID == nil else { return .failed("source_scope_unavailable: This host cannot retain exact-target consent; nothing was linked.") }
+        return await addLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
+    }
 }
 
 struct SessionAdminWorktreeInfo: Equatable {

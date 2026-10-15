@@ -10,6 +10,39 @@ file and depended on in another. For the tool contract a model sees, read the `a
 definition in `MCPDomainCanonicalToolDefinitions.swift`; for the guidance the model is taught, read
 `AgentSessionLinkPrompts.swift`.
 
+## One request, one exact-target approval
+
+`become_overseer {session_id: "<exact UUID>", message: "say hi"}` is the bootstrap entry
+point for the natural-language request “oversee session X”. `message` is optional. It requests
+`observe`, `control`, and `restructure` together, for the caller and **only that exact target**
+(no descendants or unrelated sessions). Activation and tool arguments are not consent. The
+existing app-owned approval card remains the only grant boundary. A compatible live/restored
+exact-target grant can be reused without another card.
+
+The old bootstrap response unconditionally instructed the agent to wait for its next turn.
+RPCE already advertises `tools.listChanged` and emits `notifications/tools/list_changed`, but a
+client's catalog refresh is not the continuation mechanism. The bootstrap now carries the task
+through the real approval transition into the ordinary administration front door, production
+saved-target preparation, link authority, and exactly-once managed-steer ledger. This path does
+not need a second provider tool to appear mid-turn or another user utterance. Approval, denial,
+revocation, dispatch and target status use the existing app-owned requester-resume path.
+
+Preparation materializes only the requested saved carrier through `session(for:)` and
+`ensureSessionReady(reconnectActiveProviders: false)`. It neither focuses a tab nor starts a
+provider. Exact binding/readiness, deletion, ambiguity and current consent are checked again
+after hydration and at Add/dispatch commit. `target_missing`, `target_unloaded_unpreparable`,
+and `target_ambiguous` describe distinct failures; archived or unowned carriers are not guessed.
+The target provider starts only for an actually requested message. A bounded, event-driven
+watch hands reply/approval/pending status back to the requester, whose next run has the current
+tools and must continue watching unfinished work. No target text is embedded in an app-authored
+authority notice, and pending security approvals are never inferred from a managed task.
+
+Exact-target links persist their source scope ID with their ordinary intent. The scope owner
+publishes a read-only live-consent fence to link authority; leases, cursors and sends fail closed
+immediately when that specific scope ends, including during asynchronous cleanup or restoration.
+Valid committed scope/link rows restore normally. Failed continuity writes retain their existing
+honest pending/failed receipts; this flow does not strengthen a failed write into crash durability.
+
 ## Four owners, deliberately disjoint
 
 Nothing here has a single god object. Confusing these four is the most common way to introduce a
@@ -80,8 +113,9 @@ Rules that hold the scope design together:
   and handoff instructions are not capabilities. `agent_manage.cleanup_sessions` refuses the scope
   basis outright.
 - **Revocation is a generation bump.** Revoking, releasing, or expiring a scope cascades to every
-  attenuated descendant and stops authority immediately. Sessions keep running and links stay until
-  released.
+  attenuated descendant and stops authority immediately. Sessions keep running. Independent
+  user-created links stay until released; a link created by the exact-target bootstrap carries its
+  source scope ID and cannot outlive that scope's consent.
 - **External MCP is untouched.** `session_admin` is policy-gated (`agent_session_admin`), granted by
   no static profile, recomputed live per `tools/list` and `tools/call` only for an exactly routed
   Agent Mode run (live scope, or orchestrator/overseer for `request_scope`), never advertised or

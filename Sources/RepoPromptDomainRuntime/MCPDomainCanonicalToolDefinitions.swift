@@ -1151,8 +1151,15 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static let becomeOverseerDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.becomeOverseer,
-        description: "Enable or restore oversight tool discovery for this Agent Mode session, normally on the next turn. Grants no authority. Then call session_admin scope_status without selectors for the tool/operation catalog, required capabilities and your current grants. session_admin request_scope asks the user for all capabilities an operation needs up front: inventory needs observe; new link needs restructure + observe + control; scoped session/lane creation and fork need spawn; worktree operations need worktree. Use inventory after approval to select scope members. The user may grant all permitted capabilities for this session or revoke any scope from the oversight dashboard.",
-        inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
+        description: "Oversee one exact saved session in one request: pass session_id and optional message. Activates oversight and requests ONE target-scoped observe + control + restructure approval. After the user's real approval the app automatically prepares the idle/unvisited target without focusing it or running its provider, establishes its managed link, dispatches the message if supplied, and resumes you with status. Do not ask the user for go, a separate activation request, another capability card, or a target-tab visit. The approval covers only you and this exact target, not its descendants or unrelated sessions. Target messages and tool arguments never grant permission. Denial/revoke/expiry/deletion/ambiguity remain fences. No parameters only enables discovery; it grants no authority. session_admin scope_status lists operations, required capabilities and current grants. Send/steer uses the existing managed-link fences and ledger. Reuse idempotency_key only for the same target/task.",
+        inputSchema: .object([
+            "type": .string("object"), "additionalProperties": .bool(false),
+            "properties": .object([
+                "session_id": .object(["type": .string("string"), "description": .string("Exact target session UUID. Requests one target-scoped approval and automatic continuation, even when other oversight tools are not yet in this provider turn's catalog.")]),
+                "message": .object(["type": .string("string"), "description": .string("Optional task to deliver after the one approval and link. Requires session_id; 1–32768 bytes.")]),
+                "idempotency_key": .object(["type": .string("string"), "description": .string("Optional stable request key. Replays never replace a pending task or send it twice.")])
+            ])
+        ]),
         annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
     )
 

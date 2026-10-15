@@ -187,6 +187,7 @@ struct DelegationActiveScopesSection: View {
 
     static func summary(_ scope: DomainDelegationScopeRecord) -> String {
         let kind = switch scope.grant.kind {
+        case let .session(target): "only session \(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)"
         case .tree: "its own tree"
         case let .workspace(workspaceID): "workspace \(DelegationDisplayNames.workspaceName(workspaceID) ?? workspaceID.uuidString.prefix(8).description)"
         case .allSessions: "all sessions"
@@ -355,6 +356,7 @@ struct DelegationScopeApprovalCard: View {
     private var kindDescription: String {
         let requester = request.requesterTitle.map { "\"\($0)\" asks for " } ?? "Asks for "
         let scope = switch request.kind {
+        case let .session(target): "only session \"\(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)\" (\(target.uuidString))"
         case .tree: "this session and the sessions it creates"
         case .workspace: "every session in workspace \"\(request.workspaceName ?? "this workspace")\""
         case .allSessions: "every session you own"

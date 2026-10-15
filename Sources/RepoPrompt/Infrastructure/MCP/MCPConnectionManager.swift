@@ -3245,7 +3245,7 @@ actor ServerNetworkManager {
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
-            else if canBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
+            if canBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
         }
@@ -3339,7 +3339,9 @@ actor ServerNetworkManager {
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink,
-            canBecomeOverseer: isEnabledState && oversightEnabled && eligible && !activated && !hasAnyActiveLink,
+            // The targeted bootstrap remains reachable for another exact-target request. It
+            // requests consent; activation and existing links never grant scope authority.
+            canBecomeOverseer: isEnabledState && oversightEnabled && eligible,
             hasActivatedOverseer: activated
         )
         // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope

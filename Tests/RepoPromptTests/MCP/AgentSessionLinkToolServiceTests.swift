@@ -1013,7 +1013,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
-    func testBecomeOverseerIsParameterlessAndRevalidatesEligibilityBeforeMutation() async throws {
+    func testBecomeOverseerRejectsUnknownAndSelfTargetArgumentsAndRevalidatesEligibilityBeforeMutation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let currentReference = await fixture.linkReference()
@@ -1040,7 +1040,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
         for args: [String: Value] in [["op": .string("activate")], ["session_id": .string(endpoint.sessionID.uuidString)]] {
             do { _ = try await service.execute(args: args)
-                XCTFail("bootstrap must be parameterless")
+                XCTFail("Unknown keys and self-target must fail before activation")
             } catch {}
         }
         enabled = false

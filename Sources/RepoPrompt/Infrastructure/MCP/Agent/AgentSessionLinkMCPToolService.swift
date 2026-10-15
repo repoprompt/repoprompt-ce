@@ -1712,7 +1712,7 @@ struct AgentSessionLinkMCPToolService {
 
     /// Denial for a caller that holds no oversight authority at all.
     static let unavailableError = MCPError.invalidParams(
-        "agent_session_link is not available for this session on this exact route. From a supported Agent Mode session, call become_overseer, then next turn call session_admin scope_status to discover operations and required grants. Activation alone grants no target authority."
+        "agent_session_link is not available for this session on this exact route. From a supported Agent Mode session, call become_overseer with the exact target session_id and optional message to request one target-scoped approval and automatic preparation/link/dispatch without another user turn. session_admin scope_status lists operations and current grants when available. Activation alone grants no target authority."
     )
 
     static func outboundOperationUnavailableError(_ operation: String) -> MCPError {

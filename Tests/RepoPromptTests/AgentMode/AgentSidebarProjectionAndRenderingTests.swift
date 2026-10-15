@@ -1348,9 +1348,8 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         XCTAssertEqual(headers.first, "Yesterday", "The day-change notification must relabel the headers")
     }
 
-    /// The persistence presentation overlays `observerIneligibleReason` onto marked rows' summaries
-    /// without posting a sidebar invalidation, and closed rows never render it. Recorded facts must
-    /// not carry it, or the next unrelated notification re-renders every marked row for nothing.
+    /// Continuity diagnostics do not replace live eligibility or recorded relationship facts.
+    /// A later readiness notification must not re-render every marked row for a save-only change.
     func testPersistencePresentationChangeDoesNotDriftRecordedRowFacts() async throws {
         let fixture = try await makeFixture()
         let observerID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
@@ -1364,11 +1363,8 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         changedModelFields = []
 
         fixture.vm.agentSessionLinkApplyPersistencePresentation(.init(availability: .blocked("Saved links are read-only.")))
-        XCTAssertNotNil(
-            fixture.vm.agentSidebarOversightSummary(tabID: fixture.tabs[1].id, expectedSessionID: targetID)?
-                .observerIneligibleReason,
-            "Precondition: the live summary now carries the persistence blocker"
-        )
+        let summary = try XCTUnwrap(fixture.vm.agentSidebarOversightSummary(tabID: fixture.tabs[1].id, expectedSessionID: targetID))
+        XCTAssertNil(summary.observerIneligibleReason, "Continuity diagnostics must not veto the live relationship")
         NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
         await render(fixture, currentTabID: fixture.tabs[0].id)
 

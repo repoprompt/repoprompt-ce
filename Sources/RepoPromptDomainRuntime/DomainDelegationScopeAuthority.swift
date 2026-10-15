@@ -389,6 +389,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
             .filter { record in
                 guard record.isActive else { return false }
                 if record.grant.granteeSessionID == sessionID { return true }
+                if case let .session(target) = record.grant.kind { return target == sessionID }
                 if case let .tree(rootSessionID) = record.grant.kind { return rootSessionID == sessionID }
                 return false
             }
@@ -836,6 +837,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
     ) -> Bool {
         guard proof.scopeID == grant.id, proof.targetSessionID == targetSessionID else { return false }
         switch (grant.kind, proof.basis) {
+        case let (.session(target), .exactSession):
+            return targetSessionID == target || targetSessionID == grant.granteeSessionID
         case let (.tree(rootSessionID), .treePath(path)):
             return path.first == targetSessionID
                 && path.last == rootSessionID

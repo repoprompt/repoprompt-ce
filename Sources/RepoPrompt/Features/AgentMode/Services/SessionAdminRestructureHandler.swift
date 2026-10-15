@@ -219,7 +219,8 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // cover the Add's own suspensions.
             let context = context
             let scope = batch.scope
-            let outcome = await host.addLink(observer: observer, target: target) {
+            let sourceScopeID: UUID? = if case .session = scope.grant.kind { scope.id } else { nil }
+            let outcome = await host.addLink(observer: observer, target: target, sourceScopeID: sourceScopeID) {
                 context.isStillAuthorized(lease, scope: scope) && context.isMember(observer, ofChainFrom: scope)
             }
             if outcome == .revoked { authorityLost = true }

@@ -57,18 +57,66 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
-        // Exact live incarnations, so the Add's endpoint fences and the delegated authority are
-        // re-proved together at every commit point inside the shared durable transaction.
+        await addLink(observer: observer, target: target, sourceScopeID: nil, isStillAuthorized: isStillAuthorized)
+    }
+
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
+        let windows = WindowStatesManager.shared.allWindows.filter { !$0.isClosing }
+        let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
+        guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
+            return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
+        }
+        let saved = AgentSessionCarrierResolver.capture(windows: windows, sessionIDs: [target])
+        guard !saved.ambiguousSessionIDs.contains(target), !saved.replicatedSessionIDs.contains(target) else {
+            return .failed("target_ambiguous: More than one current target claim exists. Use session_admin inventory to select the exact session; nothing was linked.")
+        }
+        guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
+        else { return .failed("target_missing: The target was deleted or is being deleted; nothing was linked.") }
+        guard let location = saved.uniqueLocations[target] else {
+            let reason = saved.metadata[target]?.isEmpty == false ? "target_unloaded_unpreparable" : "target_missing"
+            return .failed("\(reason): No current saved target carrier exists in a loaded workspace. Use session_admin inventory to check the exact session and workspace; nothing was linked.")
+        }
+        guard location.stashedTabID == nil, !location.window.isClosing else {
+            return .failed("target_unloaded_unpreparable: The saved target is stashed or its owning window is closing. Use session_admin inventory to inspect its archive/workspace state; nothing was linked.")
+        }
+        let viewModel = location.window.agentModeViewModel
+        let missing = viewModel.sessions[location.tab.id].map {
+            $0.activeAgentSessionID == nil ? "binding_missing" : "readiness_pending"
+        } ?? "runtime_missing"
+        guard await viewModel.prepareSavedOversightSession(
+            tabID: location.tab.id, sessionID: target, workspaceID: location.workspaceID,
+            isStillAuthorized: isStillAuthorized
+        ) else {
+            guard isStillAuthorized() else { return .revoked }
+            return .failed("target_unloaded_unpreparable: \(missing); targeted saved-state preparation did not settle. Use session_admin get to inspect the saved target; nothing was linked.")
+        }
+        guard !Task.isCancelled, isStillAuthorized(), !location.window.isClosing else { return .revoked }
+        // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
+        let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
+        guard !current.ambiguousSessionIDs.contains(target), !current.replicatedSessionIDs.contains(target) else {
+            return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
+        }
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
             forSessionIDs: [observer, target], includeLocation: false
         )
-        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint,
-              let targetEndpoint = candidates[target]?.only?.domainEndpoint
-        else { return .failed("Both sessions must be live and unambiguous to link.") }
+        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint, observerEndpoint == initialObserver else {
+            return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
+        }
+        guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
+              targetEndpoint.windowID == location.window.windowID,
+              targetEndpoint.workspaceID == location.workspaceID, targetEndpoint.tabID == location.tab.id,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
+        else { return .failed("target_unloaded_unpreparable: The exact target binding changed during preparation. Use session_admin inventory; nothing was linked.") }
         let outcome = await bridge().addDelegatedMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint,
-            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: isStillAuthorized)
+            authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: sourceScopeID, isCurrent: isStillAuthorized)
         )
         switch outcome {
         case .added: return .linked

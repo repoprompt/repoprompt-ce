@@ -870,9 +870,11 @@ enum AgentSessionLinkInvalidationSink {
 /// Compared by identity so a delegated Add never joins another caller's establishment.
 @MainActor
 final class AgentSessionLinkDelegatedAddAuthorization: Hashable {
+    let sourceScopeID: UUID?
     private let isCurrentPredicate: @MainActor () -> Bool
 
-    init(isCurrent: @escaping @MainActor () -> Bool) {
+    init(sourceScopeID: UUID? = nil, isCurrent: @escaping @MainActor () -> Bool) {
+        self.sourceScopeID = sourceScopeID
         isCurrentPredicate = isCurrent
     }
 
@@ -1211,6 +1213,24 @@ final class AgentSessionLinkRuntimeBridge {
     let delegationScopes = DelegationScopeRuntime(
         persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
     )
+    private var scopedLinkConsentInstalled = false
+
+    func ensureScopedLinkConsent() async -> Bool {
+        if !scopedLinkConsentInstalled {
+            scopedLinkConsentInstalled = true
+            delegationScopes.liveScopesDidChange = { [weak self] in self?.noteTopologyMayHaveChanged() }
+            delegationScopes.scopesDidInvalidate = { [weak self] ids in
+                Task { @MainActor [weak self] in
+                    guard let self, !isFrozenForTermination else { return }
+                    let captured = bookkeepingByReference
+                    let notices = await authority.revokeLinks(sourceScopeIDs: ids)
+                    await reconcile(after: notices, capturedBookkeeping: captured)
+                }
+            }
+        }
+        return await authority.installScopeConsent(delegationScopes.linkConsent)
+    }
+
     /// Durable worktree ownership for delegated worktree creation/release; installed at launch.
     let worktreeOwnership = WorktreeOwnershipStore()
     /// The single shared administration service behind `session_admin` and future UI dispatchers.
@@ -1229,7 +1249,10 @@ final class AgentSessionLinkRuntimeBridge {
                 AppDomainRuntimeComposition.shared.runtime.workspaceStore
             })
         )
-        frontDoor.registerStructureHandlers(scopes: delegationScopes, worktreeOwnership: worktreeOwnership)
+        frontDoor.registerStructureHandlers(
+            scopes: delegationScopes, worktreeOwnership: worktreeOwnership,
+            structureHost: SessionAdminWindowsStructureHost(bridge: { [unowned self] in self })
+        )
         return frontDoor
     }()
 
@@ -1748,6 +1771,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// auto-restore is off — dormant intent must survive, not be silently discarded because the user
     /// turned window restoration off for one launch.
     func bootstrapIntentStore(_ store: AgentSessionOversightIntentStore) async {
+        guard !isFrozenForTermination else { return }
+        _ = await ensureScopedLinkConsent()
         guard !isFrozenForTermination else { return }
         intentStore = store
         let mode = await store.persistenceMode
@@ -2758,7 +2783,8 @@ final class AgentSessionLinkRuntimeBridge {
         await addMonitorLink(
             pair: AgentSessionOversightIntent(
                 observerSessionID: observerEndpoint.sessionID,
-                targetSessionID: targetEndpoint.sessionID
+                targetSessionID: targetEndpoint.sessionID,
+                sourceScopeID: authorization.sourceScopeID
             ),
             expectedEndpoints: AddEndpointExpectations(
                 observer: observerEndpoint,
@@ -2813,11 +2839,15 @@ final class AgentSessionLinkRuntimeBridge {
         expectedEndpoints: AddEndpointExpectations,
         proof: AgentSessionOversightRestorationProof?
     ) async -> AgentMonitorAddOutcome {
+        var pair = pair
         guard host != nil else { return .rejected(message: Self.unavailableMessage) }
         guard !isFrozenForTermination else {
             return .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
         }
         guard pair.observerSessionID != pair.targetSessionID else { return .failed(.selfMonitor) }
+        if pair.sourceScopeID != nil, await !ensureScopedLinkConsent() {
+            return .rejected(message: "source_scope_unavailable: The exact-target decision owner is unavailable. Call session_admin scope_status; nothing was linked.")
+        }
         if isRetiringEndpoint(in: pair) { return .failed(.closing) }
         // A deleted transcript is not an oversight endpoint, however live its tab still looks: the
         // view-model teardown that removes it from the candidate sweep runs several awaits after the
@@ -2826,6 +2856,15 @@ final class AgentSessionLinkRuntimeBridge {
 
         let transaction = registerTransaction()
         defer { finishTransaction(transaction) }
+        let active = await authority.links(forObserver: pair.observerSessionID)
+        let matching = active.items.filter { $0.targetSessionID == pair.targetSessionID }
+        if matching.count == 1, let existing = matching.first {
+            // Reassertion never changes an already-active grant's consent provenance.
+            pair = AgentSessionOversightIntent(
+                observerSessionID: pair.observerSessionID, targetSessionID: pair.targetSessionID,
+                sourceScopeID: existing.sourceScopeID
+            )
+        }
 
         let store: AgentSessionOversightIntentStore? = switch intentContinuityLookup() {
         case .noDurableLayer:
@@ -3393,7 +3432,8 @@ final class AgentSessionLinkRuntimeBridge {
             observer: observerEndpoint,
             target: targetEndpoint,
             requiresExistingOutboundLink: expectedEndpoints.requiresExistingOutboundLink,
-            requiresExistingDirectLink: expectedEndpoints.requiresExistingDirectLink
+            requiresExistingDirectLink: expectedEndpoints.requiresExistingDirectLink,
+            sourceScopeID: pair.sourceScopeID
         ) {
         case let .reserved(pending, collateral):
             reservation = pending
@@ -6511,7 +6551,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// `list` presents no per-target proof, so without this it would remain callable by an observer
     /// that had already lost the capability. The lookup is by exact endpoint rather than by session
     /// UUID: a duplicate live incarnation must not satisfy the check on the granted one's behalf.
-    private func revalidateObserver(
+    func revalidateObserver(
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Bool {
         guard let host else { return false }
@@ -7942,12 +7982,14 @@ final class AgentSessionLinkRuntimeBridge {
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         isEnabled: @escaping @MainActor () -> Bool,
         revalidateRoute: @MainActor () async -> Bool,
-        commitIfCurrent: @MainActor (_ commit: () -> Bool) -> Bool
+        commitIfCurrent: @MainActor (_ commit: () -> Bool) -> Bool,
+        continuingTargetedRequest: Bool = false
     ) async -> AgentProviderKind? {
         guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), let host,
-              let initial = host.agentSessionLinkBootstrapState(for: endpoint), initial.activation == nil,
-              await !(authority.hasActiveLink(endpoint: endpoint))
+              let initial = host.agentSessionLinkBootstrapState(for: endpoint),
+              continuingTargetedRequest || initial.activation == nil
         else { return nil }
+        if !continuingTargetedRequest, await authority.hasActiveLink(endpoint: endpoint) { return nil }
         guard await revalidateRoute() else { return nil }
         #if DEBUG
             await test_afterBootstrapRouteValidation?()
@@ -7955,12 +7997,12 @@ final class AgentSessionLinkRuntimeBridge {
         // Bootstrap may linearize at this no-link sample while the route proof is valid. A grant
         // committed after the sample is an independently ordered inbound/outbound relationship;
         // activation plus inbound is supported. This is not physical cross-actor atomicity.
-        guard await !(authority.hasActiveLink(endpoint: endpoint)) else { return nil }
+        if !continuingTargetedRequest, await authority.hasActiveLink(endpoint: endpoint) { return nil }
         guard commitIfCurrent({
             guard !isFrozenForTermination, !Task.isCancelled, isEnabled(), self.host === host,
                   host.agentSessionLinkBootstrapState(for: endpoint) == initial
             else { return false }
-            return host.agentSessionLinkActivateOverseer(for: endpoint, expected: initial)
+            return initial.activation != nil || host.agentSessionLinkActivateOverseer(for: endpoint, expected: initial)
         }) else { return nil }
         await invalidateToolAdvertisement(forObserverSession: endpoint.sessionID)
         return initial.provider
@@ -8724,6 +8766,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static func message(for rejection: DomainAgentSessionLinkReservationRejection) -> String {
         switch rejection {
+        case .sourceScopeUnavailable:
+            "source_scope_unavailable: Exact-target consent is revoked, expired, or not restored. Call session_admin scope_status; nothing was linked."
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .selfMonitor:
@@ -8741,6 +8785,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private static func message(for rejection: DomainAgentSessionLinkActivationRejection) -> String {
         switch rejection {
+        case .sourceScopeUnavailable:
+            "source_scope_unavailable: Exact-target consent ended before activation. Call session_admin scope_status; nothing was linked."
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .unknownReservation:
