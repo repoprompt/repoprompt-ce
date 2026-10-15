@@ -4724,9 +4724,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Init / Deinit
 
+    /// A nonvisual exact-session owner borrows a workspace document for routing, never for saving
+    /// UI placement. Its session file still uses the normal session persistence owner.
+    private(set) var isSessionRuntimeProjection = false
+
     init(
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
+        sessionRuntimeWorkspace: WorkspaceModel? = nil,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil,
@@ -4756,6 +4761,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
             globalCustomStorageURL = URL(fileURLWithPath: path)
+        }
+
+        if let sessionRuntimeWorkspace {
+            isSessionRuntimeProjection = true
+            workspaces = [sessionRuntimeWorkspace]
+            activeWorkspaceID = sessionRuntimeWorkspace.id
+            promptViewModel.loadComposeTabsFromWorkspace(sessionRuntimeWorkspace)
+            completeInitialization()
+            return
         }
 
         // Track when the file selection changes to detect if active preset is dirty
@@ -12660,7 +12674,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Capture/publication is shared; the caller chooses its existing persistence owner.
     private func captureActiveWorkspaceForSave(source: WorkspaceSaveSource) -> (workspaceID: UUID, fileURL: URL)? {
-        guard let active = activeWorkspace else { return nil }
+        guard !isSessionRuntimeProjection, let active = activeWorkspace else { return nil }
         let workspaceID = active.id
 
         // Post notification to allow SwiftUI views to flush pending state
@@ -16688,6 +16702,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         rootEditContext: RootEditSaveContext? = nil
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard !agentAdmissionRecoveryOwnsWorkspace(workspace.id) else {
             throw WorkspacePersistenceFailure(category: .durabilityUncertain)
@@ -16777,6 +16792,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
         let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             workspaceSaveTracer.event(
@@ -16806,6 +16822,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
         let finalURL = workspaceFileURL(for: workspace)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             throw NSError(

@@ -9,7 +9,11 @@ import RepoPromptWorkspaceCore
 @MainActor
 enum SessionAdminWindows {
     static func owningViewModel(for sessionID: UUID) -> AgentModeViewModel? {
-        WindowStatesManager.shared.allWindows
+        let manager = WindowStatesManager.shared
+        if manager.preparedOversightOwnerLocations[sessionID]?.isCurrent == true,
+           !manager.preparedOversightHandoffs.contains(sessionID),
+           let owner = manager.preparedOversightWindows[sessionID], !owner.isClosing { return owner.agentModeViewModel }
+        return manager.allWindows
             .first { !$0.isClosing && $0.agentModeViewModel.ownerValidatedSessionIndex[sessionID] != nil }?
             .agentModeViewModel
     }
@@ -19,6 +23,55 @@ enum SessionAdminWindows {
               let session = try? viewModel.authoritativeLiveSession(for: sessionID)
         else { return nil }
         return (viewModel, session)
+    }
+}
+
+/// A saved carrier witness, not a permission. Preparation borrows its workspace/tab in a private
+/// runtime composition; the real tab, stash and active workspace are never edited.
+@MainActor
+struct SavedOversightSessionLocation {
+    weak var window: WindowState?
+    let workspace: WorkspaceModel
+    let tab: ComposeTabState
+    let stashedTabID: UUID?
+    let entry: AgentSessionIndexEntry
+
+    var isCurrent: Bool {
+        guard let window, !window.isClosing,
+              let current = window.workspaceManager.workspace(withID: workspace.id) else { return false }
+        if window.workspaceManager.activeWorkspaceID == workspace.id,
+           let latest = window.agentModeViewModel.ownerValidatedSessionIndex[entry.id],
+           latest.tabID != entry.tabID || latest.parentSessionID != entry.parentSessionID
+           || latest.createdByOverseerSessionID != entry.createdByOverseerSessionID
+           || latest.organizationalParentID != entry.organizationalParentID
+           || latest.delegationScopeID != entry.delegationScopeID { return false }
+        let tabs = current.composeTabs.filter { $0.id == tab.id }
+        let stashes = current.stashedTabs.filter { $0.tab.id == tab.id }
+        if let stashedTabID {
+            return tabs.isEmpty && stashes.count == 1 && stashes[0].id == stashedTabID
+                && stashes[0].tab.activeAgentSessionID == tab.activeAgentSessionID
+        }
+        return stashes.isEmpty && tabs.count == 1 && tabs[0].activeAgentSessionID == tab.activeAgentSessionID
+    }
+
+    func agreesOnCarrierAndProvenance(with other: Self) -> Bool {
+        window === other.window && workspace.id == other.workspace.id && tab.id == other.tab.id
+            && stashedTabID == other.stashedTabID && tab.activeAgentSessionID == other.tab.activeAgentSessionID
+            && entry.parentSessionID == other.entry.parentSessionID
+            && entry.createdByOverseerSessionID == other.entry.createdByOverseerSessionID
+            && entry.organizationalParentID == other.entry.organizationalParentID
+            && entry.delegationScopeID == other.entry.delegationScopeID
+    }
+
+    var runtimeWorkspace: WorkspaceModel {
+        var copy = workspace
+        var carrier = tab
+        carrier.name = entry.name
+        carrier.activeAgentSessionID = entry.id
+        copy.composeTabs = [carrier]
+        copy.stashedTabs = []
+        copy.activeComposeTabID = carrier.id
+        return copy
     }
 }
 
@@ -52,23 +105,6 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         await bridge().delegationActiveLink(observerSessionID: observer, targetSessionID: target)?.capabilities
     }
 
-    /// Admission-only metadata check: refuse unsupported saved placements before asking for consent.
-    /// Never switches a workspace, rebinds a visible tab, hydrates sessions or starts a provider.
-    static func savedTargetPreparationRefusal(target: UUID, windows: [WindowState]) -> String? {
-        let deletion = AgentSessionDeletionRegistry.shared
-        if deletion.isPermanentlyDeleted(sessionID: target) || deletion.isDeletionInProgress(sessionID: target) { return "target_missing" }
-        let saved = AgentSessionCarrierResolver.capture(windows: windows.filter { !$0.isClosing }, sessionIDs: [target])
-        if saved.ambiguousSessionIDs.contains(target) || saved.replicatedSessionIDs.contains(target) { return "target_ambiguous" }
-        guard let location = saved.uniqueLocations[target] else {
-            if saved.metadata[target]?.isEmpty == false { return "target_history_not_current" }
-            return saved.claimedWorkspaceIDs[target]?.isEmpty == false ? "target_workspace_not_active" : "target_not_in_loaded_workspace"
-        }
-        if location.stashedTabID != nil { return "target_stashed" }
-        if location.window.workspaceManager.activeWorkspaceID != location.workspaceID { return "target_workspace_not_active" }
-        if let current = location.tab.activeAgentSessionID, current != target { return "target_history_not_current" }
-        return nil
-    }
-
     func addLink(
         observer: UUID,
         target: UUID,
@@ -82,37 +118,22 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
         guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
-        let windows = WindowStatesManager.shared.allWindows.filter { !$0.isClosing }
+        let manager = WindowStatesManager.shared
         let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
         }
-        let saved = AgentSessionCarrierResolver.capture(windows: windows, sessionIDs: [target])
-        guard !saved.ambiguousSessionIDs.contains(target), !saved.replicatedSessionIDs.contains(target) else {
-            return .failed("target_ambiguous: More than one current target claim exists. Use session_admin inventory to select the exact session; nothing was linked.")
+        manager.beginPreparedOversightPreparation(target)
+        defer { manager.endPreparedOversightPreparation(target) }
+        let prepared = await manager.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
+        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+        guard case let .success(owner) = prepared,
+              let location = manager.preparedOversightLocations[target], location.isCurrent
+        else {
+            let code = if case let .failure(reason) = prepared { reason.rawValue } else { "target_binding_changed" }
+            return .failed("\(code): The exact saved target could not be prepared. Ask the user to check whether it was deleted, moved or has conflicting saved copies; nothing was linked.")
         }
-        guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
-              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
-        else { return .failed("target_missing: The target was deleted or is being deleted; nothing was linked.") }
-        guard let location = saved.uniqueLocations[target] else {
-            let reason = saved.metadata[target]?.isEmpty == false ? "target_unloaded_unpreparable" : "target_missing"
-            return .failed("\(reason): No current saved target carrier exists in a loaded workspace. Use session_admin inventory to check the exact session and workspace; nothing was linked.")
-        }
-        guard location.stashedTabID == nil, !location.window.isClosing else {
-            return .failed("target_unloaded_unpreparable: The saved target is stashed or its owning window is closing. Use session_admin inventory to inspect its archive/workspace state; nothing was linked.")
-        }
-        let viewModel = location.window.agentModeViewModel
-        let missing = viewModel.sessions[location.tab.id].map {
-            $0.activeAgentSessionID == nil ? "binding_missing" : "readiness_pending"
-        } ?? "runtime_missing"
-        guard await viewModel.prepareSavedOversightSession(
-            tabID: location.tab.id, sessionID: target, workspaceID: location.workspaceID,
-            isStillAuthorized: isStillAuthorized
-        ) else {
-            guard isStillAuthorized() else { return .revoked }
-            return .failed("target_unloaded_unpreparable: \(missing); targeted saved-state preparation did not settle. Use session_admin get to inspect the saved target; nothing was linked.")
-        }
-        guard !Task.isCancelled, isStillAuthorized(), !location.window.isClosing else { return .revoked }
+        guard !owner.isClosing else { return .revoked }
         // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
         let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
         guard !current.ambiguousSessionIDs.contains(target), !current.replicatedSessionIDs.contains(target) else {
@@ -125,8 +146,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
-              targetEndpoint.windowID == location.window.windowID,
-              targetEndpoint.workspaceID == location.workspaceID, targetEndpoint.tabID == location.tab.id,
+              targetEndpoint.windowID == owner.windowID,
+              targetEndpoint.workspaceID == location.workspace.id, targetEndpoint.tabID == location.tab.id,
+              location.isCurrent,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
         else { return .failed("target_unloaded_unpreparable: The exact target binding changed during preparation. Use session_admin inventory; nothing was linked.") }

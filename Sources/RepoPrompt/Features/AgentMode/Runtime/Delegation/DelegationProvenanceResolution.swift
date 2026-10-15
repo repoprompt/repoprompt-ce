@@ -52,7 +52,7 @@ struct DelegationProvenanceSnapshot {
 struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
     private let windows: @MainActor () -> [WindowState]
 
-    init(windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows }) {
+    init(windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.sessionRuntimeWindows }) {
         self.windows = windows
     }
 

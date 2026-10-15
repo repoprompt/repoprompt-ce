@@ -35,11 +35,29 @@ saved-target preparation, link authority, and exactly-once managed-steer ledger.
 not need a second provider tool to appear mid-turn or another user utterance. Approval, denial,
 revocation, dispatch and target status use the existing app-owned requester-resume path.
 
-Preparation materializes only the requested saved carrier through `session(for:)` and
-`ensureSessionReady(reconnectActiveProviders: false)`. It neither focuses a tab nor starts a
-provider. Exact binding/readiness, deletion, ambiguity and current consent are checked again
-after hydration and at Add/dispatch commit. `target_missing`, `target_unloaded_unpreparable`,
-and `target_ambiguous` describe distinct failures; archived or unowned carriers are not guessed.
+Preparation point-reads the exact saved session UUID in the known workspace catalog, then uses
+`session(for:)` and `ensureSessionReady(reconnectActiveProviders: false)` for only that payload.
+Historical sessions, stashed tabs and inactive/unloaded workspaces use a nonvisual session owner:
+ordinary runtime/MCP composition with a borrowed, single-carrier workspace projection, not an
+NSWindow or another saved window. Its workspace manager cannot persist UI placement. It never
+changes the real carrier's active session, stash, active workspace, selection or focus, and never
+starts a provider merely to prepare or link. It shares the visible owner's live API-settings object;
+its prompt composition does not reload stored connection flags over that live owner. Disconnects
+and reconnects remain authoritative at the unchanged provider-start availability fence.
+A projection is not a second physical carrier claim;
+the real saved identity, provenance, ambiguity, deletion, binding and consent fences still apply.
+
+The live link retains that runtime. Retirement, revocation, deletion and carrier changes release it
+through lifecycle events, without polling timers. An idle user visit settles its payload before
+handing off to the normal visible binding; an active writer cannot be duplicated by a UI rebind.
+Saved intents restore through the same targeted preparation before missing-target classification.
+The reconciliation pass holds temporary ownership through establishment's actor hops and releases
+it on every exit, so cleanup cannot retire the prepared runtime before the link commits.
+Quit withdraws nonvisual routes and joins teardown under a two-second total budget; an unsettled
+write or provider teardown is never described as completed or durable. No unrelated session is
+hydrated. Missing, ambiguous, changed or unreadable saved state has a precise reason code rather
+than instructions for the agent to select a target.
+
 The target provider starts only for an actually requested message. A bounded, event-driven
 watch hands reply/approval/pending status back to the requester, whose next run has the current
 tools and must continue watching unfinished work. No target text is embedded in an app-authored

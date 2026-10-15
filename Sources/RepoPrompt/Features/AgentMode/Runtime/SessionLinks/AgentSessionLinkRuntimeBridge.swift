@@ -1278,6 +1278,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// Bounded automatic reauthorization of the launch snapshot. Created lazily so a bridge with no
     /// durable layer never allocates one.
     private var launchCoordinator: AgentSessionOversightLaunchCoordinator?
+    private var launchPreparedTargetIDs: Set<UUID> = []
+    private weak var launchPreparationWindowHost: WindowStatesManager?
     /// The single process-wide durable-oversight level every window renders.
     private var persistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     /// Termination freeze. Set synchronously, before any async shutdown work, and never cleared:
@@ -8827,6 +8829,48 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
 
     var launchCoordinatorIsFrozen: Bool {
         isFrozenForTermination
+    }
+
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID> {
+        guard let windows = host as? WindowStatesManager, let intentStore, !isFrozenForTermination else { return [] }
+        launchPreparationWindowHost = windows
+        var uncertain: Set<UUID> = []
+        for pair in pairs {
+            guard !isFrozenForTermination,
+                  windows.agentSessionLinkCandidates(forSessionIDs: [pair.targetSessionID], includeLocation: false)[pair.targetSessionID]?.isEmpty != false,
+                  windows.agentSessionLinkCandidates(forSessionIDs: [pair.observerSessionID], includeLocation: false)[pair.observerSessionID]?.count == 1,
+                  let token = await intentStore.token(for: pair) else { continue }
+            let currentPair = token.pair
+            let consent = delegationScopes.linkConsent
+            let stillPermitted: @MainActor () -> Bool = { [weak self] in
+                guard self?.isFrozenForTermination == false else { return false }
+                guard let scopeID = currentPair.sourceScopeID else { return true }
+                return consent.permits(scopeID: scopeID, observer: currentPair.observerSessionID, target: currentPair.targetSessionID, at: Date())
+            }
+            guard stillPermitted() else { continue }
+            if launchPreparedTargetIDs.insert(pair.targetSessionID).inserted {
+                windows.beginPreparedOversightPreparation(pair.targetSessionID)
+            }
+            let result = await windows.prepareSavedOversightTarget(pair.targetSessionID, isStillAuthorized: stillPermitted)
+            // Keep this owner alive across the actor hops that establish the restored link. Cleanup
+            // must not retire an unlinked prepared runtime in the prepare-to-establish interval.
+            // Preparation grants nothing. Establishment below still rechecks the current token,
+            // consent provenance, exact endpoint, ambiguity, deletion and restoration proof.
+            if case let .failure(reason) = result, reason == .unreadable || reason == .changed {
+                uncertain.insert(pair.targetSessionID)
+            }
+        }
+        return uncertain
+    }
+
+    func launchCoordinatorFinishSavedTargetPreparation() {
+        let ids = launchPreparedTargetIDs
+        launchPreparedTargetIDs.removeAll()
+        let windows = launchPreparationWindowHost
+        launchPreparationWindowHost = nil
+        for id in ids {
+            windows?.endPreparedOversightPreparation(id)
+        }
     }
 
     func launchCoordinatorEstablish(

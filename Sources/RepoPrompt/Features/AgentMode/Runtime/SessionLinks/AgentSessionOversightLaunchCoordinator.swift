@@ -148,6 +148,20 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     /// sessions, so a waiting launch entry can reach restoration readiness without the user opening
     /// each tab. Fire-and-forget: readiness changes re-enter the pass through the ordinary signal.
     func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>)
+
+    /// Resolves only saved targets named by waiting intents before missing classification. Returned
+    /// identities have uncertain saved state and must not be retired as missing in this pass.
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID>
+    /// Releases temporary runtime ownership after every establishment/early-exit path in the pass.
+    func launchCoordinatorFinishSavedTargetPreparation()
+}
+
+extension AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorFinishSavedTargetPreparation() {}
+
+    func launchCoordinatorPrepareSavedTargets(_ pairs: [AgentSessionOversightIntent]) async -> Set<UUID> {
+        []
+    }
 }
 
 // MARK: - Coordinator
@@ -657,6 +671,11 @@ final class AgentSessionOversightLaunchCoordinator {
             didLogDiscoveryPending = false
         #endif
 
+        defer { delegate.launchCoordinatorFinishSavedTargetPreparation() }
+        let uncertainSavedTargets = await delegate.launchCoordinatorPrepareSavedTargets(launchPairOrder.filter {
+            entries[$0]?.state == .waiting || entries[$0]?.parkedReference != nil
+        })
+        guard !isFrozen, !delegate.launchCoordinatorIsFrozen, !isDirty else { return }
         let descriptors = host.agentSessionLinkComposeTabDescriptors()
         let candidates = host.agentSessionLinkCandidates()
         var descriptorCounts: [UUID: Int] = [:]
@@ -676,6 +695,7 @@ final class AgentSessionOversightLaunchCoordinator {
         for pair in launchPairOrder {
             guard !isFrozen, !isDirty else { return }
             guard var entry = entries[pair] else { continue }
+            if uncertainSavedTargets.contains(pair.targetSessionID) { continue }
             if entry.parkedReference != nil {
                 let sessions = [pair.observerSessionID, pair.targetSessionID]
                 guard sessions.allSatisfy({ sessionID in

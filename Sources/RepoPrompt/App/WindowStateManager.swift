@@ -575,11 +575,43 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
+    // Nonvisual exact-session owners are not windows: never persist them in window restore state,
+    // present them, or include them in workspace-selection UI.
+    var preparedOversightLocations: [UUID: SavedOversightSessionLocation] = [:]
+    var preparedOversightWindows: [UUID: WindowState] = [:]
+    var preparedOversightOwnerLocations: [UUID: SavedOversightSessionLocation] = [:]
+    var preparedOversightPreparationInFlight: [UUID: Int] = [:]
+    var preparedOversightHandoffs: Set<UUID> = []
+    var preparedOversightUIVisits: Set<UUID> = []
+    var preparedOversightCleanupTask: Task<Void, Never>?
+    var preparedOversightCleanupDirty = false
+    var preparedOversightCarrierSubscriptions: [UUID: AnyCancellable] = [:]
+    var retiringPreparedOversightWindows: [UUID: WindowState] = [:]
+    var sessionRuntimeWindows: [WindowState] {
+        guard !preparedOversightWindows.isEmpty else { return allWindows }
+        return allWindows + preparedOversightWindows.compactMap { id, owner in
+            guard let witness = preparedOversightOwnerLocations[id], witness.isCurrent,
+                  let current = preparedOversightLocations[id], witness.agreesOnCarrierAndProvenance(with: current),
+                  !preparedOversightHandoffs.contains(id) else { return nil }
+            return owner
+        }
+    }
+
+    #if DEBUG
+        var test_preparedOversightOwnerFactory: ((WorkspaceModel, WindowState) -> WindowState)?
+    #endif
+
     private var modelRoutingWindowIndexes: [Int: Int] = [:]
 
     /// Read-only exact lookup for configuration-only routing. Never falls back to discovery.
     func modelRoutingWindow(withID id: Int) -> WindowState? {
-        guard !isTerminating, let index = modelRoutingWindowIndexes[id],
+        guard !isTerminating else { return nil }
+        if !preparedOversightWindows.isEmpty,
+           let prepared = sessionRuntimeWindows.first(where: { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing })
+        {
+            return prepared
+        }
+        guard let index = modelRoutingWindowIndexes[id],
               allWindows.indices.contains(index), allWindows[index].windowID == id,
               !allWindows[index].isClosing else { return nil }
         return allWindows[index]
@@ -1277,6 +1309,7 @@ class WindowStatesManager: ObservableObject {
     /// Lookup a window by its ID.
     func window(withID id: Int) -> WindowState? {
         allWindows.first { $0.windowID == id }
+            ?? sessionRuntimeWindows.first { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing }
     }
 
     /// Check if a window with the given ID exists.
@@ -1320,10 +1353,11 @@ class WindowStatesManager: ObservableObject {
             self.closingWindowReferences.removeAll { $0.value == nil }
             self.terminationWindowSnapshot = self.deduplicatedWindows(
                 self.terminationWindowSnapshot +
-                    self.allWindows +
+                    self.allWindows + Array(self.preparedOversightWindows.values) + Array(self.retiringPreparedOversightWindows.values) +
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
@@ -1386,7 +1420,7 @@ class WindowStatesManager: ObservableObject {
     /// Stops MCP servers in **all** windows (unconditionally).
     /// During teardown, "running" state can be stale; we just want tools off.
     func stopAllServers() async {
-        let windowIDs = allWindows.map(\.windowID)
+        let windowIDs = (allWindows + Array(preparedOversightWindows.values)).map(\.windowID)
         await withTaskGroup(of: Void.self) { group in
             for windowID in windowIDs {
                 group.addTask { @MainActor [weak self] in
@@ -1398,7 +1432,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func stopCodexSessionsAndSignOut() async -> CodexManagedAuthLogoutResult {
-        let participants: [any CodexManagedSessionShutdownParticipant] = allWindows.map(\.agentModeViewModel)
+        let participants: [any CodexManagedSessionShutdownParticipant] = (allWindows + Array(preparedOversightWindows.values)).map(\.agentModeViewModel)
         return await CodexManagedLogoutCoordinator.shared.stopSessionsAndSignOut(
             participants: participants,
             additionalTeardown: {
@@ -1419,20 +1453,32 @@ class WindowStatesManager: ObservableObject {
     func shutdownAllAgentSessions() async {
         closingWindowReferences.removeAll { $0.value == nil }
         let windows = deduplicatedWindows(
-            terminationWindowSnapshot + allWindows + closingWindowReferences.compactMap(\.value)
+            terminationWindowSnapshot + allWindows + Array(preparedOversightWindows.values) + Array(retiringPreparedOversightWindows.values) + closingWindowReferences.compactMap(\.value)
         )
-        defer { terminationWindowSnapshot.removeAll() }
+        defer {
+            terminationWindowSnapshot.removeAll()
+            preparedOversightWindows.removeAll()
+            retiringPreparedOversightWindows.removeAll()
+            preparedOversightOwnerLocations.removeAll()
+            preparedOversightLocations.removeAll()
+            preparedOversightCarrierSubscriptions.removeAll()
+            preparedOversightPreparationInFlight.removeAll()
+            preparedOversightHandoffs.removeAll()
+            preparedOversightCleanupTask?.cancel()
+            preparedOversightCleanupTask = nil
+        }
         let participatingWindowIdentities = Set(windows.map(ObjectIdentifier.init))
 
         // The strong snapshot owns every participant until both shutdown paths have joined.
         await withTaskGroup(of: Void.self) { group in
-            for window in windows {
+            for window in windows where !window.isPreparedSessionOwner {
                 group.addTask { @MainActor [window] in
                     await window.contextBuilderAgentViewModel.shutdownForAppTermination()
                     await window.agentModeViewModel.prepareForWindowClose()
                 }
             }
         }
+        _ = await shutdownPreparedOversightOwners(timeout: 2)
         closingWindowReferences.removeAll { reference in
             guard let window = reference.value else { return true }
             return participatingWindowIdentities.contains(ObjectIdentifier(window))

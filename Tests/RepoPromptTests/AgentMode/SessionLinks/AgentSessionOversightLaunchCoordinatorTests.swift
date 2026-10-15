@@ -373,6 +373,73 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
     }
 
+    func testSavedPreparationOwnershipSpansEstablishmentAndIsReleasedOnEarlyExit() async {
+        // The real pass owns this bracket: releasing immediately after hydration lets asynchronous
+        // owner cleanup win before the restored link's actor transaction can commit.
+        final class PreparationDelegate: AgentSessionOversightLaunchCoordinatorDelegate {
+            let launchCoordinatorHost: AgentSessionLinkEndpointHost?
+            var launchCoordinatorIsFrozen = false
+            var freezeDuringPreparation = false
+            var events: [String] = []
+            var ownsPreparation = false
+            init(host: AgentSessionLinkEndpointHost) {
+                launchCoordinatorHost = host
+            }
+
+            func launchCoordinatorPrepareSavedTargets(_: [AgentSessionOversightIntent]) async -> Set<UUID> {
+                ownsPreparation = true
+                events.append("prepare")
+                launchCoordinatorIsFrozen = freezeDuringPreparation
+                return []
+            }
+
+            func launchCoordinatorFinishSavedTargetPreparation() {
+                XCTAssertTrue(ownsPreparation)
+                ownsPreparation = false
+                events.append("finish")
+            }
+
+            func launchCoordinatorEstablish(pair _: AgentSessionOversightIntent, token _: AgentSessionOversightIntentToken?, assertedAt _: UInt64?, proof _: AgentSessionOversightRestorationProof?) async -> AgentSessionLinkRuntimeBridge.EstablishmentResult {
+                XCTAssertTrue(ownsPreparation, "An unlinked prepared owner must survive establishment's actor hops")
+                events.append("establish")
+                await Task.yield()
+                XCTAssertTrue(ownsPreparation)
+                return .init(outcome: .rejected(message: "controlled refusal"))
+            }
+
+            func launchCoordinatorRemoveIntent(pair _: AgentSessionOversightIntent, token _: AgentSessionOversightIntentToken, assertedAt _: UInt64?) async -> AgentSessionOversightIntentMutationReceipt {
+                fatalError("No deletion in this fixture")
+            }
+
+            func launchCoordinatorRevoke(reference _: DomainAgentSessionLinkReference) async {
+                XCTFail("No active grant")
+            }
+
+            func launchCoordinatorReportWarning(id _: String, message _: String) {}
+            func launchCoordinatorRequestHydration(sessionIDs _: Set<UUID>) {
+                XCTFail("Both endpoints are ready")
+            }
+        }
+        for interrupted in [false, true] {
+            let host = FakeHost()
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+            host.candidates = [observer, target]
+            host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+            host.discovery = [.init(epoch: .init(windowID: 1, workspaceID: observer.workspaceID, generation: 1), isComplete: true)]
+            let delegate = PreparationDelegate(host: host)
+            delegate.freezeDuringPreparation = interrupted
+            let coordinator = AgentSessionOversightLaunchCoordinator(delegate: delegate)
+            let token = AgentSessionOversightIntentToken(storeProcessGeneration: UUID(), pair: pair, pairRevision: 1)
+            coordinator.loadLaunchEntries(.init(source: .loaded, storeRevision: 1, tokenByPair: [pair: token]), automaticRestoreEnabled: true)
+            coordinator.updateTopologyState(.completeAllEntriesConsumed)
+            await coordinator.settle()
+            XCTAssertEqual(delegate.events, interrupted ? ["prepare", "finish"] : ["prepare", "establish", "finish"])
+            XCTAssertFalse(delegate.ownsPreparation)
+            coordinator.freeze()
+        }
+    }
+
     /// Actual bridge/authority/launch reconciliation with READY fake addresses, not VM routing,
     /// provider startup or painted UI. Keep one representative scale fixture and explicit budgets.
     func testScaleRestoreRefreshAndMenuBudgets() async throws {

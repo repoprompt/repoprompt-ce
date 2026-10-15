@@ -11,15 +11,17 @@ extension AgentSessionLinkRuntimeBridge {
         targetSessionID: UUID,
         message: String?,
         idempotencyKey: String
-    ) -> Value {
-        if let reason = SessionAdminWindowsStructureHost.savedTargetPreparationRefusal(
-            target: targetSessionID, windows: WindowStatesManager.shared.allWindows
-        ) {
+    ) async -> Value {
+        let resolution = await WindowStatesManager.shared.resolveSavedOversightLocation(targetSessionID)
+        if case let .failure(reason) = resolution {
             return .object([
-                "result": .string("target_not_preparable"), "subreason": .string(reason),
+                "result": .string("target_not_preparable"), "subreason": .string(reason.rawValue),
                 "next_call": .string("session_admin {op:\"scope_status\"}"),
-                "message": .string("No approval card was created. This saved placement is not supported for background preparation yet. Tell the user this limitation and ask them to open the target in its owning workspace before trying again; the agent cannot select it on the user's behalf. Do not retry unchanged.")
+                "message": .string("No approval card was created. Ask the user to check whether this exact saved session was deleted, moved, has conflicting copies, or has unreadable saved state. Historical sessions, stashed tabs and inactive workspaces do not require a UI visit. Do not retry an unchanged refusal.")
             ])
+        }
+        guard !Task.isCancelled, await revalidateObserver(endpoint: observer) else {
+            return .object(["result": .string("request_refused"), "reason": .string("caller_changed")])
         }
         let scopes = delegationScopes
         let requested = scopes.requestScope(
@@ -91,7 +93,7 @@ extension AgentSessionLinkRuntimeBridge {
         case let .completed(value):
             guard case let .array(items) = value.objectValue?["items"], let item = items.first?.objectValue else { return "invalid_link_result" }
             if case let .string(detail) = item["detail"], let code = detail.split(separator: ":", maxSplits: 1).first {
-                let allowed: Set = ["target_missing", "target_unloaded_unpreparable", "target_ambiguous", "observer_changed", "source_scope_unavailable"]
+                let allowed: Set = ["target_missing", "target_unloaded_unpreparable", "target_ambiguous", "target_binding_changed", "target_saved_state_unreadable", "observer_changed", "source_scope_unavailable"]
                 if allowed.contains(String(code)) { return String(code) }
             }
             return "link_not_applied"

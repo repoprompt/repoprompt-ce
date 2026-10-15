@@ -99,7 +99,7 @@ struct BecomeOverseerMCPToolService {
         if let targetID {
             let key = suppliedKey
                 ?? "oversee:\(targetID.uuidString):\(AgentSessionLinkMessageDigest.steerDigest(message: message ?? ""))"
-            return bridge.requestTargetedOversight(observer: endpoint, targetSessionID: targetID, message: message, idempotencyKey: key)
+            return await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: targetID, message: message, idempotencyKey: key)
         }
         return .string(provider == .devin ? Self.devinResult : Self.nextTurnResult)
     }
