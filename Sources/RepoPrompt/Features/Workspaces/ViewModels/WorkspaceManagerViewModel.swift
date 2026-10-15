@@ -6,6 +6,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -64,12 +65,18 @@ private enum WorkspaceExitPerf {
 }
 
 enum WorkspaceStoragePaths {
+    /// The one-click backup uses a fixed destination (not a user-selected export).
+    /// Debug must not replace or consume the release app's recovery archive.
+    static var userDataBackupDirectoryName: String {
+        MCPFilesystemIdentity.current.buildFlavor == .debug ? "RepoPrompt-Debug-Backup" : "RepoPrompt-Backup"
+    }
+
     static let defaultRoot: URL = {
         let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         return home
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             .appendingPathComponent("Workspaces", isDirectory: true)
     }()
 }
@@ -4714,6 +4721,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private nonisolated func ensureBaseRootExists(at baseRoot: URL) throws {
+        try AppProfileLocations.current.validateMetadataFile(baseRoot)
         let fm = FileManager.default
         if !fm.fileExists(atPath: baseRoot.path) {
             try fm.createDirectory(at: baseRoot, withIntermediateDirectories: true)
@@ -4755,7 +4763,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.fileManager.setWorkspaceManager(self)
 
         if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
-            globalCustomStorageURL = URL(fileURLWithPath: path)
+            globalCustomStorageURL = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: URL(fileURLWithPath: path))
         }
 
         // Track when the file selection changes to detect if active preset is dirty
@@ -14259,6 +14267,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let directory: URL
         if let directoryURL {
+            try AppProfileLocations.current.validateMetadataFile(directoryURL)
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             directory = directoryURL
         } else {
@@ -14290,8 +14299,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         let directory = appSupport
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
             .appendingPathComponent("workspace-cleanup-backups", isDirectory: true)
+        try AppProfileLocations.current.validateMetadataFile(directory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
@@ -15942,6 +15952,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         do {
             let (merged, data, indexFieldsChanged, preservedDiskRepoPaths) = try await Task.detached(priority: .utility) {
+                try AppProfileLocations.current.validateMetadataFile(fileURL)
                 let workspaceDir = fileURL.deletingLastPathComponent()
                 let chatsDir = workspaceDir.appendingPathComponent("Chats", isDirectory: true)
                 let fm = FileManager.default
@@ -16852,7 +16863,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         scheduleNormalizationWriteback: Bool,
         workspaceDiskWriter: WorkspaceDiskWriter<WorkspaceAppDiskWritePolicy> = WorkspaceDiskWriterComposition.processWriter
     ) throws -> WorkspaceFileLoadResult {
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
+        if let customRoot = cachedResult.workspace.customStoragePath {
+            try AppProfileLocations.current.validateCustomWorkspaceDirectory(customRoot)
+        }
         let normalizationSaveTask: Task<Void, Never>?
         if scheduleNormalizationWriteback,
            !cachedResult.workspace.isEphemeral,
@@ -16955,6 +16970,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated func ensureWorkspaceDirectoryExists(for workspace: WorkspaceModel, baseRoot: URL) throws -> URL {
         let dir = workspaceDirectory(for: workspace, baseRoot: baseRoot)
+        try AppProfileLocations.current.validateMetadataFile(dir)
         let chats = chatsFolder(for: workspace, baseRoot: baseRoot)
         let fm = FileManager.default
 
@@ -16987,6 +17003,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
 
+        try AppProfileLocations.current.validateMetadataFile(currentGlobal)
+        try AppProfileLocations.current.validateMetadataFile(defaultWorkspaceRoot())
         for ws in workspaces {
             let oldFolder = currentGlobal.appendingPathComponent(directoryName(for: ws))
             let newFolder = defaultWorkspaceRoot().appendingPathComponent(directoryName(for: ws))
@@ -17019,11 +17037,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func moveFolderContents(from oldFolder: URL, to newFolder: URL) throws {
+        try AppProfileLocations.current.validateMetadataFile(oldFolder)
+        try AppProfileLocations.current.validateMetadataFile(newFolder)
         let fm = FileManager.default
         let items = try fm.contentsOfDirectory(atPath: oldFolder.path)
         for item in items {
             let srcURL = oldFolder.appendingPathComponent(item)
             let dstURL = newFolder.appendingPathComponent(item)
+            try AppProfileLocations.current.validateMetadataFile(srcURL)
+            try AppProfileLocations.current.validateMetadataFile(dstURL)
             if fm.fileExists(atPath: dstURL.path) {
                 try fm.removeItem(at: dstURL)
             }
@@ -17039,11 +17061,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    func updateGlobalStoragePath(_ newURL: URL) throws {
+    func updateGlobalStoragePath(_ selectedURL: URL) throws {
+        let locations = AppProfileLocations.current
+        let newURL = locations.identity.buildFlavor == .debug
+            ? try locations.customWorkspaceRoot(selectedDirectory: selectedURL) : selectedURL
         let oldBase = currentBaseRoot
+        try locations.validateMetadataFile(oldBase)
+        try locations.validateMetadataFile(newURL)
+        try FileManager.default.createDirectory(at: newURL, withIntermediateDirectories: true)
         for ws in workspaces {
             let oldFolder = oldBase.appendingPathComponent(directoryName(for: ws))
             let newFolder = newURL.appendingPathComponent(directoryName(for: ws))
+            try locations.validateMetadataFile(oldFolder)
+            try locations.validateMetadataFile(newFolder)
             if FileManager.default.fileExists(atPath: oldFolder.path) {
                 try FileManager.default.moveItem(at: oldFolder, to: newFolder)
             }
@@ -18409,7 +18439,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     NSLocalizedDescriptionKey: "Could not find the user's Downloads folder."
                 ])
             }
-            let exportFolder = downloads.appendingPathComponent("RepoPrompt-Backup", isDirectory: true)
+            let exportFolder = downloads.appendingPathComponent(WorkspaceStoragePaths.userDataBackupDirectoryName, isDirectory: true)
 
             if !fm.fileExists(atPath: exportFolder.path) {
                 try fm.createDirectory(
@@ -18461,7 +18491,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Could not find the user's Downloads folder."]
             )
         }
-        let exportFolder = downloads.appendingPathComponent("RepoPrompt-Backup", isDirectory: true)
+        let exportFolder = downloads.appendingPathComponent(WorkspaceStoragePaths.userDataBackupDirectoryName, isDirectory: true)
         guard fm.fileExists(atPath: exportFolder.path) else {
             print("No RepoPrompt-Backup folder found in ~/Downloads. Nothing to restore.")
             return
@@ -18480,6 +18510,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // 2) Attempt to restore workspace index if it exists
         let indexSource = exportFolder.appendingPathComponent("workspacesIndex.json")
         if fm.fileExists(atPath: indexSource.path) {
+            try AppProfileLocations.current.validateMetadataFile(workspaceIndexFileURL)
             if fm.fileExists(atPath: workspaceIndexFileURL.path) {
                 try fm.removeItem(at: workspaceIndexFileURL)
             }
@@ -18528,6 +18559,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                     .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id)")
             }
 
+            // Imported metadata must not direct debug cleanup into release state.
+            if workspace.customStoragePath != nil {
+                try AppProfileLocations.current.validateCustomWorkspaceDirectory(localWsDir)
+            }
+            try AppProfileLocations.current.validateMetadataFile(localWsDir)
             // If it already exists, remove it to avoid partial merges
             if fm.fileExists(atPath: localWsDir.path) {
                 try fm.removeItem(at: localWsDir)

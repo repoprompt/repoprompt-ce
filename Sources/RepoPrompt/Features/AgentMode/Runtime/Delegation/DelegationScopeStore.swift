@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 // Scope intent is authority, and it is crash-safe by construction. Every grant, revocation, release,
 // and expiry is written durably (temp file, full fsync, rename, directory fsync) at the moment it
@@ -198,7 +199,7 @@ final class DelegationScopeStore: @unchecked Sendable {
     ) -> DelegationScopeStore {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
         return DelegationScopeStore(
             fileURL: base.appendingPathComponent(filename),
             backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),

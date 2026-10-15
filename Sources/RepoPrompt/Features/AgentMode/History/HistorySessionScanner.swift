@@ -189,7 +189,7 @@ actor HistoryInventoryScanGate {
 /// and returns unified metadata across workspaces. Provides lazy transcript loading for the
 /// ``search`` operation.
 ///
-/// Uses ``MCPFilesystemIdentity.applicationSupportRootURL()`` for the base path and discovers
+/// Uses the compiled build-flavor application-state root as the base path and discovers
 /// workspaces under `Workspaces/*/`. Each workspace directory is expected to contain an
 /// `AgentSessions/AgentSessionIndex.json` file.
 actor HistorySessionScanner: HistorySessionScanning {
@@ -281,7 +281,7 @@ actor HistorySessionScanner: HistorySessionScanning {
     private let workspaceDirectoryProvider: (@Sendable (URL) throws -> [URL])?
     private let workspaceLocations: HistoryWorkspaceLocationResolver?
 
-    /// Base URL for application support. Defaults to ``MCPFilesystemIdentity.applicationSupportRootURL()``.
+    /// Base URL for application support. Defaults to the compiled build-flavor application-state root.
     /// Injectable for testing.
     private let applicationSupportRoot: URL
     private let scanCacheTTL: TimeInterval
@@ -320,7 +320,8 @@ actor HistorySessionScanner: HistorySessionScanning {
         self.fileManager = fileManager
         self.decoder = decoder
         self.applicationSupportRoot = applicationSupportRoot
-            ?? MCPFilesystemConstants.identity.applicationSupportRootURL(fileManager: fileManager)
+            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(MCPFilesystemConstants.identity.applicationStateDirectoryName, isDirectory: true)
         self.scanCacheTTL = scanCacheTTL
         self.inventoryBudget = inventoryBudget
         self.workspaceDirectoryProvider = workspaceDirectoryProvider

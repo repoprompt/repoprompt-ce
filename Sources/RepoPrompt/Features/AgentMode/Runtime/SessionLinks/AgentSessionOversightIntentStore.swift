@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptShared
 
 // Durable oversight intents: the user's directed overseer → overseen relationships and nothing else.
 //
@@ -307,7 +308,7 @@ actor AgentSessionOversightIntentStore {
     ) -> AgentSessionOversightIntentStore {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent(MCPFilesystemIdentity.current.applicationStateDirectoryName, isDirectory: true)
         return AgentSessionOversightIntentStore(
             fileURL: base.appendingPathComponent(filename),
             backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),

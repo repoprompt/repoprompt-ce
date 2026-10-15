@@ -6,6 +6,7 @@ import RepoPromptFileSystem
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import Sparkle
 import SwiftUI
 
@@ -59,7 +60,44 @@ struct RepoPromptFileLogHandler: LogHandler {
 }
 
 struct RepoPromptSwiftUIApp: App {
+    private static func checkDebugStateBoundary() {
+        let locations = AppProfileLocations.current
+        guard locations.identity.buildFlavor == .debug else { return }
+        do {
+            try locations.validateWritableRoot(locations.applicationSupportRoot)
+            try locations.validateWritableRoot(locations.savedPromptsRoot)
+            for filename in [DelegationScopeStore.filename, DelegationScopeStore.filename + ".lock", AgentSessionOversightIntentStore.filename, WorktreeOwnershipStore.filename, "Backups"] {
+                try locations.validateMetadataFile(locations.applicationSupportRoot.appendingPathComponent(filename))
+            }
+            if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
+                _ = try locations.customWorkspaceRoot(selectedDirectory: URL(fileURLWithPath: path, isDirectory: true))
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Debug state overlaps an unsafe storage location"
+            alert.informativeText = "\(error.localizedDescription)\nRelease data has not been moved or changed. Choose a separate debug storage location before reopening this build."
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            exit(EXIT_FAILURE)
+        }
+        // The previous directory mixed release and debug history. Do not guess
+        // ownership, move it, or copy its permission grants into this profile.
+        let release = AppProfileLocations(identity: .repoPromptCE(.release))
+        if !FileManager.default.fileExists(atPath: locations.applicationSupportRoot.path),
+           FileManager.default.fileExists(atPath: release.applicationSupportRoot.path)
+           || FileManager.default.fileExists(atPath: release.savedPromptsRoot.path)
+        {
+            let alert = NSAlert()
+            alert.messageText = "Debug sessions now use separate storage"
+            alert.informativeText = "This build keeps sessions, workspaces, settings, presets, and saved prompts in \(locations.applicationSupportRoot.path). Existing release and earlier debug data remains unchanged in its original location; nothing has been moved or deleted. Provider sign-in is unchanged."
+            alert.addButton(withTitle: "Continue")
+            alert.runModal()
+        }
+    }
+
     init() {
+        // Before session/settings singletons can normalize or write metadata.
+        Self.checkDebugStateBoundary()
         let appInitSpan = StartupPhaseLog.begin(.appInit)
         defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
@@ -71,6 +109,9 @@ struct RepoPromptSwiftUIApp: App {
             #endif
             return handler
         }
+        // Do not initialize the settings-backed property before the state boundary
+        // check (stored-property default initializers run before this init body).
+        _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -137,7 +178,7 @@ struct RepoPromptSwiftUIApp: App {
     }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
-    @StateObject private var fontScale = FontScaleManager.shared
+    @StateObject private var fontScale: FontScaleManager
 
     // MARK: - Body
 
