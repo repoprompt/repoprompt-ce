@@ -1053,6 +1053,12 @@ final class AgentTaskRouterRuntimeTests: XCTestCase {
         let client = RuntimeJevClient()
         let runtime = AgentTaskRouterRuntime(secureKeys: keys, jevClient: client, settingsStore: store)
         await runtime.reconcileDemand()
+        // Bootstrap completion and the readiness stream's UI projection are separate
+        // owners. Await the existing bounded observation barrier, not scheduler order.
+        try await waitForReadiness(
+            .ready(generation: 1, policyVersion: JevRouterCredentialService.routingPolicyVersion),
+            id: .jev, runtime: runtime
+        )
         let calls = await client.calls
         XCTAssertEqual(calls, 1)
         XCTAssertTrue(runtime.isBackendReady(.jev))
