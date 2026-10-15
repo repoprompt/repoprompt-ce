@@ -7,13 +7,15 @@ import RepoPromptShared
 enum WorkspaceDiskWriterComposition {
     static let processWriter = WorkspaceDiskWriter(
         policy: WorkspaceAppDiskWritePolicy(),
-        queuedAtomicWrite: { data, url in
-            try AppProfileLocations.current.validateMetadataFile(url)
-            try data.write(to: url, options: .atomic)
-        },
-        normalizationAtomicWrite: { data, url in
-            try AppProfileLocations.current.validateMetadataFile(url)
-            try data.write(to: url, options: .atomic)
-        }
+        backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { data, url in
+                try AppProfileLocations.current.validateMetadataFile(url)
+                try data.write(to: url, options: .atomic)
+            },
+            normalizationAtomicWrite: { data, url in
+                try AppProfileLocations.current.validateMetadataFile(url)
+                try data.write(to: url, options: .atomic)
+            }
+        )
     )
 }
