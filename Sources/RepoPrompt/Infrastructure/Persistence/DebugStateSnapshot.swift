@@ -248,12 +248,18 @@ struct DebugStateSnapshot {
 
     private func pruneRecovery(_ directory: URL) {
         guard let children = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.creationDateKey]) else { return }
+        // A displaced pre-bootstrap profile may contain unrelated provider or
+        // historical data. Archiving it does not make all its bytes ours to prune.
+        // Keep that unclassified original; bound only recognized seed snapshots.
         let owned = children.compactMap { url -> (URL, Date)? in
             guard UUID(uuidString: url.lastPathComponent) != nil,
                   (try? Self.requireDirectory(url)) != nil,
                   let data = try? Data(contentsOf: directory.appendingPathComponent(url.lastPathComponent + ".json")),
                   let receipt = try? JSONDecoder().decode(RecoveryRecord.self, from: data), receipt.version == 1,
-                  receipt.profile == locations.preferencesDomain else { return nil }
+                  receipt.profile == locations.preferencesDomain,
+                  let seedData = try? Data(contentsOf: url.appendingPathComponent("debugSeed.json")),
+                  let seed = try? JSONDecoder().decode(Receipt.self, from: seedData),
+                  seed.version == 1, seed.profile == locations.preferencesDomain else { return nil }
             return (url, receipt.createdAt)
         }.sorted { $0.1 > $1.1 }
         for (url, _) in owned.dropFirst(3) {

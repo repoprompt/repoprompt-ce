@@ -317,11 +317,15 @@ final class DebugStateBootstrapTests: XCTestCase {
         let f = Fixture()
         defer { f.cleanup() }
         try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let original = Data("unclassified prior debug data".utf8)
+        try f.write(original, f.debug.applicationSupportRoot.appendingPathComponent("Unmanaged/keep.bin"))
         for _ in 0 ..< 6 {
             _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:], previousPreferences: ["remember": "old debug"])
         }
         let entries = try FileManager.default.contentsOfDirectory(at: f.recovery, includingPropertiesForKeys: nil)
-        XCTAssertEqual(entries.count(where: { UUID(uuidString: $0.lastPathComponent) != nil }), 3)
+        let archives = entries.filter { UUID(uuidString: $0.lastPathComponent) != nil }
+        XCTAssertEqual(archives.count, 4, "Three recognized snapshots plus the preserved pre-bootstrap original")
+        XCTAssertEqual(archives.compactMap { try? Data(contentsOf: $0.appendingPathComponent("Unmanaged/keep.bin")) }, [original])
         let unknown = f.recovery.appendingPathComponent("unknown-user-file")
         try f.write(Data("preserve".utf8), unknown)
         _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: true, releasePreferences: [:])

@@ -250,7 +250,7 @@ Preparation and validation happen in staging. A same-volume atomic directory swa
 publishes the complete profile; a failed preparation leaves prior debug and source
 bytes intact. Prior debug-only work and its preferences are recoverable under
 `RepoPrompt CE Debug Recovery` beside the profiles. The last three owned recovery
-snapshots are retained; unrelated files and unrecognized crash leftovers are not
+snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
 deleted. Normal startup is silent. Failure presents an actionable debug-only error
 and exits instead of opening a partial mixture. `debugSeed.json` and the redacted
 startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
