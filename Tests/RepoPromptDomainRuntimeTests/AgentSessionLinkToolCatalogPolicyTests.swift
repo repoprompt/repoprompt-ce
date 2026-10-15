@@ -1137,6 +1137,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         let bootstrap = MCPWindowToolName.becomeOverseer
         _ = try await runtime.toolRegistry.register(registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1), bindings: [binding(toolName: toolName), binding(toolName: bootstrap)])
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: bootstrap))
+        // A later deliberate task repeat can have effects; clients must not auto-retry it as idempotent.
+        XCTAssertEqual(definition.annotations.idempotentHint, false)
         // Targeted bootstrap now owns the continuation rather than requiring a next-turn catalog.
         XCTAssertTrue(definition.description.contains("ONE target-scoped observe + control + restructure approval"))
         XCTAssertTrue(definition.description.contains("app automatically prepares the idle/unvisited target"))

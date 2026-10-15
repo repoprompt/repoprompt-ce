@@ -161,6 +161,7 @@ final class DelegationScopeRuntime: ObservableObject {
         var isDelivering = false
         var pendingStart: (text: String, delivery: AgentSessionLinkSendDelivery)?
         var retryScheduled = false
+        var startRetryAttempts = 0
     }
 
     private var decisions: [UUID: DecisionDelivery] = [:]
@@ -168,9 +169,13 @@ final class DelegationScopeRuntime: ObservableObject {
     var liveScopesDidChange: (@MainActor () -> Void)?
     var scopesDidInvalidate: (@MainActor (Set<UUID>) -> Void)?
     private var overseeContinuations: [UUID: @MainActor (DomainDelegationScopeRecord) async -> Void] = [:]
-    private var overseeContinuationTasks: [UUID: (scopeID: UUID, task: Task<Void, Never>)] = [:]
+    // Retain only process-local task identity, never consent. A short completed-task window
+    // absorbs client retries without making a later deliberate repeat impossible.
+    private var overseeContinuationTasks: [UUID: (scopeID: UUID, task: Task<Void, Never>, request: DelegationScopeRequest, digest: String, completedAt: Date?)] = [:]
+    private static let completedOverseeRetryWindow: TimeInterval = 30
     #if DEBUG
         var test_scopeDecision: ((UUID, String) -> Void)?
+        var test_decisionStartRetryDelay: Duration?
         var test_pendingDecisionCount: Int {
             decisions.count
         }
@@ -588,6 +593,11 @@ final class DelegationScopeRuntime: ObservableObject {
         ) {
             return .failure(.invalid(denial))
         }
+        if reusePendingOnly, let existing = existingOverseeContinuation(requester: requesterSessionID, kind: kind, reason: reason),
+           let running = overseeContinuationTasks[existing]
+        {
+            return .success(running.request)
+        }
         let key = idempotencyKey.map { "\(requesterSessionID.uuidString)|\($0)" }
         if let key, let existingID = requestIDByKey[key], let existing = requests[existingID],
            !reusePendingOnly || existing.state == .pending
@@ -641,7 +651,11 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Reuse only this owner's live, exact-target user decision. A tool argument or saved link alone
     /// cannot mark a new request approved. This also avoids another card after a normal restart.
     func continueOverseeWithExistingConsent(requestID: UUID) -> Bool {
-        guard var request = requests[requestID], request.state == .pending,
+        guard var request = requests[requestID] ?? overseeContinuationTasks[requestID]?.request else { return false }
+        if let existing = existingOverseeContinuation(requester: request.requesterSessionID, kind: request.kind, reason: request.reason) {
+            return existing == requestID // Point at that task; never start another continuation.
+        }
+        guard request.state == .pending,
               case let .session(target) = request.kind,
               let record = liveScopes(grantedTo: request.requesterSessionID).first(where: {
                   $0.grant.kind == request.kind && $0.grant.capabilities.isSuperset(of: request.capabilities)
@@ -649,12 +663,35 @@ final class DelegationScopeRuntime: ObservableObject {
               let continuation = overseeContinuations.removeValue(forKey: requestID) else { return false }
         request.state = .granted(scopeID: record.id)
         requests[requestID] = request
+        startOverseeContinuation(request: request, record: record, continuation: continuation)
+        return true
+    }
+
+    private func existingOverseeContinuation(requester: UUID, kind: DomainDelegationScopeKind, reason: String?) -> UUID? {
+        let date = now()
+        overseeContinuationTasks = overseeContinuationTasks.filter {
+            $0.value.completedAt.map { date.timeIntervalSince($0) < Self.completedOverseeRetryWindow } ?? true
+        }
+        guard case let .session(target) = kind else { return nil }
+        let digest = AgentSessionLinkMessageDigest.steerDigest(message: reason ?? "")
+        return overseeContinuationTasks.first {
+            $0.value.request.requesterSessionID == requester && $0.value.request.kind == kind && $0.value.digest == digest
+                && linkConsent.permits(scopeID: $0.value.scopeID, observer: requester, target: target, at: date)
+        }?.key
+    }
+
+    private func startOverseeContinuation(
+        request: DelegationScopeRequest, record: DomainDelegationScopeRecord,
+        continuation: @escaping @MainActor (DomainDelegationScopeRecord) async -> Void
+    ) {
         let task = Task { @MainActor [weak self] in
             await continuation(record)
-            self?.overseeContinuationTasks.removeValue(forKey: requestID)
+            guard let self else { return }
+            overseeContinuationTasks[request.id]?.completedAt = now()
         }
-        overseeContinuationTasks[requestID] = (record.id, task)
-        return true
+        overseeContinuationTasks[request.id] = (
+            record.id, task, request, AgentSessionLinkMessageDigest.steerDigest(message: request.reason ?? ""), nil
+        )
     }
 
     func notifyOverseeContinuation(sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false) {
@@ -744,11 +781,7 @@ final class DelegationScopeRuntime: ObservableObject {
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
             let continuation = overseeContinuations.removeValue(forKey: requestID)
             if let continuation {
-                let task = Task { @MainActor [weak self] in
-                    await continuation(record)
-                    self?.overseeContinuationTasks.removeValue(forKey: requestID)
-                }
-                overseeContinuationTasks[requestID] = (record.id, task)
+                startOverseeContinuation(request: request, record: record, continuation: continuation)
             }
             enqueueDecision(
                 sessionID: request.requesterSessionID,
@@ -945,7 +978,7 @@ final class DelegationScopeRuntime: ObservableObject {
             return
         }
         // Publications during the save/start await must not drop the in-flight batch or start it twice.
-        if decisions[sessionID]?.isDelivering == true { return }
+        if decisions[sessionID]?.isDelivering == true || decisions[sessionID]?.retryScheduled == true { return }
         guard let pending = decisions[sessionID], !pending.messages.isEmpty || pending.pendingStart != nil,
               let presentation = Self.loadedPresentation(forTab: pending.tabID, in: windows()),
               !presentation.window.isClosing,
@@ -967,7 +1000,9 @@ final class DelegationScopeRuntime: ObservableObject {
             guard let self, var current = decisions[sessionID], current.stopFence == pending.stopFence else { return }
             current.isDelivering = false
             switch outcome {
-            case .submitted, .indeterminate: current.pendingStart = nil
+            case .submitted, .indeterminate:
+                current.pendingStart = nil
+                current.startRetryAttempts = 0
             case .retry:
                 if pending.pendingStart == nil { current.messages = pending.messages + current.messages }
             case let .persisted(delivery): current.pendingStart = (text, delivery)
@@ -978,11 +1013,30 @@ final class DelegationScopeRuntime: ObservableObject {
                 decisions[sessionID] = current
                 if outcome == .submitted || outcome == .indeterminate { drainDecisions(sessionID: sessionID) }
                 else if current.pendingStart != nil, !current.retryScheduled {
-                    // Retry only a saved row's start, never append/save the notice again. The same
-                    // binding, Stop and readiness checks still gate every attempt.
+                    // At most five start-only retries, with 1/2/4/8/16-second backoff. Publications
+                    // cannot bypass the delay or recreate the saved row. Stop/binding still fence it.
+                    guard current.startRetryAttempts < 5 else {
+                        current.pendingStart = nil
+                        current.startRetryAttempts = 0
+                        if current.messages.isEmpty { decisions.removeValue(forKey: sessionID) }
+                        else { decisions[sessionID] = current }
+                        if let session = presentation.window.agentModeViewModel.sessions[pending.tabID],
+                           session.activeAgentSessionID == sessionID, pending.stopFence.permitsStart(of: session)
+                        {
+                            session.appendItem(.error("The saved approval notice could not resume this session after five retries. Automatic retries stopped; the saved notice was not duplicated. Check the provider and resume this session to inspect it.", sequenceIndex: session.nextSequenceIndex))
+                        }
+                        if !current.messages.isEmpty { drainDecisions(sessionID: sessionID) }
+                        return
+                    }
+                    let delay = Duration.seconds(1 << current.startRetryAttempts)
+                    decisions[sessionID]?.startRetryAttempts += 1
                     decisions[sessionID]?.retryScheduled = true
                     Task { @MainActor [weak self] in
-                        try? await Task.sleep(for: .seconds(1))
+                        var retryDelay = delay
+                        #if DEBUG
+                            retryDelay = self?.test_decisionStartRetryDelay ?? delay
+                        #endif
+                        try? await Task.sleep(for: retryDelay)
                         guard let self, decisions[sessionID]?.stopFence == pending.stopFence else { return }
                         decisions[sessionID]?.retryScheduled = false
                         drainDecisions(sessionID: sessionID)

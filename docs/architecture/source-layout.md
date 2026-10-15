@@ -148,6 +148,8 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 
 ### Documented wiring exceptions outside Diagnostics
 
+- `Features/AgentMode/Services/BecomeOverseerMCPToolService.swift` owns the targeted activation → approval → saved-session/link/task product flow. Its MCP adapter in `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` wires this feature service; keeping the flow in Infrastructure would invert its dependencies on Agent Mode's runtime and message digest. This is a narrow composition exception, not a placement rule for other transport-only MCP services.
+
 - `App/AppLaunchConfiguration.swift` remains in `App` because it owns process arguments/environment interpretation for launch behavior. It still routes DEBUG-only Agent chat stress settings, but harness-specific configuration lives under `Features/Diagnostics/AgentMode/Stress`.
 - `App/WindowState.swift` remains the composition root and continues to instantiate/pause the DEBUG-only `AgentChatStressHarness`. This is wiring only; harness implementation lives under Diagnostics.
 - `Infrastructure/Security/EphemeralSecureKeyValueStore.swift` remains with security storage code, not Diagnostics, because it is a required debug-app secure-storage backend rather than a fixture or visible diagnostic harness. It is `#if DEBUG`, in-memory only, and preserves existing debug behavior for ad-hoc/ephemeral secure storage.

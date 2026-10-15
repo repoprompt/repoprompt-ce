@@ -18,7 +18,7 @@ extension AgentSessionLinkRuntimeBridge {
             return .object([
                 "result": .string("target_not_preparable"), "subreason": .string(reason),
                 "next_call": .string("session_admin {op:\"scope_status\"}"),
-                "message": .string("No approval card was created. This placement cannot be prepared in the background. Use inventory under an observe scope to select a current, non-stashed target in a loaded workspace; do not retry unchanged.")
+                "message": .string("No approval card was created. This saved placement is not supported for background preparation yet. Tell the user this limitation and ask them to open the target in its owning workspace before trying again; the agent cannot select it on the user's behalf. Do not retry unchanged.")
             ])
         }
         let scopes = delegationScopes
@@ -55,8 +55,10 @@ extension AgentSessionLinkRuntimeBridge {
         case .denied: "denied"
         case .cancelled: "cancelled"
         }
-        let continuation = currentState == .pending || reused
+        let continuation = currentState == .pending
             ? "The app will prepare this saved target, link it, and deliver the requested task after this one approval. Do not ask for go, open its tab, duplicate the task, or request another capability card. Approval, denial and task status resume you automatically."
+            : reused
+            ? "An approved continuation owns this task: it is running or finished within the last 30 seconds. This request_id identifies it; no duplicate task is started by a retry. Automatic notices report progress; inspect agent_session_link poll/read for its status."
             : "This request is \(state). No new task was started by this replay. Inspect scope_status before making a fresh request."
         return .object([
             "result": .string(result),

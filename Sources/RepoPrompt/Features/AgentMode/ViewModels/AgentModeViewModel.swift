@@ -19127,7 +19127,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch outcome {
         case .blocked(.persistenceIndeterminate): .indeterminate
         case .blocked: .retry
-        case let .delivered(delivery) where delivery.deliveryState == .persisted: .persisted(delivery)
+        case let .delivered(delivery) where delivery.deliveryState == .persisted || delivery.deliveryState == .runStartFailed: .persisted(delivery)
         case .delivered: .submitted
         }
     }

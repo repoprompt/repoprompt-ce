@@ -2263,7 +2263,7 @@
     {
       "annotations" : {
         "destructiveHint" : false,
-        "idempotentHint" : true,
+        "idempotentHint" : false,
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
@@ -2272,7 +2272,7 @@
         "additionalProperties" : false,
         "properties" : {
           "idempotency_key" : {
-            "description" : "Optional key deduplicating pending requests only. A decided request starts a fresh task, reusing live exact-target consent when available.",
+            "description" : "Optional key for pending requests. Identical requester/target/tasks also reuse their running or recently finished continuation (30 seconds), even with a different key. Later repeats start a fresh task using live exact-target consent when available.",
             "type" : "string"
           },
           "message" : {

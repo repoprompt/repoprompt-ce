@@ -1119,6 +1119,26 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(devin, .string(BecomeOverseerMCPToolService.devinResult))
     }
 
+    func testNoArgumentBootstrapAllowsInboundOnlyDiscoveryButGrantsNoAuthority() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let endpoint = fixture.target.domainEndpoint // Existing fixture link is observer → target only.
+        let outboundBefore = await fixture.authority.links(forObserver: endpoint.sessionID)
+        XCTAssertTrue(outboundBefore.items.isEmpty)
+        let service = BecomeOverseerMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "inbound-discovery", windowID: endpoint.windowID) },
+            resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: fixture.bridge,
+            prepareActivationCommit: { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+        )
+        let result = try await service.execute(args: [:])
+        XCTAssertEqual(result, .string(BecomeOverseerMCPToolService.nextTurnResult))
+        XCTAssertNotNil(fixture.host.activations[endpoint])
+        let outboundAfter = await fixture.authority.links(forObserver: endpoint.sessionID)
+        XCTAssertTrue(outboundAfter.items.isEmpty, "Discovery is not management authority")
+        XCTAssertTrue(fixture.bridge.delegationScopes.liveScopes(grantedTo: endpoint.sessionID).isEmpty)
+        XCTAssertTrue(fixture.bridge.delegationScopes.pendingRequests(forTab: endpoint.tabID, sessionID: endpoint.sessionID).isEmpty)
+    }
+
     func testBootstrapEligibilityRejectsExploreMCPChildLaneAndTransientBindings() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }

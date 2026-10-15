@@ -77,6 +77,43 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         }
     }
 
+    func testIdenticalOverseeTaskReusesRunningAndRecentlyFinishedRequestAcrossClientKeys() async throws {
+        var date = Date()
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, now: { date }, notifyCatalogChanged: { _ in })
+        let caller = UUID(), target = UUID()
+        @MainActor func request(_ reason: String = "say hi") throws -> DelegationScopeRequest {
+            try runtime.requestScope(
+                requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                capabilities: [.observe, .control, .restructure], guardrails: .init(), reason: reason,
+                idempotencyKey: UUID().uuidString, reusePendingOnly: true
+            ).get()
+        }
+        var release: CheckedContinuation<Void, Never>?
+        defer { release?.resume() }
+        var starts = 0
+        var finished = false
+        let original = try request()
+        XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
+            starts += 1
+            await withCheckedContinuation { release = $0 }
+            finished = true
+        })
+        _ = try runtime.approve(requestID: original.id).get()
+        try await AsyncTestWait.waitUntil("first continuation running") { release != nil }
+        XCTAssertEqual(try request().id, original.id, "A new client key must not create another task")
+        XCTAssertTrue(runtime.continueOverseeWithExistingConsent(requestID: original.id))
+        XCTAssertNotEqual(try request("different task").id, original.id)
+        XCTAssertEqual(starts, 1)
+        release?.resume()
+        release = nil
+        try await AsyncTestWait.waitUntil("first continuation finished") { finished }
+        XCTAssertEqual(try request().id, original.id, "Absorb a retry just after completion too")
+        date = date.addingTimeInterval(31)
+        XCTAssertNotEqual(try request().id, original.id, "A later deliberate repeat remains possible")
+        XCTAssertEqual(starts, 1)
+        runtime.freezeForTermination()
+    }
+
     func testOverseeRefusalNoticesContainOnlyCodesAndCardReasonIsBounded() {
         let privateDetail = "target_unloaded_unpreparable: SECRET /Users/private/project workspace title"
         let outcome = AgentSessionAdministrationOutcome.completed(.object(["items": .array([.object([
@@ -6567,7 +6604,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
     func testIdleDecisionIndeterminateSaveIsFlaggedAndPersistedOnlyRetriesStartWithoutAnotherRow() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
-            for indeterminate in [true, false] {
+            for mode in ["indeterminate", "persisted", "exhausted"] {
+                let indeterminate = mode == "indeterminate"
+                let exhausted = mode == "exhausted"
                 let controller = MonitorFakeNativeController()
                 var starts = 0
                 let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
@@ -6608,6 +6647,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
                 let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [fixture.window] }, notifyCatalogChanged: { _ in })
                 runtime.test_suppressDecisionDelivery = false
+                if exhausted { runtime.test_decisionStartRetryDelay = .milliseconds(1) }
                 let request = try runtime.requestScope(
                     requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: UUID()),
                     capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
@@ -6623,14 +6663,29 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     XCTAssertEqual(runtime.test_pendingDecisionCount, 0)
                     XCTAssertEqual(AgentModeViewModel.delegationDecisionOutcome(.blocked(.persistenceIndeterminate)), .indeterminate)
                 } else {
-                    try await AsyncTestWait.waitUntil("saved row remains owned for start-only retry") { runtime.test_pendingDecisionStartCount == 1 }
+                    try await AsyncTestWait.waitUntil("saved row remains owned for start-only retry") {
+                        runtime.test_pendingDecisionStartCount == 1 || (exhausted && session.items.contains { $0.kind == .error && $0.text.contains("after five retries") })
+                    }
                     let rows = session.items.filter { $0.kind == .user }
                     XCTAssertEqual(rows.count, 1)
                     XCTAssertEqual(starts, 0)
-                    session.mcpFollowUpRunPending = false
-                    try await AsyncTestWait.waitUntil("saved notice starts without another approval or append", timeout: 15) { await controller.sentCount == 1 }
+                    if exhausted {
+                        try await AsyncTestWait.waitUntil("bounded retries visibly give up without another row") {
+                            runtime.test_pendingDecisionCount == 0 && session.items.contains { $0.kind == .error && $0.text.contains("after five retries") }
+                        }
+                        XCTAssertEqual(starts, 0)
+                        XCTAssertEqual(writes, 1)
+                        session.mcpFollowUpRunPending = false
+                        session.objectWillChange.send()
+                        XCTAssertEqual(runtime.test_pendingDecisionCount, 0)
+                    } else {
+                        session.mcpFollowUpRunPending = false
+                        try await AsyncTestWait.waitUntil("saved notice starts without another approval or append", timeout: 15) { await controller.sentCount == 1 }
+                        XCTAssertEqual(starts, 1)
+                    }
                     XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.id), rows.map(\.id))
-                    XCTAssertEqual(starts, 1)
+                    let failedStart = try AgentSessionLinkSendDelivery(targetItemID: XCTUnwrap(rows.first?.id), acceptedAt: Date(), deliveryState: .runStartFailed, resultingRunState: "idle")
+                    XCTAssertEqual(AgentModeViewModel.delegationDecisionOutcome(.delivered(failedStart)), .persisted(failedStart))
                 }
                 runtime.freezeForTermination()
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.directory.appendingPathComponent("notice.json") }
@@ -6772,6 +6827,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             } catch {
                 return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(String(describing: targetVM.sessions[targetTab.id]?.runState)), items=\(String(describing: targetVM.sessions[targetTab.id]?.items.map(\.text))), decisions=\(decisions)")
             }
+            // Retry while the app-owned continuation is watching: point at it, never steer twice.
+            let repeated = try await service.execute(args: args)
+            XCTAssertEqual(repeated.objectValue?["result"], .string("continuing_approved_request"))
+            XCTAssertEqual(repeated.objectValue?["request_id"], .string(requestID.uuidString))
             XCTAssertEqual(providerStarts, 1, "The provider starts for the assigned task, never merely to link")
             XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
             let messages = await controller.sentMessages

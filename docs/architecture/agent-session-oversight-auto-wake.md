@@ -17,7 +17,15 @@ point for the natural-language request “oversee session X”. `message` is opt
 `observe`, `control`, and `restructure` together, for the caller and **only that exact target**
 (no descendants or unrelated sessions). Activation and tool arguments are not consent. The
 existing app-owned approval card remains the only grant boundary. A compatible live/restored
-exact-target grant can be reused without another card.
+exact-target grant can be reused without another card. Identical requester/target/task retries reuse
+an in-flight continuation or one finished within 30 seconds, even if the client supplies a new key;
+later deliberate repeats can start a fresh task. The tool is not advertised as idempotent. No-argument
+activation deliberately permits discovery for an otherwise eligible inbound-only session, but grants
+neither a scope nor an outbound link.
+
+A saved requester notice whose provider start fails retains its existing row and retries only start,
+up to five retries with 1/2/4/8/16-second backoff. An exhausted retry budget leaves a visible error;
+it never duplicates the row or silently claims the requester resumed.
 
 The old bootstrap response unconditionally instructed the agent to wait for its next turn.
 RPCE already advertises `tools.listChanged` and emits `notifications/tools/list_changed`, but a
