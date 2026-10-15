@@ -683,23 +683,27 @@ final class DomainWorkspacePresentationBridge {
         attempt: DomainCatalogAttempt,
         runID: UUID
     ) async {
-        /// A covering accepted reconciliation (e.g. a newer retry/event/reload) needs nothing further.
-        func isUncoveredFreshnessRejection(
+        /// A manager reconciliation can cover the data without crediting this bridge's waiter/cache.
+        /// Give that handoff the same single refetch budget, never an invented checkpoint.
+        func needsCurrentSnapshot(
             _ rejection: DomainCatalogRejection?, _ snapshot: DomainWorkspaceCatalogSnapshot
         ) -> Bool {
             guard let rejection, [.stalePublication, .staleCatalogRevision, .reentrant, .superseded].contains(rejection)
             else { return false }
-            return workspaceManager?.coversDomainCatalog(snapshot) == false
+            guard let manager = workspaceManager else { return false }
+            return !manager.coversDomainCatalog(snapshot)
+                || lastPublicationSequence < snapshot.publicationSequence
+                || acceptedReconciliationGeneration != manager.domainCatalogReconciliationGeneration
         }
         var rejection = await project(snapshot, attempt: attempt, runID: runID)
         var resolved = snapshot
-        if isUncoveredFreshnessRejection(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
+        if needsCurrentSnapshot(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
             let refetched = await client.snapshot()
             guard isCurrentRun(runID) else { return }
-            rejection = await project(refetched, attempt: refetchAttempt, runID: runID)
+            rejection = await project(refetched, attempt: refetchAttempt, runID: runID, allowCoveredMetadata: true)
             resolved = refetched
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
-            if isUncoveredFreshnessRejection(rejection, refetched) {
+            if needsCurrentSnapshot(rejection, refetched), workspaceManager?.coversDomainCatalog(refetched) == false {
                 workspaceManager?.reportDomainCatalogFailure(
                     .catalogChangedDuringRefresh, snapshot: refetched, attempt: refetchAttempt
                 )
@@ -766,7 +770,8 @@ final class DomainWorkspacePresentationBridge {
     private func project(
         _ snapshot: DomainWorkspaceCatalogSnapshot,
         attempt: DomainCatalogAttempt,
-        runID: UUID
+        runID: UUID,
+        allowCoveredMetadata: Bool = false
     ) async -> DomainCatalogRejection? {
         guard isCurrentRun(runID), let manager = workspaceManager else { return nil }
         if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
@@ -789,22 +794,39 @@ final class DomainWorkspacePresentationBridge {
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
-        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests,
-           records.allSatisfy({ record in
-               guard let generation = manager.adoptedFullDocumentGeneration(
-                   workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
-               ) else { return false }
-               return projectedAdoptionGenerations[record.document.workspaceID] == generation
-           })
-        {
+        let cachedMetadataIsQualified = baselineGeneration != nil
+            && Set(projectedModels.keys) == Set(nextDigests.keys) && projectedDigests == nextDigests
+            && records.allSatisfy { record in
+                guard let generation = manager.adoptedFullDocumentGeneration(
+                    workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
+                ) else { return false }
+                return projectedAdoptionGenerations[record.document.workspaceID] == generation
+            }
+        // A real full reconciliation may have won while our CPU preparation was suspended.
+        // Its qualified descendants already contain these exact canonical documents. Adopt that
+        // owner's metadata baseline instead of decoding/adopting them again or stranding waiters.
+        let coveredMetadataIsQualified = allowCoveredMetadata && baselineGeneration == nil
+            && manager.domainCatalogReconciliationGeneration > 0
+            && !manager.requiresFullCatalogReconciliation
+            && manager.coversDomainCatalog(snapshot)
+            && records.allSatisfy { record in
+                manager.qualifiedDomainWorkspaceDescendant(record) != nil
+            }
+        let metadataGeneration = cachedMetadataIsQualified ? baselineGeneration
+            : (coveredMetadataIsQualified ? manager.domainCatalogReconciliationGeneration : nil)
+        if let metadataGeneration {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
-                projection: .metadata(baselineGeneration: baselineGeneration),
+                projection: .metadata(baselineGeneration: metadataGeneration),
                 preferredActiveWorkspaceID: nil,
                 rootMapPolicy: .snapshotMetadata,
                 attempt: attempt
             ) {
             case let .accepted(receipt):
+                guard isCurrentRun(runID) else { return nil }
+                if coveredMetadataIsQualified {
+                    cacheAcceptedModels(records, availableModelIDs: Set(nextDigests.keys))
+                }
                 commitAccepted(receipt, digests: nextDigests, runID: runID)
                 return nil
             case .rejected(.fullProjectionRequired):
@@ -855,6 +877,14 @@ final class DomainWorkspacePresentationBridge {
                 }
                 nextModels = prepared.models
                 failedIDs.formUnion(prepared.failedIDs)
+                // A point read may have adopted this exact document before this bridge had a cache.
+                // Keep its current local descendant, but only after a successful canonical decode
+                // and the unchanged preparation witness. A failed decode is never rescued here.
+                for record in recordsToDecode where nextModels[record.document.workspaceID] != nil {
+                    if let descendant = manager.qualifiedDomainWorkspaceDescendant(record) {
+                        nextModels[record.document.workspaceID] = descendant
+                    }
+                }
             } catch {
                 return .cancelled
             }
@@ -884,11 +914,18 @@ final class DomainWorkspacePresentationBridge {
         // Accepted chooser publication can synchronously adopt another model for the same digest.
         // Read each model and its witness together after those callbacks; never stamp an older
         // pre-application overlay with a newly observed owner generation.
+        cacheAcceptedModels(records, availableModelIDs: Set(nextModels.keys))
+        commitAccepted(receipt, digests: nextDigests, runID: runID)
+        return nil
+    }
+
+    private func cacheAcceptedModels(_ records: [DomainWorkspaceSnapshot], availableModelIDs: Set<UUID>) {
+        guard let manager = workspaceManager else { return }
         var acceptedModels: [UUID: WorkspaceModel] = [:]
         var acceptedGenerations: [UUID: UInt64] = [:]
         for record in records {
             let workspaceID = record.document.workspaceID
-            guard nextModels[workspaceID] != nil,
+            guard availableModelIDs.contains(workspaceID),
                   let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
                   let model = manager.workspace(withID: workspaceID)
             else { continue }
@@ -897,8 +934,6 @@ final class DomainWorkspacePresentationBridge {
         }
         projectedModels = acceptedModels
         projectedAdoptionGenerations = acceptedGenerations
-        commitAccepted(receipt, digests: nextDigests, runID: runID)
-        return nil
     }
 
     private func commitAccepted(

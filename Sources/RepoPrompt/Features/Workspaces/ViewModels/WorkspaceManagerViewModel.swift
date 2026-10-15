@@ -8079,6 +8079,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         return baseline.adoptionGeneration
     }
 
+    /// Preserve an owned descendant of these exact canonical bytes, never infer a write baseline.
+    func qualifiedDomainWorkspaceDescendant(_ record: DomainWorkspaceSnapshot) -> WorkspaceModel? {
+        let workspaceID = record.document.workspaceID
+        guard let local = workspace(withID: workspaceID), !local.isEphemeral,
+              let baseline = fullDocumentWriteBaseline(workspaceID: workspaceID),
+              baseline.workingRevision == record.revisions.workingRevision,
+              baseline.contentDigest == record.document.contentDigest,
+              baseline.fileURL == record.document.fileURL
+        else { return nil }
+        return local
+    }
+
     private func fullDocumentWriteBaseline(workspaceID: UUID) -> FullDocumentWriteBaseline? {
         guard catalogApplicationDepth == 0, !requiresFullCatalogReconciliation,
               let baseline = fullDocumentWriteBaselines[workspaceID],
@@ -9079,6 +9091,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     struct CatalogPreparationWitness: Equatable {
         let publicationSerial: UInt64
         let reconciliationGeneration: UInt64
+        let requiresFullReconciliation: Bool
         let adoptionGenerations: [UUID: UInt64]
         let stateVersions: [UUID: Int]
         let revisions: [UUID: DomainRevisionState]
@@ -9090,6 +9103,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         CatalogPreparationWitness(
             publicationSerial: workspacePublicationSerial,
             reconciliationGeneration: domainCatalogReconciliationGeneration,
+            requiresFullReconciliation: requiresFullCatalogReconciliation,
             adoptionGenerations: fullDocumentAdoptionGenerations,
             stateVersions: stateVersionByWorkspaceID,
             revisions: domainWorkspaceRevisionsByID,
