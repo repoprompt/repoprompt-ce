@@ -1262,3 +1262,110 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         ]))
     }
 }
+
+@MainActor
+final class ClaudeUsageSetupTests: XCTestCase {
+    func testProductionConnectAndSetupActionAcceptPendingConsentButCollectionDoesNot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ClaudeUsageSetupTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        var source: ClaudeCLIUsageSource?
+        let runtime = ProviderQuotaRuntime(
+            accountIDProvider: { nil },
+            managedAuthTransitions: { AsyncStream { $0.finish() } },
+            settingsStore: settings,
+            claudeSourceFactory: { readConsent, setupConsent in
+                let value = ClaudeCLIUsageSource(root: root.appendingPathComponent("usage"), collect: { _, _ in
+                    try XCTUnwrap(ClaudeCLIUsageRecord.extract(Data(#"{"rate_limits":{"five_hour":{"used_percentage":4}}}"#.utf8)))
+                }, consentProvider: readConsent, setupConsentProvider: setupConsent, setupCommandProvider: { "/usr/bin/false" })
+                source = value
+                return value
+            }
+        )
+        let action = ClaudeUsageSetupAction()
+        // These are the production Connect confirmation and Open Terminal action, not a
+        // hand-built ready grant. Before this fix the latter failed with needsConsent.
+        runtime.connectClaudeUsage(startReading: false)
+        let grant = try XCTUnwrap(settings.claudeCLIUsageGrant())
+        XCTAssertFalse(grant.isReady)
+        var launched: URL?
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { launched = $0 })
+        XCTAssertNil(action.error)
+        let script = try XCTUnwrap(launched)
+        XCTAssertEqual(action.script, script)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: script.path))
+        XCTAssertTrue(try String(contentsOf: script, encoding: .utf8).contains("'--tools' ''"))
+        XCTAssertEqual(settings.claudeCLIUsageGrant(), grant, "Opening setup cannot mark consent ready")
+        let connectedSource = try XCTUnwrap(source)
+        do {
+            _ = try await connectedSource.read(.init(userInitiated: true))
+            XCTFail("Pending setup authorized collection")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .needsConsent) }
+        try await runtime.completeClaudeUsageSetup()
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.grantedAt, grant.grantedAt)
+        XCTAssertEqual(settings.claudeCLIUsageGrant()?.isReady, true)
+        let reading = try await connectedSource.read(.init(userInitiated: true))
+        XCTAssertFalse(reading.buckets.isEmpty)
+        runtime.disconnectClaudeUsage()
+        await action.open(prepare: { try await runtime.prepareClaudeUsageSetup() }, launch: { _ in XCTFail("Revoked consent opened Terminal") })
+        XCTAssertNotNil(action.error)
+        XCTAssertNil(action.manualCommand, "Do not retain a runnable command after revocation")
+    }
+
+    func testTerminalFailureRetainsCopyableQuotedManualCommandAndSuccessClearsError() async throws {
+        let action = ClaudeUsageSetupAction()
+        let script = URL(fileURLWithPath: "/fixture/helper's folder/Set up Claude usage.command")
+        await action.open(prepare: { script }, launch: { _ in throw NSError(domain: "Terminal", code: 42, userInfo: [NSLocalizedDescriptionKey: "Automation denied"]) })
+        XCTAssertTrue(try XCTUnwrap(action.error).contains("Automation denied"))
+        XCTAssertEqual(action.manualCommand, "/bin/zsh '/fixture/helper'\\''s folder/Set up Claude usage.command'")
+        await action.open(prepare: { script }, launch: { XCTAssertEqual($0, script) })
+        XCTAssertNil(action.error)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testPreparationFailureNeverLaunchesOrOffersStaleCommand() async {
+        let action = ClaudeUsageSetupAction()
+        action.script = URL(fileURLWithPath: "/stale/setup.command")
+        await action.open(prepare: { throw ProviderQuotaReadError.needsConsent }, launch: { _ in XCTFail("No authorized setup script") })
+        XCTAssertNil(action.manualCommand)
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertFalse(action.isOpening)
+    }
+
+    func testMissingCLIProvidesPreparationFailureWithoutLaunching() async {
+        let profile = ClaudeUsageCredentialProfile.current()
+        let source = ClaudeCLIUsageSource(consentProvider: { nil }, setupConsentProvider: { profile.id }, setupCommandProvider: { "not-an-executable" })
+        do {
+            _ = try await source.prepareSetup()
+            XCTFail("Missing CLI accepted")
+        } catch { XCTAssertEqual(error as? ProviderQuotaReadError, .cliUnavailable) }
+    }
+
+    func testSetupRevalidatesConsentAfterPreparingFiles() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeUsageCredentialProfile.current()
+        let consent = OneUseSetupConsent(profileID: profile.id)
+        let source = ClaudeCLIUsageSource(root: root, consentProvider: { nil }, setupConsentProvider: { await consent.next() }, setupCommandProvider: { "/usr/bin/false" })
+        let action = ClaudeUsageSetupAction()
+        await action.open(prepare: { try await source.prepareSetup() }, launch: { _ in XCTFail("Revoked consent launched setup") })
+        XCTAssertEqual(action.error, ProviderQuotaReadError.needsConsent.message)
+        XCTAssertNil(action.manualCommand)
+    }
+
+    private actor OneUseSetupConsent {
+        let profileID: String
+        var calls = 0
+        init(profileID: String) {
+            self.profileID = profileID
+        }
+
+        func next() -> String? {
+            calls += 1
+            return calls == 1 ? profileID : nil
+        }
+    }
+}
