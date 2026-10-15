@@ -58,9 +58,9 @@ enum AgentSessionLinkReadOnlyApprovalPolicy {
             return args.dropFirst(2).allSatisfy { arg in
                 !arg.hasPrefix("-") || ["--log", "--log-failed", "--exit-status", "--verbose", "--job", "-j", "--repo", "-R", "--json", "--jq", "-q"].contains(arg)
             }
-        case "conductor", "./conductor":
-            guard args.count >= 2, args[0] == "job", ["list", "status", "wait"].contains(args[1]) else { return false }
-            return args.dropFirst(2).allSatisfy { !$0.hasPrefix("-") || ["--request-key", "--full-log"].contains($0) }
+        // Conductor is workspace-controlled executable code. Even job list/status/wait can
+        // run an edited script; approval-time integrity checks cannot prevent that race.
+        // Keep both conductor and ./conductor on the manual approval path.
         case "grep":
             return !args.isEmpty
         default:

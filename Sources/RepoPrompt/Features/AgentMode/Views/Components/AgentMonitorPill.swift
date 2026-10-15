@@ -214,7 +214,7 @@ struct AgentMonitorPopoverView: View {
                         ))
                         .toggleStyle(.checkbox)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .hoverTooltip("Off by default; applies only to one-time command approvals on managed lanes until this session is rebound or the app closes. Allowlist: git --no-pager status/log/diff (log/diff need --no-ext-diff --no-textconv), gh run view, conductor job list/status/wait, grep. Only simple commands without quoting, shell expansion, redirects, or unknown options qualify. Repository tools and configuration must be trusted. Turn off here to revoke immediately; other approvals remain manual.")
+                        .hoverTooltip("Off by default; applies only to one-time command approvals on managed lanes until this session is rebound or the app closes. Allowlist: git --no-pager status/log/diff (log/diff need --no-ext-diff --no-textconv), gh run view, grep. Conductor commands require manual approval because they run workspace-controlled code. Only simple commands without quoting, shell expansion, redirects, or unknown options qualify. Repository tools and configuration must be trusted. Turn off here to revoke immediately; other approvals remain manual.")
                     }
                     if props.isOverseer {
                         Divider()

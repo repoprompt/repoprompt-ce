@@ -213,8 +213,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let allowed = [
             "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null status --short", "git --no-pager log --no-ext-diff --no-textconv --oneline -n5",
             "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null diff --no-ext-diff --no-textconv --stat HEAD~1",
-            "gh run view 123 --log-failed", "./conductor job list", "conductor job status abc",
-            "./conductor job wait --request-key validation --full-log", "grep -rn needle Sources"
+            "gh run view 123 --log-failed", "grep -rn needle Sources"
         ]
         for command in allowed {
             XCTAssertTrue(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)
@@ -226,7 +225,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null -c alias.diff=unsafe diff",
             "git -c alias.log=unsafe log", "git --no-pager diff --output=out", "git --no-pager log --ext-diff",
             "git --no-pager reset --hard", "gh run view 123 --web", "gh run cancel 123",
-            "./conductor job cancel abc", "./conductor app relaunch", "grep 'quoted pattern' Sources"
+            "./conductor job list", "conductor job status abc", "./conductor job wait --request-key validation --full-log",
+            "conductor job list", "./conductor job cancel abc", "./conductor app relaunch", "grep 'quoted pattern' Sources"
         ]
         for command in denied {
             XCTAssertFalse(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)

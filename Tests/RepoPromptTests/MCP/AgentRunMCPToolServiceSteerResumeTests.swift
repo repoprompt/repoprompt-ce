@@ -86,6 +86,45 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(cancellationForwarded)
     }
 
+    func testManagedSteerRejectsEveryUnforwardableArgumentWithoutDelivery() async throws {
+        let window = try await makeWindow()
+        let target = UUID(), caller = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: target)
+        var service = makeService(window: window, resolveCaller: { _, _ in caller })
+        var deliveries = 0
+        service.forwardOversightSteer = { _, _ in
+            deliveries += 1
+            return .object(["result": .string("delivered")])
+        }
+        let rejected: [(String, Value)] = [
+            ("workflow_name", .string("review")), ("wait", .string("true")),
+            ("wait", .int(1)), ("unknown_option", .string("not forwarded")),
+            ("workflow", .string("review")), ("workflow_id", .string(UUID().uuidString)),
+            ("timeout_seconds", .int(1)), ("wait", .bool(true)), ("wait", .string("false"))
+        ]
+        for (key, value) in rejected {
+            var args: [String: Value] = [
+                "op": .string("steer"), "session_id": .string(target.uuidString), "message": .string("Continue")
+            ]
+            args[key] = value
+            do {
+                _ = try await service.execute(args: args)
+                XCTFail("Unsupported argument \(key) was accepted")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("'\(key)'"), "\(error)")
+                XCTAssertTrue(String(describing: error).contains("Nothing was delivered"), "\(error)")
+            }
+            XCTAssertEqual(deliveries, 0)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertNil(session.mcpControlContext)
+        }
+        _ = try await service.execute(args: [
+            "op": .string("steer"), "session_id": .string(target.uuidString),
+            "message": .string("Continue"), "idempotency_key": .string("approved-shape"), "wait": .bool(false)
+        ])
+        XCTAssertEqual(deliveries, 1, "Literal wait=false remains supported")
+    }
+
     func testResidentInstructionSteerAndPollDoNotCaptureOrConsumeComposer() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel

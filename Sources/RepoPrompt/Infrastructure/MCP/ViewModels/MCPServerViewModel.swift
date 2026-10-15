@@ -811,11 +811,7 @@ final class MCPServerViewModel: ObservableObject {
         )
         toolService.perfRecorder = perfRecorder
         toolService.forwardOversightSteer = { [self] args, metadata in
-            guard args["workflow"] == nil, args["workflow_id"] == nil,
-                  args["wait"] != .bool(true), args["timeout_seconds"] == nil
-            else {
-                throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Repeat with session_id and message only; workflows and message-and-wait are not supported on that surface. Nothing was delivered.")
-            }
+            // AgentRunMCPToolService applies the exact argument allowlist before entering this forwarder.
             guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
                 throw MCPError.invalidParams("Oversight steering is disabled. Enable agent_session_link in tool settings, then use its steer operation under a Manage link.")
             }

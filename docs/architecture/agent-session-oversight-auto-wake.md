@@ -488,8 +488,9 @@ there is an attested command projection; supported native command requests are c
 against a conservative command-shape allowlist, never against their redacted display text.
 
 The allowlist covers simple git status/log/diff (with `--no-pager`, and for log/diff also
-`--no-ext-diff --no-textconv`), `gh run view`, conductor job list/status/wait, and grep. Status/diff
-additionally require `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the operation: disabling
+`--no-ext-diff --no-textconv`), `gh run view`, and grep. `conductor` and `./conductor`, including
+job list/status/wait, require manual approval: they execute workspace-controlled scripts, and an
+approval-time integrity check cannot prevent an edit before execution. Status/diff additionally require `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the operation: disabling
 external diff/textconv alone does not disable fsmonitor. Other config overrides stay manual.
 Shell quoting, expansion, wrappers, operators, redirection, and unknown mutation options stay manual.
 This is not a filesystem sandbox: grep's literal relative/absolute path arguments retain the lane's

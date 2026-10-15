@@ -467,6 +467,13 @@ struct AgentRunMCPToolService {
             } catch let OversightSteerRouting.required(metadata) {
                 try Task.checkCancellation()
                 guard let forwardOversightSteer else { throw AgentSessionTargetOperationGuard.denialError(reference: "target") }
+                // Validate before any forwarder can deliver; never silently discard child-only options.
+                let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
+                if let rejected = args.keys.sorted().first(where: {
+                    !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
+                }) {
+                    throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
+                }
                 return try await forwardOversightSteer(args, metadata)
             }
         case "respond":
