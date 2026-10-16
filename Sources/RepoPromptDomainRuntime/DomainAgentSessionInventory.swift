@@ -215,6 +215,10 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     /// Every session known to exist, including ones a restricted view hides. Absence from this set
     /// (on a complete scan) is what "missing" means; a session hidden by scope is never missing.
     package let knownSessionIDs: Set<UUID>
+    /// Sessions the read saw but could not project with certainty, with a stable reason code
+    /// (for example `ambiguous_session_binding`). They are omitted from `records` and make the
+    /// read incomplete instead of failing the whole inventory.
+    package let unresolvedSessions: [UUID: String]
 
     private let edgesBySession: [UUID: [DomainAgentSessionInventoryEdge]]
     private let ancestry: DomainAgentSessionAncestryIndex
@@ -227,7 +231,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         records: [DomainAgentSessionInventoryRecord],
         edges: [DomainAgentSessionInventoryEdge],
         isComplete: Bool,
-        recordsComplete: Bool? = nil
+        recordsComplete: Bool? = nil,
+        unresolvedSessions: [UUID: String] = [:]
     ) {
         var byID: [UUID: DomainAgentSessionInventoryRecord] = [:]
         for record in records {
@@ -237,7 +242,9 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         }
         self.init(
             records: byID, edges: edges, isComplete: isComplete,
-            recordsComplete: recordsComplete ?? isComplete, knownSessionIDs: Set(byID.keys)
+            recordsComplete: recordsComplete ?? isComplete,
+            knownSessionIDs: Set(byID.keys).union(unresolvedSessions.keys),
+            unresolvedSessions: unresolvedSessions
         )
     }
 
@@ -246,8 +253,10 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         edges: [DomainAgentSessionInventoryEdge],
         isComplete: Bool,
         recordsComplete: Bool,
-        knownSessionIDs: Set<UUID>
+        knownSessionIDs: Set<UUID>,
+        unresolvedSessions: [UUID: String]
     ) {
+        self.unresolvedSessions = unresolvedSessions
         self.records = records
         self.edges = edges
         self.isComplete = isComplete
@@ -281,7 +290,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             edges: visibleEdges,
             isComplete: isComplete,
             recordsComplete: recordsComplete,
-            knownSessionIDs: knownSessionIDs
+            knownSessionIDs: knownSessionIDs,
+            unresolvedSessions: unresolvedSessions
         )
     }
 

@@ -271,14 +271,89 @@ struct AgentSessionScopeVisibility {
 
 enum AgentSessionInventoryReadFailure: Error, Equatable {
     case budgetExceeded
-    case incomplete
+    case incomplete(Reason)
+
+    /// Which completeness check refused. Every refusal names one, so a caller (and the user) can
+    /// tell a transient race from a filter that needs a complete census or a damaged index.
+    enum Reason: String, Equatable {
+        case sessionsChangedDuringRead = "sessions_changed_during_read"
+        case historyLookupFailed = "history_lookup_failed"
+        case historyIndexIncomplete = "history_index_incomplete"
+        case historyRecordMismatch = "history_record_mismatch"
+        case ancestryTooDeep = "ancestry_too_deep"
+        case filterNeedsCompleteCensus = "filter_needs_complete_census"
+        case organizationStateUnknown = "organization_state_unknown"
+        case orphanStatusUnknown = "orphan_status_unknown"
+        case noMatchesWhileHistoryIncomplete = "no_matches_while_history_incomplete"
+
+        var retryable: Bool {
+            switch self {
+            case .sessionsChangedDuringRead, .historyLookupFailed: true
+            default: false
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .sessionsChangedDuringRead:
+                "Open sessions or tabs changed repeatedly while the inventory was read."
+            case .historyLookupFailed:
+                "A saved session index could not be read."
+            case .historyIndexIncomplete:
+                "Some saved session indexes are unreadable or use an older format, so absence cannot be proven."
+            case .historyRecordMismatch:
+                "A saved index entry did not match the session it was looked up for."
+            case .ancestryTooDeep:
+                "The session's parent chain is longer than 256 sessions."
+            case .filterNeedsCompleteCensus:
+                "has_links, role and orphaned filters need every session and link to be known, and some are not."
+            case .organizationStateUnknown:
+                "pinned, group, archived and query filters need sidebar state that saved-only sessions do not carry."
+            case .orphanStatusUnknown:
+                "The orphaned filter needs a complete scan of every workspace."
+            case .noMatchesWhileHistoryIncomplete:
+                "No loaded session matched and saved history could not be fully read, so an empty result is not proof."
+            }
+        }
+
+        var nextStep: String {
+            switch self {
+            case .sessionsChangedDuringRead:
+                "Retry once after current lane/tab changes settle."
+            case .historyLookupFailed:
+                "Retry once; if it repeats, use filter {loaded:true} for open sessions only."
+            case .filterNeedsCompleteCensus, .orphanStatusUnknown:
+                "Drop has_links/role/orphaned from the filter, or add {loaded:true} and treat the result as open sessions only."
+            case .organizationStateUnknown:
+                "Add {loaded:true} to the filter so only sessions with known sidebar state are matched."
+            case .historyIndexIncomplete, .historyRecordMismatch, .noMatchesWhileHistoryIncomplete:
+                "Use filter {loaded:true} for open sessions; ask the user if saved sessions are needed."
+            case .ancestryTooDeep:
+                "Target a session nearer the root, or use inventory without tree filters."
+            }
+        }
+    }
 
     var value: Value {
-        .object([
-            "result": .string("incomplete"),
-            "code": .string(self == .budgetExceeded ? "inventory_budget_exceeded" : "inventory_incomplete"),
-            "retryable": .bool(true)
-        ])
+        switch self {
+        case .budgetExceeded:
+            .object([
+                "result": .string("incomplete"),
+                "code": .string("inventory_budget_exceeded"),
+                "detail": .string("The read hit its time or work budget across saved sessions."),
+                "next_step": .string("Narrow with filter {workspace:<id>} or {loaded:true}, then retry."),
+                "retryable": .bool(true)
+            ])
+        case let .incomplete(reason):
+            .object([
+                "result": .string("incomplete"),
+                "code": .string("inventory_incomplete"),
+                "subreason": .string(reason.rawValue),
+                "detail": .string(reason.detail),
+                "next_step": .string(reason.nextStep),
+                "retryable": .bool(reason.retryable)
+            ])
+        }
     }
 }
 
