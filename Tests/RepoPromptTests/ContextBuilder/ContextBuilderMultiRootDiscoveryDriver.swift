@@ -204,6 +204,14 @@ import XCTest
                 reason: "isolated invoking Agent Mode run", ttl: 30, purpose: .agentModeRun,
                 requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting
             ))
+            // These in-process parents share the XCTest PID, unlike distinct provider processes.
+            // Once routed, their connection/run bindings are authoritative; keeping the old
+            // bootstrap PID would make the next parent correctly fail as ambiguous_run_policy.
+            for prior in parentRuns where connections.contains(where: {
+                window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).runID == prior.runID
+            }) {
+                await ServerNetworkManager.shared.clearExpectedAgentPID(getpid(), for: prior.clientName, runID: prior.runID)
+            }
             parentRuns.append((lease, runID, name))
             let acquired = await lease.acquire()
             XCTAssertTrue(acquired)
