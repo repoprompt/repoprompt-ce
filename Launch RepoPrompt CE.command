@@ -3,6 +3,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDUCTOR="$ROOT_DIR/conductor"
+FULL_XCODE_RESOLVER="$ROOT_DIR/Scripts/resolve_full_xcode_developer_dir.sh"
 APP_ARGS=("$@")
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -19,7 +20,23 @@ elif [[ ! -x "$CONDUCTOR" ]]; then
     echo "Make sure this file is still in the repoprompt-ce folder and that conductor is executable."
     read -r -p "Press Return to close this window..." || true
     exit 1
+elif [[ ! -x "$FULL_XCODE_RESOLVER" ]]; then
+    echo "Couldn't find the full-Xcode resolver:"
+    echo "$FULL_XCODE_RESOLVER"
+    echo
+    echo "Make sure the repository's Scripts folder is complete, then reopen this launcher."
+    read -r -p "Press Return to close this window..." || true
+    exit 1
 fi
+
+if ! DEVELOPER_DIR="$("$FULL_XCODE_RESOLVER")"; then
+    echo
+    echo "Couldn't select a compatible full Xcode installation."
+    echo "Install Xcode in /Applications or set DEVELOPER_DIR to its Contents/Developer folder, then retry."
+    read -r -p "Press Return to close this window..." || true
+    exit 1
+fi
+export DEVELOPER_DIR
 
 launch_app() {
     echo
@@ -110,6 +127,7 @@ echo "RepoPrompt CE — local debug launcher"
 echo
 echo "Project: $ROOT_DIR"
 echo "Mode:    coordinated (builds and launches run through the dev daemon)"
+echo "Xcode:   $DEVELOPER_DIR"
 
 cd "$ROOT_DIR" || exit 1
 launch_app

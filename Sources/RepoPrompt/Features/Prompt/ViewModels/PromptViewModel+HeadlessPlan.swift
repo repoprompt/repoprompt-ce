@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 // MARK: - Headless Mode
 
@@ -14,6 +16,9 @@ enum HeadlessMode {
 /// A frozen snapshot of tab state for headless generation.
 /// Used when running plan/chat via AIQueriesService without activating the tab.
 struct HeadlessContextSnapshot {
+    /// Exact workspace authority for inactive/background generation.
+    let workspaceID: UUID?
+
     /// The compose tab this snapshot came from
     let tabID: UUID
 
@@ -33,6 +38,7 @@ struct HeadlessContextSnapshot {
     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
 
     init(
+        workspaceID: UUID? = nil,
         tabID: UUID,
         promptText: String,
         selection: StoredSelection,
@@ -40,6 +46,7 @@ struct HeadlessContextSnapshot {
         reviewGitContext: FrozenPromptGitReviewContext,
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) {
+        self.workspaceID = workspaceID
         self.tabID = tabID
         self.promptText = promptText
         self.selection = selection
@@ -66,10 +73,11 @@ extension PromptViewModel {
         from snapshot: HeadlessContextSnapshot,
         model: AIModel,
         mode: HeadlessMode = .plan,
-        gitScopeOverride: GitInclusion? = nil
+        gitScopeOverride: GitInclusion? = nil,
+        oraclePromptConfiguration: OraclePromptConfiguration? = nil
     ) async throws -> AIMessage {
         let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
-        let headlessConfig = PromptContextResolved(
+        var headlessConfig = oraclePromptConfiguration?.promptContext ?? PromptContextResolved(
             includeFiles: true,
             includeUserPrompt: true,
             includeMetaPrompts: false,
@@ -79,8 +87,9 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
+        headlessConfig.gitInclusion = effectiveGitScope
         // 4. System prompt based on mode
-        let systemPrompt: String = {
+        let systemPrompt: String = oraclePromptConfiguration?.systemPrompt ?? {
             switch mode {
             case .plan:
                 let custom = customPlanningPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -103,15 +112,28 @@ extension PromptViewModel {
 
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
+        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
+        // Oracle-bound headless prompts (Context Builder) must not silently omit selected files.
+        let requiresSelectedFileContent = oraclePromptConfiguration != nil
+        if requiresSelectedFileContent, headlessConfig.includeFiles {
+            try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                store: workspaceFileContextStore
+            )
+        }
 
         return try await withPreassembledPromptContext(
             cfg: headlessConfig,
             selection: snapshot.selection,
-            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
+            lookupContext: lookupContext,
             reviewGitContext: snapshot.reviewGitContext,
             sourceTabID: snapshot.tabID,
             finalReviewAuthorization: snapshot.finalReviewAuthorization
         ) { preAssembly in
+            if requiresSelectedFileContent {
+                try PromptSelectedFileContentRequirement.validate(preAssembly, config: headlessConfig)
+            }
             let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
                 preAssembly.entries
             )
@@ -132,7 +154,7 @@ extension PromptViewModel {
             ) ?? ""
             return PromptPackagingService.buildAIMessage(
                 systemPrompt: systemPrompt,
-                metaInstructions: [],
+                metaInstructions: oraclePromptConfiguration?.metaInstructions ?? [],
                 fileTree: fileTree,
                 fileContents: partitionedBlocks.contentBlocks,
                 gitDiff: preAssembly.gitDiff,

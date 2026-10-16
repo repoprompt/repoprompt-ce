@@ -1,6 +1,7 @@
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor

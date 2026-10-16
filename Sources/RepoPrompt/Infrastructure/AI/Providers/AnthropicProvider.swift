@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftAnthropic
 
 class AnthropicProvider: AIProvider {
@@ -8,7 +9,16 @@ class AnthropicProvider: AIProvider {
         service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
     }
 
-    private func createMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
+    static func isSuccessfulCompletionStopReason(_ stopReason: String) -> Bool {
+        switch stopReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "end_turn", "stop_sequence":
+            true
+        default:
+            false
+        }
+    }
+
+    static func makeMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
         var messages: [MessageParameter.Message] = []
@@ -25,15 +35,64 @@ class AnthropicProvider: AIProvider {
             }
 
             let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
+            let content: MessageParameter.Message.Content =
+                if entry.role == .user, idx == lastUserIndex, !aiMessage.transientImages.isEmpty {
+                    .list(Self.imageContentBlocks(
+                        text: contentText,
+                        images: aiMessage.transientImages
+                    ))
+                } else {
+                    .text(contentText)
+                }
             messages.append(
                 MessageParameter.Message(
                     role: role,
-                    content: .text(contentText)
+                    content: content
                 )
             )
         }
 
+        // Edge-case parity with the OpenAI encoders: when no user entry exists, images (and
+        // any remaining context) still need a user turn or they would be silently dropped.
+        if lastUserIndex == nil, !aiMessage.transientImages.isEmpty {
+            messages.append(MessageParameter.Message(
+                role: .user,
+                content: .list(Self.imageContentBlocks(
+                    text: tail,
+                    images: aiMessage.transientImages
+                ))
+            ))
+        }
+
         return messages
+    }
+
+    private static func imageContentBlocks(
+        text: String,
+        images: [AITransientImage]
+    ) -> [MessageParameter.Message.Content.ContentObject] {
+        var blocks: [MessageParameter.Message.Content.ContentObject] = []
+        // Anthropic rejects empty text blocks.
+        if !text.isEmpty {
+            blocks.append(.text(text))
+        }
+        for image in images {
+            if let annotation = image.titleAnnotation {
+                blocks.append(.text(annotation))
+            }
+            let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch image.mediaType {
+            case .png: .png
+            case .jpeg: .jpeg
+            case .gif: .gif
+            case .webp: .webp
+            }
+            blocks.append(.image(.init(
+                type: .base64,
+                mediaType: mediaType,
+                data: image.bytes.base64EncodedString()
+            )))
+        }
+        return blocks
     }
 
     private func createSystemParameter(systemPrompt: String) -> MessageParameter.System {
@@ -52,7 +111,12 @@ class AnthropicProvider: AIProvider {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
-                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                switch result.completionOutcome {
+                case .completed:
+                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                case let .incomplete(reason):
+                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                }
                 continuation.finish()
             }
         }
@@ -90,15 +154,21 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly {
+            // Adaptive thinking consumes output tokens; leave room for reasoning plus the answer.
+            overrideMaxTokens = Self.adaptiveStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
 
         // Use your existing helper functions
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = createMessages(for: aiMessage)
+        let messages = Self.makeMessages(for: aiMessage)
 
         var temperature: Double? = 0
-        // Skip temperature setting for thinking models
-        if isThinkingMode {
+        // Skip temperature setting for thinking models; Claude 5.x rejects sampling parameters.
+        if isThinkingMode || adaptiveThinkingOnly {
             temperature = nil
         }
         // Apply user-defined temperature if override is enabled (for non-thinking models)
@@ -114,7 +184,7 @@ class AnthropicProvider: AIProvider {
             system: systemParameter,
             stream: true,
             temperature: temperature,
-            thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
+            thinking: isThinkingMode && !adaptiveThinkingOnly ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
         )
 
         let stream = try await service.streamMessage(parameters)
@@ -127,9 +197,12 @@ class AnthropicProvider: AIProvider {
                     // Track token counts
                     var promptTokens: Int? = nil
                     var completionTokens: Int? = nil
+                    var observedStopReason: String?
+                    var didObserveMessageStop = false
 
                     for try await result in stream {
                         var reasoning: String? = nil
+                        var shouldYieldEvent = true
 
                         // Handle different stream events
                         switch result.streamEvent {
@@ -157,7 +230,20 @@ class AnthropicProvider: AIProvider {
                                 currentThinking = ""
                             }
 
+                        case .messageDelta:
+                            if let stopReason = result.delta?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               !stopReason.isEmpty
+                            {
+                                observedStopReason = stopReason
+                            }
+                            if let usage = result.usage {
+                                promptTokens = usage.inputTokens
+                                completionTokens = usage.outputTokens + (usage.thinkingTokens ?? 0)
+                            }
+
                         case .messageStop:
+                            didObserveMessageStop = true
+                            shouldYieldEvent = false
                             // Extract token usage from the end of stream
                             if let usage = result.usage {
                                 promptTokens = usage.inputTokens
@@ -176,21 +262,29 @@ class AnthropicProvider: AIProvider {
                             type: result.type,
                             text: result.contentBlock?.text ?? result.delta?.text,
                             reasoning: reasoning,
-                            promptTokens: promptTokens, // Only include tokens in final message_stop
+                            promptTokens: promptTokens,
                             completionTokens: completionTokens
                         )
 
-                        continuation.yield(aiResult)
+                        if shouldYieldEvent {
+                            continuation.yield(aiResult)
+                        }
                     }
 
-                    // Send final message_stop with token counts
-                    continuation.yield(AIStreamResult(
-                        type: "message_stop",
-                        text: nil,
-                        reasoning: nil,
-                        promptTokens: promptTokens,
-                        completionTokens: completionTokens
-                    ))
+                    if didObserveMessageStop {
+                        let stopReason = observedStopReason ?? "missing_stop_reason"
+                        let type = Self.isSuccessfulCompletionStopReason(stopReason)
+                            ? "message_stop"
+                            : AIStreamResult.incompleteType
+                        continuation.yield(AIStreamResult(
+                            type: type,
+                            text: nil,
+                            reasoning: nil,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            stopReason: stopReason
+                        ))
+                    }
 
                     continuation.finish()
                 } catch {
@@ -231,8 +325,31 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly, maxTokens == nil {
+            overrideMaxTokens = Self.adaptiveNonStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget)
+        return try await completeMessage(
+            aiMessage,
+            model: anthropicModel,
+            maxTokens: overrideMaxTokens,
+            isThinkingMode: isThinkingMode && !adaptiveThinkingOnly,
+            thinkingBudget: thinkingBudget
+        )
+    }
+
+    static let adaptiveStreamingMaxTokens = 64000
+    static let adaptiveNonStreamingMaxTokens = 16000
+
+    /// Claude 5.x-generation models (Sonnet 5/5.5, Opus 5/5.5, Fable, Mythos) accept only adaptive
+    /// thinking: `thinking.budget_tokens` and sampling parameters such as `temperature` return 400.
+    /// Omitting `thinking` runs adaptive thinking at the model's default effort.
+    static func usesAdaptiveThinkingOnly(_ modelName: String) -> Bool {
+        let normalized = modelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefixes = ["claude-fable-", "claude-mythos-", "claude-opus-5", "claude-sonnet-5"]
+        return prefixes.contains { normalized.hasPrefix($0) }
     }
 
     private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {
@@ -241,7 +358,7 @@ class AnthropicProvider: AIProvider {
         }
 
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = createMessages(for: aiMessage)
+        let messages = Self.makeMessages(for: aiMessage)
 
         let parameters = MessageParameter(
             model: model,
@@ -280,10 +397,16 @@ class AnthropicProvider: AIProvider {
         let thinkingTokens = response.usage.thinkingTokens ?? 0
         let completionTokens = outputTokens + thinkingTokens
 
+        let stopReason = response.stopReason ?? "missing_stop_reason"
+        let completionOutcome: AIProviderCompletionOutcome = Self.isSuccessfulCompletionStopReason(stopReason)
+            ? .completed
+            : .incomplete(reason: stopReason)
+
         return AICompletionResult(
             text: text,
             promptTokens: promptTokens,
-            completionTokens: completionTokens
+            completionTokens: completionTokens,
+            completionOutcome: completionOutcome
         )
     }
 

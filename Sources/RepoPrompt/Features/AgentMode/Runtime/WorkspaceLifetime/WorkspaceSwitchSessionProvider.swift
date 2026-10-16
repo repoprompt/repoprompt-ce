@@ -1,11 +1,34 @@
 import Foundation
 
-/// Snapshot of a session needed for background cleanup after workspace switch.
+/// Bookkeeping snapshot captured by the first, prepare phase of workspace-switch
+/// discard, before the canonical cancellation awaits run. Provider/controller
+/// ownership is intentionally NOT captured here: graceful `cancelAgentRun`
+/// still needs the live session's provider state.
+struct WorkspaceSwitchSessionDiscardContext {
+    let tabID: UUID
+    let session: AgentTabSession
+    let boundSessionID: UUID?
+    /// Run identity observed when the discard decision was made.
+    let preparedRunID: UUID?
+}
+
+/// Ownership-transfer snapshot produced by the second, finalize phase of
+/// workspace-switch discard. Finalize runs synchronously after all cancellation
+/// awaits and in the same main-actor slice as `sessions.removeAll()`, so these
+/// handles are provably the discarded session's own — background cleanup
+/// operates on them exclusively and never reads live session or tab-keyed
+/// coordinator state after a suspension point.
 struct WorkspaceSwitchSessionCleanupTarget {
     let tabID: UUID
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let boundSessionID: UUID?
-    let runID: UUID?
+    /// Distinct run IDs needing MCP run-routing cleanup: the run captured at
+    /// prepare time plus any successor run present at finalize time.
+    let runIDs: [UUID]
+    let provider: HeadlessAgentProvider?
+    let acpController: ACPAgentSessionController?
+    let detachedClaude: ClaudeAgentModeCoordinator.DetachedClaudeController?
+    let detachedCodex: CodexAgentModeCoordinator.DetachedCodexController?
 }
 
 /// Owns the background cleanup of sessions discarded during a workspace switch.
@@ -26,7 +49,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// clears mcpControlContext, etc.). The session is already detached
     /// from the active workspace.
     func teardownMCPControlForDiscardedSession(
-        _ session: AgentModeViewModel.TabSession,
+        _ session: AgentTabSession,
         cleanupSessionStore: Bool,
         publishChanges: Bool,
         deactivateLiveControlContext: Bool
@@ -35,7 +58,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// Cleanup MCP run routing for a discarded session.
     func cleanupMCPRunRoutingForDiscardedSession(
         boundSessionID: UUID?,
-        liveSession: AgentModeViewModel.TabSession,
+        liveSession: AgentTabSession,
         explicitRunID: UUID?,
         reason: String
     ) async
@@ -103,12 +126,15 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
                         publishChanges: false,
                         deactivateLiveControlContext: false
                     )
-                    await delegate.cleanupMCPRunRoutingForDiscardedSession(
-                        boundSessionID: target.boundSessionID,
-                        liveSession: target.session,
-                        explicitRunID: target.runID,
-                        reason: reason
-                    )
+                    let explicitRunIDs: [UUID?] = target.runIDs.isEmpty ? [nil] : target.runIDs
+                    for explicitRunID in explicitRunIDs {
+                        await delegate.cleanupMCPRunRoutingForDiscardedSession(
+                            boundSessionID: target.boundSessionID,
+                            liveSession: target.session,
+                            explicitRunID: explicitRunID,
+                            reason: reason
+                        )
+                    }
                     await Task.yield()
                 }
             }
@@ -130,24 +156,31 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
         #endif
     }
 
+    /// Handle-only disposal: every provider/controller reference was captured by
+    /// the synchronous finalize phase. The discarded `AgentTabSession`'s provider,
+    /// controller, run, and presentation state must not be read or mutated here
+    /// — a same-tab successor may already be live by the time this runs.
     private static func disposeDetachedTarget(
         _ target: WorkspaceSwitchSessionCleanupTarget,
         codexCoordinator: CodexAgentModeCoordinator,
         claudeCoordinator: ClaudeAgentModeCoordinator
     ) async {
-        let session = target.session
-        await session.disposeProviderIfPresent()
-        await session.teardownACPControllerIfPresent()
-        await codexCoordinator.shutdownCodexSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: target.runID
-        )
-        await claudeCoordinator.shutdownClaudeSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: target.runID
-        )
+        if let provider = target.provider {
+            await provider.dispose()
+        }
+        if let acpController = target.acpController {
+            await acpController.cancelPrompt()
+            await acpController.shutdown()
+        }
+        if let detachedCodex = target.detachedCodex {
+            await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(detachedCodex)
+        }
+        if let detachedClaude = target.detachedClaude {
+            await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(
+                detachedClaude,
+                discardedSession: target.session
+            )
+        }
     }
 
     // MARK: - Debug test support
@@ -160,38 +193,18 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
         func test_drainBackgroundCleanup(timeoutNanoseconds: UInt64) async throws {
             let cleanupIDs = Array(test_backgroundCleanupDrainTasks.keys)
             for cleanupID in cleanupIDs {
-                guard let task = test_backgroundCleanupDrainTasks[cleanupID] else { continue }
-                // Poll for the cleanup task's completion by yielding the main actor.
-                // The cleanup task is a `Task { @MainActor ... }` that may not get
-                // scheduled automatically even when the main actor is suspended via
-                // a task group. Yielding in a loop gives the Swift runtime repeated
-                // opportunities to schedule the pending @MainActor task. Once the
-                // task completes, its defer removes it from
-                // test_backgroundCleanupDrainTasks, which the poll detects.
+                let started = DispatchTime.now().uptimeNanoseconds
                 let pollIntervalNanoseconds: UInt64 = 10_000_000 // 10ms
-                let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
-                while DispatchTime.now().uptimeNanoseconds < deadline {
-                    if test_backgroundCleanupDrainTasks[cleanupID] == nil {
-                        // Task completed and was removed by test_completeBackgroundCleanup.
-                        break
+                while test_backgroundCleanupDrainTasks[cleanupID] != nil {
+                    try Task.checkCancellation()
+                    let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+                    guard elapsed < timeoutNanoseconds else {
+                        throw AgentModeWorkspaceSwitchCleanupDrainTimeoutError(timeoutNanoseconds: timeoutNanoseconds)
                     }
-                    await Task.yield()
-                    try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
-                }
-                // If the task still hasn't completed after polling, race its value
-                // against the remaining timeout as a final fallback.
-                if test_backgroundCleanupDrainTasks[cleanupID] != nil {
-                    let remaining = deadline &- DispatchTime.now().uptimeNanoseconds
-                    let fallbackTimeout = max(remaining, pollIntervalNanoseconds)
-                    try await withThrowingTaskGroup(of: Void.self) { group in
-                        group.addTask { await task.value }
-                        group.addTask {
-                            try await Task.sleep(nanoseconds: fallbackTimeout)
-                            throw AgentModeWorkspaceSwitchCleanupDrainTimeoutError(timeoutNanoseconds: timeoutNanoseconds)
-                        }
-                        try await group.next()
-                        group.cancelAll()
-                    }
+                    // Sleeping yields the main actor to cleanup. Do not race a second timer
+                    // after expiry: subtracting an expired deadline wraps UInt64, and a
+                    // cancelled timer must not become the drain's reported failure.
+                    try await Task.sleep(nanoseconds: min(pollIntervalNanoseconds, timeoutNanoseconds - elapsed))
                 }
                 test_backgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
             }
@@ -216,7 +229,7 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     }
 }
 
-extension AgentModeViewModel.TabSession {
+extension AgentTabSession {
     func disposeProviderIfPresent() async {
         let provider = provider
         self.provider = nil
@@ -228,6 +241,8 @@ extension AgentModeViewModel.TabSession {
     func teardownACPControllerIfPresent() async {
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
+        acpSteeringFlushID = nil
+        settlePendingManagedACPSteeringAsNotAccepted()
         pendingACPSteeringInstructions.removeAll()
         guard let controller = acpController else { return }
         acpController = nil
@@ -238,7 +253,7 @@ extension AgentModeViewModel.TabSession {
 }
 
 #if DEBUG
-    private struct AgentModeWorkspaceSwitchCleanupDrainTimeoutError: LocalizedError {
+    struct AgentModeWorkspaceSwitchCleanupDrainTimeoutError: LocalizedError {
         let timeoutNanoseconds: UInt64
 
         var errorDescription: String? {

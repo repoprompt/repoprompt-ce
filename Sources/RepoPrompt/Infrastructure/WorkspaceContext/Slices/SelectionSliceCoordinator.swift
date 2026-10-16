@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// Dormant value-based façade around `PartitionStore` for selection slice persistence.
 ///

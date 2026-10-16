@@ -1,5 +1,6 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+@testable import RepoPromptSecureStorage
 import XCTest
 
 @MainActor

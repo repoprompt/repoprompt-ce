@@ -92,6 +92,23 @@ private struct SettingsNotificationHandler: ViewModifier {
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .agentMode)
             }
+            .onReceive(NotificationCenter.default.publisher(for: .showModelRouterSettingsTab)) { note in
+                guard noteTargetsCurrentWindow(note) else { return }
+                if let section = note.userInfo?["agentDecisionsSection"]
+                    as? SettingsWindowCoordinator.AgentDecisionsSection
+                {
+                    SettingsWindowCoordinator.shared.openAgentDecisions(
+                        windowState: windowState,
+                        section: section
+                    )
+                } else {
+                    openSettings(tab: .modelRouter)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showNotificationSettingsTab)) { note in
+                guard noteTargetsCurrentWindow(note) else { return }
+                openSettings(tab: .notifications)
+            }
             .modifier(AgentModeDeepLinkNotificationHandler(windowState: windowState))
             .onReceive(NotificationCenter.default.publisher(for: .showModelPresetsTab)) { note in
                 guard noteTargetsCurrentWindow(note) else { return }

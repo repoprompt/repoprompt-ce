@@ -174,7 +174,7 @@ int rp_pcre2_ascii_whole_word_line_count_8(const uint8_t *subject, size_t length
 	return rp_pcre2_ascii_whole_word_line_scan_8(subject, length, needle, needle_length, case_insensitive, NULL, 0, NULL, line_count_out, non_ascii_out);
 }
 
-static int rp_declaration_consume_word(const uint8_t *line, size_t length, size_t *index, const char *word, int case_insensitive) {
+static int rp_declaration_consume_word(const uint8_t *line, size_t length, size_t *index, const char *word, int case_insensitive, int *fallback_required) {
 	size_t start = *index;
 	for (size_t offset = 0; word[offset] != '\0'; offset++) {
 		if (*index >= length) {
@@ -182,7 +182,12 @@ static int rp_declaration_consume_word(const uint8_t *line, size_t length, size_
 			return 0;
 		}
 		uint8_t hay = line[*index];
-		if (hay >= 0x80 || !rp_ascii_equal(hay, (uint8_t)word[offset], case_insensitive)) {
+		if (hay >= 0x80) {
+			*fallback_required = 1;
+			*index = start;
+			return 0;
+		}
+		if (!rp_ascii_equal(hay, (uint8_t)word[offset], case_insensitive)) {
 			*index = start;
 			return 0;
 		}
@@ -204,7 +209,7 @@ static int rp_declaration_line_matches(const uint8_t *line, size_t length, int c
 	}
 
 	size_t saved = index;
-	if (rp_declaration_consume_word(line, length, &index, "final", case_insensitive)) {
+	if (rp_declaration_consume_word(line, length, &index, "final", case_insensitive, fallback_required)) {
 		if (index >= length) return 0;
 		uint8_t byte = line[index];
 		if (byte >= 0x80) {
@@ -226,11 +231,11 @@ static int rp_declaration_line_matches(const uint8_t *line, size_t length, int c
 	}
 
 	size_t keyword_index = index;
-	if (!rp_declaration_consume_word(line, length, &index, "class", case_insensitive)) {
+	if (!rp_declaration_consume_word(line, length, &index, "class", case_insensitive, fallback_required)) {
 		index = keyword_index;
-		if (!rp_declaration_consume_word(line, length, &index, "struct", case_insensitive)) {
+		if (!rp_declaration_consume_word(line, length, &index, "struct", case_insensitive, fallback_required)) {
 			index = keyword_index;
-			if (!rp_declaration_consume_word(line, length, &index, "func", case_insensitive)) {
+			if (!rp_declaration_consume_word(line, length, &index, "func", case_insensitive, fallback_required)) {
 				return 0;
 			}
 		}

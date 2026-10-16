@@ -25,7 +25,49 @@ enum AgentModel: String, CaseIterable, Codable {
     /// GPT-5.1 Codex Mini (separate fast model)
     case codexMini = "gpt-5.1-codex-mini"
 
-    // GPT-5.5 models exposed through Codex CLI
+    // GPT-6.1 / GPT-6 models exposed through Codex CLI (GPT-6.1 Sol needs Codex CLI 0.159.0+)
+    case gpt61SolLow = "gpt-6.1-sol-low"
+    case gpt61SolMedium = "gpt-6.1-sol-medium"
+    case gpt61SolHigh = "gpt-6.1-sol-high"
+    case gpt61SolXHigh = "gpt-6.1-sol-xhigh"
+    case gpt61SolMax = "gpt-6.1-sol-max"
+    case gpt61SolUltra = "gpt-6.1-sol-ultra"
+    case gpt6AstraLow = "gpt-6-astra-low"
+    case gpt6AstraMedium = "gpt-6-astra-medium"
+    case gpt6AstraHigh = "gpt-6-astra-high"
+    case gpt6AstraXHigh = "gpt-6-astra-xhigh"
+    case gpt6AstraMax = "gpt-6-astra-max"
+    case gpt6SolLow = "gpt-6-sol-low"
+    case gpt6SolMedium = "gpt-6-sol-medium"
+    case gpt6SolHigh = "gpt-6-sol-high"
+    case gpt6SolXHigh = "gpt-6-sol-xhigh"
+    case gpt6SolMax = "gpt-6-sol-max"
+    case gpt6LunaLow = "gpt-6-luna-low"
+    case gpt6LunaMedium = "gpt-6-luna-medium"
+    case gpt6LunaHigh = "gpt-6-luna-high"
+    case gpt6LunaXHigh = "gpt-6-luna-xhigh"
+    case gpt6LunaMax = "gpt-6-luna-max"
+
+    // GPT-5.6 models exposed through Codex CLI
+    case gpt56SolLow = "gpt-5.6-sol-low"
+    case gpt56SolMedium = "gpt-5.6-sol-medium"
+    case gpt56SolHigh = "gpt-5.6-sol-high"
+    case gpt56SolXHigh = "gpt-5.6-sol-xhigh"
+    case gpt56SolMax = "gpt-5.6-sol-max"
+    case gpt56SolUltra = "gpt-5.6-sol-ultra"
+    case gpt56TerraLow = "gpt-5.6-terra-low"
+    case gpt56TerraMedium = "gpt-5.6-terra-medium"
+    case gpt56TerraHigh = "gpt-5.6-terra-high"
+    case gpt56TerraXHigh = "gpt-5.6-terra-xhigh"
+    case gpt56TerraMax = "gpt-5.6-terra-max"
+    case gpt56TerraUltra = "gpt-5.6-terra-ultra"
+    case gpt56LunaLow = "gpt-5.6-luna-low"
+    case gpt56LunaMedium = "gpt-5.6-luna-medium"
+    case gpt56LunaHigh = "gpt-5.6-luna-high"
+    case gpt56LunaXHigh = "gpt-5.6-luna-xhigh"
+    case gpt56LunaMax = "gpt-5.6-luna-max"
+
+    // Legacy GPT-5.5 models retained for decoding/resolution compatibility.
     case gpt55CodexLow = "gpt-5.5-low"
     case gpt55CodexMedium = "gpt-5.5-medium"
     case gpt55CodexHigh = "gpt-5.5-high"
@@ -55,16 +97,23 @@ enum AgentModel: String, CaseIterable, Codable {
     case gpt54MiniHigh = "gpt-5.4-mini-high"
 
     // Claude Code models
+    case claudeFable = "fable"
     case claudeSonnet = "sonnet"
     case claudeOpus = "opus"
     case claudeHaiku = "haiku"
     case claudeOpus1m = "opus[1m]"
 
     // Claude Code full model IDs (static known versions; no dynamic probing)
+    case claudeFable51 = "claude-fable-5-1"
     case claudeFable5 = "claude-fable-5"
+    case claudeMythos51 = "claude-mythos-5-1"
+    case claudeSonnet55 = "claude-sonnet-5-5"
     case claudeSonnet5 = "claude-sonnet-5"
     case claudeSonnet46 = "claude-sonnet-4-6"
     case claudeSonnet45 = "claude-sonnet-4-5"
+    case claudeOpus55 = "claude-opus-5-5"
+    case claudeOpus5 = "claude-opus-5"
+    case claudeOpus48 = "claude-opus-4-8"
     case claudeOpus47 = "claude-opus-4-7"
     case claudeOpus46 = "claude-opus-4-6"
     case claudeOpus45 = "claude-opus-4-5"
@@ -92,6 +141,44 @@ enum AgentModel: String, CaseIterable, Codable {
     var displayName: String {
         switch self {
         case .codexMini: "GPT-5.1 Codex Mini"
+        case .gpt61SolLow: "GPT-6.1 Sol Low"
+        case .gpt61SolMedium: "GPT-6.1 Sol Medium"
+        case .gpt61SolHigh: "GPT-6.1 Sol High"
+        case .gpt61SolXHigh: "GPT-6.1 Sol XHigh"
+        case .gpt61SolMax: "GPT-6.1 Sol Max"
+        case .gpt61SolUltra: "GPT-6.1 Sol Ultra"
+        case .gpt6AstraLow: "GPT-6 Astra Low"
+        case .gpt6AstraMedium: "GPT-6 Astra Medium"
+        case .gpt6AstraHigh: "GPT-6 Astra High"
+        case .gpt6AstraXHigh: "GPT-6 Astra XHigh"
+        case .gpt6AstraMax: "GPT-6 Astra Max"
+        case .gpt6SolLow: "GPT-6 Sol Low"
+        case .gpt6SolMedium: "GPT-6 Sol Medium"
+        case .gpt6SolHigh: "GPT-6 Sol High"
+        case .gpt6SolXHigh: "GPT-6 Sol XHigh"
+        case .gpt6SolMax: "GPT-6 Sol Max"
+        case .gpt6LunaLow: "GPT-6 Luna Low"
+        case .gpt6LunaMedium: "GPT-6 Luna Medium"
+        case .gpt6LunaHigh: "GPT-6 Luna High"
+        case .gpt6LunaXHigh: "GPT-6 Luna XHigh"
+        case .gpt6LunaMax: "GPT-6 Luna Max"
+        case .gpt56SolLow: "GPT-5.6 Sol Low"
+        case .gpt56SolMedium: "GPT-5.6 Sol Medium"
+        case .gpt56SolHigh: "GPT-5.6 Sol High"
+        case .gpt56SolXHigh: "GPT-5.6 Sol XHigh"
+        case .gpt56SolMax: "GPT-5.6 Sol Max"
+        case .gpt56SolUltra: "GPT-5.6 Sol Ultra"
+        case .gpt56TerraLow: "GPT-5.6 Terra Low"
+        case .gpt56TerraMedium: "GPT-5.6 Terra Medium"
+        case .gpt56TerraHigh: "GPT-5.6 Terra High"
+        case .gpt56TerraXHigh: "GPT-5.6 Terra XHigh"
+        case .gpt56TerraMax: "GPT-5.6 Terra Max"
+        case .gpt56TerraUltra: "GPT-5.6 Terra Ultra"
+        case .gpt56LunaLow: "GPT-5.6 Luna Low"
+        case .gpt56LunaMedium: "GPT-5.6 Luna Medium"
+        case .gpt56LunaHigh: "GPT-5.6 Luna High"
+        case .gpt56LunaXHigh: "GPT-5.6 Luna XHigh"
+        case .gpt56LunaMax: "GPT-5.6 Luna Max"
         case .gpt55CodexLow: "GPT-5.5 Low"
         case .gpt55CodexMedium: "GPT-5.5 Medium"
         case .gpt55CodexHigh: "GPT-5.5 High"
@@ -111,14 +198,21 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "GPT-5.4 Mini Low"
         case .gpt54MiniMedium: "GPT-5.4 Mini Medium"
         case .gpt54MiniHigh: "GPT-5.4 Mini High"
+        case .claudeFable: "Fable Latest"
         case .claudeSonnet: "Sonnet Latest"
         case .claudeOpus: "Opus Latest"
         case .claudeHaiku: "Haiku Latest"
         case .claudeOpus1m: "Opus Latest (1M)"
+        case .claudeFable51: "Fable 5.1"
         case .claudeFable5: "Fable 5"
+        case .claudeMythos51: "Mythos 5.1 (Restricted)"
+        case .claudeSonnet55: "Sonnet 5.5"
         case .claudeSonnet5: "Sonnet 5"
         case .claudeSonnet46: "Sonnet 4.6"
         case .claudeSonnet45: "Sonnet 4.5"
+        case .claudeOpus55: "Opus 5.5"
+        case .claudeOpus5: "Opus 5"
+        case .claudeOpus48: "Opus 4.8"
         case .claudeOpus47: "Opus 4.7"
         case .claudeOpus46: "Opus 4.6"
         case .claudeOpus45: "Opus 4.5"
@@ -140,6 +234,44 @@ enum AgentModel: String, CaseIterable, Codable {
     var description: String {
         switch self {
         case .codexMini: "Ultra-fast. Good for quick lookups, simple edits, and surface-level exploration."
+        case .gpt61SolLow: "Fast GPT-6.1 Sol reasoning through Codex. Recommended for bounded engineering and exploration when quality matters."
+        case .gpt61SolMedium: "Balanced GPT-6.1 Sol reasoning through Codex. Recommended for Engineer/default implementation work."
+        case .gpt61SolHigh: "Deep GPT-6.1 Sol reasoning through Codex. Recommended for planning, review, and pair-agent work."
+        case .gpt61SolXHigh: "Extra-high GPT-6.1 Sol reasoning through Codex. Use selectively for hard agentic tasks."
+        case .gpt61SolMax: "Maximum GPT-6.1 Sol reasoning through Codex. Can use substantially more tokens; reserve for exceptional tasks."
+        case .gpt61SolUltra: "Ultra GPT-6.1 Sol reasoning through Codex. Can use substantially more tokens; choose intentionally for exceptional tasks."
+        case .gpt6AstraLow: "Fast GPT-6 Astra reasoning through Codex. Highest-intelligence tier at premium cost."
+        case .gpt6AstraMedium: "Balanced GPT-6 Astra reasoning through Codex for the hardest end-to-end work at premium cost."
+        case .gpt6AstraHigh: "Deep GPT-6 Astra reasoning through Codex for demanding reasoning, research, and coding at premium cost."
+        case .gpt6AstraXHigh: "Extra-high GPT-6 Astra reasoning through Codex. Use selectively; premium cost."
+        case .gpt6AstraMax: "Maximum GPT-6 Astra reasoning through Codex. Reserve for exceptional tasks; premium cost."
+        case .gpt6SolLow: "Fast GPT-6 Sol reasoning through Codex. Recommended for bounded engineering and exploration when quality matters."
+        case .gpt6SolMedium: "Balanced GPT-6 Sol reasoning through Codex. Recommended for general engineering work."
+        case .gpt6SolHigh: "Deep GPT-6 Sol reasoning through Codex. Recommended for planning, review, and pair-agent work."
+        case .gpt6SolXHigh: "Extra-high GPT-6 Sol reasoning through Codex. Use selectively for hard agentic tasks."
+        case .gpt6SolMax: "Maximum GPT-6 Sol reasoning through Codex. Reserve for exceptional tasks."
+        case .gpt6LunaLow: "Fast, economical GPT-6 Luna reasoning through Codex. Recommended for exploration and repeated discovery."
+        case .gpt6LunaMedium: "Balanced GPT-6 Luna reasoning through Codex for routine, high-volume work."
+        case .gpt6LunaHigh: "Deep GPT-6 Luna reasoning through Codex when economical work needs more reliability."
+        case .gpt6LunaXHigh: "Extra-high GPT-6 Luna reasoning through Codex for harder cost-sensitive tasks."
+        case .gpt6LunaMax: "Maximum GPT-6 Luna reasoning through Codex. Reserve for exceptional cost-sensitive tasks."
+        case .gpt56SolLow: "Fast GPT-5.6 Sol reasoning through Codex. Recommended for explore, discovery, and lightweight implementation."
+        case .gpt56SolMedium: "Balanced GPT-5.6 Sol reasoning through Codex. Good for Engineer defaults when you want more reasoning than Low without jumping to High."
+        case .gpt56SolHigh: "Deep GPT-5.6 Sol reasoning through Codex. Recommended for planning, review, and pair-agent work."
+        case .gpt56SolXHigh: "Extra-high GPT-5.6 Sol reasoning through Codex. Use selectively for hard agentic tasks."
+        case .gpt56SolMax: "Maximum GPT-5.6 Sol reasoning through Codex. Can use substantially more tokens; choose intentionally for exceptional tasks."
+        case .gpt56SolUltra: "Ultra GPT-5.6 Sol reasoning through Codex. Can use substantially more tokens; choose intentionally for exceptional tasks."
+        case .gpt56TerraLow: "Fast GPT-5.6 Terra reasoning through Codex. Balances intelligence and cost for lighter agentic work."
+        case .gpt56TerraMedium: "Balanced GPT-5.6 Terra reasoning through Codex. Strong default when cost matters."
+        case .gpt56TerraHigh: "Deep GPT-5.6 Terra reasoning through Codex. Good for complex work with cost-conscious tradeoffs."
+        case .gpt56TerraXHigh: "Extra-high GPT-5.6 Terra reasoning through Codex. Use selectively for hard cost-conscious tasks."
+        case .gpt56TerraMax: "Maximum GPT-5.6 Terra reasoning through Codex. Can use substantially more tokens; choose intentionally."
+        case .gpt56TerraUltra: "Ultra GPT-5.6 Terra reasoning through Codex. Can use substantially more tokens; choose intentionally."
+        case .gpt56LunaLow: "Fast GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for simple exploration."
+        case .gpt56LunaMedium: "Balanced GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for routine work."
+        case .gpt56LunaHigh: "Deep GPT-5.6 Luna reasoning through Codex. Cost-sensitive option when more reasoning is needed."
+        case .gpt56LunaXHigh: "Extra-high GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for harder tasks."
+        case .gpt56LunaMax: "Maximum GPT-5.6 Luna reasoning through Codex. Can use substantially more tokens; choose intentionally."
         case .gpt55CodexLow: "Fast GPT-5.5 reasoning through Codex. Recommended for explore, discovery, and lightweight implementation."
         case .gpt55CodexMedium: "Balanced GPT-5.5 reasoning through Codex. Good for Engineer defaults when you want more reasoning than Low without jumping to High."
         case .gpt55CodexHigh: "Deep GPT-5.5 reasoning through Codex. Recommended for planning, review, and pair-agent work."
@@ -159,14 +291,21 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "Fast GPT-5.4 Mini. Good for quick exploration and lookups."
         case .gpt54MiniMedium: "GPT-5.4 Mini with balanced reasoning. Best exploration sub-agent for context gathering."
         case .gpt54MiniHigh: "GPT-5.4 Mini with deep reasoning. Good for complex exploration and analysis."
+        case .claudeFable: "Latest Claude Fable model for demanding reasoning and long-horizon agentic work."
         case .claudeSonnet: "Balanced speed and capability. Good for general coding, analysis, and everyday work."
         case .claudeOpus: "Most capable Opus-tier model. Best for open-ended tasks, architecture, and complex reasoning."
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
         case .claudeOpus1m: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context."
-        case .claudeFable5: "Claude Fable 5. Anthropic's most capable widely released model for demanding reasoning and long-horizon agentic work."
+        case .claudeFable51: "Pinned Claude Fable 5.1 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.255 or newer."
+        case .claudeFable5: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work."
+        case .claudeMythos51: "Pinned Claude Mythos 5.1 with 1M context. Restricted-access tier; only works for entitled accounts and is never used as a default."
+        case .claudeSonnet55: "Pinned Claude Sonnet 5.5 with 1M context and adaptive thinking. Balanced speed and capability for everyday engineering."
         case .claudeSonnet5: "Pinned Claude Sonnet 5. Balanced speed and capability with 1M context for everyday engineering."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
+        case .claudeOpus55: "Pinned Claude Opus 5.5 with 1M context for long-running agentic coding and knowledge work."
+        case .claudeOpus5: "Pinned Claude Opus 5 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.219 or newer."
+        case .claudeOpus48: "Pinned Claude Opus 4.8 with native 1M context. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus47: "Pinned Claude Opus 4.7. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus46: "Pinned Claude Opus 4.6. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus45: "Pinned Claude Opus 4.5. Opus-tier capability for complex reasoning and architecture."
@@ -191,10 +330,44 @@ enum AgentModel: String, CaseIterable, Codable {
         case .codexExec:
             [
                 .defaultModel,
-                .gpt55CodexLow,
-                .gpt55CodexMedium,
-                .gpt55CodexHigh,
-                .gpt55CodexXHigh,
+                .gpt61SolLow,
+                .gpt61SolMedium,
+                .gpt61SolHigh,
+                .gpt61SolXHigh,
+                .gpt61SolMax,
+                .gpt61SolUltra,
+                .gpt6AstraLow,
+                .gpt6AstraMedium,
+                .gpt6AstraHigh,
+                .gpt6AstraXHigh,
+                .gpt6AstraMax,
+                .gpt6LunaLow,
+                .gpt6LunaMedium,
+                .gpt6LunaHigh,
+                .gpt6LunaXHigh,
+                .gpt6LunaMax,
+                .gpt6SolLow,
+                .gpt6SolMedium,
+                .gpt6SolHigh,
+                .gpt6SolXHigh,
+                .gpt6SolMax,
+                .gpt56SolLow,
+                .gpt56SolMedium,
+                .gpt56SolHigh,
+                .gpt56SolXHigh,
+                .gpt56SolMax,
+                .gpt56SolUltra,
+                .gpt56TerraLow,
+                .gpt56TerraMedium,
+                .gpt56TerraHigh,
+                .gpt56TerraXHigh,
+                .gpt56TerraMax,
+                .gpt56TerraUltra,
+                .gpt56LunaLow,
+                .gpt56LunaMedium,
+                .gpt56LunaHigh,
+                .gpt56LunaXHigh,
+                .gpt56LunaMax,
                 .codexMini,
                 .codexLow,
                 .codexMedium,
@@ -214,18 +387,22 @@ enum AgentModel: String, CaseIterable, Codable {
             ]
         case .claudeCode:
             // Family priority matches the Claude Code picker catalog:
-            // Fable → Opus[1M] → Opus → Sonnet → Haiku. Within each family,
+            // Fable (incl. restricted Mythos) → Opus[1M] → Opus → Sonnet → Haiku. Within each family,
             // latest aliases come first, then pinned full IDs by descending version.
             [
                 .defaultModel,
-                .claudeFable5,
+                .claudeFable, .claudeFable51, .claudeFable5, .claudeMythos51,
                 .claudeOpus1m,
-                .claudeOpus, .claudeOpus47, .claudeOpus46, .claudeOpus45,
-                .claudeSonnet, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
+                .claudeOpus, .claudeOpus55, .claudeOpus5, .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
+                .claudeSonnet, .claudeSonnet55, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
                 .claudeHaiku, .claudeHaiku45
             ]
         case .openCode:
             [.defaultModel]
+        case .grokBuild:
+            [.defaultModel]
+        case .antigravity, .devin:
+            []
         case .cursor:
             [.cursorAuto, .cursorComposer2]
         case .claudeCodeGLM:
@@ -290,6 +467,17 @@ enum AgentModel: String, CaseIterable, Codable {
         let specifier = CodexModelSpecifier(raw: normalized)
         let base = (specifier.baseModel ?? normalized).lowercased()
         let effort = specifier.reasoningEffort
+        // Unsupported Max/Ultra-looking raw values intentionally remain unresolved instead of
+        // falling through to generic GPT-5/Codex Medium fallbacks. This preserves legitimate
+        // base IDs such as `gpt-5.1-codex-max` and prevents unknown `*-ultra` selections from
+        // silently changing to a runnable lower-effort model.
+        if effort == nil,
+           let trailingToken = normalized.split(separator: "-").last,
+           let trailingEffort = CodexReasoningEffort.parse(String(trailingToken)),
+           [.max, .ultra].contains(trailingEffort)
+        {
+            return nil
+        }
 
         func codex53(for effort: CodexReasoningEffort?) -> AgentModel {
             switch effort {
@@ -321,18 +509,99 @@ enum AgentModel: String, CaseIterable, Codable {
             }
         }
 
-        func gpt55(for effort: CodexReasoningEffort?) -> AgentModel {
+        func gpt61Sol(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low): .gpt61SolLow
+            case .some(.high): .gpt61SolHigh
+            case .some(.xhigh): .gpt61SolXHigh
+            case .some(.max): .gpt61SolMax
+            case .some(.ultra): .gpt61SolUltra
+            case .some(.none), .some(.minimal), .some(.medium), nil, .some: .gpt61SolMedium
+            }
+        }
+
+        func gpt6Astra(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low): .gpt6AstraLow
+            case .some(.high): .gpt6AstraHigh
+            case .some(.xhigh): .gpt6AstraXHigh
+            case .some(.max), .some(.ultra): .gpt6AstraMax
+            case .some(.none), .some(.minimal), .some(.medium), nil, .some: .gpt6AstraMedium
+            }
+        }
+
+        func gpt6Sol(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low): .gpt6SolLow
+            case .some(.high): .gpt6SolHigh
+            case .some(.xhigh): .gpt6SolXHigh
+            case .some(.max), .some(.ultra): .gpt6SolMax
+            case .some(.none), .some(.minimal), .some(.medium), nil, .some: .gpt6SolMedium
+            }
+        }
+
+        func gpt6Luna(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low): .gpt6LunaLow
+            case .some(.high): .gpt6LunaHigh
+            case .some(.xhigh): .gpt6LunaXHigh
+            case .some(.max), .some(.ultra): .gpt6LunaMax
+            case .some(.none), .some(.minimal), .some(.medium), nil, .some: .gpt6LunaMedium
+            }
+        }
+
+        func gpt56Sol(for effort: CodexReasoningEffort?) -> AgentModel {
             switch effort {
             case .some(.low):
-                .gpt55CodexLow
+                .gpt56SolLow
             case .some(.high):
-                .gpt55CodexHigh
+                .gpt56SolHigh
             case .some(.xhigh):
-                .gpt55CodexXHigh
+                .gpt56SolXHigh
+            case .some(.max):
+                .gpt56SolMax
+            case .some(.ultra):
+                .gpt56SolUltra
             case .some(.none), .some(.minimal), .some(.medium):
-                .gpt55CodexMedium
+                .gpt56SolMedium
             case nil, .some:
-                .gpt55CodexMedium
+                .gpt56SolMedium
+            }
+        }
+
+        func gpt56Terra(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low):
+                .gpt56TerraLow
+            case .some(.high):
+                .gpt56TerraHigh
+            case .some(.xhigh):
+                .gpt56TerraXHigh
+            case .some(.max):
+                .gpt56TerraMax
+            case .some(.ultra):
+                .gpt56TerraUltra
+            case .some(.none), .some(.minimal), .some(.medium):
+                .gpt56TerraMedium
+            case nil, .some:
+                .gpt56TerraMedium
+            }
+        }
+
+        func gpt56Luna(for effort: CodexReasoningEffort?) -> AgentModel {
+            switch effort {
+            case .some(.low):
+                .gpt56LunaLow
+            case .some(.high):
+                .gpt56LunaHigh
+            case .some(.xhigh):
+                .gpt56LunaXHigh
+            case .some(.max):
+                .gpt56LunaMax
+            case .some(.none), .some(.minimal), .some(.medium):
+                .gpt56LunaMedium
+            case nil, .some:
+                .gpt56LunaMedium
             }
         }
 
@@ -370,8 +639,26 @@ enum AgentModel: String, CaseIterable, Codable {
         if base.contains("gpt-5.3-codex") {
             return codex53(for: effort)
         }
-        if base.contains("gpt-5.5") {
-            return gpt55(for: effort)
+        if base == "gpt-6.1-sol" {
+            return gpt61Sol(for: effort)
+        }
+        if base == "gpt-6-astra" {
+            return gpt6Astra(for: effort)
+        }
+        if base == "gpt-6-sol" {
+            return gpt6Sol(for: effort)
+        }
+        if base == "gpt-6-luna" {
+            return gpt6Luna(for: effort)
+        }
+        if base == "gpt-5.6-terra" {
+            return gpt56Terra(for: effort)
+        }
+        if base == "gpt-5.6-luna" {
+            return gpt56Luna(for: effort)
+        }
+        if base == "gpt-5.6" || base == "gpt-5.6-sol" || base == "gpt-5.5" {
+            return gpt56Sol(for: effort)
         }
         // Check mini before regular gpt-5.4 to avoid false matches
         if base.contains("gpt-5.4-mini") {
@@ -387,7 +674,7 @@ enum AgentModel: String, CaseIterable, Codable {
             return codex53(for: effort)
         }
         if base.contains("gpt-5") {
-            return gpt52(for: effort)
+            return gpt56Sol(for: effort)
         }
 
         return nil
@@ -434,13 +721,17 @@ enum AgentModel: String, CaseIterable, Codable {
     /// recommendation targets. Other models are intentionally untagged.
     var discoveryTags: [AgentModelDiscoveryTag] {
         switch self {
-        case .gpt55CodexLow:
-            [.fast, .exploration, .engineering]
-        case .gpt55CodexHigh:
-            [.complex, .engineering, .pair]
-        case .claudeFable5:
+        case .gpt6LunaLow:
+            [.fast, .exploration, .engineering, .extendedContext]
+        case .gpt61SolHigh:
             [.complex, .engineering, .pair, .extendedContext]
-        case .claudeSonnet5:
+        case .gpt56SolLow:
+            [.fast, .exploration, .engineering]
+        case .gpt56SolHigh:
+            [.complex, .engineering, .pair]
+        case .claudeFable, .claudeFable51, .claudeFable5, .claudeOpus55, .claudeOpus5:
+            [.complex, .engineering, .pair, .extendedContext]
+        case .claudeSonnet55:
             [.balanced, .engineering, .extendedContext]
         case .claudeOpus:
             [.complex, .engineering, .pair]
@@ -453,7 +744,12 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeFable5, .claudeSonnet5, .claudeOpus1m, .glm52_1m:
+        case .gpt61SolLow, .gpt61SolMedium, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax, .gpt61SolUltra,
+             .gpt6AstraLow, .gpt6AstraMedium, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6SolLow, .gpt6SolMedium, .gpt6SolHigh, .gpt6SolXHigh, .gpt6SolMax,
+             .gpt6LunaLow, .gpt6LunaMedium, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6LunaMax:
+            1_050_000
+        case .claudeFable, .claudeFable51, .claudeFable5, .claudeMythos51, .claudeSonnet55, .claudeSonnet5, .claudeOpus55, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,

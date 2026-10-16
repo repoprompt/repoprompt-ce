@@ -1,5 +1,46 @@
 import Combine
+import RepoPromptSettingsCore
+import RepoPromptShared
 import SwiftUI
+
+enum CodexHookApprovalWorkspaceSetting: CaseIterable, Hashable {
+    case appDefault
+    case alwaysRequireApproval
+    case dontRequireApproval
+
+    init(workspaceOverride: Bool?) {
+        switch workspaceOverride {
+        case true:
+            self = .alwaysRequireApproval
+        case false:
+            self = .dontRequireApproval
+        case nil:
+            self = .appDefault
+        }
+    }
+
+    var workspaceOverride: Bool? {
+        switch self {
+        case .appDefault:
+            nil
+        case .alwaysRequireApproval:
+            true
+        case .dontRequireApproval:
+            false
+        }
+    }
+
+    func label(globalStrictModeEnabled: Bool) -> String {
+        switch self {
+        case .appDefault:
+            "App default (currently: \(globalStrictModeEnabled ? "required" : "not required"))"
+        case .alwaysRequireApproval:
+            "Always require approval"
+        case .dontRequireApproval:
+            "Don't require approval"
+        }
+    }
+}
 
 /// Consolidated settings view for Agent Mode — the "Overview" tab.
 ///
@@ -11,9 +52,10 @@ import SwiftUI
 /// the canonical pages, and surfaces at-a-glance CLI provider connection
 /// status so users can spot missing configuration without leaving Overview.
 ///
-/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Safe Managed summary,
-/// Oracle Model summary, Context Builder summary, Agent Role Defaults summary,
-/// CLI provider status, Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
+/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Agent Chats,
+/// Show MCP-created chats, Compose tabs without Agent sessions, Safe Managed summary, Oracle Model summary,
+/// Context Builder summary, Agent Role Defaults summary, CLI provider status,
+/// Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
 ///
 /// Related:
 /// - Agent Models:      /RepoPrompt/Views/Settings/AgentModelsSettingsView.swift
@@ -24,11 +66,21 @@ import SwiftUI
 struct AgentModeGeneralSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
+    var workspaceID: UUID?
     var onNavigate: ((SettingsTab) -> Void)?
 
     /// Observe secure permission-store changes so the read-only summary rebuilds
     /// without relying on @AppStorage for sensitive policy keys.
     @State private var subagentPolicyRevision = 0
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
+
+    @State private var handoffInstructionsDraft = ""
+    @State private var handoffInstructionsBaseline = ""
+    @State private var handoffInstructionsLastObservedStoredValue = ""
+    @State private var handoffInstructionsHaveExternalConflict = false
+    @State private var handoffInstructionsAreInitialized = false
+    @State private var handoffInstructionsExternalUpdateTick = 0
 
     // Observes GlobalSettingsStore so the workflow summary reflects cleanup-guidance
     // changes made on the Agent Workflows page or through the `app_settings` MCP tool.
@@ -53,6 +105,15 @@ struct AgentModeGeneralSettingsView: View {
             }
             .padding(fontPreset.scaledClamped(20, max: 28))
             .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .onAppear {
+            initializeHandoffInstructionsDraft()
+        }
+        .onChange(of: globalSettings.agentSessionHandoffInstructions()) { _, newValue in
+            reconcileHandoffInstructionsStoreChange(newValue)
+        }
+        .onDisappear {
+            handoffInstructionsAreInitialized = false
         }
         .onReceive(
             NotificationCenter.default
@@ -105,7 +166,17 @@ struct AgentModeGeneralSettingsView: View {
                 tab: .agentModels
             )
 
+            subAgentSupervisionCard
+
             providersLinkRow
+
+            usageLimitsCard
+
+            providerCleanupActionCard
+
+            codexHookApprovalStrictModeCard
+
+            handoffInstructionsCard
 
             agentPermissionsCard
 
@@ -117,7 +188,385 @@ struct AgentModeGeneralSettingsView: View {
             )
 
             agentWorkflowsLinkRow
+
+            agentChatsCard
         }
+    }
+
+    // MARK: - Usage limits (presentation only)
+
+    /// Master presentation switch. Enabling it shows usage only for sources that are already
+    /// enabled or connected per provider (CLI Providers); it never enables a source or reads
+    /// credentials by itself.
+    private var usageLimitsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "gauge.with.dots.needle.33percent")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Usage Limits")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Toggle("Show usage limits when available", isOn: usageLimitsDisplayBinding)
+                    .toggleStyle(.switch)
+
+                Text("Shows provider plan usage in Settings and a compact indicator in Agent Mode. Read-only; never changes which model runs. Turn on each source in CLI Providers.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let onNavigate {
+                    Button("Usage sources in CLI Providers…") { onNavigate(.cliProviders) }
+                        .buttonStyle(.link)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var usageLimitsDisplayBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.usageLimitsDisplayEnabled() },
+            set: { enabled in
+                globalSettings.setUsageLimitsDisplayEnabled(enabled)
+                UsageLimitsDisplayRuntimeBridge.applyEnabled(enabled)
+            }
+        )
+    }
+
+    // MARK: - Agent Chats
+
+    private var agentChatsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "bubble.left")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Agent Chats")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Toggle("Show chats created by MCP tools", isOn: $showComposeTabsWithoutAgentSessions)
+                    .toggleStyle(.switch)
+
+                Text("Lists chats created by MCP tools before an agent has run in them, so you can observe and iterate on their selections, prompts, and Context Builder runs in Compose.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    // MARK: - Provider cleanup
+
+    private var subAgentSupervisionCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Sub-Agent Supervision")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Picker("Default subagent wait", selection: subagentDefaultWaitBinding) {
+                    ForEach(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds, id: \.self) { seconds in
+                        Text(subagentDefaultWaitMenuLabel(for: seconds)).tag(seconds)
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .accessibilityLabel("Default subagent wait")
+
+                Text("Shorter waits allow more frequent progress checks. Longer waits reduce routine model calls. Completion, questions, and your steering can end a wait early.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Agents can choose shorter or longer waits for individual tasks.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private func subagentDefaultWaitMenuLabel(for seconds: Int) -> String {
+        let minutes = seconds / 60
+        if seconds == Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) {
+            return "\(minutes) min (default)"
+        }
+        return "\(minutes) min"
+    }
+
+    private var subagentDefaultWaitBinding: Binding<Int> {
+        Binding(
+            get: { globalSettings.subagentDefaultWaitSeconds() },
+            set: { globalSettings.setSubagentDefaultWaitSeconds($0) }
+        )
+    }
+
+    private var providerCleanupActionCard: some View {
+        VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
+            HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+                Image(systemName: "archivebox")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                    .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                    Text("Provider Conversation Cleanup")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                    Text("When deleting Agent Mode sessions, RepoPrompt asks supported providers to archive or delete their remote conversation. Local cleanup still continues if a provider does not support cleanup.")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Picker("Cleanup action", selection: providerCleanupActionBinding) {
+                        Text("Archive").tag(ProviderConversationCleanupAction.archive)
+                        Text("Delete").tag(ProviderConversationCleanupAction.delete)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 220)
+                }
+                Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+            }
+            .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+        }
+    }
+
+    private var providerCleanupActionBinding: Binding<ProviderConversationCleanupAction> {
+        Binding(
+            get: { globalSettings.providerConversationCleanupAction() },
+            set: { globalSettings.setProviderConversationCleanupAction($0) }
+        )
+    }
+
+    // MARK: - Codex hook approval
+
+    private var codexHookApprovalStrictModeCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "checkmark.shield")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Toggle("Require Codex project-hook approval", isOn: codexHookApprovalStrictModeBinding)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                if workspaceID != nil {
+                    Picker("In this workspace:", selection: codexHookApprovalWorkspaceSettingBinding) {
+                        ForEach(CodexHookApprovalWorkspaceSetting.allCases, id: \.self) { setting in
+                            Text(setting.label(
+                                globalStrictModeEnabled: globalSettings.globalCodexHookApprovalStrictModeEnabled()
+                            ))
+                            .tag(setting)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+                Text("When enabled, Continue Without Hooks is unavailable. Codex first turns remain blocked until the displayed project hooks are approved or become trusted externally.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var codexHookApprovalStrictModeBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.globalCodexHookApprovalStrictModeEnabled() },
+            set: { globalSettings.setGlobalCodexHookApprovalStrictModeEnabled($0) }
+        )
+    }
+
+    private var codexHookApprovalWorkspaceSettingBinding: Binding<CodexHookApprovalWorkspaceSetting> {
+        Binding(
+            get: {
+                guard let workspaceID else { return .appDefault }
+                return CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: globalSettings.codexHookApprovalStrictModeWorkspaceOverride(
+                        workspaceID: workspaceID
+                    )
+                )
+            },
+            set: { setting in
+                guard let workspaceID else { return }
+                globalSettings.setCodexHookApprovalStrictModeOverride(
+                    setting.workspaceOverride,
+                    for: workspaceID
+                )
+            }
+        )
+    }
+
+    // MARK: - Handoff Instructions
+
+    private var handoffInstructionsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "doc.on.clipboard")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
+                Text("Handoff Instructions")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Text("This app-wide text is appended by the titlebar’s Handoff action.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextKitView(
+                    text: $handoffInstructionsDraft,
+                    wrapLines: true,
+                    externalUpdateTick: handoffInstructionsExternalUpdateTick
+                )
+                .frame(height: fontPreset.scaledClamped(150, max: 190))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                )
+                .accessibilityLabel("Handoff instructions")
+
+                Text(handoffInstructionsValidationMessage)
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(handoffInstructionsAreValid ? .secondary : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(handoffInstructionsValidationMessage)
+
+                if handoffInstructionsHaveExternalConflict {
+                    Text("The saved default changed elsewhere. Saving will replace the newer saved value.")
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if globalSettings.persistenceBlockReason != nil {
+                    Label(
+                        "Changes are active for this launch, but global settings cannot be saved. Use the existing global settings recovery warning to restore persistence.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+                }
+
+                HStack(spacing: fontPreset.scaledClamped(8, max: 12)) {
+                    Button("Save") {
+                        saveHandoffInstructions()
+                    }
+                    .disabled(!handoffInstructionsCanSave)
+
+                    Button("Clear Saved Instructions", role: .destructive) {
+                        clearHandoffInstructions()
+                    }
+                    .disabled(!handoffInstructionsCanClear)
+                }
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var handoffInstructionsValidation: AgentSessionHandoffInstructionsPolicy.Validation {
+        AgentSessionHandoffInstructionsPolicy.validation(of: handoffInstructionsDraft)
+    }
+
+    private var handoffInstructionsAreValid: Bool {
+        if case .valid = handoffInstructionsValidation {
+            return true
+        }
+        return false
+    }
+
+    private var handoffInstructionsValidationMessage: String {
+        switch handoffInstructionsValidation {
+        case let .valid(count):
+            "\(count.formatted()) / \(AgentSessionHandoffInstructionsPolicy.maximumCharacterCount.formatted()) characters"
+        case let .tooLong(count, maximum):
+            "\(count.formatted()) / \(maximum.formatted()) characters — shorten the instructions before saving."
+        }
+    }
+
+    private var handoffInstructionsCanSave: Bool {
+        handoffInstructionsAreInitialized
+            && handoffInstructionsDraft != handoffInstructionsBaseline
+            && handoffInstructionsAreValid
+    }
+
+    private var handoffInstructionsCanClear: Bool {
+        handoffInstructionsAreInitialized
+            && (!handoffInstructionsDraft.isEmpty || !handoffInstructionsLastObservedStoredValue.isEmpty)
+    }
+
+    private func initializeHandoffInstructionsDraft() {
+        let storedValue = globalSettings.agentSessionHandoffInstructions()
+        handoffInstructionsDraft = storedValue
+        handoffInstructionsBaseline = storedValue
+        handoffInstructionsLastObservedStoredValue = storedValue
+        handoffInstructionsHaveExternalConflict = false
+        handoffInstructionsAreInitialized = true
+        handoffInstructionsExternalUpdateTick &+= 1
+    }
+
+    private func reconcileHandoffInstructionsStoreChange(_ storedValue: String) {
+        guard handoffInstructionsAreInitialized,
+              storedValue != handoffInstructionsLastObservedStoredValue
+        else { return }
+
+        handoffInstructionsLastObservedStoredValue = storedValue
+
+        if storedValue == handoffInstructionsDraft {
+            handoffInstructionsBaseline = storedValue
+            handoffInstructionsHaveExternalConflict = false
+            handoffInstructionsExternalUpdateTick &+= 1
+        } else if handoffInstructionsDraft == handoffInstructionsBaseline {
+            handoffInstructionsDraft = storedValue
+            handoffInstructionsBaseline = storedValue
+            handoffInstructionsHaveExternalConflict = false
+            handoffInstructionsExternalUpdateTick &+= 1
+        } else {
+            handoffInstructionsHaveExternalConflict = true
+        }
+    }
+
+    private func saveHandoffInstructions() {
+        guard handoffInstructionsCanSave,
+              globalSettings.setAgentSessionHandoffInstructions(handoffInstructionsDraft)
+        else { return }
+
+        handoffInstructionsBaseline = handoffInstructionsDraft
+        handoffInstructionsLastObservedStoredValue = handoffInstructionsDraft
+        handoffInstructionsHaveExternalConflict = false
+    }
+
+    private func clearHandoffInstructions() {
+        guard handoffInstructionsCanClear,
+              globalSettings.setAgentSessionHandoffInstructions("")
+        else { return }
+
+        handoffInstructionsDraft = ""
+        handoffInstructionsBaseline = ""
+        handoffInstructionsLastObservedStoredValue = ""
+        handoffInstructionsHaveExternalConflict = false
+        handoffInstructionsExternalUpdateTick &+= 1
     }
 
     // MARK: - Agent Workflows row
@@ -234,7 +683,11 @@ struct AgentModeGeneralSettingsView: View {
         case .claude: apiSettingsVM.isClaudeCodeConnected
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
+        case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
+        case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        // Devin owns its own auth, so the installed CLI is the connection.
+        case .devin: DevinRuntimeLocator.isInstalledSync()
         }
     }
 

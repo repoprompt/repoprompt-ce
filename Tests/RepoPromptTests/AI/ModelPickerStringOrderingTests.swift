@@ -1,6 +1,5 @@
-import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 final class ModelPickerStringOrderingTests: XCTestCase {
     func testScalarOrderingUsesAsciiFoldThenRawScalarTieBreak() {
@@ -12,187 +11,69 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             ["ı", "i", "I"].sorted { ModelPickerStringOrdering.precedes($0, $1) },
             ["I", "i", "ı"]
         )
-        XCTAssertTrue(ModelPickerStringOrdering.precedes("gpt-5.5-Low", "gpt-5.5-low"))
     }
 
-    func testAIModelSemanticPickerOrderingCoversGptVersionsServiceTierReasoningAndRawTieBreaks() {
-        let models: [AIModel] = [
+    func testSemanticOrderingUsesVersionEffortAndFamilyBeforeDisplayName() {
+        let codexModels: [AIModel] = [
             .codexCustom(name: "gpt-5.2-high"),
             .codexCustom(name: "gpt-5.4-fast-high"),
-            .codexCustom(name: "gpt-5.5-high"),
-            .codexCustom(name: "gpt-5.4-low"),
-            .codexCustom(name: "gpt-5.5-low"),
-            .codexCustom(name: "gpt-5.4-fast-low"),
-            .codexCustom(name: "gpt-5.5-Low")
+            .codexCustom(name: "gpt-5.4-low")
         ]
-
-        let sorted = AIModel.sortedForPicker(models).map(\.modelName)
-
-        XCTAssertEqual(sorted, [
-            "gpt-5.5-Low",
-            "gpt-5.5-low",
-            "gpt-5.5-high",
+        XCTAssertEqual(AIModel.sortedForPicker(codexModels).map(\.modelName), [
             "gpt-5.4-low",
-            "gpt-5.4-fast-low",
             "gpt-5.4-fast-high",
             "gpt-5.2-high"
         ])
-    }
 
-    func testSemanticOrderingUsesFamilyBeforeDisplayNameAcrossFamilies() {
-        let sorted = AIModel.sortedForPicker([
+        let customModels: [AIModel] = [
             .customProvider(name: "Aardvark", provider: "custom", model: "zzz-1"),
             .customProvider(name: "Zed", provider: "custom", model: "aaa-1")
-        ])
-
-        XCTAssertEqual(sorted.map(\.modelName), ["aaa-1", "zzz-1"])
+        ]
+        XCTAssertEqual(AIModel.sortedForPicker(customModels).map(\.modelName), ["aaa-1", "zzz-1"])
     }
 
-    func testStaleGeminiCLIPrefixedModelsAreRejectedForFallback() {
-        XCTAssertNil(AIModel.fromModelName("gemini_cli_flash-2.5"))
-        XCTAssertNil(AIModel.fromModelName(" gemini_cli_pro-3.1-preview "))
-        XCTAssertEqual(AIModel.fromModelName("gemini-3-pro-preview"), .gemini3p1ProPreview)
+    func testCodexMaxFamilyTokenIsNotParsedAsReasoningEffort() {
+        let base = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        XCTAssertEqual(base.baseModel, "gpt-5.1-codex-max")
+        XCTAssertNil(base.reasoningEffort)
+
+        let high = CodexModelSpecifier(raw: "gpt-5.1-codex-max-high")
+        XCTAssertEqual(high.baseModel, "gpt-5.1-codex-max")
+        XCTAssertEqual(high.reasoningEffort, .high)
     }
 
-    func testClaudeCodePickerExposesFable5WithEffortVariantsFirst() throws {
+    func testDisplaySuffixStrippingDistinguishesFamilyTokensFromEffortTokens() {
+        XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.6 Sol Fast Ultra"), "GPT-5.6 Sol Fast")
+        XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"), "GPT-5.1 Codex Max")
+        XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max High"), "GPT-5.1 Codex Max")
+    }
+
+    func testClaudeCodePickerExposesOpus55WithSupportedEfforts() throws {
         let models = AIModel.modelsForProvider(.claudeCode)
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5")))
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5:xhigh")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-opus-5-5")))
         XCTAssertEqual(
-            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-fable-5:xhigh"),
-            .claudeCodeModel(specifier: "claude-fable-5:xhigh")
+            ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5-5:xhigh"),
+            .claudeCodeModel(specifier: "claude-opus-5-5:xhigh")
         )
+        XCTAssertNil(ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5-5:ultra"))
 
         let menu = AIModel.claudeCodeMenu(for: models)
-        XCTAssertEqual(menu.groups.first?.baseModelRaw, "claude-fable-5")
-        let fableGroup = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-fable-5" })
-        XCTAssertEqual(fableGroup.displayName, "Fable 5")
-        XCTAssertTrue(fableGroup.options.contains { $0.displayName == "XHigh" })
-    }
+        let group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-5-5" })
+        XCTAssertEqual(group.displayName, "Opus 5.5")
+        XCTAssertEqual(group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), [
+            "claude-opus-5-5:low",
+            "claude-opus-5-5:medium",
+            "claude-opus-5-5:high",
+            "claude-opus-5-5:xhigh",
+            "claude-opus-5-5:max"
+        ])
 
-    func testClaudeCodePickerExposesSonnet5WithAllOfficialEffortVariants() throws {
-        let models = AIModel.modelsForProvider(.claudeCode)
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5")))
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5:max")))
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5:xhigh")))
+        XCTAssertEqual(AgentModel(rawValue: "claude-opus-5-5"), .claudeOpus55)
+        XCTAssertEqual(AgentModel.claudeOpus55.contextWindowTokens, 1_000_000)
+        XCTAssertTrue(AgentModel.claudeOpus55.isExtendedContext)
         XCTAssertEqual(
-            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-sonnet-5:xhigh"),
-            .claudeCodeModel(specifier: "claude-sonnet-5:xhigh")
-        )
-
-        let menu = AIModel.claudeCodeMenu(for: models)
-        let sonnet5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-sonnet-5" })
-        XCTAssertEqual(sonnet5Group.displayName, "Sonnet 5")
-        XCTAssertEqual(sonnet5Group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), [
-            "claude-sonnet-5:low",
-            "claude-sonnet-5:medium",
-            "claude-sonnet-5:high",
-            "claude-sonnet-5:max",
-            "claude-sonnet-5:xhigh"
-        ])
-        XCTAssertEqual(sonnet5Group.options.map(\.displayName), ["Low", "Medium", "High", "Max", "XHigh"])
-    }
-
-    func testClaudeCodeProviderResolvesSonnet5EffortSpecifierForCLI() throws {
-        let maxSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-sonnet-5:max"))
-        XCTAssertEqual(maxSelection.modelArgument, "claude-sonnet-5")
-        XCTAssertEqual(maxSelection.effortLevel, .max)
-
-        let xhighSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-sonnet-5:xhigh"))
-        XCTAssertEqual(xhighSelection.modelArgument, "claude-sonnet-5")
-        XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
-    }
-
-    func testAIModelCodexMenuGroupsUseStableSemanticOrdering() {
-        let groups = AIModel.codexMenuGroups(for: [
-            .codexCustom(name: "gpt-5.2-high"),
-            .codexCustom(name: "gpt-5.4-fast-high"),
-            .codexCustom(name: "gpt-5.5-high"),
-            .codexCustom(name: "gpt-5.4-low"),
-            .codexCustom(name: "gpt-5.5-low"),
-            .codexCustom(name: "gpt-5.4-fast-low"),
-            .codexCustom(name: "gpt-5.5-Low")
-        ])
-
-        XCTAssertEqual(groups.map(\.baseModelID), [
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-fast",
-            "gpt-5.2"
-        ])
-        XCTAssertEqual(
-            groups.first { $0.baseModelID == "gpt-5.5" }?.models.map(\.modelName),
-            ["gpt-5.5-Low", "gpt-5.5-low", "gpt-5.5-high"]
-        )
-    }
-
-    func testAgentModelCatalogCodexMenuUsesStableSemanticOrdering() {
-        let menu = AgentModelCatalog.codexMenu(for: [
-            option(raw: AgentModel.defaultModel.rawValue, displayName: AgentModel.defaultModel.displayName, placeholderDefault: true),
-            option(raw: "gpt-5.2-high", displayName: "GPT-5.2 High"),
-            option(raw: "gpt-5.4-fast-high", displayName: "GPT-5.4 Fast High"),
-            option(raw: "gpt-5.5-high", displayName: "GPT-5.5 High"),
-            option(raw: "gpt-5.4-low", displayName: "GPT-5.4 Low"),
-            option(raw: "gpt-5.5-low", displayName: "GPT-5.5 Low"),
-            option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low"),
-            option(raw: "gpt-5.5-Low", displayName: "GPT-5.5 Low")
-        ])
-
-        XCTAssertEqual(menu.defaultOption?.rawValue, AgentModel.defaultModel.rawValue)
-        XCTAssertEqual(menu.groups.map(\.baseModelID), [
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-fast",
-            "gpt-5.2"
-        ])
-        XCTAssertEqual(
-            menu.groups.first { $0.baseModelID == "gpt-5.5" }?.options.map(\.rawValue),
-            ["gpt-5.5-Low", "gpt-5.5-low", "gpt-5.5-high"]
-        )
-    }
-
-    @MainActor
-    func testCollapsedCodexOptionsUseStableSemanticOrderingAndPreserveDefaults() throws {
-        let collapsed: [AgentModelOption] = CodexAgentModeCoordinator.test_collapseCodexModelOptions([
-            option(raw: AgentModel.defaultModel.rawValue, displayName: AgentModel.defaultModel.displayName, placeholderDefault: true),
-            option(raw: "gpt-5.2-high", displayName: "GPT-5.2 High"),
-            option(raw: "gpt-5.4-fast-high", displayName: "GPT-5.4 Fast High"),
-            option(raw: "gpt-5.5-high", displayName: "GPT-5.5 High", providerDefault: true),
-            option(raw: "gpt-5.4-low", displayName: "GPT-5.4 Low"),
-            option(raw: "gpt-5.5-low", displayName: "GPT-5.5 Low"),
-            option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low")
-        ])
-
-        XCTAssertEqual(collapsed.map(\.rawValue), [
-            AgentModel.defaultModel.rawValue,
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-fast",
-            "gpt-5.2"
-        ])
-
-        let gpt55 = try XCTUnwrap(collapsed.first { $0.rawValue == "gpt-5.5" })
-        XCTAssertEqual(gpt55.supportedReasoningEfforts, [CodexReasoningEffort.low, .high])
-        XCTAssertEqual(gpt55.defaultReasoningEffort, .high)
-        XCTAssertEqual(gpt55.isProviderDefault, true)
-    }
-
-    private func option(
-        raw: String,
-        displayName: String,
-        placeholderDefault: Bool = false,
-        providerDefault: Bool = false,
-        supportedReasoningEfforts: [CodexReasoningEffort] = [],
-        defaultReasoningEffort: CodexReasoningEffort? = nil
-    ) -> AgentModelOption {
-        AgentModelOption(
-            rawValue: raw,
-            displayName: displayName,
-            description: nil,
-            isPlaceholderDefault: placeholderDefault,
-            isProviderDefault: providerDefault,
-            supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: defaultReasoningEffort
+            BestPracticeProfiles.claudeCodeOpusRecommendationLabel,
+            "Claude Opus via Claude Code's stable Opus alias (Opus 5.5 on the Anthropic API)"
         )
     }
 }

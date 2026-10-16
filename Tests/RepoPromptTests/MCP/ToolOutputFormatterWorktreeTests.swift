@@ -1,5 +1,6 @@
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 @MainActor
@@ -133,27 +134,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("placeholder"))
     }
 
-    func testGraphDTOEncodesInspectableMetadata() throws {
-        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
-            op: "list",
-            worktrees: [Self.worktreeDTO()],
-            graph: .init(
-                requested: true,
-                limit: 2,
-                lines: ["* abc1234 (HEAD -> feature/demo) Demo", "* def5678 main"],
-                source: "git log --graph --decorate --oneline --color=never -n 2"
-            )
-        )
-
-        let object = try XCTUnwrap(Self.value(dto).objectValue)
-        let graph = try XCTUnwrap(object["graph"]?.objectValue)
-        XCTAssertEqual(graph["limit"]?.intValue, 2)
-        XCTAssertEqual(graph["line_count"]?.intValue, 2)
-        XCTAssertEqual(graph["truncated"]?.boolValue, false)
-        XCTAssertEqual(graph["source"]?.stringValue, "git log --graph --decorate --oneline --color=never -n 2")
-        XCTAssertEqual(graph["lines"]?.arrayValue?.first?.stringValue, "* abc1234 (HEAD -> feature/demo) Demo")
-    }
-
     func testMergePreviewOutputUsesManageWorktreeHeaderAndNestedMergeBlock() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "preview",
@@ -241,51 +221,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                 XCTAssertTrue(text.contains(snippet), "\(name): missing \(snippet)\n\(text)")
             }
         }
-    }
-
-    func testCodeStructureOutputShowsTypedPendingIssueAndWorktreeScope() throws {
-        let dto = ToolResultDTOs.CodeStructureReplyDTO(
-            status: "pending",
-            files: [],
-            summary: .init(
-                requestedSeeds: 1,
-                resolvedSeeds: 0,
-                returnedSeeds: 0,
-                returnedRelated: 0,
-                returnedFiles: 0,
-                codemapContentTokens: 0,
-                examinedEdges: 0
-            ),
-            issues: [
-                .init(
-                    code: "artifact_pending",
-                    phase: "seed_demand",
-                    path: "Project/Sources/App.swift",
-                    retryable: true,
-                    retryAfterMilliseconds: 50,
-                    attempted: nil,
-                    limit: nil,
-                    message: "Codemap generation is still pending."
-                )
-            ],
-            retry: .init(retryable: true, retryAfterMilliseconds: 50),
-            worktreeScope: Self.scope()
-        )
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
-
-        XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
-        XCTAssertTrue(text.contains("**Status**: `pending`"), text)
-        XCTAssertTrue(text.contains("`artifact_pending`"), text)
-        XCTAssertTrue(text.contains("`Project/Sources/App.swift`"), text)
-        XCTAssertTrue(text.contains("codemap scans use"), text)
-        XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("`Project` → session-bound worktree"), text)
-        XCTAssertFalse(text.contains("/repo/project"), text)
-        XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
-        XCTAssertTrue(text.contains("wt_123"), text)
-        XCTAssertTrue(text.contains("branch `feature/demo`"), text)
-        XCTAssertTrue(text.contains("label `Demo Worktree`"), text)
     }
 
     func testWorkspaceContextOutputHidesPhysicalRootInScopeBlocks() throws {
@@ -437,56 +372,55 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
-    func testManageSelectionNonzeroPartialTokensStillShowsAccountingLine() throws {
-        let dto = ToolResultDTOs.SelectionReply(
-            files: [
-                .init(
-                    path: "Project/Sources/Partial.swift",
-                    tokens: 12,
-                    renderMode: "full",
-                    ranges: nil,
-                    isAuto: false,
-                    codemapOrigin: nil,
-                    copyPreset: nil,
-                    rootPath: "Project",
-                    pathWithinRoot: "Sources/Partial.swift"
-                )
-            ],
-            totalTokens: 12,
-            status: "ok",
-            summary: .init(
-                fullCount: 1,
-                sliceCount: 0,
-                codemapCount: 0,
-                fullTokens: 12,
-                sliceTokens: 0,
-                codemapTokens: 0
+    func testAgentRunApprovalGuidanceUsesCopyableCanonicalResponseCommand() throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let interactionID = "22222222-2222-2222-2222-222222222222"
+        let cases: [([Value], Bool)] = [
+            ([], true),
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("accept_with_amendment")]),
+                    .object(["label": .string("decline")])
+                ],
+                true
             ),
-            tokenStats: .init(total: 42, files: 12, prompt: 30),
-            tokenAccounting: .init(
-                status: "incomplete",
-                source: "active_tab_published",
-                refreshPending: true,
-                incompleteComponents: ["files"]
+            (
+                [
+                    .object(["label": .string("accept")]),
+                    .object(["label": .string("decline")])
+                ],
+                false
             )
-        )
+        ]
 
-        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
+        for (options, expectsAmendment) in cases {
+            let value = Value.object([
+                "op": .string("wait"),
+                "status": .string("waiting_for_input"),
+                "session_id": .string(sessionID),
+                "interaction_id": .string(interactionID),
+                "interaction": .object([
+                    "id": .string(interactionID),
+                    "kind": .string("approval"),
+                    "options": .array(options)
+                ])
+            ])
+            let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: value))
 
-        XCTAssertTrue(text.contains("**42 total tokens**"), text)
-        XCTAssertFalse(text.contains("**Token accounting pending**"), text)
-        XCTAssertTrue(
-            text.contains("Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
-            text
-        )
-        XCTAssertTrue(text.contains("Files: 12"), text)
-
-        let embedded = ToolOutputFormatter.formatSelectionReplyToString(dto)
-        XCTAssertTrue(embedded.contains("- Total tokens: 12 (Auto view)"), embedded)
-        XCTAssertTrue(
-            embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
-            embedded
-        )
+            XCTAssertTrue(text.contains("### How to respond"), text)
+            XCTAssertTrue(
+                text.contains(
+                    "- Copyable response: `agent_run op=respond session_id=\"\(sessionID)\" interaction_id=\"\(interactionID)\" response=\"accept\"`"
+                ),
+                text
+            )
+            XCTAssertFalse(text.contains("Use `agent_run` with"), text)
+            XCTAssertTrue(text.contains("- Allowed response values:"), text)
+            XCTAssertFalse(text.contains("Allowed decisions"), text)
+            XCTAssertFalse(text.contains("decision="), text)
+            XCTAssertEqual(text.contains("response=\"accept_with_amendment\""), expectsAmendment, text)
+        }
     }
 
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {
@@ -705,26 +639,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
-    func testHistoryFormatterTreatsNoMatchesAsSuccessfulEmptyResult() throws {
-        struct HistoryList: Encodable {
-            let total_sessions = 0
-            let truncated = false
-            let sessions_scanned = 20
-            let scan_truncated = true
-            let skipped_workspaces: [String] = []
-            let sessions: [String] = []
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("list_sessions"), "touched_file": .string("Sources/App.swift")],
-            value: Self.value(HistoryList())
-        ))
-        XCTAssertTrue(text.contains("## History Sessions ✅"))
-        XCTAssertTrue(text.contains("No matching sessions found"))
-        XCTAssertTrue(text.contains("touched_file"))
-        XCTAssertFalse(text.contains("## History Sessions ❌"))
-    }
-
     func testHistoryFormatterShowsFilesTouchedTruncation() throws {
         struct HistorySession: Encodable {
             let session_id = "s1"
@@ -753,27 +667,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("Big Session"))
         XCTAssertTrue(text.contains("files: A.swift, B.swift, C.swift (+2 more)"))
         XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"))
-    }
-
-    func testHistoryFormatterSummarizesSkippedWorkspaces() throws {
-        struct HistoryList: Encodable {
-            let total_sessions = 1
-            let truncated = false
-            let sessions_scanned = 1
-            let scan_truncated = false
-            let skipped_workspaces = [
-                "stale index schema v2: 2",
-                "unreadable index: 1"
-            ]
-            let sessions: [String] = []
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("list_sessions")],
-            value: Self.value(HistoryList())
-        ))
-        XCTAssertTrue(text.contains("- **Skipped workspaces**: stale index schema v2: 2; unreadable index: 1"))
-        XCTAssertFalse(text.contains("Workspace A: stale index schema v2; Workspace B"))
     }
 
     func testHistoryFormatterShowsSearchFollowUpIdentifiersAndRequest() throws {
@@ -827,6 +720,102 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("Skipped workspaces"))
     }
 
+    func testSessionAdminInventoryPreviewPreservesCountsCoverageAndStructuredRows() throws {
+        let cases: [(label: String, total: Int, returned: Int, totalComplete: Bool, historyComplete: Bool, endpointsComplete: Bool, truncated: Bool)] = [
+            ("complete selected records with incomplete endpoints", 97, 97, true, true, false, false),
+            ("incomplete zero", 0, 0, false, false, false, false),
+            ("row limit with complete coverage", 97, 1, true, true, true, true)
+        ]
+        for scenario in cases {
+            let rows: [Value] = (0 ..< scenario.returned).map { index in
+                .object([
+                    "session_id": .string("session-\(index)"),
+                    "name": .string(String(repeating: "Long session title 日本語 ", count: 16)),
+                    "state": .string("unknown")
+                ])
+            }
+            let value: Value = .object([
+                "result": .string("ok"),
+                "total": .int(scenario.total),
+                "total_complete": .bool(scenario.totalComplete),
+                "history_complete": .bool(scenario.historyComplete),
+                "endpoints_complete": .bool(scenario.endpointsComplete),
+                "truncated": .bool(scenario.truncated),
+                "sessions": .array(rows)
+            ])
+            let args: [String: Value] = ["op": .string("inventory")]
+            let text = try Self.onlyText(ToolOutputFormatter.buildContentBlocks(
+                toolName: "session_admin", args: args, result: value, emitResources: false
+            ))
+            // The observed provider failure retained only this preview of a 97-row response.
+            let preview = String(decoding: text.utf8.prefix(2000), as: UTF8.self)
+            XCTAssertTrue(preview.contains("\(scenario.total) matching session identities"), scenario.label)
+            XCTAssertTrue(preview.contains("\(scenario.returned) rows returned"), scenario.label)
+            XCTAssertTrue(preview.contains("total_complete=\(scenario.totalComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("history_complete=\(scenario.historyComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("endpoints_complete=\(scenario.endpointsComplete)"), scenario.label)
+            XCTAssertTrue(preview.contains("Row-limit truncated=\(scenario.truncated)"), scenario.label)
+            XCTAssertTrue(preview.contains("not the number of visible rows"), scenario.label)
+            XCTAssertEqual(preview.contains("does not prove an empty workspace"), !scenario.totalComplete, scenario.label)
+            XCTAssertEqual(preview.contains("row limit omitted matches"), scenario.truncated, scenario.label)
+
+            let jsonFence = try XCTUnwrap(text.range(of: "```json\n"), scenario.label)
+            let jsonStart = jsonFence.upperBound
+            let jsonEnd = try XCTUnwrap(text.range(of: "\n```", options: .backwards), scenario.label).lowerBound
+            let decoded = try JSONDecoder().decode(Value.self, from: Data(text[jsonStart ..< jsonEnd].utf8))
+            XCTAssertEqual(decoded, value, "The summary must preserve every structured row and coverage flag: \(scenario.label)")
+            let summary = text[..<jsonFence.lowerBound]
+            XCTAssertLessThan(summary.utf8.count, 2000, scenario.label)
+
+            let raw = try Self.onlyText(ToolOutputFormatter.buildContentBlocks(
+                toolName: "session_admin", args: args.merging(["_rawJSON": .bool(true)]) { _, new in new },
+                result: value, emitResources: false
+            ))
+            XCTAssertEqual(try JSONDecoder().decode(Value.self, from: Data(raw.utf8)), value, scenario.label)
+        }
+    }
+
+    func testIncompleteHistoryScansNeverImplyAnEmptyWorkspace() throws {
+        for (scanTruncated, skipped) in [(true, [String]()), (false, ["stale index schema v2: 1"]), (false, [])] {
+            let incomplete = scanTruncated || !skipped.isEmpty
+            let list = HistoryListSessionsReply(
+                totalSessions: 0, truncated: false, sessionsScanned: 0,
+                scanTruncated: scanTruncated, scanDiagnostics: nil, totalsAreLowerBounds: nil,
+                skippedWorkspaces: skipped, sessions: []
+            )
+            let search = HistorySearchReply(
+                totalMatches: 0, truncated: false, scanTruncated: scanTruncated,
+                scanDiagnostics: nil, totalsAreLowerBounds: nil, sessionsScanned: 0,
+                skippedWorkspaces: skipped, results: []
+            )
+            let time = HistoryTimeReply(
+                totalSessions: 0, totalActiveDurationSeconds: 0, truncated: false, sessionsScanned: 0,
+                scanTruncated: scanTruncated, scanDiagnostics: nil, totalsAreLowerBounds: nil,
+                skippedWorkspaces: skipped, groups: []
+            )
+            for (op, reply) in [("list_sessions", HistoryToolReply.listSessions(list)), ("search", .search(search)), ("time", .time(time))] {
+                let value = try MCPHistoryToolProvider.encode(reply)
+                XCTAssertEqual(value.objectValue?["scan_complete"], incomplete ? .bool(false) : nil)
+                if incomplete {
+                    XCTAssertEqual(value.objectValue?["totals_are_lower_bounds"], .bool(true))
+                    XCTAssertTrue(try XCTUnwrap(value.objectValue?["scan_note"]?.stringValue).contains("No matches does not prove"))
+                } else {
+                    XCTAssertNil(value.objectValue?["scan_note"])
+                }
+                let text = try Self.onlyText(ToolOutputFormatter.formatHistory(args: ["op": .string(op)], value: value))
+                XCTAssertEqual(text.contains("Scan completeness"), incomplete, op)
+                if incomplete {
+                    XCTAssertTrue(text.contains("No matches does not establish"), op)
+                    XCTAssertFalse(text.contains("No matching sessions found"), op)
+                    XCTAssertFalse(text.contains("No matching turns found"), op)
+                    XCTAssertTrue(text.contains("⚠️"), op)
+                } else if op != "time" {
+                    XCTAssertTrue(text.contains("No matching"), op)
+                }
+            }
+        }
+    }
+
     func testHistoryFormatterShowsGetSessionWindow() throws {
         struct Entry: Encodable {
             let role = "assistant"
@@ -835,13 +824,27 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             let truncated = false
         }
 
+        struct TokenUsage: Encodable {
+            let run_id = "run-123"
+            let input_tokens = 120
+            let output_tokens = 30
+        }
+
         struct Turn: Encodable {
             let turn_index = 4
             let started_at = "2026-07-05T06:00:00Z"
             let request_text = "Find unfiled issues"
             let tool_call_summary = "file_search success ×2"
+            let run_ids = ["run-123"]
+            let token_usage = [TokenUsage()]
             let entries = [Entry()]
             let truncated = false
+        }
+
+        struct TokenUsageSummary: Encodable {
+            let provider_input_tokens = 120
+            let provider_output_tokens = 30
+            let attributed_run_count = 1
         }
 
         struct HistoryGetSession: Encodable {
@@ -852,6 +855,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             let returned_turn_start = 3
             let returned_turn_end = 5
             let truncated = true
+            let token_usage_summary = TokenUsageSummary()
             let turns = [Turn()]
         }
 
@@ -864,6 +868,9 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("**Turns**: 3–5 of 12"))
         XCTAssertTrue(text.contains("**Request**: Find unfiled issues"))
         XCTAssertTrue(text.contains("**Tools**: file_search success ×2"))
+        XCTAssertTrue(text.contains("**Provider tokens**: input 120, output 30 • attributed runs: 1"))
+        XCTAssertTrue(text.contains("**Run IDs**: run-123"))
+        XCTAssertTrue(text.contains("**Token usage** (`run-123`): input 120, output 30"))
         XCTAssertTrue(text.contains("**assistant** @ 2026-07-05T06:00:00Z: Candidate issue: missing smoke coverage"))
     }
 

@@ -1,6 +1,10 @@
 import AppKit
 import Combine
 import Foundation
+import os
+import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -31,6 +35,12 @@ enum WindowKind: String, Codable {
 }
 
 enum WindowTitleFormatter {
+    /// Text-presentation eye marker used for the exact current overseer role.
+    ///
+    /// Variation Selector-15 is intentional: the native title must use the monochrome text glyph,
+    /// not an emoji-presentation eye that can change titlebar metrics.
+    static let overseerPrefix = "\u{1F441}\u{FE0E} "
+
     /// Default window title when no user workspace is active.
     /// Mirrors the app's display name so window and tab titles match the running distribution.
     static let defaultTitle: String = {
@@ -56,8 +66,33 @@ enum WindowTitleFormatter {
             return workspaceTitle
         }
 
-        return "\(trimmedSessionTitle) — \(workspaceTitle)"
+        return "\(workspaceTitle) — \(trimmedSessionTitle)"
     }
+
+    static func applyingOverseerPrefix(to baseTitle: String, isOverseer: Bool) -> String {
+        isOverseer ? overseerPrefix + baseTitle : baseTitle
+    }
+}
+
+/// Sticky instance number qualified by the workspace it was allocated for.
+struct WorkspaceInstanceAssignment: Equatable {
+    let workspaceID: UUID
+    let number: Int
+}
+
+/// One complete window-title resolution: workspace label, decorated tab and rendered title together.
+struct CoherentWindowTitlePresentation: Equatable {
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let workspaceDisplayName: String
+    let renderedTitle: String
+
+    static let appDefault = CoherentWindowTitlePresentation(
+        workspaceID: nil,
+        tabID: nil,
+        workspaceDisplayName: WindowTitleFormatter.defaultTitle,
+        renderedTitle: WindowTitleFormatter.defaultTitle
+    )
 }
 
 enum PendingInteractionSurface {
@@ -97,6 +132,83 @@ struct AppCommand {
     }
 }
 
+@MainActor
+enum FolderRouteState: Equatable {
+    case notRequested
+    case unresolved(expectedRoot: WorkspaceRootSetKey)
+    case authorityExactRoot(expectedRoot: WorkspaceRootSetKey)
+    case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+    case ephemeralLiveWindowSupplement(workspaceID: UUID, expectedRoot: WorkspaceRootSetKey)
+
+    var expectedRoot: WorkspaceRootSetKey? {
+        switch self {
+        case .notRequested:
+            nil
+        case let .unresolved(expectedRoot),
+             let .authorityExactRoot(expectedRoot),
+             let .ephemeralLiveWindowSupplement(_, expectedRoot):
+            expectedRoot
+        case let .pendingPersistentPublication(publication):
+            publication.expectedRoot
+        }
+    }
+
+    var routedPersistentResolution: PersistentFolderOpenProvenance? {
+        switch self {
+        case .authorityExactRoot, .pendingPersistentPublication:
+            .reused
+        case .notRequested, .unresolved, .ephemeralLiveWindowSupplement:
+            nil
+        }
+    }
+
+    var logLabel: String {
+        switch self {
+        case .notRequested:
+            "notRequested"
+        case .unresolved:
+            "unresolved"
+        case .authorityExactRoot:
+            "authorityExactRoot"
+        case .pendingPersistentPublication:
+            "pendingPersistentPublication"
+        case .ephemeralLiveWindowSupplement:
+            "ephemeralLiveWindowSupplement"
+        }
+    }
+}
+
+enum AppCommandExecutionFailure: String, Equatable {
+    case invalidFolder
+    case workspaceUnavailable
+    case workspaceSwitchBlocked
+    case authorityFailure
+    case routeChangedAfterRetry
+    case windowClosed
+    case payloadApplicationFailed
+}
+
+enum AppCommandPartialSuccessReason: Equatable {
+    case cancelled
+    case failed(AppCommandExecutionFailure)
+}
+
+enum AppCommandExecutionResult: Equatable {
+    case completed(workspaceID: UUID?)
+    case partialSuccess(workspaceID: UUID, reason: AppCommandPartialSuccessReason)
+    case failed(AppCommandExecutionFailure)
+    case cancelled
+}
+
+typealias AppCommandCompletion = @MainActor (AppCommandExecutionResult) -> Void
+typealias AgentSessionHandoffInstructionsProvider = @MainActor () -> String
+
+enum AgentChatHandoffCopyOutcome: Equatable {
+    case copied
+    case staleTarget
+    case instructionsTooLong(count: Int, maximum: Int)
+}
+
 /// Holds all of the per-window managers/services.
 /// Each new window in the app gets a fresh instance of WindowState.
 @MainActor
@@ -104,11 +216,25 @@ class WindowState: ObservableObject {
     // MARK: - Shared Services
 
     /// Single shared MCP service instance across all windows
-    private static let sharedMCPService = MCPService()
+    static let sharedMCPService = MCPService()
 
     // MARK: - Window identification
 
+    private static let mainWindowTabbingIdentifier: NSWindow.TabbingIdentifier = "com.repoprompt.main"
+
     private(set) static var windowCounter = 0
+
+    private static func allocateWindowID() -> Int {
+        windowCounter += 1
+        return windowCounter
+    }
+
+    #if DEBUG
+        static func reserveWindowIDForTesting() -> Int {
+            allocateWindowID()
+        }
+    #endif
+
     let windowID: Int
 
     @Published var kind: WindowKind = .standard
@@ -118,7 +244,13 @@ class WindowState: ObservableObject {
     @Published var isCurrentlyFocused: Bool = false
 
     /// Per-window teardown guard. Not @Published (we don't want SwiftUI updates during teardown).
-    private(set) var isClosing: Bool = false
+    private(set) var isClosing: Bool = false {
+        didSet {
+            guard oldValue != isClosing else { return }
+            // Exact candidate lookup excludes this window only after the flag changes.
+            AgentSessionLinkCandidateReadinessSignal.didChange()
+        }
+    }
 
     private var focusCancellables = Set<AnyCancellable>()
     private weak var focusObservedWindow: NSWindow?
@@ -128,6 +260,16 @@ class WindowState: ObservableObject {
 
     /// Called whenever `isCurrentlyFocused` changes.
     var onFocusChanged: ((Bool) -> Void)?
+
+    // MARK: - Presentation Visibility
+
+    /// Whether this window is presented on screen (see `WindowPresentationVisibility`). Unlike
+    /// focus, a visible non-key window counts as visible. Presentation-only: consumed solely to stop
+    /// decorative animation in hidden windows. `true` until an attached window is sampled.
+    @Published private(set) var isPresentationVisible: Bool = true
+
+    private var presentationVisibilityCancellables = Set<AnyCancellable>()
+    private weak var presentationVisibilityObservedWindow: NSWindow?
 
     // MARK: - Per-Window View Models
 
@@ -139,6 +281,7 @@ class WindowState: ObservableObject {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -159,6 +302,7 @@ class WindowState: ObservableObject {
     // MARK: - Possibly shared references
 
     let workspaceManager: WorkspaceManagerViewModel
+    private let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
     weak var windowStatesManager: WindowStatesManager?
 
     /// Reference to the NSWindow this state is associated with
@@ -167,33 +311,53 @@ class WindowState: ObservableObject {
 
     // MARK: - Agent Mode Titlebar Accessory
 
-    /// Titlebar accessory controller for Agent mode ("New Session" button near traffic lights)
+    /// Native titlebar edge accessory controller for the Agent mode New Session button
     private weak var agentTitlebarAccessory: AgentModeTitlebarAccessoryViewController?
     /// Whether Agent mode has requested the titlebar accessory be visible
     private var wantsAgentTitlebarAccessory: Bool = false
     /// Action to call when the "New Session" button is tapped
     private var agentNewSessionAction: (() -> Void)?
+    /// Narrow titlebar state observed only by the principal toolbar title cluster.
+    let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
-    /// The sticky instance number assigned for this window's current workspace (monotonically increasing per workspace).
-    /// Nil when no workspace is active yet.
-    @Published var workspaceInstanceNumber: Int? = nil
+    /// The sticky instance number assigned for this window's workspace, qualified by that workspace.
+    /// Installed only by `setWorkspaceInstanceAssignment(_:)`; never allocated here.
+    @Published private(set) var workspaceInstanceAssignment: WorkspaceInstanceAssignment?
 
-    /// Convenience: the workspace name with an instance suffix " (N)" when N ≥ 2,
-    /// except for the default/system workspace which always shows the app name.
+    /// Durable restorable identity is separate from the fail-closed live routing pair. Never mix
+    /// an incoming workspace's metadata with an outgoing assignment during publication/listener gaps.
+    private var lastCoherentSessionEntry: WindowSessionEntry?
+
+    /// The instance number for the current workspace; nil while the assignment belongs to another.
+    var workspaceInstanceNumber: Int? {
+        workspaceManager.activeWorkspaceID.flatMap { workspaceInstanceNumber(for: $0) }
+    }
+
+    /// The instance number only when it was assigned for `workspaceID`, for explicit identity pairs.
+    func workspaceInstanceNumber(for workspaceID: UUID) -> Int? {
+        guard let assignment = workspaceInstanceAssignment, assignment.workspaceID == workspaceID else { return nil }
+        return assignment.number
+    }
+
+    /// Installs a qualified assignment for the current workspace, or nil for an unload/termination
+    /// result. An assignment for a workspace this window no longer shows is stale and is rejected.
+    func setWorkspaceInstanceAssignment(_ assignment: WorkspaceInstanceAssignment?) {
+        if let assignment {
+            guard assignment.workspaceID == workspaceManager.activeWorkspaceID else { return }
+        } else {
+            guard workspaceManager.activeWorkspaceID == nil
+                || (windowStatesManager ?? WindowStatesManager.shared).isTerminating
+            else { return }
+        }
+        workspaceInstanceAssignment = assignment
+        refreshCoherentSessionEntry()
+        requestWindowTitleUpdate(reason: .workspaceChanged)
+    }
+
+    /// The workspace label of the installed (published) title: the name with " (N)" for N ≥ 2, the
+    /// app name for System, retained while a switch is still assigning.
     var workspaceDisplayName: String {
-        guard let ws = workspaceManager.activeWorkspace else {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        if ws.isSystemWorkspace {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        let base = ws.name
-        if let n = workspaceInstanceNumber, n >= 2 {
-            return "\(base) (\(n))"
-        }
-        return base
+        coherentTitlePresentation.workspaceDisplayName
     }
 
     /// Source of truth for the SwiftUI scene title (window title and native tab name).
@@ -201,51 +365,74 @@ class WindowState: ObservableObject {
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
 
-    // Cache to survive transient activeWorkspace == nil. This may include Agent session context.
-    private var lastKnownResolvedTitle: String = WindowTitleFormatter.defaultTitle
+    /// The last complete title resolution. Retained, never partially updated, while the active
+    /// workspace model is unresolved or a real switch has not yet assigned the target's number.
+    private var coherentTitlePresentation = CoherentWindowTitlePresentation.appDefault
     private var lastAppliedWindowTitle: String?
+    /// Workspace ID published by a real switch, with the switching flag and that switch's operation as
+    /// observed at publication, not at the deferred title hop, so authority-only adoption or a later
+    /// switch that has not yet published is never mistaken for the pending switch of this ID.
+    private var titleSwitchPublication: (workspaceID: UUID, wasSwitching: Bool, operationID: UUID?)?
 
-    private func resolvedWindowTitle() -> String {
-        guard let ws = workspaceManager.activeWorkspace else {
-            // If we expect a workspace but it is temporarily unresolved, do not stomp to default.
-            if workspaceManager.activeWorkspaceID != nil {
-                return lastKnownResolvedTitle
-            }
+    private func noteActiveWorkspacePublishedForTitle(_ workspaceID: UUID?) {
+        let wasSwitching = workspaceManager.isSwitchingWorkspace
+        if let workspaceID, wasSwitching {
+            titleSwitchPublication = (workspaceID, wasSwitching, workspaceManager.activeWorkspaceSwitch?.operationID)
+        } else if workspaceID != titleSwitchPublication?.workspaceID {
+            titleSwitchPublication = nil
+        }
+        requestWindowTitleUpdate(reason: .workspaceChanged)
+    }
 
-            return WindowTitleFormatter.defaultTitle
+    private func resolveCoherentTitlePresentation() -> CoherentWindowTitlePresentation {
+        guard let workspaceID = workspaceManager.activeWorkspaceID else { return .appDefault }
+        guard let workspace = workspaceManager.activeWorkspace else { return coherentTitlePresentation }
+        let switchInFlight = titleSwitchPublication.map { publication in
+            publication.wasSwitching
+                && publication.workspaceID == workspaceID
+                && publication.operationID != nil
+                && workspaceManager.activeWorkspaceSwitch?.operationID == publication.operationID
+        } ?? false
+        let number = workspaceInstanceNumber(for: workspaceID)
+        let selectedTabID = promptManager.activeComposeTabID
+        // Membership comes from this workspace directly; a global tab-name lookup cannot establish it.
+        let selectedTab = selectedTabID.flatMap { tabID in workspace.composeTabs.first { $0.id == tabID } }
+        let adoptionPending = agentModeViewModel.hasPendingOwnerAdoption(forWorkspaceID: workspaceID)
+        if switchInFlight || adoptionPending, number == nil || (selectedTabID != nil && selectedTab == nil) {
+            return coherentTitlePresentation
         }
 
-        let workspaceTitle = resolvedWorkspaceWindowTitle(for: ws)
-        let resolvedTitle = WindowTitleFormatter.compose(
-            workspaceTitle: workspaceTitle,
-            agentSessionTitle: resolvedAgentSessionTitleForWindowTitle(activeWorkspace: ws),
-            duplicateWorkspaceTitle: ws.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : ws.name
+        let label = if workspace.isSystemWorkspace {
+            WindowTitleFormatter.defaultTitle
+        } else if let number, number >= 2 {
+            "\(workspace.name) (\(number))"
+        } else {
+            workspace.name
+        }
+        let baseTitle = WindowTitleFormatter.compose(
+            workspaceTitle: label,
+            agentSessionTitle: workspace.isSystemWorkspace
+                ? nil
+                : selectedTab.map { AgentSessionRestoreSupport.normalizedSessionTitle($0.name) },
+            duplicateWorkspaceTitle: workspace.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : workspace.name
         )
-        lastKnownResolvedTitle = resolvedTitle
-        return resolvedTitle
+        // Role facts count only from the runtime currently owning this workspace.
+        let isOverseer = selectedTab.map { tab in
+            agentModeViewModel.currentPaneOwner?.workspaceID == workspaceID
+                && agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tab.id)?.workspaceID == workspaceID
+                && agentModeViewModel.agentSessionLinkIsOverseer(tabID: tab.id)
+        } ?? false
+        return CoherentWindowTitlePresentation(
+            workspaceID: workspaceID,
+            tabID: selectedTab?.id,
+            workspaceDisplayName: label,
+            renderedTitle: WindowTitleFormatter.applyingOverseerPrefix(to: baseTitle, isOverseer: isOverseer)
+        )
     }
 
-    private func resolvedWorkspaceWindowTitle(for workspace: WorkspaceModel) -> String {
-        if workspace.isSystemWorkspace {
-            return WindowTitleFormatter.defaultTitle
-        }
-
-        let base = workspace.name
-        if let n = workspaceInstanceNumber, n >= 2 {
-            return "\(base) (\(n))"
-        }
-        return base
-    }
-
-    private func resolvedAgentSessionTitleForWindowTitle(activeWorkspace: WorkspaceModel) -> String? {
-        guard !activeWorkspace.isSystemWorkspace,
-              promptManager.activeComposeTabID != nil
-        else {
-            return nil
-        }
-
-        let rawTitle = promptManager.activeComposeTabID.flatMap { workspaceManager.composeTabName(with: $0) }
-        return AgentSessionRestoreSupport.normalizedSessionTitle(rawTitle)
+    /// Chat options may act only for the workspace and decorated tab the installed title shows.
+    private func titlePresentationAdmits(workspaceID: UUID, tabID: UUID) -> Bool {
+        coherentTitlePresentation.workspaceID == workspaceID && coherentTitlePresentation.tabID == tabID
     }
 
     enum WindowTitleUpdateReason {
@@ -255,19 +442,107 @@ class WindowState: ObservableObject {
         case appBecameActive
         case activeComposeTabChanged
         case agentSessionNameChanged
+        case agentSessionOverseerProjectionChanged
         case explicit
         case unspecified
     }
 
+    private enum CommandHandlingOutcome {
+        case terminal(AppCommandExecutionResult)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
+        case forward(WindowState, FolderRouteState)
+    }
+
+    private enum FolderTargetResolution {
+        case resolved(ResolvedFolderTarget)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
+        case terminal(AppCommandExecutionResult)
+    }
+
+    private struct ResolvedFolderTarget {
+        let workspace: WorkspaceModel
+        let source: FolderTargetSource
+        let activationState: FolderOpenActivationState
+    }
+
+    private struct FolderCandidateRepresentation {
+        let workspace: WorkspaceModel
+        let source: FolderTargetSource
+    }
+
+    @MainActor
+    private enum FolderTargetSource {
+        case authority
+        case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+        case ephemeralLiveWindow(WindowState)
+
+        var permitsLocalEphemeralAdmission: Bool {
+            if case .ephemeralLiveWindow = self {
+                return true
+            }
+            return false
+        }
+
+        func route(
+            workspaceID: UUID,
+            expectedRoot: WorkspaceRootSetKey
+        ) -> FolderRouteState {
+            switch self {
+            case .authority:
+                .authorityExactRoot(expectedRoot: expectedRoot)
+            case let .pendingPersistentPublication(publication):
+                .pendingPersistentPublication(publication)
+            case .ephemeralLiveWindow:
+                .ephemeralLiveWindowSupplement(
+                    workspaceID: workspaceID,
+                    expectedRoot: expectedRoot
+                )
+            }
+        }
+    }
+
     /// Command queue to store all pending commands
-    private var commandQueue: [AppCommand] = []
+    private var commandQueue: [AppCommandLifetime] = []
+    private var isProcessingCommandQueue = false
+    #if DEBUG
+        private var automaticallyProcessesEnqueuedCommands = true
+        private var persistentFolderCreationCommitDidRecordHandlerForTesting: ((UUID) -> Void)?
+
+        func setAutomaticCommandProcessingForTesting(_ enabled: Bool) {
+            automaticallyProcessesEnqueuedCommands = enabled
+        }
+
+        var queuedCommandCountForTesting: Int {
+            commandQueue.count
+        }
+
+        func setPersistentFolderCreationCommitDidRecordHandlerForTesting(
+            _ handler: ((UUID) -> Void)?
+        ) {
+            persistentFolderCreationCommitDidRecordHandlerForTesting = handler
+        }
+
+        func stopDomainWorkspaceProjectionForTesting() {
+            domainWorkspacePresentationBridge?.stop()
+        }
+    #endif
 
     /// Lazily scheduled task to coalesce window title updates outside of mutation scopes.
     private var pendingWindowTitleUpdateTask: Task<Void, Never>?
+    #if DEBUG
+        /// Passive checkpoint after each deferred title resolution, including deduplicated ones.
+        private var windowTitleResolutionDidCompleteHandlerForTesting: (@MainActor () -> Void)?
+
+        func setWindowTitleResolutionDidCompleteHandlerForTesting(_ handler: (@MainActor () -> Void)?) {
+            windowTitleResolutionDidCompleteHandlerForTesting = handler
+        }
+    #endif
     /// Lazily scheduled task to coalesce focus updates outside of mutation scopes.
     private var pendingFocusUpdateTask: Task<Void, Never>?
     /// Lazily scheduled task to coalesce focus side-effects outside of mutation scopes.
     private var pendingFocusSideEffectsTask: Task<Void, Never>?
+    /// Lazily scheduled task to coalesce presentation-visibility samples outside of mutation scopes.
+    private var pendingPresentationVisibilityTask: Task<Void, Never>?
 
     private var shouldSuppressObservationSideEffects: Bool {
         // Avoid SwiftUI observation churn during teardown/termination.
@@ -276,15 +551,26 @@ class WindowState: ObservableObject {
 
     func beginClose() {
         guard !isClosing else { return }
-        isClosing = true
-
         let manager = windowStatesManager ?? WindowStatesManager.shared
+        if !manager.isTerminating {
+            AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
+        }
+        isClosing = true
+        failUnstartedCommandsForWindowClose()
+
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
+        // Close-triggered initialization completion must never dispatch a pending restore.
+        // Retired after the explicit-close mark so a persist flushed by the completion already
+        // excludes this window.
+        retirePendingRestoreEntry()
         closeCoordinator.beginClose()
         onFocusChanged = nil
         removeFocusObservers()
+        removePresentationVisibilityObservers()
+        pendingPresentationVisibilityTask?.cancel()
+        pendingPresentationVisibilityTask = nil
         pendingWindowTitleUpdateTask?.cancel()
         pendingWindowTitleUpdateTask = nil
         pendingFocusUpdateTask?.cancel()
@@ -299,8 +585,9 @@ class WindowState: ObservableObject {
         promptManager.gitViewModel.prepareForWindowClose()
     }
 
-    private var pendingRestoreEntry: WindowSessionEntry?
-    private var pendingRestoreCompletion: (() -> Void)?
+    /// Accepted restore execution and the protection session capture relies on. See
+    /// `WindowRestoreLifetime` for why the two lifetimes stay independent.
+    private var restoreLifetime = WindowRestoreLifetime()
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -310,16 +597,77 @@ class WindowState: ObservableObject {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
-            codexModelPollingService: .shared
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: nil
+        )
+    }
+
+    convenience init(domainRuntime: MCPDomainRuntime) {
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: domainRuntime
         )
     }
 
     #if DEBUG
+        convenience init(
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: contextBuilderProviderFactory,
+                loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil,
+                agentModeViewModelFactory: agentModeViewModelFactory
+            )
+        }
+
+        convenience init(
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
+            domainRuntime: MCPDomainRuntime,
+            keyManager: KeyManager,
+            codexModelPollingService: CodexModelPollingService,
+            loadStoredAPISettingsDataOnInit: Bool
+        ) {
+            self.init(
+                contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
+                loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+                codexModelPollingService: codexModelPollingService,
+                domainRuntimeOverride: domainRuntime,
+                keyManager: keyManager
+            )
+        }
+
+        var domainWorkspacePresentationBridgeForTesting: DomainWorkspacePresentationBridge? {
+            domainWorkspacePresentationBridge
+        }
+
+        func joinDomainWorkspaceBridgeForTesting() async {
+            await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
+        }
+
+        func restartDomainWorkspaceProjectionForTesting() {
+            domainWorkspacePresentationBridge?.start()
+        }
+
+        var hasPendingRestoreEntryForTesting: Bool {
+            restoreLifetime.hasPendingEntry
+        }
+
+        /// The restore entry session capture currently protects, if any.
+        var protectedRestoreEntryForTesting: WindowSessionEntry? {
+            restoreLifetime.protectedEntry
+        }
+
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
             self.init(
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: true,
-                codexModelPollingService: .shared
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil
             )
         }
 
@@ -330,7 +678,8 @@ class WindowState: ObservableObject {
             self.init(
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-                codexModelPollingService: codexModelPollingService
+                codexModelPollingService: codexModelPollingService,
+                domainRuntimeOverride: nil
             )
         }
 
@@ -339,7 +688,21 @@ class WindowState: ObservableObject {
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: true,
                 codexModelPollingService: .shared,
-                workspaceFileContextStore: workspaceFileContextStore
+                workspaceFileContextStore: workspaceFileContextStore,
+                domainRuntimeOverride: nil
+            )
+        }
+
+        convenience init(
+            domainRuntime: MCPDomainRuntime?,
+            storedPromptPersistence: any StoredPromptPersistenceServing
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                storedPromptPersistence: storedPromptPersistence,
+                domainRuntimeOverride: domainRuntime
             )
         }
 
@@ -349,11 +712,14 @@ class WindowState: ObservableObject {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
-        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
+        domainRuntimeOverride: MCPDomainRuntime?,
+        keyManager injectedKeyManager: KeyManager? = nil,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) {
         // Assign a unique window ID
-        WindowState.windowCounter += 1
-        windowID = WindowState.windowCounter
+        windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
 
         let claimedInitialRefreshDeferral = manager.claimInitialRefreshDeferralForNewWindow()
@@ -364,15 +730,21 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
+        let compositionSpan = StartupPhaseLog.begin(.windowComposition, window: windowID)
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
+            keyManager: injectedKeyManager,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
+            storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            agentModeViewModelFactory: agentModeViewModelFactory
         )
+        compositionSpan.end()
 
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
@@ -382,6 +754,7 @@ class WindowState: ObservableObject {
         promptManager = composition.promptManager
         oracleViewModel = composition.oracleViewModel
         apiSettingsViewModel = composition.apiSettingsViewModel
+        routerSettingsViewModel = composition.routerSettingsViewModel
         contextBuilderAgentViewModel = composition.contextBuilderAgentViewModel
         agentModeViewModel = composition.agentModeViewModel
         #if DEBUG
@@ -393,6 +766,7 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+        domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge
 
         // Set up additional actions
         setupSendPromptAction()
@@ -414,14 +788,69 @@ class WindowState: ObservableObject {
             }
         }
 
+        // Explicit (non-startup) activation wins over a restore that has not dispatched yet.
+        // Installed before yielding so startup cannot race ahead of it.
+        workspaceManager.onNonStartupWorkspaceActivationRequested = { [weak self] in
+            self?.retirePendingRestoreEntry()
+        }
+
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
+            StartupPhaseLog.mark(.initCallbackEnqueue, window: windowID)
             Task {
+                guard !self.isClosing else { return }
+                StartupPhaseLog.mark(.initCallbackStart, window: self.windowID)
                 self.applyPendingRestoreEntryIfPossible()
                 await self.processCommands()
             }
         }
+
+        // Once this window lands on any real workspace, a protected restore entry no longer
+        // describes it. This covers a successful restore, a user switch, and a restore whose
+        // switch was refused after resolution succeeded -- and it lets a later deliberate switch
+        // back to Default persist normally. The witness is taken at publication, before the
+        // deferred hop, so a selection published before a newer acceptance cannot release it.
+        workspaceManager.$activeWorkspaceID
+            .map { [weak self] newWorkspaceID in
+                (newWorkspaceID, self?.restoreLifetime.selectionWitness)
+            }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newWorkspaceID, witness in
+                guard let self,
+                      let newWorkspaceID,
+                      let witness,
+                      let workspace = workspaceManager.workspaces.first(where: { $0.id == newWorkspaceID }),
+                      !workspace.isSystemWorkspace
+                else { return }
+                restoreLifetime.noteRealSelectionPublished(witness)
+            }
+            .store(in: &cancellables)
+
+        // Title transition facts are read at publication, separately from the restore witness
+        // above: whether this ID arrived inside a real switch. A switch ending (successfully,
+        // recovered, or cancelled) requests reevaluation after the switching flag clears.
+        workspaceManager.$activeWorkspaceID
+            .sink { [weak self] workspaceID in
+                self?.noteActiveWorkspacePublishedForCapture(workspaceID)
+                self?.noteActiveWorkspacePublishedForTitle(workspaceID)
+            }
+            .store(in: &cancellables)
+        workspaceManager.$activeWorkspaceSwitch
+            .filter { $0 == nil }
+            .sink { [weak self] _ in
+                self?.requestWindowTitleUpdate(reason: .workspaceChanged)
+            }
+            .store(in: &cancellables)
+        // A queued owner adoption ends when the pane publishes its installed target (awaiting owner →
+        // owner); reevaluate a title retained for it. Stable targets do not retrigger on content.
+        agentModeViewModel.ui.transcript.$snapshot
+            .map(\.paneTarget)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.requestWindowTitleUpdate(reason: .workspaceChanged)
+            }
+            .store(in: &cancellables)
 
         // Keep the window title in sync when this window's active compose tab changes,
         // so the Agent session portion of the title does not go stale.
@@ -448,6 +877,29 @@ class WindowState: ObservableObject {
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(
+            for: .agentSessionLinkOverseerProjectionDidChange,
+            object: agentModeViewModel
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in
+            self?.requestWindowTitleUpdate(reason: .agentSessionOverseerProjectionChanged)
+        }
+        .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID,
+                      let tabID = notification.userInfo?["tabID"] as? UUID,
+                      tabID == promptManager.activeComposeTabID
+                else { return }
+                refreshAgentChatTitleCluster()
+            }
+            .store(in: &cancellables)
     }
 
     private func setupMCPAutoStart() {
@@ -466,17 +918,31 @@ class WindowState: ObservableObject {
     /// Uses deferred title update to avoid triggering layout during window lifecycle events
     /// (REPOPROMPT-1K4 fix).
     func attachWindow(_ window: NSWindow?) {
+        performWindowAttachment(window, update: updateAttachedWindow)
+    }
+
+    /// The admission boundary is window-independent so a deferred attach can be tested without
+    /// opening an AppKit window. Detach must still clean up after closing has begun.
+    func performWindowAttachment<Window>(_ window: Window?, update: (Window?) -> Void) {
+        // WindowAccessor may deliver its deferred callback after the idempotent beginClose ran.
+        guard window == nil || !isClosing else { return }
+        update(window)
+    }
+
+    private func updateAttachedWindow(_ window: NSWindow?) {
         // Detach path (always do the cleanup even if both are nil)
         if window == nil {
             let oldWindow = nsWindow
             detachTitlebarAccessoryControllers(from: oldWindow)
             nsWindow = nil
             removeFocusObservers()
+            removePresentationVisibilityObservers()
             pendingWindowTitleUpdateTask?.cancel()
             pendingWindowTitleUpdateTask = nil
             pendingFocusUpdateTask?.cancel()
             pendingFocusUpdateTask = nil
             scheduleFocusUpdate(false)
+            schedulePresentationVisibilityUpdate(from: nil)
             return
         }
         guard let window else { return }
@@ -485,6 +951,7 @@ class WindowState: ObservableObject {
             configureWindowChrome(for: window)
             ensureWindowDelegateProxy(for: window)
             scheduleFocusUpdate(from: window)
+            schedulePresentationVisibilityUpdate(from: window)
             requestWindowTitleUpdate(reason: .windowAttached)
             applyAgentTitlebarAccessoryIfPossible()
             return
@@ -503,19 +970,33 @@ class WindowState: ObservableObject {
         configureWindowChrome(for: window)
         installFocusObservers(for: window)
         scheduleFocusUpdate(from: window)
+        installPresentationVisibilityObservers(for: window)
+        schedulePresentationVisibilityUpdate(from: window)
         ensureWindowDelegateProxy(for: window)
         // Use deferred update to avoid recursive layout issues
         requestWindowTitleUpdate(reason: .windowAttached)
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
+        StartupPhaseLog.mark(.windowAttached, window: windowID)
     }
 
     private func configureWindowChrome(for window: NSWindow) {
+        // Give independently created SwiftUI scenes one explicit main-window tabbing group so
+        // AppKit keeps Merge All Windows available from whichever main window is active.
+        window.tabbingIdentifier = Self.mainWindowTabbingIdentifier
+        window.tabbingMode = .automatic
+
         // Keep titlebar visually continuous with content (no horizontal separator).
         window.toolbar?.showsBaselineSeparator = false
+        if #unavailable(macOS 15.0) {
+            window.titleVisibility = .hidden
+        }
         // SwiftUI can recreate toolbar chrome during toolbar updates; re-apply on next runloop.
         DispatchQueue.main.async { [weak window] in
             window?.toolbar?.showsBaselineSeparator = false
+            if #unavailable(macOS 15.0) {
+                window?.titleVisibility = .hidden
+            }
         }
     }
 
@@ -576,10 +1057,60 @@ class WindowState: ObservableObject {
         focusObservedWindow = nil
     }
 
+    private func installPresentationVisibilityObservers(for window: NSWindow) {
+        guard !isClosing, presentationVisibilityObservedWindow !== window else { return }
+        removePresentationVisibilityObservers()
+        presentationVisibilityObservedWindow = window
+
+        let nc = NotificationCenter.default
+        let publishers = WindowPresentationVisibility.windowNotifications.map {
+            nc.publisher(for: $0, object: window)
+        } + WindowPresentationVisibility.applicationNotifications.map {
+            nc.publisher(for: $0)
+        }
+        for publisher in publishers {
+            publisher
+                .receive(on: RunLoop.main)
+                .sink { [weak self, weak window] _ in
+                    guard let self, let window else { return }
+                    schedulePresentationVisibilityUpdate(from: window)
+                }
+                .store(in: &presentationVisibilityCancellables)
+        }
+    }
+
+    private func removePresentationVisibilityObservers() {
+        presentationVisibilityCancellables.removeAll()
+        presentationVisibilityObservedWindow = nil
+    }
+
+    /// Samples after a yield so a notification delivered mid-update never publishes in place, and
+    /// only for the window still attached; `nil` (detached) restores the unknown-is-visible default.
+    private func schedulePresentationVisibilityUpdate(from window: NSWindow?) {
+        guard !shouldSuppressObservationSideEffects else { return }
+        pendingPresentationVisibilityTask?.cancel()
+        pendingPresentationVisibilityTask = Task { [weak self, weak window] in
+            guard let self else { return }
+            await Task.yield()
+            guard !Task.isCancelled, !shouldSuppressObservationSideEffects else { return }
+            let visible: Bool
+            if let window {
+                guard nsWindow === window else { return }
+                visible = WindowPresentationVisibility.sample(window)
+            } else {
+                guard nsWindow == nil else { return }
+                visible = true
+            }
+            guard isPresentationVisible != visible else { return }
+            isPresentationVisible = visible
+        }
+    }
+
     private func setFocused(_ focused: Bool) {
         guard !shouldSuppressObservationSideEffects else { return }
         guard isCurrentlyFocused != focused else { return }
         isCurrentlyFocused = focused
+        NotificationService.shared.agentNotifications.visibilityMayHaveChanged()
         workspaceFilesViewModel.setWindowFocused(focused)
         scheduleFocusSideEffects(focused)
     }
@@ -620,14 +1151,18 @@ class WindowState: ObservableObject {
     /// Safe to call from WindowAccessor notifications; doesn't mutate SwiftUI state.
     private func reassertWindowTitle() {
         guard !shouldSuppressObservationSideEffects else { return }
-        applyWindowTitleIfNeeded(resolvedWindowTitle())
+        applyCoherentWindowTitle()
     }
 
+    /// Installs one complete resolution and reasserts the same string to SwiftUI and AppKit.
     @MainActor
-    private func applyWindowTitleIfNeeded(_ title: String) {
+    private func applyCoherentWindowTitle() {
+        coherentTitlePresentation = resolveCoherentTitlePresentation()
+        let title = coherentTitlePresentation.renderedTitle
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
+        refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
             return
@@ -735,7 +1270,282 @@ class WindowState: ObservableObject {
         agentNewSessionAction = nil
     }
 
-    /// Shows or hides the Agent mode titlebar accessory ("New Session" button near traffic lights).
+    private func currentAgentTitlebarChatOptionsTarget() -> AgentChatOptionsMenuTarget? {
+        guard wantsAgentTitlebarAccessory,
+              let workspace = workspaceManager.activeWorkspace,
+              let tabID = promptManager.activeComposeTabID,
+              agentModeViewModel.currentTabID == tabID,
+              let tab = workspace.composeTabs.first(where: { $0.id == tabID }),
+              let agentSessionID = agentModeViewModel.explicitActiveSessionID(for: tabID),
+              titlePresentationAdmits(workspaceID: workspace.id, tabID: tabID)
+        else {
+            return nil
+        }
+        return AgentChatOptionsMenuTarget(
+            windowID: windowID,
+            workspaceID: workspace.id,
+            tabID: tabID,
+            agentSessionID: agentSessionID,
+            tabName: tab.name
+        )
+    }
+
+    func agentChatTitleClusterMenuTargetIsValid(_ target: AgentChatOptionsMenuTarget) -> Bool {
+        guard target.windowID == windowID,
+              let workspace = workspaceManager.activeWorkspace,
+              workspace.id == target.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == target.tabID }),
+              titlePresentationAdmits(workspaceID: target.workspaceID, tabID: target.tabID)
+        else {
+            return false
+        }
+        guard let tab = workspace.composeTabs.first(where: { $0.id == target.tabID }),
+              tab.name == target.tabName
+        else {
+            return false
+        }
+        return agentModeViewModel.explicitActiveSessionID(for: target.tabID) == target.agentSessionID
+    }
+
+    func agentChatTitleClusterMenuSnapshot() -> AgentChatOptionsMenuSnapshot? {
+        guard let target = currentAgentTitlebarChatOptionsTarget(),
+              agentChatTitleClusterMenuTargetIsValid(target),
+              let tab = workspaceManager.activeWorkspace?.composeTabs.first(where: { $0.id == target.tabID })
+        else {
+            refreshAgentChatTitleCluster()
+            return nil
+        }
+        return AgentChatOptionsMenuSnapshot(
+            target: target,
+            isPinned: tab.isPinned,
+            copySessionIDTarget: agentModeViewModel.agentSessionCopyIDTarget(
+                tabID: target.tabID,
+                sessionID: target.agentSessionID,
+                tabName: tab.name
+            )
+        )
+    }
+
+    func agentChatTitleClusterMenuActions(
+        handoffInstructionsProvider: @escaping AgentSessionHandoffInstructionsProvider = {
+            GlobalSettingsStore.shared.agentSessionHandoffInstructions()
+        },
+        handoffOversizedFeedback: ((Int, Int) -> Void)? = nil,
+        copyToClipboard: @escaping (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> AgentChatOptionsMenuActions {
+        AgentChatOptionsMenuActions(
+            togglePin: { [weak self] target in
+                self?.toggleAgentChatPinFromTitlebar(target: target)
+            },
+            rename: { [weak self] target in
+                self?.renameAgentChatFromTitlebar(target: target)
+            },
+            stash: { [weak self] target in
+                self?.stashAgentChatFromTitlebar(target: target)
+            },
+            copyHandoffPrompt: { [weak self] target in
+                self?.copyAgentChatHandoffPromptFromTitlebar(
+                    target: target,
+                    handoffInstructionsProvider: handoffInstructionsProvider,
+                    handoffOversizedFeedback: handoffOversizedFeedback,
+                    copyToClipboard: copyToClipboard
+                )
+            },
+            copySessionID: { [weak self] target in
+                self?.copyAgentSessionIDFromTitlebar(target: target, copyToClipboard: copyToClipboard)
+            },
+            delete: { [weak self] target in
+                self?.confirmDeleteAgentChatFromTitlebar(target: target)
+            }
+        )
+    }
+
+    /// Titlebar Copy Session ID.
+    ///
+    /// Revalidates the generation-bearing capture immediately before writing. A stale capture writes
+    /// nothing to the clipboard and shows no confirmation, so the user is never told a copy happened
+    /// for a session that already rebound or closed.
+    @discardableResult
+    func copyAgentSessionIDFromTitlebar(
+        target: AgentSessionCopyIDTarget,
+        copyToClipboard: (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> Bool {
+        guard !isClosing,
+              target.windowID == windowID,
+              titlePresentationAdmits(workspaceID: target.workspaceID, tabID: target.tabID)
+        else { return false }
+        let copied = agentModeViewModel.copyAgentSessionID(
+            target: target,
+            isWindowClosing: isClosing,
+            copyToClipboard: copyToClipboard
+        )
+        guard copied else { return false }
+        agentChatTitleCluster.showCopiedNotice("Session ID copied")
+        return true
+    }
+
+    private func refreshAgentChatTitleCluster() {
+        agentChatTitleCluster.update(
+            title: displayedWindowTitle,
+            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
+        )
+    }
+
+    private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        promptManager.toggleComposeTabPinned(target.tabID)
+    }
+
+    private func copyAgentChatHandoffPromptFromTitlebar(
+        target: AgentChatOptionsMenuTarget,
+        handoffInstructionsProvider: AgentSessionHandoffInstructionsProvider,
+        handoffOversizedFeedback: ((Int, Int) -> Void)?,
+        copyToClipboard: (String) -> Void
+    ) {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let instructions = handoffInstructionsProvider()
+        let outcome = performAgentChatHandoffCopy(
+            target: target,
+            instructions: instructions,
+            copyToClipboard: copyToClipboard
+        )
+        guard case let .instructionsTooLong(count, maximum) = outcome else { return }
+        if let handoffOversizedFeedback {
+            handoffOversizedFeedback(count, maximum)
+        } else {
+            presentAgentChatHandoffInstructionsTooLongFeedback(count: count, maximum: maximum)
+        }
+    }
+
+    @discardableResult
+    private func performAgentChatHandoffCopy(
+        target: AgentChatOptionsMenuTarget,
+        instructions: String,
+        copyToClipboard: (String) -> Void
+    ) -> AgentChatHandoffCopyOutcome {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else {
+            return .staleTarget
+        }
+        switch AgentSessionHandoffInstructionsPolicy.validation(of: instructions) {
+        case .valid:
+            break
+        case let .tooLong(count, maximum):
+            return .instructionsTooLong(count: count, maximum: maximum)
+        }
+
+        let prompt = AgentSessionHandoffPrompt.render(
+            target: target,
+            cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName,
+            instructions: instructions
+        )
+        copyToClipboard(prompt)
+        return .copied
+    }
+
+    private func presentAgentChatHandoffInstructionsTooLongFeedback(count: Int, maximum: Int) {
+        guard !isClosing, let window = nsWindow, window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Handoff Instructions Too Long"
+        alert.informativeText = "The saved default contains \(count) characters; the maximum is \(maximum). Shorten or clear it in Settings → Agent Mode → Handoff Instructions, then try again."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
+    }
+
+    private func stashAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        Task { @MainActor [weak self] in
+            guard let self, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+            await promptManager.stashTab(
+                target.tabID,
+                isMutationContextCurrent: { [weak self] in
+                    self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+                }
+            )
+        }
+    }
+
+    private func renameAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let currentName = target.tabName
+        let alert = NSAlert()
+        alert.messageText = "Rename chat"
+        alert.informativeText = "Choose a new name for this chat."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(string: currentName)
+        input.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        input.selectText(nil)
+        alert.accessoryView = input
+
+        let applyRename: (NSApplication.ModalResponse) -> Void = { [weak self, weak input] response in
+            guard response == .alertFirstButtonReturn,
+                  let self,
+                  let input,
+                  agentChatTitleClusterMenuTargetIsValid(target)
+            else { return }
+            let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !newName.isEmpty, newName != currentName else { return }
+            agentModeViewModel.renameSession(tabID: target.tabID, to: newName)
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyRename)
+        } else {
+            applyRename(alert.runModal())
+        }
+    }
+
+    private func confirmDeleteAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete chat?"
+        alert.informativeText = "This permanently deletes “\(target.tabName)”."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+
+        let applyDelete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn,
+                  let self,
+                  agentChatTitleClusterMenuTargetIsValid(target)
+            else { return }
+            Task { @MainActor [weak self] in
+                guard let self, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+                #if DEBUG
+                    agentModeViewModel.debugBeginSidebarDeleteRequest(
+                        tabID: target.tabID,
+                        source: "WindowState.titlebarDelete",
+                        reason: "titlebar_delete_confirmation"
+                    )
+                #endif
+                await promptManager.closeComposeTab(
+                    target.tabID,
+                    isMutationContextCurrent: { [weak self] in
+                        self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+                    }
+                )
+            }
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyDelete)
+        } else {
+            applyDelete(alert.runModal())
+        }
+    }
+
+    /// Shows or hides the Agent mode New Session titlebar edge accessory.
     /// - Parameters:
     ///   - visible: Whether to show the accessory
     ///   - onNewSession: Action to call when button is tapped (required when visible is true)
@@ -744,11 +1554,13 @@ class WindowState: ObservableObject {
             guard !shouldSuppressObservationSideEffects else { return }
             wantsAgentTitlebarAccessory = true
             agentNewSessionAction = onNewSession
+            refreshAgentChatTitleCluster()
             applyAgentTitlebarAccessoryIfPossible()
         } else {
             wantsAgentTitlebarAccessory = false
             agentNewSessionAction = nil
             removeAgentTitlebarAccessory()
+            refreshAgentChatTitleCluster()
         }
     }
 
@@ -773,6 +1585,21 @@ class WindowState: ObservableObject {
             agentTitlebarAccessory = accessory
         }
         configureWindowChrome(for: window)
+        collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window else { return }
+            collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        }
+    }
+
+    private func collapseRedundantSingleWindowTabBarIfNeeded(for window: NSWindow) {
+        guard let tabbedWindows = window.tabbedWindows,
+              tabbedWindows.count == 1,
+              window.tabGroup?.isTabBarVisible == true
+        else {
+            return
+        }
+        window.toggleTabBar(nil)
     }
 
     /// Removes the titlebar accessory from the window
@@ -797,9 +1624,10 @@ class WindowState: ObservableObject {
         guard !shouldSuppressObservationSideEffects else { return }
         pendingWindowTitleUpdateTask?.cancel()
         pendingWindowTitleUpdateTask = Task { [weak self] in
-            guard let self else { return }
-            // Ensure this cannot run re-entrantly during a layout/constraints pass.
+            // Ensure this cannot run re-entrantly during a layout/constraints pass. Resolve `self`
+            // only after the hop: a deferred title update must never keep a closing window alive.
             await Task.yield()
+            guard let self else { return }
             guard !shouldSuppressObservationSideEffects else { return }
             performWindowTitleUpdateIfWorkspaceAvailable()
         }
@@ -807,7 +1635,10 @@ class WindowState: ObservableObject {
 
     @MainActor
     private func performWindowTitleUpdateIfWorkspaceAvailable() {
-        applyWindowTitleIfNeeded(resolvedWindowTitle())
+        applyCoherentWindowTitle()
+        #if DEBUG
+            windowTitleResolutionDidCompleteHandlerForTesting?()
+        #endif
     }
 
     // ------------------------------------------------------------------
@@ -815,7 +1646,7 @@ class WindowState: ObservableObject {
 
     /// ------------------------------------------------------------------
     func startMCPServer() {
-        Task { try? await WindowState.sharedMCPService.join(windowID: windowID) }
+        Task { await WindowState.sharedMCPService.join(windowID: windowID) }
     }
 
     func stopMCPServer() {
@@ -834,9 +1665,41 @@ class WindowState: ObservableObject {
         return (decoded as NSString).expandingTildeInPath
     }
 
-    func enqueueCommand(_ command: AppCommand) {
-        commandQueue.append(command)
-        // If the workspace manager is already initialized, process now
+    func enqueueCommand(
+        _ command: AppCommand,
+        completion: AppCommandCompletion? = nil
+    ) {
+        let folderRoute: FolderRouteState = if let folderPath = command.folderPath, !folderPath.isEmpty {
+            .unresolved(expectedRoot: WorkspaceRootSetKey(paths: [folderPath]))
+        } else {
+            .notRequested
+        }
+        enqueueCommand(command, folderRoute: folderRoute, completion: completion)
+    }
+
+    func enqueueCommand(
+        _ command: AppCommand,
+        folderRoute: FolderRouteState,
+        completion: AppCommandCompletion? = nil
+    ) {
+        let queuedCommand = AppCommandLifetime(
+            command: command,
+            folderRoute: folderRoute,
+            windowID: windowID,
+            completion: completion
+        )
+        enqueueQueuedCommand(queuedCommand)
+    }
+
+    private func enqueueQueuedCommand(_ queuedCommand: AppCommandLifetime) {
+        guard !isClosing else {
+            queuedCommand.windowClosed(in: windowID)
+            return
+        }
+        commandQueue.append(queuedCommand)
+        #if DEBUG
+            guard automaticallyProcessesEnqueuedCommands else { return }
+        #endif
         if workspaceManager.isInitialized {
             Task { await processCommands() }
         }
@@ -846,41 +1709,82 @@ class WindowState: ObservableObject {
     /// after the restore attempt finished (successfully or not) or when the entry is
     /// skipped, so callers can release restore-in-progress guards.
     func applyWindowRestoreEntry(_ entry: WindowSessionEntry, completion: (() -> Void)? = nil) {
+        guard !isClosing else {
+            completion?()
+            return
+        }
         guard !entry.isEphemeral else {
             completion?()
             return
         }
-        // Never drop a previously pending completion if the entry is replaced.
-        pendingRestoreCompletion?()
-        pendingRestoreEntry = entry
-        pendingRestoreCompletion = completion
+        // Protection is armed at acceptance, not dispatch: termination can persist the session
+        // before the restore (or failed startup) runs. The newer state is installed before the
+        // displaced completion runs so reentrant capture or explicit intent sees it.
+        let displacedCompletion = restoreLifetime.accept(entry, completion: completion)
+        displacedCompletion?()
+        StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
     }
 
-    private func applyPendingRestoreEntryIfPossible() {
-        guard workspaceManager.isInitialized else { return }
-        guard let entry = pendingRestoreEntry else { return }
-        pendingRestoreEntry = nil
-        let completion = pendingRestoreCompletion
-        pendingRestoreCompletion = nil
+    /// Completes a not-yet-dispatched restore exactly once without dispatching it. Its protection
+    /// is untouched, so session capture keeps the requested entry if explicit intent is refused.
+    private func retirePendingRestoreEntry() {
+        let completion = restoreLifetime.retirePending()
+        completion?()
+    }
 
+    private func applyPendingRestoreEntryIfPossible() {
+        guard !isClosing else { return }
+        guard workspaceManager.isInitialized else { return }
+        // The dispatch task owns this acceptance's completion from here on, even if a newer
+        // acceptance arrives before it finishes.
+        guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
+
+        StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
-            await restoreWorkspace(from: entry)
-            completion?()
+            if !self.isClosing {
+                await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            }
+            dispatch.completion?()
         }
     }
 
-    private func restoreWorkspace(from entry: WindowSessionEntry) async {
+    private func restoreWorkspace(from entry: WindowSessionEntry, acceptanceSequence: UInt64) async {
+        let restoreSpan = StartupPhaseLog.begin(.restoreWorkspace, window: windowID)
+        var resolvedTarget = 0
+        var switchOutcome: StartupPhaseLog.SwitchOutcome?
+        defer {
+            var fields = ["resolved": resolvedTarget]
+            if let switchOutcome {
+                fields["switch_result"] = switchOutcome.rawValue
+            }
+            restoreSpan.end(extraFields: fields)
+        }
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
+        // Protection was armed when this entry was accepted and is released only once a real
+        // workspace is published after that acceptance. Resolving a target does not prove the
+        // switch took, so releasing on resolution alone would let a refused switch persist the
+        // Default fallback over the snapshot.
         if let target = resolveWorkspace(for: entry) {
+            resolvedTarget = 1
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
                 )
             #endif
-            _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            if target.isSystemWorkspace {
+                // The entry intended the system workspace, so the fallback state and the intended
+                // state coincide and there is nothing to protect. Clearing here keeps such a window
+                // capturing live state instead of re-emitting its restore-time entry for good --
+                // the selection observer only fires for non-system workspaces. Scoped to this
+                // acceptance so it never releases a newer one.
+                restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
+            }
+            switchOutcome = await StartupPhaseLog.SwitchOutcome(
+                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+            )
             #if DEBUG
                 if let restoreStartMS {
                     WorkspaceRestorePerfLog.log(
@@ -898,7 +1802,97 @@ class WindowState: ObservableObject {
                 )
             }
         #endif
-        // No existing workspace matches; leave the window in its default state.
+        // No existing workspace matches; leave the window in its default state. The protection
+        // armed at acceptance stays set, so session capture re-emits it instead of persisting the
+        // Default fallback, which would discard the user's real window layout.
+    }
+
+    /// Clear on an actual published departure, not a later capture/switch-flag observation. A
+    /// System/ephemeral/unloaded stop must not resurrect an older persistent identity on return.
+    private func noteActiveWorkspacePublishedForCapture(_ workspaceID: UUID?) {
+        guard let workspaceID else {
+            lastCoherentSessionEntry = nil
+            return
+        }
+        if let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+           workspace.isSystemWorkspace || workspace.isEphemeral
+        {
+            lastCoherentSessionEntry = nil
+        }
+    }
+
+    private func makeLiveSessionEntry(for workspace: WorkspaceModel) -> WindowSessionEntry {
+        WindowSessionEntry(
+            windowKind: kind,
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            isSystemWorkspace: workspace.isSystemWorkspace,
+            isEphemeral: workspace.isEphemeral,
+            primaryRepoPath: workspace.repoPaths.first.map { ($0 as NSString).expandingTildeInPath },
+            lastFocused: isCurrentlyFocused,
+            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
+        )
+    }
+
+    /// Assignment installation captures immediately, even if no ordinary persist happened before
+    /// the next switch. Nil during termination leaves the last complete persistent entry intact.
+    private func refreshCoherentSessionEntry() {
+        guard let workspace = workspaceManager.activeWorkspace,
+              !workspace.isSystemWorkspace, !workspace.isEphemeral
+        else {
+            lastCoherentSessionEntry = nil
+            return
+        }
+        guard workspaceInstanceNumber(for: workspace.id) != nil else { return }
+        lastCoherentSessionEntry = makeLiveSessionEntry(for: workspace)
+    }
+
+    /// This window's session-capture decision, computed from the authoritative live selection.
+    /// Explicit-close exclusion and persistence gating stay in `WindowStatesManager`, so a
+    /// closing window still reports its candidate here.
+    func sessionCaptureCandidate() -> WindowSessionCaptureCandidate {
+        let workspace = workspaceManager.activeWorkspace
+        let selection: WindowRestoreLifetime.LiveSelection = switch workspace {
+        case nil: .none
+        case let workspace? where workspace.isEphemeral: .ephemeral
+        case let workspace? where workspace.isSystemWorkspace: .system
+        case .some: .persistent
+        }
+
+        switch restoreLifetime.captureDisposition(for: selection) {
+        case .omit:
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+        case let .preserve(entry):
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
+        case .captureLive:
+            guard let workspace else {
+                return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+            }
+            if !workspace.isSystemWorkspace, !workspace.isEphemeral,
+               workspaceInstanceNumber(for: workspace.id) == nil
+            {
+                guard var retained = lastCoherentSessionEntry else {
+                    return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+                }
+                let isOutgoingSwitchGap = workspaceManager.isSwitchingWorkspace
+                    && workspaceManager.activeWorkspaceSwitch.map { activity in
+                        activity.targetWorkspaceID == workspace.id
+                            && activity.previousWorkspaceID == retained.workspaceID
+                            && activity.previousWorkspaceID != workspace.id
+                    } == true
+                let isTerminatingCurrentIdentity = (windowStatesManager ?? WindowStatesManager.shared).isTerminating
+                    && retained.workspaceID == workspace.id
+                guard isOutgoingSwitchGap || isTerminatingCurrentIdentity else {
+                    return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+                }
+                // Only a proven switch gap retains outgoing metadata. Live MCP stays unassigned.
+                retained.lastFocused = isCurrentlyFocused
+                return WindowSessionCaptureCandidate(windowID: windowID, entry: retained)
+            }
+            let entry = makeLiveSessionEntry(for: workspace)
+            lastCoherentSessionEntry = workspace.isSystemWorkspace || workspace.isEphemeral ? nil : entry
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
+        }
     }
 
     private func resolveWorkspace(for entry: WindowSessionEntry) -> WorkspaceModel? {
@@ -937,9 +1931,46 @@ class WindowState: ObservableObject {
     // No workspace creation fallback; restoration is best-effort for existing workspaces only.
 
     func processCommands() async {
-        while !commandQueue.isEmpty {
-            let command = commandQueue.removeFirst()
-            await handleCommand(command)
+        guard !isProcessingCommandQueue else { return }
+        isProcessingCommandQueue = true
+        defer { isProcessingCommandQueue = false }
+
+        while let queuedCommand = commandQueue.first {
+            guard queuedCommand.beginExecution(in: windowID) else {
+                commandQueue.removeFirst()
+                continue
+            }
+            let outcome: CommandHandlingOutcome = if Task.isCancelled {
+                .terminal(.cancelled)
+            } else if isClosing {
+                .terminal(.failed(.windowClosed))
+            } else {
+                await handleCommand(queuedCommand)
+            }
+
+            // Close retains the executing entry. Detach it before any transition
+            // can invoke a completion that reenters this window's queue.
+            commandQueue.removeFirst()
+            switch outcome {
+            case let .terminal(result):
+                queuedCommand.finish(result, in: windowID)
+            case let .retry(expectedRoot, failure):
+                if queuedCommand.retry(expectedRoot: expectedRoot, failure: failure, in: windowID) {
+                    commandQueue.insert(queuedCommand, at: 0)
+                }
+            case let .forward(targetWindow, folderRoute):
+                if queuedCommand.transfer(to: targetWindow.windowID, route: folderRoute, from: windowID) {
+                    targetWindow.enqueueQueuedCommand(queuedCommand)
+                }
+            }
+        }
+    }
+
+    private func failUnstartedCommandsForWindowClose() {
+        let closingCommands = commandQueue
+        commandQueue.removeAll { !$0.isExecuting(in: windowID) }
+        for command in closingCommands {
+            command.windowClosed(in: windowID)
         }
     }
 
@@ -1018,7 +2049,16 @@ class WindowState: ObservableObject {
         } else {
             focusWindowIfPossible()
         }
+        if route.interactionID != nil {
+            agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
+        }
         return .routed
+    }
+
+    /// Whether the given agent session is the transcript the user is looking at in this window.
+    func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
+        guard !isClosing, isCurrentlyFocused else { return false }
+        return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
     }
 
     @MainActor
@@ -1043,6 +2083,15 @@ class WindowState: ObservableObject {
     }
 
     // MARK: - Handling URL commands
+
+    func decodeOpenCommand(from url: URL) -> AppCommand? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              AppDeepLinkURLScheme.isSupported(components.scheme)
+        else {
+            return nil
+        }
+        return decodeOpenCommand(from: components)
+    }
 
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -1090,225 +2139,674 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match canonical repoprompt-ce://open/~/MyProject links
-        guard let host = comps.host?.lowercased(), host == "open" else {
+        guard let command = decodeOpenCommand(from: comps) else {
             return
         }
+        enqueueCommand(command)
+    }
 
-        // Strip leading slash from comps.path if present
-        var rawFolderPath = comps.path
+    private func decodeOpenCommand(from components: URLComponents) -> AppCommand? {
+        guard components.host?.lowercased() == "open" else {
+            return nil
+        }
+
+        var rawFolderPath = components.path
         if rawFolderPath.hasPrefix("/") {
             rawFolderPath.removeFirst()
         }
         let folderPath = rawFolderPath.isEmpty ? nil : decodeAndExpandTilde(rawFolderPath)
 
-        // Extract workspaceName from ?workspace= param
-        let workspaceName = comps.queryItems?
+        let workspaceName = components.queryItems?
             .filter { $0.name == "workspace" }
             .compactMap { $0.value?.trimmingCharacters(in: .whitespaces) }
             .last
 
-        // Extract fileList from ?files= param(s)
-        let fileList: [String] = comps.queryItems?
+        let fileList: [String] = components.queryItems?
             .filter { $0.name == "files" }
             .compactMap(\.value)
             .flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
             .map { decodeAndExpandTilde($0) }
             ?? []
 
-        // Concatenate multiple prompt= params with spaces
-        let promptParts = comps.queryItems?
+        let promptParts = components.queryItems?
             .filter { $0.name == "prompt" }
             .compactMap { $0.value?.removingPercentEncoding }
             ?? []
         let promptText = promptParts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let finalPrompt = promptText.isEmpty ? nil : promptText
 
-        /// Parse focus, ephemeral, persist flags
         func boolFromQuery(_ name: String) -> Bool? {
-            guard let val = comps.queryItems?.first(where: { $0.name == name })?.value else {
+            guard let value = components.queryItems?.first(where: { $0.name == name })?.value else {
                 return nil
             }
-            let lower = val.lowercased()
-            if lower == "true" || lower == "1" { return true }
-            if lower == "false" || lower == "0" { return false }
-            return nil
+            switch value.lowercased() {
+            case "true", "1":
+                return true
+            case "false", "0":
+                return false
+            default:
+                return nil
+            }
         }
-        let focusFlag = boolFromQuery("focus")
-        let ephemeralFlag = boolFromQuery("ephemeral")
-        let persistFlag = boolFromQuery("persist")
 
-        // Build an AppCommand
-        let command = AppCommand(
+        return AppCommand(
             workspaceName: workspaceName,
             fileList: fileList,
             promptText: finalPrompt,
             folderPath: folderPath,
             newPrompt: nil,
-            focus: focusFlag,
-            ephemeral: ephemeralFlag,
-            persist: persistFlag
+            focus: boolFromQuery("focus"),
+            ephemeral: boolFromQuery("ephemeral"),
+            persist: boolFromQuery("persist")
         )
-
-        // If we want to focus an existing window for the same folderPath, do that
-        if focusFlag == true, let folderPath {
-            if let wsManager = windowStatesManager,
-               let existingWindow = wsManager.findWindowState(forFolderPath: folderPath),
-               existingWindow !== self
-            {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                existingWindow.focusWindowIfPossible()
-                existingWindow.enqueueCommand(command)
-                return
-            }
-        }
-
-        enqueueCommand(command)
     }
 
     @MainActor
-    private func handleCommand(_ command: AppCommand) async {
-        // Determine ephemeral once at the start
-        let shouldBeEphemeral = (command.ephemeral == true || command.persist == false)
-        var requestedWorkspaceSwitch = false
-        var didSwitchWorkspace = false
-
-        // Apply new prompt if provided
-        if let prompt = command.newPrompt {
-            // 1. add to the PromptViewModel's storage
-            let stored = promptManager.addStoredPrompt(
-                title: prompt.title,
-                content: prompt.content
+    private func handleCommand(_ queuedCommand: AppCommandLifetime) async -> CommandHandlingOutcome {
+        let command = queuedCommand.command
+        if let folderPath = command.folderPath, !folderPath.isEmpty {
+            return await handleFolderCommand(
+                queuedCommand,
+                folderPath: folderPath,
+                shouldBeEphemeral: command.ephemeral == true || command.persist == false
             )
-            // 2. select it so it appears checked/active
-            promptManager.selectNewPrompt(stored)
+        }
+        return await handleNonFolderCommand(queuedCommand)
+    }
 
-            // 3. if this window isn't front-most and focus flag was set, focus us
-            if command.focus == true {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                focusWindowIfPossible()
+    private func handleFolderCommand(
+        _ queuedCommand: AppCommandLifetime,
+        folderPath: String,
+        shouldBeEphemeral: Bool
+    ) async -> CommandHandlingOutcome {
+        let folderURL = URL(fileURLWithPath: folderPath).standardizedFileURL
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderURL.path])
+        guard !expectedRoot.isEmpty,
+              queuedCommand.folderRoute.expectedRoot == expectedRoot
+        else {
+            return .terminal(.failed(.invalidFolder))
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return .terminal(.failed(.invalidFolder))
+        }
+
+        let resolution = await resolveFolderTarget(
+            for: queuedCommand,
+            folderURL: folderURL,
+            expectedRoot: expectedRoot,
+            shouldBeEphemeral: shouldBeEphemeral
+        )
+        let target: ResolvedFolderTarget
+        switch resolution {
+        case let .resolved(resolvedTarget):
+            target = resolvedTarget
+        case let .retry(expectedRoot, failure):
+            return .retry(expectedRoot: expectedRoot, failure: failure)
+        case let .terminal(result):
+            return .terminal(result)
+        }
+
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        if let forwardingOutcome = forwardingOutcome(
+            for: target,
+            expectedRoot: expectedRoot,
+            queuedCommand: queuedCommand
+        ) {
+            return forwardingOutcome
+        }
+
+        let switchResult = await workspaceManager.activateFolderOpenWorkspace(
+            target.workspace,
+            expectedRoot: expectedRoot,
+            activationState: target.activationState,
+            policy: .appCommand
+        )
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        switch switchResult {
+        case .switched:
+            break
+        case .cancelled:
+            return .terminal(.cancelled)
+        case .blocked:
+            return .terminal(.failed(.workspaceSwitchBlocked))
+        }
+
+        guard let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == target.workspace.id
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+        let admitsLocalEphemeralTarget = activeWorkspace.isEphemeral
+            && target.source.permitsLocalEphemeralAdmission
+        guard WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderURL.path,
+            in: [activeWorkspace],
+            admittingEphemeral: admitsLocalEphemeralTarget
+        )?.id == target.workspace.id else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        if !admitsLocalEphemeralTarget {
+            let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+            do {
+                selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+            } catch is CancellationError {
+                return .terminal(.cancelled)
+            } catch {
+                return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
             }
-
-            // If we only have a prompt command with no other parameters, we're done
-            if command.folderPath == nil, command.workspaceName == nil,
-               command.fileList.isEmpty, command.promptText == nil
-            {
-                return
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            if case .recoveryBlocked = selection {
+                return .terminal(.failed(.authorityFailure))
+            }
+            guard case let .matched(authoritativeTarget) = selection,
+                  authoritativeTarget.id == target.workspace.id,
+                  WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeTarget),
+                  WorkspaceFolderOpenResolver.bestEligibleMatch(
+                      forFolderPath: folderURL.path,
+                      in: [authoritativeTarget]
+                  )?.id == target.workspace.id
+            else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .routeChangedAfterRetry
+                )
             }
         }
 
-        // If we have a folder path, try to open or create a workspace for it
-        if let folderPath = command.folderPath, !folderPath.isEmpty {
-            let folderURL = URL(fileURLWithPath: folderPath).standardizedFileURL
-            var isDir: ObjCBool = false
+        guard let payloadAdmissionWorkspace = workspaceManager.activeWorkspace,
+              payloadAdmissionWorkspace.id == target.workspace.id,
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [payloadAdmissionWorkspace],
+                  admittingEphemeral: payloadAdmissionWorkspace.isEphemeral
+                      && target.source.permitsLocalEphemeralAdmission
+              )?.id == target.workspace.id
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
 
-            if !FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDir) || !isDir.boolValue {
-                // Not a valid directory
-                return
-            }
+        guard applyStoredPromptIfNeeded(queuedCommand.command) else {
+            return .terminal(.failed(.payloadApplicationFailed))
+        }
+        return await applyRemainingPayload(queuedCommand.command)
+    }
 
-            // Try to find an existing workspace referencing this folder
-            if let existingWorkspace = workspaceManager.workspaces.first(where: { ws in
-                ws.repoPaths.contains { repoPath in
-                    let repoURL = URL(fileURLWithPath: (repoPath as NSString).expandingTildeInPath)
-                        .standardizedFileURL
-                    return repoURL == folderURL
-                }
-            }) {
-                // If ephemeral == true, mark existing workspace ephemeral (edge case)
-                if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
-                }
+    private func resolveFolderTarget(
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey,
+        shouldBeEphemeral: Bool
+    ) async -> FolderTargetResolution {
+        if case let .pendingPersistentPublication(publication) = queuedCommand.folderRoute {
+            return await resolvePendingPersistentFolderTarget(
+                publication,
+                for: queuedCommand,
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        }
+        if shouldBeEphemeral {
+            return await resolveEphemeralFolderTarget(
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        }
 
-                // If focus == true, attempt to bring up an existing window
-                if command.focus == true {
-                    if let wsManager = windowStatesManager,
-                       let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id)
-                    {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        existingWindow.focusWindowIfPossible()
-                        return
-                    }
-                }
+        switch queuedCommand.folderRoute {
+        case .notRequested:
+            return .terminal(.failed(.invalidFolder))
+        case .unresolved, .authorityExactRoot:
+            return await resolvePersistentFolderTarget(
+                for: queuedCommand,
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        case .pendingPersistentPublication:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        case .ephemeralLiveWindowSupplement:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .workspaceUnavailable
+            )
+        }
+    }
 
-                // Switch to the existing workspace in this window
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: existingWorkspace, saveState: true)
-                didSwitchWorkspace = result.didSwitch
-            } else {
-                // Create a brand-new workspace
-                let nameGuess = folderURL.lastPathComponent
-                let workspaceName = workspaceManager.uniqueWorkspaceName(baseName: nameGuess)
+    private func resolvePendingPersistentFolderTarget(
+        _ publication: PendingPersistentWorkspacePublication,
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
+        guard publication.expectedRoot == expectedRoot else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
 
-                // Pass ephemeral to createWorkspace
-                let newWS = workspaceManager.createWorkspace(
-                    name: workspaceName,
-                    repoPaths: [folderURL.path],
-                    ephemeral: shouldBeEphemeral
+        do {
+            let outcome = try await publication.join()
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
+            else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .authorityFailure
                 )
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: newWS, saveState: true)
-                didSwitchWorkspace = result.didSwitch
             }
-        } else if let workspaceName = command.workspaceName, !workspaceName.isEmpty {
-            // Look for an existing workspace by name
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .authorityFailure
+            )
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+        do {
+            selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        if case .recoveryBlocked = selection {
+            return .terminal(.failed(.authorityFailure))
+        }
+        guard case let .matched(authoritativeWorkspace) = selection,
+              authoritativeWorkspace.id == publication.workspaceID,
+              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeWorkspace),
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [authoritativeWorkspace]
+              )?.id == publication.workspaceID
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        queuedCommand.recordPendingPublicationReuse()
+        return .resolved(ResolvedFolderTarget(
+            workspace: authoritativeWorkspace,
+            source: .pendingPersistentPublication(publication),
+            activationState: activationState
+        ))
+    }
+
+    private func resolvePersistentFolderTarget(
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        do {
+            let resolution = try await queuedCommand.resolvePersistentFolder(expectedRoot: expectedRoot) {
+                try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                    fromFolderURL: folderURL
+                )
+            }
+            #if DEBUG
+                if resolution.provenance == .created, resolution.creationCommitted {
+                    persistentFolderCreationCommitDidRecordHandlerForTesting?(
+                        resolution.workspace.id
+                    )
+                }
+            #endif
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            let workspace = resolution.workspace
+            guard WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: workspace) else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .routeChangedAfterRetry
+                )
+            }
+            return .resolved(ResolvedFolderTarget(
+                workspace: workspace,
+                source: .authority,
+                activationState: resolution.activationState
+            ))
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch let error as DomainWorkspaceAuthorityOperationError
+            where error.outcome.diagnostic == "exact_root_selection_changed"
+        {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        } catch let error as DomainWorkspaceAuthorityOperationError
+            where error.outcome.errorCode == .workspaceUnavailable
+        {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .workspaceUnavailable
+            )
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+    }
+
+    private func resolveEphemeralFolderTarget(
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
+        guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+        do {
+            selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        // Reserve excluded catalog IDs too, so stale ephemeral copies cannot replace their owners.
+        let catalogWorkspaceIDs = Set(routingCatalog.map(\.id))
+        var representations: [UUID: FolderCandidateRepresentation] = [:]
+        for workspace in routingCatalog where workspace.isEphemeral {
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .ephemeralLiveWindow(self)
+            )
+        }
+        let recoveryBlocked: Bool
+        switch selection {
+        case let .matched(workspace):
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .authority
+            )
+            recoveryBlocked = false
+        case .noMatch:
+            recoveryBlocked = false
+        case .recoveryBlocked:
+            recoveryBlocked = true
+        case .changed:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        for workspace in workspaceManager.workspaces
+            where workspace.isEphemeral
+            && !catalogWorkspaceIDs.contains(workspace.id)
+            && representations[workspace.id] == nil
+        {
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .ephemeralLiveWindow(self)
+            )
+        }
+        let liveWindows = (windowStatesManager?.allWindows ?? [self]).filter { !$0.isClosing }
+        for window in liveWindows {
+            if let activeWorkspace = window.workspaceManager.activeWorkspace,
+               activeWorkspace.isEphemeral,
+               !catalogWorkspaceIDs.contains(activeWorkspace.id),
+               representations[activeWorkspace.id] == nil
+            {
+                representations[activeWorkspace.id] = FolderCandidateRepresentation(
+                    workspace: activeWorkspace,
+                    source: .ephemeralLiveWindow(window)
+                )
+            }
+        }
+
+        let candidates = representations.values.map(\.workspace)
+        if let winner = WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderURL.path,
+            in: candidates,
+            admittingEphemeral: true
+        ), let representation = representations[winner.id] {
+            return .resolved(ResolvedFolderTarget(
+                workspace: winner,
+                source: representation.source,
+                activationState: activationState
+            ))
+        }
+
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        // Blocked persistent recovery permits ephemeral reuse, but is not a no-match creation path.
+        guard !recoveryBlocked else {
+            return .terminal(.failed(.authorityFailure))
+        }
+
+        let workspace = workspaceManager.createWorkspace(
+            name: workspaceManager.uniqueWorkspaceName(baseName: folderURL.lastPathComponent),
+            repoPaths: [folderURL.path],
+            ephemeral: true
+        )
+        return .resolved(ResolvedFolderTarget(
+            workspace: workspace,
+            source: .ephemeralLiveWindow(self),
+            activationState: activationState
+        ))
+    }
+
+    private func forwardingOutcome(
+        for target: ResolvedFolderTarget,
+        expectedRoot: WorkspaceRootSetKey,
+        queuedCommand: AppCommandLifetime
+    ) -> CommandHandlingOutcome? {
+        if case let .ephemeralLiveWindow(owningWindow) = target.source,
+           owningWindow !== self
+        {
+            guard !owningWindow.isClosing else {
+                return .terminal(.failed(.workspaceUnavailable))
+            }
+            guard queuedCommand.canForward(to: owningWindow.windowID)
+            else {
+                return .terminal(.failed(.routeChangedAfterRetry))
+            }
+            return .forward(
+                owningWindow,
+                target.source.route(
+                    workspaceID: target.workspace.id,
+                    expectedRoot: expectedRoot
+                )
+            )
+        }
+
+        guard queuedCommand.command.focus == true,
+              let windowStatesManager,
+              let activeWindow = windowStatesManager.allWindows.first(where: { window in
+                  guard window !== self,
+                        !window.isClosing,
+                        queuedCommand.canForward(to: window.windowID),
+                        let activeWorkspace = window.workspaceManager.activeWorkspace,
+                        activeWorkspace.id == target.workspace.id
+                  else {
+                      return false
+                  }
+                  return WorkspaceFolderOpenResolver.containsExactRoot(
+                      expectedRoot,
+                      in: activeWorkspace
+                  )
+              })
+        else {
+            return nil
+        }
+        return .forward(
+            activeWindow,
+            target.source.route(
+                workspaceID: target.workspace.id,
+                expectedRoot: expectedRoot
+            )
+        )
+    }
+
+    private func commandInterruptionResult() -> AppCommandExecutionResult? {
+        if Task.isCancelled {
+            return .cancelled
+        }
+        if isClosing {
+            return .failed(.windowClosed)
+        }
+        return nil
+    }
+
+    private func handleNonFolderCommand(
+        _ queuedCommand: AppCommandLifetime
+    ) async -> CommandHandlingOutcome {
+        let command = queuedCommand.command
+        guard applyStoredPromptIfNeeded(command) else {
+            return .terminal(.failed(.payloadApplicationFailed))
+        }
+
+        if command.newPrompt != nil, command.focus == true {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            focusWindowIfPossible()
+        }
+        if command.newPrompt != nil,
+           command.workspaceName == nil,
+           command.fileList.isEmpty,
+           command.promptText == nil
+        {
+            return .terminal(.completed(workspaceID: workspaceManager.activeWorkspaceID))
+        }
+
+        if let workspaceName = command.workspaceName, !workspaceName.isEmpty {
+            let targetWorkspace: WorkspaceModel
             if let existing = workspaceManager.workspaces.first(where: { $0.name == workspaceName }) {
-                // If ephemeral == true, mark that workspace ephemeral
-                if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
+                if command.ephemeral == true || command.persist == false,
+                   let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id })
+                {
+                    workspaceManager.workspaces[index].isEphemeral = true
                 }
-
-                // If focus == true, attempt to bring up existing window
-                if command.focus == true {
-                    if let wsManager = windowStatesManager,
-                       let existingWindow = wsManager.findWindowState(showing: existing.id)
-                    {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        existingWindow.focusWindowIfPossible()
-                        return
-                    }
+                if command.focus == true,
+                   let windowStatesManager,
+                   let existingWindow = windowStatesManager.findWindowState(showing: existing.id)
+                {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    existingWindow.focusWindowIfPossible()
+                    return .terminal(.completed(workspaceID: existing.id))
                 }
-
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: existing, saveState: true)
-                didSwitchWorkspace = result.didSwitch
+                targetWorkspace = existing
             } else {
-                // Create a new workspace by name
-                let newWS = workspaceManager.createWorkspace(
+                targetWorkspace = workspaceManager.createWorkspace(
                     name: workspaceName,
                     repoPaths: [],
-                    ephemeral: shouldBeEphemeral
+                    ephemeral: command.ephemeral == true || command.persist == false
                 )
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: newWS, saveState: true)
-                didSwitchWorkspace = result.didSwitch
+            }
+
+            let switchResult = await workspaceManager.requestWorkspaceSwitch(
+                to: targetWorkspace,
+                saveState: true
+            )
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            switch switchResult {
+            case .switched:
+                break
+            case .cancelled:
+                return .terminal(.cancelled)
+            case .blocked:
+                return .terminal(.failed(.workspaceSwitchBlocked))
             }
         }
 
-        // If we now have an active workspace, apply file selection, prompt text, etc.
-        if requestedWorkspaceSwitch, !didSwitchWorkspace {
-            return
-        }
         guard workspaceManager.activeWorkspace != nil else {
-            return
+            return .terminal(.failed(.workspaceUnavailable))
         }
+        return await applyRemainingPayload(command)
+    }
 
+    private func applyStoredPromptIfNeeded(_ command: AppCommand) -> Bool {
+        guard let prompt = command.newPrompt else { return true }
+        let result = promptManager.addStoredPrompt(
+            title: prompt.title,
+            content: prompt.content
+        )
+        switch result {
+        case let .created(stored):
+            promptManager.selectNewPrompt(stored)
+            return true
+        case .persistenceFailed:
+            presentStoredPromptCommandPersistenceFailure()
+            return false
+        }
+    }
+
+    private func applyRemainingPayload(
+        _ command: AppCommand
+    ) async -> CommandHandlingOutcome {
         if !command.fileList.isEmpty {
             await workspaceFilesViewModel.selectFiles(withPaths: command.fileList)
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
         }
 
         if let prompt = command.promptText, !prompt.isEmpty {
             promptManager.promptText = prompt
         }
-
-        // If focus == true and we haven't switched to another window yet, bring ourselves front
         if command.focus == true {
             NSApplication.shared.activate(ignoringOtherApps: true)
             focusWindowIfPossible()
+        }
+        return .terminal(.completed(workspaceID: workspaceManager.activeWorkspaceID))
+    }
+
+    private func presentStoredPromptCommandPersistenceFailure() {
+        let alert = NSAlert()
+        alert.messageText = "Stored Prompt Could Not Be Saved"
+        alert.informativeText = "The command was stopped because the stored prompt could not be written."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        if let nsWindow, nsWindow.attachedSheet == nil {
+            alert.beginSheetModal(for: nsWindow)
+        } else {
+            alert.runModal()
         }
     }
 
@@ -1325,6 +2823,12 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
+        await workspaceManager.awaitInitialWorkspaceActivationCompletion()
+        // Finish this window's own saves (including the final `onDisappear` capture) before any
+        // teardown step can stop the presentation that owns them (#1089).
+        await workspaceManager.awaitOwnSavesForWindowClose()
+        await workspaceManager.awaitRootReconciliationShutdown()
         await promptManager.gitViewModel.shutdownForWindowClose()
 
         let isAppTermination = WindowStatesManager.shared.isTerminating
@@ -1338,6 +2842,13 @@ class WindowState: ObservableObject {
                 settingsManager.commitAllVisitedWorkspaces()
             }
         }
+
+        // Stop domain projection before removing the presentation incarnation. The bridge owns
+        // a long-lived subscription, so explicit cancellation is required to bound closed-window
+        // memory and prevent stale windows from multiplying catalog snapshot work.
+        domainWorkspacePresentationBridge?.stop()
+        await mcpServer.unregisterDomainRoutingWindow()
+        mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.
@@ -1379,9 +2890,8 @@ class WindowState: ObservableObject {
 
     /// Attempts to bring this window to the front if possible
     func focusWindowIfPossible() {
-        // Since WindowState is not an NSWindow, we can only activate the app
-        // The window itself will be brought forward by the system
         NSApplication.shared.activate(ignoringOtherApps: true)
+        nsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @discardableResult

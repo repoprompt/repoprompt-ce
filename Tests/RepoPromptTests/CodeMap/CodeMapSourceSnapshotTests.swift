@@ -1,5 +1,7 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
+import RepoPromptFileSystem
 import XCTest
 
 final class CodeMapSourceSnapshotTests: XCTestCase {

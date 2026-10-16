@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {
     case missingFrozenTarget
@@ -164,6 +166,13 @@ enum ContextBuilderReviewTargetResolution: Equatable {
     var availableTarget: ContextBuilderReviewTarget? {
         guard case let .available(target) = self else { return nil }
         return target
+    }
+
+    /// Without an elected target, nested Git calls must name `repo_root`/`repo_key` and may not
+    /// publish artifacts. Shared by the Git admission policy and the discovery prompt so the
+    /// prompt never instructs calls the policy refuses.
+    var restrictsGitToExplicitReadOnly: Bool {
+        availableTarget == nil
     }
 }
 
@@ -834,7 +843,7 @@ struct ContextBuilderReviewTargetResolver {
         let isSessionWorktreeRoot: Bool = switch lookupContext.rootScope {
         case let .sessionBoundWorkspace(_, physicalRootPaths):
             physicalRootPaths.contains(physicalRoot.standardizedFullPath)
-        case let .validatedSessionBoundWorkspace(_, physicalRoots):
+        case let .validatedSessionBoundWorkspace(_, physicalRoots, _):
             physicalRoots.contains(where: {
                 $0.id == physicalRoot.id
                     && $0.standardizedFullPath == physicalRoot.standardizedFullPath

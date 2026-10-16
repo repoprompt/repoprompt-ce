@@ -1,4 +1,8 @@
 import Foundation
+import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptPersistence
 
 enum CodeMapArtifactBuildPriority: Equatable {
     case demand
@@ -215,7 +219,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumTotalWaiterCount: Int = 512,
         maximumWaitersPerFlight: Int = 64,
         maximumQueuedBuildCount: Int = 128,
-        maximumConcurrentBuildCount: Int = 1,
+        maximumConcurrentBuildCount: Int = FileSystemService.codeMapArtifactBuildBulkPermitLimit,
         maximumLocatorIdentitiesPerFlight: Int = 16,
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
@@ -350,10 +354,18 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
                 let buildStart = clock.nowNanoseconds()
                 let permitWait = Self.duration(from: permitStart, to: buildStart)
                 try Task.checkCancellation()
+                let performanceOptions = CodeMapPerfRuntime.makeGeneratorOptions()
+                let performanceCollector = CodeMapPerfRuntime.makeGeneratorStats()
                 let outcome = try CodeMapSyntaxArtifactBuilder.build(
-                    source: input.source,
-                    language: input.language
+                    source: input.source.coreSnapshot,
+                    language: input.language,
+                    performanceOptions: performanceOptions,
+                    performanceCollector: performanceCollector
                 )
+                if let performanceCollector {
+                    CodeMapPerfRuntime.sharedPipelineStats?.mergeSyntaxCodeMapStats(performanceCollector)
+                    CodeMapPerfRuntime.sharedPipelineStats?.mergeGeneratorStats(performanceCollector)
+                }
                 let buildEnd = clock.nowNanoseconds()
                 try Task.checkCancellation()
                 return CodeMapArtifactBuilderExecution(
@@ -624,7 +636,7 @@ actor CodeMapArtifactBuildCoordinator {
         var locatorLookup: CodeMapArtifactCoordinatorLocatorLookup
         let missKind: WaiterMissKind
         #if DEBUG
-            let benchmarkMetricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
+            let benchmarkMetricTag: WorkspaceContextStartupInstrumentation.BenchmarkMetricTag?
         #endif
         let continuation: CheckedContinuation<CodeMapArtifactBuildCoordinatorResult, Error>
     }
@@ -1052,7 +1064,7 @@ actor CodeMapArtifactBuildCoordinator {
                 proofInput: proofInput,
                 locatorLookup: effectiveLocatorLookup,
                 missKind: missKind,
-                benchmarkMetricTag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                benchmarkMetricTag: WorkspaceContextStartupInstrumentation.currentBenchmarkMetricTag,
                 continuation: continuation
             )
         #else
@@ -1537,7 +1549,7 @@ actor CodeMapArtifactBuildCoordinator {
             let exact = tags.count == waiters.count && uniqueTags.count == 1
             var recordedBuild = false
             for tag in tags {
-                WorktreeStartupInstrumentation.recordBenchmarkCodemapWork(
+                WorkspaceContextStartupInstrumentation.recordBenchmarkCodemapWork(
                     tag: tag,
                     durations: exact && !recordedBuild ? flight.durations : nil,
                     buildPerformed: exact && !recordedBuild && flight.buildPerformed,

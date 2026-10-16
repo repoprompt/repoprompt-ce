@@ -1,8 +1,33 @@
 import Foundation
 
+/// Speed capabilities published by the signed-in Codex model catalog.
+struct CodexModelServiceTier: Codable, Hashable {
+    let id: String
+    let name: String
+    let description: String
+}
+
 enum CodexServiceTierVariantCatalog {
+    static let ultrafastServiceTier = "ultrafast"
+    static let knownServiceTiers = [fastServiceTier, ultrafastServiceTier]
     static let fastServiceTier = "fast"
     static let fastCostWarningText = "Fast service tier uses your usage limits about 2× faster."
+
+    /// An explicitly empty structured list wins over deprecated tier IDs.
+    static func advertisedTiers(from entry: [String: Any]) -> [CodexModelServiceTier] {
+        if let tiers = entry["serviceTiers"] as? [[String: Any]] {
+            return tiers.compactMap { tier in
+                guard let id = tier["id"] as? String, !id.isEmpty else { return nil }
+                return CodexModelServiceTier(
+                    id: id, name: tier["name"] as? String ?? id.capitalized,
+                    description: tier["description"] as? String ?? ""
+                )
+            }
+        }
+        return (entry["additionalSpeedTiers"] as? [String] ?? []).map {
+            CodexModelServiceTier(id: $0, name: $0.capitalized, description: "")
+        }
+    }
 
     static func isFastEligible(baseModelID: String) -> Bool {
         guard let version = gptVersion(from: baseModelID) else { return false }
@@ -10,7 +35,7 @@ enum CodexServiceTierVariantCatalog {
     }
 
     private static func gptVersion(from baseModelID: String) -> (major: Int, minor: Int)? {
-        let normalized = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalized = CodexModelIdentity.key(baseModelID)
         guard normalized.hasPrefix("gpt-") else { return nil }
 
         let versionStart = normalized.index(normalized.startIndex, offsetBy: 4)
@@ -60,6 +85,9 @@ enum CodexServiceTierVariantCatalog {
     static func supportedServiceTier(baseModelID: String, serviceTier: String?) -> String? {
         guard let serviceTier else { return nil }
         let normalizedTier = serviceTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedTier == ultrafastServiceTier {
+            return baseModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : normalizedTier
+        }
         guard normalizedTier == fastServiceTier,
               isFastEligible(baseModelID: baseModelID) else { return nil }
         return normalizedTier
@@ -67,12 +95,20 @@ enum CodexServiceTierVariantCatalog {
 
     static func fastVariantID(
         baseModelID: String,
-        reasoningEffort: CodexReasoningEffort?
+        reasoningEffort: CodexReasoningEffort?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
     ) -> String? {
         let baseModelID = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseModelID.isEmpty, isFastEligible(baseModelID: baseModelID) else { return nil }
         if let reasoningEffort {
-            return "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
+            let variantID = "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
+            // Exact discovered model IDs take precedence during extended-effort parsing.
+            if [CodexReasoningEffort.max, .ultra].contains(reasoningEffort),
+               discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(variantID) })
+            {
+                return nil
+            }
+            return variantID
         }
         return "\(baseModelID)-\(fastServiceTier)"
     }

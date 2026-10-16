@@ -25,12 +25,18 @@ struct ChatSendResultCard: View {
         ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON)
     }
 
+    private var laneCoverage: OracleLaneCoverage? {
+        isOracleTool ? OracleLaneCoverage(lanes: dto?.oracleResults, oracleCount: dto?.oracleCount) : nil
+    }
+
     /// Compact summary showing mode and a small amount of result context
     private var summary: String {
         guard let dto else { return "" }
         var parts: [String] = []
         if let mode = dto.mode { parts.append(mode) }
-        if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
+        if let laneCoverage {
+            parts.append(laneCoverage.summaryText)
+        } else if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
             parts.append(chatID)
         }
         if let diffs = dto.diffs, !diffs.isEmpty {
@@ -39,10 +45,17 @@ struct ChatSendResultCard: View {
         return parts.joined(separator: " • ")
     }
 
-    private var status: ToolCardStatus {
+    var status: ToolCardStatus {
+        if isOracleTool, dto?.status == "partial_failure" { return .warning }
         if item.toolIsError == true { return .failure }
         if let dto {
             if let errors = dto.errors, !errors.isEmpty { return .failure }
+            // A failed primary determines the canonical group outcome even when
+            // additional lanes completed. Coverage still supplies the subtitle.
+            if isOracleTool, dto.status == "failed" { return .failure }
+            if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
+            // Invalid lane identities suppress the fraction, not the group's known warning.
+            if isOracleTool, dto.status == "partial_failure" || dto.status == "warning" { return .warning }
             if dto.response == nil || dto.response?.isEmpty == true,
                let diffs = dto.diffs,
                !diffs.isEmpty

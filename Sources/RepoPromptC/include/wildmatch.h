@@ -73,6 +73,8 @@ extern "C" {
 
 int wildmatch(const char *pattern, const char *string, int flags);
 
+/* Swift-friendly wrapper implemented by repo_wildmatch_wrapper.c. */
+int repo_wildmatch(const char *pattern, const char *text, unsigned int flags);
 
 #ifdef __cplusplus
 }

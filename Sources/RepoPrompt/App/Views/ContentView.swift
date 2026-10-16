@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - ContentView
@@ -50,6 +51,7 @@ struct ContentView: View {
             if recommendationWizardViewModel == nil {
                 let engine = AutoRecommendationEngine(
                     settingsStore: GlobalSettingsStore.shared,
+                    profileSettingsManager: GlobalSettingsStore.shared,
                     apiSettingsViewModel: viewModel.apiSettingsViewModel
                 )
                 recommendationWizardViewModel = RecommendationWizardViewModel(
@@ -96,13 +98,24 @@ struct ContentView: View {
                 closeAllSheets()
             }
         }
-        // Close all sheets when a workspace approval request comes in
-        .onChange(of: workspaceApprovalManager.isApprovalOverlayVisible) { _, isVisible in
-            if isVisible {
+        // Close all sheets when a workspace approval request comes in for this window
+        .onChange(of: isWorkspaceApprovalPresentedHere) { _, isPresented in
+            if isPresented {
                 closeAllSheets()
             }
         }
         .environmentObject(viewModel.workspaceManager)
+    }
+
+    /// Mirrors the shell's presentation scope so an approval targeted at another
+    /// window does not dismiss this window's sheets.
+    private var isWorkspaceApprovalPresentedHere: Bool {
+        workspaceApprovalManager.isApprovalOverlayVisible
+            && workspaceApprovalManager.pendingRequest != nil
+            && WorkspaceApprovalPresentationPolicy.shouldPresent(
+                targetWindowID: workspaceApprovalManager.presentedTargetWindowID,
+                inWindowID: viewModel.state.windowID
+            )
     }
 
     private func closeAllSheets() {

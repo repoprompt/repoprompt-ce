@@ -151,6 +151,9 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
     signing_mode = info.get("RepoPromptSigningMode")
     allow_adhoc_without_requirement = signing_mode == "release-candidate-adhoc"
     require_leaf_certificate = signing_mode in {"developer-id", "local-self-signed"}
+    # Record only whether telemetry is enabled, never the DSN value itself (it is secret).
+    sentry_dsn = info.get("RepoPromptSentryDSN")
+    telemetry_enabled = isinstance(sentry_dsn, str) and bool(sentry_dsn.strip())
     entries = [
         executable_entry(
             app,
@@ -189,6 +192,7 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
             "marketing_version": info.get("CFBundleShortVersionString"),
             "build_number": info.get("CFBundleVersion"),
             "signing_mode": signing_mode,
+            "telemetry_enabled": telemetry_enabled,
             "architecture_policy": "universal-public"
             if actual_architectures == ["arm64", "x86_64"]
             else "host-native",

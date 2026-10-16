@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Immutable Git inputs captured for one prompt-packaging request.
 ///

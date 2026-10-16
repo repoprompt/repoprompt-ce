@@ -1,3 +1,4 @@
+import RepoPromptVCS
 #if DEBUG
     import CryptoKit
     import Foundation

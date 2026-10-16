@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 final class BranchSwitchBranchListPresentationTests: XCTestCase {

@@ -45,7 +45,7 @@ struct TextKitView: NSViewRepresentable {
     @MainActor
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: TextKitView
-        let textViewUndoManager = UndoManager()
+        private let textViewUndoManager = UndoManager()
         var internalText: String
         var lastAppliedTick: Int = 0
         // NEW: mark inactive after dismantle
@@ -97,6 +97,21 @@ struct TextKitView: NSViewRepresentable {
 
         func undoManager(for view: NSTextView) -> UndoManager? {
             textViewUndoManager
+        }
+
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: textViewUndoManager,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            textViewUndoManager.removeAllActions()
         }
 
         fileprivate func scheduleLayoutStabilization(
@@ -152,6 +167,16 @@ struct TextKitView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
+
+    #if DEBUG
+        @MainActor
+        func configuredTextViewForTesting() -> NSTextView {
+            let coordinator = Coordinator(self)
+            let textView = NSTextView()
+            setupTextView(textView, coordinator: coordinator)
+            return textView
+        }
+    #endif
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
@@ -297,7 +322,9 @@ struct TextKitView: NSViewRepresentable {
             } else {
                 // Preserve selection but clamp it to the new text length
                 let previousSelection = textView.clampedSelectedRange()
-                textView.string = text
+                context.coordinator.performExternalReplacement(in: textView) {
+                    textView.string = text
+                }
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
 
                 // Only auto-scroll when not forcing or not focused
@@ -345,7 +372,7 @@ struct TextKitView: NSViewRepresentable {
         textView.delegate = nil
         textView.isContinuousSpellCheckingEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
-        coordinator.textViewUndoManager.removeAllActions()
+        coordinator.clearUndoHistory()
         textView.string = ""
         coordinator.internalText = ""
         coordinator.wasEmpty = true

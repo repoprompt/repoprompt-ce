@@ -1,6 +1,21 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 class AIProviderFactory {
+    /// Installed once by the app composition root; Infrastructure must not construct
+    /// the app-side recorder itself (that would be a wrong-way edge into Features).
+    private static let perfRecorderSlot = AgentModePerfRecorderBox()
+
+    static func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderSlot.install(recorder)
+    }
+
+    /// The app-installed recorder (Noop until the composition root installs one).
+    static var perfRecorder: any AgentModePerfRecording {
+        perfRecorderSlot.snapshot()
+    }
+
     static func createProvider(
         for providerType: AIProviderType,
         keyManager: KeyManager,
@@ -18,7 +33,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .devin {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -82,11 +97,15 @@ class AIProviderFactory {
             return ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
-            return CodexCLIProvider()
+            return CodexCLIProvider(perfRecorder: perfRecorder)
         case .openCode:
             return OpenCodeCLIProvider()
         case .cursor:
             return CursorCLIProvider()
+        case .grokBuild:
+            return GrokBuildCLIProvider()
+        case .devin:
+            return DevinCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -178,6 +197,8 @@ enum AIProviderType: Codable, Equatable {
     case codex // <-- New Codex CLI provider case
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
+    case grokBuild // Grok Build CLI provider case
+    case devin
 }
 
 extension AIProviderType {
@@ -199,6 +220,8 @@ extension AIProviderType {
         case .codex: "Codex CLI"
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
+        case .grokBuild: "Grok Build"
+        case .devin: "Devin"
         }
     }
 
@@ -249,96 +272,17 @@ extension AIProviderError: LocalizedError {
     }
 }
 
-/// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
-struct AIStreamResult {
-    /// Standard type strings for stream results
-    static let lifecycleType = "lifecycle"
-
-    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle"
-    let text: String? // normal content (like streaming tokens)
-    let reasoning: String? // optional reasoning content
-    let promptTokens: Int? // token usage
-    let completionTokens: Int? // token usage
-    let cost: Double?
-
-    // Tool-specific metadata (for type: "tool_call" or "tool_result")
-    let toolName: String? // Name of the tool being called/completed
-    let toolArgs: String? // JSON string of tool arguments (for tool_call)
-    let toolOutput: String? // Tool execution result (for tool_result)
-    let toolInvocationID: UUID?
-    let toolResultJSON: String?
-    let toolArgsJSON: String?
-    let toolIsError: Bool?
-
-    /// Provider-specific session ID for resuming conversations (e.g., Claude CLI session_id)
-    let providerSessionID: String?
-    let stopReason: String?
-    let modelContextWindow: Int?
-    /// Best-effort estimate of input-side context used for the turn (e.g. Claude input + cache tokens)
-    let contextUsedTokens: Int?
-    /// Stable provider message identifier for content chunks when available.
-    /// Used by lightweight aggregators to separate whole-message chunks without affecting token deltas.
-    let contentMessageID: String?
-
-    init(
-        type: String,
-        text: String?,
-        reasoning: String? = nil,
-        promptTokens: Int? = nil,
-        completionTokens: Int? = nil,
-        cost: Double? = nil,
-        toolName: String? = nil,
-        toolArgs: String? = nil,
-        toolOutput: String? = nil,
-        toolInvocationID: UUID? = nil,
-        toolResultJSON: String? = nil,
-        toolArgsJSON: String? = nil,
-        toolIsError: Bool? = nil,
-        providerSessionID: String? = nil,
-        stopReason: String? = nil,
-        modelContextWindow: Int? = nil,
-        contextUsedTokens: Int? = nil,
-        contentMessageID: String? = nil
-    ) {
-        self.type = type
-        self.text = text
-        self.reasoning = reasoning
-        self.promptTokens = promptTokens
-        self.completionTokens = completionTokens
-        self.cost = cost
-        self.toolName = toolName
-        self.toolArgs = toolArgs
-        self.toolOutput = toolOutput
-        self.toolInvocationID = toolInvocationID
-        self.toolResultJSON = toolResultJSON
-        self.toolArgsJSON = toolArgsJSON
-        self.toolIsError = toolIsError
-        self.providerSessionID = providerSessionID
-        self.stopReason = stopReason
-        self.modelContextWindow = modelContextWindow
-        self.contextUsedTokens = contextUsedTokens
-        self.contentMessageID = contentMessageID
-    }
-}
-
-/// Result type for non-streaming completions, includes token counts
-struct AICompletionResult {
-    let text: String
-    let promptTokens: Int?
-    let completionTokens: Int?
-    let cost: Double?
-
-    init(text: String, promptTokens: Int? = nil, completionTokens: Int? = nil, cost: Double? = nil) {
-        self.text = text
-        self.promptTokens = promptTokens
-        self.completionTokens = completionTokens
-        self.cost = cost
-    }
-}
+public typealias ProviderConversationCleanupAction = RepoPromptDomainRuntime.ProviderConversationCleanupAction
+public typealias ProviderConversationCleanupHandle = RepoPromptDomainRuntime.ProviderConversationCleanupHandle
+typealias ProviderConversationCleanupOutcome = RepoPromptDomainRuntime.ProviderConversationCleanupOutcome
+typealias AIProviderCompletionOutcome = RepoPromptDomainRuntime.AIProviderCompletionOutcome
+typealias AIStreamResult = RepoPromptDomainRuntime.AIStreamResult
+typealias AICompletionResult = RepoPromptDomainRuntime.AICompletionResult
 
 protocol AIProvider {
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func dispose() async
 }
 
@@ -354,6 +298,10 @@ extension AIProvider {
 
     func completeMessage(_ aiMessage: AIMessage, model: AIModel) async throws -> AICompletionResult {
         try await completeMessage(aiMessage, model: model, maxTokens: nil)
+    }
+
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Provider has no local API for \(action.rawValue) cleanup of conversations.")
     }
 
     func dispose() async {}

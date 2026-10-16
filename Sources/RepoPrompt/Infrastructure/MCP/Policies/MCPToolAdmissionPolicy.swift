@@ -1,14 +1,14 @@
 import Foundation
+import MCP
+import RepoPromptDomainRuntime
 
-enum MCPToolAdmissionClass: String, CaseIterable {
-    /// Mutating, lifecycle, approval, and interactive tools. The connection lane remains
-    /// named `ordinary` for diagnostics compatibility, but this class is deliberately exclusive.
-    case exclusive
-    case control
-    case smallRead = "small_read"
-    case gitRead = "git_read"
-    case fileSearch = "file_search"
+typealias MCPToolAdmissionClass = RepoPromptDomainRuntime.MCPToolAdmissionClass
+typealias MCPToolOperationIdentity = RepoPromptDomainRuntime.MCPDomainToolOperationIdentity
+// These are the domain owners' values, not a second admission or terminal-settlement model.
+typealias MCPToolAdmissionDecision = RepoPromptDomainRuntime.MCPDomainPreAdmissionDecision
+typealias MCPToolSettlementResult = RepoPromptDomainRuntime.MCPToolExecutionSettlement
 
+extension MCPToolAdmissionClass {
     var connectionLane: MCPConnectionCallLane {
         switch self {
         case .exclusive:
@@ -17,6 +17,8 @@ enum MCPToolAdmissionClass: String, CaseIterable {
             .control
         case .smallRead:
             .smallRead
+        case .fileRead:
+            .fileRead
         case .gitRead:
             .gitRead
         case .fileSearch:
@@ -26,52 +28,62 @@ enum MCPToolAdmissionClass: String, CaseIterable {
 }
 
 enum MCPToolAdmissionPolicy {
-    /// Gate B selected the conservative lower bounds from the WI-3 baseline:
-    /// two small reads per connection and per window/store, two Git requests per connection
-    /// with a separate one-per-repository request gate, and the unchanged PR #155 four-search burst.
-    static let exclusiveConnectionLimit = 1
-    static let controlConnectionLimit = 8
-    static let smallReadConnectionLimit = 2
-    static let smallReadPerWindowLimit = 2
-    static let gitReadConnectionLimit = 2
-    static let fileSearchConnectionLimit = 4
-    static let gitReadPerRepositoryLimit = 1
+    static func clientPolicySnapshot(
+        restricted: Set<String>,
+        additional: Set<String>,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool,
+        hasExactAgentSessionLinkGrant: Bool = false,
+        canBecomeOverseer: Bool = false,
+        hasActivatedOverseer: Bool = false
+    ) -> MCPDomainClientPolicySnapshot {
+        let role: MCPClientTaskRole = switch taskLabelKind {
+        case .explore:
+            .explore
+        case .engineer, .pair, .design:
+            .engineer
+        case nil:
+            .direct
+        }
+        return MCPDomainClientPolicySnapshot(
+            restrictedToolNames: restricted,
+            additionalToolNames: additional,
+            role: role,
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant,
+            canBecomeOverseer: canBecomeOverseer,
+            hasActivatedOverseer: hasActivatedOverseer
+        )
+    }
 
-    /// Exhaustive canonical-tool table. Do not add a default: every advertised tool must be
-    /// reviewed and classified explicitly before it can enter a concurrent lane.
-    static let classifications: [String: MCPToolAdmissionClass] = [
-        MCPGlobalToolName.appSettings: .exclusive,
-        MCPGlobalToolName.bindContext: .exclusive,
-        MCPGlobalToolName.manageWorkspaces: .exclusive,
+    /// Keep app-host admission aligned with the package-level domain limits.
+    static let exclusiveConnectionLimit = MCPDomainToolAdmissionLimits.exclusiveConnection
+    static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection
+    static let smallReadConnectionLimit = MCPDomainToolAdmissionLimits.smallReadConnection
+    static let smallReadPerWindowLimit = MCPDomainToolAdmissionLimits.smallReadPerWindow
+    static let fileReadConnectionLimit = MCPDomainToolAdmissionLimits.fileReadConnection
+    static let fileReadPerWindowLimit = MCPDomainToolAdmissionLimits.fileReadPerWindow
+    static let gitReadConnectionLimit = MCPDomainToolAdmissionLimits.gitReadConnection
+    static let fileSearchConnectionLimit = MCPDomainToolAdmissionLimits.fileSearchConnection
+    static let gitReadPerRepositoryLimit = MCPDomainToolAdmissionLimits.gitReadPerRepository
 
-        MCPWindowToolName.manageSelection: .exclusive,
-        MCPWindowToolName.fileActions: .exclusive,
-        MCPWindowToolName.getCodeStructure: .smallRead,
-        MCPWindowToolName.getFileTree: .smallRead,
-        MCPWindowToolName.readFile: .smallRead,
-        MCPWindowToolName.search: .fileSearch,
-        // workspace_context includes export and select_preset, so the canonical tool stays exclusive.
-        MCPWindowToolName.workspaceContext: .exclusive,
-        MCPWindowToolName.prompt: .exclusive,
-        MCPWindowToolName.applyEdits: .exclusive,
-        MCPWindowToolName.oracleUtils: .control,
-        MCPWindowToolName.askOracle: .control,
-        MCPWindowToolName.oracleSend: .control,
-        MCPWindowToolName.oracleChatLog: .smallRead,
-        MCPWindowToolName.git: .gitRead,
-        MCPWindowToolName.manageWorktree: .exclusive,
-        MCPWindowToolName.contextBuilder: .control,
-        MCPWindowToolName.askUser: .control,
-        MCPWindowToolName.agentExplore: .control,
-        MCPWindowToolName.agentRun: .control,
-        MCPWindowToolName.agentManage: .control,
-        MCPWindowToolName.shareThoughts: .control,
-        MCPWindowToolName.setStatus: .control,
-        MCPWindowToolName.waitForNextInstruction: .control,
-        MCPWindowToolName.history: .control
-    ]
+    static let classifications = MCPDomainToolCatalog.classifications
 
     static func classification(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
-        classifications[toolName]
+        MCPDomainToolCatalog.admissionClass(for: toolName)
+    }
+
+    static func operationIdentity(
+        forCanonicalToolName toolName: String,
+        arguments: [String: Value]
+    ) -> MCPToolOperationIdentity {
+        let input: MCPDomainToolOperationInput = if let argumentKey = MCPDomainToolCatalog.operationArgumentKey(for: toolName),
+                                                    let value = arguments[argumentKey]
+        {
+            value.stringValue.map(MCPDomainToolOperationInput.value) ?? .malformed
+        } else {
+            .missing
+        }
+        return MCPDomainToolCatalog.operationIdentity(for: toolName, input: input)
     }
 }

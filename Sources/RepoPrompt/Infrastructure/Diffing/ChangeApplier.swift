@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 actor ChangeApplier {
     private var manager: ChangeManager

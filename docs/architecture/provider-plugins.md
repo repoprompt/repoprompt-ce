@@ -17,7 +17,7 @@ The seam intentionally stops short of dynamic plugin loading. It is static Swift
 ## High-level layering
 
 ```
-+--------------------------- core (RepoPrompt target) ---------------------------+
++-------------------------- core (RepoPromptApp target) --------------------------+
 |                                                                                |
 | AgentMode/UI · transcript · tool tracking · MCP permission · run state         |
 |     │                                                                          |
@@ -110,7 +110,7 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Agent Mode transcript mutation, tool-card UI, run-state ownership | core |
 | Native process control (`ClaudeNativeProcessSessionController`) | core (this wave) |
 | Provider-neutral runtime contract (`NativeAgentRuntimeControlling`) | core |
-| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`Infrastructure/AI/Prompts/Workflows`) | core |
+| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`RepoPromptShared/Workflows`) | core |
 | Headless wrapper (`ClaudeCodeAgentProvider`) | core (delegates pure rules to package) |
 | `AgentModel` raw values, option DTOs, defaults | core (adapter forwards plugin DTOs back to these) |
 | Plugin IDs (`ClaudeCompatibleProviderPluginID`), runtime variants, backend IDs | package DTOs |
@@ -220,6 +220,61 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 - **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
 - **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
+- **Grok Build:** RepoPrompt CE does not set a timeout for its session-injected `RepoPromptCEGrokRuntime` server. Without a valid same-named Grok configuration override, Grok's default applies. A per-server `tool_timeout_sec` override requires a server entry with a transport; a timeout-only `[mcp_servers.RepoPromptCEGrokRuntime]` table is rejected ("has no transport", Grok 1.0.46).
+
+### Grok Build provider notes
+
+`AgentProviderKind.grokBuild` drives `grok agent --no-leader stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
+
+- Model advertisement is a top-level `SessionModelState` (`models` in `session/new`/`session/load` responses), not modern `configOptions`; explicit selection goes through `session/set_model` (`{sessionId, modelId}`). The controller consults the provider's `ACPDirectSessionModelProvider` conformance only when no modern model selector exists; malformed modern selectors never fall back.
+- Usage arrives in the `session/prompt` response `_meta.usage` (same field names as the ACP-standard top-level `usage`); Grok emits no `usage_update` notifications.
+- Full access is a launch flag (`grok agent --always-approve --no-leader stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
+- Auth: RPCE never sends ACP `authenticate`. Grok checks a model key (`api_key`/`env_key`), then a configured auth-provider branch, then an eligible session token, then `XAI_API_KEY`, subject to `[auth] preferred_method` and `disable_api_key_auth`. The auth-provider branch does not fall through when its cached token is absent. RPCE reads a stored key from the existing `.grokAPI` keychain account at provider construction and passes it as the launch-environment `XAI_API_KEY`. Credential order is source-only at Grok 1.0.45 (`2bdd1d6a`), not live-tested.
+- MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
+
+#### Grok Agent Mode permission levels
+
+**Provenance:** Grok permission behavior below is based on Grok 1.0.45 source (`2bdd1d6a`), not observed live. Behavior on later releases has not been verified.
+
+- **Default launch intent:** Direct Default, agents launched through MCP under Safe Managed (including top-level sessions), and Custom/Inherit settings resolving to Default use the managed Grok profile. RepoPrompt sends `_meta.yoloMode: false` and `_meta.autoMode: false` on both `session/new` and `session/load`, then `_x.ai/yolo_mode_changed {auto_mode: false}` after opening the session and before prompting.
+- **Mode state is not permission rules:** These overrides turn Grok's always-approve and auto modes off; they do not clear its compiled permission rules or prior grants. An applicable Claude Code `permissions.defaultMode` of `bypassPermissions` can generate a broad allow rule for many requests, including MCP requests and shell commands subject to Grok's confirmation floor. `acceptEdits` can generate an allow rule for edit tools such as `write`, based on the request's final Edit classification—not every file-changing tool. Native `apply_patch` and MCP requests are not Edit-classified in this source. When Grok resolves an allow internally, it sends no ACP `session/request_permission` to RepoPrompt.
+- **Limits still apply:** Grok's deny rules and other safeguards still apply. Ask rules, protected edit targets, hook-forced confirmation and the shell confirmation floor can restrict these allowances. A Grok requirements lock can suppress the synthetic `bypassPermissions` allow rule, but not the `acceptEdits` Edit allow rule. Default and Safe Managed are not a guarantee that every file write prompts RepoPrompt or stays confined to the workspace.
+- **Configuration scope:** When Grok's Claude-settings fallback is active, home `~/.claude/settings.json` and `settings.local.json` apply regardless of project-folder trust; project `.claude` settings require Grok's trust gate to allow them. A managed `defaultMode` takes precedence over user/project modes. Grok's `[claude_compat] imported` marker skips that fallback; it does not erase native or previously imported rules. RepoPrompt's `GROK_CLAUDE_MCPS_ENABLED=0` override (below) affects only imported Claude Code MCP servers, not these permission settings. These disclosures are conditional, not a report of the active configuration.
+- **Loaded and discovery sessions:** A successful cold `session/load` in a new Grok process uses the same permission-rule resolution path as `session/new`. Context Builder discovery also uses the managed mode overrides; its headless bridge can decline only permission requests that reach RepoPrompt.
+
+#### Current Grok MCP launch policy
+
+- Agent Mode, Context Builder discovery, model discovery and one-shot (Oracle/Chat) launches set `GROK_CLAUDE_MCPS_ENABLED=0` and `GROK_CURSOR_MCPS_ENABLED=0` as process-local overrides. This isolates Claude Code and Cursor MCP imports, including project-local Cursor imports. It does not change `HOME`, `GROK_HOME`, credentials or the user's configuration files.
+- **MCP output budget:** Fresh ACP launches for Agent Mode, Context Builder and model discovery set `GROK_MAX_MCP_OUTPUT_BYTES=100000` (decimal bytes), replacing higher or lower inherited native caps; Oracle/Chat one-shots do not receive this override.
+  - **Precedence:** This value wins over `MAX_MCP_OUTPUT_BYTES` and user/trusted-project `[mcp] max_output_bytes`. Grok's `requirements.toml` or session/tool truncation limits can override it. Oversized results may still be truncated and saved to files.
+- Agent Mode and Context Builder inject the fixed server name `RepoPromptCEGrokRuntime`, with exact client-ID hint `grok-shell-RepoPromptCEGrokRuntime`. Grok renders its tools as `RepoPromptCEGrokRuntime__<tool>`; RPCE recognizes these aliases for known RepoPrompt tools while retaining canonical internal tool identities. Other providers keep `RepoPromptCE`.
+- The Grok-only name avoids the recorded collision with an imported `RepoPromptCE`: Grok drops client servers whose names match disabled imports, on both new and loaded sessions. It is not collision-proof if the user also configured or disabled `RepoPromptCEGrokRuntime` itself. Existing Grok grants for the old server name are not migrated, so users may see renewed permission prompts.
+- Model discovery injects no RPCE server and always uses the existing neutral `RepoPromptGrokBuildACPDiscovery` temporary directory, reusing one verified session there rather than following subscribed workspaces. Closing a window cancels its discovery subscription, not the shared polling service.
+- **Project-config limit:** Grok's project `.mcp.json` is not controlled by the two import switches. Neutral polling avoids the user's project file, but Context Builder and Agent Mode retain their real workspace and may still load it. Grok-native MCP configuration is not filtered or rewritten by this policy.
+
+#### Grok Context Builder discovery profile
+
+- Context Builder discovery supplies an `_meta.agentProfile` object on both `session/new` and `session/load`, with the required `name` and `description` fields and exactly `search_tool`/`use_tool` in its native tool allowlist. Agent Mode and model polling keep their existing profiles.
+- The discovery factory explicitly disables Full Access intent, independent of Grok's Agent Mode permission preference. Discovery retains managed `yoloMode: false`/`autoMode: false` metadata and the pre-prompt `_x.ai/yolo_mode_changed` notification. The provider's existing config/request Full Access OR remains unchanged.
+- **Strict-harness limit:** In the pinned Grok 1.0.45 source (`2bdd1d6a`), a model-required strict harness can outrank the requested profile, including on model selection. Sending metadata alone is not containment evidence; verify the offered tools after model selection and successful RPCE dispatch on the tested release/model.
+
+#### Grok background-feature launch policy
+
+- Agent Mode, Context Builder discovery and model discovery set `GROK_MEMORY=0`, `GROK_SUBAGENTS=0`, `GROK_WORKFLOWS=0` and `GROK_AUTO_WAKE=0` to disable Grok's memory, subagents, workflows and auto-wake. Switch behavior is source-verified against Grok 1.0.45 (`2bdd1d6a`), not live-proven; pinned/remote settings can affect feature-specific resolution, and auto-wake requirements pins can override the environment. Imported hooks are separate and not controlled by these switches. In the pinned source, an explicit `/workflow resume` of an existing resumable workflow record in a loaded session is not gated by `GROK_WORKFLOWS` ([`ManageOp::Resume`](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/workflow.rs)); this is not observed live, and passive or model-initiated restart is not established.
+- `GrokBuildAgentConfig.backgroundFeatureEnvironment` defaults to empty; managed callers, including Context Builder discovery, explicitly supply the four overrides. One-shot (Oracle/Chat) is a separate path that never reads this field and remains unchanged. No user configuration or global environment is changed.
+- The ACP launch adapter merges this policy once; the MCP import-isolation overrides above win on a collision, and stored-key injection as `XAI_API_KEY` remains unchanged. Headless and polling config reconstructions preserve the caller's background-feature environment.
+
+#### Grok one-shot safety policy
+
+- One-shot (Oracle/Chat) request children additionally set `GROK_CLAUDE_HOOKS_ENABLED=0` and `GROK_CURSOR_HOOKS_ENABLED=0` as process-local overrides. These disable imported Claude/Cursor hook-file discovery, not Grok-native or config-layer hooks.
+- `GROK_SESSION_SEARCH=0` requests indexing off for that child; higher-priority requirements/MDM pins can override it. `GROK_STORAGE_MODE=local` prevents account-history writeback, including after late settings arrive. It does not erase earlier uploads or change inference traffic, and is not a blanket upload/network prohibition.
+- The overrides do not erase existing index rows or prevent other Grok processes from indexing retained files. Successful request cleanup removes its owned artifacts; cleanup failures can leave them behind. Missing-source rows can be pruned both at bootstrap and through queued updates, not necessarily immediately. These control semantics are source-verified at Grok 1.0.45 (`2bdd1d6a`), not live-proven.
+
+#### Grok cancellation boundaries
+
+- **Turn cancellation:** stopping or steering an active ACP turn sends a bare `session/cancel` with only `sessionId`. [Grok's cancellation handler](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/cancel.rs) cancels every non-workflow subagent in that session, including earlier turns' background children, and kills running foreground commands. These effects are source-verified at Grok 1.0.45, not limited to the current turn.
+- **Idle `stop_session`:** MCP `agent_manage.stop_session` cancels only an active RPCE run. For an idle session it returns `stop_requested: false`, sends no `session/cancel` and leaves the controller alive; it is not background-work cleanup.
+- **Controller teardown:** `ACPAgentSessionController.shutdown()` calls `cancelPrompt()` whenever a session ID exists, including when idle. It attempts the same bare cancellation before closing stdio and terminating the provider process, so a received cancel has the subagent and foreground-command effects above. Teardown is distinct from an idle `stop_session`; the launch policy does not change either path.
 
 ## How a new provider plugs in
 
@@ -285,7 +340,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
-- `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
+- `Sources/RepoPromptShared/Workflows/` — provider-neutral RepoPrompt workflow IDs, catalog metadata, variants, and renderers shared by the app, installs, MCP prompt registration, and direct headless execution.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.

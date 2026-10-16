@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 enum MCPManageSelectionArtifactUse: Equatable {
     case remove

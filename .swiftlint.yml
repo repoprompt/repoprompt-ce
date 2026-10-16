@@ -1,14 +1,27 @@
 # RepoPrompt CE SwiftLint policy.
-# Scripts/swift_style.sh owns the canonical first-party Swift file list used by
-# local and CI checks. The include/exclude lists here mirror that scope for
-# direct SwiftLint invocations and editor integrations.
+# Full-repo lint uses this config for file discovery. Keep these include/exclude
+# lists aligned with Scripts/swift_style.sh's SwiftFormat first-party scope.
 
 included:
   - Package.swift
   - Sources/RepoPrompt
+  - Sources/RepoPromptExecutable
   - Sources/RepoPromptMCP
+  - Sources/RepoPromptMCPCore
   - Sources/RepoPromptShared
+  - Sources/RepoPromptFileSystem
+  - Sources/RepoPromptVCS
+  - Sources/RepoPromptPersistence
+  - Sources/RepoPromptSettingsCore
+  - Sources/RepoPromptProviderQuota
+  - Tests/RepoPromptFileSystemTests
+  - Tests/RepoPromptVCSTests
+  - Tests/RepoPromptPersistenceTests
+  - Tests/RepoPromptSettingsCoreTests
+  - Tests/RepoPromptProviderQuotaTests
   - Tests/RepoPromptTests
+  - Tests/RepoPromptMCPCoreTests
+  - Tests/RepoPromptTestSupport
   - Packages/RepoPromptAgentProviders/Package.swift
   - Packages/RepoPromptAgentProviders/Sources
   - Packages/RepoPromptAgentProviders/Tests
@@ -16,13 +29,26 @@ included:
 excluded:
   - .build
   - .swiftpm
-  - DerivedData
   - build
+  - Carthage
+  - DerivedData
+  - Generated
+  - Pods
   - Vendor
   - Packages/RepoPromptAgentProviders/.build
   - Sources/CSwiftPCRE2
   - Sources/RepoPromptC
   - Sources/RepoPrompt/ThirdParty/SwiftPCRE2
+  - Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift
+  - Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift
 
 # Keep the initial integration intentionally humane. Broader cleanup-oriented
 # rules are deferred until the one-time baseline and future focused cleanup work.

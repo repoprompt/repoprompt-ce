@@ -32,7 +32,7 @@ Route the affected surface without guessing a fix:
 - Product flow or UI: `Sources/RepoPrompt/Features/<Feature>`
 - App lifecycle, launch, or composition: `Sources/RepoPrompt/App`
 - Cross-cutting file, process, security, MCP, or platform behavior: `Sources/RepoPrompt/Infrastructure/<Area>`
-- CLI-only behavior: `Sources/RepoPromptMCP`
+- CLI-only behavior: `Sources/RepoPromptMCPCore` (`Sources/RepoPromptMCP` is the entry shell)
 - Shared app/CLI MCP wire contract: `Sources/RepoPromptShared/MCP`
 - Provider catalog, codec, or translation behavior: `Packages/RepoPromptAgentProviders`
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoPrompt CE Swift 6 Migration"
+  short_description: "Plan and stage Swift 6 concurrency migration"
+  default_prompt: "Use $rpce-swift-6-concurrency-migration to inventory and phase RepoPrompt CE’s Swift 6.2 concurrency migration with conductor-coordinated validation."

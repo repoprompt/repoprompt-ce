@@ -1,0 +1,3 @@
+Test Suite 'Selected tests' started at 2026-10-01.
+Test Case '-[CoreTests.ExampleTests testOne]' passed (0.001 seconds).
+Test Case '-[CoreTests.ExampleTests testTwo]' started.

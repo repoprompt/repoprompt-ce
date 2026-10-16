@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Stores user overrides for built-in copy presets
 /// Only non-nil fields represent changes from the base preset

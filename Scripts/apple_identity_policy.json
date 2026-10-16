@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "identities": {
+    "legacy": {
+      "bundleIdentifier": "com.pvncher.repoprompt.ce",
+      "teamIdentifier": "648A27MST5",
+      "developerIDRequirement": "anchor apple generic and identifier \"com.pvncher.repoprompt.ce\" and certificate leaf[subject.OU] = \"648A27MST5\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+      "developerIDApplicationIdentityName": "Developer ID Application: Eric Provencher (648A27MST5)"
+    },
+    "successor": {
+      "bundleIdentifier": "com.repoprompt.ce",
+      "teamIdentifier": "69N6K965SF",
+      "developerIDRequirement": "anchor apple generic and identifier \"com.repoprompt.ce\" and certificate leaf[subject.OU] = \"69N6K965SF\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",
+      "developerIDApplicationIdentityName": "Developer ID Application: Samuel Baron (69N6K965SF)",
+      "developerIDInstallerIdentityName": "Developer ID Installer: Samuel Baron (69N6K965SF)"
+    }
+  },
+  "sparkle": {
+    "stableFeedURL": "https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml",
+    "tipFeedURL": "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml",
+    "sparklePublicEdDSAValue": "845kp9v5+kp4U6no85H53cUdnbfN3NmE1PJHKwH8Pd4=",
+    "updateRepository": "repoprompt/repoprompt-ce-updates",
+    "tipUpdateRepository": "repoprompt/repoprompt-ce-tip-updates",
+    "minimumSystemVersion": "14.0"
+  },
+  "identityTransitionPackage": {
+    "identifier": "com.repoprompt.ce.transition",
+    "installLocation": "/Applications",
+    "appBundleName": "RepoPrompt CE.app",
+    "bundleIsRelocatable": false,
+    "bundleHasStrictIdentifier": false,
+    "bundleIsVersionChecked": true,
+    "bundleOverwriteAction": "upgrade",
+    "hasScripts": false,
+    "applicationBundleCount": 1
+  }
+}

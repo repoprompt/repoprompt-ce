@@ -1,0 +1,3 @@
+import RepoPromptDomainRuntime
+
+typealias MCPCodeStructureSettlementRegistry = RepoPromptDomainRuntime.MCPCodeStructureSettlementRegistry

@@ -16,6 +16,9 @@ build/
 !Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Updater.app/
 !Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Updater.app/**
 *.dSYM/
+# Sparkle's XCFramework Info.plist declares DebugSymbolsPath=dSYMs; keep the upstream dSYMs tracked.
+!Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/dSYMs/*.dSYM/
+!Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/dSYMs/*.dSYM/**
 *.dSYM.zip
 *.ipa
 *.xcarchive
@@ -28,15 +31,15 @@ dist/
 *.trace
 *.xcresult/
 *.profraw
-docs/test-suite-optimizer/raw-logs/
 
 # Agent-authored working documents
 docs/analysis/
 docs/designs/
 docs/references/
-docs/reviews/
+docs/reviews/*
+!docs/reviews/model-router-auto-effort-openai-decisions-verification.md
 docs/plans/*
-!docs/plans/test-coverage-value-audit-2026-05-29.md
+!docs/plans/openai-decisions-contract-2026-10-07.md
 
 # Python cache artifacts
 __pycache__/

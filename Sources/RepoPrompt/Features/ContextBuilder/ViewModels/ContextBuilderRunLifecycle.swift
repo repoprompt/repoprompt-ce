@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum ContextBuilderRunOrigin: Equatable {
     case ui
@@ -27,14 +28,34 @@ enum ContextBuilderRunTerminalOutcome: Equatable {
     }
 }
 
-enum ContextBuilderRunWaiterResolution {
+enum ContextBuilderRunWaiterResolution: Equatable {
     case snapshot
     case cancellationError
+}
+
+struct ContextBuilderRunCancellationSettlementPolicy: Equatable {
+    let waiterResolution: ContextBuilderRunWaiterResolution
+    let saveHistory: Bool
+}
+
+enum ContextBuilderRunCancellationState: Equatable {
+    case none
+    case requested
+    case deferredUntilFinalContextCommitCompletes
+    case applied
+}
+
+enum ContextBuilderRunCancellationDisposition: Equatable {
+    case settleImmediately
+    case deferredUntilFinalContextCommitCompletes
+    case alreadyRequested
+    case terminal
 }
 
 enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
     case drained
     case peerEOFDetached
+    case detachedAfterResponseDeliveryDrained
     case failed
 
     var succeeded: Bool {
@@ -42,7 +63,7 @@ enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
     }
 
     var transportAlreadyClosed: Bool {
-        self == .peerEOFDetached
+        self == .peerEOFDetached || self == .detachedAfterResponseDeliveryDrained
     }
 }
 
@@ -51,18 +72,18 @@ enum ContextBuilderResponseDeliveryDrainResolver {
     static func resolve(
         initiallyDetached: Bool,
         awaitDrain: @MainActor () async -> Bool,
-        isAuthoritativePeerEOFDetached: @MainActor () -> Bool,
+        isAuthoritativeDetached: @MainActor () -> Bool,
         awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
     ) async -> ContextBuilderResponseDeliveryDrainOutcome {
-        if initiallyDetached { return .peerEOFDetached }
-        if await awaitDrain() { return .drained }
-        if isAuthoritativePeerEOFDetached() { return .peerEOFDetached }
+        if !initiallyDetached, await awaitDrain() { return .drained }
 
         let publication = await awaitTeardownPublication()
-        guard publication == .peerEOFDetached,
-              isAuthoritativePeerEOFDetached()
+        guard publication.completedDiscoveryCanCommit,
+              isAuthoritativeDetached()
         else { return .failed }
-        return .peerEOFDetached
+        return publication == .peerEOFDetached
+            ? .peerEOFDetached
+            : .detachedAfterResponseDeliveryDrained
     }
 }
 
@@ -106,8 +127,111 @@ enum ContextBuilderChildConnectionFinalizer {
     }
 }
 
+enum ContextBuilderGeneratedResponseAuthority {
+    case contextOnly
+    case generate(mode: HeadlessMode, execution: ResolvedOracleExecution)
+
+    var execution: ResolvedOracleExecution? {
+        guard case let .generate(_, execution) = self else { return nil }
+        return execution
+    }
+
+    var planningModelName: String? {
+        execution?.models.map(\.displayName).joined(separator: ", ")
+    }
+}
+
+struct ContextBuilderResolvedRunAuthority {
+    let configuration: ContextBuilderMCPRunConfiguration
+    let agentKind: AgentProviderKind
+    let modelRaw: String
+    /// The frozen OpenCode effort pin for the run's resolved agent+model, captured at run
+    /// admission. The run never re-reads the chooser or profile after awaited startup work.
+    let modelParameterSelections: [ACPModelParameterSelection]
+
+    init(
+        configuration: ContextBuilderMCPRunConfiguration,
+        agentKind: AgentProviderKind,
+        modelRaw: String,
+        modelParameterSelections: [ACPModelParameterSelection] = []
+    ) {
+        self.configuration = configuration
+        self.agentKind = agentKind
+        self.modelRaw = modelRaw
+        self.modelParameterSelections = modelParameterSelections
+    }
+}
+
+struct ContextBuilderRunBehavior: Equatable {
+    let tokenBudget: Int
+    let enhancementMode: PromptEnhancementMode
+    let questionTimeoutSeconds: TimeInterval
+    let allowClarifyingQuestions: Bool
+    let automaticFollowUp: ContextBuilderFollowUpType?
+
+    static func ui(
+        settings: ContextBuilderBehaviorSettings,
+        selectedFollowUp: ContextBuilderFollowUpType
+    ) -> ContextBuilderRunBehavior {
+        ContextBuilderRunBehavior(
+            tokenBudget: ContextBuilderBudgetResolver.resolveUIBudget(behaviorSettings: settings),
+            enhancementMode: settings.enhancementMode,
+            questionTimeoutSeconds: settings.questionTimeoutSeconds,
+            allowClarifyingQuestions: settings.allowUIClarifyingQuestions,
+            automaticFollowUp: settings.followUpAnalysisEnabled ? selectedFollowUp : nil
+        )
+    }
+
+    static func mcp(
+        settings: ContextBuilderBehaviorSettings,
+        wantsResponse: Bool,
+        targetIsActive: Bool
+    ) -> ContextBuilderRunBehavior {
+        ContextBuilderRunBehavior(
+            tokenBudget: ContextBuilderBudgetResolver.resolveMCPBudget(
+                wantsResponse: wantsResponse,
+                behaviorSettings: settings
+            ),
+            enhancementMode: settings.enhancementMode,
+            questionTimeoutSeconds: settings.questionTimeoutSeconds,
+            allowClarifyingQuestions: targetIsActive && settings.allowMCPClarifyingQuestions,
+            automaticFollowUp: nil
+        )
+    }
+}
+
+enum ContextBuilderRunError: LocalizedError {
+    case missingRunBehavior
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRunBehavior:
+            "Context Builder run behavior was not captured at run start."
+        }
+    }
+}
+
+struct ContextBuilderMCPRunConfiguration {
+    let identity: WorkspaceSelectionIdentity
+    let nestedTabContext: MCPTabContextSnapshot
+    let providerWorkspacePath: String
+    let runBehavior: ContextBuilderRunBehavior
+    let responseType: String?
+    let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
+    let isSystemWorkspace: Bool
+
+    var effectiveTokenBudget: Int {
+        runBehavior.tokenBudget
+    }
+}
+
 @MainActor
 final class ContextBuilderRunRecord {
+    enum ProviderActivity {
+        case firstEvent(type: String)
+        case firstRepoPromptTool(name: String)
+    }
+
     struct TeardownPayload {
         let provider: HeadlessAgentProvider?
         let executionTask: Task<Void, Never>?
@@ -120,8 +244,11 @@ final class ContextBuilderRunRecord {
     let origin: ContextBuilderRunOrigin
     let agentKind: AgentProviderKind
     let modelRaw: String
+    let modelParameterSelections: [ACPModelParameterSelection]
     let progressReporter: ContextBuilderMCPProgressReporter?
+    let activityReporter: ContextBuilderMCPActivityReporter?
     let workspaceContext: ContextBuilderWorkspaceContext?
+    let mcpConfiguration: ContextBuilderMCPRunConfiguration?
 
     var output = ContextBuilderAssistantOutputAccumulator()
     var executionTask: Task<Void, Never>?
@@ -134,11 +261,18 @@ final class ContextBuilderRunRecord {
     private var continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>?
     private var provider: HeadlessAgentProvider?
     private(set) var finalContextCommitClaimed = false
+    private(set) var cancellationState = ContextBuilderRunCancellationState.none
+    private(set) var deferredCancellationSettlementPolicy: ContextBuilderRunCancellationSettlementPolicy?
     private(set) var terminalOutcome: ContextBuilderRunTerminalOutcome?
     private(set) var teardownStartedAt: Date?
     private(set) var teardownFinishedAt: Date?
     private(set) var providerDisposalFinished = false
     private(set) var executionTaskFinished = false
+    private var teardownSettlementWaiters: [CheckedContinuation<Void, Never>] = []
+    private var didBeginProviderStreamProgress = false
+    private var didReportRoutingConfirmed = false
+    private var didObserveProviderEventAfterRouting = false
+    private var didObserveRepoPromptToolAfterRouting = false
 
     init(
         runID: UUID,
@@ -148,10 +282,13 @@ final class ContextBuilderRunRecord {
         origin: ContextBuilderRunOrigin,
         agentKind: AgentProviderKind,
         modelRaw: String,
+        modelParameterSelections: [ACPModelParameterSelection] = [],
         workspaceContext: ContextBuilderWorkspaceContext? = nil,
+        mcpConfiguration: ContextBuilderMCPRunConfiguration? = nil,
         continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>? = nil,
         restoreConfiguration: (() -> Void)? = nil,
-        progressReporter: ContextBuilderMCPProgressReporter? = nil
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) {
         self.runID = runID
         self.tabID = tabID
@@ -160,22 +297,82 @@ final class ContextBuilderRunRecord {
         self.origin = origin
         self.agentKind = agentKind
         self.modelRaw = modelRaw
+        self.modelParameterSelections = modelParameterSelections
         self.workspaceContext = workspaceContext
+        self.mcpConfiguration = mcpConfiguration
         self.continuation = continuation
         self.restoreConfiguration = restoreConfiguration
         self.progressReporter = progressReporter
+        self.activityReporter = activityReporter
     }
 
     func reportProgress(_ phase: ContextBuilderMCPProgressPhase) async {
         await progressReporter?(phase)
     }
 
+    func reportRoutingProgress(_ phase: ContextBuilderMCPProgressPhase) async {
+        guard !didBeginProviderStreamProgress else { return }
+        if phase == .routingConfirmed {
+            didReportRoutingConfirmed = true
+        }
+        await reportProgress(phase)
+    }
+
+    func beginProviderStreamProgress() async {
+        guard !didBeginProviderStreamProgress else { return }
+        didBeginProviderStreamProgress = true
+        if !didReportRoutingConfirmed {
+            didReportRoutingConfirmed = true
+            await reportProgress(.routingConfirmed)
+        }
+        await reportProgress(.waitingForProviderStreamEvent)
+    }
+
+    func captureProviderActivity(_ result: AIStreamResult) -> [ProviderActivity] {
+        var activity: [ProviderActivity] = []
+        if !didObserveProviderEventAfterRouting {
+            didObserveProviderEventAfterRouting = true
+            activity.append(.firstEvent(type: result.type))
+        }
+        if !didObserveRepoPromptToolAfterRouting,
+           result.type == "tool_call",
+           let toolName = result.toolName,
+           MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(toolName)
+        {
+            didObserveRepoPromptToolAfterRouting = true
+            activity.append(
+                .firstRepoPromptTool(
+                    name: MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
+                )
+            )
+        }
+        return activity
+    }
+
+    func reportProviderActivity(_ activity: [ProviderActivity]) async {
+        for item in activity {
+            switch item {
+            case let .firstEvent(type):
+                await reportProgress(.providerStreamActive)
+                await activityReporter?(
+                    .providerStreamActive,
+                    "First discovery provider event received: \(type)"
+                )
+            case let .firstRepoPromptTool(name):
+                await activityReporter?(
+                    .providerStreamActive,
+                    "First nested RepoPrompt MCP tool request observed: \(name)"
+                )
+            }
+        }
+    }
+
     var isTerminal: Bool {
         terminalOutcome != nil
     }
 
-    var canAcceptCancellation: Bool {
-        terminalOutcome == nil && !finalContextCommitClaimed
+    var hasDeferredCancellationPending: Bool {
+        cancellationState == .deferredUntilFinalContextCommitCompletes
     }
 
     var isTeardownPending: Bool {
@@ -184,9 +381,36 @@ final class ContextBuilderRunRecord {
 
     @discardableResult
     func claimFinalContextCommit() -> Bool {
-        guard terminalOutcome == nil, !finalContextCommitClaimed else { return false }
+        guard terminalOutcome == nil,
+              cancellationState == .none,
+              !finalContextCommitClaimed
+        else { return false }
         finalContextCommitClaimed = true
         return true
+    }
+
+    func requestCancellation(
+        deferredSettlementPolicy: ContextBuilderRunCancellationSettlementPolicy
+    ) -> ContextBuilderRunCancellationDisposition {
+        guard terminalOutcome == nil else { return .terminal }
+        guard cancellationState == .none else { return .alreadyRequested }
+
+        if finalContextCommitClaimed {
+            cancellationState = .deferredUntilFinalContextCommitCompletes
+            deferredCancellationSettlementPolicy = deferredSettlementPolicy
+            return .deferredUntilFinalContextCommitCompletes
+        }
+        cancellationState = .requested
+        return .settleImmediately
+    }
+
+    func consumeDeferredCancellationAtSafeBoundary() -> ContextBuilderRunCancellationSettlementPolicy? {
+        guard terminalOutcome == nil,
+              cancellationState == .deferredUntilFinalContextCommitCompletes,
+              let deferredCancellationSettlementPolicy
+        else { return nil }
+        cancellationState = .applied
+        return deferredCancellationSettlementPolicy
     }
 
     @discardableResult
@@ -244,9 +468,23 @@ final class ContextBuilderRunRecord {
         finishTeardownIfReady()
     }
 
+    func awaitTeardownSettlement() async {
+        if teardownFinishedAt != nil { return }
+        await withCheckedContinuation { continuation in
+            if teardownFinishedAt != nil {
+                continuation.resume()
+            } else {
+                teardownSettlementWaiters.append(continuation)
+            }
+        }
+    }
+
     private func finishTeardownIfReady() {
         guard providerDisposalFinished, executionTaskFinished, teardownFinishedAt == nil else { return }
         teardownFinishedAt = Date()
+        let waiters = teardownSettlementWaiters
+        teardownSettlementWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 
@@ -274,6 +512,14 @@ final class ContextBuilderRunRegistry {
     func activeRecord(tabID: UUID) -> ContextBuilderRunRecord? {
         guard let runID = activeRunIDByTabID[tabID] else { return nil }
         return recordsByRunID[runID]
+    }
+
+    func records(tabID: UUID) -> [ContextBuilderRunRecord] {
+        recordsByRunID.values.filter { $0.tabID == tabID }
+    }
+
+    func retainedRecordsSnapshot() -> [ContextBuilderRunRecord] {
+        Array(recordsByRunID.values)
     }
 
     func acceptsEvents(from record: ContextBuilderRunRecord, currentSession: ContextBuilderAgentViewModel.TabSession?) -> Bool {

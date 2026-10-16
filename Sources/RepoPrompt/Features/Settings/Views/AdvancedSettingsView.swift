@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+
 //
 //  AdvancedSettingsView.swift
 //  RepoPrompt
@@ -220,6 +223,15 @@ struct AdvancedSettingsView: View {
                     isOn: Binding(
                         get: { globalSettings.codeMapsGloballyDisabled },
                         set: { globalSettings.setCodeMapsGloballyDisabled($0) }
+                    )
+                )
+
+                SettingToggle(
+                    title: "Enable Code Maps in non-Git folders",
+                    description: "Off by default for existing workspaces. Enable to allow background Code Map scanning for plain folders.",
+                    isOn: Binding(
+                        get: { globalSettings.nonGitCodeMapsEnabled },
+                        set: { globalSettings.setNonGitCodeMapsEnabled($0) }
                     )
                 )
 

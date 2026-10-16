@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptSecureStorage
 
 final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked Sendable {
     enum Operation: Equatable {

@@ -7,10 +7,12 @@
 
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import SwiftUI
 
 @preconcurrency
-protocol Service {
+protocol Service: AnyObject {
+    var domainRegistrationID: MCPDomainToolRegistrationID { get }
     var tools: [Tool] { get async }
 
     var isActivated: Bool { get async }

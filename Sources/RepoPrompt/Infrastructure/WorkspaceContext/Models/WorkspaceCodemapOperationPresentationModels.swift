@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 enum WorkspaceCodemapOperationPresentationIntent: Equatable {
     case none
@@ -87,7 +88,7 @@ struct WorkspaceCodemapOperationPresentationPublicationReceipt: Equatable {
     let candidates: [WorkspaceCodemapOperationPresentationCandidate]
     let demandTickets: [WorkspaceCodemapArtifactDemandTicket]
     let bundles: [WorkspaceCodemapOperationPresentationBundleReceipt]
-    let automaticReceipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt?
+    let automaticReceipt: WorkspaceCodemapAutomaticSelectionReceipt?
 }
 
 enum WorkspaceCodemapOperationPublicationStaleReason: Equatable {
@@ -99,7 +100,7 @@ enum WorkspaceCodemapOperationPublicationStaleReason: Equatable {
         rootEpoch: WorkspaceCodemapRootEpoch,
         bundleID: WorkspaceCodemapFrozenPresentationBundleID
     )
-    case automatic(WorkspaceCodemapAutomaticSelectionStaleReason)
+    case automatic([WorkspaceCodemapAutomaticSelectionIssue])
 }
 
 enum WorkspaceCodemapOperationPublicationDisposition: Equatable {

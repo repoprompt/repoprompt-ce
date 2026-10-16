@@ -1,24 +1,133 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // MARK: - MCP Agent Role Defaults Storage
 
-/// Storage boundary for global MCP Agent Mode role defaults.
-/// Role defaults are global across workspaces; legacy workspace-scoped values are migrated by GlobalSettingsStore.
+/// Storage boundary for MCP Agent Mode role defaults.
+/// Role defaults resolve from the effective Agent Models profile for a workspace;
+/// `nil` workspace IDs resolve and mutate global settings.
 @MainActor
 protocol MCPAgentRoleDefaultsStoring: AnyObject {
-    func globalMCPAgentRoleOverrides() -> [String: String]?
-    func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool)
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]?
+    func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]?
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope, commit: Bool)
+    func mcpAgentRoleModelParameters(scope: AgentModelsEditingScope) -> [String: [ACPModelParameterSelection]]?
+    func mcpAgentRoleModelParameters(workspaceID: UUID?) -> [String: [ACPModelParameterSelection]]?
 }
 
-extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {}
+extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
+        effectiveAgentModelsProfile(workspaceID: workspaceID).mcpAgentRoleOverrides
+    }
+
+    func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]? {
+        switch scope {
+        case .global:
+            globalAgentModelsProfile().mcpAgentRoleOverrides
+        case let .workspace(workspaceID):
+            workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides
+        }
+    }
+
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope, commit _: Bool) {
+        setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
+    }
+
+    func mcpAgentRoleModelParameters(scope: AgentModelsEditingScope) -> [String: [ACPModelParameterSelection]]? {
+        switch scope {
+        case .global:
+            globalAgentModelsProfile().mcpAgentRoleModelParameters
+        case let .workspace(workspaceID):
+            workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleModelParameters
+        }
+    }
+
+    func mcpAgentRoleModelParameters(workspaceID: UUID?) -> [String: [ACPModelParameterSelection]]? {
+        effectiveAgentModelsProfile(workspaceID: workspaceID).mcpAgentRoleModelParameters
+    }
+}
+
+@MainActor
+final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
+    private var overrides: [String: String]?
+    private var roleModelParameters: [String: [ACPModelParameterSelection]]?
+
+    init(
+        overrides: [String: String]?,
+        roleModelParameters: [String: [ACPModelParameterSelection]]? = nil
+    ) {
+        self.overrides = overrides
+        self.roleModelParameters = roleModelParameters
+    }
+
+    func mcpAgentRoleOverrides(workspaceID _: UUID?) -> [String: String]? {
+        overrides
+    }
+
+    func mcpAgentRoleOverrides(scope _: AgentModelsEditingScope) -> [String: String]? {
+        overrides
+    }
+
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope _: AgentModelsEditingScope, commit _: Bool) {
+        self.overrides = overrides
+    }
+
+    func mcpAgentRoleModelParameters(scope _: AgentModelsEditingScope) -> [String: [ACPModelParameterSelection]]? {
+        roleModelParameters
+    }
+
+    func mcpAgentRoleModelParameters(workspaceID _: UUID?) -> [String: [ACPModelParameterSelection]]? {
+        roleModelParameters
+    }
+}
 
 // MARK: - MCP Agent Role Defaults Service
 
-/// Centralized resolution and persistence for global MCP agent role defaults.
+/// Centralized resolution and persistence for MCP agent role defaults.
 /// Used by the recommendation wizard, settings UI, and MCP runtime.
 @MainActor
 enum MCPAgentRoleDefaultsService {
     // MARK: - Resolution Result
+
+    enum PinState: Equatable {
+        case none
+        case unavailable
+        case custom(recommendedDisplayName: String)
+        case pinnedToRecommended
+
+        var message: String? {
+            switch self {
+            case .none:
+                nil
+            case .unavailable:
+                "Saved pin unavailable; using recommended default."
+            case let .custom(recommendedDisplayName):
+                "Recommended: \(recommendedDisplayName)"
+            case .pinnedToRecommended:
+                "Pinned to recommended"
+            }
+        }
+
+        var actionTitle: String? {
+            switch self {
+            case .none:
+                nil
+            case .unavailable, .pinnedToRecommended:
+                "Clear Pin"
+            case .custom:
+                "Apply"
+            }
+        }
+
+        var usesWarningStyle: Bool {
+            switch self {
+            case .unavailable, .custom:
+                true
+            case .none, .pinnedToRecommended:
+                false
+            }
+        }
+    }
 
     struct RoleDefaultResolution: Equatable {
         let role: AgentModelCatalog.TaskLabelKind
@@ -33,30 +142,66 @@ enum MCPAgentRoleDefaultsService {
         let effective: AgentModelCatalog.NormalizedAgentSelection
         let effectiveDisplayName: String
 
+        /// A persisted override exists for this role, even if it currently matches the recommendation.
+        let hasStoredOverride: Bool
+
+        /// The effective selection differs from the current recommendation.
         let hasCustomOverride: Bool
         let overrideUnavailable: Bool
 
+        /// The stored OpenCode effort pin for this role, filtered to the effective selection's
+        /// provider and canonical model. Empty when the role has no valid explicit choice or the
+        /// stored bucket no longer matches it.
+        let modelParameters: [ACPModelParameterSelection]
+
         var selectionID: AgentModelSelectionID {
             AgentModelSelectionID(agentRaw: effective.agent.rawValue, modelRaw: effective.modelRaw)
+        }
+
+        /// The stored `.thinking` pin value for this role, if any. The chip's saved-state input.
+        var thinkingParameterValueRaw: String? {
+            modelParameters.last { $0.kind == .thinking }?.valueRaw
+        }
+
+        var pinState: PinState {
+            guard hasStoredOverride else { return .none }
+            if overrideUnavailable {
+                return .unavailable
+            }
+            if hasCustomOverride {
+                return .custom(recommendedDisplayName: recommendedDisplayName)
+            }
+            return .pinnedToRecommended
         }
     }
 
     // MARK: - Resolve All
 
-    /// Returns global resolutions for all task label roles in canonical order.
+    static func hasStoredOverrides(
+        workspaceID: UUID? = nil,
+        settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
+    ) -> Bool {
+        let settingsStore = settingsStore ?? GlobalSettingsStore.shared
+        return settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)?.isEmpty == false
+    }
+
+    /// Returns resolutions for all task label roles in canonical order.
     static func resolutions(
         availability: AgentModelCatalog.AvailabilityContext = .current,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext? = nil,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> [RoleDefaultResolution] {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        let overrides = settingsStore.globalMCPAgentRoleOverrides()
+        let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
+        let roleModelParameters = settingsStore.mcpAgentRoleModelParameters(workspaceID: workspaceID)
         let recommendationAvailability = recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
         return AgentModelCatalog.TaskLabelKind.allCases.compactMap { kind in
             resolve(
                 kind: kind,
                 overrides: overrides,
+                roleModelParameters: roleModelParameters,
                 availability: availability,
                 recommendedAvailability: recommendationAvailability,
                 codexDynamicModels: codexDynamicModels
@@ -64,19 +209,21 @@ enum MCPAgentRoleDefaultsService {
         }
     }
 
-    /// Resolve one role's effective global selection.
+    /// Resolve one role's effective selection.
     static func effectiveSelection(
         for role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext? = nil,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> RoleDefaultResolution? {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        let overrides = settingsStore.globalMCPAgentRoleOverrides()
+        let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
         return resolve(
             kind: role,
             overrides: overrides,
+            roleModelParameters: settingsStore.mcpAgentRoleModelParameters(workspaceID: workspaceID),
             availability: availability,
             recommendedAvailability: recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore),
             codexDynamicModels: codexDynamicModels
@@ -87,56 +234,120 @@ enum MCPAgentRoleDefaultsService {
     static func effectiveNormalizedSelection(
         for role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         effectiveSelection(
             for: role,
             availability: availability,
+            workspaceID: workspaceID,
             settingsStore: settingsStore
         )?.effective
     }
 
+    /// Validate an explicit role pin independently of whether a recommended default exists.
+    static func executableStoredSelection(
+        for role: AgentModelCatalog.TaskLabelKind,
+        overrides: [String: String]?,
+        roleModelParameters: [String: [ACPModelParameterSelection]]?,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection])? {
+        guard let overrideRaw = overrides?[role.rawValue],
+              let parsed = AgentModelSelectionID.parse(overrideRaw),
+              let agent = AgentProviderKind(rawValue: parsed.agentRaw)
+        else { return nil }
+
+        // Codex may have dynamic model IDs, so defer its model-level validation. Other
+        // providers must still expose the stored model or the stale pin is non-executable.
+        let modelIsExecutable = agent == .codexExec
+            || AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability)
+        guard AgentModelCatalog.AgentSelectionSurface.general.allows(agent),
+              AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable else { return nil }
+
+        let selection = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
+        // A stored bucket is authoritative only for a valid explicit choice matching its
+        // provider and canonical model. Unavailable pins never carry model parameters.
+        let modelParameters: [ACPModelParameterSelection] = if let providerID = agent.acpProviderID, let bucket = roleModelParameters?[role.rawValue] {
+            ACPModelParameterSelection.selections(
+                for: providerID, activeBaseModelRaw: selection.modelRaw, from: bucket
+            )
+        } else {
+            []
+        }
+        return (selection, modelParameters)
+    }
+
     // MARK: - Mutations
 
-    /// Set a user-selected global override for a role. An explicit selection is always
+    /// Set a user-selected override for a role. An explicit selection is always
     /// persisted; revert a role to the (recommendation-tracking) default via
     /// `clearOverride` / `clearAllOverrides`.
     @discardableResult
     static func setSelection(
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind,
+        availability _: AgentModelCatalog.AvailabilityContext = .current,
+        scope: AgentModelsEditingScope,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> Bool {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let selectionID = AgentModelSelectionID(agentRaw: selection.agent.rawValue, modelRaw: selection.modelRaw)
-        var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
+        var overrides = settingsStore.mcpAgentRoleOverrides(scope: scope) ?? [:]
         // An explicit role pick is a durable choice. Do NOT erase it just because it
         // currently equals a transient, availability-dependent recommendation — doing so
         // dropped the override and the role silently drifted to a different model after
         // restart or availability change. Reverting to the recommended default stays an
         // explicit action via clearOverride / clearAllOverrides.
         overrides[role.rawValue] = selectionID.rawValue
-        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(overrides, scope: scope, commit: true)
         return true
     }
 
-    /// Clear one role's global override.
+    /// Clear one role's override.
     static func clearOverride(
         for role: AgentModelCatalog.TaskLabelKind,
+        scope: AgentModelsEditingScope,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
+        var overrides = settingsStore.mcpAgentRoleOverrides(scope: scope) ?? [:]
         overrides.removeValue(forKey: role.rawValue)
-        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides.isEmpty ? nil : overrides, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(overrides.isEmpty ? nil : overrides, scope: scope, commit: true)
     }
 
-    /// Clear all global role overrides (revert to recommended defaults).
+    /// Clear all role overrides (revert to recommended defaults).
     static func clearAllOverrides(
+        scope: AgentModelsEditingScope,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        settingsStore.updateGlobalMCPAgentRoleOverrides(nil, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(nil, scope: scope, commit: true)
+    }
+
+    /// Write a role pin atomically with its displayed model choice.
+    ///
+    /// `displayed` is the selection the surface is showing. Persisting it as the override
+    /// together with the pin is what keeps the pin eligible: a pin written against a merely
+    /// recommended (not overridden) model would be dropped by profile normalization the moment
+    /// it is saved. `selections == nil` clears only the pin, and only when the stored bucket
+    /// belongs to `displayed` — it never writes the override, so re-picking the already-checked
+    /// "Default" cannot make a recommendation-tracking role durable, nor delete a pin retained
+    /// for a different model.
+    static func setModelParameter(
+        _ selections: [ACPModelParameterSelection]?,
+        for role: AgentModelCatalog.TaskLabelKind,
+        displayed: AgentModelCatalog.NormalizedAgentSelection,
+        scope: AgentModelsEditingScope
+    ) {
+        GlobalSettingsStore.shared.setAgentModelsRoleModelParameter(
+            selections,
+            roleRawValue: role.rawValue,
+            displayedSelectionID: AgentModelSelectionID(
+                agentRaw: displayed.agent.rawValue,
+                modelRaw: displayed.modelRaw
+            ),
+            scope: scope
+        )
     }
 
     // MARK: - Private
@@ -154,6 +365,7 @@ enum MCPAgentRoleDefaultsService {
     private static func resolve(
         kind: AgentModelCatalog.TaskLabelKind,
         overrides: [String: String]?,
+        roleModelParameters: [String: [ACPModelParameterSelection]]?,
         availability: AgentModelCatalog.AvailabilityContext,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
@@ -170,27 +382,23 @@ enum MCPAgentRoleDefaultsService {
         let recommendedDisplayName = "\(recommended.agent.displayName) \(AgentModelCatalog.displayName(for: recommended.modelRaw, agentKind: recommended.agent, codexDynamicModels: codexDynamicModels))"
 
         // Check for stored override
+        let hasStoredOverride = overrides?[kind.rawValue] != nil
+        let storedSelection = executableStoredSelection(
+            for: kind,
+            overrides: overrides,
+            roleModelParameters: roleModelParameters,
+            availability: availability
+        )
         let effective: AgentModelCatalog.NormalizedAgentSelection
         var hasCustomOverride = false
         var overrideUnavailable = false
 
-        if let overrideRaw = overrides?[kind.rawValue],
-           let parsed = AgentModelSelectionID.parse(overrideRaw),
-           let agent = AgentProviderKind(rawValue: parsed.agentRaw)
-        {
-            // Codex may have dynamic model IDs, so validate agent availability and defer model-level validation.
-            if AgentModelCatalog.isAgentAvailable(agent, availability: availability) {
-                let sel = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
-                effective = sel
-                hasCustomOverride = (sel != recommended)
-            } else {
-                effective = recommended
-                hasCustomOverride = true
-                overrideUnavailable = true
-            }
+        if let storedSelection {
+            effective = storedSelection.selection
+            hasCustomOverride = (effective != recommended)
         } else {
             effective = recommended
-            if overrides?[kind.rawValue] != nil {
+            if hasStoredOverride {
                 hasCustomOverride = true
                 overrideUnavailable = true
             }
@@ -206,8 +414,10 @@ enum MCPAgentRoleDefaultsService {
             recommendedDisplayName: recommendedDisplayName,
             effective: effective,
             effectiveDisplayName: effectiveDisplayName,
+            hasStoredOverride: hasStoredOverride,
             hasCustomOverride: hasCustomOverride,
-            overrideUnavailable: overrideUnavailable
+            overrideUnavailable: overrideUnavailable,
+            modelParameters: storedSelection?.modelParameters ?? []
         )
     }
 

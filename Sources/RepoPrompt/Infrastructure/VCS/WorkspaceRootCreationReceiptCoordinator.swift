@@ -1,6 +1,8 @@
 import CoreServices
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct WorkspaceRootCreationFSEvent: Equatable {
     let path: String
@@ -21,7 +23,7 @@ enum WorkspaceRootCreationWitnessBarrierPhase: Hashable {
 
 protocol WorkspaceRootCreationWitnessEventStream: AnyObject, Sendable {
     func start() -> Bool
-    func flushSync(phase: WorkspaceRootCreationWitnessFlushPhase) -> Bool
+    func flush(phase: WorkspaceRootCreationWitnessFlushPhase) async -> Bool
     func synchronizeCallbacks(
         phase: WorkspaceRootCreationWitnessBarrierPhase,
         _ body: @escaping @Sendable () -> Void
@@ -65,15 +67,47 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
 {
     private final class CallbackBox: @unchecked Sendable {
         let onEvents: @Sendable ([WorkspaceRootCreationFSEvent]) -> Void
+        let deliveryBarrier: FSEventAsyncDeliveryBarrier
+        let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
 
-        init(onEvents: @escaping @Sendable ([WorkspaceRootCreationFSEvent]) -> Void) {
+        init(
+            onEvents: @escaping @Sendable ([WorkspaceRootCreationFSEvent]) -> Void,
+            deliveryBarrier: FSEventAsyncDeliveryBarrier,
+            deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+        ) {
             self.onEvents = onEvents
+            self.deliveryBarrier = deliveryBarrier
+            self.deliveryGeneration = deliveryGeneration
+        }
+
+        func accept(_ payload: FSEventCallbackPayload) {
+            guard deliveryBarrier.currentGeneration == deliveryGeneration else { return }
+            let events = payload.entries.map {
+                WorkspaceRootCreationFSEvent(path: $0.path, flags: $0.flags, eventID: $0.id)
+            }
+            let hasWrappedJournal = payload.entries.contains {
+                $0.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped) != 0
+            }
+            if hasWrappedJournal {
+                // The callback still records the discontinuity for receipt
+                // classification, but its numeric cut is invalidated before
+                // any later flush can reuse the old high watermark.
+                _ = deliveryBarrier.reset(ifCurrent: deliveryGeneration)
+            }
+            onEvents(events)
+            guard !hasWrappedJournal else { return }
+            deliveryBarrier.recordDelivered(
+                eventIDs: payload.entries.map(\.id),
+                generation: deliveryGeneration
+            )
         }
     }
 
     private let lock = NSLock()
     private let queue: DispatchQueue
     private let callbackBox: CallbackBox
+    private let deliveryBarrier: FSEventAsyncDeliveryBarrier
+    private let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
     private var stream: FSEventStreamRef?
 
     init?(
@@ -85,7 +119,15 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
             label: "com.repoprompt.worktree-creation-witness.\(UUID().uuidString)",
             qos: .utility
         )
-        callbackBox = CallbackBox(onEvents: onEvents)
+        let deliveryBarrier = FSEventAsyncDeliveryBarrier()
+        let deliveryGeneration = deliveryBarrier.currentGeneration
+        self.deliveryBarrier = deliveryBarrier
+        self.deliveryGeneration = deliveryGeneration
+        callbackBox = CallbackBox(
+            onEvents: onEvents,
+            deliveryBarrier: deliveryBarrier,
+            deliveryGeneration: deliveryGeneration
+        )
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(callbackBox).toOpaque(),
@@ -103,9 +145,7 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
                   )
             else { return }
             let box = Unmanaged<CallbackBox>.fromOpaque(info).takeUnretainedValue()
-            box.onEvents(payload.entries.map {
-                WorkspaceRootCreationFSEvent(path: $0.path, flags: $0.flags, eventID: $0.id)
-            })
+            box.accept(payload)
         }
         let createFlags = FSEventStreamCreateFlags(
             kFSEventStreamCreateFlagUseCFTypes
@@ -135,12 +175,15 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
         }
     }
 
-    func flushSync(phase _: WorkspaceRootCreationWitnessFlushPhase) -> Bool {
-        lock.withLock {
-            guard let stream else { return false }
-            FSEventStreamFlushSync(stream)
-            return true
-        }
+    func flush(phase _: WorkspaceRootCreationWitnessFlushPhase) async -> Bool {
+        guard let flushTarget = lock.withLock({
+            stream.map(FSEventStreamFlushAsync)
+        }) else { return false }
+        let delivered = await deliveryBarrier.waitUntilDelivered(
+            flushTarget,
+            generation: deliveryGeneration
+        )
+        return delivered && deliveryBarrier.currentGeneration == deliveryGeneration
     }
 
     func synchronizeCallbacks(
@@ -148,7 +191,7 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
         _ body: @escaping @Sendable () -> Void
     ) -> Bool {
         queue.sync(execute: body)
-        return true
+        return deliveryBarrier.currentGeneration == deliveryGeneration
     }
 
     func stop() {
@@ -182,6 +225,35 @@ private final class ProductionWorkspaceRootCreationWitnessEventStream: @unchecke
             self.stream = nil
         }
     }
+
+    #if DEBUG
+        static func wrappedCallbackCutForTesting() async -> (
+            cutDelivered: Bool,
+            generationInvalidated: Bool
+        ) {
+            let barrier = FSEventAsyncDeliveryBarrier(
+                scheduleDeadline: { _, action in action() }
+            )
+            let generation = barrier.currentGeneration
+            let callbackBox = CallbackBox(
+                onEvents: { _ in },
+                deliveryBarrier: barrier,
+                deliveryGeneration: generation
+            )
+            barrier.recordDelivered(eventIDs: [100], generation: generation)
+            callbackBox.accept(FSEventCallbackPayload(entries: [
+                FSEventCallbackEntry(
+                    path: "/temporary-worktree/child",
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped),
+                    id: 5
+                )
+            ]))
+            return await (
+                cutDelivered: barrier.waitUntilDelivered(5, generation: generation),
+                generationInvalidated: barrier.currentGeneration != generation
+            )
+        }
+    #endif
 }
 
 final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
@@ -202,9 +274,8 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         fileprivate let activationCallbackBarrierCompleted: Bool
         fileprivate let startAcceptedCallbackWatermark: UInt64
 
-        private let finishCondition = NSCondition()
-        private var finishInProgress = false
-        private var finishedCoverage: GitWorktreeCreationWitnessCoverage?
+        private let finishLock = NSLock()
+        private var finishTask: Task<GitWorktreeCreationWitnessCoverage, Never>?
 
         fileprivate init(
             recorder: Recorder,
@@ -245,27 +316,15 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         }
 
         fileprivate func performFinishOnce(
-            _ body: () -> GitWorktreeCreationWitnessCoverage
-        ) -> GitWorktreeCreationWitnessCoverage {
-            finishCondition.lock()
-            while finishInProgress, finishedCoverage == nil {
-                finishCondition.wait()
+            _ body: @escaping @Sendable () async -> GitWorktreeCreationWitnessCoverage
+        ) async -> GitWorktreeCreationWitnessCoverage {
+            let task = finishLock.withLock {
+                if let finishTask { return finishTask }
+                let task = Task { await body() }
+                finishTask = task
+                return task
             }
-            if let finishedCoverage {
-                finishCondition.unlock()
-                return finishedCoverage
-            }
-            finishInProgress = true
-            finishCondition.unlock()
-
-            let coverage = body()
-
-            finishCondition.lock()
-            finishedCoverage = coverage
-            finishInProgress = false
-            finishCondition.broadcast()
-            finishCondition.unlock()
-            return coverage
+            return await task.value
         }
     }
 
@@ -290,6 +349,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         private let startEventID: UInt64
         private var semanticEndEventID: UInt64?
         private var latestMaterialEventID: UInt64
+        private var previousEventBatch: [WorkspaceRootCreationFSEvent] = []
         private var acceptedCallbackWatermark: UInt64 = 0
         private var acceptedCallbackCount = 0
         private var acceptedEventCount = 0
@@ -315,6 +375,13 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
             acceptedCallbackWatermark = Self.incremented(acceptedCallbackWatermark)
             acceptedCallbackCount = Self.incremented(acceptedCallbackCount)
             acceptedEventCount = Self.added(acceptedEventCount, events.count)
+
+            // An identical callback replay need not mean the journal regressed.
+            // Retain only one batch, requiring matching IDs, paths, flags and order.
+            let isIdenticalReplay = !events.isEmpty && events == previousEventBatch
+            if !events.isEmpty {
+                previousEventBatch = events
+            }
 
             for event in events {
                 let flags = event.flags
@@ -343,10 +410,12 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
                 guard isWithinEndingCut else {
                     continue
                 }
-                if eventID == 0 || eventID == UInt64.max || eventID < latestMaterialEventID {
+                if eventID == 0 || eventID == UInt64.max
+                    || (!isIdenticalReplay && eventID < latestMaterialEventID)
+                {
                     eventIDRegressed = true
                 } else {
-                    latestMaterialEventID = eventID
+                    latestMaterialEventID = max(latestMaterialEventID, eventID)
                 }
                 guard eventID > startEventID, eventID != UInt64.max else {
                     continue
@@ -444,6 +513,15 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
 
     private let backend: any WorkspaceRootCreationWitnessFSEventsBackend
 
+    #if DEBUG
+        static func wrappedCallbackCutForTesting() async -> (
+            cutDelivered: Bool,
+            generationInvalidated: Bool
+        ) {
+            await ProductionWorkspaceRootCreationWitnessEventStream.wrappedCallbackCutForTesting()
+        }
+    #endif
+
     init(
         backend: any WorkspaceRootCreationWitnessFSEventsBackend =
             ProductionWorkspaceRootCreationWitnessFSEventsBackend()
@@ -451,7 +529,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         self.backend = backend
     }
 
-    func start(destinationURL: URL, stableWatchRootURL: URL) -> Session {
+    func start(destinationURL: URL, stableWatchRootURL: URL) async -> Session {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         let canonicalWatchRoot = Self.canonicalURL(stableWatchRootURL)
         let canonicalDestination = Self.canonicalURL(destinationURL)
@@ -528,8 +606,11 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
             }
         )
         let streamDidStart = stream?.start() ?? false
-        let activationFlushCompleted = streamDidStart
-            && (stream?.flushSync(phase: .activation) ?? false)
+        let activationFlushCompleted: Bool = if streamDidStart, let stream {
+            await stream.flush(phase: .activation)
+        } else {
+            false
+        }
         let activationBarrierCompleted = activationFlushCompleted
             && (stream?.synchronizeCallbacks(phase: .activation) {} ?? false)
         let startAcceptedWatermark = activationBarrierCompleted
@@ -556,13 +637,13 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         )
     }
 
-    func finish(_ session: Session) -> GitWorktreeCreationWitnessCoverage {
-        session.performFinishOnce {
-            finishUncached(session)
+    func finish(_ session: Session) async -> GitWorktreeCreationWitnessCoverage {
+        await session.performFinishOnce { [self] in
+            await finishUncached(session)
         }
     }
 
-    private func finishUncached(_ session: Session) -> GitWorktreeCreationWitnessCoverage {
+    private func finishUncached(_ session: Session) async -> GitWorktreeCreationWitnessCoverage {
         let stableRootMatchedBeforeEnding = Self.stableRootMatches(session)
         var endEventID: UInt64 = 0
         var endingFlushCompleted = false
@@ -577,7 +658,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
             }
             if endCutBarrierCompleted {
                 endEventID = cutCapture.value
-                endingFlushCompleted = stream.flushSync(phase: .ending)
+                endingFlushCompleted = await stream.flush(phase: .ending)
                 endingBarrierCompleted = endingFlushCompleted
                     && stream.synchronizeCallbacks(phase: .ending) {}
             }
@@ -667,7 +748,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         guard lstat(url.path, &value) == 0,
               value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
         else { return nil }
-        return StableWatchRootIdentity(device: UInt64(value.st_dev), inode: UInt64(value.st_ino))
+        return StableWatchRootIdentity(device: safeDeviceID(value.st_dev), inode: UInt64(value.st_ino))
     }
 
     private static func canonicalURL(_ url: URL) -> URL {

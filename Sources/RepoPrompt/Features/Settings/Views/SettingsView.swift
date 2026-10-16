@@ -17,9 +17,9 @@ private struct SettingsSidebarMaterialView: NSViewRepresentable {
 }
 
 struct SettingsView: View {
-    @ObservedObject var fileManager: WorkspaceFilesViewModel
-    @ObservedObject var promptViewModel: PromptViewModel
-    @ObservedObject var apiSettingsViewModel: APISettingsViewModel
+    let fileManager: WorkspaceFilesViewModel
+    let promptViewModel: PromptViewModel
+    let apiSettingsViewModel: APISettingsViewModel
     let windowState: WindowState
     var onAPIKeyUpdated: (() -> Void)?
 
@@ -37,9 +37,8 @@ struct SettingsView: View {
 
     /// Canonical sidebar order. Agent-mode first, then General (app-wide
     /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
-    /// workflow. Benchmark is intentionally grouped under Models & Providers
-    /// rather than being its own top-level section.
-    private static let sidebarSectionOrder: [TabSection] = [
+    /// workflow.
+    static let sidebarSectionOrder: [TabSection] = [
         .agentMode, .general, .mcp, .api, .workspaces, .copyChat
     ]
 
@@ -107,7 +106,7 @@ struct SettingsView: View {
 
             // Right side with content
             VStack(spacing: 0) {
-                contentView
+                selectedDetailContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .id(selectedTab)
             }
@@ -246,15 +245,15 @@ struct SettingsView: View {
             // Overview (formerly "Behavior") is the top-level entry point that
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
-            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .contextBuilder]
+            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .modelRouter, .contextBuilder]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
-            [.apiGeneral, .openRouter, .customProvider, .modelOverrides, .benchmark]
+            [.apiGeneral, .openRouter, .customProvider, .modelOverrides]
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .licenseUpdates, .keyboardShortcuts, .advanced]
+            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -262,6 +261,30 @@ struct SettingsView: View {
             // in a sensible place (see `contentView`).
             [.chatSettings, .workflowPresets, .promptOrder]
         }
+    }
+
+    @ViewBuilder
+    private var selectedDetailContent: some View {
+        if selectedTab == .modelRouter {
+            routerSettingsContent
+        } else {
+            SettingsObservingContent(
+                fileManager: fileManager,
+                promptViewModel: promptViewModel,
+                apiSettingsViewModel: apiSettingsViewModel
+            ) {
+                nonRouterContentView
+            }
+        }
+    }
+
+    private var nonRouterContentView: some View {
+        contentView
+    }
+
+    private var routerSettingsContent: some View {
+        RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
+            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
     }
 
     @ViewBuilder
@@ -301,15 +324,15 @@ struct SettingsView: View {
                 windowState: windowState
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .telemetry:
+            TelemetrySettingsView()
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .notifications:
+            NotificationSettingsView()
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .chatSettings:
             ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
-        case .benchmark:
-            BenchmarkSettingsView(
-                promptViewModel: promptViewModel,
-                apiSettingsViewModel: apiSettingsViewModel
-            )
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .apiGeneral:
             APISettingsView(
                 viewModel: apiSettingsViewModel,
@@ -395,16 +418,20 @@ struct SettingsView: View {
             AgentModeGeneralSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .modelRouter:
+            routerSettingsContent
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
-                contextBuilderVM: windowState.contextBuilderAgentViewModel,
                 apiSettingsVM: apiSettingsViewModel,
                 windowID: windowState.windowID,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
+                settingsManager: windowState.settingsManager,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -450,9 +477,12 @@ struct SettingsView: View {
                 guard let agentModeVM else { return }
                 agentModeVM.providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
             },
-            // Route Claude effort changes through `AgentModeViewModel.setClaudeEffortLevel(_:)`
-            // so active sessions pick up the new effort via the same scheduling path that
-            // `AgentInputBar` uses.
+            claudeEffortLevelProvider: { [weak agentModeVM] in
+                guard let agentModeVM, let session = agentModeVM.activeSession,
+                      session.selectedAgent.usesClaudeTooling else { return nil }
+                return agentModeVM.claudeCoordinator.currentClaudeEffortLevel(for: session)
+            },
+            // Settings and the composer edit the same active conversation's effort.
             onClaudeEffortLevelChanged: { [weak agentModeVM] level in
                 agentModeVM?.setClaudeEffortLevel(level)
             }
@@ -479,6 +509,29 @@ struct SettingsView: View {
             diagnostics: diagnostics
         )
         return (provider, subagent, diagnostics)
+    }
+}
+
+private struct SettingsObservingContent<Content: View>: View {
+    @ObservedObject private var fileManager: WorkspaceFilesViewModel
+    @ObservedObject private var promptViewModel: PromptViewModel
+    @ObservedObject private var apiSettingsViewModel: APISettingsViewModel
+    private let content: () -> Content
+
+    init(
+        fileManager: WorkspaceFilesViewModel,
+        promptViewModel: PromptViewModel,
+        apiSettingsViewModel: APISettingsViewModel,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        _fileManager = ObservedObject(wrappedValue: fileManager)
+        _promptViewModel = ObservedObject(wrappedValue: promptViewModel)
+        _apiSettingsViewModel = ObservedObject(wrappedValue: apiSettingsViewModel)
+        self.content = content
+    }
+
+    var body: some View {
+        content()
     }
 }
 
@@ -516,8 +569,9 @@ enum SettingsTab: String, CaseIterable {
     case permissions // Workspace approvals (RepoPrompt-mutating operations)
     case keyboardShortcuts
     case advanced
+    case telemetry
+    case notifications
     case chatSettings
-    case benchmark
     case apiGeneral
     case openRouter
     case customProvider
@@ -532,6 +586,7 @@ enum SettingsTab: String, CaseIterable {
     case chatPresets // Chat presets management (legacy deep-link → workflowPresets with Chat scope)
     case contextBuilder // Context builder settings
     case agentMode // Agent Mode "Overview" tab (formerly labeled "Agent Mode Behavior")
+    case modelRouter // Agent Decisions settings (Model Router, Auto Effort, decision services)
     case agentModels // NEW: Unified model config shell (Phase 1 IA scaffolding)
     case agentPermissions // NEW: Unified permissions shell (Phase 1 IA scaffolding)
     case agentWorkflows // Agent Mode workflow prompts and featured/custom workflows
@@ -545,8 +600,9 @@ enum SettingsTab: String, CaseIterable {
         case .permissions: "Workspace Approvals"
         case .keyboardShortcuts: "Keyboard Shortcuts"
         case .advanced: "Advanced"
+        case .telemetry: "Telemetry"
+        case .notifications: "Notifications"
         case .chatSettings: "Chat Settings"
-        case .benchmark: "Benchmark"
         case .apiGeneral: "API Providers"
         case .openRouter: "OpenRouter"
         case .customProvider: "Custom API"
@@ -561,6 +617,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "Chat Presets"
         case .contextBuilder: "Context Builder"
         case .agentMode: "Overview"
+        case .modelRouter: "Agent Decisions"
         case .agentModels: "Agent Models"
         case .agentPermissions: "Agent Permissions"
         case .agentWorkflows: "Agent Workflows"
@@ -576,8 +633,9 @@ enum SettingsTab: String, CaseIterable {
         case .permissions: "shield.checkered"
         case .keyboardShortcuts: "keyboard"
         case .advanced: "gearshape.2"
+        case .telemetry: "lock.shield"
+        case .notifications: "bell.badge"
         case .chatSettings: "message"
-        case .benchmark: "gauge"
         case .apiGeneral: "key"
         case .openRouter: "network"
         case .customProvider: "server.rack"
@@ -592,6 +650,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "bubble.left.and.bubble.right"
         case .contextBuilder: "sparkles"
         case .agentMode: "brain.head.profile"
+        case .modelRouter: "point.3.connected.trianglepath.dotted"
         case .agentModels: "brain"
         case .agentPermissions: "lock.shield"
         case .agentWorkflows: "bolt.fill"
@@ -605,6 +664,7 @@ enum SettingsTab: String, CaseIterable {
              .agentModels,
              .agentPermissions,
              .agentWorkflows,
+             .modelRouter,
              .contextBuilder,
              .agentMode:
             .agentMode
@@ -613,9 +673,8 @@ enum SettingsTab: String, CaseIterable {
         case .mcp, .mcpTools, .permissions, .modelPresets:
             .mcp
 
-        // Models & Providers (Oracle + API key providers). Benchmark lives here
-        // rather than being its own top-level section.
-        case .apiGeneral, .openRouter, .customProvider, .modelOverrides, .benchmark:
+        // Models & Providers (Oracle + API key providers)
+        case .apiGeneral, .openRouter, .customProvider, .modelOverrides:
             .api
 
         // Workspaces
@@ -623,7 +682,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .licenseUpdates, .keyboardShortcuts, .advanced:
+        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
             .general
 
         // Copy & Chat workflows
@@ -726,6 +785,22 @@ enum SettingsTab: String, CaseIterable {
                 "global codemap",
                 "get_code_structure"
             ]
+        case .telemetry:
+            ["telemetry", "privacy", "crash", "diagnostics", "sentry"]
+        case .notifications:
+            [
+                "notifications",
+                "alerts",
+                "banner",
+                "badge",
+                "dock",
+                "approve",
+                "approval",
+                "reply",
+                "question",
+                "turn complete",
+                "sound"
+            ]
         case .chatSettings:
             [
                 "chat",
@@ -741,20 +816,6 @@ enum SettingsTab: String, CaseIterable {
                 "clear chat",
                 "chat history",
                 "built-in chat"
-            ]
-        case .benchmark:
-            [
-                "benchmark",
-                "bench",
-                "score",
-                "ranking",
-                "model benchmark",
-                "run benchmark",
-                "benchmark history",
-                "benchmark leaderboard",
-                "seed",
-                "performance test",
-                "model evaluation"
             ]
         case .apiGeneral:
             [
@@ -1054,12 +1115,12 @@ enum SettingsTab: String, CaseIterable {
                 "rewrite",
                 "augment",
                 "preserve",
-                "auto plan",
-                "plan generation",
+                "follow-up analysis",
+                "plan review question",
                 "claude code",
                 "codex",
                 "analysis budget",
-                "plan token budget",
+                "selected context",
                 "custom prompts",
                 "custom instructions",
                 "ui runs",
@@ -1089,7 +1150,28 @@ enum SettingsTab: String, CaseIterable {
                 "cleanup_sessions",
                 "investigate workflow",
                 "refactor workflow",
-                "orchestrate workflow"
+                "orchestrate workflow",
+                "agent chats",
+                "compose tabs",
+                "show mcp-created chats",
+                "mcp-created chats",
+                "compose tabs without agent sessions",
+                "sessionless compose tabs",
+                "show compose tabs",
+                "agent session visibility"
+            ]
+        case .modelRouter:
+            [
+                "agent decisions",
+                "model router",
+                "router",
+                "jev",
+                "typesafe",
+                "automatic model selection",
+                "route this task",
+                "routing backend",
+                "provider allowlist",
+                "privacy"
             ]
         case .agentModels:
             [

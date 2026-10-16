@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 @MainActor

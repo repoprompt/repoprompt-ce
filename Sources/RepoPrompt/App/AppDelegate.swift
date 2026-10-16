@@ -1,8 +1,12 @@
 import Cocoa
 import Combine
 import Darwin
+import Logging
+import RepoPromptProcess
 import Sparkle
 import SwiftUI
+
+private let appDelegateLog = Logger(label: "com.repoprompt.app.delegate")
 
 #if DEBUG
     private var appDelegateDebugLoggingEnabled = false
@@ -16,17 +20,36 @@ import SwiftUI
 
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
+    typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
+    typealias DomainRuntimeShutdownOperation = @Sendable () async -> Void
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
+    /// The app delegate retains signal routing so its Dispatch sources remain active for the
+    /// entire application lifetime.
+    private lazy var terminationSignalRouter = AppTerminationSignalRouter(
+        observer: DispatchTerminationSignalObserver()
+    ) {
+        NSApp.terminate(nil)
+    }
 
-    // New global routing/settings services (kept alive by the AppDelegate)
-    private var windowRoutingService: WindowRoutingService?
-    private var appSettingsMCPService: AppSettingsMCPService?
+    /// App startup owns one explicit registration attempt; readiness only observes it.
+    private var domainRuntimeStartupTask: Task<Void, Never>?
+    private(set) var domainRuntimeStartupFailureDescription: String?
+    private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        try await WindowState.sharedMCPService.start()
+    }
+
+    private var domainRuntimeShutdownOperation: DomainRuntimeShutdownOperation = {
+        _ = await AppDomainRuntimeComposition.shared.runtime.shutdown()
+    }
 
     // MARK: - Global references
 
     let sparkleManager: SparkleUpdaterManager
+    private let sparkleFeedDelegate: SparkleUpdateFeedDelegate
+    private let sparkleVersionDisplay: SparkleVersionDisplay
 
     /// NEW: weak reference injected by `RepoPromptApp`
     weak var windowStatesManager: WindowStatesManager?
@@ -46,10 +69,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         SparkleUpdaterManager.cleanCorruptPreferences()
 
         // Initialize Sparkle updater
+        let feedDelegate = SparkleUpdateFeedDelegate()
+        sparkleFeedDelegate = feedDelegate
+        let versionDisplay = SparkleVersionDisplay()
+        sparkleVersionDisplay = versionDisplay
         let updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
+            updaterDelegate: feedDelegate,
+            userDriverDelegate: versionDisplay
         )
         sparkleManager = SparkleUpdaterManager(updaterController: updaterController)
         SparkleUpdaterManager.shared = sparkleManager
@@ -58,11 +85,60 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         super.init()
     }
 
+    // MARK: - Global MCP startup
+
+    /// The production startup seam for process-owned application registrations.
+    /// Repeated callers join the one app-lifetime attempt instead of retrying or logging.
+    @discardableResult
+    func startGlobalMCPServiceRegistration() -> Task<Void, Never> {
+        if let domainRuntimeStartupTask { return domainRuntimeStartupTask }
+
+        domainRuntimeStartupFailureDescription = nil
+        let registrationOperation = globalMCPRegistrationOperation
+        let task = Task { @MainActor [weak self, registrationOperation] in
+            do {
+                try await registrationOperation()
+            } catch {
+                let description = String(reflecting: error)
+                self?.domainRuntimeStartupFailureDescription = description
+                appDelegateLog.error("Global MCP domain service registration failed: \(description)")
+            }
+        }
+        domainRuntimeStartupTask = task
+        return task
+    }
+
+    #if DEBUG
+        func setGlobalMCPRegistrationOperationForTesting(
+            _ operation: @escaping GlobalMCPRegistrationOperation
+        ) {
+            precondition(domainRuntimeStartupTask == nil, "Registration operation must be injected before startup")
+            globalMCPRegistrationOperation = operation
+        }
+
+        func setDomainRuntimeShutdownOperationForTesting(
+            _ operation: @escaping DomainRuntimeShutdownOperation
+        ) {
+            domainRuntimeShutdownOperation = operation
+        }
+
+        func shutdownDomainRuntimeForTerminationForTesting() async {
+            await shutdownDomainRuntimeForTermination()
+        }
+    #endif
+
     // MARK: - NSApplicationDelegate
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // The notification delegate must be installed before launch finishes so a click that launched
+        // the app is delivered. This does not prompt for authorization (that stays in didFinishLaunching).
+        NotificationService.shared.installDelegate()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
+        terminationSignalRouter.install()
 
         if launchConfiguration.isUITestSession {
             NSApp.setActivationPolicy(.regular)
@@ -77,16 +153,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         AppearanceController.shared.applyFromGlobalSettings()
 
         // ───────────────────────────────────────────────────
-        // Register global MCP app-wide helpers
-        let appSettingsMCPService = AppSettingsMCPService()
-        ServiceRegistry.register(appSettingsMCPService)
-        self.appSettingsMCPService = appSettingsMCPService
-
-        // Register global MCP window-routing helpers
-        windowRoutingService = WindowRoutingService(
-            windowStates: WindowStatesManager.shared,
-            networkMgr: ServerNetworkManager.shared
-        )
+        // Start the runtime and publish both application-scoped MCP services before
+        // any connection can report a complete catalog. Readiness is observation-only.
+        startGlobalMCPServiceRegistration()
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
@@ -150,6 +219,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
+        // Synchronous oversight freeze, before any async teardown can run: quitting closes every
+        // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
+        // exactly the saved oversight the next launch is supposed to restore.
+        AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
 
         // 2) Persist the final restorable window session before async shutdown begins.
         // Using .terminateLater lets us do async work without deadlocking.
@@ -158,11 +231,21 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
                 await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
             }
 
+            // 2b) Bounded settlement of durable oversight transactions the user already started.
+            // Total deadline, losing branch never awaited: a stuck filesystem must not hold up quit,
+            // and the write-through store means every *reported* Add or Stop is already durable.
+            await AgentSessionLinkRuntimeBridge.shared.settleIntentTransactions()
+            // Scope authority was frozen synchronously above. Only this exact final snapshot can
+            // become restorable. A failed or incomplete seal leaves approval required next launch.
+            _ = await AgentSessionLinkRuntimeBridge.shared.delegationScopes.settleForTermination()
+
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await shutdownDomainRuntimeForTermination()
+            await NotificationService.shared.prepareForTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 
@@ -177,12 +260,20 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
+        // Idempotent and synchronous only. Correctness comes from the write-through store and the
+        // bounded `.terminateLater` settlement above, never from work attempted here.
+        AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }
     }
 
     // MARK: - App Teardown
+
+    private func shutdownDomainRuntimeForTermination() async {
+        domainRuntimeStartupTask?.cancel()
+        await domainRuntimeShutdownOperation()
+    }
 
     func tearDown() async {
         // Put any global-level teardown logic here

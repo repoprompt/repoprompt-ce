@@ -1,40 +1,109 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 @MainActor
 struct AgentManageMCPToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
+    typealias RequestMetadata = MCPRequestMetadata
+
+    static let maxCleanupSessionIDs = 256
+
+    struct CleanupDependencies {
+        let loadPersistedMetadata: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> AgentSessionMeta?
+        let loadPersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> AgentSession?
+        let deleteOpenSession: @MainActor (
+            _ viewModel: AgentModeViewModel,
+            _ tabID: UUID,
+            _ workspace: WorkspaceModel
+        ) async throws -> ProviderConversationCleanupOutcome?
+        let deletePersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> Void
+        let finalizePersistedReferences: @MainActor (
+            _ viewModel: AgentModeViewModel,
+            _ sessionID: UUID,
+            _ workspaceID: UUID
+        ) async -> Int
+        let checkCancellation: @MainActor () throws -> Void
+
+        static let live = CleanupDependencies(
+            loadPersistedMetadata: { sessionID, workspace in
+                try await AgentSessionDataService.shared
+                    .metadataRecordForSessionID(sessionID, for: workspace)?
+                    .agentSessionMeta()
+            },
+            loadPersistedSession: { sessionID, workspace in
+                try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            },
+            deleteOpenSession: { viewModel, tabID, workspace in
+                try await viewModel.deleteSession(tabID: tabID, workspace: workspace)
+            },
+            deletePersistedSession: { sessionID, workspace in
+                try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
+            },
+            finalizePersistedReferences: { viewModel, sessionID, workspaceID in
+                let result = await viewModel.finalizeDeletedAgentSessionReferences(
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    knownTabIDs: [],
+                    reason: "agent_manage.cleanup_sessions"
+                )
+                return result.affectedTabIDs.count
+            },
+            checkCancellation: {
+                try Task.checkCancellation()
+            }
+        )
+    }
 
     let toolName: String
-    let captureRequestMetadata: () async -> RequestMetadata
+    let perfRecorder: any AgentModePerfRecording
+    let captureRequestMetadata: () async -> MCPRequestMetadata
     let requireTargetWindow: () throws -> WindowState
-    let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
-    let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
-    let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
-    let restrictDiscoveryToRoleLabels: @MainActor () -> Bool
+    let resolveSpawnSourceTabID: (_ metadata: MCPRequestMetadata) async -> UUID?
+    let resolveSpawnParentSessionID: (_ metadata: MCPRequestMetadata, _ targetWindow: WindowState) async -> UUID?
+    let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: MCPRequestMetadata) async throws -> Void
+    let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
+    let cleanupDependencies: CleanupDependencies
+    /// One-shot demand-scoped OpenCode observation source for explicit model-parameter
+    /// resolution. Defaults to the live polling service; tests inject a scripted provider via the
+    /// initializer to capture the resolved workspace directly (no live ACP process, no mutable
+    /// global).
+    let openCodeOneShotObservationProvider: AgentMCPModelParameterSupport.OneShotObservationProvider
+    #if DEBUG
+        var test_resumeSetupBoundary: (@MainActor (_ afterActivation: Bool) async -> Void)?
+        var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
+        var testAfterListMetadata: (@MainActor () async -> Void)?
+    #endif
 
     init(
         toolName: String,
-        captureRequestMetadata: @escaping () async -> RequestMetadata,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
+        captureRequestMetadata: @escaping () async -> MCPRequestMetadata,
         requireTargetWindow: @escaping () throws -> WindowState,
-        resolveSpawnSourceTabID: @escaping (_ metadata: RequestMetadata) async -> UUID?,
-        resolveSpawnParentSessionID: @escaping (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?,
-        bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void,
-        restrictDiscoveryToRoleLabels: @escaping @MainActor () -> Bool = {
-            GlobalSettingsStore.shared.restrictMCPAgentDiscoveryToRoleLabels()
-        }
+        resolveSpawnSourceTabID: @escaping (_ metadata: MCPRequestMetadata) async -> UUID?,
+        resolveSpawnParentSessionID: @escaping (_ metadata: MCPRequestMetadata, _ targetWindow: WindowState) async -> UUID?,
+        bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: MCPRequestMetadata) async throws -> Void,
+        restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
+            GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
+        },
+        cleanupDependencies: CleanupDependencies = .live,
+        openCodeOneShotObservationProvider: @escaping AgentMCPModelParameterSupport.OneShotObservationProvider = AgentMCPModelParameterSupport.liveOneShotObservationProvider
     ) {
         self.toolName = toolName
+        self.perfRecorder = perfRecorder
         self.captureRequestMetadata = captureRequestMetadata
         self.requireTargetWindow = requireTargetWindow
         self.resolveSpawnSourceTabID = resolveSpawnSourceTabID
         self.resolveSpawnParentSessionID = resolveSpawnParentSessionID
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
+        self.cleanupDependencies = cleanupDependencies
+        self.openCodeOneShotObservationProvider = openCodeOneShotObservationProvider
     }
 
     private struct HandoffSessionInfo {
         let sessionID: UUID
+        let parentSessionID: UUID?
         let name: String
         let transcript: AgentTranscript
         let sourceTabID: UUID?
@@ -52,6 +121,75 @@ struct AgentManageMCPToolService {
         let isMCPOriginated: Bool
         let runStateRaw: String?
         let isEffectivelyActive: Bool
+    }
+
+    /// Common execution-time gate for every target-bearing `agent_manage` operation.
+    ///
+    /// Non-Agent administrative callers retain their existing explicitly routed authority; an
+    /// Agent-origin caller may only reach a session it directly spawned. An oversight grant is never a
+    /// valid basis here.
+    private func operationCaller(
+        metadata: MCPRequestMetadata,
+        targetWindow: WindowState
+    ) async -> DomainAgentSessionCallerIdentity {
+        await AgentSessionTargetOperationGuard.resolveCaller(
+            metadata: metadata,
+            targetWindow: targetWindow,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+    }
+
+    /// Authorizes one caller-supplied session reference **before** any target-side work happens.
+    ///
+    /// Resolution here is deliberately minimal. `agent_manage` references are canonical UUIDs, so the
+    /// canonical session ID is simply the parsed reference, and provenance comes from already-loaded
+    /// live state, the workspace session index, or the persisted *metadata* record. None of those
+    /// hydrates a session or reads a transcript, so a caller that is about to be denied never causes
+    /// the target to load and never sees a target-specific error.
+    ///
+    /// A non-UUID reference is denied with the identical wording, keeping malformed, nonexistent, and
+    /// unauthorized references indistinguishable.
+    private func authorizeSessionReference(
+        operation: DomainAgentSessionTargetOperation,
+        reference: String,
+        metadata: MCPRequestMetadata,
+        targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel,
+        workspace: WorkspaceModel
+    ) async throws {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let sessionID = UUID(uuidString: trimmed) else {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: operation,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: reference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
+    }
+
+    /// Cleanup resolves target provenance through the same injected persistence seam the mutation
+    /// path uses, so authorization and deletion agree on what each requested UUID is.
+    private func cleanupProvenance(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        workspace: WorkspaceModel
+    ) async -> DomainAgentSessionTargetProvenance {
+        if let liveSession = try? agentModeVM.authoritativeLiveSession(for: sessionID),
+           liveSession.hasLoadedPersistedState
+        {
+            return .known(targetSessionID: sessionID, parentSessionID: liveSession.parentSessionID)
+        }
+        if let entry = agentModeVM.sessionIndex[sessionID] {
+            return .known(targetSessionID: sessionID, parentSessionID: entry.parentSessionID)
+        }
+        if let meta = try? await cleanupDependencies.loadPersistedMetadata(sessionID, workspace) {
+            return .known(targetSessionID: sessionID, parentSessionID: meta.parentSessionID)
+        }
+        return .unknown(targetSessionID: sessionID)
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -75,18 +213,50 @@ struct AgentManageMCPToolService {
             return try await executeStopSession(args: args)
         case "cleanup_sessions":
             return try await executeCleanupSessions(args: args)
+        case "list_pinned_sessions":
+            return try await executeListPinnedSessions()
+        case "set_session_pin":
+            return try await executeSetSessionPin(args: args)
+        case "reorder_pinned_sessions":
+            return try await executeReorderPinnedSessions(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
+            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, list_pinned_sessions, set_session_pin, reorder_pinned_sessions, or list_workflows.")
         }
     }
 
     private func executeListAgents(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+        let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
+        let openCodeWorkspacePath = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
-        let restrictedDiscovery = restrictDiscoveryToRoleLabels()
+        let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
-        let agents: [Value] = omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability).map { entry -> Value in
+        // Demand-scoped OpenCode enrichment is expensive: each uncached entry can drive a
+        // serialized disposable-controller probe. Restrict OpenCode enrichment to the
+        // advertised current/default model and dedupe canonical models so one enumeration
+        // performs at most one probe. Cursor is synchronous and cheap.
+        var probedOpenCodeCanonicals = Set<String>()
+        let openCodeCurrentModelRaw: String? = await OpenCodeACPModelPollingService.shared
+            .latestSnapshot()?.models.currentModelRaw
+        let openCodeEnrichmentTargetRaw = openCodeCurrentModelRaw
+            ?? AgentModelCatalog.discoveryAgents(availability: availability)
+            .first(where: { $0.agent.acpProviderID == .openCode })?.defaults.modelRaw
+        /// Returns whether an OpenCode enumeration for `agent`/`modelRaw` should acquire
+        /// metadata now: deduped per canonical model, and targeted at the advertised
+        /// current/default model only so list_agents never starts N serialized controllers.
+        func shouldEnrichOpenCodeModel(agent: AgentProviderKind, modelRaw: String) -> Bool {
+            guard agent.acpProviderID == .openCode else { return true }
+            let canonical = ACPModelParameterIdentity.canonicalBaseModelRaw(modelRaw, providerID: .openCode)
+            guard !probedOpenCodeCanonicals.contains(canonical) else { return false }
+            guard let openCodeEnrichmentTargetRaw,
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(openCodeEnrichmentTargetRaw, providerID: .openCode) == canonical
+            else { return false }
+            probedOpenCodeCanonicals.insert(canonical)
+            return true
+        }
+        var agents: [Value] = []
+        for entry in omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability) {
             // Flatten all models — each start target becomes its own entry.
             //
             // Role-label mappings (explore/engineer/pair/design) are the sole
@@ -105,6 +275,22 @@ struct AgentManageMCPToolService {
                         if let effort = target.reasoningEffort {
                             obj["reasoning_effort"] = .string(effort.rawValue)
                         }
+                        if entry.agent.acpProviderID != nil,
+                           shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: target.modelRaw)
+                        {
+                            // Discovery failure is already reduced to empty inside
+                            // `definitions`; a throwing `try await` here preserves the
+                            // cancellation the support layer now correctly rethrows.
+                            let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                                agent: entry.agent,
+                                modelRaw: target.modelRaw,
+                                workspacePath: openCodeWorkspacePath,
+                                oneShot: openCodeOneShotObservationProvider
+                            )
+                            if !parameters.isEmpty {
+                                obj["model_parameters"] = .array(parameters)
+                            }
+                        }
                         modelObjects.append(.object(obj))
                     }
                 } else {
@@ -113,6 +299,19 @@ struct AgentManageMCPToolService {
                     ]
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
+                    }
+                    if entry.agent.acpProviderID != nil,
+                       shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: model.id)
+                    {
+                        let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                            agent: entry.agent,
+                            modelRaw: model.id,
+                            workspacePath: openCodeWorkspacePath,
+                            oneShot: openCodeOneShotObservationProvider
+                        )
+                        if !parameters.isEmpty {
+                            obj["model_parameters"] = .array(parameters)
+                        }
                     }
                     modelObjects.append(.object(obj))
                 }
@@ -127,13 +326,13 @@ struct AgentManageMCPToolService {
             if let selID = entry.defaults.selectionID {
                 agentObj["default_model_id"] = .string(selID.rawValue)
             }
-            return .object(agentObj)
+            agents.append(.object(agentObj))
         }
-        // Build task labels with effective global role defaults. These remain
+        // Build task labels with effective workspace/global role defaults. These remain
         // visible even when restricted discovery hides the extra per-agent
         // catalog, because callers need to understand which concrete model each
         // role label resolves to.
-        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability).map { res -> Value in
+        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability, workspaceID: workspaceID).map { res -> Value in
             let recommendedID = AgentModelSelectionID(
                 agentRaw: res.recommended.agent.rawValue,
                 modelRaw: res.recommended.modelRaw
@@ -167,15 +366,46 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("No active workspace available for agent_manage.list_sessions.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
-        let scopedParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
+        let caller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        let discoveryScope = DomainAgentSessionOperationAuthorizer.discoveryScope(for: caller)
+        if discoveryScope == .none {
+            return .object([
+                "sessions": .array([]),
+                "scope": .string("unresolved_caller"),
+                "note": .string("Caller routing is unresolved; no sessions can be listed. This does not mean the workspace is empty.")
+            ])
+        }
+        let indexStore = agentModeVM.sessionIndexStore
+        let owner = indexStore.sessionIndexOwner
+        let latestOwner = indexStore.latestSessionIndexOwner
+        func checkOwner() throws {
+            guard !targetWindow.isClosing, try requireTargetWindow() === targetWindow,
+                  targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
+                  indexStore.sessionIndexOwner == owner, indexStore.latestSessionIndexOwner == latestOwner
+            else {
+                throw MCPError.invalidParams("Session discovery context changed while reading; retry the request.")
+            }
+        }
+        try checkOwner()
         let agentFilter = normalizedString(args["agent"])?.lowercased()
         let stateFilter = normalizedString(args["state"])
         let limit = max(1, args["limit"]?.intValue ?? 100)
 
         let persisted = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        #if DEBUG
+            await testAfterListMetadata?()
+        #endif
+        try Task.checkCancellation()
+        let currentCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        try checkOwner()
+        guard currentCaller == caller else {
+            throw MCPError.invalidParams("Session discovery caller changed while reading; retry the request.")
+        }
+        // Everything below is synchronous: captured metadata cannot be mixed with another
+        // activation's live/index rows or disclosed after the requesting caller changed.
         var entriesByID: [UUID: [String: Value]] = [:]
         for meta in persisted {
-            entriesByID[meta.id] = sessionSummaryObject(
+            entriesByID[meta.id] = AgentManageSessionSummary.object(
                 sessionID: meta.id,
                 name: meta.name,
                 lastModified: meta.lastModified,
@@ -185,12 +415,13 @@ struct AgentManageMCPToolService {
                 stateRaw: meta.lastRunState,
                 isLive: false,
                 parentSessionID: meta.parentSessionID,
-                isMCPOriginated: meta.isMCPOriginated
+                isMCPOriginated: meta.isMCPOriginated,
+                modelParameterSelections: meta.acpModelParameterSelections
             )
         }
 
         for entry in agentModeVM.sessionIndex.values {
-            entriesByID[entry.id] = sessionSummaryObject(
+            entriesByID[entry.id] = AgentManageSessionSummary.object(
                 sessionID: entry.id,
                 name: entry.name,
                 lastModified: entry.savedAt,
@@ -200,14 +431,15 @@ struct AgentManageMCPToolService {
                 stateRaw: entry.lastRunStateRaw,
                 isLive: agentModeVM.sessions[entry.tabID] != nil,
                 parentSessionID: entry.parentSessionID,
-                isMCPOriginated: entry.isMCPOriginated
+                isMCPOriginated: entry.isMCPOriginated,
+                modelParameterSelections: entry.acpModelParameterSelections
             )
         }
 
         for session in agentModeVM.sessions.values {
             guard let activeSessionID = session.activeAgentSessionID else { continue }
             let tabName = targetWindow.workspaceManager.composeTab(with: session.tabID)?.name
-            entriesByID[activeSessionID] = sessionSummaryObject(
+            entriesByID[activeSessionID] = AgentManageSessionSummary.object(
                 sessionID: activeSessionID,
                 name: tabName ?? "Agent Session",
                 lastModified: session.lastActivityAt,
@@ -217,17 +449,24 @@ struct AgentManageMCPToolService {
                 stateRaw: session.runState.rawValue,
                 isLive: true,
                 parentSessionID: session.parentSessionID,
-                isMCPOriginated: session.isMCPOriginated
+                isMCPOriginated: session.isMCPOriginated,
+                modelParameterSelections: session.acpModelParameterSelections
             )
         }
 
-        // Scope to direct children when called from agent mode
-        let scoped: [[String: Value]] = {
-            guard let parentID = scopedParentSessionID else { return Array(entriesByID.values) }
-            return entriesByID.values.filter { object in
+        // Agent-origin discovery is filtered to the caller's direct children so an unrelated sibling
+        // cannot be enumerated before a target operation is attempted. An Agent Mode run whose
+        // routing did not resolve exactly sees nothing rather than everything.
+        let scoped: [[String: Value]] = switch discoveryScope {
+        case .unrestricted:
+            Array(entriesByID.values)
+        case let .directChildren(parentID):
+            entriesByID.values.filter { object in
                 object["parent_session_id"]?.stringValue == parentID.uuidString
             }
-        }()
+        case .none:
+            []
+        }
 
         let filtered = scoped.filter { object in
             let agentObject = object["agent"]?.objectValue
@@ -238,7 +477,7 @@ struct AgentManageMCPToolService {
                     ?? ""
             ).lowercased()
             if let agentFilter, agent != agentFilter { return false }
-            if let stateFilter, !sessionStateMatches(object: object, filter: stateFilter) { return false }
+            if let stateFilter, !AgentManageSessionSummary.matchesState(object: object, filter: stateFilter) { return false }
             return true
         }
         .sorted {
@@ -247,13 +486,173 @@ struct AgentManageMCPToolService {
             return lhs > rhs
         }
 
-        return .object([
+        var result: [String: Value] = [
             "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
+        ]
+        switch discoveryScope {
+        case .unrestricted:
+            break // Preserve the external administrative result shape.
+        case .directChildren:
+            result["scope"] = .string("spawned_by_caller")
+            result["workspace_id"] = .string(workspace.id.uuidString)
+            result["returned_count"] = .int(min(filtered.count, limit))
+            result["matching_child_count"] = .int(filtered.count)
+            result["truncated"] = .bool(filtered.count > limit)
+            result["note"] = .string(
+                "These are matching direct child sessions only, not a workspace inventory; zero children does not mean this workspace is empty. "
+                    + "For workspace-wide listing, enable tools with become_overseer if needed, then on the next turn use session_admin request_scope "
+                    + "with kind=workspace, workspace=\(workspace.id.uuidString), and capabilities including observe plus the needed mutation capabilities. "
+                    + "Only after the user approves the scope card, use session_admin inventory. Tool discovery grants no authority."
+            )
+        case .none:
+            result["scope"] = .string("unresolved_caller")
+            result["note"] = .string("Caller routing is unresolved; no sessions can be listed. This does not mean the workspace is empty.")
+        }
+        return .object(result)
+    }
+
+    /// Sidebar pin state is workspace-wide UI state, not a child-session control capability.
+    /// A model-run connection cannot mutate or enumerate another user's pinned rows.
+    private func requireAdministrativePinCaller(targetWindow: WindowState) async throws {
+        let metadata = await captureRequestMetadata()
+        guard await operationCaller(metadata: metadata, targetWindow: targetWindow) == .administrativePrincipal else {
+            throw MCPError.invalidParams("Session pin management requires an external administrative MCP connection.")
+        }
+    }
+
+    private func pinnedSessionRows(
+        targetWindow: WindowState,
+        workspace: WorkspaceModel
+    ) -> [AgentModeViewModel.SidebarSession] {
+        targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+            .filter { $0.isPinned && $0.sessionID != nil }
+    }
+
+    private func executeListPinnedSessions() async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.list_pinned_sessions.")
+        }
+        let tabsByID = Dictionary(uniqueKeysWithValues: workspace.composeTabs.map { ($0.id, $0) })
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(rows.compactMap { $0.sessionID.map { .string($0.uuidString) } }),
+            "sessions": .array(rows.compactMap { row in
+                guard let sessionID = row.sessionID else { return nil }
+                return .object([
+                    "session_id": .string(sessionID.uuidString),
+                    "tab_id": .string(row.tabID.uuidString),
+                    "name": .string(row.title),
+                    "pinned_order": tabsByID[row.tabID]?.pinnedOrder.map(Value.int) ?? .null
+                ])
+            })
         ])
+    }
+
+    private func executeSetSessionPin(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let reference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        guard let sessionID = UUID(uuidString: reference),
+              let workspace = targetWindow.workspaceManager.activeWorkspace,
+              let row = targetWindow.agentModeViewModel.sidebarSessions(for: workspace.composeTabs)
+              .first(where: { $0.sessionID == sessionID })
+        else {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        guard let requested = args["pinned"] else {
+            throw MCPError.invalidParams("pinned is required.")
+        }
+        let pinned = try parseBool(requested, name: "pinned", defaultValue: false)
+        let report = targetWindow.promptManager.setComposeTabsPinned(
+            pinned,
+            for: [row.tabID],
+            isMutationContextCurrent: { targetWindow.workspaceManager.activeWorkspaceID == workspace.id }
+        )
+        guard !report.contextRejected else {
+            throw MCPError.invalidParams("The active workspace or session changed before pinning.")
+        }
+        return .object([
+            "session_id": .string(sessionID.uuidString),
+            "pinned": .bool(pinned),
+            "changed": .bool(!report.updatedTabIDs.isEmpty)
+        ])
+    }
+
+    /// Full-list compare-and-swap prevents a second MCP writer from silently displacing pins.
+    /// All validation and the workspace mutation run on the MainActor without suspension.
+    private func executeReorderPinnedSessions(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        try await requireAdministrativePinCaller(targetWindow: targetWindow)
+        let expectedIDs = try parseSessionIDs(args["expected_session_ids"], name: "expected_session_ids")
+        let desiredIDs = try parseSessionIDs(args["session_ids"], name: "session_ids")
+        guard Set(expectedIDs) == Set(desiredIDs) else {
+            throw MCPError.invalidParams("session_ids must contain exactly the expected pinned sessions.")
+        }
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.reorder_pinned_sessions.")
+        }
+        let rows = pinnedSessionRows(targetWindow: targetWindow, workspace: workspace)
+        let currentIDs = rows.compactMap(\.sessionID)
+        guard currentIDs == expectedIDs else {
+            throw MCPError.invalidParams("Pinned session order changed; call list_pinned_sessions and retry with its current order.")
+        }
+        let tabIDBySessionID = Dictionary(rows.compactMap { row in
+            row.sessionID.map { ($0, row.tabID) }
+        }, uniquingKeysWith: { first, _ in first })
+        guard tabIDBySessionID.count == rows.count else {
+            throw MCPError.invalidParams("Pinned sessions contain duplicate identities.")
+        }
+        let orderedTabIDs = desiredIDs.compactMap { tabIDBySessionID[$0] }
+        guard orderedTabIDs.count == desiredIDs.count else {
+            throw MCPError.invalidParams("The pinned session set changed before reordering.")
+        }
+        let rankByTabID = Dictionary(uniqueKeysWithValues: orderedTabIDs.enumerated().map { ($0.element, $0.offset) })
+        let previewTabs = workspace.composeTabs.map { tab -> ComposeTabState in
+            var preview = tab
+            if let rank = rankByTabID[tab.id] {
+                preview.pinnedOrder = rank
+            }
+            return preview
+        }
+        let projectedIDs = targetWindow.agentModeViewModel.sidebarSessions(for: previewTabs)
+            .filter(\.isPinned)
+            .compactMap(\.sessionID)
+        guard projectedIDs == desiredIDs else {
+            throw MCPError.invalidParams("Thread grouping prevents the requested pinned order from being displayed.")
+        }
+        guard targetWindow.promptManager.setPinnedComposeTabOrder(orderedTabIDs, workspaceID: workspace.id) else {
+            throw MCPError.invalidParams("The active workspace or pinned sessions changed before reordering.")
+        }
+        return .object([
+            "workspace_id": .string(workspace.id.uuidString),
+            "session_ids": .array(desiredIDs.map { .string($0.uuidString) })
+        ])
+    }
+
+    private func parseSessionIDs(_ value: Value?, name: String) throws -> [UUID] {
+        guard let values = value?.arrayValue else {
+            throw MCPError.invalidParams("\(name) must be an array of session UUIDs.")
+        }
+        var ids: [UUID] = []
+        var seen = Set<UUID>()
+        for item in values {
+            guard let raw = item.stringValue,
+                  let id = UUID(uuidString: raw),
+                  seen.insert(id).inserted
+            else {
+                throw MCPError.invalidParams("\(name) must contain unique session UUIDs.")
+            }
+            ids.append(id)
+        }
+        return ids
     }
 
     private func executeGetLog(args: [String: Value]) async throws -> Value {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.get_log.")
@@ -262,6 +661,17 @@ struct AgentManageMCPToolService {
         let limit = max(1, args["limit"]?.intValue ?? 20)
 
         let agentModeVM = targetWindow.agentModeViewModel
+        // Authorize *before* touching the target. `resolveTranscript` hydrates a live session or
+        // loads its full persisted transcript, so running it first performs target-side work — and
+        // surfaces target-specific errors — on behalf of a caller that may be about to be denied.
+        try await authorizeSessionReference(
+            operation: .manageGetLog,
+            reference: sessionReference,
+            metadata: metadata,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
         let transcriptInfo = try await resolveTranscript(
             reference: sessionReference,
             workspace: workspace,
@@ -294,6 +704,7 @@ struct AgentManageMCPToolService {
 
     private func executeExtractHandoff(args: [String: Value]) async throws -> Value {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.extract_handoff.")
@@ -315,14 +726,14 @@ struct AgentManageMCPToolService {
             name: "overwrite",
             defaultValue: true
         )
-        let maxTranscriptItems = try clampedInt(
+        let maxTranscriptItems = try Self.clampedInt(
             args["max_transcript_items"],
             name: "max_transcript_items",
             defaultValue: 200,
             minValue: 1,
             maxValue: 1000
         )
-        let maxToolArgsCharacters = try clampedInt(
+        let maxToolArgsCharacters = try Self.clampedInt(
             args["max_tool_args_characters"],
             name: "max_tool_args_characters",
             defaultValue: 2000,
@@ -340,6 +751,16 @@ struct AgentManageMCPToolService {
         }
 
         let agentModeVM = targetWindow.agentModeViewModel
+        // Authorize *before* touching the target, for the same reason as `get_log`:
+        // `resolveHandoffSession` hydrates a live session or loads its full persisted transcript.
+        try await authorizeSessionReference(
+            operation: .manageExtractHandoff,
+            reference: sessionReference,
+            metadata: metadata,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
         let sessionInfo = try await resolveHandoffSession(
             reference: sessionReference,
             workspace: workspace,
@@ -420,34 +841,118 @@ struct AgentManageMCPToolService {
     private func executeCreateSession(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.create_session.")
+        }
         let agentModeVM = targetWindow.agentModeViewModel
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
-        // create_session always creates a new session — default to the global engineer role when model_id is omitted.
+        if sourceTabID != nil, spawnParentSessionID == nil {
+            throw MCPError.invalidParams(
+                "agent_manage.create_session was routed from an Agent Mode run, but its source Agent session is unavailable. Reconnect the agent MCP client or retry after the source session finishes loading."
+            )
+        }
+        // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
+        // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
+        let spawnAdmission = try DelegationSpawnAdmission.admitOrThrow(creatorSessionID: spawnParentSessionID)
+        defer { DelegationSpawnAdmission.finish(spawnAdmission) }
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,
             createIfNeeded: true,
             sessionName: normalizedString(args["session_name"]),
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
+        if target.origin == .createdNewTab, let createdSessionID = target.sessionID {
+            await DelegationSpawnAdmission.stamp(
+                spawnAdmission, newSessionID: createdSessionID, viewModel: agentModeVM,
+                creationHandle: target.creationHandle
+            )
+        }
+        // The new member is visible to the projector now; the reservation is not held any longer.
+        DelegationSpawnAdmission.finish(spawnAdmission)
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            // Validate explicit model parameters inside the discard-on-failure scope. A throw
+            // during parsing/acquisition/validation/cancellation must not leak the allocated
+            // target; for the Cursor path the parameters are parsed after target allocation and
+            // rejected before configuration is applied. The effective workspace is resolved
+            // from the same source the composer uses (`effectiveWorkspacePath(for:)`), so a
+            // worktree-bound session validates against its real OpenCode config. A genuine
+            // resolution failure (worktree unavailable/mismatched) or cancellation propagates
+            // rather than silently acquiring from the repo root; only an explicitly absent
+            // binding falls back.
+            let createParameterWorkspacePath: String?
+            do {
+                createParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                    .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
+                modelRaw: resolved.model,
+                workspacePath: createParameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
+            )
+            // A role-label create inherits the role's stored pin as a baseline, captured with
+            // the role resolution above. Explicit request parameters override matching
+            // identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: false
+                ),
+                creationHandle: target.creationHandle
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
+            try agentModeVM.mcpApplyModelParameterSelections(
+                tabID: target.tabID,
+                selections: modelParameterSelections,
+                creationHandle: target.creationHandle
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             guard let sessionID = target.sessionID else {
                 throw MCPError.internalError("Failed to resolve created agent session ID.")
             }
@@ -456,9 +961,23 @@ struct AgentManageMCPToolService {
                 sessionID: sessionID,
                 originatingConnectionID: metadata.connectionID,
                 taskLabelKind: selection.taskLabelKind,
-                startPending: false
+                startPending: false,
+                creationHandle: target.creationHandle
             )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
+            try Task.checkCancellation()
+            guard await agentModeVM.commitConfiguredSessionCreation(target: target) else {
+                throw MCPError.internalError("Failed to persist the configured agent session.")
+            }
+            try Task.checkCancellation()
         } catch {
+            agentModeVM.failSessionCreation(
+                target.creationHandle,
+                message: "This session did not finish its initial configuration. Create a new session."
+            )
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
         }
@@ -466,8 +985,9 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to create agent session state.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
-        return .object(sessionSummaryObject(
+        return .object(AgentManageSessionSummary.object(
             sessionID: session.activeAgentSessionID,
             name: sessionName,
             lastModified: session.lastActivityAt,
@@ -477,7 +997,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            modelParameterSelections: session.acpModelParameterSelections
         ))
     }
 
@@ -492,12 +1013,27 @@ struct AgentManageMCPToolService {
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
+        if sourceTabID != nil, spawnParentSessionID == nil {
+            throw MCPError.invalidParams(
+                "agent_manage.resume_session was routed from an Agent Mode run, but its source Agent session is unavailable. Reconnect the agent MCP client or retry after the source session finishes loading."
+            )
+        }
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: .manageResume,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: sessionReference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
+        _ = try await agentModeVM.mcpPreflightResidentActivation(sessionID: sessionID)
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -506,34 +1042,139 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: nil,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
+        let expectedConfigurationTarget = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.persistentBindingTransitionToken()
+        var ownedActivation: AgentModeViewModel.AgentMCPControlContext?
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
+            let hydratedSession = await agentModeVM.ensureSessionReady(tabID: target.tabID)
+            let hasExplicitConfigurationChange = normalizedString(args["model_id"]) != nil
+                || normalizedString(args["reasoning_effort"]) != nil
+                || args["model_parameters"] != nil
+            if hydratedSession.runState.isActive, hasExplicitConfigurationChange {
+                throw MCPError.invalidParams(
+                    "Cannot change model settings while this session is actively running. Retry resume_session after the current run completes."
+                )
+            }
+            let parameterAgentRaw = resolved.agent ?? hydratedSession.selectedAgent.rawValue
+            let parameterModelRaw = resolved.model ?? hydratedSession.selectedModelRaw
+            // Acquire metadata for the session's effective workspace (the composer's source),
+            // not the repo root — a worktree-bound session may resolve a different OpenCode
+            // config. A genuine resolution failure or cancellation propagates: silently falling
+            // back to the repo root reintroduces the original mis-scope. Only an explicitly
+            // absent binding falls back.
+            let parameterWorkspacePath: String?
+            do {
+                parameterWorkspacePath = try agentModeVM.effectiveWorkspacePath(for: hydratedSession)
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: AgentProviderKind(rawValue: parameterAgentRaw),
+                modelRaw: parameterModelRaw,
+                workspacePath: parameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
+            )
+            // A role-label resume inherits the role's stored pin as a baseline. Explicit request
+            // parameters override matching identities; a compound
+            // model_id inherits nothing, because the resolver hands back no baseline for one — which
+            // is why the merge needs no role check here.
+            let modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
+            #if DEBUG
+                await test_resumeSetupBoundary?(false)
+            #endif
             if !hadMatchingMCPControl {
-                try await agentModeVM.mcpActivateControlContext(
+                ownedActivation = try await agentModeVM.mcpActivateControlContext(
                     forTabID: target.tabID,
                     sessionID: sessionID,
                     originatingConnectionID: metadata.connectionID,
                     taskLabelKind: selection.taskLabelKind,
-                    startPending: false
+                    startPending: false,
+                    requireInactiveRunState: hasExplicitConfigurationChange
+                )
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    target,
+                    expectedWorkspaceID: workspace.id
                 )
             }
+            #if DEBUG
+                await test_resumeSetupBoundary?(true)
+            #endif
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                modelParameterSelections: modelParameterSelections,
+                requireInactiveRunState: hasExplicitConfigurationChange,
+                expectedTarget: hasExplicitConfigurationChange ? expectedConfigurationTarget : nil,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: hadMatchingMCPControl
+                )
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
         } catch {
+            // A run admitted during awaited setup owns its live context and tab.
+            // Settle this request's captured target without tearing down that newer owner.
+            if let current = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+               current.runState.isActive || current.persistentBindingTransitionToken() != expectedConfigurationTarget
+            {
+                if target.recoveryClaim != nil {
+                    do {
+                        try agentModeVM.requireCurrentAgentSessionLifecycleAdmission(target)
+                        agentModeVM.mcpAcceptSessionTarget(target)
+                    } catch {
+                        _ = await agentModeVM.mcpDiscardSessionTarget(target)
+                    }
+                } else {
+                    _ = await agentModeVM.mcpDiscardSessionTarget(target)
+                }
+                throw error
+            }
             if !hadMatchingMCPControl {
-                await agentModeVM.mcpDeactivateControlContext(
-                    sessionID: sessionID,
-                    cleanupSessionStore: true
-                )
+                if let ownedActivation {
+                    guard await agentModeVM.mcpDeactivateOwnedControlContext(
+                        sessionID: sessionID,
+                        expectedContext: ownedActivation
+                    ) else { throw error }
+                } else if agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext != nil {
+                    // Failed activation cleaned its own registration. A current
+                    // context belongs to another attempt and must survive.
+                    throw error
+                }
             }
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
@@ -542,8 +1183,9 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to hydrate resumed session.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
-        return .object(sessionSummaryObject(
+        return .object(AgentManageSessionSummary.object(
             sessionID: sessionID,
             name: sessionName,
             lastModified: session.lastActivityAt,
@@ -553,11 +1195,13 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            modelParameterSelections: session.acpModelParameterSelections
         ))
     }
 
     private func executeStopSession(args: [String: Value]) async throws -> Value {
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.stop_session.")
@@ -567,28 +1211,26 @@ struct AgentManageMCPToolService {
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: .manageStop,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: sessionReference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
 
-        let target: AgentModeViewModel.MCPSessionTarget
-        do {
-            target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
-                tabID: nil,
-                sessionID: sessionID,
-                createIfNeeded: false,
-                sessionName: nil
-            )
-        } catch {
+        guard let session = try agentModeVM.mcpSettledLiveSessionForStop(sessionID: sessionID) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be stopped.")
         }
-
-        let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
-            await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
+            await agentModeVM.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
             await Task.yield()
         }
 
-        let tabName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
-        var summary = sessionSummaryObject(
+        let tabName = targetWindow.workspaceManager.composeTab(with: session.tabID)?.name ?? "Agent Session"
+        var summary = AgentManageSessionSummary.object(
             sessionID: sessionID,
             name: tabName,
             lastModified: session.lastActivityAt,
@@ -596,13 +1238,15 @@ struct AgentManageMCPToolService {
             agentRaw: session.selectedAgent.rawValue,
             modelRaw: session.selectedModelRaw,
             stateRaw: session.runState.rawValue,
-            isLive: true
+            isLive: true,
+            modelParameterSelections: session.acpModelParameterSelections
         )
         summary["stop_requested"] = .bool(wasActive)
         return .object(summary)
     }
 
     private func executeCleanupSessions(args: [String: Value]) async throws -> Value {
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.cleanup_sessions.")
@@ -613,98 +1257,172 @@ struct AgentManageMCPToolService {
         guard let sessionIDValues = args["session_ids"]?.arrayValue, !sessionIDValues.isEmpty else {
             throw MCPError.invalidParams("cleanup_sessions requires a non-empty `session_ids` array of session UUIDs to delete.")
         }
-        var seenRequestedIDs = Set<UUID>()
-        let requestedIDs: [UUID] = sessionIDValues.compactMap { value in
-            guard let raw = value.stringValue,
-                  let id = UUID(uuidString: raw),
-                  seenRequestedIDs.insert(id).inserted else { return nil }
-            return id
+        guard sessionIDValues.count <= Self.maxCleanupSessionIDs else {
+            throw MCPError.invalidParams(
+                "cleanup_sessions accepts at most \(Self.maxCleanupSessionIDs) session_ids per call; received \(sessionIDValues.count). Split the request into bounded batches."
+            )
         }
-        guard !requestedIDs.isEmpty else {
-            throw MCPError.invalidParams("cleanup_sessions: none of the provided session_ids are valid UUIDs.")
+        var firstIndexBySessionID: [UUID: Int] = [:]
+        var requestedIDs: [UUID] = []
+        requestedIDs.reserveCapacity(sessionIDValues.count)
+        for (index, value) in sessionIDValues.enumerated() {
+            guard let raw = value.stringValue else {
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] must be a UUID string; received a non-string value."
+                )
+            }
+            guard let sessionID = UUID(uuidString: raw) else {
+                let preview = String(raw.prefix(64)).debugDescription + (raw.count > 64 ? "…" : "")
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] has invalid UUID value \(preview)."
+                )
+            }
+            if let firstIndex = firstIndexBySessionID[sessionID] {
+                throw MCPError.invalidParams(
+                    "cleanup_sessions session_ids[\(index)] duplicates UUID \(sessionID.uuidString) from index \(firstIndex)."
+                )
+            }
+            firstIndexBySessionID[sessionID] = index
+            requestedIDs.append(sessionID)
+        }
+
+        // Collection operations authorize every target before any mutation or data return, so a
+        // partially applied cleanup can never leak that one of the requested UUIDs exists.
+        let cleanupCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        if cleanupCaller != .administrativePrincipal {
+            for sessionID in requestedIDs {
+                try await AgentSessionTargetOperationGuard.require(
+                    operation: .manageCleanup,
+                    caller: cleanupCaller,
+                    provenance: cleanupProvenance(
+                        sessionID: sessionID,
+                        agentModeVM: agentModeVM,
+                        workspace: workspace
+                    ),
+                    reference: sessionID.uuidString
+                )
+            }
         }
 
         #if DEBUG
-            let cleanupStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let cleanupStartMS = perfRecorder.timestampMSIfEnabled()
             var debugOpenDeletedCount = 0
             var debugPersistedDeletedCount = 0
         #endif
-        var persistedMetaByID: [UUID: AgentSessionMeta]?
         var deletedSessions: [[String: Value]] = []
         var skippedSessions: [[String: Value]] = []
+        var unprocessedSessions: [[String: Value]] = []
+        var retrySessionIDs: [UUID] = []
+        var wasCancelled = false
 
-        for sessionID in requestedIDs {
+        for (index, sessionID) in requestedIDs.enumerated() {
+            do {
+                try cleanupDependencies.checkCancellation()
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_processing")
+                    ]
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            }
+
             let candidate: CleanupSessionCandidate?
-            if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
-                let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
-                let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
-                    ?? (
-                        liveSession.runState.isActive
-                            || liveSession.mcpFollowUpRunPending
-                            || liveSession.pendingSupersedingTurnCompletions > 0
+            do {
+                if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
+                    let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
+                    let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
+                        ?? (
+                            liveSession.runState.isActive
+                                || liveSession.mcpFollowUpRunPending
+                                || liveSession.pendingSupersedingTurnCompletions > 0
+                        )
+                    candidate = CleanupSessionCandidate(
+                        sessionID: sessionID,
+                        name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name ?? "Agent Session",
+                        tabID: liveSession.tabID,
+                        isLive: true,
+                        isMCPOriginated: liveSession.isMCPOriginated,
+                        runStateRaw: liveSession.runState.rawValue,
+                        isEffectivelyActive: isEffectivelyActive
                     )
-                candidate = CleanupSessionCandidate(
-                    sessionID: sessionID,
-                    name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name ?? "Agent Session",
-                    tabID: liveSession.tabID,
-                    isLive: true,
-                    isMCPOriginated: liveSession.isMCPOriginated,
-                    runStateRaw: liveSession.runState.rawValue,
-                    isEffectivelyActive: isEffectivelyActive
-                )
-            } else if let indexEntry = agentModeVM.sessionIndex[sessionID] {
-                let runState = indexEntry.lastRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))
-                candidate = CleanupSessionCandidate(
-                    sessionID: sessionID,
-                    name: indexEntry.name,
-                    tabID: indexEntry.tabID,
-                    isLive: agentModeVM.sessions[indexEntry.tabID] != nil,
-                    isMCPOriginated: indexEntry.isMCPOriginated,
-                    runStateRaw: indexEntry.lastRunStateRaw,
-                    isEffectivelyActive: runState?.isActive == true
-                )
-            } else {
-                if persistedMetaByID == nil {
+                } else {
                     #if DEBUG
-                        let persistedLoadStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let persistedLoadStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
-                    let persistedMetas = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace, limit: nil)
+                    let meta = try await cleanupDependencies.loadPersistedMetadata(sessionID, workspace)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.loadPersistedMeta",
                             startMS: persistedLoadStartMS,
                             fields: [
                                 "workspaceID": workspace.id.uuidString,
-                                "recordCount": String(persistedMetas.count)
+                                "sessionID": sessionID.uuidString,
+                                "found": String(meta != nil)
                             ]
                         )
                     #endif
-                    persistedMetaByID = Dictionary(
-                        persistedMetas.map { ($0.id, $0) },
-                        uniquingKeysWith: { first, _ in first }
-                    )
+                    if let meta {
+                        let runState = meta.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
+                        candidate = CleanupSessionCandidate(
+                            sessionID: sessionID,
+                            name: meta.name,
+                            tabID: meta.composeTabID,
+                            isLive: false,
+                            isMCPOriginated: meta.isMCPOriginated,
+                            runStateRaw: meta.lastRunState,
+                            isEffectivelyActive: runState?.isActive == true
+                        )
+                    } else {
+                        candidate = nil
+                    }
                 }
-                if let meta = persistedMetaByID?[sessionID] {
-                    let runState = meta.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
-                    candidate = CleanupSessionCandidate(
-                        sessionID: sessionID,
-                        name: meta.name,
-                        tabID: meta.composeTabID,
-                        isLive: false,
-                        isMCPOriginated: meta.isMCPOriginated,
-                        runStateRaw: meta.lastRunState,
-                        isEffectivelyActive: runState?.isActive == true
-                    )
-                } else {
-                    candidate = nil
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_mutation")
+                    ]
                 }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            } catch {
+                skippedSessions.append([
+                    "session_id": .string(sessionID.uuidString),
+                    "name": .string("Unknown"),
+                    "reason": .string("resolution_failed"),
+                    "message": .string(error.localizedDescription)
+                ])
+                retrySessionIDs.append(sessionID)
+                continue
+            }
+
+            do {
+                try cleanupDependencies.checkCancellation()
+            } catch is CancellationError {
+                wasCancelled = true
+                let remainingIDs = requestedIDs[index...]
+                unprocessedSessions = remainingIDs.map { remainingID in
+                    [
+                        "session_id": .string(remainingID.uuidString),
+                        "reason": .string("cancelled_before_mutation")
+                    ]
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
             }
 
             guard let candidate else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string("Unknown"),
-                    "reason": .string("not_found")
+                    "reason": .string("already_absent")
                 ])
                 continue
             }
@@ -727,10 +1445,22 @@ struct AgentManageMCPToolService {
                 continue
             }
 
+            var usedOpenTabAuthority = false
+            var mutationStarted = false
+            var durableDeletionCommitted = false
+            var providerCleanupOutcome: ProviderConversationCleanupOutcome?
+            // The production deletion paths already report through `AgentSessionDataService`, but
+            // this service's dependencies are injectable, so it brackets its own boundary too. Both
+            // phases are idempotent, and a duplicate commit cannot downgrade an existing tombstone.
+            var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
             do {
+                let attempt = try await AgentSessionDurableDeletionReporter
+                    .beginDurableDeletion(sessionID: sessionID)
+                deletionAttempt = attempt
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
-                    let activeWorkspace = targetWindow.workspaceManager.activeWorkspace ?? workspace
-                    guard activeWorkspace.composeTabs.contains(where: { $0.id == tabID }) else { return nil }
+                    guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
+                          workspace.composeTabs.contains(where: { $0.id == tabID })
+                    else { return nil }
                     let liveSessionID = agentModeVM.sessions[tabID]?.activeAgentSessionID
                     let liveBindingMatches = liveSessionID == sessionID
                     let hasDifferentLiveBinding = liveSessionID != nil && liveSessionID != sessionID
@@ -741,12 +1471,20 @@ struct AgentManageMCPToolService {
                     return !hasDifferentLiveBinding && (liveBindingMatches || workspaceBindingMatches) ? tabID : nil
                 }
                 if let openTabID {
+                    usedOpenTabAuthority = true
                     #if DEBUG
-                        let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let deleteOpenStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
-                    await agentModeVM.deleteSession(tabID: openTabID)
+                    mutationStarted = true
+                    providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
+                        agentModeVM,
+                        openTabID,
+                        workspace
+                    )
+                    durableDeletionCommitted = true
+                    await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.deleteOpen",
                             startMS: deleteOpenStartMS,
                             tabID: openTabID,
@@ -755,67 +1493,187 @@ struct AgentManageMCPToolService {
                                 "tabID": openTabID.uuidString
                             ]
                         )
-                        let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
-                            "cleanup.sessions.deletePersisted",
-                            startMS: deletePersistedStartMS,
-                            fields: ["sessionID": sessionID.uuidString]
-                        )
                         debugOpenDeletedCount += 1
                     #endif
                 } else {
+                    let persistedSession = try await cleanupDependencies.loadPersistedSession(sessionID, workspace)
+                    try cleanupDependencies.checkCancellation()
                     #if DEBUG
-                        let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                        let deletePersistedStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
-                    try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
+                    mutationStarted = true
+                    try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                    durableDeletionCommitted = true
+                    await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "cleanup.sessions.deletePersisted",
                             startMS: deletePersistedStartMS,
                             fields: ["sessionID": sessionID.uuidString]
                         )
                         debugPersistedDeletedCount += 1
                     #endif
-                }
-                #if DEBUG
-                    let finalizeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-                #endif
-                let finalizeResult = await agentModeVM.finalizeDeletedAgentSessionReferences(
-                    sessionID: sessionID,
-                    workspaceID: workspace.id,
-                    knownTabIDs: openTabID.map { [$0] } ?? [],
-                    reason: "agent_manage.cleanup_sessions"
-                )
-                #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
-                        "cleanup.sessions.finalize",
-                        startMS: finalizeStartMS,
-                        fields: [
-                            "sessionID": sessionID.uuidString,
-                            "knownTabCount": String(openTabID == nil ? 0 : 1),
-                            "affectedTabCount": String(finalizeResult.affectedTabIDs.count)
-                        ]
+                    #if DEBUG
+                        let finalizeStartMS = perfRecorder.timestampMSIfEnabled()
+                    #endif
+                    let affectedTabCount = await cleanupDependencies.finalizePersistedReferences(
+                        agentModeVM,
+                        sessionID,
+                        workspace.id
                     )
-                #endif
-                deletedSessions.append([
+                    #if DEBUG
+                        perfRecorder.durationEvent(
+                            "cleanup.sessions.finalize",
+                            startMS: finalizeStartMS,
+                            fields: [
+                                "sessionID": sessionID.uuidString,
+                                "knownTabCount": "0",
+                                "affectedTabCount": String(affectedTabCount)
+                            ]
+                        )
+                    #endif
+                    if let persistedSession {
+                        providerCleanupOutcome = await agentModeVM.cleanupProviderConversationForPersistedAgentSession(persistedSession)
+                    }
+                }
+                var cancelledAfterCommittedDeletion = providerCleanupOutcome?.isCancelled == true
+                if !cancelledAfterCommittedDeletion {
+                    do {
+                        try cleanupDependencies.checkCancellation()
+                    } catch is CancellationError {
+                        cancelledAfterCommittedDeletion = true
+                    }
+                }
+                var deletedSession: [String: Value] = [
                     "session_id": .string(sessionID.uuidString),
-                    "name": .string(candidate.name)
-                ])
-            } catch {
+                    "name": .string(candidate.name),
+                    "durable": .bool(true)
+                ]
+                if let providerCleanupOutcome {
+                    var cleanupObject: [String: Value] = [
+                        "status": .string(providerCleanupOutcome.status)
+                    ]
+                    if let message = providerCleanupOutcome.message {
+                        cleanupObject["message"] = .string(message)
+                    }
+                    deletedSession["provider_cleanup"] = .object(cleanupObject)
+                }
+                deletedSessions.append(deletedSession)
+                if cancelledAfterCommittedDeletion {
+                    wasCancelled = true
+                    let remainingIDs = requestedIDs.dropFirst(index + 1)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_committed_deletion")
+                        ]
+                    }
+                    retrySessionIDs.append(contentsOf: remainingIDs)
+                    break
+                }
+            } catch let error as AgentSessionDeletionRegistry.AdmissionError {
+                if !durableDeletionCommitted, let deletionAttempt {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
-                    "reason": .string("delete_failed"),
-                    "message": .string(error.localizedDescription)
+                    "reason": .string("scope_persistence_unavailable"),
+                    "message": .string(error.localizedDescription),
+                    "durable": .bool(false)
                 ])
+                retrySessionIDs.append(sessionID)
+            } catch is CancellationError {
+                wasCancelled = true
+                if !durableDeletionCommitted, let deletionAttempt {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
+                let remainingIDs = requestedIDs.dropFirst(index + 1)
+                if durableDeletionCommitted {
+                    var deletedSession: [String: Value] = [
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "durable": .bool(true)
+                    ]
+                    if let providerCleanupOutcome {
+                        var cleanupObject: [String: Value] = [
+                            "status": .string(providerCleanupOutcome.status)
+                        ]
+                        if let message = providerCleanupOutcome.message {
+                            cleanupObject["message"] = .string(message)
+                        }
+                        deletedSession["provider_cleanup"] = .object(cleanupObject)
+                    }
+                    deletedSessions.append(deletedSession)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_committed_deletion")
+                        ]
+                    }
+                } else if mutationStarted {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("mutation_cancelled"),
+                        "durable": .bool(false),
+                        "mutation_started": .bool(true)
+                    ])
+                    retrySessionIDs.append(sessionID)
+                    unprocessedSessions = remainingIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_after_mutation_started")
+                        ]
+                    }
+                } else {
+                    let unprocessedIDs = [sessionID] + remainingIDs
+                    unprocessedSessions = unprocessedIDs.map { remainingID in
+                        [
+                            "session_id": .string(remainingID.uuidString),
+                            "reason": .string("cancelled_before_mutation")
+                        ]
+                    }
+                    retrySessionIDs.append(sessionID)
+                }
+                retrySessionIDs.append(contentsOf: remainingIDs)
+                break
+            } catch {
+                if !durableDeletionCommitted, let deletionAttempt {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
+                if usedOpenTabAuthority {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("delete_failed"),
+                        "message": .string(error.localizedDescription),
+                        "durable": .bool(false),
+                        "local_cleanup_completed": .bool(false)
+                    ])
+                } else if mutationStarted {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("delete_failed"),
+                        "message": .string(error.localizedDescription)
+                    ])
+                } else {
+                    skippedSessions.append([
+                        "session_id": .string(sessionID.uuidString),
+                        "name": .string(candidate.name),
+                        "reason": .string("resolution_failed"),
+                        "message": .string(error.localizedDescription)
+                    ])
+                }
+                retrySessionIDs.append(sessionID)
             }
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.sessions.execute",
                 startMS: cleanupStartMS,
                 fields: [
@@ -823,17 +1681,31 @@ struct AgentManageMCPToolService {
                     "validRequested": String(requestedIDs.count),
                     "deleted": String(deletedSessions.count),
                     "skipped": String(skippedSessions.count),
+                    "unprocessed": String(unprocessedSessions.count),
+                    "cancelled": String(wasCancelled),
                     "openDeleted": String(debugOpenDeletedCount),
                     "persistedDeleted": String(debugPersistedDeletedCount)
                 ]
             )
         #endif
+        let status = if wasCancelled {
+            "cancelled"
+        } else if skippedSessions.allSatisfy({ $0["reason"]?.stringValue == "already_absent" }) {
+            "completed"
+        } else {
+            "partial"
+        }
         return .object([
-            "status": .string(skippedSessions.isEmpty ? "completed" : "partial"),
+            "status": .string(status),
+            "cancelled": .bool(wasCancelled),
+            "processed_count": .int(deletedSessions.count + skippedSessions.count),
             "deleted_count": .int(deletedSessions.count),
             "skipped_count": .int(skippedSessions.count),
+            "unprocessed_count": .int(unprocessedSessions.count),
             "deleted_sessions": .array(deletedSessions.map(Value.object)),
-            "skipped_sessions": .array(skippedSessions.map(Value.object))
+            "skipped_sessions": .array(skippedSessions.map(Value.object)),
+            "unprocessed_sessions": .array(unprocessedSessions.map(Value.object)),
+            "retry_session_ids": .array(retrySessionIDs.map { .string($0.uuidString) })
         ])
     }
 
@@ -857,7 +1729,7 @@ struct AgentManageMCPToolService {
         reference: String,
         workspace: WorkspaceModel,
         agentModeVM: AgentModeViewModel
-    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript) {
+    ) async throws -> (sessionID: UUID, parentSessionID: UUID?, name: String?, transcript: AgentTranscript) {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
@@ -866,12 +1738,12 @@ struct AgentManageMCPToolService {
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
-            return (sessionID, liveName, hydrated.transcript)
+            return (sessionID, hydrated.parentSessionID, liveName, hydrated.transcript)
         }
         guard let persisted = try await AgentSessionDataService.shared.loadAgentSession(reference: reference, for: workspace) else {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
-        return (persisted.id, persisted.name, persisted.transcript ?? .empty)
+        return (persisted.id, persisted.parentSessionID, persisted.name, persisted.transcript ?? .empty)
     }
 
     private func resolveHandoffSession(
@@ -892,6 +1764,7 @@ struct AgentManageMCPToolService {
                 ?? "Agent Session"
             return HandoffSessionInfo(
                 sessionID: sessionID,
+                parentSessionID: hydrated.parentSessionID,
                 name: liveName,
                 transcript: hydrated.transcript,
                 sourceTabID: hydrated.tabID,
@@ -927,6 +1800,7 @@ struct AgentManageMCPToolService {
             ?? persisted.name
         return HandoffSessionInfo(
             sessionID: persisted.id,
+            parentSessionID: persisted.parentSessionID,
             name: persisted.name,
             transcript: transcript,
             sourceTabID: nil,
@@ -937,108 +1811,6 @@ struct AgentManageMCPToolService {
         )
     }
 
-    private func sessionSummaryObject(
-        sessionID: UUID?,
-        name: String,
-        lastModified: Date,
-        itemCount: Int,
-        agentRaw: String?,
-        modelRaw: String?,
-        stateRaw: String?,
-        isLive: Bool,
-        parentSessionID: UUID? = nil,
-        isMCPOriginated: Bool = false
-    ) -> [String: Value] {
-        let publicState = publicSessionState(raw: stateRaw)
-        var obj: [String: Value] = [
-            "session_id": sessionID.map { .string($0.uuidString) } ?? .null,
-            "name": .string(name),
-            "last_modified": .string(timestamp(lastModified)),
-            "item_count": .int(itemCount),
-            "state": publicState.map(Value.string) ?? .null,
-            "is_live": .bool(isLive)
-        ]
-        if let stateRaw, let publicState,
-           normalizedStateToken(stateRaw) != normalizedStateToken(publicState)
-        {
-            obj["raw_state"] = .string(stateRaw)
-        }
-        if agentRaw != nil || modelRaw != nil {
-            obj["agent"] = .object([
-                "id": agentRaw.map(Value.string) ?? .null,
-                "model": modelRaw.map(Value.string) ?? .null
-            ])
-        }
-        if let parentSessionID {
-            obj["parent_session_id"] = .string(parentSessionID.uuidString)
-        }
-        if isMCPOriginated {
-            obj["is_mcp_originated"] = .bool(true)
-        }
-        return obj
-    }
-
-    private func sessionStateMatches(object: [String: Value], filter: String) -> Bool {
-        let filterAliases = sessionStateAliases(for: filter)
-        guard !filterAliases.isEmpty else { return false }
-        let stateAliases = sessionStateAliases(for: object["state"]?.stringValue)
-        let rawStateAliases = sessionStateAliases(for: object["raw_state"]?.stringValue)
-        return !stateAliases.isDisjoint(with: filterAliases)
-            || !rawStateAliases.isDisjoint(with: filterAliases)
-    }
-
-    private func sessionStateAliases(for raw: String?) -> Set<String> {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return [] }
-        let compact = normalizedStateToken(raw)
-        var aliases: Set<String> = [compact]
-        if let publicState = publicSessionState(raw: raw) {
-            aliases.insert(normalizedStateToken(publicState))
-        }
-        if aliases.contains(where: isWaitingStateToken) {
-            aliases.formUnion([
-                normalizedStateToken(AgentRunMCPSnapshot.Status.waitingForInput.rawValue),
-                normalizedStateToken(AgentSessionRunState.waitingForUser.rawValue),
-                normalizedStateToken(AgentSessionRunState.waitingForQuestion.rawValue),
-                normalizedStateToken(AgentSessionRunState.waitingForApproval.rawValue)
-            ])
-        }
-        return aliases
-    }
-
-    private func publicSessionState(raw stateRaw: String?) -> String? {
-        guard let stateRaw = stateRaw?.trimmingCharacters(in: .whitespacesAndNewlines), !stateRaw.isEmpty else { return nil }
-        if let runState = AgentSessionRunState(rawValue: stateRaw) {
-            switch runState {
-            case .waitingForUser, .waitingForQuestion, .waitingForApproval:
-                return AgentRunMCPSnapshot.Status.waitingForInput.rawValue
-            case .idle, .running, .completed, .cancelled, .failed:
-                return runState.rawValue
-            }
-        }
-        let compact = normalizedStateToken(stateRaw)
-        if isWaitingStateToken(compact) {
-            return AgentRunMCPSnapshot.Status.waitingForInput.rawValue
-        }
-        return stateRaw
-    }
-
-    private func normalizedStateToken(_ state: String) -> String {
-        state
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "")
-            .replacingOccurrences(of: "-", with: "")
-    }
-
-    private func isWaitingStateToken(_ token: String) -> Bool {
-        [
-            normalizedStateToken(AgentRunMCPSnapshot.Status.waitingForInput.rawValue),
-            normalizedStateToken(AgentSessionRunState.waitingForUser.rawValue),
-            normalizedStateToken(AgentSessionRunState.waitingForQuestion.rawValue),
-            normalizedStateToken(AgentSessionRunState.waitingForApproval.rawValue)
-        ].contains(token)
-    }
-
     private func parseBool(_ value: Value?, name: String, defaultValue: Bool) throws -> Bool {
         guard let value else { return defaultValue }
         guard let parsed = AgentMCPToolHelpers.parseBool(value) else {
@@ -1047,7 +1819,7 @@ struct AgentManageMCPToolService {
         return parsed
     }
 
-    private func clampedInt(
+    static func clampedInt(
         _ value: Value?,
         name: String,
         defaultValue: Int,
@@ -1055,19 +1827,17 @@ struct AgentManageMCPToolService {
         maxValue: Int
     ) throws -> Int {
         guard let value else { return defaultValue }
-        let parsed: Int?
-        switch value {
+        let parsed: Int? = switch value {
         case let .int(intValue):
-            parsed = intValue
+            intValue
         case let .double(doubleValue):
-            guard doubleValue.isFinite else { parsed = nil
-                break
-            }
-            parsed = Int(doubleValue)
+            // Reached before target authorization, so a bad literal from any caller must clamp
+            // rather than trap: out-of-`Int`-range JSON numerals decode as `.double`.
+            AgentMCPToolHelpers.saturatingInt(fromDouble: doubleValue)
         case let .string(stringValue):
-            parsed = Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+            Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
         default:
-            parsed = nil
+            nil
         }
         guard let parsed else {
             throw MCPError.invalidParams("\(name) must be an integer.")
@@ -1096,7 +1866,7 @@ struct AgentManageMCPToolService {
             }
             let parent = url.deletingLastPathComponent()
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-            let options: Data.WritingOptions = overwrite ? [.atomic] : [.atomic, .withoutOverwriting]
+            let options: Data.WritingOptions = overwrite ? [.atomic] : [.withoutOverwriting]
             do {
                 try data.write(to: url, options: options)
             } catch {
@@ -1158,9 +1928,5 @@ struct AgentManageMCPToolService {
 
     private func normalizedString(_ value: Value?) -> String? {
         AgentMCPToolHelpers.normalizedString(value)
-    }
-
-    private func timestamp(_ date: Date) -> String {
-        AgentMCPToolHelpers.timestamp(date)
     }
 }

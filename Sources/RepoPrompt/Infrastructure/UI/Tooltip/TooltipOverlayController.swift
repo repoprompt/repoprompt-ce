@@ -64,7 +64,7 @@ final class TooltipOverlayController {
         let arrow = Self.arrowGap * preset.scaleFactor
 
         // 3. Compute *top-left* window position for every placement
-        let topLeft: NSPoint = {
+        let proposedTopLeft: NSPoint = {
             switch cachedPlacement {
             case .top:
                 // Bubble ABOVE anchor – its bottom is arrow pts above anchor.top
@@ -112,6 +112,18 @@ final class TooltipOverlayController {
             }
         }()
 
+        guard let topLeft = Self.constrainedTopLeft(
+            proposedTopLeft,
+            bubbleSize: bubble,
+            anchor: anchor,
+            screens: NSScreen.screens.map {
+                ScreenGeometrySnapshot(frame: $0.frame, visibleFrame: $0.visibleFrame)
+            }
+        ) else {
+            hide()
+            return
+        }
+
         // Skip redundant frame sets (reduces display-cycle flush churn)
         let currentTopLeft = NSPoint(x: win.frame.origin.x, y: win.frame.origin.y + win.frame.height)
         let eps: CGFloat = 0.5
@@ -137,17 +149,37 @@ final class TooltipOverlayController {
             owner.removeChildWindow(w)
         }
 
-        // Remove notification observer
-        if let token = ownerWillCloseObserver {
+        // Remove notification observers
+        for token in ownerLifecycleObservers {
             NotificationCenter.default.removeObserver(token)
-            ownerWillCloseObserver = nil
         }
+        ownerLifecycleObservers.removeAll()
 
         win = nil
         owner = nil
         cachedText = nil
         cachedPlacement = .top
         cachedPreset = nil
+    }
+
+    static func constrainedTopLeft(
+        _ proposedTopLeft: NSPoint,
+        bubbleSize: NSSize,
+        anchor: NSRect,
+        screens: [ScreenGeometrySnapshot]
+    ) -> NSPoint? {
+        guard let visibleFrame = ScreenVisibleFrameResolver.selectedVisibleFrame(for: anchor, screens: screens) else {
+            return nil
+        }
+
+        var constrainedTopLeft = proposedTopLeft
+        constrainedTopLeft.x = bubbleSize.width <= visibleFrame.width
+            ? min(max(proposedTopLeft.x, visibleFrame.minX), visibleFrame.maxX - bubbleSize.width)
+            : visibleFrame.minX
+        constrainedTopLeft.y = bubbleSize.height <= visibleFrame.height
+            ? min(max(proposedTopLeft.y, visibleFrame.minY + bubbleSize.height), visibleFrame.maxY)
+            : visibleFrame.maxY
+        return constrainedTopLeft
     }
 
     // MARK: – Private
@@ -158,7 +190,7 @@ final class TooltipOverlayController {
     private var cachedPlacement: TooltipPlacement = .top
     private var cachedPreset: FontScalePreset?
 
-    private var ownerWillCloseObserver: NSObjectProtocol?
+    private var ownerLifecycleObservers: [NSObjectProtocol] = []
 
     /// Distance (in points) between the tooltip bubble and its anchor view.
     /// Kept small to avoid a large visual gap; still multiplied by
@@ -178,15 +210,22 @@ final class TooltipOverlayController {
         // This avoids hierarchy issues with menus
         win = tooltipWindow
 
-        ownerWillCloseObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: owner,
-            queue: .main
-        ) // ensure main thread
-            { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.hide()
+        for notification in [
+            NSWindow.willCloseNotification,
+            NSWindow.didResignKeyNotification,
+            NSWindow.didMoveNotification
+        ] {
+            ownerLifecycleObservers.append(
+                NotificationCenter.default.addObserver(
+                    forName: notification,
+                    object: owner,
+                    queue: .main
+                ) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.hide()
+                    }
                 }
+            )
         }
     }
 

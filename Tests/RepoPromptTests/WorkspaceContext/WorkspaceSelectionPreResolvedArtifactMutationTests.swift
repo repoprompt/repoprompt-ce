@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFoundation
 import XCTest
 
 final class WorkspaceSelectionPreResolvedArtifactMutationTests: XCTestCase {

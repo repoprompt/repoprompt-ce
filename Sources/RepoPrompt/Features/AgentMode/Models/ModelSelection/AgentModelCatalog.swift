@@ -1,11 +1,25 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum AgentModelCatalog {
+    static func cursorEffortOption(_ option: AgentModelOption, configID: String, valueRaw: String) -> AgentModelOption? {
+        guard let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: option.rawValue),
+              let raw = specifier.replacing(configID: configID, valueRaw: valueRaw) else { return nil }
+        return CursorAIModelCatalog.option(matching: raw)
+    }
+
+    static func cursorSelectionIsAvailable(_ raw: String) -> Bool {
+        CursorAIModelCatalog.option(matching: raw) != nil
+    }
+
     struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
+        let grokBuildAvailable: Bool
+        let antigravityAvailable: Bool
+        let devinAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -15,6 +29,9 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
+            grokBuildAvailable: false,
+            antigravityAvailable: false,
+            devinAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -26,6 +43,9 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
+                antigravityAvailable: antigravityAvailable,
+                devinAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -39,6 +59,9 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                grokBuildAvailable: false,
+                antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
+                devinAvailable: DevinRuntimeLocator.isInstalledSync(),
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -50,6 +73,9 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
+            grokBuildAvailable: Bool = false,
+            antigravityAvailable: Bool = false,
+            devinAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -58,6 +84,9 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
+            self.grokBuildAvailable = grokBuildAvailable
+            self.antigravityAvailable = antigravityAvailable
+            self.devinAvailable = devinAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -80,6 +109,9 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
+                grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
+                antigravityAvailable: antigravityAvailable || agentKind == .antigravity,
+                devinAvailable: devinAvailable || agentKind == .devin,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -89,9 +121,15 @@ enum AgentModelCatalog {
 
     enum AgentSelectionSurface: Equatable {
         case general
+        case headless
 
         func allows(_ agentKind: AgentProviderKind) -> Bool {
-            true
+            switch self {
+            case .general:
+                true
+            case .headless:
+                agentKind != .antigravity
+            }
         }
     }
 
@@ -179,14 +217,16 @@ enum AgentModelCatalog {
         .codexExec,
         .claudeCode,
         .openCode,
-        .cursor
+        .cursor,
+        .grokBuild,
+        .antigravity
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -216,6 +256,12 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
+        case .grokBuild:
+            availability.grokBuildAvailable
+        case .antigravity:
+            availability.antigravityAvailable
+        case .devin:
+            availability.devinAvailable
         }
     }
 
@@ -228,6 +274,13 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
+        if agentKind == .grokBuild {
+            // Grok's default follows its own configuration.
+            return AgentModel.defaultModel.rawValue
+        }
+        if agentKind == .antigravity || agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw ?? ""
+        }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
         {
@@ -239,8 +292,10 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode:
+        case .codexExec, .openCode, .grokBuild:
             return AgentModel.defaultModel.rawValue
+        case .antigravity, .devin:
+            return ""
         }
     }
 
@@ -307,27 +362,56 @@ enum AgentModelCatalog {
         )
     }
 
+    /// Producing canonical options also refreshes the memory-only admission index. Capture its
+    /// generation before reading provider snapshots so a concurrent invalidation defeats old work.
+    /// Window-local Codex overrides are picker projections, not the list_agents catalogue.
     static func options(
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
+        let generation = AgentAdvertisedModelCatalog.shared.productionGeneration(for: agentKind)
+        let result = uncachedOptions(
+            for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
+            includeClaudeEffortVariants: includeClaudeEffortVariants
+        )
+        if includeClaudeEffortVariants,
+           agentKind != .codexExec || codexDynamicModels == nil,
+           isAgentAvailable(agentKind, availability: availability)
+        {
+            AgentAdvertisedModelCatalog.shared.record(result, for: agentKind, generation: generation)
+        }
+        return result
+    }
+
+    private static func uncachedOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        includeClaudeEffortVariants: Bool
+    ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
-            let fallbacks = [
-                staticOption(.cursorAuto, for: .cursor),
-                staticOption(.cursorComposer2, for: .cursor)
-            ]
-            if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
-               !discoveredOptions.isEmpty
-            {
-                let discoveredWithoutFallbacks = discoveredOptions.filter {
-                    !isCursorAutoOption($0) && !isCursorComposer2Option($0)
-                }
-                return fallbacks + discoveredWithoutFallbacks
+            return CursorAIModelCatalog.options
+        }
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entries.map(\.option)
+        }
+        if agentKind == .antigravity {
+            return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
+        }
+        if agentKind == .grokBuild {
+            let fallback = staticOption(.defaultModel, for: .grokBuild)
+            guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
+                  !discoveredOptions.isEmpty
+            else {
+                return [fallback]
             }
-            return fallbacks
+            let discoveredWithoutDefault = discoveredOptions.filter {
+                $0.rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+            }
+            return [fallback] + discoveredWithoutDefault
         }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
@@ -347,10 +431,12 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
+        case .antigravity, .devin:
+            return []
         }
     }
 
@@ -364,20 +450,21 @@ enum AgentModelCatalog {
         guard isAgentAvailable(agentKind, availability: availability) else { return false }
         let normalized = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return false }
-        if agentKind == .cursor,
-           normalized.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame
+        if agentKind == .cursor {
+            return CursorAIModelCatalog.contains(modelRaw: normalized)
+        }
+        if agentKind == .grokBuild,
+           normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
         }
-        if agentKind == .cursor,
-           normalized.caseInsensitiveCompare(AgentModel.cursorComposer2.rawValue) == .orderedSame
-        {
-            return true
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: normalized) != nil
+        }
+        if agentKind == .antigravity {
+            return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
-            if agentKind == .cursor {
-                return cursorSnapshotContains(rawModel: normalized, snapshot: discoveredModels)
-            }
             return discoveredModels.contains(rawModel: normalized)
         }
         if agentKind.usesClaudeTooling,
@@ -429,6 +516,13 @@ enum AgentModelCatalog {
                 return known.displayName
             }
             return raw
+        }
+
+        // The encoded effort is part of a Devin model's identity, so it is never dropped.
+        if agentKind == .devin,
+           let entry = DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: effectiveRaw)
+        {
+            return entry.option.displayName
         }
 
         if agentKind.usesClaudeTooling {
@@ -973,7 +1067,7 @@ enum AgentModelCatalog {
         }
     }
 
-    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .max, .xhigh]
+    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .xhigh, .max]
 
     private static func supportedClaudeEfforts(forBaseModelRaw baseModelRaw: String, agentKind: AgentProviderKind?) -> [ClaudeCodeEffortLevel] {
         claudeMenuEffortOrder.filter {
@@ -1368,7 +1462,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             nil
         }
     }
@@ -1571,22 +1665,14 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             true
         }
     }
 
     private static func canonicalModelRaw(_ rawModel: String, for agentKind: AgentProviderKind) -> String {
         guard agentKind == .cursor else { return rawModel }
-        if rawModel.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame {
-            return AgentModel.cursorAuto.rawValue
-        }
-        guard let discoveredOption = resolvedACPDiscoveredModels(for: .cursor)?.option(matching: rawModel),
-              isCursorAutoOption(discoveredOption)
-        else {
-            return rawModel
-        }
-        return AgentModel.cursorAuto.rawValue
+        return CursorAIModelCatalog.option(matching: rawModel)?.rawValue ?? rawModel
     }
 
     private static func canonicalClaudeGLMModelRaw(_ rawModel: String?) -> String? {
@@ -1606,45 +1692,6 @@ enum AgentModelCatalog {
         return mappedBaseModel
     }
 
-    private static func isCursorAutoOption(_ option: AgentModelOption) -> Bool {
-        let normalizedRaw = normalizedCursorModelAlias(option.rawValue)
-        let normalizedDisplayName = normalizedCursorModelAlias(option.displayName)
-        return normalizedRaw == AgentModel.cursorAuto.rawValue
-            || normalizedDisplayName == AgentModel.cursorAuto.rawValue
-    }
-
-    private static func isCursorComposer2Option(_ option: AgentModelOption) -> Bool {
-        let normalizedRaw = normalizedCursorModelAlias(option.rawValue)
-        let normalizedDisplayName = normalizedCursorModelAlias(option.displayName)
-        return normalizedRaw == AgentModel.cursorComposer2.rawValue
-            || normalizedDisplayName == AgentModel.cursorComposer2.rawValue
-    }
-
-    private static func cursorSnapshotContains(
-        rawModel: String,
-        snapshot: ACPDiscoveredSessionModels
-    ) -> Bool {
-        if snapshot.contains(rawModel: rawModel) {
-            return true
-        }
-        let normalized = normalizedCursorModelAlias(rawModel)
-        guard !normalized.isEmpty else { return false }
-        return snapshot.options.contains { option in
-            normalizedCursorModelAlias(option.rawValue) == normalized
-                || normalizedCursorModelAlias(option.displayName) == normalized
-        }
-    }
-
-    private static func normalizedCursorModelAlias(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let base: Substring = if let bracketIndex = trimmed.firstIndex(of: "[") {
-            trimmed[..<bracketIndex]
-        } else {
-            trimmed[...]
-        }
-        return String(base).replacingOccurrences(of: " ", with: "-")
-    }
-
     private static func staticOption(_ model: AgentModel, for agentKind: AgentProviderKind) -> AgentModelOption {
         let displayName: String
         let description: String?
@@ -1660,7 +1707,14 @@ enum AgentModelCatalog {
             displayName: displayName,
             description: description,
             isPlaceholderDefault: model == .defaultModel,
-            isProviderDefault: false
+            isProviderDefault: false,
+            effortVariant: agentKind == .codexExec
+                ? CodexModelSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
+                    CodexModelSpecifier(raw: model.rawValue).baseModel.map {
+                        AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
+                    }
+                }
+                : nil
         )
     }
 
@@ -1808,12 +1862,88 @@ enum AgentModelCatalog {
         TaskLabel(kind: .design, label: "design", description: "Architecture, design discussions, and creative problem solving")
     ]
 
+    /// Selects the newest provider-advertised member of an approved Codex model family.
+    /// This intentionally does not promote unknown families or turn the provider catalog
+    /// into product recommendation policy.
+    static func preferredCodexFamilyOption(
+        _ family: String,
+        availability: AvailabilityContext = .current
+    ) -> AgentModelOption? {
+        preferredCodexFamilyOption(
+            family,
+            from: options(for: .codexExec, availability: availability)
+        )
+    }
+
+    static func preferredCodexFamilyOption(
+        _ family: String,
+        from options: [AgentModelOption]
+    ) -> AgentModelOption? {
+        let normalizedFamily = family.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedFamily.isEmpty else { return nil }
+        let candidates = options.compactMap { option -> (AgentModelOption, [Int])? in
+            guard !option.isPlaceholderDefault,
+                  let base = CodexModelSpecifier(raw: option.rawValue).baseModel?.lowercased(),
+                  let version = codexVersionComponents(baseModel: base, family: normalizedFamily)
+            else { return nil }
+            return (option, version)
+        }
+        guard let newestVersion = candidates.map(\.1).max(by: codexVersionIsEarlier) else { return nil }
+        return candidates.first { $0.1 == newestVersion }?.0
+    }
+
+    static func preferredCodexFamilyModelRaw(
+        _ family: String,
+        effort: CodexReasoningEffort,
+        availability: AvailabilityContext = .current
+    ) -> String? {
+        guard let option = preferredCodexFamilyOption(family, availability: availability),
+              let base = CodexModelSpecifier(raw: option.rawValue).baseModel
+        else { return nil }
+        let desired = "\(base)-\(effort.rawValue)"
+        return options(for: .codexExec, availability: availability).contains {
+            $0.rawValue.caseInsensitiveCompare(desired) == .orderedSame
+        } ? desired : nil
+    }
+
+    private static func codexVersionComponents(baseModel: String, family: String) -> [Int]? {
+        let prefix = "gpt-"
+        let suffix = "-\(family)"
+        guard baseModel.hasPrefix(prefix), baseModel.hasSuffix(suffix) else { return nil }
+        let versionEnd = baseModel.index(baseModel.endIndex, offsetBy: -suffix.count)
+        let versionStart = baseModel.index(baseModel.startIndex, offsetBy: prefix.count)
+        let rawVersion = String(baseModel[versionStart ..< versionEnd])
+        let components = rawVersion.split(separator: ".").compactMap { Int($0) }
+        guard !components.isEmpty, components.count == rawVersion.split(separator: ".").count else { return nil }
+        return components
+    }
+
+    private static func codexVersionIsEarlier(_ lhs: [Int], _ rhs: [Int]) -> Bool {
+        let count = max(lhs.count, rhs.count)
+        for index in 0 ..< count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left < right }
+        }
+        return false
+    }
+
     /// Explicit candidate chains per role. Order matters: first available wins.
-    private static func candidateChain(for kind: TaskLabelKind) -> [SelectionCandidate] {
-        switch kind {
+    private static func candidateChain(
+        for kind: TaskLabelKind,
+        availability: AvailabilityContext
+    ) -> [SelectionCandidate] {
+        let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability)
+            ?? AgentModel.gpt6LunaLow.rawValue
+        let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
+            ?? AgentModel.gpt61SolMedium.rawValue
+        let solHigh = preferredCodexFamilyModelRaw("sol", effort: .high, availability: availability)
+            ?? AgentModel.gpt61SolHigh.rawValue
+        return switch kind {
         case .explore:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: lunaLow),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt61SolLow.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: ClaudeModelSpecifier.encodedRaw(baseModelRaw: AgentModel.claudeSonnet.rawValue, effort: .high)),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeHaiku.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeHaiku.rawValue),
@@ -1821,25 +1951,28 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt54MiniMedium.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.codexMini.rawValue),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .engineer:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexMedium.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .pair:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexHigh.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solHigh),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .design:
             [
@@ -1848,7 +1981,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexMedium.rawValue)
+                SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         }
     }
@@ -1891,7 +2025,7 @@ enum AgentModelCatalog {
         _ kind: TaskLabelKind,
         availability: AvailabilityContext = .current
     ) -> NormalizedAgentSelection? {
-        let chain = candidateChain(for: kind)
+        let chain = candidateChain(for: kind, availability: availability)
         for candidate in chain {
             if isCandidateAvailable(candidate, availability: availability) {
                 return NormalizedAgentSelection(agent: candidate.agent, modelRaw: candidate.modelRaw)
@@ -1921,11 +2055,14 @@ enum AgentModelCatalog {
 
     /// Builds a comprehensive discovery payload for all agents, suitable for `list_agents`.
     static func discoveryAgents(
-        availability: AvailabilityContext = .current
+        availability: AvailabilityContext = .current,
+        surface: AgentSelectionSurface = .general
     ) -> [DiscoveryAgent] {
-        AgentProviderKind.allCases.map { agent in
-            discoveryAgent(agent, availability: availability)
-        }
+        AgentProviderKind.allCases
+            .filter { surface.allows($0) }
+            .map { agent in
+                discoveryAgent(agent, availability: availability)
+            }
     }
 
     /// Resolves a selection ID string to an agent + modelRaw pair.

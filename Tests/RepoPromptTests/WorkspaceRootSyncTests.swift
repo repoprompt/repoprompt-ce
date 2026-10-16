@@ -1,5 +1,7 @@
 import Combine
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 import XCTest
 
 @MainActor
@@ -162,6 +164,46 @@ final class WorkspaceRootSyncTests: XCTestCase {
 
         XCTAssertEqual(changeCount, 1)
         XCTAssertEqual(snapshots, [[rootB.id, rootA.id]])
+    }
+
+    func testValidatedSessionSelectorFiltersSafelyWithoutDuplicateIDTrapOrRoleLeakage() {
+        let viewModel = WorkspaceFilesViewModel()
+        let root = makeRoot(name: "Visible", path: "/tmp/validated-ui-root")
+        let file = FileViewModel(
+            file: File(
+                name: "Visible.swift",
+                path: "/tmp/validated-ui-root/Visible.swift",
+                modificationDate: Date(timeIntervalSince1970: 1)
+            ),
+            rootPath: root.fullPath,
+            rootIdentifier: root.id,
+            rootFolderPath: root.fullPath,
+            fileSystemService: nil
+        )
+        root.addChildrenBatch([.file(file)])
+        viewModel.registerRootFolderForTesting(root)
+
+        let firstRef = WorkspaceRootRef(id: root.id, name: "First", fullPath: root.fullPath)
+        let secondRef = WorkspaceRootRef(id: root.id, name: "Second", fullPath: root.fullPath)
+        let validScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [firstRef, secondRef],
+            physicalRoots: []
+        )
+        let conflictingPathScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [
+                firstRef,
+                WorkspaceRootRef(id: root.id, name: "Other", fullPath: "/tmp/other-root")
+            ],
+            physicalRoots: []
+        )
+        let conflictingRoleScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [firstRef],
+            physicalRoots: [firstRef]
+        )
+
+        XCTAssertEqual(viewModel.getAllFileViewModels(in: validScope).map(\.id), [file.id])
+        XCTAssertTrue(viewModel.getAllFileViewModels(in: conflictingPathScope).isEmpty)
+        XCTAssertTrue(viewModel.getAllFileViewModels(in: conflictingRoleScope).isEmpty)
     }
 
     func testDefaultWorkspaceAndWindowRootsUseCESupportRoot() {

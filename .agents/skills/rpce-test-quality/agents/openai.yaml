@@ -1,4 +1,4 @@
 interface:
   display_name: "RepoPrompt CE Test Quality"
   short_description: "Choose tests that protect meaningful contracts"
-  default_prompt: "Use $rpce-test-quality to evaluate test value and follow RepoPrompt CE's exact-ID, ledger, scenario, and validation workflow."
+  default_prompt: "Use $rpce-test-quality to evaluate test value, choose the lowest faithful layer, define a strong oracle, and select focused plus appropriately broad validation."

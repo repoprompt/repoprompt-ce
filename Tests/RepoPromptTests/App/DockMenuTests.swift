@@ -1,5 +1,5 @@
 import Cocoa
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor

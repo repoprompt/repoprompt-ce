@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptCodeMapCore
+import RepoPromptPersistence
 
 // Explicit checked conformances are intentional actor-boundary contracts.
 // swiftformat:disable redundantSendable
@@ -161,7 +163,7 @@ enum WorkspaceCodemapLiveDemandRejection: Equatable, Sendable {
     case rootAuthorityInvalid
     case rootEpochMismatch
     case catalogGenerationMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case invalidToken
     case pathOutsideRoot
     case staleRequestGeneration
@@ -184,7 +186,7 @@ enum WorkspaceCodemapLiveCompletionRejection: Equatable, Sendable {
     case pendingRequestMissing
     case staleTicket
     case catalogGenerationMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case binding(WorkspaceCodemapArtifactCompletionDisposition)
     case artifactHandleMismatch
     case contributionGenerationMismatch
@@ -204,7 +206,7 @@ enum WorkspaceCodemapLiveUnavailableRejection: Equatable, Sendable {
     case pendingRequestMissing
     case staleTicket
     case catalogGenerationMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case contributionGenerationMismatch
     case invalidReason
 }
@@ -273,7 +275,7 @@ struct WorkspaceCodemapLiveEntrySnapshot: Equatable, Sendable {
 struct WorkspaceCodemapLiveRootSnapshot: Equatable, Sendable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     let authorityIsCurrent: Bool
     let manifestGeneration: UInt64?
@@ -324,13 +326,6 @@ private final class WorkspaceCodemapLiveOverlayBundleState: @unchecked Sendable 
         try lock.withLock {
             guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
             return entries.map(\.snapshot)
-        }
-    }
-
-    func bindings() throws -> [WorkspaceCodemapArtifactBinding] {
-        try lock.withLock {
-            guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
-            return entries.map(\.binding)
         }
     }
 
@@ -436,7 +431,7 @@ struct WorkspaceCodemapLiveFrozenArtifactHandle: Sendable {
 final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
 
     private let state: WorkspaceCodemapLiveOverlayBundleState
@@ -452,7 +447,7 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
     init(
         rootEpoch: WorkspaceCodemapRootEpoch,
         catalogGeneration: UInt64,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
         contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
         entries: [WorkspaceCodemapLiveReadySnapshot],
         bindings: [WorkspaceCodemapArtifactBinding],
@@ -461,7 +456,7 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
         precondition(entries.count == bindings.count && entries.count == leaseOwners.count)
         self.rootEpoch = rootEpoch
         self.catalogGeneration = catalogGeneration
-        self.repositoryAuthority = repositoryAuthority
+        self.rootAuthority = rootAuthority
         self.contributionGeneration = contributionGeneration
         state = WorkspaceCodemapLiveOverlayBundleState(entries: zip(entries.indices, entries).map { index, snapshot in
             WorkspaceCodemapLiveOverlayBundleEntry(
@@ -474,16 +469,6 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
 
     func snapshot() throws -> [WorkspaceCodemapLiveReadySnapshot] {
         try state.snapshots()
-    }
-
-    func graphSnapshot() throws -> WorkspaceCodemapLiveGraphSnapshot {
-        try WorkspaceCodemapLiveGraphSnapshot(
-            rootEpoch: rootEpoch,
-            catalogGeneration: catalogGeneration,
-            repositoryAuthority: repositoryAuthority,
-            contributionGeneration: contributionGeneration,
-            bindings: state.bindings()
-        )
     }
 
     func handle(for fileID: UUID) throws -> WorkspaceCodemapLiveFrozenArtifactHandle? {
@@ -508,12 +493,9 @@ final class WorkspaceCodemapLiveOverlayBundle: @unchecked Sendable {
     }
 }
 
-struct WorkspaceCodemapLiveGraphSnapshot: Equatable, Sendable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let catalogGeneration: UInt64
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
-    let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
-    let bindings: [WorkspaceCodemapArtifactBinding]
+enum WorkspaceCodemapGraphChangeNotification: Hashable, Sendable {
+    case changed
+    case revoked(WorkspaceCodemapGraphRevocationReason)
 }
 
 struct WorkspaceCodemapLiveOverlayRootAccounting: Equatable, Sendable {
@@ -556,4 +538,32 @@ final class WorkspaceCodemapSharedArtifactLease: Sendable {
     deinit {
         lease.closeSynchronously()
     }
+}
+
+/// How the overlay rebuilds its root-local graph ledger after a graph-index publication.
+/// `.alwaysFull` exists so tests can prove the path-scoped reconciliation is exact.
+enum WorkspaceCodemapGraphReconcileMode: Hashable {
+    case incremental
+    case alwaysFull
+}
+
+/// Diagnostics for the root-local graph ledger. Visit counts measure reconciliation work, which
+/// for graph-index publications scales with the publication, not with the resident slot count.
+struct WorkspaceCodemapGraphLedgerAccounting: Hashable {
+    let slotCount: Int
+    let changedSetFileIDCount: Int
+    let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let floorGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let acknowledgedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    let incrementalReconcileCount: UInt64
+    let fullReconcileCount: UInt64
+    let incrementalFallbackCount: UInt64
+    let lastReconcileVisitCount: UInt64
+    let maximumIncrementalReconcileVisitCount: UInt64
+    let totalReconcileVisitCount: UInt64
+    let lastDiffSlotCount: Int
+    let floorResetCount: UInt64
+    let acknowledgedPruneCount: UInt64
+    /// Whether path-scoped reconciliation may resolve live state through the path index.
+    let liveEntriesIndexedByPath: Bool
 }

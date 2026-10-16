@@ -1,18 +1,83 @@
+import AppKit
 import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
-final class MCPAskUserToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .askUser
+final class MCPAskUserToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .askUser
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
+    }
+
+    var domainInteractionAdapter: DomainLongRunningInteractionAdapter {
+        let execution = dependencies
+        let requireTargetWindow = execution.requireTargetWindow
+        let requireCurrentTabContext = execution.requireCurrentTabContext
+        let resolveAgentModeTabID = execution.resolveAgentModeTabID
+        return DomainLongRunningInteractionAdapter(
+            isAvailable: { request in
+                guard let invocationContext = try? MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser),
+                      let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID,
+                      let targetWindow = await MainActor.run(body: {
+                          try? requireTargetWindow()
+                      })
+                else {
+                    return false
+                }
+                switch await execution.liveRunPurpose(connectionID) {
+                case .discoverRun:
+                    guard let tabContext = try? await requireCurrentTabContext(
+                        MCPWindowToolName.askUser
+                    ), let runID = tabContext.runID else {
+                        return false
+                    }
+                    return await MainActor.run {
+                        targetWindow.contextBuilderAgentViewModel.canPresentAskUserInteraction(
+                            tabID: tabContext.tabID,
+                            runID: runID
+                        )
+                    }
+                case .agentModeRun:
+                    guard let target = try? await resolveAgentModeTabID(
+                        request.payload,
+                        connectionID,
+                        .askUser
+                    ) else {
+                        return false
+                    }
+                    return await MainActor.run {
+                        targetWindow.agentModeViewModel.canPresentAskUserInteraction(tabID: target.tabID)
+                    }
+                case .unknown:
+                    return false
+                }
+            },
+            resolveDefaultTimeoutSeconds: { request in
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser)
+                guard let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID
+                else {
+                    throw MCPError.invalidParams("ask_user requires an active MCP connection")
+                }
+                return try await Self.resolveDefaultTimeoutSeconds(
+                    invocationContext: invocationContext,
+                    dependencies: execution
+                )
+            },
+            cancel: { requestID in
+                await MCPAskUserPresentationCoordinator.shared.cancel(requestID: requestID)
+            }
+        )
     }
 
     func buildTools() -> [Tool] {
@@ -48,7 +113,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
             - `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.
             - `title`: Optional title for the wizard card.
             - `context`: Optional overall context shown above the questions.
-            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.
+            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference.
 
             **Response:**
             - `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.
@@ -61,7 +126,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
                 properties: [
                     "title": .string(description: "Optional title shown above the question wizard."),
                     "context": .string(description: "Optional overall context shown above the wizard."),
-                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting."),
+                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference."),
                     "questions": .array(
                         description: "One or more structured questions to ask as a single wizard.",
                         items: .object(
@@ -92,28 +157,31 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
                 ],
                 required: ["questions"]
             )
-        ) { [dependencies] _, args in
-            try await Self.executeAskUser(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeAskUser(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
     /// Execute the ask_user tool - routes to appropriate UI based on run purpose.
     private static func executeAskUser(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         // Get connection ID and determine run purpose for routing.
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_user requires an active MCP connection")
         }
-        let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        let purpose = await dependencies.liveRunPurpose(connectionID)
 
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
-        // Resolve timeout: use explicit value from caller, or workspace setting.
-        let workspaceTimeout = await MainActor.run { targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds }
-        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: workspaceTimeout)
+        let defaultTimeout = try await resolveDefaultTimeoutSeconds(
+            invocationContext: invocationContext,
+            dependencies: dependencies
+        )
+        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
 
         // Route based on run purpose.
         let response: AgentAskUserResponse
@@ -124,28 +192,65 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
             guard let runID = tabContext.runID else {
                 throw MCPError.invalidParams("ask_user requires an active Context Builder run with tab context")
             }
-            response = try await targetWindow.contextBuilderAgentViewModel.askUserInteraction(
-                tabID: tabContext.tabID,
-                interaction: parsed.interaction,
-                runID: runID
-            )
+            let requestID = DomainInteractionPresentationContext.requestID
+            let requireTargetWindow = dependencies.requireTargetWindow
+            response = try await withPresentationRegistration(
+                requestID: requestID,
+                cancellation: {
+                    await MainActor.run {
+                        guard let window = try? requireTargetWindow() else { return }
+                        window.contextBuilderAgentViewModel.cancelAskUserInteraction(
+                            tabID: tabContext.tabID,
+                            interactionID: parsed.interaction.id,
+                            runID: runID
+                        )
+                    }
+                }
+            ) {
+                try await targetWindow.contextBuilderAgentViewModel.askUserInteraction(
+                    tabID: tabContext.tabID,
+                    interaction: parsed.interaction,
+                    runID: runID
+                )
+            }
 
         case .agentModeRun:
             // Route to agent mode UI.
-            let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+            let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .askUser)
+            let tabID = target.tabID
             // For non-MCP-controlled sessions, surface the tab so the user can
             // see and answer the question. MCP-controlled runs handle interactions
             // programmatically via `respond`, so pulling focus would be disruptive.
-            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID) {
+            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID),
+               !Self.prefersNotificationOverActivation(
+                   isAppActive: NSApp?.isActive == true,
+                   preferences: GlobalSettingsStore.shared.notificationPreferences()
+               )
+            {
                 _ = await targetWindow.revealPendingInteraction(
                     tabID: tabID,
                     surface: .agentQuestion
                 )
             }
-            response = try await targetWindow.agentModeViewModel.askUserInteraction(
-                tabID: tabID,
-                interaction: parsed.interaction
-            )
+            let requestID = DomainInteractionPresentationContext.requestID
+            let requireTargetWindow = dependencies.requireTargetWindow
+            response = try await withPresentationRegistration(
+                requestID: requestID,
+                cancellation: {
+                    await MainActor.run {
+                        guard let window = try? requireTargetWindow() else { return }
+                        window.agentModeViewModel.cancelAskUserInteraction(
+                            tabID: tabID,
+                            interactionID: parsed.interaction.id
+                        )
+                    }
+                }
+            ) {
+                try await targetWindow.agentModeViewModel.askUserInteraction(
+                    target: target,
+                    interaction: parsed.interaction
+                )
+            }
 
         case .unknown:
             throw MCPError.invalidParams("ask_user is only available during Context Builder or agent mode runs")
@@ -154,7 +259,72 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         return askUserResponseValue(response, includeLegacyResponse: parsed.includeLegacyResponse)
     }
 
-    static func resolvedInteractionTimeoutSeconds(
+    private static func resolveDefaultTimeoutSeconds(
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
+    ) async throws -> TimeInterval {
+        guard let connectionID = invocationContext.connectionID else {
+            throw MCPError.invalidParams("ask_user requires an active MCP connection")
+        }
+        let targetWindow = try dependencies.requireTargetWindow()
+        switch await dependencies.liveRunPurpose(connectionID) {
+        case .discoverRun:
+            let tabContext = try await dependencies.requireCurrentTabContext(MCPWindowToolName.askUser)
+            guard let runID = tabContext.runID else {
+                throw MCPError.invalidParams("ask_user requires an active Context Builder run with tab context")
+            }
+            guard let timeout = targetWindow.contextBuilderAgentViewModel.capturedQuestionTimeoutSeconds(
+                tabID: tabContext.tabID,
+                runID: runID
+            ) else {
+                throw MCPError.internalError("ask_user Context Builder run behavior is unavailable")
+            }
+            return timeout
+        case .agentModeRun:
+            return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
+        case .unknown:
+            throw MCPError.invalidParams("ask_user is only available during Context Builder or agent mode runs")
+        }
+    }
+
+    private static func withPresentationRegistration<Result>(
+        requestID: UUID?,
+        cancellation: @escaping MCPAskUserPresentationCoordinator.Cancellation,
+        operation: () async throws -> Result
+    ) async throws -> Result {
+        guard let requestID else { return try await operation() }
+        let coordinator = MCPAskUserPresentationCoordinator.shared
+        guard await coordinator.register(requestID: requestID, cancellation: cancellation) else {
+            throw CancellationError()
+        }
+        return try await withTaskCancellationHandler {
+            do {
+                let result = try await operation()
+                await coordinator.unregister(requestID: requestID)
+                return result
+            } catch {
+                await coordinator.unregister(requestID: requestID)
+                throw error
+            }
+        } onCancel: {
+            Task { await coordinator.cancel(requestID: requestID) }
+        }
+    }
+
+    /// Opt-in (`notifications.mcp_ask_user_notify_instead_of_activate`): while RepoPrompt is in the
+    /// background, let the attention-notification reconciler surface the question instead of pulling
+    /// the app to the front. Default behavior (reveal the tab) is unchanged.
+    nonisolated static func prefersNotificationOverActivation(
+        isAppActive: Bool,
+        preferences: NotificationPreferences
+    ) -> Bool {
+        !isAppActive
+            && preferences.enabled
+            && preferences.agentInteractions
+            && preferences.mcpAskUserNotifyInsteadOfActivate
+    }
+
+    nonisolated static func resolvedInteractionTimeoutSeconds(
         _ value: Value?,
         defaultTimeout: TimeInterval
     ) throws -> TimeInterval {
@@ -165,12 +335,12 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         return TimeInterval(timeoutInt)
     }
 
-    private struct ParsedAskUserInteraction {
+    struct ParsedAskUserInteraction {
         let interaction: AgentAskUserInteraction
         let includeLegacyResponse: Bool
     }
 
-    private static func parseAskUserInteraction(args: [String: Value], defaultTimeout: TimeInterval) throws -> ParsedAskUserInteraction {
+    nonisolated static func parseAskUserInteraction(args: [String: Value], defaultTimeout: TimeInterval) throws -> ParsedAskUserInteraction {
         let hasStructuredQuestions = args["questions"] != nil
         let legacyKeys = ["question", "options", "multi_select"]
         let misplacedTopLevelQuestionKeys = ["allow_custom", "allows_custom", "allows_multiple"]
@@ -236,7 +406,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         return ParsedAskUserInteraction(interaction: interaction, includeLegacyResponse: includeLegacyResponse)
     }
 
-    private static func parseAskUserQuestion(_ value: Value, index: Int) throws -> AgentAskUserQuestion {
+    private nonisolated static func parseAskUserQuestion(_ value: Value, index: Int) throws -> AgentAskUserQuestion {
         guard let object = value.objectValue else {
             throw MCPError.invalidParams("questions[\(index)] must be an object.")
         }
@@ -266,7 +436,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         )
     }
 
-    private static func parseAskUserOptions(_ value: Value?, questionPath: String) throws -> [AgentAskUserOption] {
+    private nonisolated static func parseAskUserOptions(_ value: Value?, questionPath: String) throws -> [AgentAskUserOption] {
         guard let value else { return [] }
         guard let optionValues = value.arrayValue else {
             throw MCPError.invalidParams("\(questionPath) must be an array.")
@@ -288,13 +458,13 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private static func normalizedAskUserString(_ value: Value?) -> String? {
+    private nonisolated static func normalizedAskUserString(_ value: Value?) -> String? {
         guard let raw = value?.stringValue else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func optionalAskUserBool(_ value: Value?, name: String) throws -> Bool? {
+    private nonisolated static func optionalAskUserBool(_ value: Value?, name: String) throws -> Bool? {
         guard let value else { return nil }
         guard let bool = value.boolValue else {
             throw MCPError.invalidParams("\(name) must be a boolean.")

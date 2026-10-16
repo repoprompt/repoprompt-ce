@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptProcess
 
 /// Claude-specific integration configuration helpers.
 ///
@@ -44,12 +45,18 @@ enum ClaudeCodeIntegrationConfiguration {
     /// Claude Code tools to disallow during Agent Mode runs.
     /// Keep native Read, Bash, and Skill enabled in Agent Mode so Claude can
     /// still discover and invoke workspace/user skills from `.claude/skills`.
+    /// Native orchestration (Agent and its legacy Task alias, Workflow, ListAgents,
+    /// SendMessage) is blocked so delegation goes through RepoPrompt's `agent_run`.
     private static let agentDisallowedTools: [String] = [
         "Write",
         "Edit",
         "Glob",
         "Grep",
+        "Agent",
         "Task",
+        "Workflow",
+        "ListAgents",
+        "SendMessage",
         "Monitor",
         "SlashCommand",
         "NotebookEdit",
@@ -77,7 +84,11 @@ enum ClaudeCodeIntegrationConfiguration {
         "Edit",
         "Glob",
         "Grep",
+        "Agent",
         "Task",
+        "Workflow",
+        "ListAgents",
+        "SendMessage",
         "SlashCommand",
         "BashOutput",
         "KillShell",

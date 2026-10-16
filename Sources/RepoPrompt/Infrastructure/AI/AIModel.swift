@@ -73,16 +73,67 @@ public enum AIModel: Equatable, Hashable {
     case gpt54MiniXHigh
     case gpt54Nano
 
+    // GPT-6 family (OpenAI Responses API)
+    case gpt61Sol
+    case gpt61SolLow
+    case gpt61SolHigh
+    case gpt61SolXHigh
+    case gpt61SolMax
+    case gpt6Astra
+    case gpt6AstraLow
+    case gpt6AstraHigh
+    case gpt6AstraXHigh
+    case gpt6AstraMax
+    case gpt6Luna
+    case gpt6LunaLow
+    case gpt6LunaHigh
+    case gpt6LunaXHigh
+    case gpt6Sol
+
     case gpt5CodexLow
     case gpt5CodexMed
     case gpt5CodexHigh
     case gpt5CodexXHigh
 
     // Codex CLI Provider Models
-    case codexCliGpt55CodexLow
-    case codexCliGpt55CodexMedium
-    case codexCliGpt55CodexHigh
-    case codexCliGpt55CodexXHigh
+    case codexCliGpt61SolLow
+    case codexCliGpt61SolMedium
+    case codexCliGpt61SolHigh
+    case codexCliGpt61SolXHigh
+    case codexCliGpt61SolMax
+    case codexCliGpt61SolUltra
+    case codexCliGpt6AstraLow
+    case codexCliGpt6AstraMedium
+    case codexCliGpt6AstraHigh
+    case codexCliGpt6AstraXHigh
+    case codexCliGpt6AstraMax
+    case codexCliGpt6LunaLow
+    case codexCliGpt6LunaMedium
+    case codexCliGpt6LunaHigh
+    case codexCliGpt6LunaXHigh
+    case codexCliGpt6LunaMax
+    case codexCliGpt6SolLow
+    case codexCliGpt6SolMedium
+    case codexCliGpt6SolHigh
+    case codexCliGpt6SolXHigh
+    case codexCliGpt6SolMax
+    case codexCliGpt56SolLow
+    case codexCliGpt56SolMedium
+    case codexCliGpt56SolHigh
+    case codexCliGpt56SolXHigh
+    case codexCliGpt56SolMax
+    case codexCliGpt56SolUltra
+    case codexCliGpt56TerraLow
+    case codexCliGpt56TerraMedium
+    case codexCliGpt56TerraHigh
+    case codexCliGpt56TerraXHigh
+    case codexCliGpt56TerraMax
+    case codexCliGpt56TerraUltra
+    case codexCliGpt56LunaLow
+    case codexCliGpt56LunaMedium
+    case codexCliGpt56LunaHigh
+    case codexCliGpt56LunaXHigh
+    case codexCliGpt56LunaMax
     case codexCliGpt5Low
     case codexCliGpt5Medium
     case codexCliGpt5High
@@ -113,6 +164,12 @@ public enum AIModel: Equatable, Hashable {
     case o3High // o3-high  – high reasoning effort
 
     // Anthropic Models
+    case claudeSonnet55
+    case claudeSonnet5
+    case claudeOpus55
+    case claudeOpus5
+    case claudeFable51
+    case claudeMythos51
     case claude45Haiku
     case claude4Sonnet
     case claude4SonnetThinking
@@ -147,6 +204,12 @@ public enum AIModel: Equatable, Hashable {
     case openrouterGeminiPro
     case openrouterClaude4Sonnet
     case openrouterClaude4Opus
+    case openrouterGpt61Sol
+    case openrouterGpt6Astra
+    case openrouterGpt6Luna
+    case openrouterClaudeSonnet55
+    case openrouterClaudeOpus55
+    case openrouterClaudeFable51
 
     case openrouterGeminiPro25
     case openrouterCustom(name: String)
@@ -166,6 +229,8 @@ public enum AIModel: Equatable, Hashable {
     case codexCustom(name: String)
     case openCodeCustom(name: String)
     case cursorCustom(name: String)
+    case grokBuildCustom(name: String)
+    case devinCustom(name: String)
 
     // Custom Provider Models
     case customProvider(name: String, provider: String, model: String)
@@ -223,6 +288,7 @@ public enum AIModel: Equatable, Hashable {
         static let codex = 11
         static let openCode = 12
         static let cursor = 13
+        static let grokBuild = 14
         static let special = -1
     }
 
@@ -280,6 +346,23 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt54MiniXHigh, rawValue: "gpt-5.4-mini-xhigh", actualName: "gpt-5.4-mini", displayName: "GPT-5.4 Mini XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt54Nano, rawValue: "gpt-5.4-nano", actualName: nil, displayName: "GPT-5.4 Nano", provider: ProviderIndex.openAI),
 
+        // GPT-6 family. GPT-6.1 Sol has no none/minimal effort; GPT-6 Sol is retained for pinning.
+        ModelInfo(model: .gpt61Sol, rawValue: "gpt-6.1-sol", actualName: nil, displayName: "GPT-6.1 Sol Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61SolLow, rawValue: "gpt-6.1-sol-low", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61SolHigh, rawValue: "gpt-6.1-sol-high", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61SolXHigh, rawValue: "gpt-6.1-sol-xhigh", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61SolMax, rawValue: "gpt-6.1-sol-max", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol Max", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6Astra, rawValue: "gpt-6-astra", actualName: nil, displayName: "GPT-6 Astra Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraLow, rawValue: "gpt-6-astra-low", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraHigh, rawValue: "gpt-6-astra-high", actualName: "gpt-6-astra", displayName: "GPT-6 Astra High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraXHigh, rawValue: "gpt-6-astra-xhigh", actualName: "gpt-6-astra", displayName: "GPT-6 Astra XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraMax, rawValue: "gpt-6-astra-max", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Max", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6Luna, rawValue: "gpt-6-luna", actualName: nil, displayName: "GPT-6 Luna Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6LunaLow, rawValue: "gpt-6-luna-low", actualName: "gpt-6-luna", displayName: "GPT-6 Luna Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6LunaHigh, rawValue: "gpt-6-luna-high", actualName: "gpt-6-luna", displayName: "GPT-6 Luna High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6LunaXHigh, rawValue: "gpt-6-luna-xhigh", actualName: "gpt-6-luna", displayName: "GPT-6 Luna XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6Sol, rawValue: "gpt-6-sol", actualName: nil, displayName: "GPT-6 Sol Med", provider: ProviderIndex.openAI),
+
         ModelInfo(model: .gpt5CodexLow, rawValue: "gpt-5.1-codex-max-low", actualName: "gpt-5.1-codex-max", displayName: "GPT-5.1 Codex Max Low", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt5CodexMed, rawValue: "gpt-5.1-codex-max", actualName: nil, displayName: "GPT-5.1 Codex Max Med", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt5CodexHigh, rawValue: "gpt-5.1-codex-max-high", actualName: "gpt-5.1-codex-max", displayName: "GPT-5.1 Codex Max High", provider: ProviderIndex.openAI),
@@ -299,10 +382,45 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt54ProXHigh, rawValue: "gpt-5.4-pro-xhigh", actualName: "gpt-5.4-pro", displayName: "GPT-5.4 Pro XHigh", provider: ProviderIndex.openAI),
 
         // Codex CLI Provider Models
-        ModelInfo(model: .codexCliGpt55CodexLow, rawValue: "codex_cli_gpt-5.5-low", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 Low", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexMedium, rawValue: "codex_cli_gpt-5.5-medium", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 Medium", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexHigh, rawValue: "codex_cli_gpt-5.5-high", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 High", provider: ProviderIndex.codex),
-        ModelInfo(model: .codexCliGpt55CodexXHigh, rawValue: "codex_cli_gpt-5.5-xhigh", actualName: "gpt-5.5", displayName: "CLI·GPT-5.5 XHigh", provider: ProviderIndex.codex),
+        // GPT-6.1 Sol requires Codex CLI 0.159.0 or newer (the bundled runtime version).
+        ModelInfo(model: .codexCliGpt61SolLow, rawValue: "codex_cli_gpt-6.1-sol-low", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt61SolMedium, rawValue: "codex_cli_gpt-6.1-sol-medium", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt61SolHigh, rawValue: "codex_cli_gpt-6.1-sol-high", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt61SolXHigh, rawValue: "codex_cli_gpt-6.1-sol-xhigh", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt61SolMax, rawValue: "codex_cli_gpt-6.1-sol-max", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt61SolUltra, rawValue: "codex_cli_gpt-6.1-sol-ultra", actualName: "gpt-6.1-sol", displayName: "CLI·GPT-6.1 Sol Ultra", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6AstraLow, rawValue: "codex_cli_gpt-6-astra-low", actualName: "gpt-6-astra", displayName: "CLI·GPT-6 Astra Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6AstraMedium, rawValue: "codex_cli_gpt-6-astra-medium", actualName: "gpt-6-astra", displayName: "CLI·GPT-6 Astra Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6AstraHigh, rawValue: "codex_cli_gpt-6-astra-high", actualName: "gpt-6-astra", displayName: "CLI·GPT-6 Astra High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6AstraXHigh, rawValue: "codex_cli_gpt-6-astra-xhigh", actualName: "gpt-6-astra", displayName: "CLI·GPT-6 Astra XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6AstraMax, rawValue: "codex_cli_gpt-6-astra-max", actualName: "gpt-6-astra", displayName: "CLI·GPT-6 Astra Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6LunaLow, rawValue: "codex_cli_gpt-6-luna-low", actualName: "gpt-6-luna", displayName: "CLI·GPT-6 Luna Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6LunaMedium, rawValue: "codex_cli_gpt-6-luna-medium", actualName: "gpt-6-luna", displayName: "CLI·GPT-6 Luna Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6LunaHigh, rawValue: "codex_cli_gpt-6-luna-high", actualName: "gpt-6-luna", displayName: "CLI·GPT-6 Luna High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6LunaXHigh, rawValue: "codex_cli_gpt-6-luna-xhigh", actualName: "gpt-6-luna", displayName: "CLI·GPT-6 Luna XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6LunaMax, rawValue: "codex_cli_gpt-6-luna-max", actualName: "gpt-6-luna", displayName: "CLI·GPT-6 Luna Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6SolLow, rawValue: "codex_cli_gpt-6-sol-low", actualName: "gpt-6-sol", displayName: "CLI·GPT-6 Sol Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6SolMedium, rawValue: "codex_cli_gpt-6-sol-medium", actualName: "gpt-6-sol", displayName: "CLI·GPT-6 Sol Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6SolHigh, rawValue: "codex_cli_gpt-6-sol-high", actualName: "gpt-6-sol", displayName: "CLI·GPT-6 Sol High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6SolXHigh, rawValue: "codex_cli_gpt-6-sol-xhigh", actualName: "gpt-6-sol", displayName: "CLI·GPT-6 Sol XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt6SolMax, rawValue: "codex_cli_gpt-6-sol-max", actualName: "gpt-6-sol", displayName: "CLI·GPT-6 Sol Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolLow, rawValue: "codex_cli_gpt-5.6-sol-low", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolMedium, rawValue: "codex_cli_gpt-5.6-sol-medium", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolHigh, rawValue: "codex_cli_gpt-5.6-sol-high", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolXHigh, rawValue: "codex_cli_gpt-5.6-sol-xhigh", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolMax, rawValue: "codex_cli_gpt-5.6-sol-max", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolUltra, rawValue: "codex_cli_gpt-5.6-sol-ultra", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Ultra", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraLow, rawValue: "codex_cli_gpt-5.6-terra-low", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraMedium, rawValue: "codex_cli_gpt-5.6-terra-medium", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraHigh, rawValue: "codex_cli_gpt-5.6-terra-high", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraXHigh, rawValue: "codex_cli_gpt-5.6-terra-xhigh", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraMax, rawValue: "codex_cli_gpt-5.6-terra-max", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Max", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraUltra, rawValue: "codex_cli_gpt-5.6-terra-ultra", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Ultra", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaLow, rawValue: "codex_cli_gpt-5.6-luna-low", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Low", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaMedium, rawValue: "codex_cli_gpt-5.6-luna-medium", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Medium", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaHigh, rawValue: "codex_cli_gpt-5.6-luna-high", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna High", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaXHigh, rawValue: "codex_cli_gpt-5.6-luna-xhigh", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaMax, rawValue: "codex_cli_gpt-5.6-luna-max", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Max", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Low, rawValue: "codex_cli_gpt-5.2-low", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Low", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Medium, rawValue: "codex_cli_gpt-5.2-medium", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5High, rawValue: "codex_cli_gpt-5.2-high", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 High", provider: ProviderIndex.codex),
@@ -320,6 +438,14 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .codexCliGpt5CodexMini, rawValue: "codex_cli_gpt-5.1-codex-mini", actualName: "gpt-5.1-codex-mini", displayName: "CLI·GPT-5.1 Codex Mini", provider: ProviderIndex.codex),
 
         // Anthropic Models
+        // Claude 5.x models use adaptive thinking only; see AnthropicProvider.usesAdaptiveThinkingOnly.
+        ModelInfo(model: .claudeSonnet55, rawValue: "claude-sonnet-5-5", actualName: nil, displayName: "Claude Sonnet 5.5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claudeSonnet5, rawValue: "claude-sonnet-5", actualName: nil, displayName: "Claude Sonnet 5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claudeOpus55, rawValue: "claude-opus-5-5", actualName: nil, displayName: "Claude Opus 5.5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claudeOpus5, rawValue: "claude-opus-5", actualName: nil, displayName: "Claude Opus 5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claudeFable51, rawValue: "claude-fable-5-1", actualName: nil, displayName: "Claude Fable 5.1", provider: ProviderIndex.anthropic),
+        // Restricted-access tier: listed for entitled accounts, never used as a default.
+        ModelInfo(model: .claudeMythos51, rawValue: "claude-mythos-5-1", actualName: nil, displayName: "Claude Mythos 5.1 (Restricted)", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude45Haiku, rawValue: "claude-haiku-4-5", actualName: nil, displayName: "Claude Haiku 4.5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude4Sonnet, rawValue: "claude-sonnet-4-5-20250929", actualName: nil, displayName: "Claude Sonnet 4.5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude4SonnetThinking, rawValue: "claude-sonnet-4-5-20250929-thinking", actualName: nil, displayName: "Claude Sonnet 4.5 Thinking", provider: ProviderIndex.anthropic),
@@ -347,6 +473,12 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .openrouterGeminiPro25, rawValue: "google/gemini-2.5-flash-preview", actualName: nil, displayName: "oRouter/Gemini 2.5 Flash Preview", provider: ProviderIndex.openRouter),
         ModelInfo(model: .openrouterClaude4Sonnet, rawValue: "anthropic/claude-sonnet-4.5", actualName: nil, displayName: "oRouter/Claude Sonnet 4.5", provider: ProviderIndex.openRouter),
         ModelInfo(model: .openrouterClaude4Opus, rawValue: "anthropic/claude-opus-4.6", actualName: nil, displayName: "oRouter/Claude Opus 4.6", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterGpt61Sol, rawValue: "openai/gpt-6.1-sol", actualName: nil, displayName: "oRouter/GPT-6.1 Sol", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterGpt6Astra, rawValue: "openai/gpt-6-astra", actualName: nil, displayName: "oRouter/GPT-6 Astra", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterGpt6Luna, rawValue: "openai/gpt-6-luna", actualName: nil, displayName: "oRouter/GPT-6 Luna", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterClaudeSonnet55, rawValue: "anthropic/claude-sonnet-5.5", actualName: nil, displayName: "oRouter/Claude Sonnet 5.5", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterClaudeOpus55, rawValue: "anthropic/claude-opus-5.5", actualName: nil, displayName: "oRouter/Claude Opus 5.5", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterClaudeFable51, rawValue: "anthropic/claude-fable-5.1", actualName: nil, displayName: "oRouter/Claude Fable 5.1", provider: ProviderIndex.openRouter),
 
         // **New DeepSeek Models**
         ModelInfo(model: .deepseekChat, rawValue: "deepseek-chat", actualName: nil, displayName: "DeepSeek-V3.2-Exp", provider: ProviderIndex.deepseek),
@@ -425,7 +557,7 @@ public enum AIModel: Equatable, Hashable {
     }()
 
     private static let modelGroups: [Set<AIModel>] = {
-        var groups: [Set<AIModel>] = Array(repeating: [], count: 14) // Includes CLI provider groups through Cursor
+        var groups: [Set<AIModel>] = Array(repeating: [], count: 15) // Includes CLI provider groups through Grok Build
         for info in modelDefinitions where info.provider >= 0 {
             groups[info.provider].insert(info.model)
         }
@@ -435,6 +567,15 @@ public enum AIModel: Equatable, Hashable {
     // MARK: - Service Tier Variant Helpers
 
     private static let openAITierPrefix = "openai_tier__"
+
+    static func rawValueWithoutOpenAIServiceTier(_ rawValue: String) -> String {
+        let normalizedRawValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedRawValue.hasPrefix(openAITierPrefix) else { return rawValue }
+        let rest = String(normalizedRawValue.dropFirst(openAITierPrefix.count))
+        let parts = rest.components(separatedBy: "__")
+        guard parts.count >= 2 else { return rawValue }
+        return parts.dropFirst().joined(separator: "__")
+    }
 
     /// Returns the service tier override if this is a tier variant, nil otherwise
     var openAIServiceTierOverride: String? {
@@ -500,6 +641,10 @@ public enum AIModel: Equatable, Hashable {
             return "opencode_custom_\(n)"
         case let .cursorCustom(n):
             return "cursor_custom_\(n)"
+        case let .grokBuildCustom(n):
+            return "grokbuild_custom_\(n)"
+        case let .devinCustom(n):
+            return "devin_custom_\(n)"
         case let .customProvider(_, _, model):
             return "custom_provider_\(model)"
         case let .customProviderUser(name):
@@ -567,6 +712,12 @@ public enum AIModel: Equatable, Hashable {
             }
             return n
         }
+        if case let .grokBuildCustom(n) = self {
+            return ACPAIModelCatalog.grokBuildModelOption(for: n)?.displayName ?? n
+        }
+        if case let .devinCustom(n) = self {
+            return ACPAIModelCatalog.devinModelOption(for: n)?.displayName ?? n
+        }
         if case let .customProviderUser(name) = self { return "Custom/\(name)" }
         if case .ollama = self {
             return "local/" + modelName
@@ -595,6 +746,8 @@ public enum AIModel: Equatable, Hashable {
         case .codex: CodexCLIProvider.self
         case .openCode: OpenCodeCLIProvider.self
         case .cursor: CursorCLIProvider.self
+        case .grokBuild: GrokBuildCLIProvider.self
+        case .devin: DevinCLIProvider.self
         }
     }
 
@@ -623,6 +776,8 @@ public enum AIModel: Equatable, Hashable {
         case .codexCustom: return .codex
         case .openCodeCustom: return .openCode
         case .cursorCustom: return .cursor
+        case .grokBuildCustom: return .grokBuild
+        case .devinCustom: return .devin
         case .customProviderUser: return .customProvider
         // or, if you prefer the old modelGroups approach:
         default:
@@ -639,6 +794,7 @@ public enum AIModel: Equatable, Hashable {
             if Self.modelGroups[ProviderIndex.codex].contains(self) { return .codex }
             if Self.modelGroups[ProviderIndex.openCode].contains(self) { return .openCode }
             if Self.modelGroups[ProviderIndex.cursor].contains(self) { return .cursor }
+            if Self.modelGroups[ProviderIndex.grokBuild].contains(self) { return .grokBuild }
             // fallback
             return .azure
         }
@@ -676,7 +832,9 @@ public enum AIModel: Equatable, Hashable {
              let .zaiCustom(n),
              let .codexCustom(n),
              let .openCodeCustom(n),
-             let .cursorCustom(n):
+             let .cursorCustom(n),
+             let .grokBuildCustom(n),
+             let .devinCustom(n):
             return n
         case let .customProviderUser(name):
             return name
@@ -698,9 +856,15 @@ public enum AIModel: Equatable, Hashable {
     static let simpleDiffPriority: [AIModel] = [
         // Prioritize practical current CLI variants first
         .claudeCodeSonnet,
-        .codexCliGpt55CodexMedium,
-        .codexCliGpt55CodexLow,
-        .codexCliGpt55CodexHigh,
+        .codexCliGpt61SolMedium,
+        .codexCliGpt61SolLow,
+        .codexCliGpt61SolHigh,
+        .codexCliGpt56SolMedium,
+        .codexCliGpt56SolLow,
+        .codexCliGpt56SolHigh,
+        .gpt61SolLow,
+        .gpt61Sol,
+        .gpt61SolHigh,
         .gpt54Low,
         .gpt54,
         .gpt54High,
@@ -709,6 +873,7 @@ public enum AIModel: Equatable, Hashable {
         .gpt41,
         .fireworksDeepseekV3p1Terminus,
         .deepseekChat, .openrouterDeepseekChat,
+        .claudeSonnet55, .openrouterClaudeSonnet55,
         .claude4Sonnet, .openrouterClaude4Sonnet,
         .gemini3p1ProPreview,
         .geminiPro25, .openrouterGeminiPro25,
@@ -727,9 +892,15 @@ public enum AIModel: Equatable, Hashable {
     static let mediumDiffPriority: [AIModel] = [
         // Prioritize practical current CLI variants first
         .claudeCodeSonnet,
-        .codexCliGpt55CodexHigh,
-        .codexCliGpt55CodexMedium,
-        .codexCliGpt55CodexLow,
+        .codexCliGpt61SolHigh,
+        .codexCliGpt61SolMedium,
+        .codexCliGpt61SolLow,
+        .codexCliGpt56SolHigh,
+        .codexCliGpt56SolMedium,
+        .codexCliGpt56SolLow,
+        .gpt61Sol,
+        .gpt61SolHigh,
+        .gpt61SolLow,
         .gpt54,
         .gpt54High,
         .gpt54Low,
@@ -738,6 +909,7 @@ public enum AIModel: Equatable, Hashable {
         .gpt41,
         .fireworksDeepseekV3p1Terminus,
         .deepseekChat, .openrouterDeepseekChat,
+        .claudeSonnet55, .openrouterClaudeSonnet55,
         .claude4Sonnet, .openrouterClaude4Sonnet,
         .gemini3p1ProPreview,
         .geminiPro25, .openrouterGeminiPro25,
@@ -756,11 +928,17 @@ public enum AIModel: Equatable, Hashable {
     static let highDiffPriority: [AIModel] = [
         // Then other top models
         .claudeCodeSonnet,
-        .codexCliGpt55CodexHigh,
-        .codexCliGpt55CodexXHigh,
-        .codexCliGpt55CodexMedium,
+        .codexCliGpt61SolHigh,
+        .codexCliGpt61SolXHigh,
+        .codexCliGpt61SolMedium,
+        .codexCliGpt56SolHigh,
+        .codexCliGpt56SolXHigh,
+        .codexCliGpt56SolMedium,
+        .gpt61SolHigh,
+        .gpt61Sol,
         .gpt54High,
         .gpt54,
+        .claudeSonnet55, .openrouterClaudeSonnet55,
         .claude4Sonnet, .openrouterClaude4Sonnet,
         .gpt5CodexLow,
         .gpt5Low,
@@ -788,8 +966,10 @@ public enum AIModel: Equatable, Hashable {
     static let simpleWholePriority: [AIModel] = [
         .claudeCodeSonnet,
         .gemini3FlashPreview,
+        .gpt6LunaLow,
         .gpt54Low,
         // Prioritize fast and affordable models
+        .gpt6Luna,
         .gpt54Mini,
         // Then other cheap/fast models
         .deepseekChat, .openrouterDeepseekChat,
@@ -814,8 +994,10 @@ public enum AIModel: Equatable, Hashable {
     static let mediumWholePriority: [AIModel] = [
         .claudeCodeSonnet,
         .gemini3FlashPreview,
+        .gpt61Sol,
         .gpt54,
         // Then the simple priorities
+        .gpt6Luna,
         .gpt54Mini,
         // fallback: everything else
         .deepseekChat, .openrouterDeepseekChat,
@@ -839,8 +1021,10 @@ public enum AIModel: Equatable, Hashable {
     static let highWholePriority: [AIModel] = [
         // Prioritize higher-quality models for complex whole-file edits
         .claudeCodeSonnet,
+        .gpt61SolHigh,
         .gpt54High,
         .gemini3FlashPreview,
+        .gpt6Luna,
         .gpt54Mini,
         .geminiFlashLatest,
         // fallback: everything else
@@ -901,6 +1085,21 @@ public enum AIModel: Equatable, Hashable {
             .gpt54MiniHigh,
             .gpt54MiniXHigh,
             .gpt54Nano,
+            .gpt61Sol,
+            .gpt61SolLow,
+            .gpt61SolHigh,
+            .gpt61SolXHigh,
+            .gpt61SolMax,
+            .gpt6Astra,
+            .gpt6AstraLow,
+            .gpt6AstraHigh,
+            .gpt6AstraXHigh,
+            .gpt6AstraMax,
+            .gpt6Luna,
+            .gpt6LunaLow,
+            .gpt6LunaHigh,
+            .gpt6LunaXHigh,
+            .gpt6Sol,
             .gpt5CodexLow,
             .gpt5CodexMed,
             .gpt5CodexHigh,
@@ -1015,7 +1214,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     var isOpenRouterModel: Bool {
-        Self.modelGroups[ProviderIndex.openRouter].contains(self) || (rawValue.starts(with: "openrouter_custom_"))
+        Self.modelGroups[ProviderIndex.openRouter].contains(self) || (rawValue.hasPrefix("openrouter_custom_"))
     }
 
     var isOllamaModel: Bool {
@@ -1070,11 +1269,28 @@ public enum AIModel: Equatable, Hashable {
         case .gpt5High, .gpt54High, .gpt5CodexHigh, .o3High: return "high"
         case .gpt5, .gpt54, .gpt5CodexMed, .o3: return "medium"
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
+        // GPT-6 family (API)
+        case .gpt61SolMax, .gpt6AstraMax: return "max"
+        case .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
+        case .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
+        case .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
+        case .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
         // Codex CLI models
-        case .codexCliGpt55CodexXHigh, .codexCliGpt5XHigh, .codexCliGpt54XHigh, .codexCliGpt5CodexXHigh: return "xhigh"
-        case .codexCliGpt55CodexHigh, .codexCliGpt5High, .codexCliGpt54High, .codexCliGpt5CodexHigh: return "high"
-        case .codexCliGpt55CodexMedium, .codexCliGpt5Medium, .codexCliGpt54Medium, .codexCliGpt5CodexMedium: return "medium"
-        case .codexCliGpt55CodexLow, .codexCliGpt5Low, .codexCliGpt54Low, .codexCliGpt5CodexLow: return "low"
+        case .codexCliGpt61SolUltra, .codexCliGpt56SolUltra, .codexCliGpt56TerraUltra: return "ultra"
+        case .codexCliGpt61SolMax, .codexCliGpt6AstraMax, .codexCliGpt6LunaMax, .codexCliGpt6SolMax,
+             .codexCliGpt56SolMax, .codexCliGpt56TerraMax, .codexCliGpt56LunaMax: return "max"
+        case .codexCliGpt61SolXHigh, .codexCliGpt6AstraXHigh, .codexCliGpt6LunaXHigh, .codexCliGpt6SolXHigh,
+             .codexCliGpt56SolXHigh, .codexCliGpt56TerraXHigh, .codexCliGpt56LunaXHigh,
+             .codexCliGpt5XHigh, .codexCliGpt54XHigh, .codexCliGpt5CodexXHigh: return "xhigh"
+        case .codexCliGpt61SolHigh, .codexCliGpt6AstraHigh, .codexCliGpt6LunaHigh, .codexCliGpt6SolHigh,
+             .codexCliGpt56SolHigh, .codexCliGpt56TerraHigh, .codexCliGpt56LunaHigh,
+             .codexCliGpt5High, .codexCliGpt54High, .codexCliGpt5CodexHigh: return "high"
+        case .codexCliGpt61SolMedium, .codexCliGpt6AstraMedium, .codexCliGpt6LunaMedium, .codexCliGpt6SolMedium,
+             .codexCliGpt56SolMedium, .codexCliGpt56TerraMedium, .codexCliGpt56LunaMedium,
+             .codexCliGpt5Medium, .codexCliGpt54Medium, .codexCliGpt5CodexMedium: return "medium"
+        case .codexCliGpt61SolLow, .codexCliGpt6AstraLow, .codexCliGpt6LunaLow, .codexCliGpt6SolLow,
+             .codexCliGpt56SolLow, .codexCliGpt56TerraLow, .codexCliGpt56LunaLow,
+             .codexCliGpt5Low, .codexCliGpt54Low, .codexCliGpt5CodexLow: return "low"
         case let .codexCustom(name):
             return CodexModelSpecifier(raw: name).reasoningEffort?.rawValue
         case let .claudeCodeModel(specifier):
@@ -1086,7 +1302,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     /// Returns the Codex service tier override for this model, if any.
-    /// Currently only GPT-5.4 Fast variants request the "fast" service tier.
+    /// Fast and catalog-advertised Ultrafast variants preserve their selected tier.
     var codexServiceTier: String? {
         switch self {
         case let .codexCustom(name):
@@ -1111,7 +1327,7 @@ public enum AIModel: Equatable, Hashable {
             return SwiftOpenAI.Model.custom(modelName)
         case .anthropic:
             return SwiftAnthropic.Model.other(modelName)
-        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor:
+        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild, .devin:
             // For these providers, use the actual model name when available
             if let modelInfo = Self.modelDefinitions.first(where: { $0.model == self }),
                let actualName = modelInfo.actualName
@@ -1147,13 +1363,16 @@ public enum AIModel: Equatable, Hashable {
                 let tier = parts[0]
                 let baseRaw = parts.dropFirst().joined(separator: "__")
                 if let base = AIModel.fromModelName(baseRaw) {
+                    if !UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants") {
+                        return base
+                    }
                     return .openAIServiceTierVariant(base: base, tier: tier)
                 }
             }
         }
 
         // Handle custom OpenRouter models
-        if normalizedRawValue.starts(with: "openrouter_custom_") {
+        if normalizedRawValue.hasPrefix("openrouter_custom_") {
             return .openrouterCustom(name: String(normalizedRawValue.dropFirst("openrouter_custom_".count)))
         }
 
@@ -1174,20 +1393,40 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Codex CLI models with prefix
-        if normalizedRawValue.starts(with: "codex_cli_") {
-            return modelDefinitions.first { $0.rawValue == normalizedRawValue }?.model
+        if normalizedRawValue.hasPrefix("codex_cli_") {
+            if let model = modelDefinitions.first(where: { $0.rawValue == normalizedRawValue })?.model {
+                return model
+            }
+            switch normalizedRawValue {
+            case "codex_cli_gpt-5.5-low":
+                return .codexCliGpt56SolLow
+            case "codex_cli_gpt-5.5-medium":
+                return .codexCliGpt56SolMedium
+            case "codex_cli_gpt-5.5-high":
+                return .codexCliGpt56SolHigh
+            case "codex_cli_gpt-5.5-xhigh":
+                return .codexCliGpt56SolXHigh
+            default:
+                return nil
+            }
         }
-        if normalizedRawValue.starts(with: "codex_custom_") {
+        if normalizedRawValue.hasPrefix("codex_custom_") {
             return .codexCustom(name: String(normalizedRawValue.dropFirst("codex_custom_".count)))
         }
-        if normalizedRawValue.starts(with: "opencode_custom_") {
+        if normalizedRawValue.hasPrefix("opencode_custom_") {
             return .openCodeCustom(name: String(normalizedRawValue.dropFirst("opencode_custom_".count)))
         }
-        if normalizedRawValue.starts(with: "cursor_custom_") {
+        if normalizedRawValue.hasPrefix("cursor_custom_") {
             return .cursorCustom(name: String(normalizedRawValue.dropFirst("cursor_custom_".count)))
         }
+        if normalizedRawValue.hasPrefix("grokbuild_custom_") {
+            return .grokBuildCustom(name: String(normalizedRawValue.dropFirst("grokbuild_custom_".count)))
+        }
+        if normalizedRawValue.hasPrefix("devin_custom_") {
+            return .devinCustom(name: String(normalizedRawValue.dropFirst("devin_custom_".count)))
+        }
 
-        if normalizedRawValue.starts(with: "openai_custom_reasoning_") {
+        if normalizedRawValue.hasPrefix("openai_custom_reasoning_") {
             let rest = String(normalizedRawValue.dropFirst("openai_custom_reasoning_".count))
             let parts = rest.components(separatedBy: "__")
             if parts.count >= 2,
@@ -1199,7 +1438,7 @@ public enum AIModel: Equatable, Hashable {
             }
         }
 
-        if normalizedRawValue.starts(with: "openai_custom_responses_") {
+        if normalizedRawValue.hasPrefix("openai_custom_responses_") {
             let name = String(normalizedRawValue.dropFirst("openai_custom_responses_".count))
             guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return .openaiCustomResponses(name: name)
@@ -1219,24 +1458,24 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Grok custom models
-        if normalizedRawValue.starts(with: "grok_custom_") {
+        if normalizedRawValue.hasPrefix("grok_custom_") {
             return .grokCustom(name: String(normalizedRawValue.dropFirst("grok_custom_".count)))
         }
 
         // Handle Groq custom models
-        if normalizedRawValue.starts(with: "groq_custom_") {
+        if normalizedRawValue.hasPrefix("groq_custom_") {
             return .groqCustom(name: String(normalizedRawValue.dropFirst("groq_custom_".count)))
         }
 
-        if normalizedRawValue.starts(with: "ollama_") {
+        if normalizedRawValue.hasPrefix("ollama_") {
             return .ollama
         }
 
         // Handle custom provider models
-        if normalizedRawValue.starts(with: "custom_provider_user_") {
+        if normalizedRawValue.hasPrefix("custom_provider_user_") {
             return .customProviderUser(name: String(normalizedRawValue.dropFirst("custom_provider_user_".count)))
         }
-        if normalizedRawValue.starts(with: "custom_provider_") {
+        if normalizedRawValue.hasPrefix("custom_provider_") {
             let modelName = String(normalizedRawValue.dropFirst("custom_provider_".count))
             if let config = try? CustomProviderConfiguration.load() {
                 // Preserve the user's selection and show the real provider name when available
@@ -1248,7 +1487,7 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Fireworks models
-        if normalizedRawValue.starts(with: "accounts/fireworks/models/") {
+        if normalizedRawValue.hasPrefix("accounts/fireworks/models/") {
             return modelDefinitions.first { $0.rawValue == normalizedRawValue }?.model
         }
 
@@ -1298,6 +1537,10 @@ public enum AIModel: Equatable, Hashable {
             models = ACPAIModelCatalog.openCodeModelsFromStore()
         case .cursor:
             models = ACPAIModelCatalog.cursorModelsFromStore()
+        case .grokBuild:
+            models = ACPAIModelCatalog.grokBuildModelsFromStore()
+        case .devin:
+            models = ACPAIModelCatalog.devinModelsFromStore()
         }
 
         // Filter out models that are not yet available based on their release date
@@ -1396,6 +1639,20 @@ public enum AIModel: Equatable, Hashable {
             return metadata
         }
 
+        // Precompute claudeCode sort keys once per model so that baseSortRank's
+        // O(M) linear scan through modelDefinitions is not repeated on every
+        // comparison inside the sort closure (which would be O(N log N × M) on
+        // the main actor).
+        var claudeCodeSortKeyCache: [AIModel: ClaudeCodeAIModelCatalog.SortKey] = [:]
+        func claudeCodeSortKey(for model: AIModel) -> ClaudeCodeAIModelCatalog.SortKey {
+            if let cached = claudeCodeSortKeyCache[model] {
+                return cached
+            }
+            let key = ClaudeCodeAIModelCatalog.sortKey(for: model)
+            claudeCodeSortKeyCache[model] = key
+            return key
+        }
+
         return models.sorted { lhs, rhs in
             if lhs.providerType != rhs.providerType {
                 return ModelPickerStringOrdering.precedes(
@@ -1404,7 +1661,10 @@ public enum AIModel: Equatable, Hashable {
                 )
             }
             if lhs.providerType == .claudeCode {
-                return ClaudeCodeAIModelCatalog.modelPrecedes(lhs, rhs)
+                return ClaudeCodeAIModelCatalog.precedes(
+                    lhsKey: claudeCodeSortKey(for: lhs), lhs: lhs,
+                    rhsKey: claudeCodeSortKey(for: rhs), rhs: rhs
+                )
             }
             return semanticMetadataPrecedes(metadata(for: lhs), metadata(for: rhs))
         }
@@ -1558,9 +1818,21 @@ public enum AIModel: Equatable, Hashable {
         let specifier = CodexModelSpecifier(raw: trimmed)
         let base = specifier.baseModel ?? trimmed
         let normalizedBase = normalizedSemanticText(base)
-        guard normalizedBase == "gpt-5.5" || normalizedBase == "gpt-5.5" else { return nil }
+        let canonicalBase: String
+        switch normalizedBase {
+        case "gpt-5.6", "gpt-5.6-sol":
+            canonicalBase = "GPT-5.6 Sol"
+        case "gpt-5.6-terra":
+            canonicalBase = "GPT-5.6 Terra"
+        case "gpt-5.6-luna":
+            canonicalBase = "GPT-5.6 Luna"
+        case "gpt-5.5":
+            canonicalBase = "GPT-5.5"
+        default:
+            return nil
+        }
 
-        var label = "GPT-5.5"
+        var label = canonicalBase
         if let serviceTier = specifier.serviceTier {
             label += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier ? " Fast" : " \(serviceTier.capitalized)"
         }
@@ -1574,21 +1846,18 @@ public enum AIModel: Equatable, Hashable {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        let suffixes = [
-            "-xhigh", " xhigh", "-x-high", " x-high",
-            "-medium", " medium", "-med", " med",
-            "-minimal", " minimal",
-            "-high", " high",
-            "-none", " none",
-            "-low", " low"
-        ]
-        let lowered = trimmed.lowercased()
-        for suffix in suffixes where lowered.hasSuffix(suffix) {
-            return String(trimmed.dropLast(suffix.count))
-                .trimmingCharacters(in: CharacterSet(charactersIn: " -_/·"))
+        let specifier = codexSpecifierFromSemanticLabel(trimmed)
+        guard specifier.reasoningEffort != nil, let baseModel = specifier.baseModel else {
+            return trimmed
         }
 
-        return trimmed
+        var stripped = humanizedCodexBaseModel(baseModel)
+        if let serviceTier = specifier.serviceTier {
+            stripped += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier
+                ? " Fast"
+                : " \(serviceTier.capitalized)"
+        }
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func semanticModelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
@@ -1706,24 +1975,40 @@ public enum AIModel: Equatable, Hashable {
     }
 
     private static func reasoningEffort(in text: String) -> CodexReasoningEffort? {
-        let tokens = text
-            .lowercased()
+        codexSpecifierFromSemanticLabel(text).reasoningEffort
+    }
+
+    private static func codexSpecifierFromSemanticLabel(_ text: String) -> CodexModelSpecifier {
+        let parseableText = text
+            .replacingOccurrences(of: "CLI·", with: "")
             .replacingOccurrences(of: "(", with: " ")
             .replacingOccurrences(of: ")", with: " ")
-            .replacingOccurrences(of: "·", with: " ")
-            .split { !$0.isLetter && !$0.isNumber }
-            .map(String.init)
-
-        for token in tokens.reversed() {
-            if token == "med" {
-                return .medium
-            }
-            if let parsed = CodexReasoningEffort.parse(token) {
-                return parsed
+        let normalized = normalizedSemanticText(parseableText)
+        let candidates = codexSpecifierCandidates(fromNormalizedSemanticText: normalized)
+        for candidate in candidates {
+            let specifier = CodexModelSpecifier(raw: candidate)
+            if specifier.reasoningEffort != nil {
+                return specifier
             }
         }
+        return CodexModelSpecifier(raw: normalized)
+    }
 
-        return nil
+    private static func codexSpecifierCandidates(fromNormalizedSemanticText normalized: String) -> [String] {
+        guard !normalized.isEmpty else { return [normalized] }
+
+        var candidates: [String] = []
+        func appendAlias(suffix: String, replacement: String) {
+            guard normalized.hasSuffix(suffix) else { return }
+            let base = String(normalized.dropLast(suffix.count))
+            guard !base.isEmpty else { return }
+            candidates.append("\(base)\(replacement)")
+        }
+
+        appendAlias(suffix: "-x-high", replacement: "-xhigh")
+        appendAlias(suffix: "-med", replacement: "-medium")
+        candidates.append(normalized)
+        return candidates
     }
 
     private static func normalizedCodexBaseLabel(_ label: String) -> String {
@@ -1853,10 +2138,13 @@ public enum AIModel: Equatable, Hashable {
                 models.append(contentsOf: ACPAIModelCatalog.openCodeModelsFromStore())
             } else if providerIndex == ProviderIndex.cursor {
                 models.append(contentsOf: ACPAIModelCatalog.cursorModelsFromStore())
+            } else if providerIndex == ProviderIndex.grokBuild {
+                models.append(contentsOf: ACPAIModelCatalog.grokBuildModelsFromStore())
             } else {
                 models.append(contentsOf: group)
             }
         }
+        models.append(contentsOf: ACPAIModelCatalog.devinModelsFromStore())
         models.append(.ollama)
         // Filter out models that are not yet available based on their release date
         return models.filter(\.isAvailable)
@@ -1879,6 +2167,8 @@ public enum AIModel: Equatable, Hashable {
         case codexCustom(name: String)
         case openCodeCustom(name: String)
         case cursorCustom(name: String)
+        case grokBuildCustom(name: String)
+        case devinCustom(name: String)
         case customProvider(name: String, provider: String, model: String)
         case customProviderUser(name: String)
         case claudeCodeModel(normalizedSpecifier: String)
@@ -1900,14 +2190,63 @@ public enum AIModel: Equatable, Hashable {
         case gpt54MiniHigh
         case gpt54MiniXHigh
         case gpt54Nano
+        case gpt61Sol
+        case gpt61SolLow
+        case gpt61SolHigh
+        case gpt61SolXHigh
+        case gpt61SolMax
+        case gpt6Astra
+        case gpt6AstraLow
+        case gpt6AstraHigh
+        case gpt6AstraXHigh
+        case gpt6AstraMax
+        case gpt6Luna
+        case gpt6LunaLow
+        case gpt6LunaHigh
+        case gpt6LunaXHigh
+        case gpt6Sol
         case gpt5CodexLow
         case gpt5CodexMed
         case gpt5CodexHigh
         case gpt5CodexXHigh
-        case codexCliGpt55CodexLow
-        case codexCliGpt55CodexMedium
-        case codexCliGpt55CodexHigh
-        case codexCliGpt55CodexXHigh
+        case codexCliGpt61SolLow
+        case codexCliGpt61SolMedium
+        case codexCliGpt61SolHigh
+        case codexCliGpt61SolXHigh
+        case codexCliGpt61SolMax
+        case codexCliGpt61SolUltra
+        case codexCliGpt6AstraLow
+        case codexCliGpt6AstraMedium
+        case codexCliGpt6AstraHigh
+        case codexCliGpt6AstraXHigh
+        case codexCliGpt6AstraMax
+        case codexCliGpt6LunaLow
+        case codexCliGpt6LunaMedium
+        case codexCliGpt6LunaHigh
+        case codexCliGpt6LunaXHigh
+        case codexCliGpt6LunaMax
+        case codexCliGpt6SolLow
+        case codexCliGpt6SolMedium
+        case codexCliGpt6SolHigh
+        case codexCliGpt6SolXHigh
+        case codexCliGpt6SolMax
+        case codexCliGpt56SolLow
+        case codexCliGpt56SolMedium
+        case codexCliGpt56SolHigh
+        case codexCliGpt56SolXHigh
+        case codexCliGpt56SolMax
+        case codexCliGpt56SolUltra
+        case codexCliGpt56TerraLow
+        case codexCliGpt56TerraMedium
+        case codexCliGpt56TerraHigh
+        case codexCliGpt56TerraXHigh
+        case codexCliGpt56TerraMax
+        case codexCliGpt56TerraUltra
+        case codexCliGpt56LunaLow
+        case codexCliGpt56LunaMedium
+        case codexCliGpt56LunaHigh
+        case codexCliGpt56LunaXHigh
+        case codexCliGpt56LunaMax
         case codexCliGpt5Low
         case codexCliGpt5Medium
         case codexCliGpt5High
@@ -1932,6 +2271,12 @@ public enum AIModel: Equatable, Hashable {
         case gpt54ProXHigh
         case o3Low
         case o3High
+        case claudeSonnet55
+        case claudeSonnet5
+        case claudeOpus55
+        case claudeOpus5
+        case claudeFable51
+        case claudeMythos51
         case claude45Haiku
         case claude4Sonnet
         case claude4SonnetThinking
@@ -1957,6 +2302,12 @@ public enum AIModel: Equatable, Hashable {
         case openrouterGeminiPro
         case openrouterClaude4Sonnet
         case openrouterClaude4Opus
+        case openrouterGpt61Sol
+        case openrouterGpt6Astra
+        case openrouterGpt6Luna
+        case openrouterClaudeSonnet55
+        case openrouterClaudeOpus55
+        case openrouterClaudeFable51
         case openrouterGeminiPro25
         case fireworksDeepseekV3p1Terminus
         case fireworksGLM46
@@ -2020,6 +2371,10 @@ public enum AIModel: Equatable, Hashable {
             .openCodeCustom(name: name)
         case let .cursorCustom(name):
             .cursorCustom(name: name)
+        case let .grokBuildCustom(name):
+            .grokBuildCustom(name: name)
+        case let .devinCustom(name):
+            .devinCustom(name: name)
         case let .customProvider(name, provider, model):
             .customProvider(name: name, provider: provider, model: model)
         case let .customProviderUser(name):
@@ -2054,6 +2409,36 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt54MiniXHigh)
         case .gpt54Nano:
             .staticCase(.gpt54Nano)
+        case .gpt61Sol:
+            .staticCase(.gpt61Sol)
+        case .gpt61SolLow:
+            .staticCase(.gpt61SolLow)
+        case .gpt61SolHigh:
+            .staticCase(.gpt61SolHigh)
+        case .gpt61SolXHigh:
+            .staticCase(.gpt61SolXHigh)
+        case .gpt61SolMax:
+            .staticCase(.gpt61SolMax)
+        case .gpt6Astra:
+            .staticCase(.gpt6Astra)
+        case .gpt6AstraLow:
+            .staticCase(.gpt6AstraLow)
+        case .gpt6AstraHigh:
+            .staticCase(.gpt6AstraHigh)
+        case .gpt6AstraXHigh:
+            .staticCase(.gpt6AstraXHigh)
+        case .gpt6AstraMax:
+            .staticCase(.gpt6AstraMax)
+        case .gpt6Luna:
+            .staticCase(.gpt6Luna)
+        case .gpt6LunaLow:
+            .staticCase(.gpt6LunaLow)
+        case .gpt6LunaHigh:
+            .staticCase(.gpt6LunaHigh)
+        case .gpt6LunaXHigh:
+            .staticCase(.gpt6LunaXHigh)
+        case .gpt6Sol:
+            .staticCase(.gpt6Sol)
         case .gpt5CodexLow:
             .staticCase(.gpt5CodexLow)
         case .gpt5CodexMed:
@@ -2062,14 +2447,82 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt5CodexHigh)
         case .gpt5CodexXHigh:
             .staticCase(.gpt5CodexXHigh)
-        case .codexCliGpt55CodexLow:
-            .staticCase(.codexCliGpt55CodexLow)
-        case .codexCliGpt55CodexMedium:
-            .staticCase(.codexCliGpt55CodexMedium)
-        case .codexCliGpt55CodexHigh:
-            .staticCase(.codexCliGpt55CodexHigh)
-        case .codexCliGpt55CodexXHigh:
-            .staticCase(.codexCliGpt55CodexXHigh)
+        case .codexCliGpt61SolLow:
+            .staticCase(.codexCliGpt61SolLow)
+        case .codexCliGpt61SolMedium:
+            .staticCase(.codexCliGpt61SolMedium)
+        case .codexCliGpt61SolHigh:
+            .staticCase(.codexCliGpt61SolHigh)
+        case .codexCliGpt61SolXHigh:
+            .staticCase(.codexCliGpt61SolXHigh)
+        case .codexCliGpt61SolMax:
+            .staticCase(.codexCliGpt61SolMax)
+        case .codexCliGpt61SolUltra:
+            .staticCase(.codexCliGpt61SolUltra)
+        case .codexCliGpt6AstraLow:
+            .staticCase(.codexCliGpt6AstraLow)
+        case .codexCliGpt6AstraMedium:
+            .staticCase(.codexCliGpt6AstraMedium)
+        case .codexCliGpt6AstraHigh:
+            .staticCase(.codexCliGpt6AstraHigh)
+        case .codexCliGpt6AstraXHigh:
+            .staticCase(.codexCliGpt6AstraXHigh)
+        case .codexCliGpt6AstraMax:
+            .staticCase(.codexCliGpt6AstraMax)
+        case .codexCliGpt6LunaLow:
+            .staticCase(.codexCliGpt6LunaLow)
+        case .codexCliGpt6LunaMedium:
+            .staticCase(.codexCliGpt6LunaMedium)
+        case .codexCliGpt6LunaHigh:
+            .staticCase(.codexCliGpt6LunaHigh)
+        case .codexCliGpt6LunaXHigh:
+            .staticCase(.codexCliGpt6LunaXHigh)
+        case .codexCliGpt6LunaMax:
+            .staticCase(.codexCliGpt6LunaMax)
+        case .codexCliGpt6SolLow:
+            .staticCase(.codexCliGpt6SolLow)
+        case .codexCliGpt6SolMedium:
+            .staticCase(.codexCliGpt6SolMedium)
+        case .codexCliGpt6SolHigh:
+            .staticCase(.codexCliGpt6SolHigh)
+        case .codexCliGpt6SolXHigh:
+            .staticCase(.codexCliGpt6SolXHigh)
+        case .codexCliGpt6SolMax:
+            .staticCase(.codexCliGpt6SolMax)
+        case .codexCliGpt56SolLow:
+            .staticCase(.codexCliGpt56SolLow)
+        case .codexCliGpt56SolMedium:
+            .staticCase(.codexCliGpt56SolMedium)
+        case .codexCliGpt56SolHigh:
+            .staticCase(.codexCliGpt56SolHigh)
+        case .codexCliGpt56SolXHigh:
+            .staticCase(.codexCliGpt56SolXHigh)
+        case .codexCliGpt56SolMax:
+            .staticCase(.codexCliGpt56SolMax)
+        case .codexCliGpt56SolUltra:
+            .staticCase(.codexCliGpt56SolUltra)
+        case .codexCliGpt56TerraLow:
+            .staticCase(.codexCliGpt56TerraLow)
+        case .codexCliGpt56TerraMedium:
+            .staticCase(.codexCliGpt56TerraMedium)
+        case .codexCliGpt56TerraHigh:
+            .staticCase(.codexCliGpt56TerraHigh)
+        case .codexCliGpt56TerraXHigh:
+            .staticCase(.codexCliGpt56TerraXHigh)
+        case .codexCliGpt56TerraMax:
+            .staticCase(.codexCliGpt56TerraMax)
+        case .codexCliGpt56TerraUltra:
+            .staticCase(.codexCliGpt56TerraUltra)
+        case .codexCliGpt56LunaLow:
+            .staticCase(.codexCliGpt56LunaLow)
+        case .codexCliGpt56LunaMedium:
+            .staticCase(.codexCliGpt56LunaMedium)
+        case .codexCliGpt56LunaHigh:
+            .staticCase(.codexCliGpt56LunaHigh)
+        case .codexCliGpt56LunaXHigh:
+            .staticCase(.codexCliGpt56LunaXHigh)
+        case .codexCliGpt56LunaMax:
+            .staticCase(.codexCliGpt56LunaMax)
         case .codexCliGpt5Low:
             .staticCase(.codexCliGpt5Low)
         case .codexCliGpt5Medium:
@@ -2118,6 +2571,18 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.o3Low)
         case .o3High:
             .staticCase(.o3High)
+        case .claudeSonnet55:
+            .staticCase(.claudeSonnet55)
+        case .claudeSonnet5:
+            .staticCase(.claudeSonnet5)
+        case .claudeOpus55:
+            .staticCase(.claudeOpus55)
+        case .claudeOpus5:
+            .staticCase(.claudeOpus5)
+        case .claudeFable51:
+            .staticCase(.claudeFable51)
+        case .claudeMythos51:
+            .staticCase(.claudeMythos51)
         case .claude45Haiku:
             .staticCase(.claude45Haiku)
         case .claude4Sonnet:
@@ -2168,6 +2633,18 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.openrouterClaude4Sonnet)
         case .openrouterClaude4Opus:
             .staticCase(.openrouterClaude4Opus)
+        case .openrouterGpt61Sol:
+            .staticCase(.openrouterGpt61Sol)
+        case .openrouterGpt6Astra:
+            .staticCase(.openrouterGpt6Astra)
+        case .openrouterGpt6Luna:
+            .staticCase(.openrouterGpt6Luna)
+        case .openrouterClaudeSonnet55:
+            .staticCase(.openrouterClaudeSonnet55)
+        case .openrouterClaudeOpus55:
+            .staticCase(.openrouterClaudeOpus55)
+        case .openrouterClaudeFable51:
+            .staticCase(.openrouterClaudeFable51)
         case .openrouterGeminiPro25:
             .staticCase(.openrouterGeminiPro25)
         case .fireworksDeepseekV3p1Terminus:
@@ -2294,46 +2771,6 @@ public enum AIModel: Equatable, Hashable {
             0.6
         default:
             nil
-        }
-    }
-
-    /// Resolves the actual temperature that will be used for this model,
-    /// taking into account overrides, explicit values, and model defaults.
-    /// Returns nil when the temperature is not determinable (e.g., API uses its own default).
-    /// - Parameters:
-    ///   - explicitTemperature: Optional explicit temperature (e.g., from benchmark settings)
-    ///   - includeOverrides: Whether per-model overrides should be considered (default: true)
-    /// - Returns: The resolved temperature value, or nil if unknown
-    func resolveTemperature(explicitTemperature: Double? = nil, includeOverrides: Bool = true) -> Double? {
-        // 1. Per-model override from settings
-        if includeOverrides,
-           let override = ModelOverridesSettings.shared.temperatureOverride(for: rawValue)
-        {
-            return override
-        }
-
-        // 2. Explicit temperature passed in (e.g., benchmark override)
-        if let explicit = explicitTemperature, explicit > 0.0 {
-            return explicit
-        }
-
-        // 3. Model-specific default
-        if let modelDefault = defaultTemperature {
-            return modelDefault
-        }
-
-        // 4. Provider-specific behavior when effectiveTemperature returns nil
-        switch providerType {
-        case .anthropic:
-            // AnthropicProvider explicitly sets temperature = 0 if not overridden (line 102 in AnthropicProvider.swift)
-            return 0.0
-        case .customProvider:
-            // CustomProviderConfiguration uses 0.3 as default (line 10 in CustomProviderConfiguration.swift)
-            return 0.3
-        case .openAI, .azure, .openRouter, .gemini, .deepseek, .fireworks, .grok, .groq, .zAI, .claudeCode, .codex, .ollama, .openCode, .cursor:
-            // These providers don't set temperature when nil - API uses its own default (typically 1.0)
-            // But we can't be certain what the API actually used
-            return nil
         }
     }
 }

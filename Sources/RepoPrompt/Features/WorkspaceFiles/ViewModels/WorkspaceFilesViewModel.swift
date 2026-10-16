@@ -1,6 +1,11 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os
@@ -699,11 +704,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         didSet {
             guard codemapAutoEnabled != oldValue else { return }
             selectionStateRevision &+= 1
-            autoCodemapSyncTask?.cancel()
-            autoCodemapSyncTask = nil
-            autoCodemapSelectionGeneration &+= 1
-            autoCodemapReadinessRetryAvailable = false
-            autoCodemapReadinessRetryPending = false
+            invalidateAutomaticCodemapSelection()
             // Crossing either direction invalidates the transient inferred projection.
             // Explicit manual files are added only after auto mode is disabled.
             resetAutoCodemapFiles([])
@@ -714,10 +715,19 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
+    private struct AutomaticCodemapPendingMarker: Hashable {
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let fileID: UUID
+        let requestGeneration: UInt64
+    }
+
     private var autoCodemapSyncTask: Task<Void, Never>?
+    private var autoCodemapReadinessRetryTask: Task<Void, Never>?
     private var autoCodemapSelectionGeneration: UInt64 = 0
     private var autoCodemapReadinessRetryAvailable = false
     private var autoCodemapReadinessRetryPending = false
+    private var autoCodemapPendingMarkers: Set<AutomaticCodemapPendingMarker> = []
+    private var autoCodemapVisibleRootIDs: Set<UUID> = []
 
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var error: FileManagerError?
@@ -730,11 +740,43 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     var onRootFoldersChanged: (() -> Void)?
     private let rootShellProjectionsChangedSubject = PassthroughSubject<Void, Never>()
+    private let codemapRootStatusesChangedSubject = PassthroughSubject<Void, Never>()
+    private var codemapRootStatusesByRootID: [UUID: WorkspaceCodemapRootStatusSnapshot] = [:]
+    private var acceptedCodemapRootStatusRevision: UInt64?
     private var rootShellProjectionChangeBatchDepth = 0
     private var hasPendingRootShellProjectionChange = false
 
     var rootShellProjectionsChangedPublisher: AnyPublisher<Void, Never> {
         rootShellProjectionsChangedSubject.eraseToAnyPublisher()
+    }
+
+    var codemapRootStatusesChangedPublisher: AnyPublisher<Void, Never> {
+        codemapRootStatusesChangedSubject.eraseToAnyPublisher()
+    }
+
+    func codemapRootStatus(rootID: UUID) -> WorkspaceCodemapRootStatusSnapshot? {
+        codemapRootStatusesByRootID[rootID]
+    }
+
+    func setCodemapGenerationSuspended(rootID: UUID, suspended: Bool) async {
+        _ = await workspaceFileContextStore.setCodemapGenerationSuspended(
+            rootID: rootID,
+            suspended: suspended
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
+    }
+
+    @discardableResult
+    func prioritizeCodemapGraphIndexNow(
+        rootID: UUID
+    ) async -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
+        let disposition = await workspaceFileContextStore.prioritizeCodemapGraphIndexNow(
+            rootID: rootID
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
+        return disposition
     }
 
     @MainActor
@@ -764,6 +806,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         publishRootFoldersChanged()
         rootShellProjectionsChangedSubject.send(())
+
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        guard visibleRootIDs != autoCodemapVisibleRootIDs else { return }
+        autoCodemapVisibleRootIDs = visibleRootIDs
+        guard codemapAutoEnabled else { return }
+        invalidateAutomaticCodemapSelection()
+        resetAutoCodemapFiles([])
+        if !visibleSelectedFileIDs().isEmpty {
+            scheduleAutoCodemapSync()
+        }
     }
 
     @Published private var selectedFileIDs: Set<UUID> = []
@@ -781,6 +833,9 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var rootShellPersistenceKeysByRootKey: [RootKey: WorkspaceRootShellPersistenceKey] = [:]
     private var partitionStoreSaveCancellable: AnyCancellable?
     private var fileSystemSettingsCancellable: AnyCancellable?
+    private var nonGitCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingRevision: UInt64 = 0
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
@@ -803,7 +858,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var sliceRebaseSourceSnapshotByFullPath: [String: SliceRebaseSourceSnapshot] = [:]
     private var sliceRebaseCommitTasksByFullPath: [String: Task<Void, Never>] = [:]
     private var sliceRebaseCommitIDsByFullPath: [String: UUID] = [:]
-    private var sessionWorktreeBindingsProvider: (@MainActor (UUID) -> [AgentSessionWorktreeBinding])?
+    private var sessionWorktreeBindingStatesProvider: (@MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState])?
     private var hiddenSessionHandledGenerationByRootLifetime: [HiddenSessionRootLifetimeKey: UInt64] = [:]
     private var hiddenSessionRootLifetimeByPhysicalPath: [String: HiddenSessionRootLifetimeKey] = [:]
     /// Monotonic revision incremented for any partition save seen in the current workspace.
@@ -1220,22 +1275,39 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
-    private var codemapSelectionGraphReadinessTask: Task<Void, Never>?
     private var codemapMarkerReadinessTask: Task<Void, Never>?
+    private var codemapRootStatusTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
     private let automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
+    private let automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
+    private let automaticCodemapReadinessRetryDelay: Duration
+    private let defaultApplicationOpener: DefaultApplicationOpener
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
 
     init(
         alwaysReadableHomeDirectoryURL: URL? = nil,
         workspaceFileContextStore: WorkspaceFileContextStore,
         automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
-        automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production
+        automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .init(
+            maximumReadinessRounds: 16,
+            initialBackoffMilliseconds: 50,
+            maximumBackoffMilliseconds: 1000,
+            maximumTotalWait: .seconds(10)
+        ),
+        automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
+        automaticCodemapReadinessRetryDelay: Duration = .milliseconds(400),
+        defaultApplicationOpener: DefaultApplicationOpener = .system,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
         self.automaticCodemapSelectionRequestPolicy = automaticCodemapSelectionRequestPolicy
+        self.automaticCodemapReadinessRetryPolicy = automaticCodemapReadinessRetryPolicy
         self.automaticCodemapSelectionWaiter = automaticCodemapSelectionWaiter
+        self.automaticCodemapReadinessRetryDelay = automaticCodemapReadinessRetryDelay
+        self.defaultApplicationOpener = defaultApplicationOpener
         // If you store sortMethod in user defaults, do that here
         if let loaded = SortMethod(rawValue: storedSortMethod) {
             currentSortMethod = loaded
@@ -1248,8 +1320,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         syncFileSystemPreferencesFromGlobalSettings()
 
         subscribeToWorkspaceStoreDeltaEvents()
-        subscribeToCodemapSelectionGraphReadinessUpdates()
         subscribeToCodemapMarkerReadinessUpdates()
+        subscribeToCodemapRootStatusUpdates()
         subscribeToPartitionStoreSaves()
         subscribeToFileSystemPreferenceChanges()
     }
@@ -1266,9 +1338,10 @@ class WorkspaceFilesViewModel: ObservableObject {
     deinit {
         // Cancel the subscriptions if this VM goes away
         workspaceStoreDeltaBridgeTask?.cancel()
-        codemapSelectionGraphReadinessTask?.cancel()
         codemapMarkerReadinessTask?.cancel()
+        codemapRootStatusTask?.cancel()
         autoCodemapSyncTask?.cancel()
+        autoCodemapReadinessRetryTask?.cancel()
         for task in sliceRebaseTasksByFullPath.values {
             task.cancel()
         }
@@ -1284,10 +1357,26 @@ class WorkspaceFilesViewModel: ObservableObject {
         fileSystemSettingsCancellable?.cancel()
     }
 
+    /// Compatibility setter for narrow callers. Production composition installs
+    /// the batch provider below so a multi-tab projection shares one authority scan.
     func setSessionWorktreeBindingsProvider(
         _ provider: @escaping @MainActor (UUID) -> [AgentSessionWorktreeBinding]
     ) {
-        sessionWorktreeBindingsProvider = provider
+        sessionWorktreeBindingStatesProvider = { sessionIDs in
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+                (sessionID, .hydrated(provider(sessionID)))
+            })
+        }
+    }
+
+    func setSessionWorktreeBindingStatesProvider(
+        _ provider: @escaping @MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState]
+    ) {
+        sessionWorktreeBindingStatesProvider = provider
+    }
+
+    private func sessionWorktreeBindingState(for sessionID: UUID) -> AgentSessionWorktreeBindingState {
+        sessionWorktreeBindingStatesProvider?([sessionID])[sessionID] ?? .unavailable
     }
 
     func attachSelectionCoordinator(_ coordinator: WorkspaceSelectionCoordinator) {
@@ -1370,7 +1459,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func handleWorkspaceSwitch(to workspace: WorkspaceModel?) async {
         #if DEBUG
-            let switchSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let switchSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         currentWorkspaceID = workspace?.id
         currentTabID = nil
@@ -1378,10 +1467,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             currentSlicesByRoot.removeAll()
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "workspaceFiles.workspaceSwitchSlices.clear",
                     fields: [
-                        "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -1389,10 +1478,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.begin",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)"
                 ]
             )
@@ -1411,13 +1500,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         currentSlicesByRoot = refreshed
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.end",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)",
                     "rootsWithSlices": "\(refreshed.count)",
-                    "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -1436,31 +1525,42 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
 
     private func subscribeToWorkspaceStoreDeltaEvents() {
-        workspaceStoreDeltaBridgeTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.appliedIndexEvents()
+        // Capture the store (not self) and re-acquire self per event so a
+        // closed window's view model is released once nothing else retains it;
+        // deinit then cancels this task, which finishes the stream iterator.
+        // The per-iteration `guard let self` is load-bearing: buffered events
+        // can still be delivered after cancellation, and must not reach a dead
+        // VM. These tasks are only ever cancelled from deinit — never cancel
+        // them while the VM is alive (a mid-apply cancel could half-apply a
+        // projection).
+        let store = workspaceFileContextStore
+        workspaceStoreDeltaBridgeTask = Task { [weak self, store] in
+            let stream = await store.appliedIndexEvents()
             for await event in stream {
+                guard let self else { return }
                 await handleWorkspaceAppliedIndexEvent(event)
             }
         }
     }
 
-    private func subscribeToCodemapSelectionGraphReadinessUpdates() {
-        codemapSelectionGraphReadinessTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.codemapSelectionGraphReadinessUpdates()
+    private func subscribeToCodemapMarkerReadinessUpdates() {
+        let store = workspaceFileContextStore
+        codemapMarkerReadinessTask = Task { [weak self, store] in
+            let stream = await store.codemapMarkerReadinessUpdates()
             for await event in stream {
-                handleCodemapSelectionGraphReadiness(event)
+                guard let self else { return }
+                handleCodemapMarkerReadiness(event)
             }
         }
     }
 
-    private func subscribeToCodemapMarkerReadinessUpdates() {
-        codemapMarkerReadinessTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.codemapMarkerReadinessUpdates()
-            for await event in stream {
-                handleCodemapMarkerReadiness(event)
+    private func subscribeToCodemapRootStatusUpdates() {
+        let store = workspaceFileContextStore
+        codemapRootStatusTask = Task { [weak self, store] in
+            let stream = await store.codemapRootStatusUpdates()
+            for await update in stream {
+                guard let self else { return }
+                handleCodemapRootStatus(update)
             }
         }
     }
@@ -1571,13 +1671,19 @@ class WorkspaceFilesViewModel: ObservableObject {
             return true
         }
 
+        let modifiedFileIDs = Set(event.modifiedFileIDs)
+        let modifiedFilesByID: [UUID: WorkspaceFileRecord] = Dictionary(uniqueKeysWithValues: snapshot.files.compactMap { file in
+            guard modifiedFileIDs.contains(file.id), file.rootID == event.rootID else { return nil }
+            return (file.id, file)
+        })
+        let targetsByFileID = await hiddenSessionSliceRebaseTargets(
+            physicalRootPath: snapshot.root.standardizedFullPath,
+            modifiedFilesByID: modifiedFilesByID
+        ) ?? [:]
+
         for fileID in event.modifiedFileIDs {
-            guard let file = snapshot.files.first(where: { $0.id == fileID }),
-                  file.rootID == event.rootID,
-                  let targets = await hiddenSessionSliceRebaseTargets(
-                      physicalRootPath: snapshot.root.standardizedFullPath,
-                      physicalFullPath: file.standardizedFullPath
-                  ),
+            guard let file = modifiedFilesByID[fileID],
+                  let targets = targetsByFileID[fileID],
                   !targets.isEmpty
             else { continue }
             let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
@@ -1611,15 +1717,38 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func hiddenSessionSliceRebaseTargets(
         physicalRootPath: String,
-        physicalFullPath: String
-    ) async -> [HiddenSessionSliceRebaseTarget]? {
-        guard let provider = sessionWorktreeBindingsProvider,
-              let workspace = workspaceManager?.activeWorkspace
+        modifiedFilesByID: [UUID: WorkspaceFileRecord]
+    ) async -> [UUID: [HiddenSessionSliceRebaseTarget]]? {
+        guard let provider = sessionWorktreeBindingStatesProvider,
+              let workspace = workspaceManager?.activeWorkspace,
+              !modifiedFilesByID.isEmpty
         else { return nil }
-        var targets: [HiddenSessionSliceRebaseTarget] = []
-        for tab in workspace.composeTabs {
-            guard let sessionID = tab.activeAgentSessionID else { continue }
-            let bindings = provider(sessionID)
+
+        // Slice presence and relative-path eligibility are independent of binding
+        // authority. Apply them first so the expensive global binding snapshot is
+        // requested only for tabs that can target at least one modified file.
+        let pathIndex = HiddenSessionSlicePathIndex(
+            relativePathsByFileID: modifiedFilesByID.mapValues { $0.standardizedRelativePath }
+        )
+        let candidateTabs = workspace.composeTabs.compactMap { tab -> (
+            tab: ComposeTabState,
+            sessionID: UUID,
+            slices: [String: [LineRange]],
+            candidateFileIDs: Set<UUID>
+        )? in
+            guard let sessionID = tab.activeAgentSessionID else { return nil }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard !slices.isEmpty else { return nil }
+            let candidateFileIDs = pathIndex.matchingFileIDs(for: Array(slices.keys))
+            guard !candidateFileIDs.isEmpty else { return nil }
+            return (tab, sessionID, slices, candidateFileIDs)
+        }
+        guard !candidateTabs.isEmpty else { return [:] }
+
+        let bindingStates = provider(Set(candidateTabs.map(\.sessionID)))
+        var targetsByFileID: [UUID: [HiddenSessionSliceRebaseTarget]] = [:]
+        for candidate in candidateTabs {
+            guard case let .hydrated(bindings) = bindingStates[candidate.sessionID] else { continue }
             let matchingBindings = bindings.filter {
                 StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath) == physicalRootPath
             }
@@ -1629,24 +1758,29 @@ class WorkspaceFilesViewModel: ObservableObject {
             })
             let fingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
             guard await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
-                ownerID: sessionID,
+                ownerID: candidate.sessionID,
                 bindingFingerprint: fingerprint,
                 physicalRootPaths: physicalRootPaths
-            ), let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
-                forPhysicalPath: physicalFullPath,
-                binding: binding
             ) else { continue }
-            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
-            guard slices[logicalFullPath]?.isEmpty == false else { continue }
-            targets.append(HiddenSessionSliceRebaseTarget(
-                identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
-                logicalFullPath: logicalFullPath,
-                agentSessionID: sessionID,
-                bindingFingerprint: fingerprint,
-                physicalRootPaths: physicalRootPaths
-            ))
+
+            for fileID in candidate.candidateFileIDs {
+                guard let file = modifiedFilesByID[fileID],
+                      let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
+                          forPhysicalPath: file.standardizedFullPath,
+                          binding: binding
+                      ),
+                      candidate.slices[logicalFullPath]?.isEmpty == false
+                else { continue }
+                targetsByFileID[fileID, default: []].append(HiddenSessionSliceRebaseTarget(
+                    identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: candidate.tab.id),
+                    logicalFullPath: logicalFullPath,
+                    agentSessionID: candidate.sessionID,
+                    bindingFingerprint: fingerprint,
+                    physicalRootPaths: physicalRootPaths
+                ))
+            }
         }
-        return targets
+        return targetsByFileID
     }
 
     @MainActor
@@ -1869,14 +2003,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func hiddenSessionSliceRangesIfTargetCurrent(
         _ target: HiddenSessionSliceRebaseTarget
     ) async -> [LineRange]? {
-        guard let provider = sessionWorktreeBindingsProvider,
-              let manager = workspaceManager,
+        guard let manager = workspaceManager,
               let tab = manager.composeTab(for: target.identity),
               tab.activeAgentSessionID == target.agentSessionID,
               let ranges = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)[target.logicalFullPath],
-              !ranges.isEmpty
+              !ranges.isEmpty,
+              case let .hydrated(bindings) = sessionWorktreeBindingState(for: target.agentSessionID)
         else { return nil }
-        let bindings = provider(target.agentSessionID)
         guard AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings) == target.bindingFingerprint,
               Set(bindings.map {
                   StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)
@@ -2020,10 +2153,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             ))
         }
 
-        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
-              snapshot.root.id == event.rootID,
-              snapshot.root.standardizedFullPath == rootKey,
-              snapshot.generation >= event.generation
+        guard let lookup = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: missingFileIDs,
+            folderIDs: missingFolderIDs
+        ),
+            lookup.root.id == event.rootID,
+            lookup.root.standardizedFullPath == rootKey,
+            lookup.generation >= event.generation
         else {
             return .requiresCanonicalResync
         }
@@ -2045,9 +2182,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         }
 
-        let canonicalFilesByID = Dictionary(uniqueKeysWithValues: snapshot.files.map { ($0.id, $0) })
         for fileID in missingFileIDs {
-            guard let record = canonicalFilesByID[fileID] else {
+            guard let record = lookup.filesByID[fileID] else {
                 return .requiresCanonicalResync
             }
             let fileByID = fileHierarchyIndex.filesByID[fileID]
@@ -2068,9 +2204,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         }
 
-        let canonicalFoldersByID = Dictionary(uniqueKeysWithValues: snapshot.folders.map { ($0.id, $0) })
         for folderID in missingFolderIDs {
-            guard let record = canonicalFoldersByID[folderID] else {
+            guard let record = lookup.foldersByID[folderID] else {
                 return .requiresCanonicalResync
             }
             let folderByID = fileHierarchyIndex.foldersByID[folderID]
@@ -2445,22 +2580,50 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     @MainActor
-    private func handleCodemapSelectionGraphReadiness(
-        _ event: WorkspaceCodemapSelectionGraphReadinessEvent
-    ) {
-        guard codemapAutoEnabled,
-              autoCodemapReadinessRetryPending,
-              visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID })
-        else { return }
-        scheduleAutoCodemapSync(readinessTriggered: true)
-    }
-
-    @MainActor
     private func handleCodemapMarkerReadiness(
         _ event: WorkspaceCodemapMarkerReadinessEvent
     ) {
         guard visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID }) else { return }
         codemapMarkerReadinessRevision &+= 1
+        guard codemapAutoEnabled, autoCodemapReadinessRetryPending,
+              event.changes.contains(where: { change in
+                  change.state == .ready && autoCodemapPendingMarkers.contains(
+                      AutomaticCodemapPendingMarker(
+                          rootEpoch: event.rootEpoch,
+                          fileID: change.fileID,
+                          requestGeneration: change.requestGeneration
+                      )
+                  ) && change.pathGeneration == change.requestGeneration
+              })
+        else { return }
+        scheduleAutoCodemapSync(readinessTriggered: true)
+    }
+
+    @MainActor
+    private func handleCodemapRootStatus(_ update: WorkspaceCodemapRootStatusUpdate) {
+        if let acceptedCodemapRootStatusRevision,
+           update.revision <= acceptedCodemapRootStatusRevision
+        {
+            return
+        }
+        acceptedCodemapRootStatusRevision = update.revision
+        let next = Dictionary(uniqueKeysWithValues: update.roots.map {
+            ($0.rootEpoch.rootID, $0)
+        })
+        guard next != codemapRootStatusesByRootID else { return }
+        codemapRootStatusesByRootID = next
+        codemapRootStatusesChangedSubject.send(())
+        if codemapAutoEnabled, autoCodemapReadinessRetryPending,
+           update.roots.contains(where: { root in
+               visibleRootFolders.contains(where: { $0.id == root.rootEpoch.rootID }) &&
+                   (
+                       root.availability == .ready || root.availability == .updating ||
+                           root.availability == .reconciling
+                   )
+           })
+        {
+            scheduleAutoCodemapSync(readinessTriggered: true)
+        }
     }
 
     func cancelAllLoadingTasks() {
@@ -2591,14 +2754,14 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func restoreExpansionState(from paths: [String]) async {
         #if DEBUG
-            let restoreExpansionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let restoreExpansionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var restoreExpansionOutcome = "completed"
             var restoreExpansionTargetFolders = 0
             var restoreExpansionCollapseCount = 0
             var restoreExpansionExpandCount = 0
             var restoreExpansionDidChange = false
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.restoreExpansion",
                     fields: [
                         "requestedPaths": "\(paths.count)",
@@ -2608,7 +2771,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "expandCount": "\(restoreExpansionExpandCount)",
                         "didChange": "\(restoreExpansionDidChange)",
                         "outcome": restoreExpansionOutcome,
-                        "duration": restoreExpansionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": restoreExpansionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -2875,7 +3038,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         // Use stable string key for root/service mirrors (avoids URL key instability)
         let rootKey = rootKey(forPath: url.path)
         #if DEBUG
-            let loadFolderTotalStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let loadFolderTotalStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let restorePerfRootKind = restorePerfRootKindName(rootKind)
             let restorePerfRootName = url.lastPathComponent
         #endif
@@ -2892,14 +3055,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             workspaceFilesDebugLog("Root shell already loaded: \(url.path)")
             isLoading = false
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "folderLoad.total",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "rootKind": restorePerfRootKind,
                         "rootName": restorePerfRootName,
                         "outcome": "alreadyLoaded",
-                        "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -2924,7 +3087,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let storeLoadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let storeLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
                 let workspaceRootRecord = try await workspaceFileContextStore.loadRoot(
                     path: rootPath,
@@ -2937,16 +3100,16 @@ class WorkspaceFilesViewModel: ObservableObject {
                     cancelUnderlyingLoadOnCallerCancellation: true
                 )
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.storeLoad",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "rootID": WorkspaceRestorePerfLog.shortID(workspaceRootRecord.id),
+                            "rootID": restorePerfRecorder.shortID(workspaceRootRecord.id),
                             "wasPreloadedCandidate": "\(preloadedWorkspaceFileContextRootsByRootKey[rootKey] != nil)",
                             "outcome": "success",
-                            "duration": storeLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": storeLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -2954,7 +3117,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let rootVMInitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let rootVMInitStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
                 let rootShellAttachment: RootShellAttachment
                 do {
@@ -2977,13 +3140,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     appendedRootFolder = rootFolderVM
                 }
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.rootShellAttach",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "duration": rootVMInitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": rootVMInitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                     if let rootLoadDidAttachRootShellHandler {
@@ -3009,14 +3172,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                 folderBeingAdded = nil
                 folderDidFinishLoadingPublisher.send(rootFolderVM)
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": "success",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -3037,14 +3200,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                     folderBeingAdded = nil
                     folderDidFinishLoadingPublisher.send(attachedRootFolder)
                     #if DEBUG
-                        WorkspaceRestorePerfLog.event(
+                        restorePerfRecorder.event(
                             "folderLoad.total",
                             fields: [
-                                "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                                "workspaceID": restorePerfRecorder.shortID(workspace.id),
                                 "rootKind": restorePerfRootKind,
                                 "rootName": restorePerfRootName,
                                 "outcome": "watcherErrorRetained",
-                                "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                                "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                             ]
                         )
                     #endif
@@ -3099,14 +3262,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
 
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": error is CancellationError ? "cancelled" : "error",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -5477,15 +5640,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         }
         return nil
-    }
-
-    /// Provides baseline file content for a given path.
-    /// This is a "back door" method that subclasses can override to provide
-    /// content without needing full FileViewModel infrastructure (e.g., for benchmarks).
-    /// Default implementation returns nil.
-    @MainActor
-    func getBaselineContent(forPath relativePath: String, rootIdentifier: UUID?) async -> String? {
-        nil
     }
 
     private func findFilesByName(_ fileName: String, in folder: FolderViewModel) -> [FileViewModel] {
@@ -8147,12 +8301,18 @@ class WorkspaceFilesViewModel: ObservableObject {
                 return visibleRootFolders.contains(where: { $0.id == root.id })
                     && canonicalRootPaths.contains(root.standardizedFullPath)
             }
-        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            let allowedRootsByID = Dictionary(
-                uniqueKeysWithValues: canonicalRoots.union(physicalRoots).map { ($0.id, $0) }
-            )
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, includesGitData):
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else { return [] }
             return rootFolders.filter { root in
-                allowedRootsByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || (
+                        includesGitData && !canonicalRoots.isEmpty && physicalRoots.isEmpty
+                            && gitDataRootFolders().contains { $0.id == root.id }
+                    )
             }
         }
     }
@@ -9454,7 +9614,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             let currentSlicesAfter = sliceStoreCounts(currentSlicesByRoot)
             let projectionRangeCount = projection.values.reduce(0) { $0 + $1.count }
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.sliceMirror",
                 fields: [
                     "requestedSliceFiles": "\(requestedSlices.count)",
@@ -9466,7 +9626,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                     "projectionAfterFiles": "\(projection.count)",
                     "projectionAfterRanges": "\(projectionRangeCount)",
                     "selectedFiles": "\(selectedFiles.count)",
-                    "currentTabID": WorkspaceRestorePerfLog.shortID(currentTabID)
+                    "currentTabID": restorePerfRecorder.shortID(currentTabID)
                 ]
             )
         #endif
@@ -9485,7 +9645,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func hydrateSlicesForActiveTab(from tabSelection: StoredSelection) async {
         #if DEBUG
-            let hydrateSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let hydrateSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var hydrateSlicesOutcome = "completed"
             var hydrateSlicesRootCount = rootFolders.count
             var hydrateSlicesRequestedFiles = tabSelection.slices.count
@@ -9494,7 +9654,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             var hydrateSlicesPendingPersistRoots = 0
             var hydrateSlicesPendingPersistFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.hydrateSlices",
                     fields: [
                         "rootCount": "\(hydrateSlicesRootCount)",
@@ -9504,7 +9664,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingPersistRoots": "\(hydrateSlicesPendingPersistRoots)",
                         "pendingPersistFiles": "\(hydrateSlicesPendingPersistFiles)",
                         "outcome": hydrateSlicesOutcome,
-                        "duration": hydrateSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": hydrateSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -9648,16 +9808,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         scope: PartitionScope
     ) async {
         #if DEBUG
-            let applySlicesSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySlicesSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.applySlicesSnapshot",
                     fields: [
                         "rootCount": "\(snapshot.count)",
                         "snapshotFiles": "\(snapshot.values.reduce(0) { $0 + $1.count })",
                         "pendingPersistRoots": "\(pendingPersist.count)",
                         "pendingPersistFiles": "\(pendingPersist.values.reduce(0) { $0 + $1.count })",
-                        "duration": applySlicesSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": applySlicesSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -9688,17 +9848,17 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func onActiveTabChangedFast(_ tab: ComposeTabState) {
         #if DEBUG
-            let activeTabFastStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabFastStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         setActiveTabID(tab.id)
         selectionSlicesByFileID.removeAll()
         requestSelectionSliceSnapshotRebuild(reason: "activeTabChanged.fast")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.activeTabChanged.fast",
                 fields: [
-                    "tabID": WorkspaceRestorePerfLog.shortID(tab.id),
-                    "duration": activeTabFastStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "tabID": restorePerfRecorder.shortID(tab.id),
+                    "duration": activeTabFastStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -9710,17 +9870,17 @@ class WorkspaceFilesViewModel: ObservableObject {
         selection: StoredSelection
     ) async {
         #if DEBUG
-            let activeTabHeavyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabHeavyStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var activeTabHeavyOutcome = "completed"
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.activeTabChanged.heavy",
                     fields: [
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
+                        "tabID": restorePerfRecorder.shortID(tabID),
                         "selectedPaths": "\(selection.selectedPaths.count)",
                         "sliceFiles": "\(selection.slices.count)",
                         "outcome": activeTabHeavyOutcome,
-                        "duration": activeTabHeavyStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": activeTabHeavyStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -10195,7 +10355,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             sliceSnapshotRebuildPending = true
             #if DEBUG
                 sliceSnapshotRebuildPendingReasons.insert(reason)
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": "deferredRequest",
@@ -10240,10 +10400,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         pendingReasons: Set<String>
     ) {
         #if DEBUG
-            let rebuildStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rebuildStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var snapshotFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": mode,
@@ -10251,7 +10411,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingReasons": pendingReasons.sorted().joined(separator: ","),
                         "selectedFiles": "\(selectedFiles.count)",
                         "snapshotFiles": "\(snapshotFiles)",
-                        "duration": rebuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": rebuildStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -10375,6 +10535,15 @@ extension WorkspaceFilesViewModel {
     struct SearchScopeParseResult {
         let spec: SearchPathFilterSpec
         let issues: [PathResolutionIssue]
+    }
+
+    /// Lexical load identity for configured workspace roots; not filesystem or symlink identity.
+    func workspaceRootIdentity(for input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\0"),
+              !trimmed.lowercased().hasPrefix("file://") else { return nil }
+        let normalized = normalizeUserInputPath(input)
+        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
     }
 
     func canonicalURL(for path: String, assumingDirectory: Bool = false) -> URL {
@@ -10810,6 +10979,7 @@ extension WorkspaceFilesViewModel {
         // In manual mode, keep codemap files even if selection becomes empty.
         if newFiles.isEmpty {
             if codemapAutoEnabled {
+                invalidateAutomaticCodemapSelection()
                 resetAutoCodemapFiles([])
             }
             // Do not flip codemapAutoEnabled here; explicit flows (clearSelection, tools) decide that.
@@ -10991,17 +11161,43 @@ extension WorkspaceFilesViewModel {
         }
 
         @MainActor
-        func handleAutomaticCodemapReadinessForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch
-        ) {
-            handleCodemapSelectionGraphReadiness(
-                WorkspaceCodemapSelectionGraphReadinessEvent(rootEpoch: rootEpoch)
-            )
+        func waitForAutoCodemapSyncForTesting() async {
+            await autoCodemapSyncTask?.value
         }
 
         @MainActor
-        func waitForAutoCodemapSyncForTesting() async {
-            await autoCodemapSyncTask?.value
+        func handleCodemapMarkerReadinessForTesting(
+            _ event: WorkspaceCodemapMarkerReadinessEvent
+        ) {
+            handleCodemapMarkerReadiness(event)
+        }
+
+        @MainActor
+        var automaticCodemapReadinessRetryTaskActiveForTesting: Bool {
+            autoCodemapReadinessRetryTask != nil
+        }
+
+        @MainActor
+        var automaticCodemapSelectionGenerationForTesting: UInt64 {
+            autoCodemapSelectionGeneration
+        }
+
+        @MainActor
+        func armAutomaticCodemapReadinessRetryForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            fileID: UUID
+        ) {
+            invalidateAutomaticCodemapSelection()
+            autoCodemapReadinessRetryAvailable = true
+            armAutomaticCodemapReadinessRetry(
+                pendingMarkers: [AutomaticCodemapPendingMarker(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    requestGeneration: 1
+                )],
+                generation: autoCodemapSelectionGeneration,
+                sourceIDs: visibleSelectedFileIDs()
+            )
         }
 
         @MainActor
@@ -11057,17 +11253,24 @@ extension WorkspaceFilesViewModel {
     func flushAutoCodemapSyncNowIfNeeded() async {
         autoCodemapSyncTask?.cancel()
         autoCodemapSyncTask = nil
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
         guard codemapAutoEnabled else { return }
 
         autoCodemapSelectionGeneration &+= 1
         autoCodemapReadinessRetryAvailable = true
         autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
         let generation = autoCodemapSelectionGeneration
         let sourceIDs = visibleSelectedFileIDs()
         if !autoCodemapFiles.isEmpty {
             resetAutoCodemapFiles([])
         }
-        await resolveAutomaticCodemaps(generation: generation, sourceIDs: sourceIDs)
+        await resolveAutomaticCodemaps(
+            generation: generation,
+            sourceIDs: sourceIDs,
+            requestPolicy: automaticCodemapSelectionRequestPolicy
+        )
     }
 
     @MainActor
@@ -11093,15 +11296,19 @@ extension WorkspaceFilesViewModel {
     @MainActor
     private func scheduleAutoCodemapSync(readinessTriggered: Bool = false) {
         guard codemapAutoEnabled else { return }
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
         if readinessTriggered {
             guard autoCodemapReadinessRetryAvailable,
                   autoCodemapReadinessRetryPending
             else { return }
             autoCodemapReadinessRetryAvailable = false
             autoCodemapReadinessRetryPending = false
+            autoCodemapPendingMarkers.removeAll()
         } else {
             autoCodemapReadinessRetryAvailable = true
             autoCodemapReadinessRetryPending = false
+            autoCodemapPendingMarkers.removeAll()
         }
         autoCodemapSyncTask?.cancel()
         autoCodemapSelectionGeneration &+= 1
@@ -11110,6 +11317,9 @@ extension WorkspaceFilesViewModel {
         if !autoCodemapFiles.isEmpty {
             resetAutoCodemapFiles([])
         }
+        let requestPolicy = readinessTriggered
+            ? automaticCodemapReadinessRetryPolicy
+            : automaticCodemapSelectionRequestPolicy
         autoCodemapSyncTask = Task(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard let self else { return }
@@ -11119,7 +11329,11 @@ extension WorkspaceFilesViewModel {
                 }
             }
             guard !Task.isCancelled else { return }
-            await resolveAutomaticCodemaps(generation: generation, sourceIDs: sourceIDs)
+            await resolveAutomaticCodemaps(
+                generation: generation,
+                sourceIDs: sourceIDs,
+                requestPolicy: requestPolicy
+            )
         }
     }
 
@@ -11142,10 +11356,22 @@ extension WorkspaceFilesViewModel {
             visibleSelectedFileIDs() == sourceIDs
     }
 
+    static func automaticCodemapResultNeedsReadinessRetry(
+        _ result: WorkspaceCodemapAutomaticSelectionResult
+    ) -> Bool {
+        result.status == .partial && result.roots.contains { root in
+            root.issues.contains { issue in
+                if case .targetDemandPending = issue { return true }
+                return false
+            }
+        }
+    }
+
     @MainActor
     private func resolveAutomaticCodemaps(
         generation: UInt64,
-        sourceIDs: [UUID]
+        sourceIDs: [UUID],
+        requestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     ) async {
         guard automaticCodemapSelectionIsCurrent(
             generation: generation,
@@ -11160,7 +11386,7 @@ extension WorkspaceFilesViewModel {
         do {
             result = try await WorkspaceSelectionMutationService(
                 store: workspaceFileContextStore,
-                automaticSelectionPolicy: automaticCodemapSelectionRequestPolicy,
+                automaticSelectionPolicy: requestPolicy,
                 automaticSelectionWaiter: automaticCodemapSelectionWaiter
             ).resolveAutomaticCodemapSelection(
                 sourceFileIDs: sourceIDs,
@@ -11179,58 +11405,163 @@ extension WorkspaceFilesViewModel {
             generation: generation,
             sourceIDs: sourceIDs
         ) else { return }
-        switch result.aggregateCoverage {
-        case .complete, .partial, .provisional:
+        switch result.status {
+        case .ok, .partial:
             break
-        case .incomplete, .pending, .busy:
+        case .pending:
             resetAutoCodemapFiles([])
             if autoCodemapReadinessRetryAvailable {
-                autoCodemapReadinessRetryPending = true
+                await armAutomaticCodemapReadinessRetry(
+                    result: result,
+                    generation: generation,
+                    sourceIDs: sourceIDs
+                )
             }
             return
-        case .unavailable, .stale, .budget:
+        case .unavailable:
             resetAutoCodemapFiles([])
             return
         }
-        guard let receipt = result.publicationReceipt else {
+        guard let receipt = result.receipt else {
             resetAutoCodemapFiles([])
             return
         }
-        let publication = await workspaceFileContextStore
-            .revalidateAutomaticCodemapSelectionForPublication(
-                receipt,
-                rootScope: .visibleWorkspace
-            )
+        let receiptTargets = receipt.roots.flatMap(\.targets)
+        guard let materializedFilesByID = await materializeAutomaticCodemapTargets(receiptTargets),
+              automaticCodemapSelectionIsCurrent(
+                  generation: generation,
+                  sourceIDs: sourceIDs
+              )
+        else { return }
+        let revalidation = await workspaceFileContextStore.revalidateAutomaticCodemapSelection(
+            receipt,
+            rootScope: .visibleWorkspace
+        )
 
         guard automaticCodemapSelectionIsCurrent(
             generation: generation,
             sourceIDs: sourceIDs
         ) else { return }
-        guard case let .current(targets) = publication else {
-            rejectAutomaticCodemapPublicationForRetry()
-            return
-        }
         guard let resolvedTargets = reconstructAutomaticCodemapTargets(
-            receiptTargets: receipt.targets,
-            revalidatedTargets: targets,
+            receiptTargets: receiptTargets,
+            revalidatedTargets: revalidation.validTargets,
             sourceIDs: sourceIDs,
-            filesByID: fileHierarchyIndex.filesByID
+            filesByID: materializedFilesByID
         ) else {
             rejectAutomaticCodemapPublicationForRetry()
             return
         }
-        guard receipt.publicationPermit.withCurrent({
-            autoCodemapReadinessRetryAvailable = true
-            autoCodemapReadinessRetryPending = false
-            resetAutoCodemapFiles(resolvedTargets)
-            return true
-        }) == true else {
-            resetAutoCodemapFiles([])
-            if autoCodemapReadinessRetryAvailable {
-                autoCodemapReadinessRetryPending = true
-            }
-            return
+        autoCodemapReadinessRetryAvailable = true
+        autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
+        resetAutoCodemapFiles(resolvedTargets)
+        if Self.automaticCodemapResultNeedsReadinessRetry(result) {
+            await armAutomaticCodemapReadinessRetry(
+                result: result,
+                generation: generation,
+                sourceIDs: sourceIDs
+            )
         }
+    }
+
+    @MainActor
+    private func armAutomaticCodemapReadinessRetry(
+        result: WorkspaceCodemapAutomaticSelectionResult,
+        generation: UInt64,
+        sourceIDs: [UUID]
+    ) async {
+        let pendingSlots = Set(result.roots.flatMap { root in
+            root.issues.compactMap { issue -> WorkspaceCodemapRootScopedFileSlot? in
+                guard case let .targetDemandPending(rootEpoch, fileID) = issue else { return nil }
+                return WorkspaceCodemapRootScopedFileSlot(rootEpoch: rootEpoch, fileID: fileID)
+            }
+        })
+        let identities = await workspaceFileContextStore.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: pendingSlots.map(\.fileID),
+            rootScope: .visibleWorkspace
+        )
+        guard automaticCodemapSelectionIsCurrent(
+            generation: generation,
+            sourceIDs: sourceIDs
+        ) else { return }
+        let pendingMarkers = Set(identities.compactMap { identity -> AutomaticCodemapPendingMarker? in
+            let slot = WorkspaceCodemapRootScopedFileSlot(
+                rootEpoch: identity.rootEpoch,
+                fileID: identity.fileID
+            )
+            guard pendingSlots.contains(slot) else { return nil }
+            return AutomaticCodemapPendingMarker(
+                rootEpoch: identity.rootEpoch,
+                fileID: identity.fileID,
+                requestGeneration: identity.requestGeneration
+            )
+        })
+        armAutomaticCodemapReadinessRetry(
+            pendingMarkers: pendingMarkers,
+            generation: generation,
+            sourceIDs: sourceIDs
+        )
+    }
+
+    @MainActor
+    private func armAutomaticCodemapReadinessRetry(
+        pendingMarkers: Set<AutomaticCodemapPendingMarker>,
+        generation: UInt64,
+        sourceIDs: [UUID]
+    ) {
+        autoCodemapReadinessRetryPending = true
+        autoCodemapPendingMarkers = pendingMarkers
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: automaticCodemapReadinessRetryDelay)
+            } catch {
+                return
+            }
+            guard automaticCodemapSelectionIsCurrent(
+                generation: generation,
+                sourceIDs: sourceIDs
+            ) else { return }
+            autoCodemapReadinessRetryTask = nil
+            scheduleAutoCodemapSync(readinessTriggered: true)
+        }
+    }
+
+    @MainActor
+    private func invalidateAutomaticCodemapSelection() {
+        autoCodemapSyncTask?.cancel()
+        autoCodemapSyncTask = nil
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
+        autoCodemapSelectionGeneration &+= 1
+        autoCodemapReadinessRetryAvailable = false
+        autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
+    }
+
+    @MainActor
+    private func materializeAutomaticCodemapTargets(
+        _ targets: [WorkspaceCodemapAutomaticSelectionTarget]
+    ) async -> [UUID: FileViewModel]? {
+        var filesByID = fileHierarchyIndex.filesByID
+        for target in targets {
+            if let existing = filesByID[target.fileID] {
+                guard existing.rootIdentifier == target.rootEpoch.rootID else { return nil }
+                continue
+            }
+            guard let root = visibleRootFolders.first(where: { $0.id == target.rootEpoch.rootID }),
+                  let file = await materializeFileForUserInput(
+                      URL(fileURLWithPath: root.standardizedFullPath)
+                          .appendingPathComponent(target.logicalPath.standardizedRelativePath)
+                          .path
+                  ),
+                  file.id == target.fileID,
+                  file.rootIdentifier == target.rootEpoch.rootID
+            else { return nil }
+            filesByID[file.id] = file
+        }
+        return filesByID
     }
 
     @MainActor
@@ -11262,6 +11593,7 @@ extension WorkspaceFilesViewModel {
         resetAutoCodemapFiles([])
         autoCodemapReadinessRetryAvailable = true
         autoCodemapReadinessRetryPending = true
+        autoCodemapPendingMarkers.removeAll()
     }
 
     /// UI/test compatibility snapshot of the current checkbox/slice/codemap mirror.
@@ -11357,19 +11689,19 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func applyStoredSelection(_ stored: StoredSelection) async {
         #if DEBUG
-            let applyStoredSelectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applyStoredSelectionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var applySelectionSnapshotDuration = "notMeasured"
         #endif
         autoCodemapSyncTask?.cancel()
         codemapAutoEnabled = false
 
         #if DEBUG
-            let applySelectionSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySelectionSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         await applySelectionSnapshot(paths: stored.selectedPaths, allowEmpty: true)
         #if DEBUG
-            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-            WorkspaceRestorePerfLog.event(
+            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.selectionSnapshot",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
@@ -11410,14 +11742,14 @@ extension WorkspaceFilesViewModel {
             scheduleAutoCodemapSync()
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
                     "sliceFiles": "\(stored.slices.count)",
                     "codemapAutoEnabled": "\(stored.codemapAutoEnabled)",
                     "selectionSnapshotDuration": applySelectionSnapshotDuration,
-                    "duration": applyStoredSelectionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": applyStoredSelectionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -11739,15 +12071,14 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func openFileForMarkdownLink(_ target: MarkdownFileLinkTarget) async -> Bool {
         if let file = await resolveFileForMarkdownLink(target) {
-            file.openInDefaultApp()
-            return true
+            return await file.openInDefaultApp(using: defaultApplicationOpener)
         }
 
         let standardizedPath = (target.normalizedPath as NSString).standardizingPath
         guard standardizedPath.hasPrefix("/") else { return false }
 
         let fileURL = URL(fileURLWithPath: standardizedPath)
-        return NSWorkspace.shared.open(fileURL)
+        return await defaultApplicationOpener.open(fileURL)
     }
 
     @MainActor
@@ -12040,30 +12371,6 @@ extension WorkspaceFilesViewModel {
                     }
                 }
             }
-        }
-    }
-}
-
-enum FileManagerError: Error, LocalizedError {
-    case failedToLoadFolder(Error)
-    case failedToLoadFile(Error)
-    case fileSystemServiceNotFound
-    case failedToLoadContent
-    // New: richer, contextual variant used by MCP tools and FS ops
-    case fileSystemServiceNotFoundWithContext(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .failedToLoadFolder(err):
-            "Failed to load folder: \(err.localizedDescription)"
-        case let .failedToLoadFile(err):
-            "Failed to load file: \(err.localizedDescription)"
-        case .fileSystemServiceNotFound:
-            "No matching workspace folder for the requested path."
-        case .failedToLoadContent:
-            "Failed to load content."
-        case let .fileSystemServiceNotFoundWithContext(context):
-            context
         }
     }
 }
@@ -12896,6 +13203,27 @@ extension WorkspaceFilesViewModel {
             )
         }
         return nil
+    }
+
+    func bindGlobalCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        globalCodeMapsSettingCancellable = settings.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak self] disabled in
+                guard let self else { return }
+                globalCodeMapsSettingRevision += 1
+                let revision = globalCodeMapsSettingRevision
+                let store = workspaceFileContextStore
+                Task { await store.setCodeMapsGloballyDisabled(disabled, settingsRevision: revision) }
+            }
+    }
+
+    func bindNonGitCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        nonGitCodeMapsSettingCancellable = settings.$nonGitCodeMapsEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                Task { await self.workspaceFileContextStore.setNonGitCodeMapsEnabled(enabled) }
+            }
     }
 
     private func subscribeToFileSystemPreferenceChanges() {

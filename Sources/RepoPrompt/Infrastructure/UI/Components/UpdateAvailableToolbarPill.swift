@@ -3,7 +3,7 @@ import SwiftUI
 
 private enum UpdateAvailableToolbarSnapshot: Equatable {
     case hidden
-    case available(displayVersion: String?, canCheckForUpdates: Bool)
+    case available(notice: AvailableUpdateNotice, canPerformAction: Bool, manualDownload: Bool)
 }
 
 @MainActor
@@ -14,17 +14,17 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
 
     init(sparkleManager: SparkleUpdaterManager) {
         snapshot = Self.makeSnapshot(
-            updateAvailable: sparkleManager.updateAvailable,
-            updateVersion: sparkleManager.updateVersion,
-            canCheckForUpdates: sparkleManager.canCheckForUpdates
+            availableUpdate: sparkleManager.availableUpdate,
+            canCheckForUpdates: sparkleManager.canCheckForUpdates,
+            installationBlockedMessage: sparkleManager.updateInstallationBlockedMessage
         )
 
         Publishers.CombineLatest3(
-            sparkleManager.$updateAvailable.removeDuplicates(),
-            sparkleManager.$updateVersion.removeDuplicates(),
-            sparkleManager.$canCheckForUpdates.removeDuplicates()
+            sparkleManager.$availableUpdate.removeDuplicates(),
+            sparkleManager.$canCheckForUpdates.removeDuplicates(),
+            sparkleManager.$updateInstallationBlockedMessage.removeDuplicates()
         )
-        .map(Self.makeSnapshot(updateAvailable:updateVersion:canCheckForUpdates:))
+        .map(Self.makeSnapshot(availableUpdate:canCheckForUpdates:installationBlockedMessage:))
         .removeDuplicates()
         .receive(on: RunLoop.main)
         .sink { [weak self] snapshot in
@@ -35,21 +35,20 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
     }
 
     private nonisolated static func makeSnapshot(
-        updateAvailable: Bool,
-        updateVersion: String?,
-        canCheckForUpdates: Bool
+        availableUpdate: AvailableUpdateNotice?,
+        canCheckForUpdates: Bool,
+        installationBlockedMessage: String?
     ) -> UpdateAvailableToolbarSnapshot {
-        guard updateAvailable else { return .hidden }
+        guard let availableUpdate else { return .hidden }
+        let manualDownload = installationBlockedMessage != nil
+        let canPerformAction = manualDownload
+            ? SparkleUpdaterManager.updateChannel(forAppcastItemURL: availableUpdate.downloadURL) == availableUpdate.channel
+            : canCheckForUpdates
         return .available(
-            displayVersion: normalizedDisplayVersion(updateVersion),
-            canCheckForUpdates: canCheckForUpdates
+            notice: availableUpdate,
+            canPerformAction: canPerformAction,
+            manualDownload: manualDownload
         )
-    }
-
-    private nonisolated static func normalizedDisplayVersion(_ version: String?) -> String? {
-        guard let version = version?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !version.isEmpty else { return nil }
-        return version.lowercased().hasPrefix("v") ? version : "v\(version)"
     }
 }
 
@@ -68,14 +67,14 @@ struct UpdateAvailableToolbarPill: View {
         switch observer.snapshot {
         case .hidden:
             EmptyView()
-        case let .available(displayVersion, canCheckForUpdates):
+        case let .available(notice, canPerformAction, manualDownload):
             Button {
-                sparkleManager.installUpdate()
+                sparkleManager.performAvailableUpdateAction()
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.down.circle.fill")
                         .imageScale(.small)
-                    Text(labelText(displayVersion: displayVersion))
+                    Text(notice.toolbarLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                 }
@@ -90,41 +89,19 @@ struct UpdateAvailableToolbarPill: View {
             }
             .buttonStyle(.plain)
             .padding(.trailing, 8)
-            .disabled(!canCheckForUpdates)
-            .hoverTooltip(helpText(displayVersion: displayVersion, canCheckForUpdates: canCheckForUpdates), .bottom)
-            .accessibilityLabel(accessibilityLabel(displayVersion: displayVersion))
-            .accessibilityHint(accessibilityHint(canCheckForUpdates: canCheckForUpdates))
+            .disabled(!canPerformAction)
+            .hoverTooltip(
+                canPerformAction
+                    ? manualDownload ? "Open the trusted-channel update download in your browser" : notice.availableTooltip
+                    : notice.notReadyTooltip,
+                .bottom
+            )
+            .accessibilityLabel(notice.accessibilityLabel)
+            .accessibilityHint(
+                canPerformAction
+                    ? manualDownload ? "Opens the trusted-channel update download in your browser." : notice.accessibilityHint
+                    : "The update action is not available yet."
+            )
         }
-    }
-
-    private func labelText(displayVersion: String?) -> String {
-        guard let displayVersion else { return "Update" }
-        return "Update \(displayVersion)"
-    }
-
-    private func helpText(displayVersion: String?, canCheckForUpdates: Bool) -> String {
-        if !canCheckForUpdates {
-            guard let displayVersion else {
-                return "Update available, but Sparkle is not ready to check for updates yet"
-            }
-            return "Update available: \(displayVersion), but Sparkle is not ready to check for updates yet"
-        }
-
-        guard let displayVersion else {
-            return "Update available — click for release notes"
-        }
-        return "Update available: \(displayVersion) — click for release notes"
-    }
-
-    private func accessibilityLabel(displayVersion: String?) -> String {
-        guard let displayVersion else { return "Update available" }
-        return "Update available, version \(displayVersion)"
-    }
-
-    private func accessibilityHint(canCheckForUpdates: Bool) -> String {
-        if canCheckForUpdates {
-            return "Opens Sparkle's release notes and install dialog."
-        }
-        return "Sparkle is not ready to check for updates yet."
     }
 }

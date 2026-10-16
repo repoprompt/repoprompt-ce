@@ -1,0 +1,584 @@
+import Foundation
+import RepoPromptProcess
+
+/// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
+///
+/// Production defaults to the verified bundled package for the running architecture. Advanced
+/// users may explicitly select an absolute executable in Settings; ordinary environment and PATH
+/// lookup are intentionally not runtime authorities.
+enum CodexRuntimeAuthority {
+    static let bundledVersion = Version(major: 0, minor: 159, patch: 0)
+    static let minimumExternalVersion = Version(major: 0, minor: 149, patch: 0)
+    static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
+
+    /// The persisted preference captured for this application process. Settings writes remain
+    /// pending until the next process launch; runtime consumers never reread UserDefaults after
+    /// this snapshot has been initialized.
+    struct LaunchSnapshot: Equatable {
+        let selection: CodexRuntimePreferences.Selection
+
+        init(selection: CodexRuntimePreferences.Selection) {
+            self.selection = selection
+        }
+    }
+
+    private static let launchSnapshotLock = NSLock()
+    private static var storedLaunchSnapshot: LaunchSnapshot?
+
+    /// Builds a deterministic launch snapshot without touching process-global state. Tests inject
+    /// these values into runtime consumers instead of resetting the process snapshot.
+    static func makeLaunchSnapshot(defaults: UserDefaults = .standard) -> LaunchSnapshot {
+        LaunchSnapshot(selection: CodexRuntimePreferences.selection(defaults: defaults))
+    }
+
+    /// Captures the persisted runtime choice once, before the app creates settings or provider
+    /// clients. Repeated calls are intentionally no-ops so a settings write cannot retarget this
+    /// process; the next app launch captures the new persisted value.
+    @discardableResult
+    static func initializeLaunchSnapshot(defaults: UserDefaults = .standard) -> LaunchSnapshot {
+        let candidate = makeLaunchSnapshot(defaults: defaults)
+        launchSnapshotLock.lock()
+        if let storedLaunchSnapshot {
+            launchSnapshotLock.unlock()
+            return storedLaunchSnapshot
+        }
+        storedLaunchSnapshot = candidate
+        launchSnapshotLock.unlock()
+        return candidate
+    }
+
+    /// Returns the immutable process launch choice. Production initializes this explicitly from
+    /// `RepoPromptApplication.main`; the fallback keeps non-app callers safe without exposing a
+    /// reset API.
+    static func currentLaunchSnapshot() -> LaunchSnapshot {
+        launchSnapshotLock.lock()
+        if let storedLaunchSnapshot {
+            launchSnapshotLock.unlock()
+            return storedLaunchSnapshot
+        }
+        let snapshot = makeLaunchSnapshot()
+        storedLaunchSnapshot = snapshot
+        launchSnapshotLock.unlock()
+        return snapshot
+    }
+
+    enum Source: Equatable {
+        case bundled(target: String)
+        case externalOverride
+    }
+
+    struct StatePaths: Equatable {
+        let codexHome: URL
+        let sqliteHome: URL
+
+        var environment: [String: String] {
+            [
+                "CODEX_HOME": codexHome.path,
+                "CODEX_SQLITE_HOME": sqliteHome.path
+            ]
+        }
+    }
+
+    struct Runtime: Equatable {
+        let executableURL: URL
+        let version: Version
+        let source: Source
+        let statePaths: StatePaths
+
+        func prepareState(
+            fileManager: FileManager = .default,
+            ordinaryCodexHomeURL: URL? = nil
+        ) throws {
+            try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            let ordinaryCodexHome = ordinaryCodexHomeURL
+                ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+            try CodexGlobalInstructionsProjection.prepare(
+                ordinaryCodexHome: ordinaryCodexHome,
+                managedCodexHome: statePaths.codexHome,
+                fileManager: fileManager
+            )
+        }
+
+        var redactedDiagnosticSummary: String {
+            let provenance = switch source {
+            case let .bundled(target):
+                "bundled:\(target)"
+            case .externalOverride:
+                "external-override:\(executableURL.lastPathComponent)"
+            }
+            return "Codex runtime authority: provenance=\(provenance), version=\(version), state=\(CodexRuntimeAuthority.redactedStateDescription(statePaths))"
+        }
+    }
+
+    enum Failure: Error, Equatable, LocalizedError {
+        case unsupportedArchitecture(String)
+        case bundledResourcesUnavailable
+        case bundledPackageMissing(target: String)
+        case bundledMetadataUnreadable(target: String)
+        case bundledMetadataMismatch(expectedTarget: String, actualTarget: String?, actualVersion: String?)
+        case bundledLayoutIncomplete(target: String, missingComponent: String)
+        case externalPreferenceMalformed
+        case externalOverrideMustBeAbsolute
+        case externalOverrideMissing(String)
+        case externalOverrideNotExecutable(String)
+        case externalOverrideVersionUnreadable(String)
+        case externalOverrideTooOld(actual: Version, minimum: Version)
+
+        var errorDescription: String? {
+            switch self {
+            case let .unsupportedArchitecture(architecture):
+                "RepoPrompt could not start Codex: architecture `\(architecture)` is unsupported. Supported macOS architectures are arm64 and x86_64."
+            case .bundledResourcesUnavailable:
+                "RepoPrompt could not start Codex: the app's bundled runtime resources are unavailable. Reinstall RepoPrompt CE."
+            case let .bundledPackageMissing(target):
+                "RepoPrompt could not start Codex: the bundled \(target) package is missing. Reinstall RepoPrompt CE; RepoPrompt will not fall back to PATH."
+            case let .bundledMetadataUnreadable(target):
+                "RepoPrompt could not start Codex: the bundled \(target) package metadata is missing or corrupt. Reinstall RepoPrompt CE; RepoPrompt will not fall back to PATH."
+            case let .bundledMetadataMismatch(expectedTarget, actualTarget, actualVersion):
+                "RepoPrompt could not start Codex: bundled package identity mismatch (expected target \(expectedTarget), version \(bundledVersion); found target \(actualTarget ?? "unknown"), version \(actualVersion ?? "unknown")). Reinstall RepoPrompt CE."
+            case let .bundledLayoutIncomplete(target, component):
+                "RepoPrompt could not start Codex: the bundled \(target) package is incomplete at `\(component)`. Reinstall RepoPrompt CE."
+            case .externalPreferenceMalformed:
+                "RepoPrompt could not start Codex: the saved custom executable preference has no usable path. Choose another executable in Settings or restore the included runtime."
+            case .externalOverrideMustBeAbsolute:
+                "RepoPrompt could not start Codex: the local executable configured in Settings must use an absolute path. PATH lookup is not used."
+            case let .externalOverrideMissing(path):
+                "RepoPrompt could not start Codex: the configured local executable does not exist at `\(path)`. Choose another in Settings or restore the included runtime."
+            case let .externalOverrideNotExecutable(path):
+                "RepoPrompt could not start Codex: the configured local executable is not executable at `\(path)`. Choose another in Settings or restore the included runtime."
+            case let .externalOverrideVersionUnreadable(path):
+                "RepoPrompt could not start Codex: the local executable at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's external-runtime compatibility contract."
+            case let .externalOverrideTooOld(actual, minimum):
+                "RepoPrompt could not start Codex: local version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's external-runtime compatibility contract; update the configured executable or remove it to use bundled Codex \(bundledVersion)."
+            }
+        }
+    }
+
+    struct Version: Comparable, CustomStringConvertible, Equatable {
+        let major: Int
+        let minor: Int
+        let patch: Int
+        let prerelease: String?
+
+        init(major: Int, minor: Int, patch: Int, prerelease: String? = nil) {
+            self.major = major
+            self.minor = minor
+            self.patch = patch
+            self.prerelease = prerelease
+        }
+
+        var description: String {
+            let core = "\(major).\(minor).\(patch)"
+            return prerelease.map { "\(core)-\($0)" } ?? core
+        }
+
+        static func < (lhs: Version, rhs: Version) -> Bool {
+            let lhsCore = (lhs.major, lhs.minor, lhs.patch)
+            let rhsCore = (rhs.major, rhs.minor, rhs.patch)
+            if lhsCore != rhsCore {
+                return lhsCore < rhsCore
+            }
+
+            switch (lhs.prerelease, rhs.prerelease) {
+            case (nil, nil):
+                return false
+            case (nil, .some):
+                return false
+            case (.some, nil):
+                return true
+            case let (.some(lhsPrerelease), .some(rhsPrerelease)):
+                return comparePrerelease(lhsPrerelease, rhsPrerelease)
+            }
+        }
+
+        static func parse(_ text: String) -> Version? {
+            let pattern = #"(?<![0-9A-Za-z.+-])([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![0-9A-Za-z.+-])"#
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  match.numberOfRanges == 5,
+                  let majorRange = Range(match.range(at: 1), in: text),
+                  let minorRange = Range(match.range(at: 2), in: text),
+                  let patchRange = Range(match.range(at: 3), in: text),
+                  let major = Int(text[majorRange]),
+                  let minor = Int(text[minorRange]),
+                  let patch = Int(text[patchRange])
+            else {
+                return nil
+            }
+            let prerelease = Range(match.range(at: 4), in: text).map { String(text[$0]) }
+            if let prerelease {
+                let hasInvalidNumericIdentifier = prerelease.split(separator: ".").contains { identifier in
+                    identifier.count > 1 && identifier.first == "0" && identifier.allSatisfy(\.isNumber)
+                }
+                guard !hasInvalidNumericIdentifier else { return nil }
+            }
+            return Version(major: major, minor: minor, patch: patch, prerelease: prerelease)
+        }
+
+        private static func comparePrerelease(_ lhs: String, _ rhs: String) -> Bool {
+            let lhsIdentifiers = lhs.split(separator: ".", omittingEmptySubsequences: false)
+            let rhsIdentifiers = rhs.split(separator: ".", omittingEmptySubsequences: false)
+            for (lhsIdentifier, rhsIdentifier) in zip(lhsIdentifiers, rhsIdentifiers) {
+                guard lhsIdentifier != rhsIdentifier else { continue }
+                switch (Int(lhsIdentifier), Int(rhsIdentifier)) {
+                case let (.some(lhsNumber), .some(rhsNumber)):
+                    return lhsNumber < rhsNumber
+                case (.some, nil):
+                    return true
+                case (nil, .some):
+                    return false
+                case (nil, nil):
+                    return lhsIdentifier < rhsIdentifier
+                }
+            }
+            return lhsIdentifiers.count < rhsIdentifiers.count
+        }
+    }
+
+    private struct PackageMetadata: Decodable {
+        let layoutVersion: Int
+        let version: String
+        let target: String
+        let variant: String
+        let entrypoint: String
+        let resourcesDir: String
+        let pathDir: String
+    }
+
+    private struct ExternalVersionCacheKey: Hashable {
+        let path: String
+        let modificationDate: Date?
+        let fileSize: UInt64?
+        let environmentFingerprint: Int
+    }
+
+    private struct ExternalVersionCacheEntry {
+        let version: Version?
+        let failureExpiresAt: Date?
+    }
+
+    private static let externalVersionFailureCacheDuration: TimeInterval = 5
+    private static let externalVersionCacheLock = NSLock()
+    private static var externalVersionCache: [ExternalVersionCacheKey: ExternalVersionCacheEntry] = [:]
+
+    static var currentArchitectureTarget: String? {
+        #if arch(arm64)
+            "aarch64-apple-darwin"
+        #elseif arch(x86_64)
+            "x86_64-apple-darwin"
+        #else
+            nil
+        #endif
+    }
+
+    static func statePaths(applicationSupportURL: URL? = nil) -> StatePaths {
+        let support = applicationSupportURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        #if DEBUG
+            let buildChannel = "Debug"
+        #else
+            let buildChannel = "Release"
+        #endif
+        let root = support
+            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent("Codex", isDirectory: true)
+            .appendingPathComponent(buildChannel, isDirectory: true)
+        return StatePaths(
+            codexHome: root.appendingPathComponent("home", isDirectory: true),
+            sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true)
+        )
+    }
+
+    static func resolve(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resourcesURL: URL? = Bundle.main.resourceURL,
+        architectureTarget: String? = currentArchitectureTarget,
+        applicationSupportURL: URL? = nil,
+        explicitExecutableOverride: String? = nil,
+        externalVersionReader: ((URL) -> String?)? = nil
+    ) -> Result<Runtime, Failure> {
+        let state = statePaths(applicationSupportURL: applicationSupportURL)
+        let configuredOverride = explicitExecutableOverride
+        if let configuredOverride = configuredOverride?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configuredOverride.isEmpty
+        {
+            return resolveExternalOverride(
+                configuredOverride,
+                statePaths: state,
+                environment: environment,
+                versionReader: externalVersionReader
+            )
+        }
+
+        guard let architectureTarget else {
+            return .failure(.unsupportedArchitecture("unknown"))
+        }
+        guard architectureTarget == "aarch64-apple-darwin" || architectureTarget == "x86_64-apple-darwin" else {
+            return .failure(.unsupportedArchitecture(architectureTarget))
+        }
+        guard let resourcesURL else {
+            return .failure(.bundledResourcesUnavailable)
+        }
+
+        let packageRoot = resourcesURL
+            .appendingPathComponent("BundledRuntimes", isDirectory: true)
+            .appendingPathComponent("Codex", isDirectory: true)
+            .appendingPathComponent(architectureTarget, isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: packageRoot.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return .failure(.bundledPackageMissing(target: architectureTarget))
+        }
+
+        let metadataURL = packageRoot.appendingPathComponent("codex-package.json")
+        guard let data = try? Data(contentsOf: metadataURL),
+              let metadata = try? JSONDecoder().decode(PackageMetadata.self, from: data)
+        else {
+            return .failure(.bundledMetadataUnreadable(target: architectureTarget))
+        }
+        guard metadata.layoutVersion == 1,
+              metadata.version == bundledVersion.description,
+              metadata.target == architectureTarget,
+              metadata.variant == "codex",
+              metadata.entrypoint == "bin/codex",
+              metadata.resourcesDir == "codex-resources",
+              metadata.pathDir == "codex-path"
+        else {
+            return .failure(
+                .bundledMetadataMismatch(
+                    expectedTarget: architectureTarget,
+                    actualTarget: metadata.target,
+                    actualVersion: metadata.version
+                )
+            )
+        }
+
+        let requiredDirectories = [metadata.resourcesDir, metadata.pathDir]
+        for relative in requiredDirectories {
+            let url = packageRoot.appendingPathComponent(relative, isDirectory: true)
+            var componentIsDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &componentIsDirectory), componentIsDirectory.boolValue else {
+                return .failure(.bundledLayoutIncomplete(target: architectureTarget, missingComponent: relative))
+            }
+        }
+        let executableURL = packageRoot.appendingPathComponent(metadata.entrypoint)
+        let codeModeHostURL = packageRoot.appendingPathComponent("bin/codex-code-mode-host")
+        for url in [executableURL, codeModeHostURL] where !FileManager.default.isExecutableFile(atPath: url.path) {
+            return .failure(
+                .bundledLayoutIncomplete(
+                    target: architectureTarget,
+                    missingComponent: url.path.replacingOccurrences(of: packageRoot.path + "/", with: "")
+                )
+            )
+        }
+
+        return .success(
+            Runtime(
+                executableURL: executableURL,
+                version: bundledVersion,
+                source: .bundled(target: architectureTarget),
+                statePaths: state
+            )
+        )
+    }
+
+    /// Resolves the production configuration without making persistence part of the pure
+    /// validation path. A call-site override wins, followed by the supplied launch snapshot,
+    /// an explicit selection or injected defaults for preflight/tests, and finally the process
+    /// launch snapshot. Both an absent legacy selection and an explicitly bundled selection
+    /// suppress the legacy environment override so the included runtime is predictable.
+    static func resolveConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resourcesURL: URL? = Bundle.main.resourceURL,
+        architectureTarget: String? = currentArchitectureTarget,
+        applicationSupportURL: URL? = nil,
+        explicitExecutableOverride: String? = nil,
+        defaults: UserDefaults? = nil,
+        launchSnapshot: LaunchSnapshot? = nil,
+        selection: CodexRuntimePreferences.Selection? = nil,
+        externalVersionReader: ((URL) -> String?)? = nil
+    ) -> Result<Runtime, Failure> {
+        if let explicitExecutableOverride {
+            return resolve(
+                environment: environment,
+                resourcesURL: resourcesURL,
+                architectureTarget: architectureTarget,
+                applicationSupportURL: applicationSupportURL,
+                explicitExecutableOverride: explicitExecutableOverride,
+                externalVersionReader: externalVersionReader
+            )
+        }
+
+        var configuredEnvironment = environment
+        let configuredOverride: String?
+        let effectiveSelection = launchSnapshot?.selection
+            ?? selection
+            ?? defaults.map { CodexRuntimePreferences.selection(defaults: $0) }
+            ?? currentLaunchSnapshot().selection
+        switch effectiveSelection {
+        case .inherited, .bundled:
+            configuredEnvironment.removeValue(forKey: externalExecutableOverrideEnvironmentKey)
+            configuredOverride = nil
+        case let .external(path):
+            configuredEnvironment.removeValue(forKey: externalExecutableOverrideEnvironmentKey)
+            configuredOverride = path
+        case .invalidExternalPreference:
+            return .failure(.externalPreferenceMalformed)
+        }
+
+        return resolve(
+            environment: configuredEnvironment,
+            resourcesURL: resourcesURL,
+            architectureTarget: architectureTarget,
+            applicationSupportURL: applicationSupportURL,
+            explicitExecutableOverride: configuredOverride,
+            externalVersionReader: externalVersionReader
+        )
+    }
+
+    static func ignoredLegacyEnvironmentOverride(
+        environment: [String: String],
+        selection: CodexRuntimePreferences.Selection
+    ) -> Bool {
+        guard selection == .inherited else { return false }
+        return !(
+            environment[externalExecutableOverrideEnvironmentKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
+        )
+    }
+
+    private static func resolveExternalOverride(
+        _ rawPath: String,
+        statePaths: StatePaths,
+        environment: [String: String],
+        versionReader: ((URL) -> String?)?
+    ) -> Result<Runtime, Failure> {
+        let expandedPath = (rawPath as NSString).expandingTildeInPath
+        guard expandedPath.hasPrefix("/") else {
+            return .failure(.externalOverrideMustBeAbsolute)
+        }
+        let url = URL(fileURLWithPath: expandedPath).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return .failure(.externalOverrideMissing(url.path))
+        }
+        guard !isDirectory.boolValue, FileManager.default.isExecutableFile(atPath: url.path) else {
+            return .failure(.externalOverrideNotExecutable(url.path))
+        }
+        let version: Version? = if let versionReader {
+            versionReader(url).flatMap(Version.parse)
+        } else {
+            cachedExternalVersion(executableURL: url, environment: environment)
+        }
+        guard let version else {
+            return .failure(.externalOverrideVersionUnreadable(url.path))
+        }
+        guard version >= minimumExternalVersion else {
+            return .failure(.externalOverrideTooOld(actual: version, minimum: minimumExternalVersion))
+        }
+        return .success(
+            Runtime(
+                executableURL: url,
+                version: version,
+                source: .externalOverride,
+                statePaths: statePaths
+            )
+        )
+    }
+
+    private static func cachedExternalVersion(
+        executableURL: URL,
+        environment: [String: String]
+    ) -> Version? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: executableURL.path)
+        let key = ExternalVersionCacheKey(
+            path: executableURL.path,
+            modificationDate: attributes?[.modificationDate] as? Date,
+            fileSize: (attributes?[.size] as? NSNumber)?.uint64Value,
+            environmentFingerprint: environmentFingerprint(environment)
+        )
+        let now = Date()
+
+        externalVersionCacheLock.lock()
+        if let cached = externalVersionCache[key] {
+            if let version = cached.version {
+                externalVersionCacheLock.unlock()
+                return version
+            }
+            if let failureExpiresAt = cached.failureExpiresAt, failureExpiresAt > now {
+                externalVersionCacheLock.unlock()
+                return nil
+            }
+            externalVersionCache.removeValue(forKey: key)
+        }
+        externalVersionCacheLock.unlock()
+
+        // Version probing may launch an invalid or hanging executable. Never hold the global
+        // cache lock while waiting for that child; cache identity-bound failures briefly so
+        // repeated callers do not serialize behind the same bad override.
+        let version = readExternalVersion(
+            executableURL: executableURL,
+            environment: environment
+        ).flatMap(Version.parse)
+
+        externalVersionCacheLock.lock()
+        if let version {
+            externalVersionCache[key] = ExternalVersionCacheEntry(version: version, failureExpiresAt: nil)
+        } else {
+            externalVersionCache[key] = ExternalVersionCacheEntry(
+                version: nil,
+                failureExpiresAt: Date().addingTimeInterval(externalVersionFailureCacheDuration)
+            )
+        }
+        externalVersionCacheLock.unlock()
+        return version
+    }
+
+    private static func readExternalVersion(
+        executableURL: URL,
+        environment: [String: String]
+    ) -> String? {
+        do {
+            try ProviderProcessLaunchPolicy.check()
+        } catch {
+            return nil
+        }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = executableURL
+        process.environment = environment
+        process.arguments = ["--version"]
+        process.standardOutput = output
+        process.standardError = output
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completed.signal() }
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        if completed.wait(timeout: .now() + 3) == .timedOut {
+            process.terminate()
+            _ = completed.wait(timeout: .now() + 1)
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+
+    private static func environmentFingerprint(_ environment: [String: String]) -> Int {
+        var hasher = Hasher()
+        for key in environment.keys.sorted() {
+            hasher.combine(key)
+            hasher.combine(environment[key])
+        }
+        return hasher.finalize()
+    }
+
+    private static func redactedStateDescription(_ paths: StatePaths) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        func redact(_ path: String) -> String {
+            path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : "<application-support>/" + URL(fileURLWithPath: path).lastPathComponent
+        }
+        return "CODEX_HOME=\(redact(paths.codexHome.path)), CODEX_SQLITE_HOME=\(redact(paths.sqliteHome.path))"
+    }
+}

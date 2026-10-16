@@ -1,7 +1,17 @@
 import Foundation
+import RepoPromptSecureStorage
 
 final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     static let shared = ClaudeCodeCompatibleBackendStore()
+
+    // The catalogue owner injects its synchronous invalidator. The store knows no agent IDs or
+    // admission types; copying the handler releases this lock before invoking higher-level work.
+    private static let configurationChangeHandlerLock = NSLock()
+    private static var configurationChangeHandler: (@Sendable () -> Void)?
+
+    static func setConfigurationChangeHandler(_ handler: @escaping @Sendable () -> Void) {
+        configurationChangeHandlerLock.withLock { configurationChangeHandler = handler }
+    }
 
     static let configsDefaultsKey = "ClaudeCodeCompatibleBackendConfigs"
     private static let configuredDefaultsKeyPrefix = "ClaudeCodeCompatibleBackendConfigured."
@@ -180,6 +190,8 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(configs) else { return }
         defaults.set(data, forKey: Self.configsDefaultsKey)
+        let handler = Self.configurationChangeHandlerLock.withLock { Self.configurationChangeHandler }
+        handler?()
     }
 }
 

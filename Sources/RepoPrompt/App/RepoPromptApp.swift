@@ -2,6 +2,10 @@ import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptFileSystem
+import RepoPromptProcess
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import Sparkle
 import SwiftUI
 
@@ -54,9 +58,10 @@ struct RepoPromptFileLogHandler: LogHandler {
     }
 }
 
-@main
-struct RepoPromptApp: App {
+struct RepoPromptSwiftUIApp: App {
     init() {
+        let appInitSpan = StartupPhaseLog.begin(.appInit)
+        defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
             #if DEBUG
@@ -69,7 +74,20 @@ struct RepoPromptApp: App {
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
+        // Pre-warm date formatter cache on a background thread to avoid blocking the main
+        // thread with ICU locale processing (ulocimp_addLikelySubtags) on first render.
+        Task.detached(priority: .utility) {
+            MessageTimestampFormatter.warmUp()
+        }
+
         SentryTelemetryBootstrap.start()
+
+        AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
+        AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AIProviderFactory.installPerfRecorder(AppAgentModePerfRecorder())
+        AgentSessionDeletionRegistry.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
+        AgentSessionLinkRuntimeBridge.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
 
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
@@ -77,12 +95,26 @@ struct RepoPromptApp: App {
             flushStdout: true
         )
         Task.detached {
+            SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
             ProcessDebugLogging.log(
                 prefix: "MCPStartup",
                 "RepoPromptApp.init start task running",
                 flushStdout: true
             )
-            await ServerController.shared.startServer()
+            do {
+                await ServerNetworkManager.shared.installPerfRecorder(AppAgentModePerfRecorder())
+                await ServerNetworkManager.shared.installCatalogDiagnosticsSink(AppAgentSessionLinkCatalogEventSink())
+                await ServerNetworkManager.shared.installExecutionDiagnosticsSink(AppMCPToolExecutionEventSink())
+                await ServerNetworkManager.shared.installPhaseRecorderFactory(AppMCPToolExecutionHandlerPhaseRecorderFactory())
+                try await ServerController.shared.startServer()
+                SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
+            } catch {
+                ProcessDebugLogging.log(
+                    prefix: "MCPStartup",
+                    "MCP server startup failed before listener activation: \(String(reflecting: error))",
+                    flushStdout: true
+                )
+            }
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
@@ -96,8 +128,13 @@ struct RepoPromptApp: App {
     /// Global version manager for the entire app
     @StateObject private var versionManager = VersionManager()
 
-    /// Tracks all WindowState objects across multiple windows (singleton)
-    @StateObject private var windowStatesManager = WindowStatesManager.shared
+    /// Tracks all WindowState objects across multiple windows (singleton).
+    /// Deliberately not observed: the scene and commands only read it inside actions, and observing
+    /// it here re-evaluated the whole App scene body on every window open/close. Computed rather than
+    /// stored so the singleton is still first created after `init()` bootstraps logging/telemetry.
+    private var windowStatesManager: WindowStatesManager {
+        WindowStatesManager.shared
+    }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale = FontScaleManager.shared
@@ -162,5 +199,40 @@ struct RepoPromptApp: App {
                     .environmentObject(versionManager)
             }
         }
+    }
+}
+
+@MainActor
+public enum RepoPromptApplication {
+    public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
+        let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
+        case .skipped: .skipped
+        case .alreadyCompleted: .alreadyCompleted
+        case .migrated: .succeeded
+        case .verificationFailed: .failed
+        }
+        IdentityTransitionDiagnostics.shared.record(
+            subsystem: .defaultsMigration,
+            stage: "pre-bootstrap",
+            outcome: defaultsOutcome,
+            recordStateCounts: [
+                "copied": defaultsReport.copiedKeyCount,
+                "preserved": defaultsReport.preservedKeyCount
+            ]
+        )
+
+        // Capture after the defaults migration attempt because it may copy a persisted Codex
+        // selection, but before bootstrap can create Settings or provider clients.
+        CodexRuntimeAuthority.initializeLaunchSnapshot()
+
+        SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
+        GlobalSettingsStore.installProcessApplicationEventBridge()
+        FileSystemAppIntegration.installHooks()
+        bootstrapSpan.end()
+        RepoPromptSwiftUIApp.main()
     }
 }

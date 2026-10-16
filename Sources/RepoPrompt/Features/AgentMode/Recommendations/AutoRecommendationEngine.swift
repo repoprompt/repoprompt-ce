@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // Import AIModel for type-safe model references
 
@@ -22,6 +23,7 @@ final class AutoRecommendationEngine {
     // MARK: - Dependencies
 
     private let settingsStore: GlobalSettingsStore
+    private let profileSettingsManager: any SettingsManaging
     private(set) weak var apiSettingsViewModel: APISettingsViewModel?
 
     // MARK: - Constants
@@ -33,9 +35,11 @@ final class AutoRecommendationEngine {
 
     init(
         settingsStore: GlobalSettingsStore,
+        profileSettingsManager: any SettingsManaging,
         apiSettingsViewModel: APISettingsViewModel
     ) {
         self.settingsStore = settingsStore
+        self.profileSettingsManager = profileSettingsManager
         self.apiSettingsViewModel = apiSettingsViewModel
 
         // Ensure schema version is up to date on init
@@ -51,6 +55,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokBuildCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -72,27 +77,29 @@ final class AutoRecommendationEngine {
 
     // MARK: - Compute Recommendations
 
-    /// Compute all recommendations for a workspace.
-    /// Only returns recommendations where current settings differ from the recommended configuration.
+    /// Compute all recommendations for a workspace and Agent Models editing scope.
+    /// Recommendation satisfaction compares against the targeted profile rather than
+    /// raw global settings. Mute/completion state remains workspace-local via `workspaceID`.
     func computeRecommendations(
-        for workspaceID: UUID,
+        for identity: AgentModelsOperationIdentity,
         enabledProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> RecommendationSet {
+        let scope = identity.scope
         let actualStatus = computeProviderStatus()
         let status = actualStatus.filtered(to: enabledProviders)
-        let settings = settingsStore.chatSettings(for: workspaceID)
+        let profile = profile(for: scope)
 
         var result = RecommendationSet()
 
         // Chat Model Recommendation
         if var chatRec = computeChatModelRecommendation(status: status) {
-            chatRec.alreadySatisfied = isChatModelAlreadyConfigured(chatRec)
+            chatRec.alreadySatisfied = isChatModelAlreadyConfigured(chatRec, profile: profile)
             result.chatModel = chatRec
         }
 
         // Context Builder Recommendation
-        if var cbRec = computeContextBuilderRecommendation(status: status, settings: settings) {
-            cbRec.alreadySatisfied = isContextBuilderAlreadyConfigured(cbRec, settings: settings)
+        if var cbRec = computeContextBuilderRecommendation(status: status) {
+            cbRec.alreadySatisfied = isContextBuilderAlreadyConfigured(cbRec, profile: profile)
             result.contextBuilder = cbRec
         }
 
@@ -104,7 +111,7 @@ final class AutoRecommendationEngine {
 
         // MCP Agent Defaults Recommendation
         if status.hasAnyCLIAgentReady, let agentRec = computeMCPAgentDefaultsRecommendation(
-            workspaceID: workspaceID,
+            scope: scope,
             actualStatus: actualStatus,
             recommendedStatus: status
         ) {
@@ -117,10 +124,17 @@ final class AutoRecommendationEngine {
     // MARK: - Chat Model Recommendation
 
     private func computeChatModelRecommendation(status: ProviderStatusSnapshot) -> ChatModelRecommendation? {
-        let inAppPlanning = BestPracticeProfiles.bestInAppPlanningReview
         let bestPlanning = BestPracticeProfiles.bestPlanning
-        let apiPlanningModelString = AIModel.gpt54Pro.rawValue
-        let apiPlanningModelLabel = AIModel.gpt54Pro.displayName
+        let codexPlanningRaw = Self.preferredCodexFamilyModelRaw(
+            "sol",
+            effort: .high,
+            fallback: .gpt61SolHigh
+        )
+        let codexPlanningModel = AIModel.codexCustom(name: codexPlanningRaw)
+        let codexPlanningLabel = AgentModelCatalog.displayName(for: codexPlanningRaw, agentKind: .codexExec)
+        let apiPlanningModel = AIModel.gpt61SolHigh
+        let apiPlanningModelString = apiPlanningModel.rawValue
+        let apiPlanningModelLabel = apiPlanningModel.displayName
 
         // Build available options
         var codexOption: ChatBackendOption?
@@ -132,8 +146,8 @@ final class AutoRecommendationEngine {
             codexOption = ChatBackendOption(
                 kind: .codex,
                 displayName: "Codex CLI (Recommended)",
-                modelString: inAppPlanning.modelString,
-                description: "\(inAppPlanning.modelLabel) – strong reasoning with practical limits",
+                modelString: codexPlanningModel.rawValue,
+                description: "\(codexPlanningLabel) – strong reasoning with practical limits",
                 tradeoffs: [
                     "• Strong reasoning without extended wait times",
                     "• Won't exhaust weekly usage limits quickly",
@@ -142,8 +156,7 @@ final class AutoRecommendationEngine {
             )
         }
 
-        // OpenAI API option - shows reasoning but higher cost. GPT-5.5 Pro is a ChatGPT Pro export/planning recommendation,
-        // not an OpenAI API model in RepoPrompt's guidance.
+        // OpenAI API option - use the current Sol model with explicit high reasoning.
         if status.openAI == .ready {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
@@ -153,7 +166,7 @@ final class AutoRecommendationEngine {
                 tradeoffs: [
                     "• API-backed planning and review when Codex CLI is unavailable",
                     "• Visible reasoning traces",
-                    "• GPT-5.5 is Codex CLI / ChatGPT Pro guidance, not an API availability claim"
+                    "• GPT-6.1 Sol is available through the OpenAI Responses API"
                 ]
             )
         }
@@ -164,7 +177,7 @@ final class AutoRecommendationEngine {
                 kind: .claudeCode,
                 displayName: "Claude Code",
                 modelString: AIModel.claudeCodeOpus.rawValue, // Opus for chat
-                description: "Claude Opus 4.6 – great for editing and context management",
+                description: "\(BestPracticeProfiles.claudeCodeOpusRecommendationLabel) – great for editing and context management",
                 tradeoffs: [
                     "• Excellent at file editing and code modifications",
                     "• Superior context window management",
@@ -181,15 +194,15 @@ final class AutoRecommendationEngine {
 
         if codexOption != nil {
             defaultBackend = .codex
-            priorityPath = ["Codex CLI (\(inAppPlanning.modelLabel))", "OpenAI API", "Claude Code"]
+            priorityPath = ["Codex CLI (\(codexPlanningLabel))", "OpenAI API", "Claude Code"]
         } else if openAIOption != nil {
             defaultBackend = .openAI
             priorityPath = ["OpenAI API (\(apiPlanningModelLabel))", "Claude Code"]
-            upgradeHint = "Connect Codex CLI for \(inAppPlanning.modelLabel) – strong reasoning with practical usage limits (requires OpenAI Plus/Pro)."
+            upgradeHint = "Connect Codex CLI for \(codexPlanningLabel) – strong reasoning with practical usage limits (requires OpenAI Plus/Pro)."
         } else if claudeCodeOption != nil {
             defaultBackend = .claudeCode
             priorityPath = ["Claude Code"]
-            upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(inAppPlanning.modelLabel) – balances quality with usage limits."
+            upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(codexPlanningLabel) – balances quality with usage limits."
         } else {
             return nil
         }
@@ -230,11 +243,12 @@ final class AutoRecommendationEngine {
 
         // Priority 2: Codex CLI
         if status.codexCLI == .ready {
+            let modelRaw = Self.preferredCodexFamilyModelRaw("sol", effort: .medium, fallback: .gpt61SolMedium)
             codexOption = ChatBackendOption(
                 kind: .codex,
                 displayName: "Codex CLI",
-                modelString: AIModel.codexCliGpt55CodexMedium.rawValue,
-                description: "GPT-5.5 Medium via Codex CLI",
+                modelString: AIModel.codexCustom(name: modelRaw).rawValue,
+                description: "\(AgentModelCatalog.displayName(for: modelRaw, agentKind: .codexExec)) via Codex CLI",
                 tradeoffs: [
                     "• Superior reasoning capabilities",
                     "• Excellent for complex tasks",
@@ -248,8 +262,8 @@ final class AutoRecommendationEngine {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
                 displayName: "OpenAI API",
-                modelString: AIModel.gpt54.rawValue,
-                description: "GPT-5.4 via OpenAI API",
+                modelString: AIModel.gpt61Sol.rawValue,
+                description: "GPT-6.1 Sol via OpenAI API",
                 tradeoffs: [
                     "• Superior reasoning capabilities",
                     "• Pay-per-use pricing",
@@ -286,11 +300,18 @@ final class AutoRecommendationEngine {
         )
     }
 
+    private static func preferredCodexFamilyModelRaw(
+        _ family: String,
+        effort: CodexReasoningEffort,
+        fallback: AgentModel
+    ) -> String {
+        AgentModelCatalog.preferredCodexFamilyModelRaw(family, effort: effort) ?? fallback.rawValue
+    }
+
     // MARK: - Context Builder Recommendation
 
     private func computeContextBuilderRecommendation(
-        status: ProviderStatusSnapshot,
-        settings _: ChatGlobalSettings
+        status: ProviderStatusSnapshot
     ) -> ContextBuilderRecommendation? {
         Self.contextBuilderRecommendation(status: status)
     }
@@ -304,9 +325,11 @@ final class AutoRecommendationEngine {
         // Cursor is a fallback only; it does not take priority over existing recommended providers.
         // Note: codexExec agent requires Codex CLI specifically, not just OpenAI API key
         if status.codexCLI == .ready {
+            let modelRaw = preferredCodexFamilyModelRaw("luna", effort: .low, fallback: .gpt6LunaLow)
+            let model = AgentModel.resolvedModel(forRaw: modelRaw, agentKind: .codexExec) ?? .gpt6LunaLow
             return ContextBuilderRecommendation(
                 recommendedAgent: .codexExec,
-                recommendedModel: .gpt55CodexLow,
+                recommendedModel: model,
                 rationale: BestPracticeProfiles.contextBuilderRationale
             )
         } else if status.claudeCodeCLI == .ready {
@@ -314,22 +337,22 @@ final class AutoRecommendationEngine {
                 recommendedAgent: .claudeCode,
                 recommendedModel: .claudeSonnet,
                 rationale: "Claude Code with Sonnet provides strong context building with good balance of speed and quality.",
-                upgradeHint: "For best context building, connect Codex CLI with GPT-5.5 Low. Requires OpenAI Plus/Pro subscription."
+                upgradeHint: "For best context building, connect Codex CLI with GPT-6 Luna Low. Requires OpenAI Plus/Pro subscription."
             )
         } else if status.cursorCLI == .ready {
             return ContextBuilderRecommendation(
                 recommendedAgent: .cursor,
                 recommendedModel: .cursorComposer2,
                 rationale: "Cursor CLI with Composer 2 can handle context building when the preferred Codex or Claude Code providers are not configured.",
-                upgradeHint: "For best context building, connect Codex CLI with GPT-5.5 Low or Claude Code with Sonnet."
+                upgradeHint: "For best context building, connect Codex CLI with GPT-6 Luna Low or Claude Code with Sonnet."
             )
         }
 
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restores a usable saved Context Builder agent, using its catalog default when the saved model is absent or blank.
+    /// Invalid nonempty models or unavailable agents fall back through the same recommendation ranking as the wizard.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
@@ -337,34 +360,49 @@ final class AutoRecommendationEngine {
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
-           !modelRaw.isEmpty,
-           AgentModelCatalog.isAgentAvailable(agent, availability: availability),
-           isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
+           AgentModelCatalog.isAgentAvailable(agent, availability: availability)
         {
-            return AgentModelCatalog.normalizeSelection(
-                agentRaw: agent.rawValue,
-                modelRaw: modelRaw,
-                availability: availability
-            )
+            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if modelRaw.isEmpty {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: nil,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
+            if isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability) {
+                return AgentModelCatalog.normalizeSelection(
+                    agentRaw: agent.rawValue,
+                    modelRaw: modelRaw,
+                    availability: availability,
+                    surface: .headless
+                )
+            }
         }
 
         let status = ProviderStatusSnapshot(
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokBuildCLI: availability.grokBuildAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
                 modelRaw: recommendation.recommendedModel.rawValue,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(
+            availability: availability,
+            surface: .headless
+        ).first(where: {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
@@ -372,8 +410,12 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
+            case .grokBuild:
+                enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
+            case .antigravity, .devin:
+                false
             }
         }) else {
             return nil
@@ -428,14 +470,20 @@ final class AutoRecommendationEngine {
 
     // MARK: - MCP Agent Defaults Recommendation
 
-    /// Build a connection-aware availability context from provider status.
-    private func mcpAgentAvailabilityContext(from status: ProviderStatusSnapshot) -> AgentModelCatalog.AvailabilityContext {
+    /// Keep CLI readiness/filtering separate from providers whose availability is runtime-owned.
+    func mcpAgentAvailabilityContext(
+        from status: ProviderStatusSnapshot,
+        runtimeAvailability: AgentModelCatalog.AvailabilityContext
+    ) -> AgentModelCatalog.AvailabilityContext {
         let backendStore = ClaudeCodeCompatibleBackendStore.shared
         return AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: status.claudeCodeCLI == .ready,
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
+            grokBuildAvailable: status.grokBuildCLI == .ready,
+            antigravityAvailable: runtimeAvailability.antigravityAvailable,
+            devinAvailable: runtimeAvailability.devinAvailable,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid
@@ -443,16 +491,20 @@ final class AutoRecommendationEngine {
     }
 
     private func computeMCPAgentDefaultsRecommendation(
-        workspaceID: UUID,
+        scope: AgentModelsEditingScope,
         actualStatus: ProviderStatusSnapshot,
         recommendedStatus: ProviderStatusSnapshot
     ) -> MCPAgentDefaultsRecommendation? {
-        let availability = mcpAgentAvailabilityContext(from: actualStatus)
-        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus)
+        let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
+        let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
+        let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
+        let profileStore = AgentModelsProfileRoleDefaultsStore(
+            overrides: profile(for: scope).mcpAgentRoleOverrides
+        )
         let resolutions = MCPAgentRoleDefaultsService.resolutions(
             availability: availability,
             recommendedAvailability: recommendedAvailability,
-            settingsStore: settingsStore
+            settingsStore: profileStore
         )
         guard !resolutions.isEmpty else { return nil }
 
@@ -492,7 +544,7 @@ final class AutoRecommendationEngine {
         // Suggest upgrade if only some CLIs are available
         let upgradeHint: String? = {
             if recommendedStatus.codexCLI != .ready {
-                return "Connect Codex CLI for GPT-5.5 Low (explore/discovery), GPT-5.5 Medium (engineer and design fallback), and GPT-5.5 High (pair/Oracle)."
+                return "Connect Codex CLI for GPT-6 Luna Low (explore/discovery), GPT-6.1 Sol Medium (engineer and design fallback), and GPT-6.1 Sol High (pair/Oracle)."
             }
             if recommendedStatus.claudeCodeCLI != .ready {
                 return "Connect Claude Code for Claude Opus (design/pair). Best for architecture and creative work."
@@ -509,9 +561,17 @@ final class AutoRecommendationEngine {
         return rec
     }
 
-    /// Apply MCP agent defaults by clearing all global overrides (revert to recommended).
-    func applyMCPAgentDefaultsRecommendation(_ rec: MCPAgentDefaultsRecommendation, workspaceID: UUID) {
-        MCPAgentRoleDefaultsService.clearAllOverrides(settingsStore: settingsStore)
+    /// Apply MCP agent defaults by clearing overrides in the targeted Agent Models scope.
+    func applyMCPAgentDefaultsRecommendation(
+        _: MCPAgentDefaultsRecommendation,
+        identity: AgentModelsOperationIdentity
+    ) {
+        updateProfile(
+            scope: identity.scope,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        ) { profile in
+            profile.mcpAgentRoleOverrides = nil
+        }
     }
 
     // MARK: - Apply Recommendations
@@ -579,97 +639,96 @@ final class AutoRecommendationEngine {
         return fallback
     }
 
-    /// Apply chat model recommendation for a workspace.
-    /// Configures both built-in chat model and MCP planning model.
-    func applyChatModelRecommendation(_ rec: ChatModelRecommendation, backend: ChatBackendKind, workspaceID: UUID) {
-        // Determine the model string based on backend choice
-        // For CLI-driven backends (Claude Code), we use a reasonable default model
+    /// Resolve the chat model raw value a recommendation should apply.
+    func recommendedChatModelRaw(_ rec: ChatModelRecommendation, backend: ChatBackendKind) -> String? {
+        // Determine the model string based on backend choice.
+        // For CLI-driven backends (Claude Code), we use a reasonable default model.
         let modelString: String = switch backend {
         case .claudeCode:
-            // Claude Code - Opus for chat
             rec.claudeCodeOption?.modelString ?? AIModel.claudeCodeOpus.rawValue
         case .codex:
-            rec.codexOption?.modelString ?? AIModel.codexCliGpt55CodexHigh.rawValue
+            rec.codexOption?.modelString ?? AIModel.codexCustom(
+                name: Self.preferredCodexFamilyModelRaw("sol", effort: .high, fallback: .gpt61SolHigh)
+            ).rawValue
         case .openAI:
-            rec.openAIOption?.modelString ?? AIModel.gpt54Pro.rawValue
+            rec.openAIOption?.modelString
+                ?? AIModel.gpt61SolHigh.rawValue
         }
-
-        let reasonPrefix = "recommendations.chat_model.\(backend.rawValue)"
-        if settingsStore.syncChatModelWithOracle() {
-            settingsStore.setPlanningModelRaw(
-                modelString,
-                reason: "\(reasonPrefix).planning",
-                honorSync: true
-            )
-        } else {
-            // Set for built-in UI chat (preferredComposeModel)
-            settingsStore.setPreferredComposeModelRaw(
-                modelString,
-                reason: "\(reasonPrefix).preferred_compose"
-            )
-            // Set for MCP default model (planningModel) - used when presets are off, hidden, or empty
-            settingsStore.setPlanningModelRaw(
-                modelString,
-                reason: "\(reasonPrefix).planning"
-            )
-        }
-
-        // Note: Notification is posted by the caller (wizard) after all recommendations are applied
+        let trimmedModel = modelString.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedModel.isEmpty ? nil : trimmedModel
     }
 
-    /// Apply context builder recommendation.
-    /// Configures the Context Builder agent/model globally, and also backfills legacy
-    /// workspace-scoped context-builder fields for compatibility with older consumers.
-    func applyContextBuilderRecommendation(_ rec: ContextBuilderRecommendation, workspaceID: UUID) {
-        let resolvedModelRaw = resolveContextBuilderRecommendedModelRaw(rec)
+    /// Resolve the Context Builder model raw value a recommendation should apply.
+    func recommendedContextBuilderModelRaw(_ rec: ContextBuilderRecommendation) -> String {
+        resolveContextBuilderRecommendedModelRaw(rec)
+    }
 
-        // Set GLOBAL Context Builder agent and model (single source of truth)
-        settingsStore.setGlobalContextBuilderAgentSelection(
-            agentRaw: rec.recommendedAgent.rawValue,
-            modelRaw: resolvedModelRaw,
-            markUserDefined: true // Recommendations count as user-defined to prevent re-apply
-        )
-        // Backfill legacy workspace-scoped context-builder settings so PromptViewModel and
-        // MCP callers that still read these fields remain in sync with recommendations.
-        var workspaceSettings = settingsStore.chatSettings(for: workspaceID)
-        workspaceSettings.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
-        workspaceSettings.contextBuilderAgentModelRaw = rec.recommendedModel.rawValue
-        workspaceSettings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(workspaceSettings, commit: true)
-        // Note: Notification is posted by the caller (wizard) after all recommendations are applied
+    /// Apply chat model recommendation for a workspace.
+    /// Configures both built-in chat model and MCP planning model in the target profile.
+    func applyChatModelRecommendation(
+        _ rec: ChatModelRecommendation,
+        backend: ChatBackendKind,
+        identity: AgentModelsOperationIdentity
+    ) {
+        guard let trimmedModel = recommendedChatModelRaw(rec, backend: backend) else { return }
+
+        updateProfile(
+            scope: identity.scope,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        ) { profile in
+            profile.planningModelRaw = trimmedModel
+            profile.preferredComposeModelRaw = trimmedModel
+        }
+    }
+
+    /// Apply context builder recommendation in the target Agent Models profile.
+    func applyContextBuilderRecommendation(
+        _ rec: ContextBuilderRecommendation,
+        identity: AgentModelsOperationIdentity,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .userInitiated
+    ) {
+        let resolvedModelRaw = recommendedContextBuilderModelRaw(rec)
+
+        updateProfile(
+            scope: identity.scope,
+            contextBuilderWriteIntent: contextBuilderWriteIntent
+        ) { profile in
+            profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
+            profile = profile.replacingContextBuilderModel(resolvedModelRaw, for: rec.recommendedAgent.rawValue)
+        }
     }
 
     /// Apply every model-family recommendation in one pass.
     ///
     /// Composes `applyChatModelRecommendation` + `applyContextBuilderRecommendation`
     /// + `applyMCPAgentDefaultsRecommendation` (and optionally `applyMCPPresetExposure`),
-    /// then posts `.recommendationsDidApply` so listeners refresh. Intended for the
+    /// then posts `.recommendationsDidApply` for each unique affected scope so listeners refresh. Intended for the
     /// "Apply Recommended Setup" button on the Agent Models settings page; callers
     /// that want row-level control should keep using the individual apply methods.
     ///
     /// SEARCH-HELPER: Agent Models, Apply Recommended Setup, bulk apply
     func applyModelRecommendations(
         _ rec: RecommendationSet,
-        workspaceID: UUID,
+        identity: AgentModelsOperationIdentity,
         includePresetExposure: Bool = false
     ) {
         if let chat = rec.chatModel {
-            applyChatModelRecommendation(chat, backend: chat.defaultBackend, workspaceID: workspaceID)
+            applyChatModelRecommendation(chat, backend: chat.defaultBackend, identity: identity)
         }
         if let cb = rec.contextBuilder {
-            applyContextBuilderRecommendation(cb, workspaceID: workspaceID)
+            applyContextBuilderRecommendation(cb, identity: identity)
         }
         if let agentDefaults = rec.mcpAgentDefaults {
-            applyMCPAgentDefaultsRecommendation(agentDefaults, workspaceID: workspaceID)
+            applyMCPAgentDefaultsRecommendation(agentDefaults, identity: identity)
         }
         if includePresetExposure, let presetExposure = rec.mcpPresetExposure {
             applyMCPPresetExposure(presetExposure)
         }
 
-        NotificationCenter.default.post(
-            name: .recommendationsDidApply,
-            object: nil,
-            userInfo: ["workspaceID": workspaceID]
+        RecommendationApplyNotification.post(
+            sourceWorkspaceID: identity.sourceWorkspaceID,
+            agentModelsScope: rec.hasAgentModelsRecommendations ? identity.scope : nil,
+            includesPresetExposure: includePresetExposure && rec.mcpPresetExposure != nil
         )
     }
 
@@ -689,6 +748,36 @@ final class AutoRecommendationEngine {
         // Note: Notification is posted by the caller (wizard) after all recommendations are applied
     }
 
+    // MARK: - Scoped Profile Helpers
+
+    private func profile(for scope: AgentModelsEditingScope) -> AgentModelsSettingsProfile {
+        switch scope {
+        case .global:
+            profileSettingsManager.globalAgentModelsProfile()
+        case let .workspace(workspaceID):
+            profileSettingsManager.workspaceAgentModelsProfile(for: workspaceID)
+                ?? profileSettingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        }
+    }
+
+    private func updateProfile(
+        scope: AgentModelsEditingScope,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent,
+        _ mutation: (inout AgentModelsSettingsProfile) -> Void
+    ) {
+        var profile = profile(for: scope)
+        mutation(&profile)
+        switch scope {
+        case .global:
+            profileSettingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
+        case let .workspace(workspaceID):
+            profileSettingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        }
+    }
+
     // MARK: - Auto-Apply for New Workspaces
 
     /// Auto-applies recommended defaults when global settings are not yet configured.
@@ -703,14 +792,19 @@ final class AutoRecommendationEngine {
         }
 
         // Compute recommendations
-        let recs = computeRecommendations(for: workspaceID)
+        let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global)
+        let recs = computeRecommendations(for: identity)
         var didApply = false
 
         // Apply Context Builder recommendation if global not already configured
         if let cbRec = recs.contextBuilder,
            !cbRec.alreadySatisfied
         {
-            applyContextBuilderRecommendation(cbRec, workspaceID: workspaceID)
+            applyContextBuilderRecommendation(
+                cbRec,
+                identity: identity,
+                contextBuilderWriteIntent: .automaticSeed
+            )
             didApply = true
         }
 
@@ -828,7 +922,9 @@ final class AutoRecommendationEngine {
         let current = currentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let recommended = recommendedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !current.isEmpty, !recommended.isEmpty else { return false }
-        if current.caseInsensitiveCompare(recommended) == .orderedSame { return true }
+        if current.caseInsensitiveCompare(recommended) == .orderedSame {
+            return true
+        }
         guard let currentCodex = codexChatModelIdentity(for: current),
               let recommendedCodex = codexChatModelIdentity(for: recommended),
               currentCodex.baseModel == recommendedCodex.baseModel
@@ -841,16 +937,22 @@ final class AutoRecommendationEngine {
     /// Check if chat model is already configured to match the current default recommendation.
     /// Lower-priority available backends do not satisfy this check, so newly connected
     /// higher-priority providers surface as recommendation upgrades.
-    /// Checks both preferredComposeModel (UI chat) and planningModel (MCP default).
-    private func isChatModelAlreadyConfigured(_ rec: ChatModelRecommendation) -> Bool {
+    /// Checks both preferredComposeModel (UI chat) and planningModel (MCP default)
+    /// from the active Agent Models profile.
+    private func isChatModelAlreadyConfigured(
+        _ rec: ChatModelRecommendation,
+        profile: AgentModelsSettingsProfile
+    ) -> Bool {
         guard let recommendedModel = rec.option(for: rec.defaultBackend)?.modelString,
               !recommendedModel.isEmpty
         else {
             return false
         }
 
-        let currentCompose = settingsStore.preferredComposeModelRaw() ?? ""
-        let currentPlanning = settingsStore.planningModelRaw() ?? ""
+        let currentPlanning = profile.planningModelRaw ?? ""
+        let currentCompose = profile.syncChatModelWithOracle
+            ? currentPlanning
+            : (profile.preferredComposeModelRaw ?? "")
 
         return chatModelSelection(currentCompose, satisfiesRecommended: recommendedModel)
             && chatModelSelection(currentPlanning, satisfiesRecommended: recommendedModel)
@@ -859,8 +961,12 @@ final class AutoRecommendationEngine {
     /// Infer which chat backend is currently configured based on the stored model string.
     /// Returns nil if the current model doesn't match any of the available options.
     /// Prefers planningModel (MCP default) over preferredComposeModel for inference.
-    func inferCurrentChatBackend(from rec: ChatModelRecommendation) -> ChatBackendKind? {
-        let currentModel = settingsStore.planningModelRaw() ?? settingsStore.preferredComposeModelRaw()
+    func inferCurrentChatBackend(
+        from rec: ChatModelRecommendation,
+        scope: AgentModelsEditingScope = .global
+    ) -> ChatBackendKind? {
+        let profile = profile(for: scope)
+        let currentModel = profile.planningModelRaw ?? profile.preferredComposeModelRaw
 
         guard let current = currentModel, !current.isEmpty else { return nil }
 
@@ -870,26 +976,27 @@ final class AutoRecommendationEngine {
         })?.kind
     }
 
-    /// Check if context builder is already configured to match the recommendation.
-    /// Uses GLOBAL settings (not per-workspace) since Context Builder agent/model are now global.
+    /// Check if context builder is already configured to match the recommendation
+    /// in the active Agent Models profile.
     private func isContextBuilderAlreadyConfigured(
         _ rec: ContextBuilderRecommendation,
-        settings: ChatGlobalSettings // Parameter kept for API compatibility but not used
+        profile: AgentModelsSettingsProfile
     ) -> Bool {
-        let (globalAgentRaw, globalModelRaw) = settingsStore.globalContextBuilderAgentSelection()
-        let agentMatch = globalAgentRaw == rec.recommendedAgent.rawValue
+        let agentRaw = profile.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
+        let agentMatch = agentRaw == rec.recommendedAgent.rawValue
         let modelMatch: Bool = {
-            guard let globalModelRaw else { return false }
+            guard let modelRaw else { return false }
             if rec.recommendedAgent != .codexExec {
-                return globalModelRaw == rec.recommendedModel.rawValue
+                return modelRaw == rec.recommendedModel.rawValue
             }
 
-            let globalNormalized = globalModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !globalNormalized.isEmpty else { return false }
+            let normalized = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { return false }
 
             var accepted = Set(codexEquivalentModelCandidates(for: rec.recommendedModel.rawValue).map { $0.lowercased() })
             accepted.insert(resolveContextBuilderRecommendedModelRaw(rec).lowercased())
-            return accepted.contains(globalNormalized)
+            return accepted.contains(normalized)
         }()
         return agentMatch && modelMatch
     }

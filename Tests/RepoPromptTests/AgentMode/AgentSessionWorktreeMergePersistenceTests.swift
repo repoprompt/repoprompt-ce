@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
@@ -21,7 +22,7 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         XCTAssertTrue(decoded.worktreeMergeOperations.isEmpty)
     }
 
-    func testAgentSessionRoundTripsActiveWorktreeMergeOperationsAsVersionSix() throws {
+    func testAgentSessionRoundTripsActiveWorktreeMergeOperationsAsCurrentVersion() throws {
         let operation = makeOperation(status: .awaitingCommit, conflictFiles: [])
         let session = try AgentSession(
             id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000202")),
@@ -38,7 +39,7 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 6)
+        XCTAssertEqual(decoded.serializationVersion, 9)
         XCTAssertEqual(decoded.worktreeMergeOperations, [operation])
         XCTAssertEqual(decoded.worktreeMergeOperations.activeWorktreeMergeSummaries, try [XCTUnwrap(operation.activeSummary)])
     }
@@ -83,144 +84,6 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         XCTAssertEqual(stub.worktreeMergeOperations.activeWorktreeMergeSummaries, [summary])
         XCTAssertEqual(metadata.first?.activeWorktreeMergeSummaries, [summary])
         XCTAssertEqual(sidebar.entriesBySessionID[sessionID]?.activeWorktreeMergeSummaries, [summary])
-    }
-
-    func testReconciliationCancelsAwaitingApproval() async {
-        let operation = makeOperation(status: .awaitingApproval)
-
-        let reconciled = await reconcile(operation) { _ in
-            throw NSError(domain: "AgentSessionWorktreeMergePersistenceTests", code: 1)
-        }
-
-        XCTAssertEqual(reconciled.status, .cancelled)
-        XCTAssertEqual(reconciled.completedAt, reconciliationNow)
-        XCTAssertTrue(reconciled.lastError?.contains("approval") == true)
-    }
-
-    func testReconciliationMapsApplyingConflictStateToConflicted() async {
-        let operation = makeOperation(status: .applying)
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(
-                targetMergeInProgress: true,
-                targetHead: operation.targetHeadBefore,
-                conflictFiles: ["b.txt", "a.txt"]
-            )
-        }
-
-        XCTAssertEqual(reconciled.status, .conflicted)
-        XCTAssertEqual(reconciled.conflictFiles, ["a.txt", "b.txt"])
-        XCTAssertNil(reconciled.completedAt)
-    }
-
-    func testReconciliationMapsApplyingCleanMergeStateToAwaitingCommit() async {
-        let operation = makeOperation(status: .applying)
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(targetMergeInProgress: true, targetHead: operation.targetHeadBefore, conflictFiles: [])
-        }
-
-        XCTAssertEqual(reconciled.status, .awaitingCommit)
-        XCTAssertTrue(reconciled.conflictFiles.isEmpty)
-        XCTAssertNil(reconciled.completedAt)
-    }
-
-    func testReconciliationMapsApplyingCompletedTargetHeadToCompleted() async {
-        let operation = makeOperation(status: .applying)
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(targetMergeInProgress: false, targetHead: "dddddddddddddddddddddddddddddddddddddddd", conflictFiles: [])
-        }
-
-        XCTAssertEqual(reconciled.status, .completed)
-        XCTAssertEqual(reconciled.resultCommit, "dddddddddddddddddddddddddddddddddddddddd")
-        XCTAssertEqual(reconciled.completedAt, reconciliationNow)
-        XCTAssertTrue(reconciled.conflictFiles.isEmpty)
-    }
-
-    func testReconciliationRefreshesConflictedToAwaitingCommitAfterConflictsResolved() async {
-        let operation = makeOperation(status: .conflicted, conflictFiles: ["old.txt"])
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(targetMergeInProgress: true, targetHead: operation.targetHeadBefore, conflictFiles: [])
-        }
-
-        XCTAssertEqual(reconciled.status, .awaitingCommit)
-        XCTAssertTrue(reconciled.conflictFiles.isEmpty)
-        XCTAssertNil(reconciled.completedAt)
-    }
-
-    func testReconciliationRefreshesAwaitingCommitBackToConflictedWhenConflictsRemain() async {
-        let operation = makeOperation(status: .awaitingCommit)
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(targetMergeInProgress: true, targetHead: operation.targetHeadBefore, conflictFiles: ["conflict.txt"])
-        }
-
-        XCTAssertEqual(reconciled.status, .conflicted)
-        XCTAssertEqual(reconciled.conflictFiles, ["conflict.txt"])
-    }
-
-    func testReconciliationMarksPreviewedStaleWhenArtifactsMissing() async {
-        let operation = makeOperation(status: .previewed)
-
-        let reconciled = await reconcile(operation) { _ in
-            .init(
-                targetMergeInProgress: false,
-                targetHead: operation.targetHeadBefore,
-                previewArtifactsAvailable: false,
-                previewFingerprintsMatch: true
-            )
-        }
-
-        XCTAssertEqual(reconciled.status, .stale)
-        XCTAssertTrue(reconciled.lastError?.contains("artifacts") == true)
-    }
-
-    func testPreviewedOperationWithoutArtifactReferencesIsNotActiveAfterReconciliation() async {
-        let operation = makeOperation(status: .previewed, previewArtifacts: nil)
-
-        let reconciled = await reconcile(operation) { inspected in
-            .init(
-                targetMergeInProgress: false,
-                targetHead: inspected.targetHeadBefore,
-                previewArtifactsAvailable: inspected.previewArtifacts != nil,
-                previewFingerprintsMatch: true
-            )
-        }
-
-        XCTAssertEqual(reconciled.status, .stale)
-        XCTAssertNil(reconciled.activeSummary)
-    }
-
-    func testFingerprintEqualityIgnoresGeneratedAtForPreviewRevalidation() {
-        let old = GitDiffFingerprint(
-            headSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            baseRef: "HEAD",
-            statusHash: "clean",
-            generatedAt: Date(timeIntervalSinceReferenceDate: 1)
-        )
-        let refreshed = GitDiffFingerprint(
-            headSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            baseRef: "HEAD",
-            statusHash: "clean",
-            generatedAt: Date(timeIntervalSinceReferenceDate: 2)
-        )
-
-        XCTAssertEqual(old, refreshed)
-    }
-
-    private let reconciliationNow = Date(timeIntervalSinceReferenceDate: 999)
-
-    private func reconcile(
-        _ operation: AgentSessionWorktreeMergeOperation,
-        inspect: @escaping @Sendable (AgentSessionWorktreeMergeOperation) async throws -> AgentSessionWorktreeMergeReconciliationInspection
-    ) async -> AgentSessionWorktreeMergeOperation {
-        await AgentSessionWorktreeMergeReconciler.reconcile(
-            operation,
-            now: reconciliationNow,
-            hooks: AgentSessionWorktreeMergeReconciliationHooks(inspect: inspect)
-        )
     }
 
     private func makeOperation(

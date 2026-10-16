@@ -5,7 +5,7 @@ final class InterceptingWindowDelegateProxy: NSObject, NSWindowDelegate {
     weak var windowState: WindowState?
     weak var forwardedDelegate: NSWindowDelegate?
 
-    init(windowState: WindowState, forwardedDelegate: NSWindowDelegate?) {
+    init(windowState: WindowState?, forwardedDelegate: NSWindowDelegate?) {
         self.windowState = windowState
         self.forwardedDelegate = forwardedDelegate
         super.init()
@@ -46,6 +46,20 @@ final class InterceptingWindowDelegateProxy: NSObject, NSWindowDelegate {
             MCPBackgroundModeCoordinator.shared.clearIfBackgroundedWindow(windowID: windowID)
         }
         forwardedDelegate?.windowDidBecomeKey?(notification)
+    }
+
+    @objc(windowDidOrderOffScreen:)
+    func windowDidOrderOffScreen(_ notification: Notification) {
+        // AppKit can cache this selector after SwiftUI releases its delegate.
+        guard let forwardedDelegate else {
+            return
+        }
+
+        let selector = #selector(InterceptingWindowDelegateProxy.windowDidOrderOffScreen(_:))
+        guard forwardedDelegate.responds(to: selector) else {
+            return
+        }
+        _ = forwardedDelegate.perform(selector, with: notification)
     }
 
     override func responds(to aSelector: Selector!) -> Bool {

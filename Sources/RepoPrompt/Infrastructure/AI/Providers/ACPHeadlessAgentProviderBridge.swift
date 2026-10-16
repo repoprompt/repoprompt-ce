@@ -12,7 +12,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         case acceptForSession
     }
 
-    typealias ProviderFactory = () -> any ACPAgentProvider
+    typealias ProviderFactory = () async throws -> any ACPAgentProvider
     typealias RequestFactory = (_ message: AgentMessage, _ runID: UUID) -> ACPRunRequest
     typealias ControllerFactory = (
         _ provider: any ACPAgentProvider,
@@ -51,7 +51,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let actualRunID = runID ?? UUID()
         let request = makeRequest(message, actualRunID)
-        let provider = makeProvider()
+        let provider = try await makeProvider()
 
         await lifecycle.waitForDisposalIfNeeded()
 

@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 
 enum SelectedGitDiffArtifactPolicy {
     case includeBeforeGitInclusion

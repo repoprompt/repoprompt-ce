@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentInputBar.swift
 //  RepoPrompt
@@ -7,15 +9,18 @@
 //
 
 import AppKit
+import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct AgentComposerActions {
-    let storeDraft: (_ tabID: UUID, _ text: String) -> Void
-    let retrieveDraft: (_ tabID: UUID) -> String
+    var toggleComputerUse: (UUID, ObjectIdentifier) async -> Void = { _, _ in }
+    let storeDraft: (_ tabID: UUID, _ text: String, _ acknowledgedSequence: UInt64) -> Void
+    let loadDraft: (_ tabID: UUID) -> AgentComposerDraftSnapshot
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
+    let cancelRouting: (_ tabID: UUID) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
@@ -27,6 +32,9 @@ struct AgentComposerActions {
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
+    let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
+    var clearCursorModelParameter: (ACPModelParameterIdentity) -> Void = { _ in }
+    var canMutateCursorModel: (_ tabID: UUID?) -> Bool = { _ in false }
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -36,9 +44,11 @@ struct AgentComposerActions {
 }
 
 struct AgentInputBar: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     let oracleViewModel: OracleViewModel
     let promptManager: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
@@ -80,7 +90,7 @@ struct AgentInputBar: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar")
+            let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
         AgentComposerView(
             props: composerUI.props,
@@ -104,14 +114,21 @@ struct AgentInputBar: View {
     }
 
     private var composerActions: AgentComposerActions {
-        AgentComposerActions(
-            storeDraft: { tabID, text in agentModeVM.storeDraftText(for: tabID, text) },
-            retrieveDraft: { tabID in agentModeVM.retrieveDraftText(for: tabID) },
+        // Composer props carry the source session identity in submitTarget, so replacing
+        // an idle session also invalidates the equatable view's retained actions.
+        let cursorSession = agentModeVM.activeSession
+        return AgentComposerActions(
+            toggleComputerUse: { tabID, identity in await agentModeVM.toggleComputerUse(tabID: tabID, expectedSessionIdentity: identity) },
+            storeDraft: { tabID, text, sequence in
+                agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
+            },
+            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
             claimSubmit: { attempt in agentModeVM.claimComposerSubmitAttempt(attempt) },
             executeSubmit: { claim, text in
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
@@ -137,6 +154,13 @@ struct AgentInputBar: View {
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
+            selectACPModelParameter: { target, openCodeDiscoveryKey in
+                agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
+            },
+            clearCursorModelParameter: { agentModeVM.clearCursorModelParameter($0) },
+            canMutateCursorModel: { tabID in
+                agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
+            },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
             applyCodexToolSettingMutation: { mutation in
@@ -159,11 +183,15 @@ struct AgentInputBar: View {
     @ViewBuilder
     private var statusPills: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar.statusPills")
+            let _ = perfRecorder.increment("ui.body.inputBar.statusPills")
         #endif
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
             statusPillsUI: statusPillsUI,
+            computerUse: composerUI.props.computerUse,
+            computerUseTarget: composerUI.props.submitTarget,
+            toggleComputerUse: composerActions.toggleComputerUse,
+            openContextDrawerFiles: openContextDrawerFiles,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
             selectionCoordinator: selectionCoordinator,
@@ -236,6 +264,7 @@ enum AgentFileMentionText {
 }
 
 struct AgentComposerView: View, Equatable {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let props: AgentComposerProps
     let placeholderText: String
     let actions: AgentComposerActions
@@ -252,7 +281,9 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
+    @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
+    @State private var acknowledgedDraftRestorationSequenceByTab: [UUID: UInt64] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -320,7 +351,8 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var canAttachImages: Bool {
-        !props.isAgentBusy && currentTabID != nil
+        // Grok Build advertises no ACP image capability; its provider rejects attachments.
+        !props.isAgentBusy && currentTabID != nil && props.selectedAgent != .grokBuild
     }
 
     private var renderedSubmitTarget: AgentComposerSubmitTarget? {
@@ -353,7 +385,13 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var modelControlsDisabledTooltip: String {
-        "Model and effort controls are locked while this session is controlled by an MCP agent."
+        if props.isCurrentTabMCPControlled {
+            return "Model and effort controls are locked while this session is controlled by an MCP agent."
+        }
+        if props.selectedAgent == .cursor, props.runState.isActive {
+            return "Cursor model, effort, and speed controls are locked while this run is active."
+        }
+        return "Model controls are temporarily unavailable."
     }
 
     private var permissionBinding: AgentPermissionChromeBinding? {
@@ -434,7 +472,7 @@ struct AgentComposerView: View, Equatable {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.composer")
+            let _ = perfRecorder.increment("ui.body.composer")
         #endif
         VStack(spacing: 0) {
             ComposerChrome(
@@ -473,7 +511,7 @@ struct AgentComposerView: View, Equatable {
         .onDisappear {
             // Store draft when leaving
             if let tabID = currentTabID {
-                actions.storeDraft(tabID, localInputText)
+                actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
             }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
@@ -484,7 +522,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: currentTabID) { oldTabID, newTabID in
             // Switch drafts when tab changes
             if let oldTabID {
-                actions.storeDraft(oldTabID, localInputText)
+                actions.storeDraft(oldTabID, localInputText, acknowledgedDraftRestorationSequenceByTab[oldTabID] ?? 0)
             }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
@@ -493,7 +531,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
-            actions.storeDraft(tabID, newValue)
+            actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
@@ -514,9 +552,24 @@ struct AgentComposerView: View, Equatable {
                 } else {
                     restoredText = event.text + "\n" + existing
                 }
+            case .replaceAlways:
+                if let operation = event.operation {
+                    restoredText = AgentComposerDraftRestorationReducer.apply(
+                        operation,
+                        to: localInputText,
+                        acknowledgedSequence: acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0
+                    )
+                } else {
+                    restoredText = event.text
+                }
             }
-            setLocalInputText(restoredText, forceRevision: true)
-            actions.storeDraft(event.tabID, restoredText)
+            let sequence = max(
+                acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0,
+                event.operation?.fragments.last?.sequence ?? 0
+            )
+            acknowledgedDraftRestorationSequenceByTab[event.tabID] = sequence
+            setLocalInputText(restoredText, forceRevision: true, isExternalUpdate: true)
+            actions.storeDraft(event.tabID, restoredText, sequence)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
             }
@@ -595,6 +648,7 @@ struct AgentComposerView: View, Equatable {
                         await actions.slashSkillSuggestions(query)
                     }
                 ),
+                externalUpdateTick: externalTextUpdateTick,
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -627,11 +681,24 @@ struct AgentComposerView: View, Equatable {
                         mcpControlChip
                     }
                     if props.hasAvailableAgentProviders {
-                        agentProviderModelPicker
-                        reasoningEffortPicker
-                        claudeEffortPicker
-                        codexToolsButton
-                        claudeToolsButton
+                        if props.isGlobalModelRouterControllingFreshTask {
+                            automaticRouterTargetChip
+                            if let autoEffortServiceName = props.autoEffortServiceName {
+                                automaticEffortChip(serviceName: autoEffortServiceName)
+                            }
+                        } else {
+                            agentProviderModelPicker
+                            acpModelParameterPickers
+                            reasoningEffortPicker
+                            claudeEffortPicker
+                            if let autoEffortServiceName = props.autoEffortServiceName,
+                               props.manualEffortControl != nil
+                            {
+                                automaticEffortChip(serviceName: autoEffortServiceName)
+                            }
+                            codexToolsButton
+                            claudeToolsButton
+                        }
                     } else {
                         connectAgentProvidersButton
                     }
@@ -644,7 +711,7 @@ struct AgentComposerView: View, Equatable {
                 transaction.animation = nil
             }
 
-            // Right side: Attach + Context indicator + Send/Cancel button
+            // Right side: Attach + Send/Cancel button
             HStack(spacing: 8) {
                 Button(action: pickImages) {
                     Image(systemName: "photo.badge.plus")
@@ -659,7 +726,9 @@ struct AgentComposerView: View, Equatable {
                     transaction.animation = nil
                 }
 
-                if let cancelTarget = props.cancelTarget {
+                if props.isRoutingFreshTask, let tabID = props.currentTabID {
+                    CancelButton(action: { Task { await actions.cancelRouting(tabID) } })
+                } else if let cancelTarget = props.cancelTarget {
                     CancelButton(action: { cancelRun(cancelTarget) })
                 } else {
                     SendOrResendButton(
@@ -703,6 +772,53 @@ struct AgentComposerView: View, Equatable {
 
     // MARK: - Agent Pickers
 
+    private var automaticRouterTargetChip: some View {
+        let serviceName = props.automaticRouterServiceName
+        return HStack(spacing: 5) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            Text(serviceName.map { "Automatic · \($0)" } ?? "Automatic")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Model Router")
+        .accessibilityValue(serviceName.map { "Automatic with \($0)" } ?? "Automatic")
+        .hoverTooltip("Model Router asks \(serviceName ?? "the selected service") to choose a model and reasoning effort for this new task.")
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func automaticEffortChip(serviceName: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "gauge.open.with.lines.needle.33percent")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
+            Text("Auto Effort · \(serviceName)")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
+        .accessibilityElement(children: .combine)
+        .hoverTooltip("Auto Effort uses \(serviceName) before eligible turns; otherwise, your current effort applies. This tag is informational.")
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func effortPickerLabel(_ manualDisplayName: String) -> some View {
+        Text(manualDisplayName)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(pickerChipColor)
+            .cornerRadius(4)
+    }
+
     private enum LayoutMetrics {
         static let providerChipMaxWidth: CGFloat = 250
         static let permissionChipMaxWidth: CGFloat = 120
@@ -737,7 +853,7 @@ struct AgentComposerView: View, Equatable {
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
 
-    private var isSelectedCodexFastModel: Bool {
+    private var isSelectedCodexSpeedTier: Bool {
         AgentModelSelectionWarningVisuals.showsWarning(
             agent: props.selectedAgent,
             rawModel: props.selectedModelRaw
@@ -752,8 +868,8 @@ struct AgentComposerView: View, Equatable {
         } else {
             "Choose agent and model"
         }
-        guard isSelectedCodexFastModel else { return baseTooltip }
-        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.warningTooltip)"
+        guard isSelectedCodexSpeedTier else { return baseTooltip }
+        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.tooltip(agent: props.selectedAgent, rawModel: props.selectedModelRaw))"
     }
 
     private var inputBarSelectedModelDisplayName: String {
@@ -795,10 +911,11 @@ struct AgentComposerView: View, Equatable {
             HStack(spacing: 4) {
                 Image(systemName: props.selectedAgent.iconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                if isSelectedCodexFastModel {
-                    Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                if isSelectedCodexSpeedTier {
+                    AgentModelSpeedIcon(
+                        agent: props.selectedAgent, rawModel: props.selectedModelRaw,
+                        font: fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold)
+                    )
                 }
                 Text(providerChipTitle)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -813,7 +930,7 @@ struct AgentComposerView: View, Equatable {
                     .foregroundColor(.secondary)
             }
             .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
-            .foregroundColor(isSelectedCodexFastModel ? .orange : .primary)
+            .foregroundColor(isSelectedCodexSpeedTier ? AgentModelSelectionWarningVisuals.color(agent: props.selectedAgent, rawModel: props.selectedModelRaw) : .primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
@@ -855,6 +972,55 @@ struct AgentComposerView: View, Equatable {
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
         let options = inputBarModelOptions(for: agent)
+        if options.isEmpty {
+            return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
+                actions.selectAgentModel(agent, "")
+            }]
+        }
+        if agent == .cursor {
+            return AgentModelStableMenuItems.cursorModelItems(
+                options: options,
+                selectedModelRaw: props.selectedAgent == .cursor ? ((try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) ?? props.selectedModelRaw) : "",
+                selections: props.acpModelParameterControls.filter { $0.providerID == .cursor }.compactMap {
+                    guard let savedValueRaw = $0.savedValueRaw else { return nil }
+                    return ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: $0.baseModelRaw,
+                        kind: $0.kind,
+                        configID: $0.configID,
+                        valueRaw: savedValueRaw
+                    )
+                },
+                onSelectModel: { model in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    actions.selectAgentModel(.cursor, model.rawValue)
+                },
+                onSelectParameter: { model, parameter in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.selectACPModelParameter(parameter, nil)
+                },
+                onClearParameter: { model, identity in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.clearCursorModelParameter(identity)
+                }
+            )
+        }
+        if agent == .devin {
+            return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in
+                guard group.rendersAsSubmenu else {
+                    return group.entries.map { inputBarModelMenuItem(agent: agent, model: $0.option) }
+                }
+                return [.submenu(group.displayName, items: group.entries.map {
+                    inputBarModelMenuItem(agent: agent, model: $0.option, title: $0.effortDisplayName)
+                })]
+            }
+        }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }
@@ -930,7 +1096,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var reasoningEffortPicker: some View {
-        if props.selectedAgent == .codexExec {
+        if props.manualEffortControl == .codex {
             let efforts = actions.reasoningEffortOptionsForCurrentSelection()
             Menu {
                 ForEach(efforts, id: \.rawValue) { effort in
@@ -947,15 +1113,7 @@ struct AgentComposerView: View, Equatable {
                     }
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Text(props.selectedReasoningEffortDisplayName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                }
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
+                effortPickerLabel(props.selectedReasoningEffortDisplayName)
             }
             .menuStyle(.borderlessButton)
             .disabled(efforts.isEmpty || modelControlsDisabled)
@@ -965,9 +1123,62 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    private var acpModelParameterPickers: some View {
+        ForEach(props.acpModelParameterControls) { control in
+            Menu {
+                ForEach(control.choices, id: \.rawValue) { choice in
+                    Button {
+                        actions.selectACPModelParameter(
+                            ACPModelParameterSelection(
+                                providerID: control.providerID,
+                                baseModelRaw: control.baseModelRaw,
+                                kind: control.kind,
+                                configID: control.configID,
+                                valueRaw: choice.rawValue
+                            ),
+                            control.openCodeDiscoveryKey
+                        )
+                    } label: {
+                        HStack {
+                            Text(choice.displayName)
+                            if choice.rawValue == control.selectedValueRaw {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(control.selectedDisplayName)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                }
+                .foregroundColor(
+                    control.isSavedValueUnavailable || (
+                        control.kind == .speed
+                            && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
+                    )
+                        ? .orange
+                        : .secondary
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(pickerChipColor)
+                .cornerRadius(4)
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel(Text(control.accessibilityLabel))
+            .accessibilityValue(Text(control.accessibilityValue))
+            .disabled(modelControlsDisabled || control.choices.isEmpty)
+            .opacity(modelControlsDisabled ? 0.55 : 1.0)
+            .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : control.tooltip)
+            .fixedSize()
+        }
+    }
+
     @ViewBuilder
     private var claudeEffortPicker: some View {
-        if props.selectedAgent.usesClaudeTooling,
+        if props.manualEffortControl == .claude,
            let claudeTools = props.providerControls?.claudeTools
         {
             let efforts = AgentModelCatalog.supportedClaudeEfforts(
@@ -989,15 +1200,7 @@ struct AgentComposerView: View, Equatable {
                     }
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Text(claudeTools.effortLevel.displayName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                }
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
+                effortPickerLabel(claudeTools.effortLevel.displayName)
             }
             .menuStyle(.borderlessButton)
             .disabled(modelControlsDisabled || efforts.isEmpty)
@@ -1257,13 +1460,21 @@ struct AgentComposerView: View, Equatable {
                         }
                     ))
                     .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+                    Toggle("Local Memories", isOn: Binding(
+                        get: { codexTools.memoriesEnabled },
+                        set: { newValue in
+                            actions.applyCodexToolSettingMutation(.memories(enabled: newValue))
+                        }
+                    ))
+                    .hoverTooltip("Let Codex generate and reuse local memories across Agent Mode chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
                 } header: {
                     Text("Tools")
                 }
 
                 Section {
                     if codexTools.mcpServerEntries.isEmpty {
-                        Text("No servers in ~/.codex/config.toml")
+                        Text("No servers in RepoPrompt's isolated Codex config")
                             .foregroundStyle(.tertiary)
                     } else {
                         ForEach(codexTools.mcpServerEntries, id: \.normalizedName) { entry in
@@ -1404,15 +1615,14 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    @ViewBuilder
     private var imageDropOutline: some View {
-        Group {
-            if isImageDropTargeted {
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                    .foregroundColor(.accentColor)
-                    .padding(.horizontal, 2)
-                    .padding(.bottom, Self.footerHeight)
-            }
+        if isImageDropTargeted {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
+                .foregroundColor(.accentColor)
+                .padding(.horizontal, 2)
+                .padding(.bottom, Self.footerHeight)
         }
     }
 
@@ -1447,7 +1657,11 @@ struct AgentComposerView: View, Equatable {
             return
         }
 
-        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        actions.storeDraft(
+            attempt.sourceTabID,
+            rawDraftSnapshot,
+            acknowledgedDraftRestorationSequenceByTab[attempt.sourceTabID] ?? 0
+        )
         switch actions.claimSubmit(attempt) {
         case let .claimed(claim):
             Task { @MainActor in
@@ -1463,7 +1677,7 @@ struct AgentComposerView: View, Equatable {
                     return
                 }
                 if effects.shouldClearInput {
-                    setLocalInputText("")
+                    setLocalInputText("", isExternalUpdate: true)
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
@@ -1504,19 +1718,19 @@ struct AgentComposerView: View, Equatable {
 
     private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.composer.submit.rejected",
                 tabID: currentTabID,
                 fields: [
                     "reason": reason,
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "propsTabID": AgentModePerfDiagnostics.shortID(props.currentTabID),
-                    "targetTabID": AgentModePerfDiagnostics.shortID(target?.tabID),
-                    "attemptID": AgentModePerfDiagnostics.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
+                    "propsTabID": perfRecorder.shortID(props.currentTabID),
+                    "targetTabID": perfRecorder.shortID(target?.tabID),
+                    "attemptID": perfRecorder.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
                     "inputRevision": String(submissionLatch.inputRevision),
-                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target?.expectedSubmissionToken),
-                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target?.expectedSourceAgentSessionID),
-                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target?.expectedPersistentBindingIdentity?.generation),
+                    "expectedSubmissionToken": perfRecorder.shortID(target?.expectedSubmissionToken),
+                    "expectedSourceAgentSessionID": perfRecorder.shortID(target?.expectedSourceAgentSessionID),
+                    "expectedPersistentBindingGeneration": perfRecorder.shortID(target?.expectedPersistentBindingIdentity?.generation),
                     "expectedBindingTransitionGeneration": target.map { String($0.expectedBindingTransitionGeneration) } ?? "nil"
                 ]
             )
@@ -1564,7 +1778,8 @@ struct AgentComposerView: View, Equatable {
                     displayName: attachment.displayName,
                     relativePath: attachment.relativePath,
                     from: localInputText
-                )
+                ),
+                isExternalUpdate: true
             )
         }
     }
@@ -1606,7 +1821,14 @@ struct AgentComposerView: View, Equatable {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func setLocalInputText(_ newValue: String, forceRevision: Bool = false) {
+    private func setLocalInputText(
+        _ newValue: String,
+        forceRevision: Bool = false,
+        isExternalUpdate: Bool = false
+    ) {
+        if isExternalUpdate {
+            externalTextUpdateTick &+= 1
+        }
         guard forceRevision || localInputText != newValue else {
             isInputEmpty = newValue.isEmpty
             return
@@ -1618,7 +1840,13 @@ struct AgentComposerView: View, Equatable {
 
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
-        setLocalInputText(actions.retrieveDraft(tabID), forceRevision: true)
+        let snapshot = actions.loadDraft(tabID)
+        acknowledgedDraftRestorationSequenceByTab[tabID] = snapshot.restorationSequence
+        setLocalInputText(
+            snapshot.text,
+            forceRevision: true,
+            isExternalUpdate: true
+        )
         DispatchQueue.main.async {
             isSyncingDraftFromSession = false
         }
@@ -1651,7 +1879,6 @@ struct AgentImageInputAdapter {
         self.temporaryRoot = temporaryRoot
             ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
             .appendingPathComponent("AgentImageInput", isDirectory: true)
-            .standardizedFileURL
     }
 
     func preparedImages(from pasteboard: NSPasteboard) -> [PreparedImage] {

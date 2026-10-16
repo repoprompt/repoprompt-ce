@@ -1,6 +1,11 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension Notification.Name {
+    /// Posted by `GlobalSettingsStore` after the notification preference group changes.
+    static let notificationPreferencesDidChange = Notification.Name("RepoPromptNotificationPreferencesDidChange")
+    /// Posted when the UI should open Settings to the Notifications tab.
+    static let showNotificationSettingsTab = Notification.Name("showNotificationSettingsTab")
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
     /// `object` should be the WindowState to target; when omitted, the focused/latest window is used.
@@ -15,6 +20,8 @@ extension Notification.Name {
     static let showCLIProvidersTab = Notification.Name("showCLIProvidersTab")
     /// Posted when the UI should show the Agent Mode settings tab
     static let showAgentModeSettingsTab = Notification.Name("showAgentModeSettingsTab")
+    /// Posted when the UI should open Settings to the Model Router tab.
+    static let showModelRouterSettingsTab = Notification.Name("showModelRouterSettingsTab")
     /// Posted when the UI should open Settings to the Agent Models tab.
     static let showAgentModelsSettingsTab = Notification.Name("showAgentModelsSettingsTab")
     /// Posted when the UI should open Settings to the Agent Permissions tab.
@@ -71,6 +78,7 @@ extension Notification.Name {
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
     static let showAgentWorkflowPopover = Notification.Name("showAgentWorkflowPopover")
+
     /// Posted by WorkspaceManagerViewModel when workspace switch overlay visibility changes.
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]
@@ -78,6 +86,9 @@ extension Notification.Name {
     /// Posted when a compose tab's persisted display name changes.
     /// userInfo: ["tabID": UUID, "windowID": Int, "name": String]
     static let composeTabNameChanged = Notification.Name("composeTabNameChanged")
+    /// Posted when a compose tab is linked to or unlinked from a persistent Agent session.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
+    static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.

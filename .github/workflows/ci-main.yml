@@ -1,0 +1,62 @@
+name: CI (main)
+
+# Main-only checks, kept out of the PR workflow so PRs show no skipped rows:
+# Sentry-enabled build/privacy checks. All module parity tests now gate PRs in CI/Style.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-main-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sentry-enabled-build:
+    name: Sentry-enabled Build
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Restore SwiftPM build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-
+
+      - name: Cache checksum-verified SwiftPM binary artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            .build/artifacts
+            .build/swiftbuild/artifacts
+            Packages/RepoPromptAgentProviders/.build/artifacts
+            ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+
+      - name: Resolve Sentry dependency downloads with bounded retries
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: python3 Scripts/ci_resolve_packages.py
+
+      - name: Build app product with Sentry SDK linked
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./conductor swift-build --product RepoPrompt --full-log
+
+      - name: Test serialized Sentry privacy boundary
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./conductor test --filter SentryTelemetryPrivacyTests --full-log

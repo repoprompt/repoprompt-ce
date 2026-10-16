@@ -1,82 +1,11 @@
 import Foundation
-@testable import RepoPrompt
+import MCP
+@testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 @MainActor
 final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
-    func testUntargetedStartWithoutModelIDResolvesThroughPairDefault() throws {
-        let defaultLabel = AgentRunMCPToolService.defaultTaskLabelForStart(resolvedTabID: nil)
-        XCTAssertEqual(defaultLabel, .pair)
-
-        var requestedRole: AgentModelCatalog.TaskLabelKind?
-        let resolved = try AgentMCPSelectionResolver.resolve(
-            modelID: nil,
-            defaultTaskLabel: defaultLabel,
-            availability: .current,
-            roleSelectionProvider: { role, _ in
-                requestedRole = role
-                return AgentModelCatalog.NormalizedAgentSelection(agent: .codexExec, modelRaw: "pair-default-model")
-            }
-        )
-
-        XCTAssertEqual(requestedRole, .pair)
-        XCTAssertEqual(resolved.taskLabelKind, .pair)
-        XCTAssertEqual(resolved.agentRaw, AgentProviderKind.codexExec.rawValue)
-        XCTAssertEqual(resolved.modelRaw, "pair-default-model")
-    }
-
-    func testFreshPairEngineerAndExploreStartsUseCodexSafeManagedDefaults() throws {
-        let suiteName = "AgentRunMCPToolServiceStartDefaultTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        defaults.removePersistentDomain(forName: suiteName)
-        CodexAgentToolPreferences.setBashToolEnabled(false, defaults: defaults)
-        CodexAgentToolPreferences.setMCPServerEnabled(
-            normalizedName: "external-tools",
-            isEnabled: true,
-            defaults: defaults
-        )
-        let service = makeBindingService(defaults: defaults)
-
-        for role in [AgentModelCatalog.TaskLabelKind.pair, .engineer, .explore] {
-            let selection = try AgentMCPSelectionResolver.resolve(
-                modelID: role.rawValue,
-                defaultTaskLabel: nil,
-                availability: .current,
-                roleSelectionProvider: { requestedRole, _ in
-                    XCTAssertEqual(requestedRole, role)
-                    return AgentModelCatalog.NormalizedAgentSelection(
-                        agent: .codexExec,
-                        modelRaw: "\(role.rawValue)-codex-model"
-                    )
-                }
-            )
-            XCTAssertEqual(selection.agentRaw, AgentProviderKind.codexExec.rawValue)
-
-            let profile = service.permissionProfileForMCPActivation(
-                isSubagent: true,
-                provider: .codex
-            )
-            XCTAssertEqual(profile, .mcpSafeDefaults)
-
-            let snapshot = service.controlsBinding(
-                selectedAgent: .codexExec,
-                selectedModelRaw: selection.modelRaw,
-                permissionProfile: profile,
-                isSubagent: true,
-                externallyManagedReason: nil
-            )
-            XCTAssertEqual(snapshot.permission.displayName, CodexAgentToolPreferences.PermissionLevel.autoReview.displayName)
-            XCTAssertEqual(snapshot.runtimePermission.codexSandboxMode, .workspaceWrite)
-            XCTAssertEqual(snapshot.runtimePermission.codexApprovalPolicy, .onRequest)
-            XCTAssertEqual(snapshot.runtimePermission.codexApprovalReviewer, .autoReview)
-            XCTAssertEqual(snapshot.codexTools?.bashToolEnabled, true)
-            XCTAssertEqual(snapshot.codexTools?.mcpServerStatesByNormalizedName["external-tools"], false)
-            XCTAssertTrue(profile.codexBashToolEnabled(userConfigured: false))
-            XCTAssertTrue(profile.codexSuppressesThirdPartyMCPServers)
-        }
-    }
-
     func testInheritedRestrictiveCodexSettingsRemainRestrictive() throws {
         let suiteName = "AgentRunMCPToolServiceStartDefaultTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -181,6 +110,56 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         XCTAssertEqual(defaultLabel, .pair)
     }
 
+    func testRouterOwnedStartKeepsRoleSemanticsWithoutResolvingChildModelPin() {
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: nil,
+                defaultTaskLabel: .pair
+            ),
+            .pair
+        )
+        XCTAssertEqual(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "explore",
+                defaultTaskLabel: .pair
+            ),
+            .explore
+        )
+        XCTAssertNil(
+            AgentRunMCPToolService.taskLabelKindForRouterOwnedStart(
+                requestedModelID: "claudeCode:unavailable-stale-model",
+                defaultTaskLabel: .pair
+            )
+        )
+    }
+
+    func testExplicitModelAndParameterPinsBypassModelRouter() {
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertTrue(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "codexExec:gpt-6-sol-xhigh",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "devin:swe-2",
+            hasExplicitModelParameters: false
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: "engineer",
+            hasExplicitModelParameters: true
+        ))
+        XCTAssertFalse(AgentRunMCPToolService.shouldRouteModelForStart(
+            requestedModelID: nil,
+            hasExplicitModelParameters: true
+        ))
+    }
+
     private func makeBindingService(
         defaults: UserDefaults,
         secureStore: AgentPermissionSecureStore? = nil
@@ -201,20 +180,6 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
             )
         )
     }
-
-    func testExplicitModelIDTakesPrecedenceOverStartPairDefault() throws {
-        let defaultLabel = AgentRunMCPToolService.defaultTaskLabelForStart(resolvedTabID: nil)
-
-        let resolved = try AgentMCPSelectionResolver.resolve(
-            modelID: "codexExec:explicit-model",
-            defaultTaskLabel: defaultLabel,
-            availability: AgentModelCatalog.AvailabilityContext(codexAvailable: true)
-        )
-
-        XCTAssertNil(resolved.taskLabelKind)
-        XCTAssertEqual(resolved.agentRaw, AgentProviderKind.codexExec.rawValue)
-        XCTAssertEqual(resolved.modelRaw, "explicit-model")
-    }
 }
 
 private final class AgentRunFailingSecurePlainStringStore: SecurePlainStringStoring {
@@ -230,5 +195,73 @@ private final class AgentRunFailingSecurePlainStringStore: SecurePlainStringStor
 
     func deletePlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws {
         throw KeychainService.KeychainError.interactionNotAllowed
+    }
+}
+
+final class MCPToolIdleWaitTests: XCTestCase {
+    @MainActor
+    func testAlreadyCancelledToolIdleWaitDoesNotTakeIdleFastPath() async {
+        let server = makeServerViewModel(service: MCPService(
+            hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {}
+        ))
+        let task = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await server.awaitNoActiveToolExecutions(runID: UUID())
+        }
+        do {
+            try await task.value
+            XCTFail("Already-cancelled idle waiter must throw")
+        } catch is CancellationError {
+            // The same guard also closes cancellation before continuation installation.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    private func makeServerViewModel(service: MCPService) -> MCPServerViewModel {
+        let store = WorkspaceFileContextStore()
+        let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let settingsManager = WindowSettingsManager(windowID: -1)
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            aiQueriesService: aiQueriesService,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: settingsManager
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        let oracle = OracleViewModel(
+            aiQueriesService: aiQueriesService,
+            promptViewModel: prompt,
+            workspaceManager: workspaceManager,
+            chatData: ChatDataService()
+        )
+        return MCPServerViewModel(
+            service: service,
+            promptVM: prompt,
+            oracleVM: oracle,
+            workspaceManager: workspaceManager,
+            windowID: -1,
+            workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                throw MCPError.internalError("workspace search is not used by these tests")
+            },
+            ensureGitDataRootLoaded: { _, _ in
+                throw MCPError.internalError("git-data loading is not used by these tests")
+            }
+        )
     }
 }
