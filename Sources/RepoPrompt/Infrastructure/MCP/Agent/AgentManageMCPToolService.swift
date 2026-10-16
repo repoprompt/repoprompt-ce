@@ -430,7 +430,7 @@ struct AgentManageMCPToolService {
                 modelRaw: entry.agentModelRaw,
                 stateRaw: entry.lastRunStateRaw,
                 isLive: agentModeVM.sessions[entry.tabID] != nil,
-                parentSessionID: entry.parentSessionID,
+                parentSessionID: entry.parentSessionID ?? entriesByID[entry.id]?["parent_session_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
                 isMCPOriginated: entry.isMCPOriginated,
                 modelParameterSelections: entry.acpModelParameterSelections
             )
@@ -448,7 +448,10 @@ struct AgentManageMCPToolService {
                 modelRaw: session.selectedModelRaw,
                 stateRaw: session.runState.rawValue,
                 isLive: true,
-                parentSessionID: session.parentSessionID,
+                // A loading carrier has no provenance yet. Do not erase the persisted immutable
+                // spawn parent with its default nil. A completed load remains authoritative, even nil.
+                parentSessionID: session.hasLoadedPersistedState ? session.parentSessionID
+                    : entriesByID[activeSessionID]?["parent_session_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
                 isMCPOriginated: session.isMCPOriginated,
                 modelParameterSelections: session.acpModelParameterSelections
             )

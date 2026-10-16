@@ -45,6 +45,57 @@ private final class ScopeBlockedWriter: @unchecked Sendable {
 /// and the shared administration core's single authority check and batch cards.
 @MainActor
 final class SessionAdminScopeLifecycleTests: XCTestCase {
+    func testTwoTargetedTasksShareGlobalConsentButOnlyOneGrantNotice() async throws {
+        var global = true
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        runtime.isGlobalAutoApproveEnabled = { global }
+        let caller = UUID()
+        var notices: [String] = []
+        var continued: [UUID] = []
+        runtime.test_scopeDecision = { _, text in notices.append(text) }
+        for target in [UUID(), UUID()] {
+            let request = try runtime.requestScope(
+                requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                capabilities: [.observe, .control, .restructure], guardrails: .init(),
+                reason: "task", idempotencyKey: UUID().uuidString, reusePendingOnly: true
+            ).get()
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: request.id) { scope in
+                XCTAssertTrue(runtime.linkConsent.permits(scopeID: scope.id, observer: caller, target: target, at: Date()))
+                continued.append(request.id)
+                runtime.notifyOverseeContinuation(sessionID: caller, tabID: UUID(), requestID: request.id, result: "task_delivered")
+            })
+            XCTAssertTrue(runtime.approveWithStandingConsent(requestID: request.id))
+        }
+        try await AsyncTestWait.waitUntil("both tasks continue") { continued.count == 2 }
+        XCTAssertEqual(notices.count { $0.contains("decision: granted;") }, 1)
+        XCTAssertEqual(notices.count { $0.contains("decision: task_delivered;") }, 2)
+        let scope = try XCTUnwrap(runtime.allLiveScopes().first)
+        XCTAssertFalse(runtime.linkConsent.permits(scopeID: scope.id, observer: UUID(), target: UUID(), at: Date()))
+        global = false
+        runtime.reconcileGlobalAutoApprove()
+        XCTAssertFalse(runtime.linkConsent.permits(scopeID: scope.id, observer: caller, target: UUID(), at: Date()))
+        runtime.freezeForTermination()
+    }
+
+    func testCancellingInitialOutcomeWaitDoesNotReplaceTheTaskReceipt() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let request = try runtime.requestScope(requesterSessionID: UUID(), requesterTabID: nil,
+            kind: .session(targetSessionID: UUID()), capabilities: [.observe, .control, .restructure],
+            guardrails: .init(), reason: "task", idempotencyKey: "wait").get()
+        runtime.beginOverseeInitialOutcome(requestID: request.id)
+        let waiter = Task { @MainActor in await runtime.waitForOverseeInitialOutcome(requestID: request.id) }
+        await Task.yield()
+        waiter.cancel()
+        let interrupted = await waiter.value
+        XCTAssertEqual(interrupted.objectValue?["code"], .string("continuation_pending"))
+        XCTAssertNil(runtime.overseeInitialOutcome(requestID: request.id))
+        let committed: Value = .object(["result": .string("applied"), "code": .string("task_delivered")])
+        runtime.completeOverseeInitialOutcome(requestID: request.id, value: committed)
+        let outcome = await runtime.waitForOverseeInitialOutcome(requestID: request.id)
+        XCTAssertEqual(outcome, committed)
+        runtime.freezeForTermination()
+    }
+
     func testTargetedRequestReusesOnlyPendingAndContinuesFreshGrantedDeniedAndCancelledRequests() async throws {
         for terminal in ["granted", "denied", "cancelled"] {
             let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
@@ -142,6 +193,13 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         try await AsyncTestWait.waitUntil("refused continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
         XCTAssertNotEqual(try request().id, original.id)
         runtime.freezeForTermination()
+    }
+
+    func testTypedLinkRefusalSurvivesContinuationFormatting() {
+        let outcome = AgentSessionAdministrationOutcome.completed(.object(["items": .array([.object([
+            "result": .string("not_applied"), "code": .string("link_refused"), "subreason": .string("child_session")
+        ])])]))
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeLinkRefusalCode(outcome), "child_session")
     }
 
     func testOverseeRefusalNoticesContainOnlyCodesAndCardReasonIsBounded() {
@@ -6775,6 +6833,95 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    func testTargetedChildLinkUsesGlobalOrApprovedExactConsentAndReturnsActualOutcome() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: true)
+        try await assertTargetedChildLink(global: true, ownChild: false)
+        try await assertTargetedChildLink(global: false, ownChild: true)
+        try await assertTargetedChildLink(global: false, ownChild: false)
+    }
+
+    func testTargetedPostLinkRevocationReturnsPartialAndRetainsRetryReceipt() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: true, revokeAfterLink: true)
+    }
+
+    func testFullAccessOffAfterLinkRevalidatesConsentBeforeDelivery() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: false, revokeAfterLink: true, disableAfterLink: true)
+    }
+
+    private func assertTargetedChildLink(global: Bool, ownChild: Bool, revokeAfterLink: Bool = false, disableAfterLink: Bool = false) async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let caller = UUID(), target = UUID()
+            let parent = ownChild ? caller : UUID()
+            var fullAccess = global
+            let observerFixture = try await LoadedWindowFixture.make(activeID: caller, parentID: nil)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: target, parentID: parent)
+            addTeardownBlock { @MainActor in await targetFixture.cleanup(); await observerFixture.cleanup() }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
+            bridge.delegationScopes.isGlobalAutoApproveEnabled = { fullAccess }
+            var decisions: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in decisions.append(text) }
+            addTeardownBlock { @MainActor in
+                bridge.test_afterTargetedLink = nil
+                bridge.delegationScopes.test_scopeDecision = nil
+                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
+            }
+            for (fixture, id, parent) in [(observerFixture, caller, Optional<UUID>.none), (targetFixture, target, Optional(parent))] {
+                let vm = fixture.window.agentModeViewModel
+                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let payload = AgentSession(id: id, workspaceID: workspace.id, composeTabID: tab.id, name: "Targeted child", agentKind: "claudeCode", agentModel: "", parentSessionID: parent, isMCPOriginated: parent != nil)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                let session = vm.session(for: tab.id)
+                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: id, on: session, updateWorkspaceMetadata: true))
+                session.parentSessionID = parent
+                session.hasLoadedPersistedState = true
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            let observerTab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerFixture.window.agentModeViewModel, tabID: observerTab.id)
+            if revokeAfterLink {
+                bridge.test_afterTargetedLink = {
+                    if disableAfterLink { fullAccess = false; return }
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                }
+            }
+            if !global, !ownChild {
+                let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+                let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(targetFixture.window.agentModeViewModel, tabID: targetTab.id)
+                let refusal = await bridge.addDelegatedMonitorLink(observerEndpoint: endpoint, targetEndpoint: targetEndpoint,
+                    authorization: .init(isCurrent: { true }))
+                XCTAssertEqual(refusal, .failed(.childSession), "OFF: another parent's child is not linkable without applicable consent")
+            }
+            let key = UUID().uuidString
+            let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: revokeAfterLink ? "must not dispatch" : nil, idempotencyKey: key)
+            if global {
+                XCTAssertEqual(response.objectValue?["result"], .string(revokeAfterLink ? "partial" : "applied"))
+                if revokeAfterLink {
+                    XCTAssertEqual(response.objectValue?["code"], .string("scope_revoked"))
+                    XCTAssertNotNil(response.objectValue?["link_id"]?.stringValue)
+                    XCTAssertEqual(response.objectValue?["retryable"], .bool(false))
+                    let replay = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "must not dispatch", idempotencyKey: key)
+                    XCTAssertEqual(replay, response, "A retry inspects the existing receipt, never starts the task again")
+                }
+            } else {
+                XCTAssertEqual(response.objectValue?["result"], .string("approval_requested"))
+                let before = await bridge.delegationActiveLink(observerSessionID: caller, targetSessionID: target)
+                XCTAssertNil(before, "Neither parenthood nor a UUID bypasses the OFF-mode card")
+                let requestID = try XCTUnwrap(response.objectValue?["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+                _ = try bridge.delegationScopes.approve(requestID: requestID).get()
+                try await AsyncTestWait.waitUntil("approved child link outcome") { decisions.contains { $0.contains("linked;") || $0.contains("link_refused") } }
+            }
+            if !revokeAfterLink {
+                let link = await bridge.delegationActiveLink(observerSessionID: caller, targetSessionID: target)
+                XCTAssertNotNil(link)
+            }
+        }
+    }
+
     func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
@@ -6896,6 +7043,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 cleaned = true
             }
         }
+    }
+
+    func testTargetedPostDeliveryRevocationReportsAcceptedPartialWithoutDuplicateTask() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "revoke-after-delivery")
     }
 
     func testExactTargetApprovalContinuesColdSavedLinkAndManagedTaskWithoutUserTurn() async throws {
@@ -7300,10 +7451,27 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 await network.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: endpoint.windowID, runID: runID)
                 await network.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
             }
+            if duringRun == "revoke-after-delivery" {
+                bridge.test_afterTargetedDelivery = {
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == requesterID { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                }
+                addTeardownBlock { @MainActor in bridge.test_afterTargetedDelivery = nil }
+            }
             let granted = try bridge.delegationScopes.approve(
                 requestID: requestID, presentedWindowID: endpoint.windowID,
                 presentedTabID: endpoint.tabID, presentedSessionID: requesterID
             ).get()
+            if duringRun == "revoke-after-delivery" {
+                try await AsyncTestWait.waitUntil("accepted delivery reports revoked authority", timeout: 15) { decisions.contains { $0.contains("delivery_accepted_scope_revoked") } }
+                let replay = try await executeOversee(args)
+                XCTAssertEqual(replay.objectValue?["result"], .string("partial"))
+                XCTAssertEqual(replay.objectValue?["code"], .string("delivery_accepted_scope_revoked"))
+                XCTAssertEqual(replay.objectValue?["retryable"], .bool(false))
+                XCTAssertEqual(providerStarts, 1)
+                let sent = await controller.sentCount
+                XCTAssertEqual(sent, 1)
+                return
+            }
             try await AsyncTestWait.waitUntil("one approval automatically prepares, links and dispatches", timeout: 15) {
                 decisions.contains { $0.contains("task_delivered") || $0.contains("refused") || $0.contains("failed") || $0.contains("not_dispatched") }
             }

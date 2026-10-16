@@ -330,7 +330,9 @@ extension AgentModeViewModel {
             // rather than travelling on the candidate as authoritative.
             restorationReadiness: session.qualifiedRestorationReadiness,
             isDeletionInProgress: AgentSessionDeletionRegistry.shared
-                .isDeletionInProgress(sessionID: sessionID)
+                .isDeletionInProgress(sessionID: sessionID),
+            parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID
         )
     }
 

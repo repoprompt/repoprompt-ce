@@ -21,6 +21,7 @@ enum SessionAdminLinkOutcome: Equatable {
     /// The delegated authority behind the operation ended before it committed; nothing was left behind.
     case revoked
     case failed(String)
+    case refused(AgentSessionLinkResolveFailure)
 }
 
 /// A fork crossed its creation boundary but a later required step failed. Its identity must be

@@ -270,8 +270,19 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         case .stopped: SessionAdminItemResult(sessionID: target, result: "unlinked")
         case .notLinked: SessionAdminItemResult(sessionID: target, result: "not_linked")
         case .revoked: .revoked(target)
+        case let .refused(reason):
+            SessionAdminItemResult(sessionID: target, result: "not_applied", code: "link_refused", fields: [
+                "subreason": .string(reason.rawValue), "detail": .string(reason.uiMessage),
+                "affected_session_ids": .array([.string(target.uuidString)]),
+                "next_call": .string("session_admin {op:\"scope_status\"}"),
+                "retryable": .bool(reason == .loading || reason == .rebinding)
+            ])
         case let .failed(message):
-            SessionAdminItemResult(sessionID: target, result: "not_applied", code: "link_failed", fields: ["detail": .string(message)])
+            SessionAdminItemResult(sessionID: target, result: "not_applied", code: "link_failed", fields: [
+                "subreason": .string("host_refused"), "detail": .string(message),
+                "affected_session_ids": .array([.string(target.uuidString)]),
+                "next_call": .string("session_admin {op:\"scope_status\"}"), "retryable": .bool(false)
+            ])
         }
     }
 
