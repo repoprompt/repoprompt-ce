@@ -94,6 +94,16 @@ extension AgentModeViewModel {
             )
         } catch let published as AgentSessionLanePublishedFailure {
             return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
+        } catch let MCPError.internalError(detail) {
+            // Every internal error on this path is app-authored (binding admission, workspace or
+            // prompt-manager availability), so the reason reaches the caller instead of a type name.
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
+        } catch let MCPError.invalidParams(detail) {
+            throw AgentSessionLaneDestinationFailure.creationRejected(
+                String((detail ?? "Lane session creation was refused before allocation.").prefix(400))
+            )
         }
         guard let sessionID = target.sessionID ?? target.recoveryClaim?.identity.sessionID else {
             throw MCPError.internalError("The new lane has no session ID.")

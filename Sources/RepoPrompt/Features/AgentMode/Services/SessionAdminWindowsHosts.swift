@@ -74,10 +74,30 @@ struct SavedOversightSessionLocation {
 
 @MainActor
 final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
-    private let bridge: () -> AgentSessionLinkRuntimeBridge
+    typealias Preparation = @MainActor (
+        UUID, @escaping @MainActor () -> Bool
+    ) async -> Result<WindowState, WindowStatesManager.SavedOversightPreparationFailure>
 
-    init(bridge: @escaping () -> AgentSessionLinkRuntimeBridge = { AgentSessionLinkRuntimeBridge.shared }) {
+    private let bridge: () -> AgentSessionLinkRuntimeBridge
+    private let preparation: Preparation
+
+    init(
+        bridge: @escaping () -> AgentSessionLinkRuntimeBridge = { AgentSessionLinkRuntimeBridge.shared },
+        preparation: @escaping Preparation = { target, isStillAuthorized in
+            await WindowStatesManager.shared.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
+        }
+    ) {
         self.bridge = bridge
+        self.preparation = preparation
+    }
+
+    static func preparationDetail(_ reason: WindowStatesManager.SavedOversightPreparationFailure) -> String {
+        switch reason {
+        case .missing: "The source session was not found in any loaded workspace. Check its ID with session_admin inventory."
+        case .ambiguous: "The source session is open in more than one place. Close the duplicate tab, then retry."
+        case .changed: "The source session moved or changed while being prepared. Retry fork."
+        case .unreadable: "The source session's saved transcript could not be read, so it cannot be forked."
+        }
     }
 
     func commitOrganizationalPlacement(
@@ -245,6 +265,18 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     func fork(
         sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> UUID {
+        // A saved or never-visited source is prepared the same way targeted oversight prepares
+        // one: point read, no tab focus, no provider run. Authority is re-checked throughout.
+        if SessionAdminWindows.liveSession(sessionID) == nil {
+            switch await preparation(sessionID, isStillAuthorized) {
+            case .success: break
+            case let .failure(reason):
+                throw reason == .changed && !isStillAuthorized()
+                    ? SessionAdminHostError.authorityEnded
+                    : SessionAdminHostError.invalid(Self.preparationDetail(reason))
+            }
+        }
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }

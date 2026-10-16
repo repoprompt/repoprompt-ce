@@ -8435,6 +8435,7 @@ final class AgentSessionLinkRuntimeBridge {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
             receipt.destinationFailure = failure
             receipt.refusalStage = "host_allocation"
+            if case let .creationRejected(detail) = failure { receipt.refusalDetail = detail }
             return receipt
         } catch {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)

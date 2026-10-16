@@ -45,6 +45,9 @@ struct AgentSessionLaneDestination: Equatable {
 enum AgentSessionLaneDestinationFailure: Error, Equatable {
     case callerWindowHasNoWorkspace, selectorMatchedNone, selectorAmbiguous, destinationChanged
     case hostError(String)
+    /// App-authored refusal from lane session creation (e.g. the workspace binding was not
+    /// durably accepted). The detail is agent-facing; no session was allocated.
+    case creationRejected(String)
 
     var subreason: String {
         switch self {
@@ -53,6 +56,7 @@ enum AgentSessionLaneDestinationFailure: Error, Equatable {
         case .selectorAmbiguous: "selector_ambiguous"
         case .destinationChanged: "destination_changed"
         case let .hostError(type): "host_error:\(type)"
+        case .creationRejected: "lane_creation_rejected"
         }
     }
 }

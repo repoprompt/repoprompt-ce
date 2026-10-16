@@ -1571,6 +1571,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let agentFacing = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("host-invalid-params")])
             XCTAssertEqual(agentFacing["subreason"], .string("host_error:MCPError"))
             XCTAssertEqual(agentFacing["detail"], .string("Open the destination workspace, then retry."))
+            fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.creationRejected("binding was not durably accepted")
+            let rejected = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("rejected")])
+            XCTAssertEqual(rejected["subreason"], .string("lane_creation_rejected"))
+            XCTAssertEqual(rejected["detail"], .string("binding was not durably accepted"))
+            XCTAssertEqual(rejected["retryable"], .bool(true))
             fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.destinationChanged
             let changed = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("changed")])
             XCTAssertEqual(changed["subreason"], .string("destination_changed"))

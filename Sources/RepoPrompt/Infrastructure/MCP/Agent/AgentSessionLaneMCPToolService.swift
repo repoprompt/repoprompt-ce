@@ -109,6 +109,11 @@ enum AgentSessionLaneMCPToolService {
                 "Refresh the lane inventory and available models before retrying."
             }
             var fields: [String: Value] = ["result": .string(reason.rawValue), "hint": .string(hint)]
+            if case .creationRejected? = receipt.destinationFailure {
+                // The destination was fine; the app refused to create the session. The detail says why.
+                fields["hint"] = .string("The destination resolved, but the app refused to create the lane session; see detail. Retry with a new idempotency_key once that condition clears. No lane was allocated.")
+                fields["retryable"] = .bool(true)
+            }
             if let detail = receipt.refusalDetail { fields["detail"] = .string(detail) }
             fields["subreason"] = .string(reason == .destinationUnavailable ? (receipt.destinationFailure ?? .destinationChanged).subreason : receipt.admissionSubreason ?? reason.rawValue)
             if let stage = receipt.refusalStage { fields["stage"] = .string(stage) }

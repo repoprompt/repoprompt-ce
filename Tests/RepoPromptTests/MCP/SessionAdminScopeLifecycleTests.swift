@@ -604,6 +604,46 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertNil(unrestrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
     }
 
+    func testForkPreparesUnloadedSourceAndReportsPreparationFailures() async throws {
+        let source = UUID()
+        var prepared: [UUID] = []
+        for (failure, authorized, expected) in [
+            (WindowStatesManager.SavedOversightPreparationFailure.missing, true, "not found"),
+            (.ambiguous, true, "more than one place"),
+            (.unreadable, true, "could not be read"),
+            (.changed, true, "Retry fork")
+        ] {
+            let host = SessionAdminWindowsStructureHost(preparation: { target, _ in
+                prepared.append(target)
+                return .failure(failure)
+            })
+            do {
+                _ = try await host.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { authorized })
+                XCTFail("fork must refuse when preparation fails (\(failure))")
+            } catch let SessionAdminHostError.invalid(detail) {
+                XCTAssertTrue(detail.contains(expected), detail)
+            }
+        }
+        XCTAssertEqual(prepared, Array(repeating: source, count: 4), "an unloaded source is prepared, never refused outright")
+        let revoked = SessionAdminWindowsStructureHost(preparation: { _, _ in .failure(.changed) })
+        do {
+            _ = try await revoked.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { false })
+            XCTFail("revoked authority must not fork")
+        } catch SessionAdminHostError.authorityEnded {}
+    }
+
+    func testCreateLaneReportsAppRefusalDetailWithoutDestinationHint() throws {
+        var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+        receipt.destinationFailure = .creationRejected("The Agent session could not be started because its workspace binding was not durably accepted (reason=workspace_persistence_rejected).")
+        receipt.refusalDetail = "The Agent session could not be started because its workspace binding was not durably accepted (reason=workspace_persistence_rejected)."
+        receipt.refusalStage = "host_allocation"
+        let value = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
+        XCTAssertEqual(value["subreason"], .string("lane_creation_rejected"))
+        XCTAssertEqual(value["retryable"], .bool(true))
+        XCTAssertTrue(value["detail"]?.stringValue?.contains("workspace_persistence_rejected") == true)
+        XCTAssertFalse(value["hint"]?.stringValue?.contains("No unambiguous active destination") == true)
+    }
+
     func testHostErrorsRenderAsStructuredRefusalsNotBareEnumNames() throws {
         let target = UUID()
         let cases: [(SessionAdminHostError, String, Bool)] = [
