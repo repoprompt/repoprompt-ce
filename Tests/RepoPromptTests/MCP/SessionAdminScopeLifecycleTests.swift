@@ -620,11 +620,20 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             do {
                 _ = try await host.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { authorized })
                 XCTFail("fork must refuse when preparation fails (\(failure))")
-            } catch let SessionAdminHostError.invalid(detail) {
+            } catch let SessionAdminHostError.refused(code, detail, _) {
+                XCTAssertTrue(code.hasPrefix("target_"), code)
                 XCTAssertTrue(detail.contains(expected), detail)
             }
         }
         XCTAssertEqual(prepared, Array(repeating: source, count: 4), "an unloaded source is prepared, never refused outright")
+        var modelPrepared = 0
+        let modelHost = SessionAdminWindowsStructureHost(preparation: { _, _ in modelPrepared += 1
+            return .missing
+        })
+        let model = await modelHost.setModel(sessionID: source, modelID: "explore", isStillAuthorized: { true })
+        XCTAssertEqual(modelPrepared, 1, "set_model prepares an unloaded target instead of refusing it as not live")
+        guard case let .invalid(detail) = model else { return XCTFail("expected the preparation refusal, got \(model)") }
+        XCTAssertTrue(detail.contains("not found"), detail)
         let revoked = SessionAdminWindowsStructureHost(preparation: { _, _ in .changed })
         do {
             _ = try await revoked.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { false })
@@ -687,6 +696,14 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             XCTAssertNotNil(value["next_call"]?.objectValue?["tool"], code)
             XCTAssertNotEqual(value["detail"]?.stringValue, String(describing: error), "detail is the readable message")
         }
+        let branch = try XCTUnwrap(SessionAdminHostError.refused(
+            code: "branch_exists", detail: "exists",
+            nextCall: .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("worktree_bind")])])
+        ).refusalValue(op: "worktree_create", targets: [target]).objectValue)
+        XCTAssertEqual(branch["code"], .string("branch_exists"))
+        XCTAssertEqual(branch["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("worktree_bind"))
+        let invalid = try XCTUnwrap(SessionAdminHostError.invalid("bad").refusalValue(op: "fork", targets: [target]).objectValue)
+        XCTAssertEqual(invalid["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("get"), "not a generic scope_status")
         let unavailable = try XCTUnwrap(SessionAdminHostError.sessionUnavailable.refusalValue(op: "fork", targets: [target]).objectValue)
         XCTAssertEqual(unavailable["next_call"]?.objectValue?["tool"], .string("become_overseer"))
     }

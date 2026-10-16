@@ -105,20 +105,34 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             return order
         case .adminReorderGroups:
-            let (workspaceID, order) = try groupReorderArguments(request.arguments)
+            guard let workspaceID = try AgentSessionAdminArguments.uuid(request.arguments, "workspace") else {
+                throw AgentSessionAdminArguments.invalid("reorder_groups requires workspace (workspace UUID).")
+            }
             guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
                 throw AgentSessionAdminEarlyResult(value: Self.workspaceNotLoaded(workspaceID))
             }
+            let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
+            /// Both refusals list the groups that exist and the exact call shape that reorders them.
+            func refusal(_ code: String, _ detail: String) -> AgentSessionAdminEarlyResult {
+                AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: code, fields: [
+                    "result": .string(code),
+                    "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+                    "current_groups": .array(current.map(Value.string)),
+                    "detail": .string(detail),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("reorder_groups"), "workspace": .string(workspaceID.uuidString),
+                        "order": .array(current.map(Value.string)), "expected_order": .array(current.map(Value.string))
+                    ])])
+                ])))
+            }
+            guard request.arguments["order"] != nil else {
+                throw refusal("order_required", "reorder_groups needs order: the group names in their new order. current_groups is the present order; pass it as expected_order.")
+            }
+            let (_, order) = try groupReorderArguments(request.arguments)
             let named = Set(order)
             let members = entries.filter { named.contains($0.group) }.map(\.sessionID)
             if members.isEmpty {
-                let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
-                throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "groups_not_found", fields: [
-                    "result": .string("groups_not_found"),
-                    "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                    "current_groups": .array(current.map(Value.string)),
-                    "detail": .string("None of the named groups has a session in this workspace (a group exists only while a session carries it). Reorder groups from current_groups, using that list as expected_order.")
-                ])))
+                throw refusal("groups_not_found", "None of the named groups has a session in this workspace (a group exists only while a session carries it). Reorder groups from current_groups, using that list as expected_order.")
             }
             return members
         default:

@@ -1556,9 +1556,13 @@ struct AgentSessionLinkMCPToolService {
             throw MCPError.invalidParams("session_ids must be an array of session UUID strings.")
         }
 
+        // `wait` cursors each name their session, so a cursors-only call needs no separate list.
+        if single == nil, many == nil, case let .array(cursors)? = args["cursors"], !cursors.isEmpty {
+            many = cursors.map { $0.objectValue?["session_id"] ?? .null }
+        }
         switch (single, many) {
         case (nil, nil):
-            throw MCPError.invalidParams("Provide exactly one of session_id or session_ids.")
+            throw MCPError.invalidParams("Provide exactly one of session_id or session_ids (wait may instead pass only cursors).")
         case (.some, .some):
             throw MCPError.invalidParams("session_id and session_ids are mutually exclusive.")
         case let (.some(raw), nil):

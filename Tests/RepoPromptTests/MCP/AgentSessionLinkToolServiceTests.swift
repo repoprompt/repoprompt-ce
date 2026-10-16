@@ -1542,6 +1542,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ))
     }
 
+    func testWaitCursorsAloneNameTheirTargets() throws {
+        let first = UUID(), second = UUID()
+        let parsed = try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([
+            .object(["session_id": .string(first.uuidString), "cursor": .string("c1")]),
+            .object(["session_id": .string(second.uuidString), "cursor": .string("c2")])
+        ])])
+        XCTAssertEqual(parsed.sessionIDs, [first, second])
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.object(["cursor": .string("c")])])]))
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets([:]))
+    }
+
     func testCreateLaneUsesResolvedCallerOnceAndReportsHostAndSelectorFailures() async throws {
         try await withActivatedLaneFixture { fixture in
             var windowReads = 0

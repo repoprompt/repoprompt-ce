@@ -431,6 +431,10 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     XCTAssertEqual(gone["result"], .string("groups_not_found"))
                     XCTAssertEqual(gone["current_groups"], .array([]))
                     XCTAssertNotNil(gone["detail"])
+                    XCTAssertEqual(gone["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("reorder_groups"))
+                    let noOrder = try await perform(.adminReorderGroups, arguments: ["workspace": .string(destination.workspaceID.uuidString)], key: "no-order")
+                    XCTAssertEqual(noOrder["result"], .string("order_required"))
+                    XCTAssertNotNil(noOrder["current_groups"])
                     await destination.cleanup()
                     await caller.cleanup()
                 } catch {

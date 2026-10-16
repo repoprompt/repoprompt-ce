@@ -67,6 +67,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard let worktreeID = request.arguments["worktree_id"]?.stringValue, !worktreeID.isEmpty else {
             throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "target_required", fields: [
                 "result": .string("invalid_request"), "op": .string(op), "retryable": .bool(false),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("worktree_inventory")])]),
+
                 "detail": .string("\(op) needs session_id (the session the worktree is bound to) or worktree_id. Call worktree_inventory to see bound worktrees and their sessions.")
             ])))
         }
@@ -74,6 +76,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard !bound.isEmpty else {
             throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "worktree_not_bound", fields: [
                 "result": .string("not_applied"), "op": .string(op), "retryable": .bool(false),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("worktree_inventory")])]),
                 "worktree_id": .string(worktreeID),
                 "detail": .string("No loaded session is bound to this worktree, so there is nothing to \(op == "worktree_release" ? "release" : "unbind"). Removing the worktree from disk stays with the user.")
             ])))

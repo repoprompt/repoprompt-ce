@@ -176,6 +176,8 @@ enum SessionAdminHostError: LocalizedError, Equatable {
     case usageEvidenceUnavailable
     case guardrailExceeded(limit: Int, current: Int)
     case invalid(String)
+    /// A specific, recoverable refusal with its own code and the call that resolves it.
+    case refused(code: String, detail: String, nextCall: Value?)
 
     var errorDescription: String? {
         switch self {
@@ -191,6 +193,8 @@ enum SessionAdminHostError: LocalizedError, Equatable {
             "The worktree binding would exceed max_worktrees (limit \(limit), current \(current))."
         case let .invalid(message):
             message
+        case let .refused(_, detail, _):
+            detail
         }
     }
 }
@@ -206,9 +210,10 @@ extension SessionAdminHostError: SessionAdminStructuredRefusal {
                 "why": .string("Prepares a saved or unvisited session without opening its tab, then retry \(op).")
             ]))
         case .notIdle:
-            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object([
-                "op": .string("wait"), "until": .string("idle")
-            ])]))
+            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object(
+                ["op": .string("wait"), "until": .string("idle")]
+                    .merging(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]) { first, _ in first }
+            )]))
         case .authorityEnded:
             ("scope_revoked", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
         case .usageEvidenceUnavailable:
@@ -216,17 +221,25 @@ extension SessionAdminHostError: SessionAdminStructuredRefusal {
         case .guardrailExceeded:
             ("guardrail_exceeded", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
         case .invalid:
-            ("invalid_request", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+            // The detail names the fix; the next call inspects the target it concerns.
+            ("invalid_request", false, targets.first.map { target in
+                .object(["tool": .string("session_admin"), "arguments": .object([
+                    "op": .string("get"), "session_id": .string(target.uuidString)
+                ])])
+            } ?? .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case let .refused(code, _, nextCall):
+            (code, false, nextCall ?? .null)
         }
-        return .object([
+        var object: [String: Value] = [
             "result": .string("not_applied"),
             "op": .string(op),
             "code": .string(code),
             "subreason": .string(code),
             "detail": .string(localizedDescription),
             "affected": .array(targets.map { .string($0.uuidString) }),
-            "next_call": next,
             "retryable": .bool(retryable)
-        ])
+        ]
+        if next != .null { object["next_call"] = next }
+        return .object(object)
     }
 }
