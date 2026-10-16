@@ -150,7 +150,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             rendered.contains("you will be told once"),
             "the final-revocation notice is not guaranteed, so the guidance must not promise it"
         )
-        XCTAssertTrue(rendered.contains("Revocation may close an inventory without a notice"))
+        XCTAssertTrue(rendered.contains("Revocation may close an inventory silently"))
     }
 
     func testNeverLeaksStatusProviderOrLocationData() {
