@@ -785,10 +785,14 @@ final class DelegationScopeRuntime: ObservableObject {
         private(set) var test_activeOverseeContinuationCount = 0
     #endif
 
-    func notifyOverseeContinuation(sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false) {
-        // A refused link did not dispatch anything. Do not absorb a corrected retry as though
-        // it were a successful recently completed assignment.
-        if result.contains("; link_refused:") || result.contains("; link_failed:") {
+    func notifyOverseeContinuation(
+        sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false,
+        deliveredNothing: Bool = false
+    ) {
+        // A task that delivered nothing (refused or failed before any effect) must not absorb a
+        // corrected retry as though it were a recently completed assignment. Decided from the
+        // typed outcome, never by parsing notice text.
+        if deliveredNothing {
             overseeContinuationTasks.removeValue(forKey: requestID)
         }
         enqueueDecision(sessionID: sessionID, tabID: tabID, result: result, identifier: requestID, automaticContinuation: continuing)

@@ -768,9 +768,9 @@ enum AgentSessionLinkPrompts {
             "`snooze_auto_wake` pauses only routine status-triggered admission on one lane, not collection or delivery. Exact purposeful attention may bypass its snooze. `set_waiting_on` is self-scoped; `request_attention` is an attributed inverse signal, not a reverse observer grant.",
             "Managed `poll`/`wait` may include a redacted `pending_interaction` beside the snapshot. `respond` applies only to its exact current `interaction_id`; manual-only prompts remain with the target's user. `steer` cannot bypass a pending prompt; `stop` cancels one current run and never queues a continuation.",
             "`create_lane` makes your own top-level lane under a direct link; it inherits no authority. `retire_lane` unlinks and stashes only your own idle creation under a live manage grant; it never deletes it.",
-            "A `read` may repeat an updated newest `item_id`; replace your prior copy rather than appending it.",
+            "A `read` may repeat an updated newest `item_id`; replace your copy, do not append it.",
             "`status: \"idle\"` is not send readiness. Use `idle_for_send: true` or wait for `sendable`; `awaiting_user` without a pending interaction is waiting for its next instruction, not asking you a question. On a managed link, `steer` may deliver that instruction only when your own user's instruction covers it.",
-            "Idle alone does not prove completion. Revocation may close an inventory without a notice; never treat an old list as authority.",
+            "Idle does not prove completion. Revocation may close an inventory silently; never treat an old list as authority.",
             "This block is versioned by membership `revision` and `guidance_revision`. If several active `\(envelopeTag)` blocks appear, only the newest is current; never merge older targets or permissions into it."
         ])
         let escapedLines = lines.map { escaped($0) }.joined(separator: "\n")

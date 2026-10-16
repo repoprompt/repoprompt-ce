@@ -364,12 +364,11 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
 
     func testGroupsAcrossLoadedWorkspacesUseProductionFrontDoorAndRealFullAccessSetting() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
-            let defaults = UserDefaults.standard
-            let key = "agentMode.delegation.autoApproveAllRequests"
-            let old = defaults.object(forKey: key)
-            defer { if let old { defaults.set(old, forKey: key) } else { defaults.removeObject(forKey: key) } }
+            // Override in memory; tests must never write the user's real setting.
+            let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+            defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
             for enabled in [false, true] {
-                defaults.set(enabled, forKey: key)
+                OverseerGlobalAutoApprove.isEnabled = { enabled }
                 let caller = try await Fixture.make(isolated: true)
                 let destination = try await Fixture.make(isolated: true)
                 do {

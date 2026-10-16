@@ -1652,7 +1652,7 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         XCTFail("""
         Fixture never settled: \((previous?.rows ?? []).count { $0 == "pending" }) rows pending; \
         probe endpoint=\(endpoint != nil) candidate=\(candidate != nil) \
-        failure=\(String(describing: candidate.flatMap(AgentSessionLinkEndpointEligibility.targetResolveFailure(for:)))) \
+        failure=\(String(describing: candidate.flatMap { AgentSessionLinkEndpointEligibility.targetResolveFailure(for: $0) })) \
         loaded=\(session.hasLoadedPersistedState) loadTask=\(session.persistedLoadTask != nil) \
         transition=\(session.bindingTransitionInProgress) active=\(String(describing: session.activeAgentSessionID == probeSessionID))
         """)

@@ -1043,9 +1043,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let response = try await provider.listLinks()
                 let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
                 let result = try XCTUnwrap(object["result"] as? [String: Any])
-                XCTAssertEqual(result["isError"] as? Bool == true, activate, response.rawJSON)
+                // An activated Overseer with no links lists an empty inventory instead of an error.
+                XCTAssertNotEqual(result["isError"] as? Bool, true, response.rawJSON)
                 let content = try XCTUnwrap(result["content"] as? [[String: Any]])
                 let text = content.compactMap { $0["text"] as? String }.joined()
+                if activate {
+                    let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                    XCTAssertEqual((payload["items"] as? [[String: Any]])?.count, 0)
+                }
                 if !activate {
                     let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
                     let listed = try XCTUnwrap(payload["items"] as? [[String: Any]])

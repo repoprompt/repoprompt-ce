@@ -221,6 +221,9 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     package let unresolvedSessions: [UUID: String]
     /// Includes unresolved identities whose IDs a restricted view must not disclose.
     package let unresolvedSessionCount: Int
+    /// Why saved history could not be fully read, as a stable reason code (for example
+    /// `history_index_incomplete`), or nil when history was complete or not requested.
+    package let historyIssue: String?
 
     private let edgesBySession: [UUID: [DomainAgentSessionInventoryEdge]]
     private let ancestry: DomainAgentSessionAncestryIndex
@@ -234,7 +237,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         edges: [DomainAgentSessionInventoryEdge],
         isComplete: Bool,
         recordsComplete: Bool? = nil,
-        unresolvedSessions: [UUID: String] = [:]
+        unresolvedSessions: [UUID: String] = [:],
+        historyIssue: String? = nil
     ) {
         var byID: [UUID: DomainAgentSessionInventoryRecord] = [:]
         for record in records where unresolvedSessions[record.sessionID] == nil {
@@ -246,7 +250,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             records: byID, edges: edges, isComplete: isComplete,
             recordsComplete: recordsComplete ?? isComplete,
             knownSessionIDs: Set(byID.keys).union(unresolvedSessions.keys),
-            unresolvedSessions: unresolvedSessions, unresolvedSessionCount: unresolvedSessions.count
+            unresolvedSessions: unresolvedSessions, unresolvedSessionCount: unresolvedSessions.count,
+            historyIssue: historyIssue
         )
     }
 
@@ -257,8 +262,10 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         recordsComplete: Bool,
         knownSessionIDs: Set<UUID>,
         unresolvedSessions: [UUID: String],
-        unresolvedSessionCount: Int
+        unresolvedSessionCount: Int,
+        historyIssue: String?
     ) {
+        self.historyIssue = historyIssue
         self.unresolvedSessions = unresolvedSessions
         self.unresolvedSessionCount = unresolvedSessionCount
         self.records = records
@@ -298,7 +305,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             recordsComplete: recordsComplete,
             knownSessionIDs: knownSessionIDs,
             unresolvedSessions: unresolvedSessions.filter { visibleSessionIDs.contains($0.key) },
-            unresolvedSessionCount: unresolvedSessionCount
+            unresolvedSessionCount: unresolvedSessionCount,
+            historyIssue: historyIssue
         )
     }
 

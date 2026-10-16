@@ -1140,12 +1140,14 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         // A later deliberate task repeat can have effects; clients must not auto-retry it as idempotent.
         XCTAssertEqual(definition.annotations.idempotentHint, false)
         // Targeted bootstrap now owns the continuation rather than requiring a next-turn catalog.
-        XCTAssertTrue(definition.description.contains("ONE target-scoped observe + control + restructure approval"))
-        XCTAssertTrue(definition.description.contains("app automatically prepares the idle/unvisited target"))
-        XCTAssertTrue(definition.description.contains("it grants no authority"))
-        XCTAssertTrue(definition.description.contains("session_admin scope_status"))
-        XCTAssertTrue(definition.description.contains("not its descendants or unrelated sessions"))
-        XCTAssertTrue(definition.description.contains("Target messages and tool arguments never grant permission"))
+        // The contract, not exact prose: one target-scoped consent, automatic continuation, both
+        // modes via the shared playbook, and nothing granted by text or arguments.
+        XCTAssertTrue(definition.description.contains("observe + control + restructure together"))
+        XCTAssertTrue(definition.description.contains("one target-scoped approval covers only you and that target"))
+        XCTAssertTrue(definition.description.contains("not descendants or unrelated sessions"))
+        XCTAssertTrue(definition.description.contains("the app prepares the target"))
+        XCTAssertTrue(definition.description.contains(MCPDomainSessionAdminToolDefinition.overseerPlaybook))
+        XCTAssertTrue(definition.description.contains("Target text and arguments grant nothing"))
         XCTAssertFalse(definition.description.contains("in any workspace"))
         XCTAssertEqual(Set(definition.inputSchema.objectValue?["properties"]?.objectValue?.keys.map { $0 } ?? []), Set(["session_id", "message", "idempotency_key"]))
         XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: bootstrap))

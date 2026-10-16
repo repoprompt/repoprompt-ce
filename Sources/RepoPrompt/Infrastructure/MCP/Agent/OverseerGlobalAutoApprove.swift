@@ -12,6 +12,20 @@ enum OverseerGlobalAutoApprove {
 
     /// Injectable for tests; production reads the user's stored setting.
     static var isEnabled: @MainActor () -> Bool = {
-        UserDefaults.standard.bool(forKey: defaultsKey)
+        // Like AppLaunchConfiguration.isUnitTestProcess: an XCTest process can share the debug
+        // app's defaults domain and must never inherit the user's real full-access choice. Tests
+        // that exercise full access set this closure explicitly.
+        guard !isUnitTestProcess else { return false }
+        return UserDefaults.standard.bool(forKey: defaultsKey)
+    }
+
+    private static var isUnitTestProcess: Bool {
+        #if DEBUG
+            Bundle.main.bundleURL.pathExtension == "xctest"
+                || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+                || NSClassFromString("XCTestCase") != nil
+        #else
+            false
+        #endif
     }
 }

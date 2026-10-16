@@ -606,7 +606,6 @@ struct SessionAdminMCPToolService {
             "kind": .string(record.grant.kind.label),
             "unrestricted": .bool(record.grant.unrestricted),
             "capabilities": capabilitiesValue(record.grant.capabilities),
-            "unrestricted": .bool(record.grant.unrestricted),
             "guardrails": record.grant.unrestricted ? .object([:]) : guardrailsValue(record.grant.guardrails)
         ]
         switch record.grant.kind {

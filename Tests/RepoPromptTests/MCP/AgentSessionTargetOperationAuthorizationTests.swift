@@ -746,6 +746,36 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
+    func testCleanupCommitFenceRevalidatesCallerAndModeWhileDeletionIsParked() async throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        for change in ["none", "mode_off", "caller_changed"] {
+            var enabled = true
+            var caller = callerSessionID
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let target = UUID(), deleted = DeletionRecorder()
+            let service = cleanupService(window: window, deleted: deleted, caller: { caller }, metadata: { id in
+                self.makeMeta(id: id, parentSessionID: nil, isMCPOriginated: false)
+            }, atStorageCommit: {
+                switch change {
+                case "mode_off": enabled = false
+                case "caller_changed": caller = UUID()
+                default: break
+                }
+            })
+            let result = try await service.execute(args: cleanupArgs([target]))
+            if change == "none" {
+                XCTAssertEqual(deleted.sessionIDs, [target], "unchanged authority deletes")
+            } else {
+                XCTAssertTrue(deleted.sessionIDs.isEmpty, "\(change): authority that ended at commit deletes nothing")
+                let skipped = result.objectValue?["skipped_sessions"]?.arrayValue ?? []
+                XCTAssertEqual(skipped.first?.objectValue?["reason"], .string("authority_changed_before_commit"), change)
+            }
+        }
+    }
+
     func testCleanupOffRefusesExplicitlyAndCancellationHasActionableItems() async throws {
         let previous = OverseerGlobalAutoApprove.isEnabled
         defer { OverseerGlobalAutoApprove.isEnabled = previous }
@@ -884,7 +914,8 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         connectionID: UUID? = UUID(),
         metadata: @escaping (UUID) throws -> AgentSessionMeta?,
         load: @escaping () -> Void = {},
-        cancellation: @escaping () throws -> Void = {}
+        cancellation: @escaping () throws -> Void = {},
+        atStorageCommit: @escaping @MainActor () -> Void = {}
     ) -> AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
@@ -901,7 +932,15 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
                     if let id = vm.sessions[tab]?.activeAgentSessionID { deleted.sessionIDs.append(id) }
                     return nil
                 },
-                deletePersistedSession: { id, _ in deleted.sessionIDs.append(id) },
+                deletePersistedSession: { id, _ in
+                    // Mirror AgentSessionDataService: authority can change while deletion is parked,
+                    // and the caller-supplied fence is evaluated at the commit point.
+                    atStorageCommit()
+                    if let fence = AgentSessionDataService.destructiveCommitFence.get(), await !fence() {
+                        throw AgentSessionDestructiveCommitRefused()
+                    }
+                    deleted.sessionIDs.append(id)
+                },
                 finalizePersistedReferences: { _, _, _ in 0 }, checkCancellation: cancellation
             )
         )

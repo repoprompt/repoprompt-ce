@@ -31,7 +31,14 @@ final class OverseerContinuityRepository: @unchecked Sendable {
     static func production(fileManager: FileManager = .default) -> OverseerContinuityLocations {
         let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         #if DEBUG
-            let base = support.appendingPathComponent("RepoPrompt CE Debug", isDirectory: true)
+            // An XCTest process must never read or write the signed-in user's real overseer state
+            // (grants, links, worktree ownership). Use one private per-process directory instead.
+            let isUnitTestProcess = Bundle.main.bundleURL.pathExtension == "xctest"
+                || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+                || NSClassFromString("XCTestCase") != nil
+            let base = isUnitTestProcess
+                ? testProcessBase
+                : support.appendingPathComponent("RepoPrompt CE Debug", isDirectory: true)
             let profile = "repoprompt-ce-debug-overseer-v1"
         #else
             let base = support.appendingPathComponent("RepoPrompt CE", isDirectory: true)
@@ -43,6 +50,11 @@ final class OverseerContinuityRepository: @unchecked Sendable {
             legacyDirectory: base
         )
     }
+
+    #if DEBUG
+        private static let testProcessBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptCE-XCTest-Overseer-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)", isDirectory: true)
+    #endif
 
     let database: OverseerContinuityStore
     let legacyURL: URL

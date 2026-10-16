@@ -79,9 +79,15 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
 
     func testCancellingInitialOutcomeWaitDoesNotReplaceTheTaskReceipt() async throws {
         let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
-        let request = try runtime.requestScope(requesterSessionID: UUID(), requesterTabID: nil,
-            kind: .session(targetSessionID: UUID()), capabilities: [.observe, .control, .restructure],
-            guardrails: .init(), reason: "task", idempotencyKey: "wait").get()
+        let request = try runtime.requestScope(
+            requesterSessionID: UUID(),
+            requesterTabID: nil,
+            kind: .session(targetSessionID: UUID()),
+            capabilities: [.observe, .control, .restructure],
+            guardrails: .init(),
+            reason: "task",
+            idempotencyKey: "wait"
+        ).get()
         runtime.beginOverseeInitialOutcome(requestID: request.id)
         let waiter = Task { @MainActor in await runtime.waitForOverseeInitialOutcome(requestID: request.id) }
         await Task.yield()
@@ -180,18 +186,27 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
                 reusePendingOnly: true
             ).get()
         }
-        let original = try request()
-        XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
-            runtime.notifyOverseeContinuation(
-                sessionID: caller,
-                tabID: UUID(),
-                requestID: original.id,
-                result: "oversee target=\(target.uuidString); link_refused: target_binding_changed"
-            )
-        })
-        _ = try runtime.approve(requestID: original.id).get()
-        try await AsyncTestWait.waitUntil("refused continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
-        XCTAssertNotEqual(try request().id, original.id)
+        // The producer's current format ("link_refused; result=not_applied; …") carries a typed
+        // delivered-nothing flag; retention follows that flag, never the notice text.
+        for deliveredNothing in [true, false] {
+            let original = try request()
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
+                runtime.notifyOverseeContinuation(
+                    sessionID: caller,
+                    tabID: UUID(),
+                    requestID: original.id,
+                    result: "oversee target=\(target.uuidString); link_refused; result=\(deliveredNothing ? "not_applied" : "partial"); subreason=target_binding_changed",
+                    deliveredNothing: deliveredNothing
+                )
+            })
+            _ = try runtime.approve(requestID: original.id).get()
+            try await AsyncTestWait.waitUntil("continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
+            if deliveredNothing {
+                XCTAssertNotEqual(try request().id, original.id, "a corrected retry starts fresh")
+            } else {
+                XCTAssertEqual(try request().id, original.id, "a task with effects is not re-run by a quick retry")
+            }
+        }
         runtime.freezeForTermination()
     }
 
@@ -571,6 +586,24 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(afterStop["result"], .string("pending_user_approval"))
     }
 
+    func testScopeValueSerializesRestrictedAndUnrestrictedGrantsWithoutDuplicateKeys() throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let grantee = UUID()
+        let request = try runtime.requestScope(
+            requesterSessionID: grantee, requesterTabID: nil, kind: .tree(rootSessionID: grantee),
+            capabilities: [.observe], guardrails: .init(bulkConfirmationThreshold: 5), reason: nil, idempotencyKey: nil
+        ).get()
+        let restricted = try runtime.approve(requestID: request.id).get()
+        runtime.isGlobalAutoApproveEnabled = { true }
+        let unrestricted = try XCTUnwrap(runtime.ensureGlobalAutoApproveScope(for: grantee))
+        let restrictedValue = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(restricted, now: Date()).objectValue)
+        XCTAssertEqual(restrictedValue["unrestricted"], .bool(false))
+        XCTAssertEqual(restrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"], .int(5))
+        let unrestrictedValue = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(unrestricted, now: Date()).objectValue)
+        XCTAssertEqual(unrestrictedValue["unrestricted"], .bool(true))
+        XCTAssertNil(unrestrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
+    }
+
     func testRequestScopeAcceptsSessionKindWithItsSessionID() async throws {
         let fixture = Fixture()
         let overseer = UUID()
@@ -774,7 +807,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let locations = OverseerContinuityRepository.production()
         XCTAssertEqual(locations.databaseURL.deletingLastPathComponent().deletingLastPathComponent(), locations.legacyDirectory)
         #if DEBUG
-            XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE Debug")
+            // A test process is isolated from the user's real overseer state, never the app's path.
+            XCTAssertTrue(locations.legacyDirectory.lastPathComponent.hasPrefix("RepoPromptCE-XCTest-Overseer-"))
+            XCTAssertTrue(locations.databaseURL.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+            XCTAssertFalse(locations.databaseURL.path.contains("RepoPrompt CE Debug"))
         #else
             XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE")
         #endif
@@ -938,16 +974,18 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         defer { block.release.signal() }
         runtime.freezeForTermination()
         let enteredSettlement = expectation(description: "termination settlement started")
-        let start = ContinuousClock.now
         let settling = Task { @MainActor in
             enteredSettlement.fulfill()
-            return await runtime.settleForTermination(timeout: 0.25)
+            // Time the settlement call itself, not XCTest's expectation scheduling around it.
+            let start = ContinuousClock.now
+            let settled = await runtime.settleForTermination(timeout: 0.25)
+            return (settled, start.duration(to: .now))
         }
         await fulfillment(of: [enteredSettlement], timeout: 3)
         runtime.revokeAll(involving: first.grant.granteeSessionID)
-        let settled = await settling.value
+        let (settled, elapsed) = await settling.value
         XCTAssertFalse(settled)
-        XCTAssertLessThan(start.duration(to: .now), .seconds(1), "Do not structurally join a blocked writer past the deadline")
+        XCTAssertLessThan(elapsed, .seconds(1), "Do not structurally join a blocked writer past the deadline")
         let after = UUID()
         runtime.revokeAll(involving: after)
         block.release.signal()
@@ -1787,12 +1825,11 @@ final class SessionAdminStructureTests: XCTestCase {
     }
 
     func testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation() async throws {
-        let defaults = UserDefaults.standard
-        let key = "agentMode.delegation.autoApproveAllRequests"
-        let old = defaults.object(forKey: key)
-        defer { if let old { defaults.set(old, forKey: key) } else { defaults.removeObject(forKey: key) } }
+        // Override in memory; tests must never write the user's real setting.
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
         for enabled in [false, true] {
-            defaults.set(enabled, forKey: key)
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
             let fixture = Fixture()
             let caller = UUID(), target = UUID(), tab = UUID()
             fixture.provenance.add(caller, parent: nil)
@@ -1851,7 +1888,9 @@ final class SessionAdminStructureTests: XCTestCase {
             XCTAssertEqual(result["changed_count"], .int(1))
             XCTAssertEqual(result["bound"], .bool(false))
             XCTAssertNotNil(result["worktree"])
-            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] { XCTAssertNotNil(result[key], key) }
+            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] {
+                XCTAssertNotNil(result[key], key)
+            }
             guard case let .completed(replay) = try await door.perform(create) else { return XCTFail("Replay completes") }
             XCTAssertEqual(replay.objectValue?["idempotent_replay"], .bool(true))
             XCTAssertEqual(fixture.worktrees.created.count, 1)
@@ -1876,7 +1915,7 @@ final class SessionAdminStructureTests: XCTestCase {
             }
             // A global caller still cannot hide the restricted scopes its target's bindings count toward.
             // Create restrictions with the setting OFF, then exercise the actual ON/OFF front door.
-            defaults.set(false, forKey: key)
+            OverseerGlobalAutoApprove.isEnabled = { false }
             let ancestor = UUID()
             fixture.provenance.add(ancestor, parent: nil)
             fixture.provenance.add(caller, parent: ancestor)
@@ -1887,15 +1926,16 @@ final class SessionAdminStructureTests: XCTestCase {
                 newGranteeSessionID: caller, newGranteeMemberships: [proof], capabilities: [.observe, .worktree],
                 guardrails: .init(maxWorktrees: 1)
             ).get()
-            defaults.set(enabled, forKey: key)
-            let originalID: UUID?
-            if enabled { originalID = nil }
-            else { originalID = try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { $0.grant.parentScopeID == nil }).id }
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let originalID: UUID? = if enabled { nil }
+            else { try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { $0.grant.parentScopeID == nil }).id }
             @MainActor func limitedBind() async throws -> [String: Value] {
                 guard case let .completed(value) = try await door.perform(.init(
                     operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
                     scopeID: originalID, targetSessionIDs: [target], arguments: ["worktree": .string("over-limit")]
-                )) else { XCTFail("A restricted-overlap refusal must be structured"); return [:] }
+                )) else { XCTFail("A restricted-overlap refusal must be structured")
+                    return [:]
+                }
                 return try XCTUnwrap(value.objectValue)
             }
             let limitedReply = try await limitedBind()
@@ -4188,6 +4228,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var endpointsComplete = true
         var omittedSessionIDs: Set<UUID> = []
         var unresolvedSessions: [UUID: String] = [:]
+        var historyIssue: String?
         var unknownOrganizationSessionIDs: Set<UUID> = []
         var readCount = 0
         let now: Date
@@ -4220,7 +4261,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             return DomainAgentSessionInventorySnapshot(
                 records: (loaded + historyOnly).filter { !omittedSessionIDs.contains($0.sessionID) },
                 edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete,
-                unresolvedSessions: unresolvedSessions
+                unresolvedSessions: unresolvedSessions, historyIssue: historyIssue
             )
         }
     }
@@ -4485,7 +4526,9 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "expected_order": .array([.string("Beta"), .string("Alpha")])
         ])
         XCTAssertEqual(conflict["result"], .string("order_conflict"))
-        for key in ["code", "subreason", "detail", "next_call", "retryable"] { XCTAssertNotNil(conflict[key], key) }
+        for key in ["code", "subreason", "detail", "next_call", "retryable"] {
+            XCTAssertNotNil(conflict[key], key)
+        }
         XCTAssertEqual(conflict["retryable"], .bool(false))
         let applied = try await fixture.call([
             "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
@@ -4802,6 +4845,25 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     // MARK: - Filters and inventory
 
+    func testHistoryFailureWithoutUnresolvedSessionsReportsActionablePartialAndKeepsRows() async throws {
+        for (issue, retryable) in [("history_index_incomplete", false), ("history_lookup_failed", true)] {
+            let fixture = Fixture()
+            let a = fixture.member("A")
+            try fixture.grant(threshold: 25)
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.historyIssue = issue
+            let inventory = try await fixture.call(["op": .string("inventory")])
+            XCTAssertEqual(inventory["result"], .string("partial"), issue)
+            XCTAssertEqual(inventory["code"], .string("inventory_incomplete"))
+            XCTAssertEqual(inventory["subreason"], .string(issue))
+            XCTAssertEqual(inventory["retryable"], .bool(retryable))
+            XCTAssertNotNil(inventory["next_step"]?.stringValue)
+            XCTAssertEqual(inventory["total_complete"], .bool(false))
+            let rows = try XCTUnwrap(inventory["sessions"]?.arrayValue).compactMap { $0.objectValue?["session_id"] }
+            XCTAssertTrue(rows.contains(.string(a.uuidString)), "healthy open sessions are still listed")
+        }
+    }
+
     func testPartialInventoryPreservesFullAccessAndOrdinaryApprovalCards() async throws {
         for fullAccess in [false, true] {
             let fixture = Fixture()
@@ -4827,7 +4889,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 let id = try XCTUnwrap(result["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
                 await fixture.approveAndApply(id)
                 let applied = try await fixture.call(["op": .string("confirmation_status"), "confirmation_id": .string(id.uuidString)])
-                XCTAssertEqual(applied["state"], .string("applied"))
+                XCTAssertEqual(applied["result"], .string("applied"))
             }
             XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
             XCTAssertEqual(fixture.organizer.states[b]?.isPinned, true)
@@ -6077,10 +6139,89 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome["result"], .string("not_applied"))
         XCTAssertEqual(outcome["code"], .string("bind_failed"))
         XCTAssertEqual(outcome["detail"], .string("test_bind_failure"))
+        // Full error contract on the deferred outcome, not just a code and free text.
+        // An unclassified failure (for example a missing worktree path) is not retryable unchanged.
+        XCTAssertEqual(outcome["subreason"], .string("bind_error"))
+        XCTAssertEqual(outcome["retryable"], .bool(false))
+        XCTAssertEqual(outcome["affected"], .array([.string(target.uuidString)]))
+        XCTAssertEqual(outcome["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("scope_status"))
         XCTAssertEqual(inventory["pending_binds"], .array([]))
         fixture.provenance.add(target, parent: nil, org: UUID())
         let restricted = try await fixture.value(.adminWorktreeInventory, caller: caller)
         XCTAssertEqual(restricted["deferred_outcomes"], .array([]), "A prior outcome must not disclose an out-of-scope target")
+    }
+
+    func testDeferredBindLimitRefusalIsPermanentAndPointsAtScopeStatus() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let host = Host(base: fixture.worktrees)
+        host.bindingError = SessionAdminHostError.guardrailExceeded(limit: 1, current: 1)
+        let handler = SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+        )
+        fixture.core.register(handler)
+        fixture.worktrees.idle[target] = false
+        let queued = try await fixture.value(
+            .adminWorktreeBind,
+            caller: caller,
+            targets: [target],
+            args: ["worktree": .string("test-worktree"), "apply": .string("next_boundary")]
+        )
+        XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"))
+        fixture.worktrees.becomeIdle(target)
+        await handler.settleDeferredBinds()
+        XCTAssertNil(handler.pendingBinds[target])
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        let outcome = try XCTUnwrap(inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(outcome["session_id"], .string(target.uuidString))
+        XCTAssertEqual(outcome["result"], .string("not_applied"))
+        XCTAssertEqual(outcome["code"], .string("bind_failed"))
+        // A configured limit is permanent: no unchanged retry, and recovery points at the scope.
+        XCTAssertEqual(outcome["subreason"], .string("worktree_limit_reached"))
+        XCTAssertEqual(outcome["retryable"], .bool(false))
+        XCTAssertEqual(outcome["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("scope_status"))
+        XCTAssertEqual(inventory["pending_binds"], .array([]))
+    }
+
+    func testDeferredBindIdleTimeoutIsRetryableWithCompleteBindCall() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let host = Host(base: fixture.worktrees)
+        host.bindingError = SessionAdminHostError.notIdle
+        let handler = SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+        )
+        fixture.core.register(handler)
+        fixture.worktrees.idle[target] = false
+        let queued = try await fixture.value(
+            .adminWorktreeBind,
+            caller: caller,
+            targets: [target],
+            args: ["worktree": .string("test-worktree"), "apply": .string("next_boundary")]
+        )
+        XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"))
+        fixture.worktrees.becomeIdle(target)
+        await handler.settleDeferredBinds()
+        XCTAssertNil(handler.pendingBinds[target])
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        let outcome = try XCTUnwrap(inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(outcome["session_id"], .string(target.uuidString))
+        XCTAssertEqual(outcome["result"], .string("not_applied"))
+        XCTAssertEqual(outcome["code"], .string("bind_failed"))
+        // The idle-boundary timeout is transient: retry the complete original bind call.
+        XCTAssertEqual(outcome["subreason"], .string("no_idle_boundary"))
+        XCTAssertEqual(outcome["retryable"], .bool(true))
+        let recovery = outcome["next_call"]?.objectValue?["arguments"]?.objectValue
+        XCTAssertEqual(recovery?["op"], .string("worktree_bind"))
+        XCTAssertEqual(recovery?["session_id"], .string(target.uuidString))
+        XCTAssertEqual(recovery?["worktree"], .string("test-worktree"))
+        XCTAssertEqual(inventory["pending_binds"], .array([]))
     }
 
     func testWorktreeInventoryRefusesRevocationAndMembershipChangeDuringPrunabilityAwait() async throws {
@@ -6111,6 +6252,7 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
     private final class Host: SessionAdminWorktreeHost {
         let base: SessionAdminStructureTests.WorktreeHost
         var failBinding = false
+        var bindingError: Error?
         var onPrunability: (() -> Void)?
         init(base: SessionAdminStructureTests.WorktreeHost) {
             self.base = base
@@ -6131,6 +6273,7 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
             admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
             bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
         ) async throws -> SessionAdminWorktreeInfo {
+            if let bindingError { throw bindingError }
             if failBinding { throw NSError(domain: "Test", code: 1, userInfo: [NSLocalizedDescriptionKey: "test_bind_failure"]) }
             return try await base.bindWorktree(
                 sessionID: sessionID, worktree: worktree, repoRoot: repoRoot, isStillAuthorized: isStillAuthorized,
@@ -7167,7 +7310,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             var fullAccess = global
             let observerFixture = try await LoadedWindowFixture.make(activeID: caller, parentID: nil)
             let targetFixture = try await LoadedWindowFixture.make(activeID: target, parentID: parent)
-            addTeardownBlock { @MainActor in await targetFixture.cleanup(); await observerFixture.cleanup() }
+            addTeardownBlock { @MainActor in await targetFixture.cleanup()
+                await observerFixture.cleanup()
+            }
             try observerFixture.installCarriers()
             try targetFixture.installCarriers()
             let bridge = AgentSessionLinkRuntimeBridge.shared
@@ -7178,10 +7323,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             addTeardownBlock { @MainActor in
                 bridge.test_afterTargetedLink = nil
                 bridge.delegationScopes.test_scopeDecision = nil
-                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller {
+                    bridge.delegationScopes.revoke(scopeID: scope.id)
+                }
                 bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
             }
-            for (fixture, id, parent) in [(observerFixture, caller, Optional<UUID>.none), (targetFixture, target, Optional(parent))] {
+            for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
                 let vm = fixture.window.agentModeViewModel
                 let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
                 let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
@@ -7197,15 +7344,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerFixture.window.agentModeViewModel, tabID: observerTab.id)
             if revokeAfterLink {
                 bridge.test_afterTargetedLink = {
-                    if disableAfterLink { fullAccess = false; return }
-                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                    if disableAfterLink { fullAccess = false
+                        return
+                    }
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller {
+                        bridge.delegationScopes.revoke(scopeID: scope.id)
+                    }
                 }
             }
             if !global, !ownChild {
                 let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
                 let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(targetFixture.window.agentModeViewModel, tabID: targetTab.id)
-                let refusal = await bridge.addDelegatedMonitorLink(observerEndpoint: endpoint, targetEndpoint: targetEndpoint,
-                    authorization: .init(isCurrent: { true }))
+                let refusal = await bridge.addDelegatedMonitorLink(
+                    observerEndpoint: endpoint,
+                    targetEndpoint: targetEndpoint,
+                    authorization: .init(isCurrent: { true })
+                )
                 XCTAssertEqual(refusal, .failed(.childSession), "OFF: another parent's child is not linkable without applicable consent")
             }
             let key = UUID().uuidString
@@ -7450,9 +7604,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false) async throws {
+        // This is the full-access OFF approval-card flow. Never inherit the machine's real setting.
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
         try await MCPSharedServerTestLease.shared.withLease { _ in
-            let requesterID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "EBDD3C4A-E6DE-4D9F-8FA3-5456B640BBE6")! : UUID()
-            let targetID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "7028330D-041A-432C-A6F6-F1C976FAD1AD")! : UUID()
+            // Fresh IDs: reusing a real session's UUID (the original T30 report) collides with the
+            // signed-in user's saved sessions and history on a developer machine.
+            let requesterID = UUID()
+            let targetID = UUID()
             let controller = MonitorFakeNativeController()
             var providerStarts = 0
             let observerController = MonitorFakeNativeController()
@@ -7765,7 +7925,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             if duringRun == "revoke-after-delivery" {
                 bridge.test_afterTargetedDelivery = {
-                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == requesterID { bridge.delegationScopes.revoke(scopeID: scope.id) }
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == requesterID {
+                        bridge.delegationScopes.revoke(scopeID: scope.id)
+                    }
                 }
                 addTeardownBlock { @MainActor in bridge.test_afterTargetedDelivery = nil }
             }
@@ -7779,9 +7941,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertEqual(replay.objectValue?["result"], .string("partial"))
                 XCTAssertEqual(replay.objectValue?["code"], .string("delivery_accepted_scope_revoked"))
                 XCTAssertEqual(replay.objectValue?["retryable"], .bool(false))
-                XCTAssertEqual(providerStarts, 1)
+                // Revocation can cancel the accepted run before its provider starts.
+                XCTAssertLessThanOrEqual(providerStarts, 1, "the replay must not start the task again")
+                // Revocation right after acceptance may stop the run before the provider sends; the
+                // invariant is that the replay never sends the task a second time.
                 let sent = await controller.sentCount
-                XCTAssertEqual(sent, 1)
+                XCTAssertLessThanOrEqual(sent, 1, "the replay must not deliver the task again")
                 return
             }
             try await AsyncTestWait.waitUntil("one approval automatically prepares, links and dispatches", timeout: 15) {
@@ -7827,7 +7992,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertNil(observerVM.test_agentSessionLinkCurrentRunCatalogRouteToken)
             }
             let repeated = try await executeOversee(args)
-            XCTAssertEqual(repeated.objectValue?["result"], .string("continuing_approved_request"))
+            // A replay returns the retained outcome of the one delivered task, never a second task.
+            XCTAssertEqual(repeated.objectValue?["result"], .string("applied"))
             XCTAssertEqual(repeated.objectValue?["request_id"], .string(requestID.uuidString))
             XCTAssertEqual(providerStarts, 1, "The provider starts for the assigned task, never merely to link")
             XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)

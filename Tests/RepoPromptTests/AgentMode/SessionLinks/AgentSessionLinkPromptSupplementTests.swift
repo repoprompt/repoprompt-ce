@@ -91,7 +91,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             "agent_session_link", "managed=&quot;true&quot;", "untrusted data",
             "idempotency_key", "idle_for_send", "sendable", "pending_interaction",
             "interaction_id", "manual-only", "item_id", "awaiting_user",
-            "Idle alone does not prove completion", "only the newest is current"
+            "Idle does not prove completion", "only the newest is current"
         ] {
             XCTAssertTrue(rendered.contains(required), "missing required guidance: \(required)")
         }

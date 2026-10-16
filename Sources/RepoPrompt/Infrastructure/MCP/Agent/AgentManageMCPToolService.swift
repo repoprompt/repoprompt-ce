@@ -1298,6 +1298,20 @@ struct AgentManageMCPToolService {
                 }
             }
         }
+        /// Agent callers' authority (full access, routed caller, connection, workspace, self-target)
+        /// can end while deletion waits for admission and writer draining. Re-prove all of it at
+        /// the storage commit point itself, not only before entering deletion.
+        func destructiveCommitFence(for sessionID: UUID) -> (@Sendable () async -> Bool)? {
+            guard case .agentSession = cleanupCaller else { return nil }
+            return { @MainActor in
+                do {
+                    try await requireCurrentCleanupAuthority(for: sessionID)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        }
         /// Synchronous target fence AFTER the final authority hop. In particular, the tab named
         /// before that hop must not have rebound to another session (possibly the caller itself).
         func requireInactiveCleanupTarget(_ sessionID: UUID, openTabID: UUID? = nil) throws {
@@ -1321,29 +1335,10 @@ struct AgentManageMCPToolService {
                 try await requireCurrentCleanupAuthority(for: sessionID)
             }
         } catch let failure as CleanupAuthorityFailure {
-            let items = requestedIDs.map { id in
-                var reason = failure.subreason
-                if reason == "self_target", case let .agentSession(callerID) = cleanupCaller, id != callerID {
-                    reason = "batch_preflight_not_applied"
-                }
-                return Value.object(AgentManageCleanupDiagnostics.item([
-                    "session_id": .string(id.uuidString), "reason": .string(reason)
-                ]))
-            }
-            var result = AgentManageCleanupDiagnostics.item(["reason": .string(failure.subreason)])
-            result["result"] = .string("not_applied")
-            result["affected"] = .array(requestedIDs.map { .string($0.uuidString) })
-            result["deleted_count"] = .int(0)
-            result["skipped_count"] = .int(items.count)
-            result["skipped_sessions"] = .array(items)
-            result["unprocessed_sessions"] = .array([])
-            result["deleted_sessions"] = .array([])
-            result["retry_session_ids"] = .array([])
-            result["unprocessed_count"] = .int(0)
-            result["processed_count"] = .int(items.count)
-            result["status"] = .string("refused")
-            result["cancelled"] = .bool(false)
-            return .object(result)
+            let callerID: UUID? = if case let .agentSession(id) = cleanupCaller { id } else { nil }
+            return AgentManageCleanupDiagnostics.preflightRefused(
+                reason: failure.subreason, requestedIDs: requestedIDs, callerID: callerID
+            )
         } catch is CancellationError {
             cancelledBeforeLookup = true
         }
@@ -1540,11 +1535,9 @@ struct AgentManageMCPToolService {
                     try await requireCurrentCleanupAuthority(for: sessionID)
                     try requireInactiveCleanupTarget(sessionID, openTabID: openTabID)
                     mutationStarted = true
-                    providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
-                        agentModeVM,
-                        openTabID,
-                        workspace
-                    )
+                    providerCleanupOutcome = try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
+                        try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                    }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
                     #if DEBUG
@@ -1570,7 +1563,9 @@ struct AgentManageMCPToolService {
                     try await requireCurrentCleanupAuthority(for: sessionID)
                     try requireInactiveCleanupTarget(sessionID)
                     mutationStarted = true
-                    try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                    try await AgentSessionDataService.destructiveCommitFence.withValue(destructiveCommitFence(for: sessionID)) {
+                        try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
+                    }
                     durableDeletionCommitted = true
                     await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
                     #if DEBUG
@@ -1646,6 +1641,11 @@ struct AgentManageMCPToolService {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString), "reason": .string(failure.subreason)
                 ])
+            } catch is AgentSessionDestructiveCommitRefused {
+                if !durableDeletionCommitted, let deletionAttempt {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
+                skippedSessions.append(AgentManageCleanupDiagnostics.commitRefusedItem(sessionID: sessionID, name: candidate.name))
             } catch let error as AgentSessionDeletionRegistry.AdmissionError {
                 if !durableDeletionCommitted, let deletionAttempt {
                     await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)

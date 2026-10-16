@@ -49,6 +49,41 @@ enum AgentManageCleanupDiagnostics {
         ])
     }
 
+    /// Whole-batch refusal before any lookup or mutation. A self-target refusal names only the
+    /// caller's own item; the others were not applied because the batch is all-or-nothing.
+    static func preflightRefused(reason: String, requestedIDs: [UUID], callerID: UUID?) -> Value {
+        let items = requestedIDs.map { id in
+            let itemReason = reason == "self_target" && callerID != nil && id != callerID
+                ? "batch_preflight_not_applied" : reason
+            return Value.object(item(["session_id": .string(id.uuidString), "reason": .string(itemReason)]))
+        }
+        var result = item(["reason": .string(reason)])
+        result["result"] = .string("not_applied")
+        result["affected"] = .array(requestedIDs.map { .string($0.uuidString) })
+        result["deleted_count"] = .int(0)
+        result["skipped_count"] = .int(items.count)
+        result["skipped_sessions"] = .array(items)
+        result["unprocessed_sessions"] = .array([])
+        result["deleted_sessions"] = .array([])
+        result["retry_session_ids"] = .array([])
+        result["unprocessed_count"] = .int(0)
+        result["processed_count"] = .int(items.count)
+        result["status"] = .string("refused")
+        result["cancelled"] = .bool(false)
+        return .object(result)
+    }
+
+    /// The deletion's storage commit fence refused: the caller's authority ended while it waited.
+    static func commitRefusedItem(sessionID: UUID, name: String) -> [String: Value] {
+        [
+            "session_id": .string(sessionID.uuidString),
+            "name": .string(name),
+            "reason": .string("authority_changed_before_commit"),
+            "message": .string("The caller's authority (full access, routing, connection or workspace) changed before the deletion committed; nothing was deleted. Re-check with session_admin scope_status, then retry."),
+            "durable": .bool(false)
+        ]
+    }
+
     static func item(_ item: [String: Value]) -> [String: Value] {
         var item = item
         let reason = item["reason"]?.stringValue ?? "cleanup_failed"

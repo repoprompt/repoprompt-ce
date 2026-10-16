@@ -1851,6 +1851,9 @@ actor AgentSessionDataService {
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
         do {
+            if let fence = Self.destructiveCommitFence.get(), await !fence() {
+                throw AgentSessionDestructiveCommitRefused()
+            }
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 try FileManager.default.removeItem(at: fileURL)
             }

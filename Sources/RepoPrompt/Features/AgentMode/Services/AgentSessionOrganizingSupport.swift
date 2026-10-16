@@ -486,6 +486,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         var records: [DomainAgentSessionInventoryRecord] = []
         var isComplete = false
         var recordsComplete = false
+        var historyIssue: String?
         var historyByID: [UUID: (AgentSessionMetadataRecord, String)] = [:]
         if let targets = read.historyTargetIDs {
             var pending = Array(targets)
@@ -537,6 +538,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 try Task.checkCancellation()
                 // A workspace-local scan cannot prove that an endpoint in another workspace is gone.
                 recordsComplete = Self.isComplete(scan)
+                if !recordsComplete { historyIssue = AgentSessionInventoryReadFailure.Reason.historyIndexIncomplete.rawValue }
                 isComplete = read.workspaceID == nil && recordsComplete
                 var projected = 0
                 for workspace in scan.workspaces {
@@ -556,11 +558,13 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 try Task.checkCancellation()
                 if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
                 isComplete = false
+                historyIssue = AgentSessionInventoryReadFailure.Reason.historyLookupFailed.rawValue
             } catch {
                 // History I/O/budget failures never prove deletion, and must not expose filesystem
                 // details through the administration surface. Keep the app-owned loaded projection.
                 try Task.checkCancellation()
                 isComplete = false
+                historyIssue = AgentSessionInventoryReadFailure.Reason.historyLookupFailed.rawValue
             }
         }
         try Task.checkCancellation()
@@ -581,7 +585,8 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             records: records, edges: edges,
             isComplete: isComplete && read.budget.elapsedDiagnostic(phase: "session_admin_projection") == nil,
             recordsComplete: (read.loadedOnly || recordsComplete) && loaded.unresolved.isEmpty,
-            unresolvedSessions: loaded.unresolved
+            unresolvedSessions: loaded.unresolved,
+            historyIssue: read.loadedOnly ? nil : historyIssue
         )
         try Task.checkCancellation()
         // The immutable snapshot's dictionary/edge indexing is synchronous. Never hand back a
@@ -854,7 +859,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
 /// rendered separately after scope redaction, and never treated as deleted sessions.
 enum AgentSessionInventoryRendering {
     static func unresolvedFields(_ snapshot: DomainAgentSessionInventorySnapshot) -> [String: Value] {
-        guard snapshot.unresolvedSessionCount > 0 else { return [:] }
+        guard snapshot.unresolvedSessionCount > 0 else { return historyIssueFields(snapshot) }
         return [
             "result": .string("partial"),
             "code": .string("inventory_incomplete"),
@@ -868,6 +873,21 @@ enum AgentSessionInventoryRendering {
             "unresolved_sessions": .array(snapshot.unresolvedSessions.sorted { $0.key.uuidString < $1.key.uuidString }.map {
                 unresolvedValue(id: $0.key, reason: $0.value)
             })
+        ]
+    }
+
+    /// Healthy rows stay usable; the result says why saved history is incomplete and what to do.
+    static func historyIssueFields(_ snapshot: DomainAgentSessionInventorySnapshot) -> [String: Value] {
+        guard let raw = snapshot.historyIssue,
+              let reason = AgentSessionInventoryReadFailure.Reason(rawValue: raw) else { return [:] }
+        return [
+            "result": .string("partial"),
+            "code": .string("inventory_incomplete"),
+            "subreason": .string(reason.rawValue),
+            "detail": .string(reason.detail + " Open sessions are listed; saved sessions may be missing."),
+            "next_step": .string(reason.nextStep),
+            "retryable": .bool(reason.retryable),
+            "total_complete": .bool(false)
         ]
     }
 

@@ -34,7 +34,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
     enum DeferredBindOutcome: Equatable {
         case applied(worktreeID: String)
         case revoked
-        case failed(String)
+        case failed(subreason: String, detail: String, retryable: Bool, worktree: String, repoRoot: String?)
     }
 
     private let context: SessionAdminHandlerContext
@@ -462,11 +462,36 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 continue
             } catch is CancellationError {
                 return
+            } catch SessionAdminHostError.usageEvidenceUnavailable {
+                // Permanent until placement is repaired: an unchanged retry cannot succeed.
+                return finishDeferredBind(pending, .failed(
+                    subreason: "usage_evidence_unavailable",
+                    detail: SessionAdminHostError.usageEvidenceUnavailable.localizedDescription,
+                    retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
+            } catch let SessionAdminHostError.guardrailExceeded(limit, current) {
+                return finishDeferredBind(pending, .failed(
+                    subreason: "worktree_limit_reached",
+                    detail: "The scope allows \(limit) worktrees and \(current) are bound; release one before binding.",
+                    retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
+            } catch let SessionAdminHostError.invalid(message) {
+                return finishDeferredBind(pending, .failed(
+                    subreason: "invalid_bind", detail: message, retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
             } catch {
-                return finishDeferredBind(pending, .failed(error.localizedDescription))
+                // Unclassified failures (for example a missing worktree path) are not repaired by an
+                // unchanged retry. Only the idle-boundary timeout below is known to be transient.
+                return finishDeferredBind(pending, .failed(
+                    subreason: "bind_error", detail: error.localizedDescription, retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
             }
         }
-        finishDeferredBind(pending, .failed("The target never reached an idle boundary that admitted the bind."))
+        finishDeferredBind(pending, .failed(
+            subreason: "no_idle_boundary",
+            detail: "The target never reached an idle boundary that admitted the bind.",
+            retryable: true, worktree: pending.worktree, repoRoot: pending.repoRoot
+        ))
     }
 
     private func finishDeferredBind(_ pending: DeferredBind, _ outcome: DeferredBindOutcome) {
@@ -643,7 +668,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             .sorted { $0.uuidString < $1.uuidString }
             .compactMap { sessionID -> Value? in
                 guard let outcome = deferredOutcomes[sessionID] else { return nil }
-                var row: [String: Value] = ["session_id": .string(sessionID.uuidString)]
+                var row: [String: Value] = [
+                    "session_id": .string(sessionID.uuidString),
+                    "affected": .array([.string(sessionID.uuidString)])
+                ]
                 switch outcome {
                 case let .applied(worktreeID):
                     row["result"] = .string("applied")
@@ -651,10 +679,24 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 case .revoked:
                     row["result"] = .string("not_applied")
                     row["code"] = .string("scope_revoked")
-                case let .failed(detail):
+                    row["subreason"] = .string("revoked_before_idle_boundary")
+                    row["detail"] = .string("The scope authorizing this deferred bind was revoked before the target reached an idle boundary; nothing was bound.")
+                    row["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+                    row["retryable"] = .bool(false)
+                case let .failed(subreason, detail, retryable, worktree, repoRoot):
                     row["result"] = .string("not_applied")
                     row["code"] = .string("bind_failed")
+                    row["subreason"] = .string(subreason)
                     row["detail"] = .string(detail)
+                    // Retryable failures get the complete original bind call; permanent ones point
+                    // at the scope and limits to inspect instead of an unchanged retry.
+                    row["next_call"] = retryable
+                        ? .object(["tool": .string("session_admin"), "arguments": .object([
+                            "op": .string("worktree_bind"), "session_id": .string(sessionID.uuidString),
+                            "worktree": .string(worktree)
+                        ].merging(repoRoot.map { ["repo_root": Value.string($0)] } ?? [:]) { current, _ in current })])
+                        : .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+                    row["retryable"] = .bool(retryable)
                 }
                 return .object(row)
             }

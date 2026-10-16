@@ -188,10 +188,11 @@ extension AgentSessionLinkRuntimeBridge {
         var linkCommitted = false
         var linkID: UUID?
         var acceptedReceipt: DomainAgentSessionLinkSendReceipt?
-        func notify(_ result: String, continuing: Bool = false) {
+        func notify(_ result: String, continuing: Bool = false, deliveredNothing: Bool = false) {
             scopes.notifyOverseeContinuation(
                 sessionID: observer.sessionID, tabID: observer.tabID, requestID: requestID,
-                result: "oversee target=\(targetSessionID.uuidString); \(result)", continuing: continuing
+                result: "oversee target=\(targetSessionID.uuidString); \(result)", continuing: continuing,
+                deliveredNothing: deliveredNothing
             )
         }
         func finish(_ code: String, subreason: String, detail: String, applied: Bool = false, retryable: Bool = false, continuing: Bool = false) {
@@ -212,7 +213,7 @@ extension AgentSessionLinkRuntimeBridge {
             )
             scopes.completeOverseeInitialOutcome(requestID: requestID, value: value)
             // Only closed app codes/static detail enter this authority notice, never handler text.
-            notify("\(code); result=\(result); subreason=\(subreason); detail=\(detail); link_committed=\(linkCommitted); link_id=\(linkID?.uuidString ?? "unavailable"); next_call=session_admin {op:\"scope_status\"}; retryable=\(retryable)", continuing: continuing)
+            notify("\(code); result=\(result); subreason=\(subreason); detail=\(detail); link_committed=\(linkCommitted); link_id=\(linkID?.uuidString ?? "unavailable"); next_call=session_admin {op:\"scope_status\"}; retryable=\(retryable)", continuing: continuing, deliveredNothing: result == "not_applied")
         }
         func consentIsCurrent() -> Bool {
             scopes.reconcileGlobalAutoApprove()
