@@ -173,6 +173,7 @@ enum SessionAdminHostError: LocalizedError, Equatable {
     case notIdle
     /// Delegated authority (lease or membership) ended before the write; nothing changed.
     case authorityEnded
+    case usageEvidenceUnavailable
     case guardrailExceeded(limit: Int, current: Int)
     case invalid(String)
 
@@ -184,6 +185,8 @@ enum SessionAdminHostError: LocalizedError, Equatable {
             "The target session is busy; worktree bindings change only at an idle boundary."
         case .authorityEnded:
             "Delegated authority over the target ended before the change; nothing was changed."
+        case .usageEvidenceUnavailable:
+            "A configured worktree limit requires complete placement evidence. Resolve ambiguous session bindings or open their workspace, then retry; inspect session_admin scope_status for configured limits."
         case let .guardrailExceeded(limit, current):
             "The worktree binding would exceed max_worktrees (limit \(limit), current \(current))."
         case let .invalid(message):

@@ -362,6 +362,81 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         }
     }
 
+    func testGroupsAcrossLoadedWorkspacesUseProductionFrontDoorAndRealFullAccessSetting() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let defaults = UserDefaults.standard
+            let key = "agentMode.delegation.autoApproveAllRequests"
+            let old = defaults.object(forKey: key)
+            defer { if let old { defaults.set(old, forKey: key) } else { defaults.removeObject(forKey: key) } }
+            for enabled in [false, true] {
+                defaults.set(enabled, forKey: key)
+                let caller = try await Fixture.make(isolated: true)
+                let destination = try await Fixture.make(isolated: true)
+                do {
+                    let callerID = caller.callerTab.activeAgentSessionID!
+                    let ids = [destination.callerTab.activeAgentSessionID!, destination.targetTab.activeAgentSessionID!]
+                    var scope: UUID?
+                    if !enabled {
+                        let request = try caller.scopes.requestScope(
+                            requesterSessionID: callerID, requesterTabID: caller.callerTab.id,
+                            kind: .workspace(workspaceID: destination.workspaceID), capabilities: [.observe, .organize],
+                            guardrails: .init(bulkConfirmationThreshold: 1), reason: nil, idempotencyKey: nil
+                        ).get()
+                        scope = try caller.scopes.approve(requestID: request.id).get().id
+                    }
+                    @MainActor func perform(_ operation: DomainAgentSessionTargetOperation, targets: [UUID] = [], arguments: [String: Value], key: String) async throws -> [String: Value] {
+                        let result = try await caller.frontDoor.perform(.init(
+                            operation: operation, caller: .agentSession(callerID), callerTabID: caller.callerTab.id,
+                            scopeID: scope, targetSessionIDs: targets, idempotencyKey: key, arguments: arguments
+                        ))
+                        switch result {
+                        case let .completed(value): return try XCTUnwrap(value.objectValue)
+                        case let .pendingConfirmation(card, _):
+                            XCTAssertFalse(enabled, "ON must never raise a card")
+                            let before = try destination.workspace()
+                            if key == "set" { XCTAssertTrue(before.composeTabs.allSatisfy { $0.sidebarGroup == nil }) }
+                            await caller.frontDoor.approveAndApply(
+                                confirmationID: card.id, presentedTabID: caller.callerTab.id, presentedSessionID: callerID
+                            )
+                            return try XCTUnwrap(caller.frontDoor.appliedResult(forConfirmation: card.id)?.objectValue)
+                        default: XCTFail("Unexpected authorization outcome for \(operation) (full access \(enabled)): \(result)")
+                            return [:]
+                        }
+                    }
+                    let set = try await perform(.adminSetGroup, targets: ids, arguments: ["group": .string("Alpha")], key: "set")
+                    XCTAssertEqual(set["result"], .string("applied"))
+                    if enabled { XCTAssertTrue(caller.scopes.confirmations.confirmations.isEmpty) }
+                    else { XCTAssertFalse(caller.scopes.confirmations.confirmations.isEmpty, "OFF must use a real batch card") }
+                    let changed = try await perform(.adminSetGroup, targets: [ids[1]], arguments: ["group": .string("Beta")], key: "change")
+                    XCTAssertEqual(changed["changed_count"], .int(1))
+                    var reorder: [String: Value] = [
+                        "workspace": .string(destination.workspaceID.uuidString),
+                        "order": .array([.string("Beta"), .string("Alpha")]),
+                        "expected_order": .array([.string("Beta"), .string("Alpha")])
+                    ]
+                    let conflict = try await perform(.adminReorderGroups, arguments: reorder, key: "stale")
+                    XCTAssertEqual(conflict["result"], .string("order_conflict"))
+                    for key in ["code", "subreason", "detail", "next_call", "retryable"] {
+                        XCTAssertNotNil(conflict[key], key)
+                    }
+                    reorder["expected_order"] = .array([.string("Alpha"), .string("Beta")])
+                    let ordered = try await perform(.adminReorderGroups, arguments: reorder, key: "order")
+                    XCTAssertEqual(ordered["group_order"], .array([.string("Beta"), .string("Alpha")]))
+                    let cleared = try await perform(.adminSetGroup, targets: ids, arguments: ["group": .string("")], key: "clear")
+                    XCTAssertEqual(cleared["changed_count"], .int(2))
+                    XCTAssertTrue(try destination.workspace().composeTabs.allSatisfy { $0.sidebarGroup == nil && $0.sidebarGroupOrder == nil })
+                    XCTAssertTrue(try caller.workspace().composeTabs.allSatisfy { $0.sidebarGroup == nil }, "Do not mutate the caller's workspace")
+                    await destination.cleanup()
+                    await caller.cleanup()
+                } catch {
+                    await destination.cleanup()
+                    await caller.cleanup()
+                    throw error
+                }
+            }
+        }
+    }
+
     func testRenamePinGroupAndUndoReachWorkspaceAndSidebarWithoutChangingSelection() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let fixture = try await Fixture.make()
@@ -839,7 +914,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 }
                 let reply = try await fixture.call("unarchive", [:])
                 XCTAssertTrue(restashed)
-                XCTAssertEqual(reply["result"], .string("failed"))
+                XCTAssertEqual(reply["result"], .string("partial"))
                 XCTAssertEqual(reply["changed_count"], .int(0))
                 XCTAssertNil(reply["undo_token"], "An unconfirmed restore must not issue an inverse archive token")
                 let item = try XCTUnwrap(reply["items"]?.arrayValue?.first?.objectValue)
@@ -1053,7 +1128,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             self.directory = directory
         }
 
-        static func make(ephemeral: Bool = true) async throws -> Fixture {
+        static func make(ephemeral: Bool = true, isolated: Bool = false) async throws -> Fixture {
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("session-admin-production-\(UUID())", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1062,17 +1137,22 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             WindowStatesManager.shared.registerWindowState(window)
             do {
                 await window.workspaceManager.awaitInitialized()
-                var workspace = window.workspaceManager.createWorkspace(
-                    name: "Organizer journey", repoPaths: [], ephemeral: ephemeral
-                )
+                var workspace = isolated
+                    ? WorkspaceModel(name: "Isolated organizer journey", repoPaths: [], ephemeralFlag: true)
+                    : window.workspaceManager.createWorkspace(name: "Organizer journey", repoPaths: [], ephemeral: ephemeral)
                 workspace.customStoragePath = directory
                 workspace.composeTabs = [fixture.callerTab, fixture.targetTab]
                 workspace.activeComposeTabID = fixture.callerTab.id
                 fixture.workspaceID = workspace.id
-                let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
-                    workspace, reason: "sessionAdminProductionJourney"
-                )
-                XCTAssertEqual(switched, .switched)
+                if isolated {
+                    window.workspaceManager.workspaces = [workspace]
+                    window.workspaceManager.activeWorkspace = workspace
+                } else {
+                    let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+                        workspace, reason: "sessionAdminProductionJourney"
+                    )
+                    XCTAssertEqual(switched, .switched)
+                }
                 // Activation resolves the manager's canonical workspace, not every field of the
                 // caller's local replacement. Install the actual carriers only after it settles.
                 var current = try fixture.workspace()
@@ -1142,12 +1222,14 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 fixture.frontDoor = AgentSessionAdministrationFrontDoor.production(
                     core: core, scopes: fixture.scopes, workspaceLocations: locations
                 )
-                let requested = try fixture.scopes.requestScope(
-                    requesterSessionID: fixture.callerTab.activeAgentSessionID!, requesterTabID: fixture.callerTab.id,
-                    kind: .workspace(workspaceID: workspace.id), capabilities: [.observe, .organize],
-                    guardrails: .init(), reason: nil, idempotencyKey: nil
-                ).get()
-                _ = try fixture.scopes.approve(requestID: requested.id).get()
+                if !OverseerGlobalAutoApprove.isEnabled() {
+                    let requested = try fixture.scopes.requestScope(
+                        requesterSessionID: fixture.callerTab.activeAgentSessionID!, requesterTabID: fixture.callerTab.id,
+                        kind: .workspace(workspaceID: workspace.id), capabilities: [.observe, .organize],
+                        guardrails: .init(), reason: nil, idempotencyKey: nil
+                    ).get()
+                    _ = try fixture.scopes.approve(requestID: requested.id).get()
+                }
                 return fixture
             } catch {
                 await fixture.cleanup()

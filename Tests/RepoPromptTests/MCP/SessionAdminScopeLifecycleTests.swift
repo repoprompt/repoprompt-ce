@@ -1703,6 +1703,158 @@ private extension Array {
 /// release card), lease re-checks after suspension, and placement persistence.
 @MainActor
 final class SessionAdminStructureTests: XCTestCase {
+    func testBatchResultsReflectEffectsAndFailuresAcrossReceiptFamilies() throws {
+        let id = UUID(), other = UUID()
+        for op in ["link", "worktree_bind", "worktree_release", "set_model", "reparent"] {
+            let failed = SessionAdminItemResult(sessionID: id, result: "not_applied", code: "bind_failed")
+            let changed = SessionAdminItemResult(sessionID: other, result: "applied")
+            let unchanged = SessionAdminItemResult(sessionID: id, result: "unchanged")
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [failed]).objectValue?["result"], .string("not_applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [changed, failed]).objectValue?["result"], .string("partial"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [unchanged]).objectValue?["result"], .string("not_applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [changed]).objectValue?["result"], .string("applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [failed], preview: true).objectValue?["result"], .string("preview"))
+            let failure = try XCTUnwrap(failed.value.objectValue)
+            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] {
+                XCTAssertNotNil(failure[key], key)
+            }
+        }
+        for status in [AgentSessionAdminItemResult.Status.unchanged, .failed, .skipped] {
+            XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
+                operation: .adminSetGroup, items: [.init(sessionID: id, status: status)], itemsRequiringControl: []
+            ).objectValue?["result"], .string("not_applied"))
+        }
+        XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
+            operation: .adminArchive, items: [.init(sessionID: id, status: .failed)], itemsRequiringControl: [],
+            extra: [AgentSessionAdminRendering.committedChangesKey: .bool(true)]
+        ).objectValue?["result"], .string("partial"))
+    }
+
+    func testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation() async throws {
+        let defaults = UserDefaults.standard
+        let key = "agentMode.delegation.autoApproveAllRequests"
+        let old = defaults.object(forKey: key)
+        defer { if let old { defaults.set(old, forKey: key) } else { defaults.removeObject(forKey: key) } }
+        for enabled in [false, true] {
+            defaults.set(enabled, forKey: key)
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID(), tab = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            if !enabled { try fixture.grant(caller) }
+            typealias Organizing = SessionAdminOrganizingOperationTests
+            let organizer = Organizing.FakeOrganizer(), links = Organizing.FakeLinks()
+            let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+            defer { withExtendedLifetime((organizer, links, inventoryProvenance)) {} }
+            let door = AgentSessionAdministrationFrontDoor(
+                core: fixture.core, scopes: fixture.runtime, projector: fixture.projector,
+                inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
+                liveBoundSession: { $0 == tab ? caller : nil }
+            )
+            door.registerStructureHandlers(
+                scopes: fixture.runtime, worktreeOwnership: fixture.ownership, projector: fixture.projector,
+                structureHost: fixture.structure, worktreeHost: fixture.worktrees
+            )
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("existing")]
+            let release = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeRelease, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "release"
+            )
+            let outcome = try await door.perform(release)
+            if enabled {
+                guard case .completed = outcome else { return XCTFail("Full access must not raise a card") }
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            } else {
+                guard case let .pendingConfirmation(card, _) = outcome else { return XCTFail("OFF must retain the release card") }
+                XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+                await door.approveAndApply(confirmationID: card.id, presentedTabID: tab, presentedSessionID: caller)
+            }
+            XCTAssertEqual(fixture.worktrees.unbindCalls, [target])
+            fixture.provenance.censusConflicts = [UUID(): []]
+            let bind = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], arguments: ["worktree": .string("no-limit")]
+            )
+            guard case let .completed(binding) = try await door.perform(bind) else { return XCTFail("No limit requires no capacity census") }
+            XCTAssertEqual(binding.objectValue?["result"], .string("applied"))
+            if enabled {
+                guard case let .completed(inventory) = try await door.perform(.init(
+                    operation: .adminWorktreeInventory, caller: .agentSession(caller), callerTabID: tab
+                )) else { return XCTFail("Full access inventory requires no capacity census") }
+                XCTAssertNotNil(inventory.objectValue?["worktrees"])
+            }
+            fixture.provenance.censusConflicts = [:]
+            fixture.worktrees.idle[target] = false
+            let create = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-partial"
+            )
+            guard case let .completed(value) = try await door.perform(create) else { return XCTFail("Create completes") }
+            let result = try XCTUnwrap(value.objectValue)
+            XCTAssertEqual(result["result"], .string("partial"))
+            XCTAssertEqual(result["changed_count"], .int(1))
+            XCTAssertEqual(result["bound"], .bool(false))
+            XCTAssertNotNil(result["worktree"])
+            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] { XCTAssertNotNil(result[key], key) }
+            guard case let .completed(replay) = try await door.perform(create) else { return XCTFail("Replay completes") }
+            XCTAssertEqual(replay.objectValue?["idempotent_replay"], .bool(true))
+            XCTAssertEqual(fixture.worktrees.created.count, 1)
+            fixture.worktrees.idle[target] = true
+            guard case let .completed(bound) = try await door.perform(.init(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-bound"
+            )) else { return XCTFail("Create binds by default") }
+            XCTAssertEqual(bound.objectValue?["bound"], .bool(true))
+            XCTAssertEqual(fixture.worktrees.bound[target]?.first?.worktreeID, "wt-2")
+            guard case let .completed(unbound) = try await door.perform(.init(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-unbound", arguments: ["bind": .bool(false)]
+            )) else { return XCTFail("Explicit unbound remains supported") }
+            XCTAssertEqual(unbound.objectValue?["bound"], .bool(false))
+            XCTAssertNotNil(unbound.objectValue?["next_call"])
+            if enabled {
+                let scope = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.unrestricted })
+                let status = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(scope, now: Date()).objectValue)
+                XCTAssertEqual(status["unrestricted"], .bool(true))
+                XCTAssertNil(status["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
+            }
+            // A global caller still cannot hide the restricted scopes its target's bindings count toward.
+            // Create restrictions with the setting OFF, then exercise the actual ON/OFF front door.
+            defaults.set(false, forKey: key)
+            let ancestor = UUID()
+            fixture.provenance.add(ancestor, parent: nil)
+            fixture.provenance.add(caller, parent: ancestor)
+            let limited = try fixture.grant(ancestor, guardrails: .init(maxWorktrees: 1))
+            let proof = try XCTUnwrap(fixture.projector.membershipProof(for: caller, in: limited.grant))
+            _ = try fixture.runtime.attenuate(
+                parentScopeID: limited.id, presentedGeneration: limited.generation, caller: .agentSession(ancestor),
+                newGranteeSessionID: caller, newGranteeMemberships: [proof], capabilities: [.observe, .worktree],
+                guardrails: .init(maxWorktrees: 1)
+            ).get()
+            defaults.set(enabled, forKey: key)
+            let originalID: UUID?
+            if enabled { originalID = nil }
+            else { originalID = try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { $0.grant.parentScopeID == nil }).id }
+            @MainActor func limitedBind() async throws -> [String: Value] {
+                guard case let .completed(value) = try await door.perform(.init(
+                    operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
+                    scopeID: originalID, targetSessionIDs: [target], arguments: ["worktree": .string("over-limit")]
+                )) else { XCTFail("A restricted-overlap refusal must be structured"); return [:] }
+                return try XCTUnwrap(value.objectValue)
+            }
+            let limitedReply = try await limitedBind()
+            XCTAssertEqual(limitedReply["result"], .string("not_applied"))
+            XCTAssertEqual(items(limitedReply)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+            fixture.provenance.censusConflicts = [UUID(): []]
+            let unproven = try await limitedBind()
+            XCTAssertEqual(unproven["result"], .string("not_applied"))
+            let item = try XCTUnwrap(items(unproven)[target.uuidString])
+            XCTAssertEqual(item["subreason"], .string("usage_evidence_unavailable"))
+            XCTAssertEqual(item["retryable"], .bool(false))
+            XCTAssertNotNil(item["next_call"])
+        }
+    }
+
     fileprivate struct Pair: Hashable {
         let observer: UUID
         let target: UUID
@@ -1711,6 +1863,11 @@ final class SessionAdminStructureTests: XCTestCase {
     @MainActor
     final class Provenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
+        var censusConflicts: [UUID: Set<UUID>] = [:]
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            .init(records: sessions, states: sessions.mapValues { _ in .indexOnly }, placementConflicts: censusConflicts)
+        }
 
         func add(
             _ id: UUID,
@@ -3392,7 +3549,7 @@ final class SessionAdminStructureTests: XCTestCase {
         _ = try await fixture.value(.adminWorktreeBind, caller: overseer, targets: [member], args: ["worktree": .string("w-old")])
         XCTAssertNil(fixture.ownership.record(worktreeID: "w-old")?.releasedAt)
 
-        _ = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member])
+        _ = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member], args: ["bind": .bool(false)])
         fixture.ownership.markReleased([WorktreeHost.summary("wt-1")], bySessionID: overseer, at: Date())
         fixture.worktrees.boundElsewhere["wt-1"] = [elsewhere]
         let inventory = try await fixture.value(.adminWorktreeInventory, caller: overseer)
@@ -4272,6 +4429,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "expected_order": .array([.string("Beta"), .string("Alpha")])
         ])
         XCTAssertEqual(conflict["result"], .string("order_conflict"))
+        for key in ["code", "subreason", "detail", "next_call", "retryable"] { XCTAssertNotNil(conflict[key], key) }
+        XCTAssertEqual(conflict["retryable"], .bool(false))
         let applied = try await fixture.call([
             "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
             "order": .array([.string("Beta"), .string("Alpha")]),
@@ -4892,7 +5051,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let failed = try await fixture.call([
             "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
         ])
-        XCTAssertEqual(failed["applied_result"]?.objectValue?["result"], .string("failed"))
+        XCTAssertEqual(failed["applied_result"]?.objectValue?["result"], .string("not_applied"))
         XCTAssertEqual(failed["selection"], pending["selection"])
         fixture.inventory.recordsComplete = true
         fixture.inventory.endpointsComplete = true
@@ -4994,7 +5153,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let status = try await fixture.call(statusArgs)
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(hasLink ? "applied" : "unchanged")
+            let expected: Value = .string(hasLink ? "applied" : "not_applied")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -5045,7 +5204,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             ])
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(hasLink ? "partial" : "failed")
+            let expected: Value = .string(hasLink ? "partial" : "not_applied")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -5161,7 +5320,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             ])
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(alreadyArchived ? "failed" : "partial")
+            let expected: Value = .string(alreadyArchived ? "not_applied" : "partial")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -5522,7 +5681,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "idempotency_key": .string("pin-noop")
         ]
         let noop = try await fixture.call(args)
-        XCTAssertEqual(noop["result"], .string("unchanged"))
+        XCTAssertEqual(noop["result"], .string("not_applied"))
         XCTAssertEqual(items(noop)[a.uuidString], "unchanged")
         fixture.organizer.states[a]?.isPinned = false
         let retry = try await fixture.call(args)
