@@ -2482,17 +2482,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         bumpStateVersion(for: workspaceID)
     }
 
-    /// Deferred UI publications can arrive after a save has already captured them, or repeat
-    /// an unchanged selection during root reconciliation. They must not invalidate prepared
-    /// bytes unless there is still an actual persistent tab change to capture.
-    func markWorkspaceDirtyIfActiveTabSnapshotChanged() {
-        let (name, base) = activeComposeTabContext()
-        guard let base else { return }
-        let snapshot = collectComposeTabSnapshot(name: name, base: base)
-        guard Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: base, touchModified: false) else { return }
-        bumpStateVersion(for: activeWorkspaceID)
-    }
-
     /// Quick lookup cache replaced with index-based lookup
     private var workspaceIndexMap: [UUID: Int] = [:]
     /// Last accepted root order: canonical working roots with runtime authority, disk roots in legacy managers.

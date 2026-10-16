@@ -2504,7 +2504,7 @@ class PromptViewModel: ObservableObject {
                 isDirty = true
                 // ⬇️ Only mark prompt-text dirty (light recalculation)
                 tokenCountingViewModel.markPromptDirty()
-                workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                workspaceManager?.markWorkspaceDirty()
                 updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
@@ -2516,7 +2516,7 @@ class PromptViewModel: ObservableObject {
                 self?.isDirty = true
                 // ⬇️ Heavy changes (selection impacts baseline)
                 self?.tokenCountingViewModel.markDirty()
-                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesSelectionVersion()
             }
@@ -2525,26 +2525,36 @@ class PromptViewModel: ObservableObject {
         fileManager.selectionClearedPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
 
         fileManager.$autoCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesAutoCodemapVersion()
             }
             .store(in: &cancellables)
 
         fileManager.$manualCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
                 self?.bumpChatPromptEntriesAutoCodemapVersion()
             }
@@ -2604,7 +2614,7 @@ class PromptViewModel: ObservableObject {
                 self?.isDirty = true
                 // ⬇️ Only git diff tokens change (light recalculation)
                 self?.tokenCountingViewModel.markGitDiffDirty()
-                self?.workspaceManager?.markWorkspaceDirtyIfActiveTabSnapshotChanged()
+                self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
             }
             .store(in: &cancellables)
