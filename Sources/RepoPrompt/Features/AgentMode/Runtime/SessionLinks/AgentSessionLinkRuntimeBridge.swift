@@ -28,6 +28,7 @@ enum AgentSessionLinkModelOutcome {
     case accepted(AgentSessionLinkModelReceipt)
     case blocked(AgentSessionLinkSendFailure)
     case invalid(String)
+    case refused(code: String, detail: String, alternatives: [String])
 }
 
 extension AgentSessionLinkEndpointHost {
@@ -6643,16 +6644,28 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Authoritative outbound inventory for a targetless `list`.
     ///
-    /// `list` names no target, so it is authorized against the caller's own grant set and exists only
-    /// while at least one outbound link remains.
+    /// Linked observers list their own grant set. An explicitly activated eligible caller may also
+    /// inspect its own empty set; activation never supplies authority over a target.
     func inventory(
         forObserverEndpoint observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Result<DomainAgentSessionLinkInventory, AuthorizationFailure> {
         guard await revalidateObserver(endpoint: observerEndpoint) else {
             return .failure(.denied)
         }
-        return await authority.authorizeInventory(observerEndpoint: observerEndpoint)
-            .mapError(AuthorizationFailure.init)
+        let result = await authority.authorizeInventory(observerEndpoint: observerEndpoint)
+        if case .failure(.noActiveLink) = result,
+           let activation = overseerBootstrapState(for: observerEndpoint)?.activation,
+           activation.endpoint == observerEndpoint
+        {
+            // Activation admits discovery of the caller's own empty set, never any target action.
+            // Keep the domain's link-only authorization unchanged for unactivated inbound callers.
+            let inventory = await authority.links(forObserverEndpoint: observerEndpoint)
+            guard await revalidateObserver(endpoint: observerEndpoint),
+                  overseerBootstrapState(for: observerEndpoint)?.activation == activation,
+                  !isFrozenForTermination else { return .failure(.denied) }
+            return .success(inventory)
+        }
+        return result.mapError(AuthorizationFailure.init)
     }
 
     func setWaitingOn(

@@ -224,6 +224,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .applied(changed: receipt.changed, fields: fields)
         case let .blocked(failure):
             return .blocked(failure.rawValue)
+        case let .refused(_, detail, _):
+            return .invalid(detail)
         case let .invalid(message):
             return .invalid(message)
         }

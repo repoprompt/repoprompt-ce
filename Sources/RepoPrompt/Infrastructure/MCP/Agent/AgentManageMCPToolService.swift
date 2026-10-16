@@ -171,27 +171,6 @@ struct AgentManageMCPToolService {
         )
     }
 
-    /// Cleanup resolves target provenance through the same injected persistence seam the mutation
-    /// path uses, so authorization and deletion agree on what each requested UUID is.
-    private func cleanupProvenance(
-        sessionID: UUID,
-        agentModeVM: AgentModeViewModel,
-        workspace: WorkspaceModel
-    ) async -> DomainAgentSessionTargetProvenance {
-        if let liveSession = try? agentModeVM.authoritativeLiveSession(for: sessionID),
-           liveSession.hasLoadedPersistedState
-        {
-            return .known(targetSessionID: sessionID, parentSessionID: liveSession.parentSessionID)
-        }
-        if let entry = agentModeVM.sessionIndex[sessionID] {
-            return .known(targetSessionID: sessionID, parentSessionID: entry.parentSessionID)
-        }
-        if let meta = try? await cleanupDependencies.loadPersistedMetadata(sessionID, workspace) {
-            return .known(targetSessionID: sessionID, parentSessionID: meta.parentSessionID)
-        }
-        return .unknown(targetSessionID: sessionID)
-    }
-
     func execute(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "list_sessions"
         switch op {
@@ -1292,19 +1271,78 @@ struct AgentManageMCPToolService {
         // Collection operations authorize every target before any mutation or data return, so a
         // partially applied cleanup can never leak that one of the requested UUIDs exists.
         let cleanupCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
-        if cleanupCaller != .administrativePrincipal {
-            for sessionID in requestedIDs {
-                try await AgentSessionTargetOperationGuard.require(
-                    operation: .manageCleanup,
-                    caller: cleanupCaller,
-                    provenance: cleanupProvenance(
-                        sessionID: sessionID,
-                        agentModeVM: agentModeVM,
-                        workspace: workspace
-                    ),
-                    reference: sessionID.uuidString
-                )
+        /// Deletion is human-only unless the user explicitly enabled full access. Neither spawn
+        /// provenance nor an ordinary scope/link can supply this exception. Check before lookup.
+        func requireCurrentCleanupAuthority(for sessionID: UUID) async throws {
+            let currentMetadata = await captureRequestMetadata()
+            let currentCaller = await operationCaller(metadata: currentMetadata, targetWindow: targetWindow)
+            try cleanupDependencies.checkCancellation()
+            guard currentCaller == cleanupCaller,
+                  currentMetadata.connectionID == metadata.connectionID,
+                  targetWindow.workspaceManager.activeWorkspace?.id == workspace.id
+            else { throw CleanupAuthorityFailure(subreason: "caller_or_workspace_changed") }
+            switch currentCaller {
+            case .administrativePrincipal: return
+            case .unresolvedAgentRun:
+                throw CleanupAuthorityFailure(subreason: "caller_routing_unresolved")
+            case let .agentSession(callerID):
+                guard sessionID != callerID else { throw CleanupAuthorityFailure(subreason: "self_target") }
+                guard OverseerGlobalAutoApprove.isEnabled() else {
+                    throw CleanupAuthorityFailure(subreason: "human_only_operation")
+                }
+                guard metadata.connectionID != nil else {
+                    throw CleanupAuthorityFailure(subreason: "caller_routing_unresolved")
+                }
             }
+        }
+        /// Synchronous target fence AFTER the final authority hop. In particular, the tab named
+        /// before that hop must not have rebound to another session (possibly the caller itself).
+        func requireInactiveCleanupTarget(_ sessionID: UUID, openTabID: UUID? = nil) throws {
+            if let openTabID {
+                guard targetWindow.workspaceManager.modelRoutingTab(workspaceID: workspace.id, tabID: openTabID)?.activeAgentSessionID == sessionID,
+                      agentModeVM.sessions[openTabID].map({ $0.activeAgentSessionID == sessionID }) ?? true
+                else { throw CleanupAuthorityFailure(subreason: "target_binding_changed") }
+            }
+            let live: AgentModeViewModel.TabSession?
+            do { live = try agentModeVM.authoritativeLiveSession(for: sessionID) }
+            catch { throw CleanupAuthorityFailure(subreason: "target_state_unresolved") }
+            if let live {
+                let active = agentModeVM.mcpSnapshot(for: live).map { !$0.status.isTerminal }
+                    ?? (live.runState.isActive || live.mcpFollowUpRunPending || live.pendingSupersedingTurnCompletions > 0)
+                guard !active else { throw CleanupAuthorityFailure(subreason: "skipped_active") }
+            }
+        }
+        var cancelledBeforeLookup = false
+        do {
+            for sessionID in requestedIDs {
+                try await requireCurrentCleanupAuthority(for: sessionID)
+            }
+        } catch let failure as CleanupAuthorityFailure {
+            let items = requestedIDs.map { id in
+                var reason = failure.subreason
+                if reason == "self_target", case let .agentSession(callerID) = cleanupCaller, id != callerID {
+                    reason = "batch_preflight_not_applied"
+                }
+                return Value.object(AgentManageCleanupDiagnostics.item([
+                    "session_id": .string(id.uuidString), "reason": .string(reason)
+                ]))
+            }
+            var result = AgentManageCleanupDiagnostics.item(["reason": .string(failure.subreason)])
+            result["result"] = .string("not_applied")
+            result["affected"] = .array(requestedIDs.map { .string($0.uuidString) })
+            result["deleted_count"] = .int(0)
+            result["skipped_count"] = .int(items.count)
+            result["skipped_sessions"] = .array(items)
+            result["unprocessed_sessions"] = .array([])
+            result["deleted_sessions"] = .array([])
+            result["retry_session_ids"] = .array([])
+            result["unprocessed_count"] = .int(0)
+            result["processed_count"] = .int(items.count)
+            result["status"] = .string("refused")
+            result["cancelled"] = .bool(false)
+            return .object(result)
+        } catch is CancellationError {
+            cancelledBeforeLookup = true
         }
 
         #if DEBUG
@@ -1315,11 +1353,11 @@ struct AgentManageMCPToolService {
         var deletedSessions: [[String: Value]] = []
         var skippedSessions: [[String: Value]] = []
         var unprocessedSessions: [[String: Value]] = []
-        var retrySessionIDs: [UUID] = []
         var wasCancelled = false
 
         for (index, sessionID) in requestedIDs.enumerated() {
             do {
+                if cancelledBeforeLookup { throw CancellationError() }
                 try cleanupDependencies.checkCancellation()
             } catch is CancellationError {
                 wasCancelled = true
@@ -1330,7 +1368,7 @@ struct AgentManageMCPToolService {
                         "reason": .string("cancelled_before_processing")
                     ]
                 }
-                retrySessionIDs.append(contentsOf: remainingIDs)
+
                 break
             }
 
@@ -1393,7 +1431,7 @@ struct AgentManageMCPToolService {
                         "reason": .string("cancelled_before_mutation")
                     ]
                 }
-                retrySessionIDs.append(contentsOf: remainingIDs)
+
                 break
             } catch {
                 skippedSessions.append([
@@ -1402,7 +1440,7 @@ struct AgentManageMCPToolService {
                     "reason": .string("resolution_failed"),
                     "message": .string(error.localizedDescription)
                 ])
-                retrySessionIDs.append(sessionID)
+
                 continue
             }
 
@@ -1417,7 +1455,22 @@ struct AgentManageMCPToolService {
                         "reason": .string("cancelled_before_mutation")
                     ]
                 }
-                retrySessionIDs.append(contentsOf: remainingIDs)
+
+                break
+            }
+
+            do {
+                try await requireCurrentCleanupAuthority(for: sessionID)
+            } catch let failure as CleanupAuthorityFailure {
+                skippedSessions.append([
+                    "session_id": .string(sessionID.uuidString), "reason": .string(failure.subreason)
+                ])
+                continue
+            } catch is CancellationError {
+                wasCancelled = true
+                unprocessedSessions = requestedIDs[index...].map {
+                    ["session_id": .string($0.uuidString), "reason": .string("cancelled_before_mutation")]
+                }
                 break
             }
 
@@ -1430,7 +1483,10 @@ struct AgentManageMCPToolService {
                 continue
             }
 
-            guard candidate.isMCPOriginated else {
+            guard candidate.isMCPOriginated || {
+                if case .agentSession = cleanupCaller { return OverseerGlobalAutoApprove.isEnabled() }
+                return false
+            }() else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
@@ -1478,6 +1534,8 @@ struct AgentManageMCPToolService {
                     #if DEBUG
                         let deleteOpenStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
+                    try await requireCurrentCleanupAuthority(for: sessionID)
+                    try requireInactiveCleanupTarget(sessionID, openTabID: openTabID)
                     mutationStarted = true
                     providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
                         agentModeVM,
@@ -1506,6 +1564,8 @@ struct AgentManageMCPToolService {
                     #if DEBUG
                         let deletePersistedStartMS = perfRecorder.timestampMSIfEnabled()
                     #endif
+                    try await requireCurrentCleanupAuthority(for: sessionID)
+                    try requireInactiveCleanupTarget(sessionID)
                     mutationStarted = true
                     try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
                     durableDeletionCommitted = true
@@ -1573,9 +1633,16 @@ struct AgentManageMCPToolService {
                             "reason": .string("cancelled_after_committed_deletion")
                         ]
                     }
-                    retrySessionIDs.append(contentsOf: remainingIDs)
+
                     break
                 }
+            } catch let failure as CleanupAuthorityFailure {
+                if let deletionAttempt {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
+                skippedSessions.append([
+                    "session_id": .string(sessionID.uuidString), "reason": .string(failure.subreason)
+                ])
             } catch let error as AgentSessionDeletionRegistry.AdmissionError {
                 if !durableDeletionCommitted, let deletionAttempt {
                     await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
@@ -1587,7 +1654,7 @@ struct AgentManageMCPToolService {
                     "message": .string(error.localizedDescription),
                     "durable": .bool(false)
                 ])
-                retrySessionIDs.append(sessionID)
+
             } catch is CancellationError {
                 wasCancelled = true
                 if !durableDeletionCommitted, let deletionAttempt {
@@ -1624,7 +1691,7 @@ struct AgentManageMCPToolService {
                         "durable": .bool(false),
                         "mutation_started": .bool(true)
                     ])
-                    retrySessionIDs.append(sessionID)
+
                     unprocessedSessions = remainingIDs.map { remainingID in
                         [
                             "session_id": .string(remainingID.uuidString),
@@ -1639,15 +1706,20 @@ struct AgentManageMCPToolService {
                             "reason": .string("cancelled_before_mutation")
                         ]
                     }
-                    retrySessionIDs.append(sessionID)
                 }
-                retrySessionIDs.append(contentsOf: remainingIDs)
+
                 break
             } catch {
                 if !durableDeletionCommitted, let deletionAttempt {
                     await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
                 }
-                if usedOpenTabAuthority {
+                if durableDeletionCommitted {
+                    deletedSessions.append([
+                        "session_id": .string(sessionID.uuidString), "name": .string(candidate.name),
+                        "durable": .bool(true), "reason": .string("local_cleanup_failed"),
+                        "message": .string(error.localizedDescription)
+                    ])
+                } else if usedOpenTabAuthority {
                     skippedSessions.append([
                         "session_id": .string(sessionID.uuidString),
                         "name": .string(candidate.name),
@@ -1671,7 +1743,6 @@ struct AgentManageMCPToolService {
                         "message": .string(error.localizedDescription)
                     ])
                 }
-                retrySessionIDs.append(sessionID)
             }
         }
 
@@ -1691,25 +1762,14 @@ struct AgentManageMCPToolService {
                 ]
             )
         #endif
-        let status = if wasCancelled {
-            "cancelled"
-        } else if skippedSessions.allSatisfy({ $0["reason"]?.stringValue == "already_absent" }) {
-            "completed"
-        } else {
-            "partial"
-        }
-        return .object([
-            "status": .string(status),
-            "cancelled": .bool(wasCancelled),
-            "processed_count": .int(deletedSessions.count + skippedSessions.count),
-            "deleted_count": .int(deletedSessions.count),
-            "skipped_count": .int(skippedSessions.count),
-            "unprocessed_count": .int(unprocessedSessions.count),
-            "deleted_sessions": .array(deletedSessions.map(Value.object)),
-            "skipped_sessions": .array(skippedSessions.map(Value.object)),
-            "unprocessed_sessions": .array(unprocessedSessions.map(Value.object)),
-            "retry_session_ids": .array(retrySessionIDs.map { .string($0.uuidString) })
-        ])
+        return AgentManageCleanupDiagnostics.response(
+            deletedSessions: deletedSessions, skippedSessions: skippedSessions,
+            unprocessedSessions: unprocessedSessions, requestedIDs: requestedIDs, wasCancelled: wasCancelled
+        )
+    }
+
+    private struct CleanupAuthorityFailure: Error {
+        let subreason: String
     }
 
     private func executeListWorkflows() async throws -> Value {
