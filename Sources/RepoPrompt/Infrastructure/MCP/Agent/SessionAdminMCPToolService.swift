@@ -53,6 +53,7 @@ struct SessionAdminMCPToolService {
     private static let scopeLevelSelectorKeys: [String: Set<String>] = [
         "inventory": ["filter"],
         "tree": ["session_id"],
+        "worktree_inventory": ["session_id"],
         "links": ["session_id"]
     ]
 

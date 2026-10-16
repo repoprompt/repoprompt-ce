@@ -321,6 +321,17 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let repo: GitRepoDescriptor
     }
 
+    /// A saved or never-visited target is prepared (no tab focus, no provider run) before an
+    /// on-behalf worktree change, instead of being refused as unavailable.
+    private func prepareIfUnloaded(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async throws {
+        guard SessionAdminWindows.liveSession(sessionID) == nil else { return }
+        let outcome = await SessionAdminWindowsStructureHost.savedTargetPreparation(sessionID, isStillAuthorized)
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+        guard outcome == .ready else {
+            throw SessionAdminHostError.invalid(SessionAdminWindowsStructureHost.preparationDetail(outcome))
+        }
+    }
+
     /// Repositories and roots come from the target's own workspace, never the caller's routing.
     private func targetContext(_ sessionID: UUID, repoRoot: String?) async throws -> TargetContext {
         guard let (viewModel, session) = SessionAdminWindows.liveSession(sessionID),
@@ -375,6 +386,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         baseRef: String?,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> SessionAdminWorktreeInfo {
+        try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         let authorize: @MainActor () throws -> Void = {
             guard isStillAuthorized(),
@@ -467,6 +479,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
         bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo {
+        try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         guard isIdle(context.viewModel, context.session) else { throw SessionAdminHostError.notIdle }
         let worktree: GitWorktreeDescriptor

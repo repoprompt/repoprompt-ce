@@ -13,7 +13,7 @@ import RepoPromptDomainRuntime
 ///   card. Nothing here removes or prunes a worktree; that is human-only.
 /// - `merge_apply` goes through the existing user merge-review prompt in the target's tab.
 @MainActor
-final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHandler {
+final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHandler, AgentSessionAdministrationTargetDeriving {
     let operations: Set<DomainAgentSessionTargetOperation> = [
         .adminWorktreeCreate, .adminWorktreeBind, .adminWorktreeUnbind, .adminWorktreeRelease,
         .adminWorktreeInventory, .adminMergePreview, .adminMergeApply
@@ -55,6 +55,30 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         self.host = host
         self.ownership = ownership
         self.now = now
+    }
+
+    // MARK: - Target derivation
+
+    /// `worktree_unbind`/`worktree_release` naming only `worktree_id` act on the sessions bound to
+    /// it. The front door keeps only scope members; each one is still authorized individually.
+    func derivedTargets(for request: AgentSessionAdministrationRequest) throws -> [UUID]? {
+        guard request.operation == .adminWorktreeUnbind || request.operation == .adminWorktreeRelease else { return nil }
+        let op = request.operation.adminOperationName
+        guard let worktreeID = request.arguments["worktree_id"]?.stringValue, !worktreeID.isEmpty else {
+            throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "target_required", fields: [
+                "result": .string("invalid_request"), "op": .string(op), "retryable": .bool(false),
+                "detail": .string("\(op) needs session_id (the session the worktree is bound to) or worktree_id. Call worktree_inventory to see bound worktrees and their sessions.")
+            ])))
+        }
+        let bound = (host.allBoundWorktrees()[worktreeID] ?? []).sorted { $0.uuidString < $1.uuidString }
+        guard !bound.isEmpty else {
+            throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "worktree_not_bound", fields: [
+                "result": .string("not_applied"), "op": .string(op), "retryable": .bool(false),
+                "worktree_id": .string(worktreeID),
+                "detail": .string("No loaded session is bound to this worktree, so there is nothing to \(op == "worktree_release" ? "release" : "unbind"). Removing the worktree from disk stays with the user.")
+            ])))
+        }
+        return bound
     }
 
     // MARK: - Cards and preflight
@@ -593,8 +617,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         else { throw SessionAdminMCPToolService.unavailableError }
         // Listing has no capacity admission: per-row membership and final chain fences remain
         // authoritative. Unrelated incomplete usage evidence must not veto a read.
+        let focus = Set(batch.request.targetSessionIDs)
         let members = context.projector.members(of: batch.scope.grant)
             .filter { context.isMember($0, ofChainFrom: batch.scope) }
+            .filter { focus.isEmpty || focus.contains($0) }
         let memberSet = Set(members)
         let chainScopeIDs = Set(context.scopeChain(of: batch.scope).map(\.id))
         struct Row {

@@ -3219,6 +3219,25 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.worktrees.unbindCalls, [member])
     }
 
+    func testWorktreeReleaseByWorktreeIDDerivesBoundSessionsAndExplainsUnboundOnes() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID()
+        fixture.worktrees.boundElsewhere["w1"] = [member]
+        func request(_ args: [String: Value]) -> AgentSessionAdministrationRequest {
+            .init(operation: .adminWorktreeRelease, caller: .agentSession(overseer), arguments: args)
+        }
+        XCTAssertEqual(try fixture.worktreeHandler.derivedTargets(for: request(["worktree_id": .string("w1")])), [member])
+        for (args, code) in [([String: Value](), "target_required"), (["worktree_id": .string("w-gone")], "worktree_not_bound")] {
+            do {
+                _ = try fixture.worktreeHandler.derivedTargets(for: request(args))
+                XCTFail("\(code) must be explained, not left to a target-less denial")
+            } catch let early as AgentSessionAdminEarlyResult {
+                XCTAssertEqual(early.value.objectValue?["code"], .string(code))
+                XCTAssertNotNil(early.value.objectValue?["detail"])
+            }
+        }
+    }
+
     func testWorktreeInventoryFlagsUnboundOwnedWorktrees() async throws {
         let fixture = Fixture()
         let overseer = UUID(), member = UUID()
