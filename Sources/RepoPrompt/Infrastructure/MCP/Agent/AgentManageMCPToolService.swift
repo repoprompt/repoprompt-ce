@@ -482,9 +482,12 @@ struct AgentManageMCPToolService {
             result["truncated"] = .bool(filtered.count > limit)
             result["note"] = .string(
                 "These are matching direct child sessions only, not a workspace inventory; zero children does not mean this workspace is empty. "
-                    + "For one saved target, become_overseer with session_id and optional message requests one exact-target approval and continues automatically. For workspace-wide listing, enable discovery if needed, then use session_admin request_scope when available "
-                    + "with kind=workspace, workspace=\(workspace.id.uuidString), and capabilities including observe plus the needed mutation capabilities. "
-                    + "Only after the user approves the scope card, use session_admin inventory. Tool discovery grants no authority."
+                    + (
+                        OverseerGlobalAutoApprove.isEnabled()
+                            ? "Overseer full access: ON. For workspace-wide listing, call become_overseer if needed, then just call session_admin inventory with filter.workspace=\(workspace.id.uuidString); no scope request or card is needed. "
+                            : "Overseer full access: OFF. Use existing covering grants directly. Request authority only when no current grant covers workspace-wide listing: call become_overseer if needed, then session_admin request_scope with kind=workspace, workspace=\(workspace.id.uuidString), and capabilities including observe plus needed mutation capabilities. Existing standing consent may settle it without a card. Otherwise continue after the user approves the scope card and RepoPrompt notifies you; then use session_admin inventory. "
+                    )
+                    + "Tool discovery grants no authority."
             )
         case .none:
             result["scope"] = .string("unresolved_caller")

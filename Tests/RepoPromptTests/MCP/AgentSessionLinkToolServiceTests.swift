@@ -1129,6 +1129,36 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(devin, .string(BecomeOverseerMCPToolService.devinResult))
     }
 
+    func testBootstrapGuidanceResamplesFullAccessWithoutChangingAuthorization() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let original = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = original }
+        var fullAccess = false
+        OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+        let endpoint = fixture.target.domainEndpoint
+        let service = BecomeOverseerMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "mode-guidance", windowID: endpoint.windowID) },
+            resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: fixture.bridge,
+            prepareActivationCommit: { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+        )
+        for enabled in [false, true, false] {
+            fullAccess = enabled
+            let result = try await service.execute(args: [:])
+            let guidance = try XCTUnwrap(result.stringValue)
+            XCTAssertTrue(guidance.contains(enabled ? "Overseer full access: ON" : "Overseer full access: OFF"))
+            if enabled {
+                XCTAssertTrue(guidance.contains("just call the operation"))
+                XCTAssertFalse(guidance.contains("request_scope"))
+                XCTAssertFalse(guidance.contains("approval card"))
+            } else {
+                XCTAssertTrue(guidance.contains("when no current grant covers"))
+                XCTAssertTrue(guidance.contains("standing consent"))
+                XCTAssertTrue(guidance.contains("request_scope"))
+            }
+        }
+    }
+
     func testNoArgumentBootstrapAllowsInboundOnlyDiscoveryButGrantsNoAuthority() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }

@@ -33,7 +33,7 @@ struct SessionAdminMCPToolService {
         "session_admin is not available for this session on this exact route. For one target, call become_overseer with session_id and optional message now: one exact-target approval automatically continues preparation, link and dispatch. session_admin scope_status discovers operations and grants when available. If already enabled, retry from the original requesting session; use request_scope for missing authority. A grant never substitutes for a current routed session."
     )
 
-    static let inventoryGuidance = "For cleanup or organizing, request observe together with the needed mutation capabilities, then use inventory to select targets when available. A workspace scope covers only that workspace; history is not a scope inventory."
+    static let inventoryGuidance = "Use covering grants directly. If authority is missing for cleanup or organizing, request observe together with needed mutation capabilities, then use inventory to select targets. A workspace scope covers only that workspace; history is not a scope inventory."
 
     private static let lifecycleKeys: [String: Set<String>] = [
         "request_scope": ["op", "kind", "workspace", "session_id", "capabilities", "guardrails", "reason", "idempotency_key"],
@@ -80,7 +80,7 @@ struct SessionAdminMCPToolService {
             try await administer(op: op, args: args, caller: caller, endpoint: endpoint)
         }
         guard case let .object(fields) = value else { return value }
-        return Self.withScopeAvailability(fields, runtime: scopes())
+        return Self.withScopeAvailability(fields, runtime: scopes(), includeContinuity: op == "scope_status")
     }
 
     // MARK: - Caller
@@ -169,10 +169,27 @@ struct SessionAdminMCPToolService {
             let request = runtime.request(id: recorded.id, requesterSessionID: endpoint.sessionID) ?? recorded
             var value = Self.requestValue(request)
             value["result"] = .string(request.state.label)
-            if autoApproved {
-                value["guidance"] = .string(
-                    "Granted immediately by the user's standing approval for this session; no card was shown. The grant is live now."
-                )
+            if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
+                // The requested scope may be narrower than the authority that actually settled it.
+                // Keep the proposal separate so it cannot be mistaken for the covering grant.
+                let scope = Self.scopeValue(record, now: now())
+                var requestedScope: [String: Value] = [:]
+                for key in ["kind", "capabilities", "guardrails"] {
+                    requestedScope[key] = value[key]
+                    value[key] = scope.objectValue?[key]
+                }
+                value["requested_scope"] = .object(requestedScope)
+                value["scope_id"] = .string(scopeID.uuidString)
+                value["scope"] = scope
+                if record.grant.unrestricted {
+                    value["guidance"] = .string(
+                        "Granted by Overseer full access; no card was shown. scope is the actual unrestricted covering grant, not the narrower requested_scope. Just call the operation."
+                    )
+                } else if autoApproved {
+                    value["guidance"] = .string(
+                        "Granted immediately by the user's standing consent for this session; no card was shown. scope describes the actual grant."
+                    )
+                }
             }
             if request.state == .pending {
                 value["guidance"] = .string(
@@ -284,10 +301,13 @@ struct SessionAdminMCPToolService {
     }
 
     private static func withScopeAvailability(
-        _ value: [String: Value], runtime: DelegationScopeRuntime
+        _ value: [String: Value], runtime: DelegationScopeRuntime, includeContinuity: Bool = false
     ) -> Value {
         var value = value
         value["authority_available"] = .bool(runtime.canUseAuthority)
+        // Storage history is diagnostic context, not a warning on every successful operation.
+        // Preserve it when authority is unavailable because it then affects this call.
+        guard includeContinuity || !runtime.canUseAuthority else { return .object(value) }
         value["continuity_save_state"] = .string(runtime.continuityState)
         value["continuity_durable"] = .bool(runtime.continuityState == "saved")
         if !runtime.unsettledScopeIDs.isEmpty {
@@ -584,6 +604,7 @@ struct SessionAdminMCPToolService {
             "scope_id": .string(record.id.uuidString),
             "state": .string(expired ? DomainDelegationScopeState.expired.rawValue : record.state.rawValue),
             "kind": .string(record.grant.kind.label),
+            "unrestricted": .bool(record.grant.unrestricted),
             "capabilities": capabilitiesValue(record.grant.capabilities),
             "unrestricted": .bool(record.grant.unrestricted),
             "guardrails": record.grant.unrestricted ? .object([:]) : guardrailsValue(record.grant.guardrails)

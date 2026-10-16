@@ -91,8 +91,9 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         }
         // Bound the added guidance independently of later lanes' implemented-operation text.
         let guidance = try XCTUnwrap(definition.description.components(separatedBy: "\n\n").first {
-            $0.hasPrefix("For cleanup/organizing,")
+            $0.hasPrefix("For cleanup/organizing")
         })
+        XCTAssertTrue(guidance.contains("without covering authority"))
         XCTAssertLessThan(guidance.utf8.count, 250)
         XCTAssertLessThan(capabilities.utf8.count, 300)
     }
