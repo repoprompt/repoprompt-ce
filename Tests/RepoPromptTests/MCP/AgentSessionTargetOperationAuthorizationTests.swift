@@ -720,6 +720,12 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         XCTAssertTrue(text.contains(active.uuidString))
         XCTAssertTrue(text.contains("skipped_active"))
         XCTAssertTrue(text.contains("Next"))
+        // Successful deletions are listed by ID too, not only counted.
+        XCTAssertTrue(text.contains(lane.uuidString) && text.contains(fork.uuidString), text)
+        XCTAssertTrue(text.contains("deleted"))
+        for id in [absent, active, broken] {
+            XCTAssertTrue(text.contains(id.uuidString), "skipped \(id) must be listed")
+        }
     }
 
     func testCleanupRechecksModeAndCallerAfterResolutionBeforeDeletion() async throws {

@@ -604,6 +604,29 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertNil(unrestrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
     }
 
+    func testHostErrorsRenderAsStructuredRefusalsNotBareEnumNames() throws {
+        let target = UUID()
+        let cases: [(SessionAdminHostError, String, Bool)] = [
+            (.sessionUnavailable, "session_unavailable", false),
+            (.notIdle, "target_busy", true),
+            (.authorityEnded, "scope_revoked", false),
+            (.usageEvidenceUnavailable, "usage_evidence_unavailable", false),
+            (.guardrailExceeded(limit: 1, current: 1), "guardrail_exceeded", false),
+            (.invalid("bad"), "invalid_request", false)
+        ]
+        for (error, code, retryable) in cases {
+            let value = try XCTUnwrap(SessionAdminMCPToolService.hostErrorValue(error, op: "fork", targets: [target]).objectValue)
+            XCTAssertEqual(value["result"], .string("not_applied"), code)
+            XCTAssertEqual(value["code"], .string(code))
+            XCTAssertEqual(value["retryable"], .bool(retryable), code)
+            XCTAssertEqual(value["affected"], .array([.string(target.uuidString)]))
+            XCTAssertNotNil(value["next_call"]?.objectValue?["tool"], code)
+            XCTAssertNotEqual(value["detail"]?.stringValue, String(describing: error), "detail is the readable message")
+        }
+        let unavailable = try XCTUnwrap(SessionAdminMCPToolService.hostErrorValue(.sessionUnavailable, op: "fork", targets: [target]).objectValue)
+        XCTAssertEqual(unavailable["next_call"]?.objectValue?["tool"], .string("become_overseer"))
+    }
+
     func testRequestScopeAcceptsSessionKindWithItsSessionID() async throws {
         let fixture = Fixture()
         let overseer = UUID()

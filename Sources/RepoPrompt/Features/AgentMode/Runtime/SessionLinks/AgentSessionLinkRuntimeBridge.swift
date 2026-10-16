@@ -8441,6 +8441,9 @@ final class AgentSessionLinkRuntimeBridge {
             let type = String(describing: Swift.type(of: error)).filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." }
             receipt.destinationFailure = .hostError(String(type.prefix(120)))
             receipt.refusalStage = "host_allocation"
+            // The type alone is not actionable. Only agent-facing invalid-params text is
+            // forwarded; internal error text stays private.
+            receipt.refusalDetail = Self.laneHostAgentFacingDetail(error)
             return receipt
         }
         let sessionID: UUID

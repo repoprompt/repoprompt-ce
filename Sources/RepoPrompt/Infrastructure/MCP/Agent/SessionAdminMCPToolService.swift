@@ -402,12 +402,52 @@ struct SessionAdminMCPToolService {
             preview: Self.parsePreview(args["preview"]),
             arguments: args
         )
-        return try await render(
-            administration().perform(request),
+        let outcome: AgentSessionAdministrationOutcome
+        do {
+            outcome = try await administration().perform(request)
+        } catch let error as SessionAdminHostError {
+            return Self.hostErrorValue(error, op: op, targets: request.targetSessionIDs)
+        }
+        return try render(
+            outcome,
             confirmationID: request.confirmationID,
             callerSessionID: endpoint.sessionID,
             requestedScopeID: request.scopeID
         )
+    }
+
+    /// A handler's host refusal as a structured result, never a bare enum name.
+    static func hostErrorValue(_ error: SessionAdminHostError, op: String, targets: [UUID]) -> Value {
+        let (code, retryable, next): (String, Bool, Value) = switch error {
+        case .sessionUnavailable:
+            ("session_unavailable", false, .object([
+                "tool": .string("become_overseer"),
+                "arguments": .object(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]),
+                "why": .string("Prepares a saved or unvisited session without opening its tab, then retry \(op).")
+            ]))
+        case .notIdle:
+            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object([
+                "op": .string("wait"), "until": .string("idle")
+            ])]))
+        case .authorityEnded:
+            ("scope_revoked", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .usageEvidenceUnavailable:
+            ("usage_evidence_unavailable", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .guardrailExceeded:
+            ("guardrail_exceeded", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .invalid:
+            ("invalid_request", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        }
+        return .object([
+            "result": .string("not_applied"),
+            "op": .string(op),
+            "code": .string(code),
+            "subreason": .string(code),
+            "detail": .string(error.localizedDescription),
+            "affected": .array(targets.map { .string($0.uuidString) }),
+            "next_call": next,
+            "retryable": .bool(retryable)
+        ])
     }
 
     private func render(

@@ -70,7 +70,7 @@ extension AgentModeViewModel {
         guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
               workspaceManager?.activeWorkspace?.id == expectedWorkspaceID
         else {
-            throw MCPError.invalidParams("The destination workspace is not active.")
+            throw AgentSessionLaneDestinationFailure.destinationChanged
         }
         // Scope-only: guardrails of every scope the creator belongs to, and auto-join stamping.
         let spawnAdmission: DelegationSpawnAdmission.Admission?
@@ -349,5 +349,14 @@ extension AgentModeViewModel {
               let workspaceManager
         else { return false }
         return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
+    }
+}
+
+extension AgentSessionLinkRuntimeBridge {
+    /// Agent-facing detail for an unclassified lane host error, or nil when the text is internal.
+    static func laneHostAgentFacingDetail(_ error: any Error) -> String? {
+        guard case let MCPError.invalidParams(detail)? = error as? MCPError,
+              let detail, !detail.isEmpty else { return nil }
+        return String(detail.prefix(400))
     }
 }

@@ -1567,6 +1567,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             XCTAssertEqual(hostError["subreason"], .string("host_error:MCPError"))
             XCTAssertEqual(hostError["stage"], .string("host_allocation"))
             XCTAssertFalse(String(describing: hostError).contains("PRIVATE_HOST_DETAIL"))
+            fixture.host.laneCreationError = MCPError.invalidParams("Open the destination workspace, then retry.")
+            let agentFacing = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("host-invalid-params")])
+            XCTAssertEqual(agentFacing["subreason"], .string("host_error:MCPError"))
+            XCTAssertEqual(agentFacing["detail"], .string("Open the destination workspace, then retry."))
             fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.destinationChanged
             let changed = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("changed")])
             XCTAssertEqual(changed["subreason"], .string("destination_changed"))
