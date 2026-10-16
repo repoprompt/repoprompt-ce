@@ -194,3 +194,39 @@ enum SessionAdminHostError: LocalizedError, Equatable {
         }
     }
 }
+
+/// A host refusal as a structured result, never a bare enum name.
+extension SessionAdminHostError: SessionAdminStructuredRefusal {
+    func refusalValue(op: String, targets: [UUID]) -> Value {
+        let (code, retryable, next): (String, Bool, Value) = switch self {
+        case .sessionUnavailable:
+            ("session_unavailable", false, .object([
+                "tool": .string("become_overseer"),
+                "arguments": .object(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]),
+                "why": .string("Prepares a saved or unvisited session without opening its tab, then retry \(op).")
+            ]))
+        case .notIdle:
+            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object([
+                "op": .string("wait"), "until": .string("idle")
+            ])]))
+        case .authorityEnded:
+            ("scope_revoked", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .usageEvidenceUnavailable:
+            ("usage_evidence_unavailable", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .guardrailExceeded:
+            ("guardrail_exceeded", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        case .invalid:
+            ("invalid_request", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
+        }
+        return .object([
+            "result": .string("not_applied"),
+            "op": .string(op),
+            "code": .string(code),
+            "subreason": .string(code),
+            "detail": .string(localizedDescription),
+            "affected": .array(targets.map { .string($0.uuidString) }),
+            "next_call": next,
+            "retryable": .bool(retryable)
+        ])
+    }
+}

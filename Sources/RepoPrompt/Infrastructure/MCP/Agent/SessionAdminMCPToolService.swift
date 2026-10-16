@@ -12,6 +12,12 @@ import RepoPromptDomainRuntime
 /// are handled here. `undo` and every other operation go through the administration service (in
 /// production `AgentSessionAdministrationFrontDoor`), which returns `not_implemented` for operations
 /// no handler has registered.
+/// A handler refusal that renders as a structured result (code, detail, next_call) instead of a
+/// bare thrown error name.
+protocol SessionAdminStructuredRefusal: Error {
+    func refusalValue(op: String, targets: [UUID]) -> Value
+}
+
 @MainActor
 struct SessionAdminMCPToolService {
     typealias Endpoint = DomainAgentSessionLinkEndpointIdentity
@@ -405,8 +411,8 @@ struct SessionAdminMCPToolService {
         let outcome: AgentSessionAdministrationOutcome
         do {
             outcome = try await administration().perform(request)
-        } catch let error as SessionAdminHostError {
-            return Self.hostErrorValue(error, op: op, targets: request.targetSessionIDs)
+        } catch let error as any SessionAdminStructuredRefusal {
+            return error.refusalValue(op: op, targets: request.targetSessionIDs)
         }
         return try render(
             outcome,
@@ -414,40 +420,6 @@ struct SessionAdminMCPToolService {
             callerSessionID: endpoint.sessionID,
             requestedScopeID: request.scopeID
         )
-    }
-
-    /// A handler's host refusal as a structured result, never a bare enum name.
-    static func hostErrorValue(_ error: SessionAdminHostError, op: String, targets: [UUID]) -> Value {
-        let (code, retryable, next): (String, Bool, Value) = switch error {
-        case .sessionUnavailable:
-            ("session_unavailable", false, .object([
-                "tool": .string("become_overseer"),
-                "arguments": .object(targets.first.map { ["session_id": .string($0.uuidString)] } ?? [:]),
-                "why": .string("Prepares a saved or unvisited session without opening its tab, then retry \(op).")
-            ]))
-        case .notIdle:
-            ("target_busy", true, .object(["tool": .string("agent_session_link"), "arguments": .object([
-                "op": .string("wait"), "until": .string("idle")
-            ])]))
-        case .authorityEnded:
-            ("scope_revoked", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
-        case .usageEvidenceUnavailable:
-            ("usage_evidence_unavailable", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
-        case .guardrailExceeded:
-            ("guardrail_exceeded", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
-        case .invalid:
-            ("invalid_request", false, .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])]))
-        }
-        return .object([
-            "result": .string("not_applied"),
-            "op": .string(op),
-            "code": .string(code),
-            "subreason": .string(code),
-            "detail": .string(error.localizedDescription),
-            "affected": .array(targets.map { .string($0.uuidString) }),
-            "next_call": next,
-            "retryable": .bool(retryable)
-        ])
     }
 
     private func render(
@@ -526,7 +498,23 @@ struct SessionAdminMCPToolService {
     static func deniedValue(_ denial: DomainDelegationScopeDenial, sessionID: UUID?) throws -> Value {
         guard let code = denial.publicCode else {
             if let sessionID { throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID) }
-            throw unavailableError
+            // The caller is already resolved, so "not available on this route" would be false.
+            // Name only the cases that disclose nothing about other sessions.
+            let (code, detail, retryable) = switch denial {
+            case .selfTarget:
+                ("self_target", "This operation cannot target your own session.", false)
+            case .generationStale:
+                ("scope_changed", "Your scope changed while this call ran. Call scope_status, then retry.", true)
+            case .operationNotScopeAuthorizable:
+                ("operation_not_scope_authorizable", "No delegation scope can authorize this operation; it stays with the user.", false)
+            default:
+                ("not_authorized", "No current grant of yours covers this operation on its targets. If you hold no scope, call session_admin request_scope with the capabilities the operation needs; otherwise call scope_status for your grants and the operation catalog, and inventory to check the targets are in scope.", false)
+            }
+            return .object([
+                "result": .string("denied"), "code": .string(code), "subreason": .string(code),
+                "detail": .string(detail), "retryable": .bool(retryable),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
+            ])
         }
         var value: [String: Value] = ["result": .string("denied"), "code": .string(code)]
         switch denial {

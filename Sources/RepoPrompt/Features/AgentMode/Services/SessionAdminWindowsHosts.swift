@@ -74,25 +74,38 @@ struct SavedOversightSessionLocation {
 
 @MainActor
 final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
-    typealias Preparation = @MainActor (
-        UUID, @escaping @MainActor () -> Bool
-    ) async -> Result<WindowState, WindowStatesManager.SavedOversightPreparationFailure>
+    /// Outcome of preparing a saved or never-visited session without opening its tab.
+    enum ForkPreparation: Equatable {
+        case ready, missing, ambiguous, changed, unreadable
+    }
+
+    typealias Preparation = @MainActor (UUID, @escaping @MainActor () -> Bool) async -> ForkPreparation
 
     private let bridge: () -> AgentSessionLinkRuntimeBridge
-    private let preparation: Preparation
+    private let preparation: Preparation?
+
+    /// Production preparation: the targeted-oversight path (point read, no tab focus, no provider run).
+    static let savedTargetPreparation: Preparation = { target, isStillAuthorized in
+        switch await WindowStatesManager.shared.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized) {
+        case .success: .ready
+        case .failure(.missing): .missing
+        case .failure(.ambiguous): .ambiguous
+        case .failure(.changed): .changed
+        case .failure(.unreadable): .unreadable
+        }
+    }
 
     init(
         bridge: @escaping () -> AgentSessionLinkRuntimeBridge = { AgentSessionLinkRuntimeBridge.shared },
-        preparation: @escaping Preparation = { target, isStillAuthorized in
-            await WindowStatesManager.shared.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
-        }
+        preparation: Preparation? = SessionAdminWindowsStructureHost.savedTargetPreparation
     ) {
         self.bridge = bridge
         self.preparation = preparation
     }
 
-    static func preparationDetail(_ reason: WindowStatesManager.SavedOversightPreparationFailure) -> String {
+    static func preparationDetail(_ reason: ForkPreparation) -> String {
         switch reason {
+        case .ready: "The source session is ready."
         case .missing: "The source session was not found in any loaded workspace. Check its ID with session_admin inventory."
         case .ambiguous: "The source session is open in more than one place. Close the duplicate tab, then retry."
         case .changed: "The source session moved or changed while being prepared. Retry fork."
@@ -267,14 +280,10 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) async throws -> UUID {
         // A saved or never-visited source is prepared the same way targeted oversight prepares
         // one: point read, no tab focus, no provider run. Authority is re-checked throughout.
-        if SessionAdminWindows.liveSession(sessionID) == nil {
-            switch await preparation(sessionID, isStillAuthorized) {
-            case .success: break
-            case let .failure(reason):
-                throw reason == .changed && !isStillAuthorized()
-                    ? SessionAdminHostError.authorityEnded
-                    : SessionAdminHostError.invalid(Self.preparationDetail(reason))
-            }
+        if SessionAdminWindows.liveSession(sessionID) == nil, let preparation {
+            let outcome = await preparation(sessionID, isStillAuthorized)
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            guard outcome == .ready else { throw SessionAdminHostError.invalid(Self.preparationDetail(outcome)) }
         }
         guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
@@ -378,6 +387,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         try authorize()
         let existing = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRoot = existing.first(where: \.isMain)?.path ?? context.repo.rootPath
+        if let branch, let holder = existing.first(where: { $0.branch.map(Self.shortBranch) == Self.shortBranch(branch) }) {
+            throw SessionAdminHostError.invalid(Self.branchExistsDetail(branch, checkedOutAt: holder.path))
+        }
         // On-behalf creation is app-managed only: no explicit or external destination.
         let plan = try GitWorktreeDefaultPathPlanner.plan(GitWorktreeDefaultPathPlanner.Request(
             mainWorktreeRoot: URL(fileURLWithPath: mainRoot),
@@ -413,10 +425,15 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
         let vcsService = vcsService
         let repoURL = context.repo.rootURL
-        let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
-            try await vcsService.createGitWorktreeWithResult(
-                request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
-            )
+        let result: GitWorktreeCreateResult
+        do {
+            result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
+                try await vcsService.createGitWorktreeWithResult(
+                    request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
+                )
+            }
+        } catch let error where branch != nil && String(describing: error).contains("already exists") {
+            throw SessionAdminHostError.invalid(Self.branchExistsDetail(branch ?? "", checkedOutAt: nil))
         }
         let created = result.descriptor
         return SessionAdminWorktreeInfo(
@@ -427,6 +444,17 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             branch: created.branch,
             isPrunable: created.isPrunable
         )
+    }
+
+    static func shortBranch(_ name: String) -> String {
+        name.hasPrefix("refs/heads/") ? String(name.dropFirst("refs/heads/".count)) : name
+    }
+
+    static func branchExistsDetail(_ branch: String, checkedOutAt path: String?) -> String {
+        if let path {
+            return "Branch '\(branch)' already exists and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. Nothing was created."
+        }
+        return "Branch '\(branch)' already exists. Pass a new branch name, or omit branch to get a generated one. Nothing was created."
     }
 
     // MARK: - Bind / unbind

@@ -110,7 +110,17 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
                 throw AgentSessionAdminEarlyResult(value: Self.workspaceNotLoaded(workspaceID))
             }
             let named = Set(order)
-            return entries.filter { named.contains($0.group) }.map(\.sessionID)
+            let members = entries.filter { named.contains($0.group) }.map(\.sessionID)
+            if members.isEmpty {
+                let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
+                throw AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: "groups_not_found", fields: [
+                    "result": .string("groups_not_found"),
+                    "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+                    "current_groups": .array(current.map(Value.string)),
+                    "detail": .string("None of the named groups has a session in this workspace (a group exists only while a session carries it). Reorder groups from current_groups, using that list as expected_order.")
+                ])))
+            }
+            return members
         default:
             return nil
         }

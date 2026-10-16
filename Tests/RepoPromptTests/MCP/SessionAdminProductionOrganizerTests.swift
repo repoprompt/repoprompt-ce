@@ -425,6 +425,12 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     XCTAssertEqual(cleared["changed_count"], .int(2))
                     XCTAssertTrue(try destination.workspace().composeTabs.allSatisfy { $0.sidebarGroup == nil && $0.sidebarGroupOrder == nil })
                     XCTAssertTrue(try caller.workspace().composeTabs.allSatisfy { $0.sidebarGroup == nil }, "Do not mutate the caller's workspace")
+                    // Reordering groups that no session carries any more names what does exist.
+                    reorder["expected_order"] = .array([.string("Beta"), .string("Alpha")])
+                    let gone = try await perform(.adminReorderGroups, arguments: reorder, key: "gone")
+                    XCTAssertEqual(gone["result"], .string("groups_not_found"))
+                    XCTAssertEqual(gone["current_groups"], .array([]))
+                    XCTAssertNotNil(gone["detail"])
                     await destination.cleanup()
                     await caller.cleanup()
                 } catch {
@@ -870,7 +876,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 XCTAssertEqual(archived["changed_count"], .int(1))
                 manager.setWorkspacePersistenceOutcomeOverrideForTesting(.rejected(reason: "unarchive_fixture_disk_failure"))
                 let undone = try await fixture.undo(archived)
-                XCTAssertEqual(undone["result"], .string("not_undone"))
+                // The tab is restored on screen, so "not_undone" would wrongly say it is still
+                // archived. The local effect is reported; persistence is explicitly not claimed.
+                XCTAssertEqual(undone["result"], .string("partially_undone"))
                 XCTAssertEqual(undone["changed_count"], .int(0))
                 XCTAssertEqual(undone["local_changes"], .bool(true))
                 XCTAssertNotEqual(undone[AgentSessionAdminRendering.committedChangesKey], .bool(true))

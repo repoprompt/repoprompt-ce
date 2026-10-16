@@ -608,14 +608,14 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let source = UUID()
         var prepared: [UUID] = []
         for (failure, authorized, expected) in [
-            (WindowStatesManager.SavedOversightPreparationFailure.missing, true, "not found"),
+            (SessionAdminWindowsStructureHost.ForkPreparation.missing, true, "not found"),
             (.ambiguous, true, "more than one place"),
             (.unreadable, true, "could not be read"),
             (.changed, true, "Retry fork")
         ] {
             let host = SessionAdminWindowsStructureHost(preparation: { target, _ in
                 prepared.append(target)
-                return .failure(failure)
+                return failure
             })
             do {
                 _ = try await host.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { authorized })
@@ -625,7 +625,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             }
         }
         XCTAssertEqual(prepared, Array(repeating: source, count: 4), "an unloaded source is prepared, never refused outright")
-        let revoked = SessionAdminWindowsStructureHost(preparation: { _, _ in .failure(.changed) })
+        let revoked = SessionAdminWindowsStructureHost(preparation: { _, _ in .changed })
         do {
             _ = try await revoked.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { false })
             XCTFail("revoked authority must not fork")
@@ -644,6 +644,30 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertFalse(value["hint"]?.stringValue?.contains("No unambiguous active destination") == true)
     }
 
+    func testTargetlessHiddenDenialsAreStructuredNotARouteError() throws {
+        for (denial, code) in [
+            (DomainDelegationScopeDenial.selfTarget, "self_target"),
+            (.generationStale, "scope_changed"),
+            (.operationNotScopeAuthorizable, "operation_not_scope_authorizable"),
+            (.membershipProofMissing, "not_authorized"),
+            (.unknownScope, "not_authorized")
+        ] {
+            let value = try XCTUnwrap(SessionAdminMCPToolService.deniedValue(denial, sessionID: nil).objectValue)
+            XCTAssertEqual(value["result"], .string("denied"))
+            XCTAssertEqual(value["code"], .string(code))
+            XCTAssertFalse(value["detail"]?.stringValue?.contains("exact route") ?? true)
+            XCTAssertEqual(value["next_call"]?.objectValue?["tool"], .string("session_admin"))
+        }
+    }
+
+    func testExistingBranchRefusalNamesTheWorktreeAndNextStep() {
+        XCTAssertEqual(SessionAdminWindowsWorktreeHost.shortBranch("refs/heads/e2e/1392"), "e2e/1392")
+        let held = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: "/tmp/wt")
+        XCTAssertTrue(held.contains("/tmp/wt") && held.contains("worktree_bind"), held)
+        let bare = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: nil)
+        XCTAssertTrue(bare.contains("new branch name"), bare)
+    }
+
     func testHostErrorsRenderAsStructuredRefusalsNotBareEnumNames() throws {
         let target = UUID()
         let cases: [(SessionAdminHostError, String, Bool)] = [
@@ -655,7 +679,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             (.invalid("bad"), "invalid_request", false)
         ]
         for (error, code, retryable) in cases {
-            let value = try XCTUnwrap(SessionAdminMCPToolService.hostErrorValue(error, op: "fork", targets: [target]).objectValue)
+            let value = try XCTUnwrap(error.refusalValue(op: "fork", targets: [target]).objectValue)
             XCTAssertEqual(value["result"], .string("not_applied"), code)
             XCTAssertEqual(value["code"], .string(code))
             XCTAssertEqual(value["retryable"], .bool(retryable), code)
@@ -663,7 +687,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             XCTAssertNotNil(value["next_call"]?.objectValue?["tool"], code)
             XCTAssertNotEqual(value["detail"]?.stringValue, String(describing: error), "detail is the readable message")
         }
-        let unavailable = try XCTUnwrap(SessionAdminMCPToolService.hostErrorValue(.sessionUnavailable, op: "fork", targets: [target]).objectValue)
+        let unavailable = try XCTUnwrap(SessionAdminHostError.sessionUnavailable.refusalValue(op: "fork", targets: [target]).objectValue)
         XCTAssertEqual(unavailable["next_call"]?.objectValue?["tool"], .string("become_overseer"))
     }
 
@@ -913,10 +937,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             fixture.source.add(target, parent: caller)
             let handler = RecordingHandler([.adminRename])
             fixture.core.register(handler)
-            do {
-                _ = try await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Unapproved")])
-                XCTFail("Storage failure cannot invent authority before the user approves")
-            } catch {}
+            let unapproved = try? await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Unapproved")])
+            if let unapproved {
+                XCTAssertEqual(unapproved["result"], .string("denied"), "Storage failure cannot invent authority before the user approves")
+            }
             XCTAssertTrue(handler.batches.isEmpty)
             let requested = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe"), .string("organize")])])
             XCTAssertEqual(requested["authority_available"], .bool(true))
@@ -1557,11 +1581,11 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         // No-scope failure remains distinct and tells the caller how to request authority.
         fixture.endpoint = fixture.makeEndpoint(session: UUID())
         do {
-            _ = try await fixture.call(args)
-            XCTFail("a scope is required")
-        } catch {
-            let message = String(describing: error)
-            XCTAssertTrue(message.contains("session_admin is not available for this session"))
+            let refused = try await fixture.call(args)
+            let message = String(describing: refused)
+            XCTAssertEqual(refused["result"], .string("denied"), "a scope is required")
+            XCTAssertEqual(refused["code"], .string("not_authorized"))
+            XCTAssertFalse(message.contains("exact route"), "the caller is resolved; a route error would be false")
             XCTAssertTrue(message.contains("request_scope"))
             XCTAssertFalse(message.contains(target.uuidString))
         }
