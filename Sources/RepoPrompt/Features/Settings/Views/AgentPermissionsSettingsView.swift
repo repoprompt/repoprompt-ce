@@ -196,12 +196,12 @@ struct AgentPermissionsSettingsView: View {
     /// through MCP app_settings). When on, Active delegations shows it and every grant stays revocable.
     private var delegationApprovalSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Session Oversight Approvals")
+            Text("Overseer")
                 .font(.headline)
             Toggle(isOn: $autoApproveDelegationRequests) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Approve agent delegation requests automatically")
-                    Text("Agents that ask to observe, organize, control, or restructure your sessions get what they asked for without an approval card. Grants still appear in Active delegations, where you can revoke them. Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
+                    Text("Auto-approve Overseer access requests")
+                    Text("When an Overseer asks for access to your sessions, it gets exactly what it asked for with no approval card. Grants still appear in Active delegations, where you can revoke them. Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

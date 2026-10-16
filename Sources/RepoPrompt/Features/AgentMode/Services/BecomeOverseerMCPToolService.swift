@@ -5,7 +5,7 @@ import RepoPromptDomainRuntime
 /// Bootstrap only: exact installed model route, memory-only eligibility, and no invented grant.
 @MainActor
 struct BecomeOverseerMCPToolService {
-    static let nextTurnResult = "Oversight enabled. To oversee one saved target without another user turn, call become_overseer with session_id and optional message now: it requests one exact-target observe/control/restructure approval and the app automatically prepares, links and dispatches after approval. No go turn or target tab visit is needed. session_admin scope_status lists the operation catalog and current grants when available; activation alone grants no authority."
+    static let nextTurnResult = "Overseer enabled. For one saved target, call become_overseer with session_id and optional message: one approval and the app prepares, links and dispatches automatically. For anything broader (finding, listing, organizing or cleaning up sessions), call session_admin request_scope now, for example {op:\"request_scope\", kind:\"workspace\", capabilities:[\"observe\",\"organize\"]}; if the user has auto-approve on it is granted immediately, otherwise they see one card and you are notified. Then use session_admin inventory. session_admin scope_status lists every op, the capability it needs and your current grants. Activation alone grants no authority."
     static let devinResult = nextTurnResult
 
     /// Transport-owned proof adapted to the bridge's synchronous, network-independent commit fence.

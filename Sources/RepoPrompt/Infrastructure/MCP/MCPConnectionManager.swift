@@ -3358,7 +3358,11 @@ actor ServerNetworkManager {
         // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
         // authority. Keep durable scope eligibility independent of activation retirement.
         snapshot.canListBecomeOverseer = isEnabledState && oversightEnabled && (eligible || transientlyIneligible)
-        snapshot.isSessionAdminEligible = holdsLiveScope
+        // Every session that can become an overseer also sees session_admin from its first turn,
+        // so it can request a scope without waiting for a catalog refresh some providers (Codex)
+        // never perform mid-thread. Listing grants nothing: each op re-authorizes at execution.
+        snapshot.isSessionAdminEligible = snapshot.canListBecomeOverseer
+            || holdsLiveScope
             || runState.allowsAgentExternalControlTools
             || hasActiveOutboundLink
             || (activated && oversightEnabled)
