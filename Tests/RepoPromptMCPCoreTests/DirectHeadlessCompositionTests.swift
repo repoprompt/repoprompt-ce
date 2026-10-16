@@ -25,7 +25,9 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testOverseerDescriptionsTeachBothModesWithoutRequiringRedundantCards() throws {
-        for name in [MCPWindowToolName.becomeOverseer, MCPWindowToolName.sessionAdmin, MCPWindowToolName.agentSessionLink, MCPWindowToolName.agentManage] {
+        // agent_session_link keeps its frozen, budgeted contract; the scope playbook lives on the
+        // tools that request and exercise scopes.
+        for name in [MCPWindowToolName.becomeOverseer, MCPWindowToolName.sessionAdmin, MCPWindowToolName.agentManage] {
             let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
             XCTAssertTrue(definition.description.contains("Overseer full access"), name)
             XCTAssertTrue(definition.description.contains("ON"), name)

@@ -2255,7 +2255,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         static let description = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
             of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
             with: "- `create_lane`: direct link or overseer opt-in; make your managed lane; unique `idempotency_key`. Its first message assigns the lane's job, without asking the user to repeat it. No unrelated authority is inherited: approvals, sandbox/permission changes, destructive or out-of-workspace actions still need their own user approval."
-        ) + "\n\n" + MCPDomainSessionAdminToolDefinition.overseerPlaybook
+        )
 
         static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
             definition.description == description && definition.inputSchema == AgentSessionLinkModelSelectionMigration.inputSchema
