@@ -692,6 +692,7 @@ final class ACPIntegratedAgentModeRunner {
         // render whatever membership is current when it dispatches.
         let oversightDispatch = AgentSessionLinkPromptDispatchID.acpActiveSteering(runAttemptID: runAttemptID)
         var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let promptMessage: AgentMessage
         if carry.exactNote {
             promptMessage = agentMessage
@@ -899,7 +900,9 @@ final class ACPIntegratedAgentModeRunner {
                 await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
                 log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
                 guard session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID
+                      session.activeRunAttemptID == runAttemptID,
+                      let ingressOwner = session.activeRunOwnership,
+                      session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
                 else {
                     await controller.shutdown()
                     return .superseded
@@ -1177,6 +1180,7 @@ final class ACPIntegratedAgentModeRunner {
         // refresh system text.
         let oversightDispatch = AgentSessionLinkPromptDispatchID.acpPromptTurn(runAttemptID: runAttemptID)
         var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let promptMessage: AgentMessage
         if carry.exactNote {
             // The framed note is the whole provider input. Decoration would change those bytes.
@@ -1616,7 +1620,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         for await event in events {
             guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID,
+                  let ingressOwner = session.activeRunOwnership,
+                  session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
             else {
                 return .superseded
             }
@@ -1628,6 +1634,9 @@ final class ACPIntegratedAgentModeRunner {
             case let .stream(result):
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .approvalRequested(request):
+                if let owner = session.activeRunOwnership, owner.attemptID == runAttemptID {
+                    session.recordRunProgress(ownership: owner, kind: .interaction, stage: .waitingForInteraction)
+                }
                 session.pendingApproval = request
                 session.runState = .waitingForApproval
                 setRunningStatus(nil, source: nil, session: session, urgent: true)
@@ -2319,6 +2328,16 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     #if DEBUG
+        func testConsumeQuietEvents(_ events: [NormalizedAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async {
+            let stream = AsyncStream<NormalizedAgentRuntimeEvent> { continuation in
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+            _ = await consumeEvents(stream, session: session, runID: runID, runAttemptID: owner.attemptID)
+        }
+
         func testRetireToolCorrelation(tabID: UUID) {
             resetACPToolCorrelation(for: tabID)
         }

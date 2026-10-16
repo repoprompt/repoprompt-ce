@@ -9,6 +9,7 @@ public struct ClaudeSDKNDJSONTranslator {
     /// announces no new `init`, so this is what keeps the session model current; once set it is the
     /// authority, and a later `init` never demotes it.
     private var responseModel: String?
+    private var currentContentMessageID: String?
     private var toolNameByToolUseID: [String: String] = [:]
     private var invocationIDByToolUseID: [String: UUID] = [:]
     private let enableDebugLogging: Bool
@@ -62,6 +63,7 @@ public struct ClaudeSDKNDJSONTranslator {
             cliSessionID = sessionID
         }
         let type = (json["type"] as? String) ?? ""
+        if type == "system", (json["subtype"] as? String)?.lowercased() == "init" { currentContentMessageID = nil }
         switch type {
         case "system":
             return parseSystemMessage(json)
@@ -195,6 +197,7 @@ public struct ClaudeSDKNDJSONTranslator {
 
     private mutating func parseAssistantMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
+        if !isSubagentMessage(json), let messageID = payload["id"] as? String { currentContentMessageID = messageID }
         if !isSubagentMessage(json) {
             if let model = Self.modelName(payload["model"]) { responseModel = model }
         }
@@ -217,7 +220,7 @@ public struct ClaudeSDKNDJSONTranslator {
                 if let usageResult {
                     fallbackResults.append(usageResult)
                 }
-                fallbackResults.append(ClaudeProviderStreamResult(type: "content", text: fallback))
+                fallbackResults.append(ClaudeProviderStreamResult(type: "content", text: fallback, contentMessageID: currentContentMessageID))
                 return fallbackResults
             }
             if let usageResult {
@@ -240,7 +243,7 @@ public struct ClaudeSDKNDJSONTranslator {
             switch type {
             case "text":
                 if let text = block["text"] as? String, !text.isEmpty {
-                    results.append(ClaudeProviderStreamResult(type: "content", text: text))
+                    results.append(ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID))
                 }
             case "thinking":
                 guard ClaudeReasoningExtractionFeature.isEnabled else { continue }
@@ -371,7 +374,7 @@ public struct ClaudeSDKNDJSONTranslator {
             switch deltaType {
             case "text_delta":
                 if let text = delta["text"] as? String, !text.isEmpty {
-                    return [ClaudeProviderStreamResult(type: "content", text: text)]
+                    return [ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID)]
                 }
             case "thinking_delta":
                 guard ClaudeReasoningExtractionFeature.isEnabled else { return [] }
@@ -393,6 +396,7 @@ public struct ClaudeSDKNDJSONTranslator {
             guard !isSubagentMessage(json), let message = event["message"] as? [String: Any] else {
                 return []
             }
+            if let messageID = message["id"] as? String { currentContentMessageID = messageID }
             if let model = Self.modelName(message["model"]) { responseModel = model }
             guard let usage = parseUsage(message["usage"] as? [String: Any]) else {
                 return []
@@ -502,7 +506,7 @@ public struct ClaudeSDKNDJSONTranslator {
             results.append(ClaudeProviderStreamResult(type: "error", text: errorMessage))
         }
         if let finalText = json["result"] as? String, !finalText.isEmpty {
-            results.append(ClaudeProviderStreamResult(type: "final_content", text: finalText))
+            results.append(ClaudeProviderStreamResult(type: "final_content", text: finalText, contentMessageID: currentContentMessageID))
         }
         // Note: contextUsedTokens is intentionally nil here. Claude's result.usage is an aggregate
         // billed-turn total, not a live context snapshot. Live context snapshots come from stream

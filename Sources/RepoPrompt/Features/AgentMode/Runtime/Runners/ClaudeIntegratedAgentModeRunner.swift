@@ -117,6 +117,7 @@ final class ClaudeIntegratedAgentModeRunner {
             Task { await lease.cancelAndCleanup() }
             return
         }
+        let qualifiesQuietProvider = session.selectedAgent == .claudeCode
         let ownership = session.beginRunAttempt(source: "claudeNative")
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
@@ -303,6 +304,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         terminalState: terminalState,
                         errorText: outcome.kind == .failed ? nativeFailureMetadata?.errorText : nil,
                         notifyTurnComplete: outcome.kind == .completed,
+                        classifiesQuietCheckIn: qualifiesQuietProvider && outcome.kind == .completed && providerControlCommand == nil && selfCompactDispatchID == nil,
                         shouldShutdownSession: outcome.kind == .failed
                             && nativeFailureMetadata?.shouldShutdownSession == true
                     )
@@ -320,6 +322,20 @@ final class ClaudeIntegratedAgentModeRunner {
         return ClaudeUsageCredentialProfile.current(environment: environment).id
     }
 
+    #if DEBUG
+        @discardableResult
+        func testConsumeQuietEvents(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> Bool {
+            let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+            if case .completed = await consumeEvents(stream, session: session, runID: runID, runAttemptID: owner.attemptID) { return true }
+            return false
+        }
+    #endif
+
     private func consumeEvents(
         _ events: AsyncStream<NativeAgentRuntimeEvent>,
         session: AgentTabSession,
@@ -331,7 +347,9 @@ final class ClaudeIntegratedAgentModeRunner {
         // process is started; compatible launchers cannot populate Claude account usage.
         var quotaLease: UUID?
         if session.selectedAgent == .claudeCode,
-           session.runID == runID, session.activeRunAttemptID == runAttemptID
+           session.runID == runID, session.activeRunAttemptID == runAttemptID,
+           let ingressOwner = session.activeRunOwnership,
+           session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
         {
             // Diagnostics toggle OR connected Claude usage display (see
             // `GlobalSettingsStore.claudeRunTelemetryRecordingEnabled`): the pill stays current
@@ -350,7 +368,9 @@ final class ClaudeIntegratedAgentModeRunner {
 
         eventLoop: for await event in events {
             guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID,
+                  let ingressOwner = session.activeRunOwnership,
+                  session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
             else {
                 exitedDueToAttemptMismatch = true
                 break eventLoop
@@ -514,6 +534,7 @@ final class ClaudeIntegratedAgentModeRunner {
         terminalState: AgentSessionRunState,
         errorText: String?,
         notifyTurnComplete: Bool,
+        classifiesQuietCheckIn: Bool = false,
         shouldShutdownSession: Bool = false
     ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
@@ -528,6 +549,7 @@ final class ClaudeIntegratedAgentModeRunner {
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
             notifyTurnComplete: notifyTurnComplete,
+            classifiesQuietCheckIn: classifiesQuietCheckIn,
             prepareProviderState: { [claudeCoordinator] in
                 session.pendingSupersedingTurnCompletions = 0
                 session.claudeSupersedingProtectedTurnIDs.removeAll()

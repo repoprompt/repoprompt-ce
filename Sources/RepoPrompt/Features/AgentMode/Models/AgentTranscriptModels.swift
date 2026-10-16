@@ -910,7 +910,27 @@ public struct AgentTranscriptCollapsedHistoryRange: Sendable, Equatable {
     }
 }
 
+/// Lossless summary inputs omitted from rendered sections, not source rows or an ID index.
+/// All content is generated with the existing materialized block and dies with that value.
+struct AgentTranscriptDisplaySummaryInput: Equatable {
+    struct Row: Equatable {
+        let id: UUID
+        let kind: AgentChatItemKind
+        let hasAssistantBody: Bool
+        let narration: String?
+    }
+
+    let blockID: String
+    let kind: AgentTranscriptRenderBlockKind
+    let primaryAnchor: AgentTranscriptAnchor?
+    let anchorActivityID: UUID?
+    let activityIDs: [UUID]
+    let rows: [Row]
+}
+
 public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
+    /// No raw rows/payloads. Full groups reuse sections and only retain a summary-only prefix.
+    var displaySummaryInputs: [AgentTranscriptDisplaySummaryInput] = []
     public let id: String
     public let kind: AgentTranscriptRenderBlockKind
     public let turnID: UUID

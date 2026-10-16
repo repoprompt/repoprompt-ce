@@ -19,6 +19,17 @@ import RepoPromptDomainRuntime
 /// never builds a fragment of its own. `AgentSessionLinkMCPToolService.untrustedContentNotice`
 /// mirrors the autonomy clauses in compact form for the per-response notice.
 enum AgentSessionLinkPrompts {
+    /// Shared by classification and routine-dispatch copy. Calling this predicate is not provider
+    /// enablement: the normal terminal path must first qualify its accepted ingress coverage.
+    static func supportsQuietCheckIn(_ provider: AgentSessionLinkPromptProviderContext) -> Bool {
+        switch provider {
+        case .codexExec, .claudeCode: true
+        // Devin stays disabled for BOTH classification and future copy until exact own-echo U4 proof exists.
+        case .devin, .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
+             .openCode, .cursor, .grokBuild, .antigravity: false
+        }
+    }
+
     /// Hard cap on the rendered supplement. An inventory that cannot fit keeps a deterministic,
     /// order-preserving subset — each row is kept only if it still fits, so a single oversized row
     /// does not drop the rows after it and the retained set is not necessarily a prefix — reports
@@ -242,6 +253,9 @@ enum AgentSessionLinkPrompts {
             return AgentSessionLinkPromptRenderResult(fragment: fragment)
         }
 
+        let offersQuietReply = request.routineQuietCheckIn
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(request.providerContext)
+            && request.providerContext != .codexExec
         let omitsDuplicateAutonomy = request.membershipKind == .inventory
             && request.laneGuidanceMode == .full
         var fragments: [String] = []
@@ -260,7 +274,8 @@ enum AgentSessionLinkPrompts {
                    passive,
                    maximumBytes: reservationBudget,
                    guidanceMode: request.laneGuidanceMode,
-                   includesAutonomyContract: !omitsDuplicateAutonomy
+                   includesAutonomyContract: !omitsDuplicateAutonomy,
+                   offersQuietReply: offersQuietReply
                )
             {
                 let inventoryBudget = maximumRenderedBytes
@@ -287,7 +302,8 @@ enum AgentSessionLinkPrompts {
             passive,
             maximumBytes: passiveBudget,
             guidanceMode: request.laneGuidanceMode,
-            includesAutonomyContract: !omitsDuplicateAutonomy
+            includesAutonomyContract: !omitsDuplicateAutonomy,
+            offersQuietReply: offersQuietReply
         ) else {
             return AgentSessionLinkPromptRenderResult(fragment: joined(fragments))
         }
@@ -322,7 +338,8 @@ enum AgentSessionLinkPrompts {
         entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
         attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest],
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String {
         let offeredCount = passive.entries.count + passive.attentionRequests.count
         return statusChangeSupplement(
@@ -332,7 +349,8 @@ enum AgentSessionLinkPrompts {
             omittedCount: passive.unacknowledgedOverflowCount,
             deferredCount: offeredCount - entries.count - attentionRequests.count,
             guidanceMode: guidanceMode,
-            includesAutonomyContract: includesAutonomyContract
+            includesAutonomyContract: includesAutonomyContract,
+            offersQuietReply: offersQuietReply
         )
     }
 
@@ -342,7 +360,8 @@ enum AgentSessionLinkPrompts {
         _ passive: AgentSessionLinkPassiveStatusNotices.Snapshot,
         maximumBytes: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String? {
         let fragment = { (
             entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
@@ -353,7 +372,8 @@ enum AgentSessionLinkPrompts {
                 entries: entries,
                 attentionRequests: attentionRequests,
                 guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
+                includesAutonomyContract: includesAutonomyContract,
+                offersQuietReply: offersQuietReply
             )
         }
         if passive.entries.isEmpty, passive.attentionRequests.isEmpty {
@@ -375,7 +395,8 @@ enum AgentSessionLinkPrompts {
         _ passive: AgentSessionLinkPassiveStatusNotices.Snapshot,
         maximumBytes: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> RenderedPassiveSubset? {
         let fragment = { (
             entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
@@ -386,7 +407,8 @@ enum AgentSessionLinkPrompts {
                 entries: entries,
                 attentionRequests: attentionRequests,
                 guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
+                includesAutonomyContract: includesAutonomyContract,
+                offersQuietReply: offersQuietReply
             )
         }
         var renderedAttention: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = []
@@ -450,7 +472,8 @@ enum AgentSessionLinkPrompts {
         omittedCount: UInt64,
         deferredCount: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String {
         var guidance = laneGuidance(
             mode: guidanceMode,
@@ -461,6 +484,9 @@ enum AgentSessionLinkPrompts {
             guidance.append(
                 "`deferred` counts pending offered rows not shown here; they remain queued for a later accepted delivery."
             )
+        }
+        if offersQuietReply, attentionRequests.isEmpty {
+            guidance.append("Nothing needed? Reply [ack].")
         }
         var body = """
         <\(statusChangeEnvelopeTag) revision="\(revision)" \

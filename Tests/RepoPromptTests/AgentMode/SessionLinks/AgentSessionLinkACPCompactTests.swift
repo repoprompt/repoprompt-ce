@@ -900,6 +900,20 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         XCTAssertEqual(openCodeSupport, .notSupported)
     }
 
+    func testDevinBootstrapAdvertisementBeforeNewResponseKeepsExistingCommandSupport() async throws {
+        let fixture = try makeFixture(agent: .devin, providerID: .devin, environment: [
+            "ACP_ADVERTISE_COMMANDS": "compact",
+            "ACP_ADVERTISE_BEFORE_NEW_RESPONSE": "1"
+        ])
+        let controller = try await installLiveController(fixture, waitForAdvertisement: false)
+        XCTAssertTrue(
+            controller.advertisesCommand("compact", inProviderSession: ACPCompactFixtures.sessionID),
+            "Bootstrap metadata precedes installed session identity; quiet ingress must not discard it"
+        )
+        let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
+        XCTAssertEqual(support, .acpAdvertisedCommand)
+    }
+
     /// Only a live provider session's *observed* command list can prove incapability. Everything
     /// short of that — no controller at all (post-relaunch), a dead controller, or a live session
     /// whose `available_commands_update` has not been seen — is the retryable `noProviderSession`.

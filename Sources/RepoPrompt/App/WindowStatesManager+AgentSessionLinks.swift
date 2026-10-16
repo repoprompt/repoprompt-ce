@@ -489,6 +489,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return result
     }
 
+    func agentSessionLinkRunFacts(
+        for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
+    ) -> AgentRunQuietFacts? {
+        guard !isTerminating, let window = modelRoutingWindow(withID: candidate.windowID), !window.isClosing else { return nil }
+        return window.agentModeViewModel.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
+    }
+
     func agentSessionLinkObservationSnapshot(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot {

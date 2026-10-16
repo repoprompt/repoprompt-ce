@@ -565,6 +565,10 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         }
     }
 
+    func agentSessionLinkRunFacts(for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus) -> AgentRunQuietFacts? {
+        viewModelsByWindowID[candidate.windowID]?.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
+    }
+
     func agentSessionLinkObservationSnapshot(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot {
