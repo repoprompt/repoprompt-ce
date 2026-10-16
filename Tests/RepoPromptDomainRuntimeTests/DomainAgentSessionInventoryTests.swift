@@ -27,6 +27,27 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
         )
     }
 
+    func testUnresolvedSessionsCannotBecomeRowsDeletionProofOrLeakedIDsInRestrictedViews() {
+        let unresolved = UUID(), healthy = UUID()
+        let snapshot = DomainAgentSessionInventorySnapshot(
+            records: [record(unresolved, loaded: false), record(healthy)], edges: [],
+            isComplete: true, recordsComplete: true, unresolvedSessions: [unresolved: "ambiguous_binding"]
+        )
+        XCTAssertNil(snapshot.records[unresolved], "A saved row cannot replace an unresolved loaded identity")
+        XCTAssertNotNil(snapshot.records[healthy])
+        XCTAssertFalse(snapshot.isComplete)
+        XCTAssertFalse(snapshot.recordsComplete)
+        XCTAssertTrue(snapshot.knownSessionIDs.contains(unresolved))
+        XCTAssertFalse(snapshot.isMissing(unresolved))
+        let restricted = snapshot.restricted(to: [healthy])
+        XCTAssertTrue(restricted.unresolvedSessions.isEmpty)
+        XCTAssertEqual(restricted.unresolvedSessionCount, 1)
+        XCTAssertTrue(restricted.knownSessionIDs.contains(unresolved))
+        XCTAssertFalse(restricted.isMissing(unresolved))
+        let disclosed = snapshot.restricted(to: [healthy, unresolved])
+        XCTAssertEqual(disclosed.unresolvedSessions, [unresolved: "ambiguous_binding"])
+    }
+
     // MARK: - Orphans
 
     func testOrphanReasonsCoverMissingIntentEndpointArchivedObserverParentAndCreator() {

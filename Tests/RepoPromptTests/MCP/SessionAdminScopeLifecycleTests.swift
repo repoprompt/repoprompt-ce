@@ -3916,6 +3916,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var recordsComplete = true
         var endpointsComplete = true
         var omittedSessionIDs: Set<UUID> = []
+        var unresolvedSessions: [UUID: String] = [:]
+        var unknownOrganizationSessionIDs: Set<UUID> = []
         var readCount = 0
         let now: Date
 
@@ -3931,6 +3933,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let loaded = organizer.states.values.map { state in
                 DomainAgentSessionInventoryRecord(
                     sessionID: state.sessionID, name: state.name, workspaceID: state.workspaceID, isLoaded: true,
+                    organizationStateIsKnown: !unknownOrganizationSessionIDs.contains(state.sessionID),
                     isArchived: state.isArchived, isPinned: state.isPinned, pinnedOrder: state.pinnedOrder,
                     sidebarGroup: state.sidebarGroup, sidebarGroupOrder: state.sidebarGroupOrder,
                     runState: state.runState == .idle ? .idle : .running,
@@ -3945,7 +3948,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             )
             return DomainAgentSessionInventorySnapshot(
                 records: (loaded + historyOnly).filter { !omittedSessionIDs.contains($0.sessionID) },
-                edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete
+                edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete,
+                unresolvedSessions: unresolvedSessions
             )
         }
     }
@@ -4525,6 +4529,95 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     // MARK: - Filters and inventory
 
+    func testPartialInventoryPreservesFullAccessAndOrdinaryApprovalCards() async throws {
+        for fullAccess in [false, true] {
+            let fixture = Fixture()
+            let a = fixture.member("A"), b = fixture.member("B")
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            fixture.inventory.unresolvedSessions = [UUID(): "replica_mismatch"]
+            fixture.runtime.isGlobalAutoApproveEnabled = { fullAccess }
+            if !fullAccess { try fixture.grant(threshold: 1) }
+            let inventory = try await fixture.call(["op": .string("inventory")])
+            XCTAssertEqual(inventory["result"], .string("partial"))
+            XCTAssertEqual(inventory["total_complete"], .bool(false))
+            let result = try await fixture.call([
+                "op": .string("set_pin"), "targets": ids([a, b]), "pinned": .bool(true),
+                "idempotency_key": .string("partial-explicit-pin")
+            ])
+            if fullAccess {
+                XCTAssertEqual(result["result"], .string("applied"))
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            } else {
+                XCTAssertEqual(result["result"], .string("pending_confirmation"))
+                XCTAssertEqual(fixture.organizer.states[a]?.isPinned, false)
+                let id = try XCTUnwrap(result["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+                await fixture.approveAndApply(id)
+                let applied = try await fixture.call(["op": .string("confirmation_status"), "confirmation_id": .string(id.uuidString)])
+                XCTAssertEqual(applied["state"], .string("applied"))
+            }
+            XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
+            XCTAssertEqual(fixture.organizer.states[b]?.isPinned, true)
+        }
+    }
+
+    func testUnknownOrganizationFactsIndependentlyRefuseFilteredPreviewAndMutation() async throws {
+        let predicates: [[String: Value]] = [
+            ["pinned": .bool(false)], ["group": .null], ["archived": .bool(false)], ["query": .string("Known")]
+        ]
+        for predicate in predicates {
+            let fixture = Fixture()
+            let unknown = fixture.member("Known unknown sidebar")
+            let selectable = fixture.member("Known selectable sidebar")
+            fixture.inventory.unknownOrganizationSessionIDs = [unknown]
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            XCTAssertTrue(fixture.inventory.unresolvedSessions.isEmpty, "Do not let unresolved-binding rejection mask the knowledge guard")
+            try fixture.grant()
+            for preview in [true, false] {
+                let result = try await fixture.call([
+                    "op": .string("set_pin"), "filter": .object(predicate),
+                    "pinned": .bool(true), "preview": .bool(preview)
+                ])
+                XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                XCTAssertEqual(result["subreason"], .string("organization_state_unknown"))
+                XCTAssertEqual(result["retryable"], .bool(false))
+                XCTAssertNil(result["items"])
+                XCTAssertEqual(fixture.organizer.states[unknown]?.isPinned, false)
+                XCTAssertEqual(fixture.organizer.states[selectable]?.isPinned, false, "A known matching row must not turn an unknown selection into a writable subset")
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            }
+        }
+    }
+
+    func testPartialInventoryCannotWidenFilteredMutationsWithUnknownFacts() async throws {
+        let predicates: [[String: Value]] = [
+            ["has_links": .bool(false)], ["role": .string("overseer")],
+            ["orphaned": .bool(false)], ["pinned": .bool(false)],
+            ["group": .null], ["archived": .bool(false)], ["query": .string("Known")]
+        ]
+        for predicate in predicates {
+            let fixture = Fixture()
+            let target = fixture.member("Known", group: "Cleanup")
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            fixture.inventory.unresolvedSessions = [target: "ambiguous_binding"]
+            try fixture.grant()
+            for preview in [true, false] {
+                let result = try await fixture.call([
+                    "op": .string("set_pin"), "filter": .object(predicate),
+                    "pinned": .bool(true), "preview": .bool(preview)
+                ])
+                XCTAssertEqual(result["code"], .string("inventory_incomplete"), "\(predicate)")
+                XCTAssertNotNil(result["subreason"])
+                XCTAssertEqual(result["retryable"], .bool(false))
+                XCTAssertNil(result["items"])
+                XCTAssertEqual(fixture.organizer.states[target]?.isPinned, false)
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            }
+        }
+    }
+
     func testFilterResolvesOnlyLoadedMembersAndInventoryHidesNonMembers() async throws {
         let fixture = Fixture()
         let stale = fixture.member("Stale lane")
@@ -4630,7 +4723,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let result = try await fixture.call(args.merging(["preview": .bool(preview)]) { $1 })
             XCTAssertEqual(result["result"], .string("incomplete"))
             XCTAssertEqual(result["code"], .string("inventory_incomplete"))
-            XCTAssertEqual(result["retryable"], .bool(true))
+            XCTAssertEqual(result["retryable"], .bool(false))
+            XCTAssertEqual(result["subreason"], .string("no_matches_while_inventory_incomplete"))
             XCTAssertEqual(result["selection_complete"], .bool(false))
             XCTAssertNil(result["items"], "an incomplete zero is not a successful empty target set")
             XCTAssertNil(result["idempotent_replay"])
@@ -6227,7 +6321,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         )
         let value = try await handler.perform(batch)
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         source.afterRead = { _ = runtime.release(scopeID: scope.id, caller: .agentSession(caller)) }
         do {
             _ = try await handler.perform(batch)
@@ -6299,7 +6393,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             arguments: ["filter": .object(["has_links": .bool(false)])]
         )) else { return XCTFail("incomplete census must return a typed refusal") }
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_incomplete"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["subreason"], .string("filter_needs_complete_census"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         XCTAssertFalse(handler.performed)
     }
 
@@ -6307,6 +6402,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         let source: LiveAgentSessionInventorySource?
         let records: [DomainAgentSessionInventoryRecord]
         let edges: [DomainAgentSessionInventoryEdge]
+        var unresolvedSessions: [UUID: String] = [:]
 
         init(
             source: LiveAgentSessionInventorySource? = nil,
@@ -6318,7 +6414,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
 
         func snapshot() async -> DomainAgentSessionInventorySnapshot {
-            .init(records: records, edges: edges, isComplete: false)
+            .init(records: records, edges: edges, isComplete: false, unresolvedSessions: unresolvedSessions)
         }
 
         func snapshot(read: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
@@ -6328,7 +6424,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             return .init(
                 records: records.filter { read.sessionIDs?.contains($0.sessionID) ?? true },
-                edges: edges, isComplete: false
+                edges: edges, isComplete: false, unresolvedSessions: unresolvedSessions
             )
         }
     }
@@ -6421,7 +6517,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
         guard case let .completed(value) = outcome else { return XCTFail("budget refusal must be a typed grantee-only outcome") }
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["subreason"], .string("request_budget_exhausted"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         XCTAssertFalse(handler.performed)
     }
 
@@ -6619,7 +6716,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 "window=\(window.windowID) closing=\(window.isClosing) activeID=\(String(describing: manager.activeWorkspaceID)) established=\(manager.hasEstablishedWorkspaceSelectionForTesting) expected=\(expected.id) catalog=\(catalog)"
             )
             XCTAssertEqual(current.id, expected.id, "fixture activation must still own its workspace")
-            guard current.id == expected.id else { throw AgentSessionInventoryReadFailure.incomplete }
+            guard current.id == expected.id else { throw AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) }
             current.composeTabs = expected.composeTabs
             current.stashedTabs = expected.stashedTabs
             current.activeComposeTabID = expected.activeComposeTabID
@@ -7698,12 +7795,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         _ source: LiveAgentSessionInventorySource, sessionIDs: Set<UUID>? = nil,
         file: StaticString = #filePath, line: UInt = #line
     ) async throws {
-        do {
-            _ = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: sessionIDs))
-            XCTFail("Conflicting carrier evidence must not produce a successful row", file: file, line: line)
-        } catch let failure as AgentSessionInventoryReadFailure {
-            XCTAssertEqual(failure, .incomplete, file: file, line: line)
-        }
+        let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: sessionIDs))
+        XCTAssertFalse(snapshot.unresolvedSessions.isEmpty, file: file, line: line)
+        XCTAssertFalse(snapshot.recordsComplete, file: file, line: line)
+        XCTAssertTrue(Set(snapshot.records.keys).isDisjoint(with: snapshot.unresolvedSessions.keys), file: file, line: line)
     }
 
     func testExactGetAndCensusChooseTheSameCarrierBeforeFilteringRequestedIDs() async throws {
@@ -7790,7 +7885,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 fixture.window.agentModeViewModel.test_installLiveSession(live)
                 try await assertCarrierReadIncomplete(source, sessionIDs: [c])
                 let result = try await carrierGet(source, sessionID: c, workspaceID: workspace.id)
-                XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                XCTAssertEqual(result["code"], .string("ambiguous_binding"))
                 XCTAssertNil(result["session"])
                 XCTAssertNil(result["sessions"])
                 await fixture.cleanup()
@@ -8002,6 +8097,191 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    func testAmbiguousBindingOmitsOnlyThatSessionAndNeverFallsBackToHistory() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 1) { windows in
+                let target = UUID(), healthy = UUID()
+                let tabs = [
+                    ComposeTabState(name: "First binding", activeAgentSessionID: target),
+                    ComposeTabState(name: "Second binding", activeAgentSessionID: target),
+                    ComposeTabState(name: "Healthy", activeAgentSessionID: healthy)
+                ]
+                let workspace = WorkspaceModel(name: "Mixed carriers", repoPaths: [], ephemeralFlag: true, composeTabs: tabs)
+                installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                let scanner = Scanner()
+                await scanner.setWorkspaces([.init(
+                    workspaceDir: URL(fileURLWithPath: "/tmp/inventory-unresolved-history"),
+                    workspaceName: workspace.name, workspaceID: workspace.id,
+                    records: [directRecord(id: target, parent: nil, workspace: workspace.id)],
+                    indexReadFailed: false, indexSchemaVersion: nil
+                )])
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { windows }, links: { ([], []) })
+                for loadedOnly in [true, false] {
+                    let snapshot = try await source.snapshot(read: .init(loadedOnly: loadedOnly))
+                    XCTAssertEqual(Set(snapshot.records.keys), [healthy])
+                    XCTAssertEqual(snapshot.unresolvedSessions, [target: "ambiguous_binding"])
+                    XCTAssertFalse(snapshot.isComplete)
+                    XCTAssertFalse(snapshot.recordsComplete)
+                    XCTAssertTrue(snapshot.knownSessionIDs.contains(target))
+                    XCTAssertFalse(snapshot.isMissing(target))
+                }
+            }
+        }
+    }
+
+    func testReplicaMetadataMismatchOmitsOnlyConflictingSession() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 2) { windows in
+                let target = UUID(), healthy = UUID()
+                let tab = ComposeTabState(name: "Replica", activeAgentSessionID: target)
+                let safe = ComposeTabState(name: "Healthy", activeAgentSessionID: healthy)
+                let workspace = WorkspaceModel(name: "Replicas", repoPaths: [], ephemeralFlag: true, composeTabs: [tab, safe])
+                for (index, window) in windows.enumerated() {
+                    installCarrierWindow(window, workspace: workspace, entries: [
+                        target: carrierEntry(target, tabID: tab.id, savedAt: Double(20 + index)),
+                        healthy: carrierEntry(healthy, tabID: safe.id)
+                    ])
+                }
+                for ordered in [windows, Array(windows.reversed())] {
+                    let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { ordered }, links: { ([], []) })
+                    let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
+                    XCTAssertEqual(Set(snapshot.records.keys), [healthy])
+                    XCTAssertEqual(snapshot.unresolvedSessions, [target: "replica_mismatch"])
+                    XCTAssertFalse(snapshot.recordsComplete)
+                }
+            }
+        }
+    }
+
+    func testLoadedCaptureRetriesOnceDiscardsInvalidatedRowsAndPropagatesCancellation() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 1) { windows in
+                for outcome in ["recover", "exhaust", "cancel", "budget"] {
+                    let target = UUID()
+                    let tab = ComposeTabState(name: "Invalidated row", activeAgentSessionID: target)
+                    var workspace = WorkspaceModel(name: "Capture", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
+                    installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                    var attempts = 0
+                    let clock = ProjectionClock(stopAt: 100)
+                    let source = LiveAgentSessionInventorySource(
+                        scanner: Scanner(), windows: { windows },
+                        loadedProjectionCheckpoint: {
+                            attempts += 1
+                            if outcome == "cancel" { throw CancellationError() }
+                            if outcome == "budget", attempts == 2 {
+                                for _ in 0 ..< 100 {
+                                    _ = clock.now()
+                                }
+                            }
+                            if attempts == 1 || outcome == "exhaust" {
+                                workspace.composeTabs[0].name = "Fresh capture"
+                                self.installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                                // Owner generations are the production capture's freshness fence.
+                                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: UInt64(attempts + 1))
+                                windows[0].agentModeViewModel.test_installSessionIndexSnapshot(
+                                    [:], owner: owner, latestOwner: owner, activeWorkspace: workspace
+                                )
+                            }
+                        }, links: { ([], []) }
+                    )
+                    do {
+                        let snapshot = try await source.snapshot(read: .init(loadedOnly: true, budget: clock.budget()))
+                        XCTAssertEqual(outcome, "recover")
+                        XCTAssertEqual(snapshot.records[target]?.name, "Fresh capture", "invalidated rows must never escape")
+                    } catch let failure as AgentSessionInventoryReadFailure {
+                        if outcome == "budget" {
+                            XCTAssertEqual(failure, .budgetExceeded, "retry must not replace the invocation’s expired budget")
+                        } else {
+                            XCTAssertEqual(outcome, "exhaust")
+                            XCTAssertEqual(failure, .incomplete(.sessionsChangedDuringRead))
+                        }
+                    } catch is CancellationError {
+                        XCTAssertEqual(outcome, "cancel")
+                    }
+                    XCTAssertEqual(attempts, outcome == "cancel" ? 1 : 2, "exactly one internal retry, and none for cancellation")
+                }
+            }
+        }
+    }
+
+    func testUnresolvedDiagnosticsAreRenderedAndIDsRedactedAcrossInventoryTreeAndLinks() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID(), hidden = UUID(), workspace = UUID()
+        let source = LoadedProjectionSource(records: [
+            .init(sessionID: caller, name: "Root", workspaceID: workspace, isLoaded: true, lastActivityAt: Date())
+        ])
+        source.unresolvedSessions = [hidden: "ambiguous_binding"]
+        for kind in [DomainDelegationScopeKind.allSessions, .workspace(workspaceID: workspace)] {
+            let scope = try grant(runtime: runtime, caller: caller, kind: kind)
+            let handler = AgentSessionInventoryOperationHandler(
+                source: source, scopeChain: { runtime.scopeChain(from: $0) },
+                isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+                isLeaseCurrent: { runtime.isCurrent($0) }
+            )
+            for operation in [DomainAgentSessionTargetOperation.adminInventory, .adminTree, .adminLinks] {
+                let value = try await handler.perform(.init(
+                    request: .init(operation: operation, caller: .agentSession(caller)),
+                    scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+                ))
+                let object = try XCTUnwrap(value.objectValue)
+                XCTAssertEqual(object["result"], .string("partial"))
+                XCTAssertEqual(object["total_complete"], .bool(false))
+                XCTAssertEqual(object["unresolved_session_count"], .int(1))
+                let items = try XCTUnwrap(object["unresolved_sessions"]?.arrayValue)
+                if kind == .allSessions {
+                    XCTAssertEqual(items.first?.objectValue?["session_id"], .string(hidden.uuidString))
+                    XCTAssertEqual(items.first?.objectValue?["code"], .string("ambiguous_binding"))
+                    XCTAssertNotNil(items.first?.objectValue?["next_step"])
+                } else {
+                    XCTAssertTrue(items.isEmpty)
+                    XCTAssertEqual(object["unresolved_sessions_redacted_count"], .int(1))
+                    XCTAssertFalse(String(describing: value).contains(hidden.uuidString))
+                }
+            }
+        }
+    }
+
+    func testUnresolvedGrantedTreeRootReturnsPartialInsteadOfAbortingDiscovery() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .tree(rootSessionID: caller))
+        let source = LoadedProjectionSource(records: [])
+        source.unresolvedSessions = [caller: "ambiguous_binding"]
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        let result = try await handler.perform(.init(
+            request: .init(operation: .adminTree, caller: .agentSession(caller)),
+            scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+        ))
+        XCTAssertEqual(result.objectValue?["result"], .string("partial"))
+        XCTAssertEqual(result.objectValue?["tree"], .null)
+        XCTAssertEqual(result.objectValue?["unresolved_sessions"]?.arrayValue?.first?.objectValue?["session_id"], .string(caller.uuidString))
+    }
+
+    func testLoadedFilterSkipsHistoryButGlobalPredicatesStillRequireIt() async throws {
+        var filter = DomainAgentSessionInventoryFilter()
+        filter.loaded = true
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let read = AgentSessionInventoryRead.scoped(chain: [], filter: filter)
+        XCTAssertTrue(read.loadedOnly)
+        _ = try await source.snapshot(read: read)
+        let scans = await scanner.capturedQueries()
+        XCTAssertTrue(scans.isEmpty)
+        filter.hasLinks = false
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+        // Loaded rows obtain their creation dates from history, not sidebar carriers.
+        filter.hasLinks = nil
+        filter.createdBefore = Date(timeIntervalSince1970: 100)
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+        filter.createdBefore = nil
+        filter.createdAfter = Date(timeIntervalSince1970: 100)
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+    }
+
     func testCanonicalCarrierRuntimeJoinPreservesLiveEvidenceAcrossWindowOrders() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             try await withCarrierWindows(count: 3) { windows in
@@ -8010,12 +8290,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 tab.lastModified = Date(timeIntervalSince1970: 20)
                 let workspace = WorkspaceModel(name: "Shared canonical workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
                 typealias Observation = (live: AgentSessionRunState?, fallback: String?)
-                let cases: [(String, [Observation], DomainAgentSessionInventoryRunState?)] = [
+                let cases: [(String, [Observation], DomainAgentSessionInventoryRunState)] = [
                     ("absent then live", [(nil, nil), (.running, "idle")], .running),
                     ("equal live", [(.running, "idle"), (.running, "idle")], .running),
-                    ("different live", [(.running, "idle"), (.idle, "idle")], nil),
-                    ("different fallback", [(nil, "running"), (nil, "idle")], nil),
-                    ("live fallback live", [(.running, "idle"), (nil, "idle"), (.idle, "idle")], nil),
+                    ("different live", [(.running, "idle"), (.idle, "idle")], .unknown),
+                    ("different fallback", [(nil, "running"), (nil, "idle")], .unknown),
+                    ("live fallback live", [(.running, "idle"), (nil, "idle"), (.idle, "idle")], .unknown),
                     ("conflicting fallback plus live", [(nil, "idle"), (nil, "completed"), (.running, "idle")], .running)
                 ]
                 for (label, observations, expected) in cases {
@@ -8035,21 +8315,13 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { ordered }, links: { ([], []) })
                         let selectors: [Set<UUID>?] = [Set([target]), nil]
                         for ids in selectors {
-                            if let expected {
-                                let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
-                                XCTAssertEqual(Set(snapshot.records.keys), Set([target]), "\(label) \(order)")
-                                XCTAssertEqual(snapshot.records[target]?.runState, expected, "\(label) \(order)")
-                            } else {
-                                try await assertCarrierReadIncomplete(source, sessionIDs: ids)
-                            }
+                            let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
+                            XCTAssertEqual(Set(snapshot.records.keys), Set([target]), "\(label) \(order)")
+                            XCTAssertEqual(snapshot.records[target]?.runState, expected, "\(label) \(order)")
+                            XCTAssertTrue(snapshot.unresolvedSessions.isEmpty, "Run-state disagreement is not a binding conflict")
                         }
                         let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
-                        if let expected {
-                            XCTAssertEqual(result["session"]?.objectValue?["state"], .string(expected.rawValue), label)
-                        } else {
-                            XCTAssertEqual(result["code"], .string("inventory_incomplete"), label)
-                            XCTAssertNil(result["session"], label)
-                        }
+                        XCTAssertEqual(result["session"]?.objectValue?["state"], .string(expected.rawValue), label)
                         let scans = await scanner.capturedQueries()
                         let direct = await scanner.capturedDirectQueries()
                         XCTAssertTrue(scans.isEmpty && direct.isEmpty)
@@ -8067,7 +8339,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     try await assertCarrierReadIncomplete(source, sessionIDs: [target])
                     try await assertCarrierReadIncomplete(source)
                     let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
-                    XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                    XCTAssertEqual(result["code"], .string("ambiguous_binding"))
                     XCTAssertNil(result["session"])
                 }
 

@@ -216,9 +216,11 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     /// (on a complete scan) is what "missing" means; a session hidden by scope is never missing.
     package let knownSessionIDs: Set<UUID>
     /// Sessions the read saw but could not project with certainty, with a stable reason code
-    /// (for example `ambiguous_session_binding`). They are omitted from `records` and make the
+    /// (for example `ambiguous_binding`). They are omitted from `records` and make the
     /// read incomplete instead of failing the whole inventory.
     package let unresolvedSessions: [UUID: String]
+    /// Includes unresolved identities whose IDs a restricted view must not disclose.
+    package let unresolvedSessionCount: Int
 
     private let edgesBySession: [UUID: [DomainAgentSessionInventoryEdge]]
     private let ancestry: DomainAgentSessionAncestryIndex
@@ -235,7 +237,7 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         unresolvedSessions: [UUID: String] = [:]
     ) {
         var byID: [UUID: DomainAgentSessionInventoryRecord] = [:]
-        for record in records {
+        for record in records where unresolvedSessions[record.sessionID] == nil {
             // Loaded projections win over history rows for the same session.
             if let existing = byID[record.sessionID], existing.isLoaded, !record.isLoaded { continue }
             byID[record.sessionID] = record
@@ -244,7 +246,7 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             records: byID, edges: edges, isComplete: isComplete,
             recordsComplete: recordsComplete ?? isComplete,
             knownSessionIDs: Set(byID.keys).union(unresolvedSessions.keys),
-            unresolvedSessions: unresolvedSessions
+            unresolvedSessions: unresolvedSessions, unresolvedSessionCount: unresolvedSessions.count
         )
     }
 
@@ -254,13 +256,15 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
         isComplete: Bool,
         recordsComplete: Bool,
         knownSessionIDs: Set<UUID>,
-        unresolvedSessions: [UUID: String]
+        unresolvedSessions: [UUID: String],
+        unresolvedSessionCount: Int
     ) {
         self.unresolvedSessions = unresolvedSessions
+        self.unresolvedSessionCount = unresolvedSessionCount
         self.records = records
         self.edges = edges
-        self.isComplete = isComplete
-        self.recordsComplete = recordsComplete
+        self.isComplete = isComplete && unresolvedSessionCount == 0
+        self.recordsComplete = recordsComplete && unresolvedSessionCount == 0
         self.knownSessionIDs = knownSessionIDs
         ancestry = DomainAgentSessionAncestryIndex(parents: records.compactMapValues(\.effectiveParentID))
         var bySession: [UUID: [DomainAgentSessionInventoryEdge]] = [:]
@@ -278,6 +282,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
     /// Edges to existing sessions outside the scope, and edges between two missing sessions (which
     /// belong to no visible session), are dropped entirely, so counts, roles, and orphan reasons
     /// derived from the view never reflect, count, or name a session the scope cannot see.
+    /// Unresolved diagnostic counts are retained without hidden IDs to explain incompleteness;
+    /// they are not membership, filter, role, or absence evidence.
     package func restricted(to visibleSessionIDs: Set<UUID>) -> Self {
         let visibleRecords = records.filter { visibleSessionIDs.contains($0.key) }
         let visibleEdges = edges.filter { edge in
@@ -291,7 +297,8 @@ package struct DomainAgentSessionInventorySnapshot: Sendable {
             isComplete: isComplete,
             recordsComplete: recordsComplete,
             knownSessionIDs: knownSessionIDs,
-            unresolvedSessions: unresolvedSessions
+            unresolvedSessions: unresolvedSessions.filter { visibleSessionIDs.contains($0.key) },
+            unresolvedSessionCount: unresolvedSessionCount
         )
     }
 

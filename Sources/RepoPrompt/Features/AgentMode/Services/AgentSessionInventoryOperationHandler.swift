@@ -60,13 +60,13 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
         if !full.isComplete, filter?.hasLinks != nil || filter?.role != nil || filter?.orphaned != nil {
             // Read predicates can feed a later explicit mutation just as target-shaping filters can.
             // Never report candidate IDs obtained by treating an unknown endpoint census as false.
-            return AgentSessionInventoryReadFailure.incomplete.value
+            return AgentSessionInventoryReadFailure.incomplete(.filterNeedsCompleteCensus).value
         }
         // Membership is decided on the full snapshot; everything rendered, counted, filtered, or
         // classified below comes from the scope-restricted view, so no output can name, count, or
         // reflect a session outside the scope.
         let visibility = AgentSessionScopeVisibility(chain: scopeChain(batch.scope.id))
-        let snapshot = full.restricted(to: Set(
+        var visibleIDs = Set(
             full.records.values
                 .filter {
                     // An exact get already carries current app-owned target leases. Its partial
@@ -74,7 +74,21 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                     boundedGet ? batch.admittedSessionIDs.contains($0.sessionID) : visibility.isVisible($0, in: full)
                 }
                 .map(\.sessionID)
-        ))
+        )
+        visibleIDs.formUnion(full.unresolvedSessions.keys.filter { visibility.mayDiscloseUnresolved($0) })
+        visibleIDs.formUnion(batch.admittedSessionIDs.filter { full.unresolvedSessions[$0] != nil })
+        let snapshot = full.restricted(to: visibleIDs)
+        let unresolved = AgentSessionInventoryRendering.unresolvedFields(snapshot)
+        func readValue(_ fields: [String: Value]) -> Value {
+            .object(fields.merging(unresolved) { _, diagnostic in diagnostic })
+        }
+        // An exact get has current app-owned target leases. An unresolved binding must return
+        // its reason, never a usable row or a stale history substitute.
+        if exactGet, let target = batch.admittedSessionIDs.first, let reason = full.unresolvedSessions[target] {
+            var result = AgentSessionInventoryRendering.unresolvedValue(id: target, reason: reason).objectValue ?? [:]
+            result["result"] = .string("not_applied")
+            return .object(result)
+        }
         let date = now()
         func visible(_ id: UUID) -> DomainAgentSessionInventoryRecord? {
             snapshot.records[id]
@@ -94,7 +108,7 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
             let totalComplete = snapshot.recordsComplete
                 && (!needsOrganization || snapshot.records.values.allSatisfy(\.organizationStateIsKnown))
                 && (filter?.orphaned == nil || snapshot.records.keys.allSatisfy { snapshot.orphanStatusIsComplete(for: $0) })
-            return .object([
+            return readValue([
                 "result": .string("ok"),
                 "total": .int(matches.count),
                 "total_complete": .bool(totalComplete),
@@ -131,13 +145,19 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                         .map { .string($0.sessionID.uuidString) }
                 )
             }
-            return .object([
+            return readValue([
                 "result": .string("ok"), "history_complete": .bool(snapshot.recordsComplete), "session": .object(row)
             ])
 
         case .adminTree:
             let rootID = batch.request.targetSessionIDs.first ?? defaultRoot(batch)
-            guard let rootID, let root = visible(rootID) else { throw SessionAdminMCPToolService.unavailableError }
+            guard let rootID else { throw SessionAdminMCPToolService.unavailableError }
+            guard let root = visible(rootID) else {
+                if snapshot.unresolvedSessions[rootID] != nil {
+                    return readValue(["result": .string("partial"), "tree": .null])
+                }
+                throw SessionAdminMCPToolService.unavailableError
+            }
             var childrenByParent: [UUID: [DomainAgentSessionInventoryRecord]] = [:]
             for record in snapshot.records.values {
                 if let parent = record.effectiveParentID, parent != record.sessionID {
@@ -182,17 +202,19 @@ final class AgentSessionInventoryOperationHandler: AgentSessionAdministrationOpe
                 }
                 return .object(object)
             }
-            return .object([
+            return readValue([
                 "result": .string("ok"), "history_complete": .bool(snapshot.recordsComplete), "tree": node(root, depth: 0)
             ])
 
         case .adminLinks:
             let focus = batch.request.targetSessionIDs.first
-            if let focus, visible(focus) == nil { throw SessionAdminMCPToolService.unavailableError }
+            if let focus, visible(focus) == nil, snapshot.unresolvedSessions[focus] == nil {
+                throw SessionAdminMCPToolService.unavailableError
+            }
             let edges = snapshot.edges.filter { edge in
                 focus.map(edge.touches) ?? true
             }
-            return .object([
+            return readValue([
                 "result": .string("ok"),
                 "total": .int(edges.count),
                 "total_complete": .bool(snapshot.isComplete),
