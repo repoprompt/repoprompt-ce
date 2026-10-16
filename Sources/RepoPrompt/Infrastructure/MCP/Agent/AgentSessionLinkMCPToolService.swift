@@ -169,18 +169,22 @@ struct AgentSessionLinkMCPToolService {
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
             + "request_attention, respond, steer, stop, set_model, create_lane, or retire_lane."
 
-    static func parseModelID(_ value: Value?) throws -> String {
+    static func parseModelID(_ value: Value?, allowRoleLabels: Bool = false) throws -> String {
         guard case let .string(raw)? = value,
               AgentSessionLinkRuntimeBridge.isValidModelID(raw)
+              || (allowRoleLabels && AgentModelCatalog.TaskLabelKind(rawValue: raw.lowercased()) != nil)
         else {
-            throw MCPError.invalidParams(AgentSessionLinkRuntimeBridge.invalidModelIDMessage)
+            let detail = allowRoleLabels
+                ? "model_id must be a role label (explore, engineer, pair, design) or exact compound ID. Use agent_manage {op: list_agents, roles_only: false} for valid IDs."
+                : AgentSessionLinkRuntimeBridge.invalidModelIDMessage
+            throw MCPError.invalidParams(detail)
         }
         return raw
     }
 
     private func executeSetModel(args: [String: Value]) async throws -> Value {
         let sessionID = try Self.parseSingleSessionID(args["session_id"], op: "set_model")
-        let modelID = try Self.parseModelID(args["model_id"])
+        let modelID = try Self.parseModelID(args["model_id"], allowRoleLabels: true)
         let metadata = await captureRequestMetadata()
         guard let observer = await resolveModelObserverEndpoint(metadata) else {
             throw MCPError.invalidParams(
@@ -205,7 +209,27 @@ struct AgentSessionLinkMCPToolService {
                 "persistence": .string("scheduled"),
                 "hint": .string("Configuration only; no turn started or provider contacted. Next ordinary turn applies it and may fail. Default/Auto follows provider policy, not a guaranteed reset; enabled automatic effort/routing remains enabled.")
             ])
-        case let .invalid(message): throw MCPError.invalidParams(message)
+        case let .refused(code, detail, alternatives):
+            return .object([
+                "result": .string("not_applied"), "code": .string(code), "subreason": .string(code),
+                "detail": .string(detail), "session_id": .string(sessionID.uuidString),
+                "affected": .array([.string(sessionID.uuidString)]), "retryable": .bool(false),
+                "same_agent_model_ids": .array(alternatives.map(Value.string)),
+                "next_call": .object([
+                    "tool": .string("agent_manage"),
+                    "args": .object(["op": .string("list_agents"), "roles_only": .bool(false)])
+                ])
+            ])
+        case let .invalid(message):
+            return .object([
+                "result": .string("not_applied"), "code": .string("model_selection_refused"),
+                "subreason": .string("model_transaction_admission"), "detail": .string(message),
+                "session_id": .string(sessionID.uuidString), "retryable": .bool(false),
+                "next_call": .object([
+                    "tool": .string("agent_manage"),
+                    "args": .object(["op": .string("list_agents"), "roles_only": .bool(false)])
+                ])
+            ])
         case .blocked(.managementRevoked):
             return AgentSessionLinkResponseRenderer.managementNotGrantedValue(targetSessionID: sessionID)
         case .blocked(.shuttingDown): throw MCPError.internalError("RepoPrompt is shutting down.")
@@ -214,7 +238,14 @@ struct AgentSessionLinkMCPToolService {
                 throw Self.denialError(targetSessionID: sessionID)
             }
             return .object([
-                "result": .string(failure.rawValue), "session_id": .string(sessionID.uuidString),
+                "result": .string("not_applied"), "session_id": .string(sessionID.uuidString),
+                "code": .string(failure.rawValue), "subreason": .string(failure.rawValue),
+                "detail": .string("The target is busy or loading. No model configuration changed."),
+                "affected": .array([.string(sessionID.uuidString)]),
+                "next_call": .object([
+                    "tool": .string("agent_session_link"),
+                    "args": .object(["op": .string("wait"), "session_id": .string(sessionID.uuidString), "until": .string("sendable")])
+                ]),
                 "retryable": .bool(true),
                 "hint": .string("No model change. Use wait(until: \"sendable\"), then retry set_model.")
             ])

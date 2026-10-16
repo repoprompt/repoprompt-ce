@@ -6512,6 +6512,17 @@ extension ToolOutputFormatter {
             if skippedCount > 0 {
                 lines.append("- Skipped: **\(skippedCount)** sessions")
             }
+            if let result = object["result"]?.stringValue { lines.append("- Result: `\(result)`") }
+            for key in ["skipped_sessions", "unprocessed_sessions", "deleted_sessions"] {
+                for entry in object[key]?.arrayValue ?? [] {
+                    guard let item = entry.objectValue,
+                          let code = item["code"]?.stringValue else { continue }
+                    let id = item["session_id"]?.stringValue ?? "unknown"
+                    let detail = item["detail"]?.stringValue ?? ""
+                    let next = item["next_step"]?.stringValue ?? "Inspect the session in the app."
+                    lines.append("  - `\(id)` — `\(code)`: \(detail) Next: \(next)")
+                }
+            }
         }
         if let returned = object["returned_turn_count"]?.intValue,
            let total = object["total_turns"]?.intValue

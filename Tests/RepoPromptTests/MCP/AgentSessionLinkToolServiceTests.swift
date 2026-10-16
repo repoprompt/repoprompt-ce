@@ -271,6 +271,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     }
 
     func testSetModelWireRequiresExactIDAndReportsNextTurnOnly() async throws {
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseModelID(.string("explore"), allowRoleLabels: true), "explore")
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseModelID(.string("explore")), "Explicit create_lane model IDs must stay exact")
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let args: [String: Value] = [
@@ -291,7 +293,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 XCTFail("Accepted \(extra)")
             } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
         }
-        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("pair"), .string("unknown:model")] {
+        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("unknown-role"), .string("unknown:model")] {
             var invalid = args
             invalid["model_id"] = invalidID
             do { _ = try await fixture.service.execute(args: invalid)
@@ -1105,6 +1107,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let result = try await service.execute(args: [:])
         XCTAssertEqual(result, .string(BecomeOverseerMCPToolService.nextTurnResult))
         XCTAssertNotNil(fixture.host.activations[endpoint])
+        let listing = try await fixture.routedService(from: endpoint).execute(args: ["op": .string("list")])
+        XCTAssertEqual(listing.objectValue?["items"], .array([]))
+        XCTAssertEqual(listing.objectValue?["has_more"], .bool(false))
+
         let noInventedLink = await fixture.authority.hasActiveLink(endpoint: endpoint)
         XCTAssertFalse(noInventedLink)
         let noInventory = await fixture.authority.links(forObserver: endpoint.sessionID)
