@@ -113,12 +113,14 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let date = Date(timeIntervalSince1970: 1_900_000_000)
         let snapshot = try cliPlanUsageSnapshot(observedAt: date)
         let hourOld = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(60 * 60)), "an hour-old 5-hour reading is within 25% of its window")
-        XCTAssertEqual(hourOld.usedPercent, 6)
+        XCTAssertEqual(hourOld.usedPercent, 5, "the weekly window remains the primary figure")
+        XCTAssertEqual(hourOld.shortWindowPercent, 6, "the hour-old 5-hour reading remains visible as the secondary figure")
         let pastFiveHourHorizon = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(76 * 60)))
         XCTAssertEqual(pastFiveHourHorizon.usedPercent, 5, "only the weekly reading remains fresh")
         XCTAssertEqual(pastFiveHourHorizon.freshness, .fresh)
         let everythingAged = try XCTUnwrap(ProviderQuotaIndicatorState.project(snapshot, now: date.addingTimeInterval(43 * 3600)), "aged readings stay visible")
-        XCTAssertEqual(everythingAged.usedPercent, 6)
+        XCTAssertEqual(everythingAged.usedPercent, 5, "the aged weekly reading stays primary")
+        XCTAssertEqual(everythingAged.shortWindowPercent, 6, "the aged 5-hour reading also stays visible")
         XCTAssertEqual(everythingAged.freshness, .resetPassed, "the 5-hour reset has passed with nothing newer")
     }
 
